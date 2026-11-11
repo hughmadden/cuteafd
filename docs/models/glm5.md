@@ -26,22 +26,14 @@ Native EXL3 K4 + K6-core starting configs:
 [min](../../examples/configs/glm53-exl3-k6core-min.config) ·
 [max](../../examples/configs/glm53-exl3-k6core-max.config).
 
-## Selected attention bundles
+## Core selection
 
-`wrldsuksgo2mars/GLM-5.3-EXL3-K4-Core-K6-HQA` at
-`354226e187c9f6c318a633aeee3a1bb327ae11f7` supplies native BF16
-`q_b_proj`/`o_proj` weights alongside its original K6 Compact bundle.
-`ATTENTION_MODE=hqa` selects the native bundle; `compact` selects the parent
-bundle without reading native shards; `fp8-compact` converts native BF16
-attention to one retained E4M3 copy with block-128 FP32 scales at load/push.
-Already-E4M3 attention cannot be converted again. Selection is immutable and
-participates in model, prefix-cache and golden identity.
-
-Native BF16 uses ordered-K16 projection kernels. TP2 output projections retain
-FP32 partials, add rank 0 then rank 1, and narrow to BF16 once. The publication
-contains 79 attention pairs, including unused MTP layer 78; only the 78
-backbone layers receive runtime owners. Speculation remains external DFlash2.
-ML4 shares the runtime, not GLM 5.3's qualification row.
+Plain GLM checkpoints use `CORE_VIEW=original` and their checkpoint-native
+core. A compact selector requires an explicit [MC manifest](../mc-checkpoints.md);
+there is no alternate-attention publication or filename fallback. Where native
+BF16 attention operands are supported, `fp8-compact` retains the existing
+load-time attention conversion scope. It does not convert an FP8-origin core.
+Selected metadata and fingerprints are immutable across planning and serving.
 
 ## Engineering summary
 

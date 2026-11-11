@@ -83,7 +83,7 @@ impl NativeSelection {
             let split = layer < cfg.layers && !cfg.full[layer] && ranks == 2;
             requirements.push(NativeRequirement { layout: NativeLayout {
                 stem, shape: [cfg.hidden, cfg.heads * cfg.dim / if split { 2 } else { 1 }],
-                fp8: contract.attention_mode == crate::plan::checkpoint::AttentionMode::Fp8Compact, rank: 0, ranks: if split { 2 } else { 1 },
+                fp8: contract.core_view == crate::plan::checkpoint::CoreView::Fp8Compact, rank: 0, ranks: if split { 2 } else { 1 },
                 split: if split { CoreSplit::Input } else { CoreSplit::Whole },
             }, output: if split { ProjectionOutput::F32 } else { ProjectionOutput::Bf16 } });
         }

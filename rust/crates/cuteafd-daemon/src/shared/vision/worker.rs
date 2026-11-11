@@ -3,7 +3,7 @@ use super::{normalization_lut, remote::{EncoderHandshake, EncoderServer}, Encode
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::vision::NativeVision;
 use cuteafd_loader::media::ProcessorConfig;
-use cuteafd_loader::plan::checkpoint::{AttentionMode, CheckpointView};
+use cuteafd_loader::plan::checkpoint::{CoreView, CheckpointView};
 use std::{path::{Path, PathBuf}, time::Duration};
 
 #[derive(Clone, Debug)]
@@ -37,7 +37,7 @@ pub(crate) fn architecture(library: &Path) -> Result<u32> {
 /// Returns a server only after the tower owner has reported ready. The caller
 /// subtracts this exact ledger before any expert weight/workspace admission.
 pub fn start(config: &EncoderWorkerConfig, snapshot: &Path, library: PathBuf, budget: u64) -> Result<(EncoderServer, u64)> {
-    let view = CheckpointView::select(snapshot, AttentionMode::Hqa)?;
+    let view = CheckpointView::select(snapshot, CoreView::Original)?;
     start_view(config, &view, library, budget)
 }
 

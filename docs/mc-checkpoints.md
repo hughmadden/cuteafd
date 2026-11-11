@@ -33,7 +33,9 @@ aliases or fallback to another compact width are supported.
 roles supported by that family's existing runtime, never routed experts,
 embeddings, routers, norms, towers or drafters. Initially the converter retains
 the family's existing qualified attention-only scope; whole-core FP8 expansion
-is a separate runtime change. Unsupported families refuse it.
+is a separate runtime change. Kimi K3.1 MC and GLM Flash MC refuse
+`fp8-compact` until that work lands. Muse MC converts q/k/v/o attention
+only, not the whole core. Unsupported families refuse it.
 
 An FP8-origin model is not MC and contains no trellis-quantized core tensors,
 including unindexed shards. Mistral Large 4 is published as

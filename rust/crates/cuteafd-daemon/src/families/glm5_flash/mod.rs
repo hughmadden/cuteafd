@@ -63,7 +63,7 @@ use std::time::Instant;
 #[derive(Debug, Clone, clap::Args)]
 pub(crate) struct EngineArgs {
     #[command(flatten)]
-    pub attention: crate::cli::AttentionArgs,
+    pub attention: crate::cli::CoreViewArgs,
     /// Packed prefill arithmetic policy. Unset: unrestricted serving, exact --packed-check.
     #[arg(long, value_enum)]
     pub prefill_packing: Option<crate::shared::prefill_packing::PackingMode>,
@@ -1854,18 +1854,18 @@ pub(crate) fn open(args: &EngineArgs) -> Result<Opened> {
     let library = std::sync::Arc::new(unsafe { NativeLibrary::load(&args.native_lib) }?);
     library.cuda_set_device(args.device)?;
     let mode = match view.mode() {
-        cuteafd_loader::plan::checkpoint::AttentionMode::Hqa => "hqa",
-        cuteafd_loader::plan::checkpoint::AttentionMode::Compact => "compact",
-        cuteafd_loader::plan::checkpoint::AttentionMode::Fp8Compact => "fp8-compact",
+        cuteafd_loader::plan::checkpoint::CoreView::Original => "original",
+        cuteafd_loader::plan::checkpoint::CoreView::K6Compact => "k6-compact", cuteafd_loader::plan::checkpoint::CoreView::K8Compact => "k8-compact",
+        cuteafd_loader::plan::checkpoint::CoreView::Fp8Compact => "fp8-compact",
     };
     cuteafd_bench::context::set_resolved("attention-mode", mode);
     cuteafd_bench::context::set_resolved("attention-bundle-fingerprint", view.fingerprint());
-    let recipe = if view.mode() == cuteafd_loader::plan::checkpoint::AttentionMode::Fp8Compact {
+    let recipe = if view.mode() == cuteafd_loader::plan::checkpoint::CoreView::Fp8Compact {
         cuteafd_loader::plan::checkpoint::view::FP8_RECIPE
     } else { "none" };
     cuteafd_bench::context::set_resolved("attention-fp8-recipe", recipe);
     let active_bytes: u64 = checkpoint.tensors.iter().map(|tensor| tensor.meta.byte_length).sum();
-    tracing::info!(attention_mode = mode, bundle = view.fingerprint(), fp8_recipe = recipe,
+    tracing::info!(core_view = mode, bundle = view.fingerprint(), fp8_recipe = recipe,
         active_dense_source_bytes = active_bytes, "selected immutable attention bundle");
     Ok(Opened { view, expert_view, checkpoint, cfg, library, experts, native })
 }
@@ -3570,7 +3570,7 @@ fn golden_run(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmfEngine<'_
         std::fs::write(dir.join("attention.json"), serde_json::to_vec_pretty(&serde_json::json!({
             "mode": opened.view.mode(), "bundle_fingerprint": opened.view.fingerprint(),
             "config": opened.view.config_name(), "index": opened.view.index_name(),
-            "fp8_recipe": (opened.view.mode() == cuteafd_loader::plan::checkpoint::AttentionMode::Fp8Compact)
+            "fp8_recipe": (opened.view.mode() == cuteafd_loader::plan::checkpoint::CoreView::Fp8Compact)
                 .then_some(cuteafd_loader::plan::checkpoint::view::FP8_RECIPE),
         }))?)?;
     }

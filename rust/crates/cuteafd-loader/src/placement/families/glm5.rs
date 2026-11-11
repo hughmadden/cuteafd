@@ -182,7 +182,7 @@ pub fn manifest_context_for_cards(cfg: &GlmDsaConfig, manifest: &serde_json::Val
         cuteafd_core::coordinator_programs::select_card_plans(&mut selected, sm_count.try_into()?)?;
         let family = cuteafd_core::coordinator_programs::CoordinatorPrograms {
             family: cfg.program_family(), split_family: cfg.split_program_family() };
-        cuteafd_core::coordinator_programs::select_attention_plans(&mut selected, plan,
+        cuteafd_core::coordinator_programs::select_core_view_plans(&mut selected, plan,
             |name| family.contains(name))?;
         let Some(card) = manifest_context(cfg, &selected, sm_count, &plan) else { return Ok(None) };
         context = Some(match context {

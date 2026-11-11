@@ -160,7 +160,7 @@ struct SwaWeights<'a> {
     /// EXL3 q, k, v, o (replacing operand slots 1, 2, 3, 7, which then hold
     /// no BF16 allocation); the o projection is K-split when heads are split.
     native: Option<super::native::NativeAttention<'a>>,
-    hqa_output: Option<super::native::OutputProjection<'a>>,
+    native_output: Option<super::native::OutputProjection<'a>>,
 }
 
 pub(super) struct SwaLayer<'a> {
@@ -338,7 +338,7 @@ impl<'a> SwaLayer<'a> {
             (DType::F32, vec![192]),
             (DType::F32, vec![192]),
             (DType::Bf16, vec![heads, H]),
-            (if contract.attention_mode == cuteafd_loader::plan::checkpoint::AttentionMode::Fp8Compact { DType::F8E4M3 } else { DType::Bf16 }, vec![H, q]),
+            (if contract.core_view == cuteafd_loader::plan::checkpoint::CoreView::Fp8Compact { DType::F8E4M3 } else { DType::Bf16 }, vec![H, q]),
         ]) {
             let Some(weight) = weight else { continue };
             ensure!(
@@ -447,7 +447,7 @@ impl<'a> SwaLayer<'a> {
             "SWA pointwise geometry"
         );
         // HQA target and MTP share one ordered-K16 registry; TP2 keeps F32 partials.
-        let hqa_output = if native_layer && !native_o {
+        let native_output = if native_layer && !native_o {
             let output = if heads == 32 { cuteafd_ffi::draft_projection::ProjectionOutput::F32 }
                 else { cuteafd_ffi::draft_projection::ProjectionOutput::Bf16 };
             Some(device.run(|| super::native::OutputProjection::load(
@@ -492,7 +492,7 @@ impl<'a> SwaLayer<'a> {
         let attention_rope = rope.tables.get(layer.rope)?;
         let mut owner = Self::workspace(device, admission, std::rc::Rc::new(SwaWeights { kv_format, rope, attention_rope,
             layer: layer_id, extent: contract.rope_tables.extent as usize, weights,
-            programs: resolved, epsilon: cfg.norm_eps, heads, native, hqa_output }), ffn, arena)?;
+            programs: resolved, epsilon: cfg.norm_eps, heads, native, native_output }), ffn, arena)?;
         owner.native_scratch = match (&owner.immutable.native, native_scratch) {
             (None, _) => None,
             (Some(_), Some(shared)) => Some(shared),
@@ -659,7 +659,7 @@ impl<'a> SwaLayer<'a> {
             } else {
                 output.launch(rows, gated, CuteafdDeviceBuffer { bytes: rows * H * 2, ..delta }, scratch, stream.raw)?;
             }
-        } else if let Some(output) = &self.immutable.hqa_output {
+        } else if let Some(output) = &self.immutable.native_output {
             let q = self.immutable.heads * 192;
             let delta = CuteafdDeviceBuffer { bytes: rows * H * output.output().bytes(), ..self.planes[DELTA].buffer };
             stream.device.run(|| {

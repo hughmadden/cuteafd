@@ -178,7 +178,7 @@ fn native_tp_rank_sum() -> Result<()> {
         .map(str::parse).collect::<std::result::Result<Vec<_>, _>>()?;
     ensure!(peers.len() == world, "rank-sum world disagrees with launched peers");
     let view = cuteafd_loader::plan::checkpoint::CheckpointView::select(&snapshot,
-        cuteafd_loader::plan::checkpoint::AttentionMode::Hqa)?;
+        cuteafd_loader::plan::checkpoint::CoreView::Original)?;
     let catalog = cuteafd_loader::read_expert_catalog_view(&view)?;
     let geometry = validate_source(&catalog, &family, &format)?;
     let (ingress, dtype) = checkpoint_ingress(&snapshot)?;

@@ -879,7 +879,7 @@ impl<'a> GlmfLoader<'a> {
                     self.allocation(rank, &format!("{}.payload", layout.stem), n*k*if layout.fp8 { 1 } else { 2 })?,
                     if layout.fp8 { Some(self.allocation(rank, &format!("{}.scales", layout.stem), n/128*(k/128)*4)?) } else { None }
                 )))?;
-                let records = attention_records(&self.checkpoint.snapshot, &selected, self.checkpoint.attention_mode(),
+                let records = attention_records(&self.checkpoint.snapshot, &selected, self.checkpoint.core_view(),
                     &layout, self.fp8_scales, values.buffer, scales.as_ref().map(|s| s.buffer))?;
                 for record in records {
                     match record {
@@ -1523,7 +1523,7 @@ mod tests {
     #[test]
     fn selected_attention_records_preserve_tp_slices_and_fp8_recipe() -> anyhow::Result<()> {
         use super::{attention_records, AttentionRecord};
-        use cuteafd_loader::{plan::checkpoint::{SelectedProjection, ProjectionStorage, AttentionMode,
+        use cuteafd_loader::{plan::checkpoint::{SelectedProjection, ProjectionStorage, CoreView,
             CheckpointTensor}, SafetensorsTensorMetadata, families::glm5_flash::core::{NativeLayout, CoreSplit}};
         use cuteafd_ffi::CuteafdDeviceBuffer;
         use cuteafd_core::DType;
@@ -1532,9 +1532,9 @@ mod tests {
         for split in [CoreSplit::Input, CoreSplit::Output] {
             for rank in 0..2 {
                 for dtype in [DType::Bf16, DType::F8E4M3] {
-                    for mode in [AttentionMode::Hqa, AttentionMode::Fp8Compact] {
+                    for mode in [CoreView::Original, CoreView::Fp8Compact] {
                         let stem = "model.language_model.layers.3.self_attn.o_proj";
-                        let fp8 = dtype == DType::F8E4M3 || mode == AttentionMode::Fp8Compact;
+                        let fp8 = dtype == DType::F8E4M3 || mode == CoreView::Fp8Compact;
                         let shape = if split == CoreSplit::Input { [256, 512] } else { [512, 256] };
                         let tensor = |name: String, dtype: DType, shape: Vec<usize>, width| CheckpointTensor {
                             shard: "selected.safetensors".into(), meta: SafetensorsTensorMetadata {
@@ -1549,7 +1549,7 @@ mod tests {
                         let layout = NativeLayout { stem: stem.into(), shape: [256,256], fp8, rank, ranks: 2, split };
                         let records = attention_records(std::path::Path::new("/selected"), &selected, mode, &layout,
                             Fp8Scales::Pow2, buffer(256*256*2), fp8.then(|| buffer(256)));
-                        if dtype == DType::F8E4M3 && mode == AttentionMode::Fp8Compact {
+                        if dtype == DType::F8E4M3 && mode == CoreView::Fp8Compact {
                             let error = records.err().expect("already-FP8 conversion must refuse");
                             assert!(error.downcast_ref::<cuteafd_loader::formats::native_attention::UnsupportedFp8Conversion>().is_some());
                             continue;

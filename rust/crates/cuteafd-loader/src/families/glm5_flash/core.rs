@@ -81,7 +81,7 @@ impl CoreInventory {
             .is_some_and(|(layer, leaf)| layer.parse::<usize>().is_ok_and(|layer| layer < cfg.layers)
                 && !leaf.contains(".experts."));
         let projections = read_projections(checkpoint, &expected(cfg), selected,
-            |stem| split(cfg, stem).map(|split| CoreContract { family: "GLM Flash", widths: &[6], split, padded_outputs: false }))?;
+            |stem| split(cfg, stem).map(|split| CoreContract { family: "GLM Flash", widths: &[4, 6, 8], split, padded_outputs: false }))?;
         let mut inventory = Self { projections, native: BTreeMap::new() };
         // A selected view can replace individual attention operands. Legacy
         // checkpoints retain their existing fused conversion policy.
@@ -101,7 +101,7 @@ impl CoreInventory {
                 ensure!(matches!(dtype, cuteafd_core::DType::Bf16 | cuteafd_core::DType::F8E4M3),
                     "{stem}: native attention requires BF16 or E4M3, found {dtype:?}");
                 let fp8 = dtype == cuteafd_core::DType::F8E4M3
-                    || checkpoint.attention_mode() == crate::plan::checkpoint::AttentionMode::Fp8Compact;
+                    || checkpoint.core_view() == crate::plan::checkpoint::CoreView::Fp8Compact;
                 if dtype == cuteafd_core::DType::F8E4M3 {
                     let scale = selected.tensors.iter().find(|t| t.meta.name == format!("{name}_scale_inv"))
                         .with_context(|| format!("{stem}: missing native block scales"))?;
@@ -113,6 +113,9 @@ impl CoreInventory {
                     split: split(cfg, stem).context("Flash native attention split")? });
             }
         }
+        ensure!(checkpoint.core_view() != crate::plan::checkpoint::CoreView::Fp8Compact
+            || !inventory.native.is_empty(),
+            "CORE_VIEW=fp8-compact has no supported conversion scope for this all-native core; use original until the native projection path supports conversion");
         for layer in 0..cfg.layers {
             let root = format!("{PREFIX}{layer}");
             let attention = attention_leaves(cfg.attention[layer]);
@@ -208,7 +211,7 @@ mod tests {
 
     #[test]
     fn selected_mixed_attention_drops_fused_scratch_and_keeps_owner_specific_fp8_receipts() -> Result<()> {
-        use crate::plan::checkpoint::{AttentionMode, CheckpointView};
+        use crate::plan::checkpoint::{CoreView, CheckpointView};
         use super::super::core_admission::{CoreCharges, fp8_projection_name};
         let (cfg, mut checkpoint) = fixture();
         let dir = tempfile::tempdir()?;
@@ -224,15 +227,15 @@ mod tests {
         }
         checkpoint.tensors.sort_by(|a, b| a.meta.name.cmp(&b.meta.name));
         checkpoint.weight_map = checkpoint.tensors.iter().map(|t| (t.meta.name.clone(), t.shard.clone())).collect();
-        for mode in [AttentionMode::Hqa, AttentionMode::Fp8Compact] {
+        for mode in [CoreView::Original, CoreView::Fp8Compact] {
             checkpoint.view = Some(CheckpointView::select(dir.path(), mode)?);
             let core = CoreInventory::from_checkpoint(&cfg, &checkpoint)?;
             assert_eq!(core.projections.len(), 314);
             assert_eq!(core.native.len(), 2);
-            assert_eq!(core.native.values().all(|p| p.fp8), mode == AttentionMode::Fp8Compact);
+            assert_eq!(core.native.values().all(|p| p.fp8), mode == CoreView::Fp8Compact);
             assert!(core.scratch_mask(&cfg, cfg.layers).mla);
             let mut manifest = executable_package(&cfg, &core)?;
-            if mode == AttentionMode::Fp8Compact {
+            if mode == CoreView::Fp8Compact {
                 for layout in core.layer_native(&cfg, 3, 2, Some(0))?[0].values() {
                     for cap in [64, 4096] {
                         manifest["programs"].as_array_mut().unwrap().push(serde_json::json!({
@@ -241,7 +244,7 @@ mod tests {
                     }
                 }
             }
-            if mode == AttentionMode::Hqa {
+            if mode == CoreView::Original {
                 assert!(CoreCharges::from_package(&cfg, &core, cfg.layers, 2,
                     Some(&vec![0; cfg.layers]), 4096, 3, 64, None, false, &manifest).is_err(),
                     "BF16 requires row-invariant exports before weight allocation");
@@ -258,9 +261,9 @@ mod tests {
             let charges = CoreCharges::from_package(&cfg, &core, cfg.layers, 2,
                 Some(&vec![0; cfg.layers]), 4096, 3, 64, None, false, &manifest)?;
             assert_eq!(charges.programs.iter().filter(|n| n.starts_with("draft_bf16_")).count(),
-                if mode == AttentionMode::Hqa { 2 } else { 0 });
+                if mode == CoreView::Original { 2 } else { 0 });
             for rank in 0..2 {
-                let expected = if rank == 0 && mode == AttentionMode::Fp8Compact { 16384 } else { 4096 };
+                let expected = if rank == 0 && mode == CoreView::Fp8Compact { 16384 } else { 4096 };
                 for stage in charges.ranks[rank].stages.as_ref().unwrap() {
                     assert_eq!(stage.extents["scratch"], expected);
                 }
@@ -726,7 +729,7 @@ mod tests {
     #[test]
     fn mixed_native_attention_uses_staged_scratch_with_shipped_defaults() -> Result<()> {
         use crate::serving_capacity::{glmf_core_step_scratch, GlmfScratchOptions};
-        use crate::plan::checkpoint::{AttentionMode, CheckpointView};
+        use crate::plan::checkpoint::{CoreView, CheckpointView};
         let (cfg, checkpoint) = fixture();
         let compact = CoreInventory::from_checkpoint(&cfg, &checkpoint)?;
         let compact_mask = compact.scratch_mask(&cfg, cfg.layers);
@@ -741,7 +744,7 @@ mod tests {
                 || stem.starts_with("o_") || stem.starts_with("ffn_i") { None }
             else { Some(if stem.starts_with("index_topk_") { 17 } else { 23 }) }
         };
-        for mode in [AttentionMode::Hqa, AttentionMode::Fp8Compact] {
+        for mode in [CoreView::Original, CoreView::Fp8Compact] {
             let (_, mut checkpoint) = fixture();
             for (layer, leaf) in [(0, "o_proj"), (3, "q_b_proj"), (3, "o_proj")] {
                 let stem = format!("{PREFIX}{layer}.self_attn.{leaf}");
@@ -759,7 +762,7 @@ mod tests {
             let mask = core.scratch_mask(&cfg, cfg.layers);
             assert_eq!(mask, compact_mask);
             assert_eq!(core.native.len(), 3);
-            assert!(core.native.values().all(|p| p.fp8 == (mode == AttentionMode::Fp8Compact)));
+            assert!(core.native.values().all(|p| p.fp8 == (mode == CoreView::Fp8Compact)));
             for (rows, decode) in [(64, true), (4096, false)] {
                 let scratch = glmf_core_step_scratch(lookup, &cfg, options, rows, decode, mask)?;
                 assert_eq!((scratch.programs, scratch.topk), (23, 17));

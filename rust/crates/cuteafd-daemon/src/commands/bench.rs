@@ -322,7 +322,7 @@ fn serve_context(matches: &ArgMatches, memory: Option<crate::cli::MemoryArgs>)
         .or_else(|| std::env::var("CUTEAFD_ATTENTION_PLACEMENT").ok())
         .unwrap_or_else(|| "auto".into());
     // Reject an unrunnable placement before loading CUDA or starting workers.
-    let mode = attention_mode(family, sub, &requested)?;
+    let mode = core_view(family, sub, &requested)?;
     let executor = placement_executor(family)?;
     settings.retain(|setting| setting.name != "attention-placement");
     settings.push(Setting { name: "attention-placement".into(), value: Some(mode.to_string()),
@@ -340,7 +340,7 @@ fn serve_context(matches: &ArgMatches, memory: Option<crate::cli::MemoryArgs>)
 
 /// The attention placement `requested` resolves to for a serve command: two coordinator GPUs
 /// are generic serve's `--rtx-gpus 2` or a family's `--split-device`.
-fn attention_mode(family: &str, sub: &ArgMatches, requested: &str)
+fn core_view(family: &str, sub: &ArgMatches, requested: &str)
     -> Result<cuteafd_loader::placement::AttentionPlacement> {
     let requested = cuteafd_loader::placement::attention::parse(requested).map_err(anyhow::Error::msg)?;
     let executor = placement_executor(family)?;
@@ -454,7 +454,7 @@ mod tests {
         let matches = crate::cli::Cli::command().try_get_matches_from([
             "cuteafd", "serve-glm", "--snapshot", "/s", "--native-lib", "/l",
         ]).unwrap();
-        let error = attention_mode("unregistered", matches.subcommand().unwrap().1, "auto").unwrap_err();
+        let error = core_view("unregistered", matches.subcommand().unwrap().1, "auto").unwrap_err();
         assert!(error.downcast_ref::<MissingPlacementExecutor>().is_some());
     }
 
@@ -469,7 +469,7 @@ mod tests {
             let placement = context.settings.iter().find(|s| s.name == "attention-placement").unwrap();
             assert_eq!(placement.value.as_deref(), Some(resolved));
             assert_eq!(placement.default.as_deref(), Some("layers"));
-            assert!(attention_mode("step5", matches.subcommand().unwrap().1, "context").is_err());
+            assert!(core_view("step5", matches.subcommand().unwrap().1, "context").is_err());
         }
     }
 
@@ -502,13 +502,13 @@ mod tests {
         };
         let split = serve(&["--split-device", "1"]);
         let (_, sub) = split.subcommand().unwrap();
-        assert_eq!(attention_mode("glm5", sub, "context").unwrap(), Context);
-        assert_eq!(attention_mode("glm5", sub, "auto").unwrap(), Context);
-        assert_eq!(attention_mode("glm5", sub, "heads").unwrap(), Heads);
+        assert_eq!(core_view("glm5", sub, "context").unwrap(), Context);
+        assert_eq!(core_view("glm5", sub, "auto").unwrap(), Context);
+        assert_eq!(core_view("glm5", sub, "heads").unwrap(), Heads);
         let one = serve(&[]);
         let (_, sub) = one.subcommand().unwrap();
-        assert!(attention_mode("glm5", sub, "context").is_err());
-        assert_eq!(attention_mode("glm5", sub, "auto").unwrap(), Heads);
+        assert!(core_view("glm5", sub, "context").is_err());
+        assert_eq!(core_view("glm5", sub, "auto").unwrap(), Heads);
     }
 
     #[test]

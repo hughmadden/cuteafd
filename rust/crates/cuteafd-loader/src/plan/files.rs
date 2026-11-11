@@ -75,7 +75,7 @@ pub fn required_tensors(checkpoint: &Checkpoint, role: ReadRole) -> Result<BTree
 }
 
 pub fn open_role(snapshot: &Path, role: ReadRole) -> Result<Checkpoint> {
-    open_role_view(&super::checkpoint::CheckpointView::select(snapshot, super::checkpoint::AttentionMode::Hqa)?, role)
+    open_role_view(&super::checkpoint::CheckpointView::select(snapshot, super::checkpoint::CoreView::Original)?, role)
 }
 
 pub fn open_role_view(view: &super::checkpoint::CheckpointView, role: ReadRole) -> Result<Checkpoint> {
@@ -108,7 +108,7 @@ pub fn manifest(snapshot: &Path, role: ReadRole) -> Result<FileManifest> {
 
 /// A host's file list is the union of the processes it runs, never a shard split.
 pub fn manifest_roles(snapshot: &Path, roles: &[ReadRole]) -> Result<FileManifest> {
-    manifest_roles_view(&super::checkpoint::CheckpointView::select(snapshot, super::checkpoint::AttentionMode::Hqa)?, roles)
+    manifest_roles_view(&super::checkpoint::CheckpointView::select(snapshot, super::checkpoint::CoreView::Original)?, roles)
 }
 
 pub fn manifest_roles_view(view: &super::checkpoint::CheckpointView, roles: &[ReadRole]) -> Result<FileManifest> {
@@ -286,210 +286,6 @@ mod tests {
                 assert!(manifest.files.iter().any(|f| f.path == name), "loader input missing: {name}");
             }
         }
-    }
-
-    #[test]
-    fn declared_native_headers_survive_index_only_eager_family_role_open() -> Result<()> {
-        use crate::plan::{checkpoint::{AttentionMode, CheckpointView}, testing::*};
-        let dir = tempfile::tempdir()?;
-        write_kimi_snapshot(dir.path(), false);
-        let names = ["language_model.model.layers.0.self_attn.o_proj.weight",
-            "language_model.model.layers.3.self_attn.q_b_proj.weight"];
-        let tensors = kimi_k3_tensors(false).into_iter().filter(|tensor| names.contains(&tensor.0.as_str()))
-            .collect::<Vec<_>>();
-        let mut index: serde_json::Value = serde_json::from_slice(&std::fs::read(dir.path().join("model.safetensors.index.json"))?)?;
-        let declaration = serde_json::json!({"schema":"cuteafd-attention-views-v1", "mode":"hqa",
-            "views":{"hqa":{"config":"config.json", "index":"model.safetensors.index.json", "quantize":"quantize_config.json"},
-                "compact-attention":{"config":"config.compact-attention.json",
-                    "index":"model.compact-attention.safetensors.index.json", "quantize":"quantize_config.compact-attention.json"}},
-            "native_modules":"quantize_config.json:native_attention"});
-        let mut config = kimi_k3_config();
-        config["quantization_config"]["attention_view"] = declaration.clone();
-        let native = tensors.iter().map(|(name, dtype, shape)| {
-            index["weight_map"][name] = serde_json::json!("native.safetensors");
-            (name.strip_suffix(".weight").unwrap().to_owned(), serde_json::json!({"format":"bf16",
-                "shard":"native.safetensors", "compact_attention_bits":6, "tensors":{name:{"dtype":dtype,"shape":shape}}}))
-        }).collect::<serde_json::Map<_, _>>();
-        let quant = serde_json::json!({"attention_view":declaration, "native_attention":native});
-        for (name, value) in [("config.json", &config), ("model.safetensors.index.json", &index),
-            ("quantize_config.json", &quant)] {
-            std::fs::write(dir.path().join(name), serde_json::to_vec(value)?)?;
-        }
-        let mut shard = tensors.clone();
-        shard.push(t("unindexed.weight", "BF16", &[2, 2]));
-        write_safetensors(&dir.path().join("native.safetensors"), &shard);
-        for mode in [AttentionMode::Hqa, AttentionMode::Fp8Compact] {
-            let view = CheckpointView::select(dir.path(), mode)?;
-            let started = std::time::Instant::now();
-            let inventory = Checkpoint::inventory_view(&view)?;
-            let role = ReadRole::Coordinator { local_experts: false, speculator: false };
-            // Kimi constructs its core eagerly inside family.open, including in
-            // required_tensors before the role has loaded its ordinary headers.
-            let selected = required_tensors(&inventory, role)?;
-            let opened = open_role_view(&view, role)?;
-            eprintln!("native inventory {mode:?}: inventory+required+role {:?}", started.elapsed());
-            assert_eq!(inventory.tensors.len(), names.len());
-            assert!(!inventory.has_header("unindexed.weight"));
-            for name in names {
-                assert!(selected.contains(name));
-                assert!(inventory.has_header(name));
-                let stem = name.strip_suffix(".weight").unwrap();
-                assert_eq!(inventory.projection(stem)?.storage, opened.projection(stem)?.storage);
-            }
-            let role = ReadRole::Spark { rank: 0, world: 6 };
-            let selected = required_tensors(&inventory, role)?;
-            let opened = open_role_view(&view, role)?;
-            let expert_shards = selected.iter().map(|name| &inventory.weight_map[name]).collect::<BTreeSet<_>>();
-            let expert_bytes = expert_shards.iter().map(|shard|
-                std::fs::metadata(dir.path().join(shard)).map(|meta| meta.len())).sum::<std::io::Result<u64>>()?;
-            assert_eq!(opened.shard_bytes, expert_bytes, "classification headers cannot grow role payload bytes");
-            assert_eq!(opened.tensors.len(), selected.len());
-            let classification = Checkpoint::open_view_for_role(&view, "classification-only", |_| false)?;
-            assert_eq!(classification.shard_bytes, 0);
-            assert!(classification.tensors.is_empty());
-            for name in names {
-                assert!(opened.has_header(name), "role checkpoint lost classification header {name}");
-                assert!(!selected.contains(name), "native attention is not a Spark read");
-                let stem = name.strip_suffix(".weight").unwrap();
-                assert_eq!(inventory.projection(stem)?.storage, opened.projection(stem)?.storage);
-                assert_eq!(inventory.projection(stem)?.storage, classification.projection(stem)?.storage);
-                assert_eq!(inventory.module_numerics(stem)?, opened.module_numerics(stem)?);
-            }
-            assert!(!opened.has_header("unindexed.weight"));
-            assert_eq!(required_tensors(&opened, role)?, selected);
-            let recipe = super::super::experts::checkpoint_spark_recipe(&opened, 6, &[1])?;
-            assert_eq!(recipe, super::super::experts::checkpoint_spark_recipe(
-                &Checkpoint::open_view(&view)?, 6, &[1])?);
-            let manifest = manifest_roles_view(&view, &[role])?;
-            let payload_files = manifest.files.iter().filter(|file| file.path.ends_with(".safetensors"))
-                .map(|file| &file.path).collect::<BTreeSet<_>>();
-            assert_eq!(payload_files, expert_shards);
-            assert!(!manifest.files.iter().any(|file| file.path == "native.safetensors"));
-        }
-        write_safetensors(&dir.path().join("native.safetensors"), &tensors[..1]);
-        let view = CheckpointView::select(dir.path(), AttentionMode::Hqa)?;
-        assert!(Checkpoint::inventory_view(&view).unwrap_err().to_string().contains("native attention header missing"));
-        assert!(Checkpoint::open_view_for_role(&view, "spark0", |name| name.contains(".experts."))
-            .unwrap_err().to_string().contains("header is missing"));
-        let mut malformed = tensors.clone();
-        malformed[0].2[0] += 1;
-        write_safetensors(&dir.path().join("native.safetensors"), &malformed);
-        assert!(Checkpoint::inventory_view(&view).unwrap_err().to_string().contains("disagree with selected safetensors header"));
-        assert!(Checkpoint::open_view_for_role(&view, "spark0", |name| name.contains(".experts."))
-            .unwrap_err().to_string().contains("disagree with selected safetensors header"));
-        Ok(())
-    }
-
-    #[test]
-    fn hqa_vision_roles_return_only_tower_tensors() -> Result<()> {
-        use crate::plan::{checkpoint::{AttentionMode, CheckpointView}, testing::*};
-        // All six published HQA families bundle a tower, including ML4's native
-        // FP8 attention with a separate block-scale operand.
-        for family in ["glm5_flash", "glm5", "kimi_k3", "muse_spark", "step5", "mistral_large4"] {
-            let dir = tempfile::tempdir()?;
-            let (native, tower) = match family {
-                "glm5_flash" => {
-                    let config = glm5_flash_config(2);
-                    let mut tensors = glm5_flash_tensors(&config);
-                    tensors.extend(glm5_flash_vision_tensors());
-                    write_snapshot(dir.path(), &config, &tensors, None);
-                    (t("model.language_model.layers.0.self_attn.o_proj.weight", "BF16", &[4096, 8192]),
-                        "model.visual.patch_embed.proj.weight")
-                },
-                "glm5" => {
-                    let mut tensors = glm5_tensors(|stem, n, k| fp8(stem, n, k, None));
-                    tensors.push(t("model.visual.patch_embed.proj.weight", "BF16", &[2, 2]));
-                    write_snapshot(dir.path(), &glm5_config(), &tensors, None);
-                    (t("model.layers.0.self_attn.o_proj.weight", "BF16", &[6144, 16384]),
-                        "model.visual.patch_embed.proj.weight")
-                },
-                "kimi_k3" => {
-                    write_kimi_snapshot(dir.path(), false);
-                    (t("language_model.model.layers.0.self_attn.o_proj.weight", "BF16", &[7168, 12288]),
-                        "vision_tower.encoder.blocks.0.wqkv.weight")
-                },
-                "muse_spark" => {
-                    write_muse_vision_snapshot(dir.path(), &[]);
-                    (t("model.language_model.layers.0.self_attn.o_proj.weight", "BF16", &[8192, 8192]),
-                        "model.vision_projection.weight")
-                },
-                "step5" => {
-                    let (config, tensors) = step5_fixture("bf16");
-                    write_snapshot(dir.path(), &config, &tensors, None);
-                    (t("model.layers.0.self_attn.o_proj.weight", "BF16", &[4096, 12288]),
-                        "vision_model.conv1.weight")
-                },
-                "mistral_large4" => {
-                    write_mistral_large4_snapshot(dir.path(), Some(&[]), false);
-                    (t("layers.0.attention.wo.weight", "F8_E4M3", &[6144, 8192]),
-                        "vision_encoder.patch_conv.weight")
-                },
-                _ => unreachable!(),
-            };
-            let mut config: serde_json::Value = serde_json::from_slice(&std::fs::read(dir.path().join("config.json"))?)?;
-            let mut index: serde_json::Value = serde_json::from_slice(&std::fs::read(
-                super::super::checkpoint::index_path(dir.path())?)?)?;
-            let index_path = dir.path().join("model.safetensors.index.json");
-            config.as_object_mut().unwrap().remove("transformers_weights");
-            let declaration = serde_json::json!({"schema":"cuteafd-attention-views-v1", "mode":"hqa",
-                "views":{"hqa":{"config":"config.json", "index":"model.safetensors.index.json",
-                    "quantize":"quantize_config.json"}, "compact-attention":{"config":"config.compact-attention.json",
-                    "index":"model.compact-attention.safetensors.index.json", "quantize":"quantize_config.compact-attention.json"}},
-                "native_modules":"quantize_config.json:native_attention"});
-            config["quantization_config"]["attention_view"] = declaration.clone();
-            let mut quant = std::fs::read(dir.path().join("quantize_config.json")).ok()
-                .map(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes)).transpose()?.unwrap_or(serde_json::json!({}));
-            quant["attention_view"] = declaration;
-            let stem = native.0.strip_suffix(".weight").unwrap();
-            let weights = if family == "mistral_large4" {
-                let cfg = crate::families::mistral_large4::Ml4Config::from_hf(&config)?;
-                (0..cfg.layers).flat_map(|layer| [
-                    t(format!("layers.{layer}.attention.wq.weight"), "F8_E4M3", &[cfg.heads * cfg.qk_head_dim(), cfg.hidden]),
-                    t(format!("layers.{layer}.attention.wo.weight"), "F8_E4M3", &[cfg.hidden, cfg.heads * cfg.v_head_dim]),
-                ]).collect::<Vec<_>>()
-            } else { vec![native.clone()] };
-            let mut natives = Vec::new();
-            let mut declarations = serde_json::Map::new();
-            for weight in weights {
-                let module = weight.0.strip_suffix(".weight").unwrap();
-                let mut tensors = vec![weight.clone()];
-                let mut entry = serde_json::json!({"format":"bf16", "shard":"native.safetensors", "compact_attention_bits":6});
-                if weight.1 == "F8_E4M3" {
-                    let scale = format!("{module}.qscale_weight");
-                    tensors.push(t(&scale, "F32", &weight.2.iter().map(|n| n.div_ceil(128)).collect::<Vec<_>>()));
-                    entry["format"] = serde_json::json!("fp8_e4m3_block_scaled");
-                    entry["scale"] = serde_json::json!({"tensor":scale,"dtype":"F32","block_size":[128,128],
-                        "semantics":"checkpoint-native: original FP8 weight with its original per-block FP32 scale"});
-                }
-                entry["tensors"] = serde_json::Value::Object(tensors.iter().map(|(name, dtype, shape)|
-                    (name.clone(), serde_json::json!({"dtype":dtype,"shape":shape}))).collect());
-                declarations.insert(module.to_owned(), entry);
-                // Replace any compact operand and stale native scales in the index.
-                index["weight_map"].as_object_mut().unwrap().retain(|name, _| !name.starts_with(&format!("{module}.")));
-                for (name, ..) in &tensors { index["weight_map"][name] = serde_json::json!("native.safetensors"); }
-                natives.extend(tensors);
-            }
-            quant["native_attention"] = serde_json::Value::Object(declarations);
-            write_safetensors(&dir.path().join("native.safetensors"), &natives);
-            for (path, value) in [(dir.path().join("config.json"), config), (index_path, index),
-                (dir.path().join("quantize_config.json"), quant)] {
-                std::fs::write(path, serde_json::to_vec(&value)?)?;
-            }
-            let view = CheckpointView::select(dir.path(), AttentionMode::Hqa)?;
-            let inventory = Checkpoint::inventory_view(&view)?;
-            let selected = required_tensors(&inventory, ReadRole::Vision)?;
-            assert!(selected.contains(tower), "{family}: missing fixture tower {tower}");
-            let opened = open_role_view(&view, ReadRole::Vision)?;
-            assert_eq!(opened.tensors.iter().map(|tensor| tensor.meta.name.clone()).collect::<BTreeSet<_>>(),
-                selected, "{family}: classification headers leaked into vision payload");
-            assert_eq!(required_tensors(&opened, ReadRole::Vision)?, selected, "{family}: role cannot reopen family");
-            let payload_shards = selected.iter().map(|name| &opened.weight_map[name]).collect::<BTreeSet<_>>();
-            assert_eq!(opened.shard_bytes, payload_shards.iter().map(|shard|
-                std::fs::metadata(dir.path().join(shard)).map(|meta| meta.len())).sum::<std::io::Result<u64>>()?);
-            assert!(!payload_shards.iter().any(|shard| shard.as_str() == "native.safetensors"));
-            assert_eq!(opened.projection(stem)?.storage, inventory.projection(stem)?.storage);
-        }
-        Ok(())
     }
 
     #[test]

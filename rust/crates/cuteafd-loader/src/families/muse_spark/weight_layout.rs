@@ -159,7 +159,7 @@ impl GlobalLayout {
 }
 
 /// A K6 projection program's package geometry: (K, N stored, side 1/2, codebook).
-pub type ProjectionKey = (usize, usize, usize, &'static str);
+pub type ProjectionKey = (usize, usize, usize, &'static str, usize);
 
 /// Output dtype a K6 geometry runs with: BF16 rows, or F32 (the head, and the
 /// TP2 side-2 o_proj partial whose F32 core result is reduced across GPUs).
@@ -169,7 +169,7 @@ pub enum ProjectionOutput { Bf16, F32 }
 pub fn projection_key(layout: &CoreWeightLayout) -> ProjectionKey {
     (layout.shape[1], layout.shape[0], match layout.side { TrellisSide::Output => 1, TrellisSide::Input => 2 },
         match layout.codebook { crate::formats::exl3_storage::Exl3Codebook::Mcg => "mcg",
-            crate::formats::exl3_storage::Exl3Codebook::Mul1 => "mul1" })
+            crate::formats::exl3_storage::Exl3Codebook::Mul1 => "mul1" }, layout.bits)
 }
 
 /// One concrete native owner, including the caller's reduction output contract.
@@ -268,7 +268,7 @@ pub fn projections_with_manifest(cfg: &MuseSparkConfig, core: &CoreInventory, ra
         }).collect::<Vec<_>>();
         rank.native_programs = NativePrograms::resolve(&requests, rows, manifest)?;
         let mut merged: Option<crate::formats::trellis_core::ProjectionScratchLayout> = None;
-        for (&((k, n, _, _), _), &program_rows) in &rank.programs {
+        for (&((k, n, _, _, _), _), &program_rows) in &rank.programs {
             let mut layout = crate::formats::trellis_core::ProjectionScratchLayout::new(k, n, program_rows)?;
             // One scratch set serves the body's full row capacity.
             layout.rows = rows;
@@ -507,17 +507,17 @@ mod tests {
         let whole = projections(&cfg, &core, 1, 2752).unwrap();
         let keys = |rank: &RankProjections| rank.programs.keys().copied().collect::<Vec<_>>();
         use ProjectionOutput::*;
-        assert_eq!(keys(&whole[0]), [((4096, 8192, 1, "mcg"), Bf16), ((8192, 1024, 1, "mcg"), Bf16),
-            ((8192, 4096, 1, "mcg"), Bf16), ((8192, 8192, 1, "mcg"), Bf16), ((8192, 202112, 1, "mcg"), F32)]);
+        assert_eq!(keys(&whole[0]), [((4096, 8192, 1, "mcg", 6), Bf16), ((8192, 1024, 1, "mcg", 6), Bf16),
+            ((8192, 4096, 1, "mcg", 6), Bf16), ((8192, 8192, 1, "mcg", 6), Bf16), ((8192, 202112, 1, "mcg", 6), F32)]);
         let pair = projections(&cfg, &core, 2, 2752).unwrap();
         // q/k/v halve as output units; o_proj halves its input and returns an F32 partial.
-        assert!(pair[0].programs.contains_key(&((4096, 8192, 2, "mcg"), F32)));
-        assert!(pair[0].programs.contains_key(&((8192, 512, 1, "mcg"), Bf16)));
+        assert!(pair[0].programs.contains_key(&((4096, 8192, 2, "mcg", 6), F32)));
+        assert!(pair[0].programs.contains_key(&((8192, 512, 1, "mcg", 6), Bf16)));
         // The MoE split: pre_expert halves its output, post_expert its input (an F32 K-split core).
-        assert!(pair[0].programs.contains_key(&((8192, 2048, 1, "mcg"), Bf16)));
-        assert!(pair[0].programs.contains_key(&((2048, 8192, 2, "mcg"), F32)));
+        assert!(pair[0].programs.contains_key(&((8192, 2048, 1, "mcg", 6), Bf16)));
+        assert!(pair[0].programs.contains_key(&((2048, 8192, 2, "mcg", 6), F32)));
         assert!(!pair[0].programs.keys().any(|(key, _)| key.1 == 202112), "head on the last rank only");
-        assert!(pair[1].programs.contains_key(&((8192, 202112, 1, "mcg"), F32)));
+        assert!(pair[1].programs.contains_key(&((8192, 202112, 1, "mcg", 6), F32)));
         let scratch = pair[1].scratch.as_ref().unwrap();
         assert_eq!(scratch.rows, 2752);
         // The head's accumulator dominates at 64 rows; the body's rotated input at 2752.

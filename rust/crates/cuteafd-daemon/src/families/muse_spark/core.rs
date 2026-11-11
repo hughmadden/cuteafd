@@ -138,8 +138,8 @@ impl<'a> CorePrograms<'a> {
         let mut projections = BTreeMap::new();
         let mut required: Option<ProjectionLayout> = None;
         for (&(key, output), &rows) in &admitted.programs {
-            let (k, n, side, book) = key;
-            let projection = device.run(|| Projection::load_geometry(programs, k, n, side, book, rows, dtype(output)))
+            let (k, n, side, book, bits) = key;
+            let projection = device.run(|| Projection::load_geometry_bits(programs, k, n, side, bits, book, rows, dtype(output)))
                 .with_context(|| format!("Muse K6 program ({k}, {n}, side {side}, {book}) at {rows} rows"))?;
             let mut layout = ProjectionLayout::new(&projection.program, rows)?;
             if let Some(scratch) = &admitted.scratch { layout.rows = scratch.rows; }
@@ -342,7 +342,7 @@ mod tests {
                 let reduced = lane.rows("o_reduced", rows)?;
                 let svh = Buffer { ptr: 0x10_0000_0000usize as *mut c_void, bytes: cfg.hidden * 2, ..base };
                 for (k, channel, plane) in [(4096, Channel::Attention, "attended"), (2048, Channel::Moe, "moe")] {
-                    let key = (k, cfg.hidden, 2, "mcg");
+                    let key = (k, cfg.hidden, 2, "mcg", 6);
                     let output_dtype = *programs.programs.keys().find(|(geometry, _)| *geometry == key).unwrap();
                     let names = validate_package_geometry(&manifest, k, cfg.hidden, 2, "mcg", 2752, dtype(output_dtype.1))?;
                     assert_eq!(names[0], format!("dense_trellis_k6_trellis_input_k{k}_bf16"));

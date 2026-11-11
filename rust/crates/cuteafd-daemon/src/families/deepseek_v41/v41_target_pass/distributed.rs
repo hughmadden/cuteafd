@@ -1354,7 +1354,7 @@ mod tests {
         // the Sparks, two prefill units) before any link. Endpoints admit the
         // decode owners' verify width (64 rows); the fixture's 16-row links fit.
         crate::families::deepseek_v41::v41_native_serve::admission::spark_admission(&cuteafd_loader::plan::checkpoint::CheckpointView::select(
-            std::path::Path::new(&snapshot), cuteafd_loader::plan::checkpoint::AttentionMode::Hqa)?,
+            std::path::Path::new(&snapshot), cuteafd_loader::plan::checkpoint::CoreView::Original)?,
             &catalog, 20, peers.len(), unit_rows.max(cuteafd_core::V41_VERIFY_ROWS as u32), 2)?.start(&peers)?.wait()?;
         let roce = SparkExperts::new_world(cuteafd_transport::expert::SparkWorld::canonical(peers.len())?, &peers, 16, crate::families::deepseek_v41::v41_native_serve::transport_config(crate::families::deepseek_v41::v41_native_serve::protocol_v2_timing()), 0)?;
         let mut transport =

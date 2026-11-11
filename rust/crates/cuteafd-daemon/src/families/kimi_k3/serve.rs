@@ -9,7 +9,7 @@ use cuteafd_loader::families::kimi_k3::COMPILED_CONTEXT;
 #[derive(Debug, Clone, clap::Args)]
 pub(crate) struct ServeArgs {
     #[command(flatten)]
-    pub(crate) attention: crate::cli::AttentionArgs,
+    pub(crate) attention: crate::cli::CoreViewArgs,
     /// Target and drafter share the exact selected MLA record.
     #[arg(long, default_value = "fp8")] pub kv_cache: cuteafd_core::MlaCacheFormat,
     #[arg(long)] pub snapshot: PathBuf,
@@ -158,16 +158,16 @@ pub(crate) async fn run(mut args: ServeArgs) -> Result<()> {
             cuteafd_bench::context::set_family(cfg.family_id());
             let view = checkpoint.view.as_ref()
                 .context("Kimi serving requires the immutable selected checkpoint view")?;
-            use cuteafd_loader::plan::checkpoint::{view::FP8_RECIPE, AttentionMode};
+            use cuteafd_loader::plan::checkpoint::{view::FP8_RECIPE, CoreView};
             let mode = match view.mode() {
-                AttentionMode::Hqa => "hqa", AttentionMode::Compact => "compact",
-                AttentionMode::Fp8Compact => "fp8-compact",
+                CoreView::Original => "original", CoreView::K6Compact => "k6-compact", CoreView::K8Compact => "k8-compact",
+                CoreView::Fp8Compact => "fp8-compact",
             };
-            let recipe = if view.mode() == AttentionMode::Fp8Compact { FP8_RECIPE } else { "none" };
+            let recipe = if view.mode() == CoreView::Fp8Compact { FP8_RECIPE } else { "none" };
             cuteafd_bench::context::set_resolved("attention-mode", mode);
             cuteafd_bench::context::set_resolved("attention-bundle-fingerprint", view.fingerprint());
             cuteafd_bench::context::set_resolved("attention-fp8-recipe", recipe);
-            tracing::info!(attention_mode = mode, bundle = view.fingerprint(), fp8_recipe = recipe,
+            tracing::info!(core_view = mode, bundle = view.fingerprint(), fp8_recipe = recipe,
                 "selected immutable attention bundle");
             let concurrency = usize::from(worker_args.max_sequences);
             let slots = cuteafd_core::concurrency::state_slots(concurrency as u64) as usize;
@@ -263,12 +263,13 @@ mod tests {
     }
 
     #[test]
-    fn attention_bundle_flags_use_shared_modes_and_conflict() -> Result<()> {
-        use cuteafd_loader::plan::checkpoint::AttentionMode;
-        assert_eq!(args(&[])?.attention.mode(), AttentionMode::Hqa);
-        assert_eq!(args(&["--compact-attention"])?.attention.mode(), AttentionMode::Compact);
-        assert_eq!(args(&["--fp8-compact-attention"])?.attention.mode(), AttentionMode::Fp8Compact);
-        assert!(args(&["--compact-attention", "--fp8-compact-attention"]).is_err());
+    fn core_view_flags_are_explicit_and_reject_removed_flags() -> Result<()> {
+        use cuteafd_loader::plan::checkpoint::CoreView;
+        assert_eq!(args(&[])?.attention.mode(), CoreView::Original);
+        assert_eq!(args(&["--core-view", "k6-compact"])?.attention.mode(), CoreView::K6Compact);
+        assert_eq!(args(&["--core-view", "k8-compact"])?.attention.mode(), CoreView::K8Compact);
+        assert_eq!(args(&["--core-view", "fp8-compact"])?.attention.mode(), CoreView::Fp8Compact);
+        for flag in ["--compact-attention", "--fp8-compact-attention"] { assert!(args(&[flag]).is_err()); }
         Ok(())
     }
 

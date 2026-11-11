@@ -1235,27 +1235,16 @@ echo "  context/output: $MAX_CONTEXT_TOKENS/$MAX_OUTPUT_TOKENS; dSpark: $SPECULA
 }
 
 # The family: run.sh passes --family; a direct call reads the checkpoint's own config.json.
-attention_mode="$(get ATTENTION_MODE hqa)"
-case "$attention_mode" in
-  hqa|compact|fp8-compact) ;;
-  *) release_die "ATTENTION_MODE must be hqa, compact or fp8-compact" ;;
+core_view="$(get CORE_VIEW original)"
+case "$core_view" in
+  original|fp8-compact) selected_config=config.json ;;
+  k8-compact) selected_config=config.k8.json ;;
+  k6-compact) selected_config=config.k6.json ;;
+  *) release_die "CORE_VIEW must be original, k8-compact, k6-compact or fp8-compact" ;;
 esac
-selected_config=config.json
-[[ "$attention_mode" != compact ]] || selected_config=config.compact-attention.json
-detected_family="$(release_config_family "$config" "$attention_mode")"
+detected_family="$(release_config_family "$config" "$core_view")"
 [[ -n "$family" ]] || family="$detected_family"
-attention_mode="$(get ATTENTION_MODE hqa)"
-attention_mode_args=()
-case "$attention_mode" in
-  hqa) ;;
-  compact|fp8-compact)
-    python3 "$repo_root/scripts/lib/checkpoint-family.py" --attention-variant "$detected_family" ||
-      release_die "unsupported ATTENTION_MODE=$attention_mode for checkpoint variant $detected_family"
-    if [[ "$attention_mode" == compact ]]; then attention_mode_args=(--compact-attention)
-    else attention_mode_args=(--fp8-compact-attention); fi
-    ;;
-  *) release_die "ATTENTION_MODE must be hqa, compact or fp8-compact" ;;
-esac
+core_view_args=(--core-view "$core_view")
 
 [[ "$family" == deepseek_v41 || "$family" == deepseek_v4 || "$(get TP2_DSPARK_EXPERTS off)" != on ]] ||
   release_die "TP2_DSPARK_EXPERTS requires V4/V4.1, two selected RTX GPUs and dSpark"
@@ -1471,7 +1460,7 @@ snapshot_of() {
   [[ -d "$dir/snapshots/$rev" ]] || { echo "missing snapshot $id@$rev" >&2; return 1; }
   readlink -f "$dir/snapshots/$rev"
 }
-spark_worker_args+=" ${attention_mode_args[*]}"
+spark_worker_args+=" ${core_view_args[*]}"
 exlr8_manifest="$(get EXLR8_MANIFEST)"
 exlr8_prefill_activations="$(get EXLR8_PREFILL_ACTIVATIONS)"
 if [[ -n "$exlr8_prefill_activations" ]]; then
@@ -1623,7 +1612,7 @@ decode_lanes="$(get DECODE_LANES)"
 if [[ -n "$decode_lanes" ]]; then
   [[ "$decode_lanes" =~ ^[12]$ ]] || release_die "DECODE_LANES must be 1 or 2"
 fi
-family_args=(--embedding-placement "$embedding" "${exlr8_plan_args[@]}" "${attention_mode_args[@]}")
+family_args=(--embedding-placement "$embedding" "${exlr8_plan_args[@]}" "${core_view_args[@]}")
 case "$(get EXPERT_USAGE on)" in
   on|off) ;;
   *) release_die "EXPERT_USAGE must be on or off" ;;
@@ -2550,7 +2539,7 @@ audio_encoder_hash=""
   done
   plan_json="$(docker run --rm --network none ${plan_profile_env[@]+"${plan_profile_env[@]}"} "${lane_env_args[@]}" -e "HF_HOME=$container_hf_home" "${generic_worker_mounts[@]}" "${chat_template_mounts[@]}" "${wip_mount_args[@]}" "${plan_config_mounts[@]}" \
     "$coordinator_image" cuteafd plan "$snapshot" --attention-placement "$attention_placement" --vision "$vision" --audio "$audio" --deployment "${readiness_args[@]}" \
-    "${deployment_args[@]}" "${count_args[@]}" "${exlr8_plan_args[@]}" "${attention_mode_args[@]}" "${plan_memory_args[@]}" \
+    "${deployment_args[@]}" "${count_args[@]}" "${exlr8_plan_args[@]}" "${core_view_args[@]}" "${plan_memory_args[@]}" \
     --rtx "$plan_rtx" --gpu-memory-cap "$plan_cap" --coordinator-weight-budget-gib "$(release_gib "$plan_cap")" --pool-tokens "$plan_pool" --vision-replicas "$vision_replicas" "${plan_draft_args[@]}")"
   release_validate_deployment "$plan_json" "$checkpoint_family"
   RELEASE_RECLAIM_ARGS=()

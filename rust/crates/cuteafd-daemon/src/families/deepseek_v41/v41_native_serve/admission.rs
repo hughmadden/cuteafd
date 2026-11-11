@@ -37,7 +37,7 @@ pub(super) fn plan_sparks(args: &crate::cli::NativeServeArgs,
     }
     let slots = super::AdmittedPrefill::resolve(args)?.waves;
     spark_admission(&cuteafd_loader::plan::checkpoint::CheckpointView::select(
-        &args.snapshot, cuteafd_loader::plan::checkpoint::AttentionMode::Hqa)?, catalog, local_layers, args.peers.len(), capacity, slots).map(Some)
+        &args.snapshot, cuteafd_loader::plan::checkpoint::CoreView::Original)?, catalog, local_layers, args.peers.len(), capacity, slots).map(Some)
 }
 
 /// The Spark admission for `ranks` workers serving layers `local_layers..`,

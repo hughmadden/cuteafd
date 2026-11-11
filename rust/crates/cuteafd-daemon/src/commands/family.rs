@@ -59,7 +59,7 @@ fn snapshot_arg(args: &[String]) -> Option<&str> {
 /// The family id of the checkpoint at `snapshot`.
 pub(crate) fn detect(snapshot: &Path) -> Result<&'static str> {
     detect_view(&cuteafd_loader::plan::checkpoint::CheckpointView::select(snapshot,
-        cuteafd_loader::plan::checkpoint::AttentionMode::Hqa)?)
+        cuteafd_loader::plan::checkpoint::CoreView::Original)?)
 }
 
 fn detect_view(view: &cuteafd_loader::plan::checkpoint::CheckpointView) -> Result<&'static str> {
@@ -79,15 +79,12 @@ pub(crate) struct ResolvedFamily {
 }
 
 pub(crate) fn resolve(kind: Kind, args: FamilyArgs) -> Result<Option<ResolvedFamily>> {
-    let attention = crate::cli::AttentionArgs {
-        compact_attention: args.args.iter().any(|arg| arg == "--compact-attention")
-            || std::env::var("CUTEAFD_COMPACT_ATTENTION").is_ok_and(|value| value == "true"),
-        fp8_compact_attention: args.args.iter().any(|arg| arg == "--fp8-compact-attention")
-            || std::env::var("CUTEAFD_FP8_COMPACT_ATTENTION").is_ok_and(|value| value == "true"),
-        ..Default::default()
-    };
-    anyhow::ensure!(!(attention.compact_attention && attention.fp8_compact_attention),
-        "--compact-attention conflicts with --fp8-compact-attention");
+    let mut core_view = std::env::var("CUTEAFD_CORE_VIEW").unwrap_or_else(|_| "original".into());
+    for (i, arg) in args.args.iter().enumerate() {
+        if arg == "--core-view" { core_view = args.args.get(i + 1).context("--core-view requires a value")?.clone(); }
+        else if let Some(value) = arg.strip_prefix("--core-view=") { core_view = value.into(); }
+    }
+    let attention = crate::cli::CoreViewArgs { core_view: core_view.parse()?, ..Default::default() };
     let wants_help = args.args.iter().any(|a| a == "--help" || a == "-h");
     // Detection and the eventual family command consume this same immutable bundle.
     let view = snapshot_arg(&args.args).filter(|_| args.family.is_none())

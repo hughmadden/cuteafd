@@ -70,7 +70,7 @@ impl CheckpointIdentity {
     /// Native formats require an explicit selection; an HF publication cannot
     /// silently accept a native manifest. This is called by both bootstrap peers.
     pub fn from_snapshot(snapshot: &Path, manifest: Option<&str>) -> Result<Self> {
-        Self::from_view(&super::CheckpointView::select(snapshot, super::AttentionMode::Hqa)?, manifest)
+        Self::from_view(&super::CheckpointView::select(snapshot, super::CoreView::Original)?, manifest)
     }
 
     pub fn from_view(view: &super::CheckpointView, manifest: Option<&str>) -> Result<Self> {

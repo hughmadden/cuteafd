@@ -722,7 +722,7 @@ struct ComponentCensus {
 
 impl PlanInput {
     pub fn open(snapshot: &Path) -> anyhow::Result<Self> {
-        Self::open_view(&checkpoint::CheckpointView::select(snapshot, checkpoint::AttentionMode::Hqa)?)
+        Self::open_view(&checkpoint::CheckpointView::select(snapshot, checkpoint::CoreView::Original)?)
     }
 
     pub fn open_view(view: &checkpoint::CheckpointView) -> anyhow::Result<Self> {

@@ -14,7 +14,7 @@ use cuteafd_core::DType;
 
 #[derive(Debug, Clone)]
 pub struct CoordinatorContract {
-    pub attention_mode: crate::plan::checkpoint::AttentionMode,
+    pub core_view: crate::plan::checkpoint::CoreView,
     pub weights: NativeDenseLayout,
     /// Header-native EXL3 dense projections (empty for FP8/NVFP4 releases).
     pub core: super::exl3::CoreInventory,
@@ -96,7 +96,7 @@ impl LayerContract {
 impl CoordinatorContract {
     /// FP8-compact load-only staging; final device values/scales are charged by rank layouts.
     pub fn attention_mount_load(&self, ranks: usize) -> Result<crate::shared::dense_read::MountLoad> {
-        if self.attention_mode != crate::plan::checkpoint::AttentionMode::Fp8Compact {
+        if self.core_view != crate::plan::checkpoint::CoreView::Fp8Compact {
             return Ok(Default::default());
         }
         crate::shared::dense_read::MountLoad::from_headers(self.weights.tensors.iter()
@@ -168,7 +168,7 @@ impl CoordinatorContract {
             !is_exl3_member(name) && tensor.role.component == Component::Speculator)
             .map(|(name, tensor)| (name.clone(), tensor.shape.clone(), tensor.dtype.clone())).collect();
         Ok(Self {
-            attention_mode: checkpoint.attention_mode(),
+            core_view: checkpoint.core_view(),
             weights,
             mtp_declarations,
             core: model.core.clone(),
@@ -327,7 +327,7 @@ impl RankWeightLayout {
         let mut layout = Self::from_native(&weights, 0, 1, None)?;
         for operand in &mut layout.operands { operand.slice = WeightSlice::Replicated; }
         layout.attach_core(&cfg, &contract.core, None, |layer| layer >= cfg.layers && layer < cfg.layers + depth)?;
-        layout.select_attention(contract.attention_mode)?;
+        layout.select_core_view(contract.core_view)?;
         Ok(layout)
     }
 
@@ -368,13 +368,13 @@ impl RankWeightLayout {
         if let Some(ownership) = ownership { ownership.validate_config(cfg)?; }
         let mut layout = Self::from_native(&contract.weights, rank, ranks, ownership)?;
         layout.attach_core(cfg, &contract.core, ownership, |layer| layer < cfg.layers)?;
-        layout.select_attention(contract.attention_mode)?;
+        layout.select_core_view(contract.core_view)?;
         Ok(layout)
     }
 
     /// FP8-compact replaces only selected native O matrices, never the EXL3 core.
-    fn select_attention(&mut self, mode: crate::plan::checkpoint::AttentionMode) -> Result<()> {
-        if mode != crate::plan::checkpoint::AttentionMode::Fp8Compact { return Ok(()); }
+    fn select_core_view(&mut self, mode: crate::plan::checkpoint::CoreView) -> Result<()> {
+        if mode != crate::plan::checkpoint::CoreView::Fp8Compact { return Ok(()); }
         for operand in &mut self.operands {
             if !operand.name.ends_with(".self_attn.o_proj.weight") { continue; }
             ensure!(operand.dtype == DType::Bf16 && operand.shape.len() == 2
@@ -1007,7 +1007,7 @@ mod tests {
         // FP8-compact attention: each converted O keeps values and scales as one
         // composite view, sized by its packed native layout.
         let mut compact = one.clone();
-        compact.select_attention(crate::plan::checkpoint::AttentionMode::Fp8Compact).unwrap();
+        compact.select_core_view(crate::plan::checkpoint::CoreView::Fp8Compact).unwrap();
         let arena = assert_arena(&compact);
         let converted = compact.operands.iter().filter(|o| o.dtype == DType::F8E4M3).collect::<Vec<_>>();
         assert!(!converted.is_empty() && converted.iter().all(|o| o.name.ends_with(".self_attn.o_proj.weight")));

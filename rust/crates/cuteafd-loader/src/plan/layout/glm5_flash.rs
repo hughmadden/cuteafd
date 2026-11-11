@@ -117,7 +117,7 @@ fn layout_with_native(report: &mut PlanReport, model: &dyn super::super::FamilyM
         let selected_manifest = manifest.map(|manifest| -> anyhow::Result<_> {
             let mut selected = manifest.clone();
             cuteafd_core::coordinator_programs::select_card_plans(&mut selected, sms)?;
-            cuteafd_core::coordinator_programs::select_attention_plans(&mut selected, attention_plan,
+            cuteafd_core::coordinator_programs::select_core_view_plans(&mut selected, attention_plan,
                 |name| (name.starts_with("glmf_") && (decode_rows > 64 || !name.ends_with("_m128")))
                     || (ranks == 2 && name.starts_with("glmf2_")))?;
             Ok(selected)
@@ -568,7 +568,7 @@ fn layout_with_native(report: &mut PlanReport, model: &dyn super::super::FamilyM
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cuteafd_core::coordinator_programs::{AttentionReductionPlan, select_attention_plans, select_card_plans};
+    use cuteafd_core::coordinator_programs::{AttentionReductionPlan, select_core_view_plans, select_card_plans};
     use crate::serving_capacity::{GlmfCoreScratch, GlmfScratchOptions, GlmfStepShape,
         glmf_core_step_scratch, glmf_manifest_scratch, glmf_step_workspaces, glmf_table_pages};
 
@@ -611,7 +611,7 @@ mod tests {
                 let plan = AttentionReductionPlan::new(64, drafts, None).unwrap();
                 let mut selected = raw.clone();
                 select_card_plans(&mut selected, sms).unwrap();
-                select_attention_plans(&mut selected, plan, |name| name.starts_with("glmf")).unwrap();
+                select_core_view_plans(&mut selected, plan, |name| name.starts_with("glmf")).unwrap();
                 let context = glmf::manifest_context_for_plan(&selected, cfg.heads, sms as usize, &plan).unwrap().unwrap();
                 assert_eq!(context.partial_scratch, expected_context);
                 let planned = glmf_step_workspace(&selected, &checkpoint, &ExpertPlacement::Local, 1,
@@ -622,7 +622,7 @@ mod tests {
                 let lookup = |name: &str| {
                     let entry = raw["programs"].as_array()?.iter().find(|p| p["name"] == name)?;
                     let mut scratch = serde_json::from_value(entry["scratch_bytes_at_capacity"].clone()).unwrap();
-                    cuteafd_core::coordinator_programs::select_attention_scratch(&entry["geometry"], &mut scratch, plan).unwrap();
+                    cuteafd_core::coordinator_programs::select_core_view_scratch(&entry["geometry"], &mut scratch, plan).unwrap();
                     scratch.get("scratch").copied()
                 };
                 let options = GlmfScratchOptions { split: true, index_compact: true, ..Default::default() };

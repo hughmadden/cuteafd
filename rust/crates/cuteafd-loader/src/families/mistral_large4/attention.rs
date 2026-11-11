@@ -1,4 +1,4 @@
-//! Native HQA restores Mistral's original E4M3 weights and F32 block scales.
+//! Mistral original E4M3 weights and F32 block scales.
 use crate::plan::Checkpoint;
 use cuteafd_core::DType;
 
@@ -6,18 +6,15 @@ use super::Ml4Config;
 
 #[derive(Debug, thiserror::Error)]
 pub enum AttentionError {
-    #[error("Mistral Large 4 HQA {tensor}: expected {expected}")]
+    #[error("Mistral Large 4 {tensor}: expected {expected}")]
     NativeTensor { tensor: String, expected: String },
     #[error("{0}")]
     UnsupportedFp8Conversion(#[from] crate::formats::native_attention::UnsupportedFp8Conversion),
 }
 
-/// Check the complete restored wq/wo inventory before runtime admission. The
-/// official FP8 source has no HQA declaration and remains inventory-readable.
+/// Check the complete native wq/wo inventory before runtime admission.
 pub fn validate(checkpoint: &Checkpoint, cfg: &Ml4Config) -> Result<(), AttentionError> {
-    if checkpoint.config["quantization_config"].get("attention_view").is_none() {
-        return Ok(());
-    }
+    if checkpoint.contains_tensor("layers.0.attention.wq.trellis") { return Ok(()); }
     for layer in 0..cfg.layers {
         for (projection, shape) in [
             ("wq", [cfg.heads * cfg.qk_head_dim(), cfg.hidden]),
@@ -47,7 +44,7 @@ pub fn validate(checkpoint: &Checkpoint, cfg: &Ml4Config) -> Result<(), Attentio
             }
         }
     }
-    if checkpoint.attention_mode() == crate::plan::checkpoint::AttentionMode::Fp8Compact {
+    if checkpoint.core_view() == crate::plan::checkpoint::CoreView::Fp8Compact {
         return Err(crate::formats::native_attention::UnsupportedFp8Conversion {
             tensor: "layers.0.attention.wq.weight".into(), found: "E4M3".into(),
         }.into());

@@ -178,7 +178,8 @@ def shapes_for(families):
     """Canonicalize equal geometries so runtime lookup is never ambiguous."""
     result, seen = [], set()
     for family in families:
-        for item in FAMILY_SHAPES[family]:
+        for item in (*FAMILY_SHAPES[family], *(tuple((*shape[:4], 8) for shape in FAMILY_SHAPES[family])
+                                                if family in ("glmf", "muse") else ())):
             if _key(item) not in seen:
                 result.append(item)
                 seen.add(_key(item))

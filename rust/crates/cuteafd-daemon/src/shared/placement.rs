@@ -28,7 +28,7 @@ pub(crate) struct SparkAdmission {
 
 impl SparkAdmission {
     #[cfg(test)]
-    pub(crate) fn plan_hqa_for_test(snapshot: &std::path::Path, geometry: ExpertGeometry,
+    pub(crate) fn plan_original_for_test(snapshot: &std::path::Path, geometry: ExpertGeometry,
         catalog: Option<&cuteafd_loader::OfficialV41Catalog>, working: &SparkWorkingSet,
         world: usize, model: ModelAdmission) -> Result<Self> {
         Self::plan_hqa_manifest_for_test(snapshot, geometry, catalog, working, world, model, None)
@@ -40,7 +40,7 @@ impl SparkAdmission {
         world: usize, model: ModelAdmission,
         manifest: Option<&str>) -> Result<Self> {
         Self::plan_view(&cuteafd_loader::plan::checkpoint::CheckpointView::select(snapshot,
-            cuteafd_loader::plan::checkpoint::AttentionMode::Hqa)?, geometry, catalog, working,
+            cuteafd_loader::plan::checkpoint::CoreView::Original)?, geometry, catalog, working,
             world, model, manifest)
     }
 
@@ -417,7 +417,7 @@ mod tests {
         // Identity only: idle admission must not try to infer a storage recipe.
         std::fs::write(root.path().join("config.json"), b"{}")?;
         std::fs::write(root.path().join("model.safetensors.index.json"), br#"{"weight_map":{}}"#)?;
-        SparkAdmission::plan_hqa_for_test(root.path(), ExpertGeometry::GLM5_FLASH, None,
+        SparkAdmission::plan_original_for_test(root.path(), ExpertGeometry::GLM5_FLASH, None,
             &SparkWorkingSet::default(), 2,
             ModelAdmission::new(vec![SparkEndpoint { ring_depth: None, capacity: 2048, ingress: SparkIngress::Fp8K32, partial_reply_bytes: None }],
                 SparkRings { max_frame_bytes: 64 << 20, depth: 8, slot_bytes: 8 << 20, alignment: 4096 },
@@ -426,29 +426,24 @@ mod tests {
     }
 
     #[test]
-    fn compact_admission_matches_compact_worker_and_rejects_hqa() -> Result<()> {
-        use cuteafd_loader::plan::checkpoint::{AttentionMode, CheckpointView};
+    fn compact_admission_matches_compact_worker_and_rejects_original() -> Result<()> {
+        use cuteafd_loader::plan::checkpoint::{CoreView, CheckpointView};
         let root = tempfile::tempdir()?;
-        for config in ["config.json", "config.compact-attention.json"] {
-            std::fs::write(root.path().join(config), b"{}")?;
-        }
-        for index in ["model.safetensors.index.json", "model.compact-attention.safetensors.index.json"] {
-            std::fs::write(root.path().join(index), br#"{"weight_map":{}}"#)?;
-        }
-        std::fs::write(root.path().join("quantize_config.compact-attention.json"), b"{}")?;
-        let compact = CheckpointView::select(root.path(), AttentionMode::Compact)?;
+        cuteafd_loader::plan::testing::write_mc_snapshot(root.path(), &serde_json::json!({}), &[],
+            &std::collections::BTreeMap::from([("lm_head.weight".into(), vec![128,128])]));
+        let compact = CheckpointView::select(root.path(), CoreView::K6Compact)?;
         let geometry = ExpertGeometry::GLM5_FLASH;
         let model = idle_plan()?.selection.model().context("fixture admission model")?.clone();
         // Idle workers still seal the selected bundle, without needing weight payloads.
         let coordinator = SparkAdmission::plan_view(&compact, geometry, None,
             &SparkWorkingSet::default(), 2, model, None)?;
         let world = crate::shared::spark_topology::world(2)?;
-        let worker_view = CheckpointView::select(root.path(), AttentionMode::Compact)?;
+        let worker_view = CheckpointView::select(root.path(), CoreView::K6Compact)?;
         let worker = WorkerIdentity::from_view(&worker_view, geometry, world, None)?;
         let received: WorkerSelection = serde_json::from_slice(&serde_json::to_vec(&coordinator.selection)?)?;
         received.validate_for(&worker)?;
         let hqa = WorkerIdentity::from_view(
-            &CheckpointView::select(root.path(), AttentionMode::Hqa)?, geometry, world, None)?;
+            &CheckpointView::select(root.path(), CoreView::Original)?, geometry, world, None)?;
         assert_ne!(worker, hqa);
         let error = received.validate_for(&hqa).unwrap_err().to_string();
         assert!(error.contains(&format!("coordinator={worker:?}")), "{error}");
@@ -457,7 +452,7 @@ mod tests {
     }
 
     #[test]
-    fn production_admission_has_no_implicit_hqa_path_api() {
+    fn production_admission_has_no_implicit_original_path_api() {
         // Removing the methods makes any new production use a compile error too.
         for source in [
             include_str!("../families/glm5/mod.rs"),
@@ -521,7 +516,7 @@ mod tests {
             let mut model = fixture_model();
             for endpoint in &mut model.endpoints { endpoint.ingress = SparkIngress::Bf16; }
             // No worker process is involved: coordinator admission must reject the selection itself.
-            let error = SparkAdmission::plan_hqa_for_test(root.path(), geometry, Some(&catalog), &working, 4, model)
+            let error = SparkAdmission::plan_original_for_test(root.path(), geometry, Some(&catalog), &working, 4, model)
                 .err().expect("compressed NVFP4-weight replies must fail coordinator admission");
             assert!(format!("{error:#}").contains("only BF16 replies"), "{error:#}");
             return Ok(());
@@ -621,7 +616,7 @@ mod tests {
         let geometry = catalog.routed_experts().geometry()?;
         let working = SparkWorkingSet { spark_layers: vec![1], spark_ranks: 6, prefill_lanes: 1,
             ..Default::default() };
-        let plan = SparkAdmission::plan_hqa_for_test(root.path(), geometry, Some(&catalog), &working, 6,
+        let plan = SparkAdmission::plan_original_for_test(root.path(), geometry, Some(&catalog), &working, 6,
             fixture_model())?;
         assert_eq!(plan.selection.layers(), [1]);
         assert_eq!(plan.assignments.iter().map(|rank| rank.slices[0].stored_width).collect::<Vec<_>>(),
@@ -717,7 +712,7 @@ mod tests {
         let catalog = cuteafd_loader::read_expert_catalog(root.path())?;
         let working = SparkWorkingSet { spark_layers: vec![0, 2], rtx_layers: vec![1], spark_ranks: 3,
             prefill_lanes: 1 };
-        let plan = SparkAdmission::plan_hqa_for_test(root.path(), catalog.routed_experts().geometry()?, Some(&catalog),
+        let plan = SparkAdmission::plan_original_for_test(root.path(), catalog.routed_experts().geometry()?, Some(&catalog),
             &working, 3, fixture_model())?;
         assert_eq!(plan.selection.layers(), [0, 2]);
         for (rank, assignment) in plan.assignments.iter().enumerate() {
@@ -741,7 +736,7 @@ mod tests {
         let catalog = cuteafd_loader::read_expert_catalog(root.path())?;
         let working = SparkWorkingSet { spark_layers: vec![1], spark_ranks: 6, prefill_lanes: 1,
             ..Default::default() };
-        let admission = SparkAdmission::plan_hqa_for_test(root.path(), catalog.routed_experts().geometry()?,
+        let admission = SparkAdmission::plan_original_for_test(root.path(), catalog.routed_experts().geometry()?,
             Some(&catalog), &working, 6, fixture_model())?;
         assert_eq!(admission.selection.layers(), [1]);
         for (rank, assignment) in admission.assignments.iter().enumerate() {
@@ -795,7 +790,7 @@ mod tests {
                 prefill_lanes: 2, ..Default::default() };
             let mut model = fixture_model();
             if nvfp4 { model.endpoints.iter_mut().for_each(|e| e.ingress = SparkIngress::Bf16); }
-            let plan = SparkAdmission::plan_hqa_for_test(root.path(), ExpertGeometry::DEEPSEEK_V41, Some(&catalog),
+            let plan = SparkAdmission::plan_original_for_test(root.path(), ExpertGeometry::DEEPSEEK_V41, Some(&catalog),
                 &working, 4, model)?;
             assert_eq!(plan.selection.layers(), [17, 39]);
             assert!(plan.assignments.iter().all(|a| a.resident_bytes > 0 && a.slices.len() == 2));
@@ -812,7 +807,7 @@ mod tests {
         for world in [4, 6] {
         let working = SparkWorkingSet { spark_layers: vec![1, 3], spark_ranks: world,
             prefill_lanes: 2, ..Default::default() };
-        let plan = SparkAdmission::plan_hqa_for_test(root.path(), catalog.routed_experts().geometry()?, Some(&catalog),
+        let plan = SparkAdmission::plan_original_for_test(root.path(), catalog.routed_experts().geometry()?, Some(&catalog),
             &working, world, fixture_model())?;
         for (rank, assignment) in plan.assignments.iter().enumerate() {
             let expected = [1, 3].into_iter().map(|layer| -> Result<u64> {

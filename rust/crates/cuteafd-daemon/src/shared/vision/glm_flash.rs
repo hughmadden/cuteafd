@@ -54,7 +54,7 @@ fn validate(config: &serde_json::Value, max_tokens: usize) -> Result<()> {
 impl TowerSpec {
     pub fn glm_flash(snapshot: &Path, max_tokens: usize) -> Result<Self> {
         let view = cuteafd_loader::plan::checkpoint::CheckpointView::select(snapshot,
-            cuteafd_loader::plan::checkpoint::AttentionMode::Hqa)
+            cuteafd_loader::plan::checkpoint::CoreView::Original)
             .map_err(|error| VisionError::Unsupported(error.to_string()))?;
         Self::glm_flash_view(&view, max_tokens)
     }
@@ -342,11 +342,8 @@ mod tests {
             dir.path().join("vision.safetensors")).unwrap();
         std::fs::remove_file(dir.path().join("experts/exlr8-layer-000.index.safetensors")).unwrap();
         std::fs::write(dir.path().join("model.safetensors.index.json"), hf_index).unwrap();
-        use cuteafd_loader::plan::checkpoint::{AttentionMode, CheckpointView, view::{COMPACT_CONFIG, COMPACT_INDEX, COMPACT_QUANT}};
-        std::fs::copy(dir.path().join("config.json"), dir.path().join(COMPACT_CONFIG)).unwrap();
-        std::fs::copy(dir.path().join("model.safetensors.index.json"), dir.path().join(COMPACT_INDEX)).unwrap();
-        std::fs::write(dir.path().join(COMPACT_QUANT), b"{}").unwrap();
-        let view = CheckpointView::select(dir.path(), AttentionMode::Compact).unwrap();
+        use cuteafd_loader::plan::checkpoint::{CoreView, CheckpointView};
+        let view = CheckpointView::select(dir.path(), CoreView::Original).unwrap();
         std::fs::write(dir.path().join("config.json"), b"invalid unselected config").unwrap();
         std::fs::write(dir.path().join("model.safetensors.index.json"), b"invalid unselected index").unwrap();
         let compact = TowerSpec::glm_flash_view(&view, 4096).unwrap();

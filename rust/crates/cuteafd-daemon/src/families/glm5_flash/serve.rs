@@ -142,7 +142,7 @@ pub(crate) fn auto_vision(mode: cuteafd_loader::plan::MediaMode, snapshot: &std:
         return Ok((mode, None));
     }
     let view = cuteafd_loader::plan::checkpoint::CheckpointView::select(snapshot,
-        cuteafd_loader::plan::checkpoint::AttentionMode::Hqa)?;
+        cuteafd_loader::plan::checkpoint::CoreView::Original)?;
     auto_vision_view(mode, &view, template_from)
 }
 

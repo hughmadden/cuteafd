@@ -51,7 +51,7 @@ pub fn fp8_scale<'a>(selected: &'a crate::plan::checkpoint::SelectedProjection, 
 
 /// FP8-compact is a conversion of native BF16, never a requantization of native FP8.
 #[derive(Debug, thiserror::Error)]
-#[error("{tensor}: HQA attention is already FP8; --fp8-compact-attention applies only to BF16 HQA attention (found {found})")]
+#[error("{tensor}: native core operand is already FP8; CORE_VIEW=fp8-compact applies only to BF16 operands (found {found})")]
 pub struct UnsupportedFp8Conversion { pub tensor: String, pub found: String }
 
 #[cfg(test)]

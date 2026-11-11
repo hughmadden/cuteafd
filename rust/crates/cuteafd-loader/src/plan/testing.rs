@@ -1726,3 +1726,69 @@ pub fn write_mistral_large4_snapshot(dir: &Path, expert_layers: Option<&[usize]>
     fs::write(dir.join("processor_config.json"),
         include_str!("../families/mistral_large4/official-processor-config.json")).unwrap();
 }
+
+/// Three complete indexed core views with private core shards and one shared backing.
+pub fn write_mc_snapshot(dir: &Path, config: &Value, tensors: &[Tensor],
+    shapes: &std::collections::BTreeMap<String, Vec<usize>>) {
+    use sha2::{Digest, Sha256};
+    use std::collections::BTreeMap;
+    fs::create_dir_all(dir).unwrap();
+    let core_stems = shapes.keys().map(|n| n.strip_suffix(".weight").unwrap()).collect::<Vec<_>>();
+    let shared = tensors.iter().filter(|(name, ..)| !core_stems.iter().any(|stem|
+        name.strip_prefix(stem).is_some_and(|tail| tail.starts_with('.')))).cloned().collect::<Vec<_>>();
+    let shard = "shared-and-core.safetensors";
+    let mut h = Sha256::new();
+    let shared_map: BTreeMap<_, _> = shared.iter().map(|(name, ..)| (name.clone(), shard)).collect();
+    for (name, shard) in &shared_map { h.update(format!("{name}\0{shard}\n")); }
+    let shared_digest = format!("{:x}", h.finalize());
+    let all: BTreeMap<String, Tensor> = shared.iter().cloned().map(|t| (t.0.clone(), t)).collect();
+    let mut variants = Vec::new();
+    for (view, bits, suffix) in [("original", 16, ""), ("k6-compact", 6, ".k6"), ("k8-compact", 8, ".k8")] {
+        let index_name = format!("model{suffix}.safetensors.index.json");
+        let config_name = format!("config{suffix}.json");
+        let quant_name = format!("quantize_config{suffix}.json");
+        let mut active = shared.clone();
+        let mut core = Vec::new();
+        for (name, shape) in shapes {
+            let stem = name.strip_suffix(".weight").unwrap();
+            let generated = if bits == 16 { vec![t(name, "BF16", shape)] }
+                else { exl3(&format!("{stem}{suffix}"), shape[0].next_multiple_of(128), shape[1], bits) };
+            for mut tensor in generated {
+                // Views select the canonical module names but use private shards
+                // for alternate payloads that share tensor names.
+                tensor.0 = tensor.0.replace(&format!("{stem}{suffix}."), &format!("{stem}."));
+                core.push(tensor.0.clone());
+                active.push(tensor);
+            }
+        }
+        let core_shard = format!("core{suffix}.safetensors");
+        let core_set = core.iter().collect::<std::collections::BTreeSet<_>>();
+        write_safetensors(&dir.join(&core_shard), &active.iter().filter(|t| core_set.contains(&t.0)).cloned().collect::<Vec<_>>());
+        let weights: BTreeMap<_, _> = active.iter().map(|(name, ..)| (name.clone(),
+            if core_set.contains(name) { core_shard.as_str() } else { shard })).collect();
+        let projections = active.iter().filter_map(|(name, _, shape)| name.strip_suffix(".trellis")
+            .map(|stem| (stem.to_owned(), shape[2]/16, shape[0]*16, shape[1]*16))).collect::<Vec<_>>();
+        let mut cfg = config.clone();
+        let mut compact = exl3_compact(4);
+        compact["per_module_metadata"] = json!(format!("{quant_name}:tensor_storage"));
+        cfg["quantization_config"] = compact.clone();
+        cfg["transformers_weights"] = json!(index_name);
+        let quant = exl3_manifest(&compact, &projections);
+        let mut hashes = BTreeMap::new();
+        for (name, value) in [(&config_name, cfg), (&quant_name, quant), (&index_name, json!({"weight_map":weights}))] {
+            let bytes = serde_json::to_vec(&value).unwrap();
+            hashes.insert(name.clone(), format!("{:x}", Sha256::digest(&bytes)));
+            fs::write(dir.join(name), bytes).unwrap();
+        }
+        core.sort();
+        let mut h = Sha256::new();
+        h.update(format!("cuteafd-mc-view-v1\0{view}\0{shared_digest}\0"));
+        for (name, digest) in &hashes { h.update(format!("{name}\0{digest}\n")); }
+        variants.push(json!({"name":view, "index":index_name, "config":config_name, "quantize":quant_name,
+            "core_bits":bits, "core_tensors":core, "metadata_sha256":hashes, "fingerprint":format!("{:x}", h.finalize())}));
+    }
+    write_safetensors(&dir.join(shard), &all.into_values().collect::<Vec<_>>());
+    fs::write(dir.join("cuteafd-mc.json"), json!({"schema":"cuteafd-mc-v1",
+        "source":{"repo":"test/source", "revision":"0123456789012345678901234567890123456789"},
+        "original_core_dtype":"BF16", "shared_inventory_sha256":shared_digest, "variants":variants}).to_string()).unwrap();
+}

@@ -487,7 +487,7 @@ pub(crate) fn with_mla_arena_fixture(mut verify: impl FnMut(&DflashDrafter<'_>,
         "rope_parameters":{"rope_type":"yarn", "rope_theta":50000., "factor":32.,
             "original_max_position_embeddings":32768, "beta_fast":32, "beta_slow":1,
             "mscale":1., "mscale_all_dim":1.},
-        "dflash_config":{"attention_mode":"mla", "block_size":8,
+        "dflash_config":{"core_view":"mla", "block_size":8,
             "conv_kernel_size":2, "conv_group_size":16, "selector_rank":256,
             "selector_top_k":16, "target_layer_ids":[0,1], "mask_token_id":0}
     }))?)?;

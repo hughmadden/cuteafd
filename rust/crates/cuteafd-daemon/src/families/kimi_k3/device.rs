@@ -238,6 +238,7 @@ pub(crate) struct NativePrograms<'a> {
     pub add: Bf16Add<'a>,
     pub core:Option<super::core_runtime::CorePrograms<'a>>,
     pub(crate) packing_cap: usize,
+    graph_core: cuteafd_loader::serving_capacity::kimi_prewarm::KimiCoreFormat,
     ranks: usize,
     scratch: NativeScratch,
     wire_grid: crate::shared::launch_grid::Fp8QuantizeGrid,
@@ -245,8 +246,7 @@ pub(crate) struct NativePrograms<'a> {
 
 impl NativePrograms<'_> {
     pub(crate) fn graph_core(&self) -> cuteafd_loader::serving_capacity::kimi_prewarm::KimiCoreFormat {
-        use cuteafd_loader::serving_capacity::kimi_prewarm::KimiCoreFormat;
-        self.core.as_ref().map_or(KimiCoreFormat::Bf16, |core| KimiCoreFormat::from_inventory(&core.native_inventory))
+        self.graph_core
     }
 }
 
@@ -319,6 +319,7 @@ impl<'a> NativePrograms<'a> {
                 kda, commit: KimiKdaCommit::load_heads(programs, heads)?, mla, latent: KimiLatent::load(programs)?,
                 router: KimiRouter::load(programs)?, wire: KimiExpertInput::load(programs)?,
                 add: device.library.bf16_add()?, core, packing_cap, ranks, scratch,
+                graph_core: cuteafd_loader::serving_capacity::kimi_prewarm::KimiCoreFormat::from_inventory(inventory),
                 wire_grid: crate::shared::launch_grid::Fp8QuantizeGrid::new(device.library.sm_count()?, None)? })
         })
     }
@@ -909,7 +910,7 @@ impl<'a> LocalLane<'a> {
         self.lane.metadata_bank = 0;
     }
 
-    pub(crate) fn select_attention_unit(&mut self, bank: usize, rows: usize) -> Result<()> {
+    pub(crate) fn select_core_view_unit(&mut self, bank: usize, rows: usize) -> Result<()> {
         self.lane.layout.metadata_extent("KDA slots", bank)?;
         ensure!(rows > 0 && rows <= self.lane.layout.unit, "Kimi attention unit rows");
         self.lane.metadata_bank = bank;
@@ -2671,7 +2672,7 @@ mod tests {
         use cuteafd_loader::formats::exl3_storage::Exl3Codebook;
         let cfg=KimiK3Config::from_hf(&cuteafd_loader::plan::testing::kimi_k3_config())?;
         let stem="language_model.lm_head".to_owned();
-        let core=CoreInventory { largest_selected_dense_bytes: None, native: BTreeMap::new(), projections:BTreeMap::from([(stem.clone(),CoreProjection{stem,bits:6,
+        let core=CoreInventory { selected_core_view: None, largest_selected_dense_bytes: None, native: BTreeMap::new(), projections:BTreeMap::from([(stem.clone(),CoreProjection{stem,bits:6,
             codebook:Exl3Codebook::Mcg,shape:[cfg.vocab_size,cfg.hidden],stored_outputs:cfg.vocab_size,
             source_bytes:0,split:CoreSplit::Whole})])};
         for rows in [1,8,64,4096] {
@@ -2690,7 +2691,7 @@ mod tests {
         use cuteafd_loader::formats::exl3_storage::Exl3Codebook;
         let cfg = KimiK3Config::from_hf(&cuteafd_loader::plan::testing::kimi_k3_config())?;
         let stem = "language_model.lm_head".to_owned();
-        let core = CoreInventory { largest_selected_dense_bytes: None, native: BTreeMap::new(), projections: BTreeMap::from([(stem.clone(), CoreProjection {
+        let core = CoreInventory { selected_core_view: None, largest_selected_dense_bytes: None, native: BTreeMap::new(), projections: BTreeMap::from([(stem.clone(), CoreProjection {
             stem, bits: 6, codebook: Exl3Codebook::Mcg, shape: [cfg.vocab_size, cfg.hidden],
             stored_outputs: cfg.vocab_size, source_bytes: 0, split: CoreSplit::Whole })]) };
         for rows in [1, 64, 8256] {

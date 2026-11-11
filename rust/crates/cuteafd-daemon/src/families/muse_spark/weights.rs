@@ -251,7 +251,7 @@ impl<'a> LayerWeights<'a> {
         let native = layout.native.iter().map(|(&name, layout)| {
             let weights = allocate_native(device, arena, layout)?;
             let selected = checkpoint.projection(&layout.stem)?;
-            for record in attention_records(&checkpoint.snapshot, &selected, checkpoint.attention_mode(), layout,
+            for record in attention_records(&checkpoint.snapshot, &selected, checkpoint.core_view(), layout,
                 crate::shared::fp8_linear::Fp8Scales::Amax, weights.values.buffer,
                 weights.scales.as_ref().map(|scales| scales.buffer))? {
                 match record {
@@ -461,7 +461,7 @@ mod tests {
     #[test]
     fn arena_k6_and_native_contents_match_original_loads() -> Result<()> {
         use cuteafd_loader::{formats::{dense_trellis::TrellisSide, exl3_storage::Exl3Codebook,
-            trellis_core::{CoreProjection, CoreSplit}}, plan::{testing, checkpoint::AttentionMode}};
+            trellis_core::{CoreProjection, CoreSplit}}, plan::{testing, checkpoint::CoreView}};
         use std::io::{Seek, SeekFrom, Write};
         let fixture = cuteafd_ffi::native_library_lifetime_fixture::Fixture::build_for_tests()?;
         let library = fixture.load()?;
@@ -539,7 +539,7 @@ mod tests {
                             values: DeviceAllocation::new(&library, actual.values.buffer.bytes, crate::shared::memory::TEST)?,
                             scales: actual.scales.as_ref().map(|s| DeviceAllocation::new(&library, s.buffer.bytes, crate::shared::memory::TEST)).transpose()? }))?;
                         let selected = checkpoint.projection(&layout.stem)?;
-                        let mode = if compact && layout.stem == bf16 { AttentionMode::Fp8Compact } else { AttentionMode::Hqa };
+                        let mode = if compact && layout.stem == bf16 { CoreView::Fp8Compact } else { CoreView::Original };
                         for owner in [&actual, &expected] {
                             device.run(|| {
                                 for record in attention_records(dir.path(), &selected, mode, layout,
@@ -608,7 +608,7 @@ mod tests {
     #[test]
     fn native_attention_records_match_mode_residency_and_admitted_load() -> Result<()> {
         use cuteafd_loader::{families::muse_spark::core::{CoreSplit, NativeLayout},
-            plan::{checkpoint::{AttentionMode, CheckpointView}, testing, Checkpoint}};
+            plan::{checkpoint::{CoreView, CheckpointView}, testing, Checkpoint}};
         use crate::shared::native_attention::{attention_records, AttentionRecord};
         let dir = tempfile::tempdir()?;
         let stem = format!("{PREFIX}0.self_attn.o_proj");
@@ -616,14 +616,14 @@ mod tests {
         config["quantization_config"] = serde_json::json!({"quant_method":"exl3"});
         testing::write_snapshot(dir.path(), &config,
             &[testing::t(format!("{stem}.weight"), "BF16", &[8192, 8192])], None);
-        for mode in [AttentionMode::Hqa, AttentionMode::Fp8Compact] {
+        for mode in [CoreView::Original, CoreView::Fp8Compact] {
             let view = CheckpointView::select(dir.path(), mode)?;
             let checkpoint = Checkpoint::open_view(&view)?;
             let selected = checkpoint.projection(&stem)?;
             for ranks in [1, 2] {
                 for rank in 0..ranks {
                     let k = 8192 / ranks;
-                    let fp8 = mode == AttentionMode::Fp8Compact;
+                    let fp8 = mode == CoreView::Fp8Compact;
                     let layout = NativeLayout { stem: stem.clone(), shape: [8192, k], fp8,
                         split: CoreSplit::Input, rank, ranks };
                     let values = CuteafdDeviceBuffer { ptr: 0x1000_0000usize as *mut _,

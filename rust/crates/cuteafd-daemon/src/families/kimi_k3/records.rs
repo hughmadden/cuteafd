@@ -299,7 +299,7 @@ impl<'l, 'a> KimiRecords<'l, 'a> {
                     DeviceAllocation::from_allocation(scoped.allocate(device, &format!("{name}.values"), (n * k * if layout.fp8 { 1 } else { 2 }).max(256))?),
                     if layout.fp8 { Some(DeviceAllocation::from_allocation(scoped.allocate(device, &format!("{name}.scales"), (n.div_ceil(128) * k.div_ceil(128) * 4).max(256))?)) } else { None },
                 )))?;
-                let records = attention_records(&scoped.checkpoint.snapshot, &selected, scoped.checkpoint.attention_mode(),
+                let records = attention_records(&scoped.checkpoint.snapshot, &selected, scoped.checkpoint.core_view(),
                     layout, crate::shared::fp8_linear::Fp8Scales::Amax, values.buffer,
                     scales.as_ref().map(|scales| scales.buffer))?;
                 let stream = scoped.streams.iter().find(|(id, _)| *id == device.id)
@@ -534,7 +534,7 @@ mod native_record_tests {
     use super::*;
     use crate::shared::native_attention::{attention_records, AttentionRecord};
     use cuteafd_loader::{formats::{native_attention::{NativeLayout, NativeProjection}, trellis_core::CoreSplit},
-        plan::checkpoint::{AttentionMode, CheckpointTensor, ProjectionStorage, SelectedProjection},
+        plan::checkpoint::{CoreView, CheckpointTensor, ProjectionStorage, SelectedProjection},
         SafetensorsTensorMetadata};
 
     #[test]
@@ -559,7 +559,7 @@ mod native_record_tests {
                         bytes: local[0] * local[1] * if fp8 { 1 } else { 2 }, ..Default::default() };
                     let scales = fp8.then(|| CuteafdDeviceBuffer { ptr: 0x2000usize as *mut _,
                         bytes: local[0] / 128 * (local[1] / 128) * 4, ..Default::default() });
-                    let mode = if fp8 { AttentionMode::Fp8Compact } else { AttentionMode::Hqa };
+                    let mode = if fp8 { CoreView::Fp8Compact } else { CoreView::Original };
                     let records = attention_records(std::path::Path::new("/not-opened"), &selected, mode,
                         &layout, crate::shared::fp8_linear::Fp8Scales::Amax, values, scales)?;
                     let mut actual = cuteafd_loader::shared::dense_read::MountLoad::default();

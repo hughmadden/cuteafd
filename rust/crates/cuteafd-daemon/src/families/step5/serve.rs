@@ -72,7 +72,7 @@ pub(crate) struct ServeArgs {
     #[command(flatten)]
     pub draft_length: crate::shared::draft::length::DraftLength,
     #[command(flatten)]
-    pub(crate) attention: crate::cli::AttentionArgs,
+    pub(crate) attention: crate::cli::CoreViewArgs,
     #[arg(long)]
     pub(crate) snapshot: PathBuf,
     #[arg(long, env = "CUTEAFD_NATIVE_LIB")]

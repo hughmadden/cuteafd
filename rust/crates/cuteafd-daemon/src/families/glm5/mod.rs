@@ -28,7 +28,7 @@ pub(crate) use cuteafd_loader::plan::exlr8::PrefillActivations as Exlr8PrefillAc
 #[derive(Debug, Clone, clap::Args)]
 pub(crate) struct EngineArgs {
     #[command(flatten)]
-    pub(crate) attention: crate::cli::AttentionArgs,
+    pub(crate) attention: crate::cli::CoreViewArgs,
     /// Count executed expert routes; --expert-usage=false disables telemetry.
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set,
         num_args = 0..=1, default_missing_value = "true", require_equals = true)]
@@ -2082,7 +2082,7 @@ fn write_attention_identity(dir: &std::path::Path, view: &cuteafd_loader::plan::
     std::fs::write(dir.join("attention.json"), serde_json::to_vec_pretty(&serde_json::json!({
         "mode": view.mode(), "bundle_fingerprint": view.fingerprint(),
         "config": view.config_name(), "index": view.index_name(),
-        "fp8_recipe": (view.mode() == cuteafd_loader::plan::checkpoint::AttentionMode::Fp8Compact)
+        "fp8_recipe": (view.mode() == cuteafd_loader::plan::checkpoint::CoreView::Fp8Compact)
             .then_some(cuteafd_loader::plan::checkpoint::view::FP8_RECIPE),
     }))?)?;
     Ok(())

@@ -41,7 +41,7 @@ const BF16_REVISION: &str = "7734b7ffac118d70d8398bfa3eb0fab007eb45b1";
 #[derive(Debug, Clone, clap::Args)]
 pub(crate) struct GoldenArgs {
     #[command(flatten)]
-    pub(crate) attention: crate::cli::AttentionArgs,
+    pub(crate) attention: crate::cli::CoreViewArgs,
     /// Same immutable target KV storage as serving.
     #[arg(long, default_value = "fp8")]
     kv_cache: cuteafd_loader::families::qwen4::Qwen4KvCache,
@@ -156,7 +156,7 @@ fn save_diagnostics(
         && !positions.is_empty() && positions.iter().all(|&p| p > 0 && p < tokens.len())
         && positions.windows(2).all(|p| p[0] < p[1]), "diagnostic token/scored positions mismatch");
     let identity = serde_json::json!({
-        "attention_mode": view.mode(), "view_fingerprint": view.fingerprint(),
+        "core_view": view.mode(), "view_fingerprint": view.fingerprint(),
     });
     let token_bytes = tokens.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>();
     if let Some(dir) = &args.save_logits {
@@ -1458,31 +1458,29 @@ mod tests {
         Ok(())
     }
 
-    fn diagnostic_view(root: &std::path::Path, mode: cuteafd_loader::plan::checkpoint::AttentionMode)
+    fn diagnostic_view(root: &std::path::Path, mode: cuteafd_loader::plan::checkpoint::CoreView)
         -> Result<cuteafd_loader::plan::checkpoint::CheckpointView> {
-        std::fs::write(root.join("config.json"), b"{}")?;
-        std::fs::write(root.join("config.compact-attention.json"), b"{}")?;
-        std::fs::write(root.join("model.compact-attention.safetensors.index.json"), br#"{"weight_map":{}}"#)?;
-        std::fs::write(root.join("quantize_config.compact-attention.json"), b"{}")?;
+        cuteafd_loader::plan::testing::write_mc_snapshot(root, &serde_json::json!({}), &[],
+            &std::collections::BTreeMap::from([("lm_head.weight".into(), vec![128,128])]));
         cuteafd_loader::plan::checkpoint::CheckpointView::select(root, mode)
     }
 
     #[test]
     fn diagnostic_files_preserve_full_rows_bits_positions_and_head_input() -> Result<()> {
-        use cuteafd_loader::plan::checkpoint::AttentionMode;
-        for (mode, format) in [AttentionMode::Hqa, AttentionMode::Compact].into_iter().flat_map(|mode|
+        use cuteafd_loader::plan::checkpoint::CoreView;
+        for (mode, format) in [CoreView::Original, CoreView::K6Compact].into_iter().flat_map(|mode|
             [cuteafd_loader::families::qwen4::Qwen4KvCache::Bf16,
              cuteafd_loader::families::qwen4::Qwen4KvCache::Fp8].map(|format| (mode, format))) {
             let root = tempfile::tempdir()?;
             let mut args = diagnostic_args(&["--nll", "--dump-residuals", "/unused", "--dump-layers", "0,91"])?;
             args.kv_cache = format;
             let view = diagnostic_view(root.path(), mode)?;
-            let other_mode = if mode == AttentionMode::Hqa { AttentionMode::Compact } else { AttentionMode::Hqa };
+            let other_mode = if mode == CoreView::Original { CoreView::K6Compact } else { CoreView::Original };
             let other = diagnostic_view(root.path(), other_mode)?;
             assert_ne!(view.fingerprint(), other.fingerprint());
             // Diagnostics bind the frozen selection, not metadata reopened at write time.
             std::fs::remove_file(root.path().join("config.json"))?;
-            std::fs::remove_file(root.path().join("config.compact-attention.json"))?;
+            std::fs::remove_file(root.path().join("config.k6.json"))?;
             let logits_dir = root.path().join("logits");
             let residual_dir = root.path().join("residuals");
             args.save_logits = Some(logits_dir.clone());
@@ -1507,7 +1505,7 @@ mod tests {
                 assert_eq!(std::fs::read(residual_dir.join(file))?,
                     vec![value; tokens.len() * H].iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>());
             }
-            let identity = serde_json::json!({"attention_mode":mode, "view_fingerprint":view.fingerprint()});
+            let identity = serde_json::json!({"core_view":mode, "view_fingerprint":view.fingerprint()});
             let logits_meta: Value = serde_json::from_slice(&std::fs::read(logits_dir.join("logits.meta.json"))?)?;
             assert_eq!(logits_meta, serde_json::json!({
                 "schema":"cuteafd.step5.logits/1", "checkpoint":identity,
@@ -1539,7 +1537,7 @@ mod tests {
         let root = tempfile::tempdir()?;
         let mut args = diagnostic_args(&["--nll", "--dump-residuals", "/unused", "--dump-layers", "0"])?;
         args.dump_residuals = Some(root.path().into());
-        let view = diagnostic_view(root.path(), cuteafd_loader::plan::checkpoint::AttentionMode::Hqa)?;
+        let view = diagnostic_view(root.path(), cuteafd_loader::plan::checkpoint::CoreView::Original)?;
         let norm = vec![1f32; 2 * H];
         for bad in [vec![1.; H], vec![f32::NAN; 2 * H], vec![f32::INFINITY; 2 * H]] {
             std::fs::write(root.path().join("meta.json"), b"stale")?;

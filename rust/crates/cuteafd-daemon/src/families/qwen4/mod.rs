@@ -629,7 +629,7 @@ impl Opened {
             };
             let source = args.experts_snapshot.as_deref().unwrap_or(&args.snapshot);
             crate::shared::placement::SparkAdmission::plan_view(&cuteafd_loader::plan::checkpoint::CheckpointView::select(
-                source, cuteafd_loader::plan::checkpoint::AttentionMode::Hqa)?, cuteafd_core::ExpertGeometry::QWEN4,
+                source, cuteafd_loader::plan::checkpoint::CoreView::Original)?, cuteafd_core::ExpertGeometry::QWEN4,
                 self.experts.as_ref(), &working, peers.len(),
                 admission::spark_model(cuteafd_loader::plan::spark_executions::SparkBackend::for_catalog(
                     self.experts.as_ref().context("Qwen Spark admission requires routed expert headers")?)?,

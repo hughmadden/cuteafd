@@ -119,7 +119,7 @@ pub(super) fn load_operand<'a>(
         ensure!(native.bytes()? == operand.allocation_bytes, "Step-5 FP8 owner extent");
         let selected = checkpoint.projection(&native.stem)?;
         let (values, scales) = fp8_buffers(allocation.buffer, &operand.shape)?;
-        let records = attention_records(&checkpoint.snapshot, &selected, checkpoint.attention_mode(), &native,
+        let records = attention_records(&checkpoint.snapshot, &selected, checkpoint.core_view(), &native,
             crate::shared::fp8_linear::Fp8Scales::Amax, values, Some(scales))?;
         let dense = DenseLoad::mount(device.library);
         dense.admit_mount(cuteafd_loader::shared::dense_read::MountLoad::from_headers(
@@ -339,7 +339,7 @@ mod tests {
     #[test]
     fn fp8_conversion_records_keep_selected_tp_and_mtp_source_rectangles() -> Result<()> {
         use crate::shared::{experts::rtx::dense::Job, native_attention::{attention_records, AttentionRecord}};
-        use cuteafd_loader::plan::checkpoint::{AttentionMode, ProjectionStorage, SelectedProjection};
+        use cuteafd_loader::plan::checkpoint::{CoreView, ProjectionStorage, SelectedProjection};
         for (layer, ranks, rank) in [(0, 1, 0), (0, 2, 0), (0, 2, 1), (92, 1, 0)] {
             let name = format!("model.layers.{layer}.self_attn.o_proj.weight");
             let src = source(&name, DType::Bf16, vec![4096, 12288]);
@@ -353,7 +353,7 @@ mod tests {
             let owner = CuteafdDeviceBuffer { bytes: layout.bytes()? as usize, ..Default::default() };
             let (q, scales) = fp8_buffers(owner, &operand.shape)?;
             let records = attention_records(std::path::Path::new("/selected"), &selected,
-                AttentionMode::Fp8Compact, &layout, crate::shared::fp8_linear::Fp8Scales::Amax, q, Some(scales))?;
+                CoreView::Fp8Compact, &layout, crate::shared::fp8_linear::Fp8Scales::Amax, q, Some(scales))?;
             let mut rows = 0;
             for record in records {
                 let AttentionRecord::Step(step) = record else { panic!("BF16 conversion must be staged, not resident"); };

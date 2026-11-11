@@ -119,8 +119,8 @@ impl CoreCharges {
         }
         for weight in bodies.iter().flatten().chain(head.iter()) {
             let book = weight.codebook.marker();
-            programs.extend(cuteafd_ffi::dense_trellis::validate_package_geometry(manifest,
-                weight.shape[1], weight.shape[0], if weight.side == TrellisSide::Input { 2 } else { 1 }, book,
+            programs.extend(cuteafd_ffi::dense_trellis::validate_package_geometry_bits(manifest,
+                weight.shape[1], weight.shape[0], if weight.side == TrellisSide::Input { 2 } else { 1 }, weight.bits, book,
                 if weight.stem == "lm_head" { decode_rows.max(draft_rows.unwrap_or(1)) } else { unit.max(decode_rows) },
                 if weight.stem == "lm_head" { cuteafd_ffi::dense_trellis::TrellisDType::F32 }
                 else { cuteafd_ffi::dense_trellis::TrellisDType::Bf16 })?);

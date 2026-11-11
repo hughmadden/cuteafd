@@ -15,22 +15,14 @@ lossless speculation have passed on hardware. On two GPUs, `auto` selects
 `context` after correctness and interleaved throughput qualification;
 explicit `layers` remains available.
 
-## Selected attention bundles
+## Original mixed-precision core
 
-`wrldsuksgo2mars/Mistral-Large-4-EXL3-K4-Core-K6-HQA` at
-`080757045cd2b9c0a65505c61a16aa90d118e35e` restores checkpoint-native E4M3
-`wq`/`wo` and their original F32 block-128 `qscale_weight` tensors.
-`ATTENTION_MODE=hqa` selects those operands; `compact` selects the original
-parent K6 attention without opening native shards. `fp8-compact` refuses with
-`UnsupportedFp8Conversion`: this HQA attention is already FP8, not BF16 to
-convert. Selection is immutable and part of model, prefix-cache and golden
-identity. The remaining K6 core and routed K4 experts are unchanged.
-
-Both bundles use the shared GLM per-projection runtime. Whole-attention owners
-retain whole projections; TP2 head/context placement splits `wq` by output
-heads and `wo` by input heads. Output reductions keep F32 partials, add rank 0
-then rank 1, and narrow once. Qualification targets RTX PRO 6000 only; it
-makes no RTX 5090 claim.
+`wrldsuksgo2mars/Mistral-Large-4-EXL3-K4` is a plain checkpoint, not MC.
+Its complete original mixed-precision core is restored, including native E4M3
+`wq`/`wo` and F32 block-128 `qscale_weight`; routed experts remain EXL3 K4.
+Only `CORE_VIEW=original` is accepted. Compact trellis views and load-time FP8
+conversion refuse: an FP8-origin core is not requantized.
+TP2 output reductions retain F32 partials, add ranks in order and narrow once.
 
 ## How it runs
 

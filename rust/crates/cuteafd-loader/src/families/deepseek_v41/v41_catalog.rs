@@ -1419,7 +1419,7 @@ fn deepseek_v4_exl3_catalog_input(snapshot: &Path, weight_map: &BTreeMap<String,
         Some(view) => view,
         None => {
             default_view = crate::plan::checkpoint::CheckpointView::select(snapshot,
-                crate::plan::checkpoint::AttentionMode::Hqa)?;
+                crate::plan::checkpoint::CoreView::Original)?;
             &default_view
         }
     };
@@ -1974,19 +1974,13 @@ mod tests {
                 resident_bytes: Default::default(),
             }), nvfp4: None, fp8: None,
         };
-        // A role-provisioned compact catalog has no default metadata. Keep the
-        // selected value even after its on-disk config/index are removed too.
-        for (from, to) in [("config.json", "config.compact-attention.json"),
-            ("model.safetensors.index.json", "model.compact-attention.safetensors.index.json")] {
-            std::fs::rename(dir.path().join(from), dir.path().join(to)).unwrap();
-        }
-        std::fs::write(dir.path().join("quantize_config.compact-attention.json"), "{}").unwrap();
+        // Keep the frozen selection after its on-disk metadata is removed.
         let view = crate::plan::checkpoint::CheckpointView::select(dir.path(),
-            crate::plan::checkpoint::AttentionMode::Compact).unwrap();
+            crate::plan::checkpoint::CoreView::Original).unwrap();
         let fingerprint = view.fingerprint().to_owned();
         catalog.source = CatalogSource::Selected(view);
-        std::fs::remove_file(dir.path().join("config.compact-attention.json")).unwrap();
-        std::fs::remove_file(dir.path().join("model.compact-attention.safetensors.index.json")).unwrap();
+        std::fs::remove_file(dir.path().join("config.json")).unwrap();
+        std::fs::remove_file(dir.path().join("model.safetensors.index.json")).unwrap();
         assert_eq!(catalog.inventory().unwrap().view.unwrap().fingerprint(), fingerprint);
         assert_eq!(catalog.bundled_dspark_ownership(true).unwrap(), DraftOwnership::BundledDspark);
         catalog.select_draft(DraftOwnership::selected("deepseek_v41", "dspark")).unwrap();

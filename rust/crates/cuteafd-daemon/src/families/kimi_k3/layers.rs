@@ -1088,7 +1088,7 @@ impl UnitHooks<'_, '_, '_, '_> {
     fn select(&mut self, unit: &crate::shared::prefill_pipeline::Unit) -> Result<()> {
         for local in self.binding.local.iter_mut() {
             local.select_subwave(Some(unit.rows.clone()))?;
-            local.select_attention_unit(unit.index, unit.rows.len())?;
+            local.select_core_view_unit(unit.index, unit.rows.len())?;
         }
         self.binding.rows = unit.rows.len();
         self.binding.completed = self.state[unit.index].completed;

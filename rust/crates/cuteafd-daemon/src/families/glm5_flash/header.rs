@@ -231,7 +231,7 @@ mod tests {
             std::fs::write(root.path().join(name), value).unwrap();
         }
         checkpoint.view = Some(cuteafd_loader::plan::checkpoint::CheckpointView::select(root.path(),
-            cuteafd_loader::plan::checkpoint::AttentionMode::Compact).unwrap());
+            cuteafd_loader::plan::checkpoint::CoreView::K6Compact).unwrap());
         for leaf in ["q_proj", "k_proj", "v_proj"] {
             let stem = format!("model.language_model.layers.0.self_attn.{leaf}");
             let at = checkpoint.tensors.iter().position(|t| t.meta.name == format!("{stem}.weight")).unwrap();

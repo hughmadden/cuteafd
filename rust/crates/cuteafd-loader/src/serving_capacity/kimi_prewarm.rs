@@ -20,11 +20,22 @@ use std::sync::OnceLock;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
-pub enum KimiCoreFormat { Bf16, K6, Trellis }
+pub enum KimiCoreFormat {
+    Bf16, K6, Trellis,
+    #[serde(rename = "original")] McOriginal,
+    #[serde(rename = "k6-compact")] McK6,
+    #[serde(rename = "k8-compact")] McK8,
+    #[serde(rename = "fp8-compact")] McFp8,
+}
 
 impl KimiCoreFormat {
-    /// Header-native trellis inventory, not a repository name or HQA mode.
+    /// Header-native trellis inventory, not a repository name.
     pub fn from_inventory(core: &crate::families::kimi_k3::core::CoreInventory) -> Self {
+        if let Some(view) = core.selected_core_view {
+            use crate::plan::checkpoint::CoreView;
+            return match view { CoreView::Original => Self::McOriginal, CoreView::K6Compact => Self::McK6,
+                CoreView::K8Compact => Self::McK8, CoreView::Fp8Compact => Self::McFp8 };
+        }
         if core.projections.is_empty() { Self::Bf16 }
         else if core.projections.values().all(|p| p.bits == 6) { Self::K6 }
         else { Self::Trellis }
@@ -99,7 +110,13 @@ fn kimi_bootstrap_layout(core: KimiCoreFormat) -> &'static KimiPrewarmLayout {
     static BF16: OnceLock<KimiPrewarmLayout> = OnceLock::new();
     static K6: OnceLock<KimiPrewarmLayout> = OnceLock::new();
     static TRELLIS: OnceLock<KimiPrewarmLayout> = OnceLock::new();
-    let bootstrap = match core { KimiCoreFormat::Bf16 => &BF16, KimiCoreFormat::K6 => &K6, KimiCoreFormat::Trellis => &TRELLIS };
+    static ORIGINAL: OnceLock<KimiPrewarmLayout> = OnceLock::new();
+    static MC_K6: OnceLock<KimiPrewarmLayout> = OnceLock::new();
+    static MC_K8: OnceLock<KimiPrewarmLayout> = OnceLock::new();
+    static MC_FP8: OnceLock<KimiPrewarmLayout> = OnceLock::new();
+    let bootstrap = match core { KimiCoreFormat::Bf16 => &BF16, KimiCoreFormat::K6 => &K6, KimiCoreFormat::Trellis => &TRELLIS,
+        KimiCoreFormat::McOriginal => &ORIGINAL, KimiCoreFormat::McK6 => &MC_K6,
+        KimiCoreFormat::McK8 => &MC_K8, KimiCoreFormat::McFp8 => &MC_FP8 };
     bootstrap.get_or_init(|| KimiPrewarmLayout {
         core,
         ranks: 0,
@@ -185,6 +202,26 @@ mod tests {
             crate::families::kimi_k3::allocation::graph_census(1, 0).0);
         assert_ne!(kimi_reserve(KimiCoreFormat::Bf16, 1, 0), kimi_reserve(KimiCoreFormat::K6, 1, 0));
         assert_eq!(KimiCoreFormat::from_inventory(&Default::default()), KimiCoreFormat::Bf16);
+    }
+
+    #[test]
+    fn each_mc_view_has_its_own_untraced_bootstrap() {
+        use crate::plan::checkpoint::CoreView;
+        for (view, format) in [(CoreView::Original, KimiCoreFormat::McOriginal),
+            (CoreView::K6Compact, KimiCoreFormat::McK6), (CoreView::K8Compact, KimiCoreFormat::McK8),
+            (CoreView::Fp8Compact, KimiCoreFormat::McFp8)] {
+            let core = crate::families::kimi_k3::core::CoreInventory {
+                selected_core_view: Some(view), ..Default::default()
+            };
+            assert_eq!(KimiCoreFormat::from_inventory(&core), format);
+            assert_eq!(serde_json::to_value(format).unwrap(), view.name());
+            for ranks in [1, 2] {
+                let layout = kimi_layout(format, ranks);
+                assert_eq!(layout.core, format);
+                assert_eq!(layout.ranks, 0);
+                assert!(layout.entries.iter().all(|e| !e.pin && e.capture_bytes.is_empty()));
+            }
+        }
     }
 
     #[test]

@@ -6,9 +6,9 @@ use cuteafd_ffi::{CuteafdDeviceBuffer as Buffer, dense_trellis::TrellisDType, Bf
 use cuteafd_loader::families::glm5_flash::core_admission::{CoreCharges, CoreRankLayout, CoreStageLayout, route_stage_names, fp8_projection_name};
 use std::collections::BTreeMap;
 
-type Key = (usize, usize, usize, &'static str);
+type Key = (usize, usize, usize, &'static str, usize);
 fn key(w: &CoreWeights<'_>) -> Key {
-    (w.shape[1], w.shape[0], if w.side == cuteafd_loader::formats::dense_trellis::TrellisSide::Input { 2 } else { 1 }, codebook(w))
+    (w.shape[1], w.shape[0], if w.side == cuteafd_loader::formats::dense_trellis::TrellisSide::Input { 2 } else { 1 }, codebook(w), w.bits)
 }
 fn rows(value: Scalar) -> Result<usize> {
     match value { Scalar::I32(n) if n > 0 => Ok(n as usize), _ => anyhow::bail!("Flash K6 positive row count") }
@@ -59,7 +59,7 @@ impl<'a> Rank<'a> {
         for weights in layers.iter().flat_map(|l| l.core.values()) {
             let k = key(weights);
             if projections.contains_key(&k) { continue; }
-            let p = Projection::load_geometry(engine.programs, k.0, k.1, k.2, k.3,
+            let p = Projection::load_geometry_bits(engine.programs, k.0, k.1, k.2, k.4, k.3,
                 engine.prefill_rows.max(engine.decode_rows), TrellisDType::Bf16)?;
             ProjectionLayout::new(&p.program, engine.prefill_rows.max(engine.decode_rows))?;
             projections.insert(k, p);

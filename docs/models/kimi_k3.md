@@ -17,21 +17,17 @@ Set `TP2_DFLASH=off` to keep the draft on GPU1; direct CLI users can pass
 Starting config (replace the REPLACE-ME Spark hosts and the 192.0.2.x RoCE
 addresses): [max](../../examples/configs/kimi-k3-exl3-k6-max.config).
 
-## Attention Views
+## Core views
 
-`wrldsuksgo2mars/Kimi-K3-EXL3-K2-Core-K6-HQA` bundles three attention modes.
-Set `MODEL_ID` to this checkpoint and `MODEL_REVISION` to
-`46b802d31c737bc64b4251ad158b9b3ffc4e04f6` when adapting the starting config.
-The default HQA view retains native BF16 attention output and MLA query
-projections alongside the K6 core. `ATTENTION_MODE=compact` selects the bundled
-parent K6 attention; `ATTENTION_MODE=fp8-compact` instead converts the selected
-native BF16 projections to block-scaled FP8, with BF16 activations. The default
-is `ATTENTION_MODE=hqa`, and only one mode applies to the model lifetime.
+`wrldsuksgo2mars/Kimi-K3.1-Pro-EXL3-K2-MC` uses the [MC contract](../mc-checkpoints.md).
+`CORE_VIEW=original` retains the complete source-native BF16 core, not a mixture
+of native attention outputs and trellis inputs. `k8-compact` and `k6-compact`
+select complete trellis cores. Direct CLI uses `--core-view VALUE`.
+The selected metadata, memory ownership, worker identity and graph prewarm key
+remain fixed for the model lifetime. Untraced views use unpinned bootstrap
+shapes, never another view's measured graph inventory.
 
-The corresponding CLI flags are `--compact-attention` and
-`--fp8-compact-attention`. Plan, inspect, serve and golden select the complete
-checkpoint bundle before planning or loading. Incomplete or mixed bundles
-refuse, and each mode has its own checkpoint fingerprint and memory charges.
+`fp8-compact` refuses for this MC original; whole-core FP8 is pending.
 
 ## Release card
 

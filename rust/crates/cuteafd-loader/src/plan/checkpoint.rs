@@ -7,8 +7,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 pub mod identity;
+pub mod mc;
 pub mod view;
-pub use view::{AttentionMode, CheckpointView};
+pub use mc::CoreView;
+pub use view::CheckpointView;
 
 /// Storage discovery is shared by inventories, catalogs and bootstrap identity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -47,7 +49,7 @@ pub fn index_path(snapshot: &Path) -> Result<PathBuf> {
 
 impl CheckpointFormat {
     pub fn detect_view(view: &CheckpointView) -> Result<Self> {
-        if view.mode() != AttentionMode::Compact && super::exlr8::recognizes(view.snapshot())? {
+        if !view.mode().compact() && super::exlr8::recognizes(view.snapshot())? {
             return Ok(Self::Exlr8);
         }
         if view.weight_map().is_some() { return Ok(Self::HfIndexed); }
@@ -139,8 +141,8 @@ pub struct SelectedProjection {
 }
 
 impl Checkpoint {
-    pub fn attention_mode(&self) -> AttentionMode {
-        self.view.as_ref().map_or(AttentionMode::Hqa, CheckpointView::mode)
+    pub fn core_view(&self) -> CoreView {
+        self.view.as_ref().map_or(CoreView::Original, CheckpointView::mode)
     }
 
     /// Whether a payload or classification header is available, independent of index membership.
@@ -210,13 +212,13 @@ impl Checkpoint {
     /// Reads the index/configuration plus declared native-attention and scale-free
     /// declared-A4 headers needed to classify storage before opening a role.
     pub fn inventory(snapshot: &Path) -> Result<Self> {
-        Self::inventory_view(&CheckpointView::select(snapshot, AttentionMode::Hqa)?)
+        Self::inventory_view(&CheckpointView::select(snapshot, CoreView::Original)?)
     }
 
     pub fn inventory_view(view: &CheckpointView) -> Result<Self> {
         let snapshot = view.snapshot();
         let mut checkpoint = Self::open_view_filtered(view, None, |_| false, None)?;
-        let native = view.native_attention_names().collect::<BTreeSet<_>>();
+        let native = view.native_core_names().collect::<BTreeSet<_>>();
         let mut required = BTreeMap::<String, BTreeSet<String>>::new();
         for name in &native {
             let shard = checkpoint.weight_map.get(*name).context("declared native attention is not indexed")?;
@@ -241,7 +243,6 @@ impl Checkpoint {
             ensure!(!names.iter().any(|name| native.contains(name.as_str())),
                 "declared native attention header missing in shard {shard}: {}", names.into_iter().collect::<Vec<_>>().join(", "));
         }
-        view.check_attention_headers(checkpoint.tensors.iter().map(|tensor| &tensor.meta))?;
         checkpoint.tensors.sort_by(|a, b| a.meta.name.cmp(&b.meta.name));
         debug_assert!(checkpoint.tensors.windows(2).all(|pair| pair[0].meta.name <= pair[1].meta.name));
         Ok(checkpoint)
@@ -259,7 +260,7 @@ impl Checkpoint {
     }
 
     pub(crate) fn open_with_header_validation(snapshot: &Path) -> Result<(Self, Result<(), String>)> {
-        Self::open_view_with_header_validation(&CheckpointView::select(snapshot, AttentionMode::Hqa)?)
+        Self::open_view_with_header_validation(&CheckpointView::select(snapshot, CoreView::Original)?)
     }
 
     pub(crate) fn open_view_with_header_validation(view: &CheckpointView) -> Result<(Self, Result<(), String>)> {
@@ -274,7 +275,7 @@ impl Checkpoint {
 
     fn open_filtered_validated(snapshot: &Path, role: Option<&str>, needed: impl Fn(&str) -> bool,
         validation: Option<&mut Result<(), String>>) -> Result<Self> {
-        let view = CheckpointView::select(snapshot, AttentionMode::Hqa)?;
+        let view = CheckpointView::select(snapshot, CoreView::Original)?;
         Self::open_view_filtered(&view, role, needed, validation)
     }
 
@@ -306,7 +307,7 @@ impl Checkpoint {
         };
         // Native headers classify eager family cores even when this role never
         // reads their payloads. Share the role's once-per-shard header pass.
-        let native = if role.is_some() { view.native_attention_names().collect::<BTreeSet<_>>() }
+        let native = if role.is_some() { view.native_core_names().collect::<BTreeSet<_>>() }
             else { BTreeSet::new() };
         // Group once instead of scanning the complete index for every shard.
         let mut shards = BTreeMap::<&String, BTreeSet<&str>>::new();
@@ -365,7 +366,6 @@ impl Checkpoint {
                 }
             }
         }
-        view.check_attention_headers(tensors.iter().chain(&classification_headers).map(|tensor| &tensor.meta))?;
         tensors.sort_by(|a, b| a.meta.name.cmp(&b.meta.name));
         classification_headers.sort_by(|a, b| a.meta.name.cmp(&b.meta.name));
         let mut view = view.clone();
