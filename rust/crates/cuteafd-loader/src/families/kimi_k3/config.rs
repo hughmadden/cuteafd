@@ -246,10 +246,15 @@ impl KimiK3Config {
         Ok(())
     }
 
-    /// Refuse before device allocation until the sparse execution path is qualified.
+    /// Serving and planning remain closed until the sparse golden is qualified.
     pub fn validate_attention_runtime(&self) -> Result<()> {
-        ensure!(self.dsa.is_none(),
-            "Kimi K3.1 Gated DSA execution is not yet installed: requires native NoPE indexer, token top-k and index-cache prefix restore (#1777)");
+        self.validate_attention_role(false)
+    }
+
+    /// Explicit golden entry point; never selected from checkpoint metadata.
+    pub fn validate_attention_role(&self, golden: bool) -> Result<()> {
+        ensure!(golden || self.dsa.is_none(),
+            "Kimi K3.1 Gated DSA serving is unqualified; use the explicit golden diagnostic (#1777)");
         Ok(())
     }
 
@@ -313,6 +318,8 @@ pub(crate) mod tests {
         assert_eq!(index.key_cache_bytes(64, 2)?, 16384);
         assert_eq!(index.selection_bytes(16)?, 16 * 2048 * 4);
         assert!(cfg.validate_attention_runtime().unwrap_err().to_string().contains("Gated DSA"));
+        cfg.validate_attention_role(true)?;
+        assert!(cfg.validate_attention_role(false).is_err());
         cfg.validate_speculation(false)?;
         assert!(cfg.validate_speculation(true).is_err());
         KimiK3Config::from_hf(&release_config())?.validate_attention_runtime()?;

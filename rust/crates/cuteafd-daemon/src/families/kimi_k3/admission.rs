@@ -65,6 +65,7 @@ pub(super) fn check_prefix(full: &KimiK3Config, selected: &KimiK3Config) -> Resu
 /// engine supplies its native programs' lane extents, exchange, graphs and
 /// page tables; global weights, token IO and state banks add their own demands.
 pub(crate) struct Inputs<'a, const RANKS: usize = 2> {
+    pub skip_routed_experts: bool,
     pub expert_usage: bool,
     pub cfg: &'a KimiK3Config,
     pub resident_weight_limit: ResidentWeights,
@@ -133,6 +134,7 @@ pub(crate) fn plan_rtx_for_ranks(cfg: &KimiK3Config, catalog: &cuteafd_loader::O
 }
 
 pub(crate) struct Admission<'a> {
+    pub skip_routed_experts: bool,
     pub expert_usage: Option<cuteafd_core::expert_usage::Geometry>,
     pub placement: Placement,
     pub host_prefix: Option<cuteafd_hostcache::config::Config>,
@@ -483,6 +485,21 @@ impl<'a> Admission<'a> {
         Ok(weights.into_iter().map(Some).collect())
     }
 
+    pub(crate) fn load_skipped_routed<const RANKS: usize>(&mut self,
+        devices: [Device<'a>; RANKS], checkpoint: &cuteafd_loader::plan::Checkpoint,
+        streams: [*mut std::ffi::c_void; RANKS],
+        memory: &mut crate::shared::inventory::StartupMemoryPhases<'_>) -> Result<LoadedWeights<'a>> {
+        ensure!(self.skip_routed_experts && self.spark_ranks == 0 && self.rtx.is_none() && self.expert_usage.is_none()
+            && self.placement.layers.iter().all(|layer| layer.experts == ExpertHome::Dense),
+            "Kimi skipped-routed mount cannot contain admitted expert owners");
+        check_prefix(&KimiK3Config::from_hf(&checkpoint.config)?, &self.cfg)?;
+        let streams = devices.iter().zip(streams).map(|(device, stream)| (device.id, stream)).collect::<Vec<_>>();
+        let mount = crate::shared::experts::rtx::dense::DenseLoad::mount(devices[0].library);
+        let owners = self.record(&devices, checkpoint, &mount, &streams, memory)?;
+        mount.release();
+        self.register(&devices, owners)
+    }
+
     /// Every global and layer owner through the shared records on `load`.
     #[allow(clippy::type_complexity)]
     fn record(&mut self, devices: &[Device<'a>], checkpoint: &cuteafd_loader::plan::Checkpoint,
@@ -699,6 +716,7 @@ pub(crate) fn admit<'a, const RANKS: usize>(mut inputs: Inputs<'_, RANKS>) -> Re
     let lanes = inputs.lanes as u64;
     let inputs_waves = inputs.waves;
     let spark_ranks = inputs.spark_ranks;
+    let skip_routed_experts = inputs.skip_routed_experts;
     let unit_rows = cuteafd_loader::families::kimi_k3::allocation::prefill_shape_with(inputs.rows, inputs.waves,
         inputs.unit_rows)?.unit_rows as usize;
     let lane_layouts = inputs.lane_layouts.iter().map(|pair| pair.to_vec()).collect::<Vec<_>>();
@@ -882,7 +900,7 @@ pub(crate) fn admit<'a, const RANKS: usize>(mut inputs: Inputs<'_, RANKS>) -> Re
     recipe.owners.push(kimi::host_upload_owner(maximum_pages));
     recipe.owners.extend(kimi::stream_slab_owners(RANKS, maximum_pages)?);
     let push_host = kimi::selected_push_host_envelope(cfg, &core, RANKS)?;
-    recipe.owners.extend(kimi::push_host_owners(&push_host, maximum_pages)?);
+    if !skip_routed_experts { recipe.owners.extend(kimi::push_host_owners(&push_host, maximum_pages)?); }
     recipe.owners.extend(kimi::native_load_owners(&core, RANKS, maximum_pages)?);
     let mut host_budget = kimi::host_budget(host_total, host_available);
     host_budget.headroom = host_budget.headroom.max(prefix_args.map_or(0, |args| args.host_cache_headroom_bytes));
@@ -933,7 +951,7 @@ pub(crate) fn admit<'a, const RANKS: usize>(mut inputs: Inputs<'_, RANKS>) -> Re
     let mla_layouts = (0..devices.len()).map(|rank| CacheLayout::for_ranks(cfg, &placement, rank, cache_format, devices.len()))
         .collect::<Result<Vec<_>>>()?;
     let admission = Admission { receipt: admitted.solved, expert_usage: recipe.expert_usage.clone(), placement, host_prefix, mark_selection, graph_set, rtx, rtx_loaded: false, draft, draft_allocated: false, draft_marks_allocated: false, context, context_allocated: false, cfg: cfg.clone(), core, layouts, layer_owners, layer_uploaded, local_bound,
-        devices: devices.to_vec(), lanes, spark_ranks, waves: inputs_waves, unit_rows, lane_layouts, lane_allocated, lane_readers,
+        skip_routed_experts, devices: devices.to_vec(), lanes, spark_ranks, waves: inputs_waves, unit_rows, lane_layouts, lane_allocated, lane_readers,
         kda_layout, kda_allocated: vec![false; devices.len()], kda_owners: vec![Weak::new(); devices.len()],
         mla_layouts, mla_allocated: vec![false; devices.len()], mla_owners: vec![Weak::new(); devices.len()],
         global_layouts, global_uploaded: vec![false; devices.len()], global_owners: vec![Weak::new(); devices.len()],
@@ -964,8 +982,10 @@ fn request<const RANKS: usize>(mut i: Inputs<'_, RANKS>) -> Result<PlacementRequ
     let cfg = i.cfg;
     ensure!(cfg.layers > 0 && cfg.layers == cfg.attention.len() && cfg.layers == cfg.dense.len(),
         "Kimi admission layer inventory differs from checkpoint");
-    ensure!((1..=8).contains(&i.spark_ranks) && (RANKS == 1 || i.peer_access),
-        "Kimi native admission requires 1..8 Spark ranks and peer access for a pair");
+    ensure!((RANKS == 1 || i.peer_access) && if i.skip_routed_experts {
+        i.spark_ranks == 0 && i.rtx.is_none() && i.spark_budget.is_none() && !i.expert_usage && i.draft.is_none()
+    } else { (1..=8).contains(&i.spark_ranks) },
+        "Kimi admission requires real experts, or an explicit peer-free skipped-routed golden without expert owners/drafter");
     ensure!(i.devices.iter().all(|device| *device >= 0) && (RANKS == 1 || i.devices[0] != i.devices[1]),
         "Kimi admitted devices must be distinct CUDA ordinals");
     ensure!(i.context.is_some() == (i.attention == Some(AttentionPlacement::Context)),
@@ -1044,7 +1064,7 @@ fn request<const RANKS: usize>(mut i: Inputs<'_, RANKS>) -> Result<PlacementRequ
             fixed.push(demand);
         }
     }
-    for lane in 0..i.lanes {
+    for lane in 0..if i.skip_routed_experts { 0 } else { i.lanes } {
         let demand = super::spark::admitted_demand_on(i.waves, unit, lane, i.spark_ranks, RANKS - 1,
             cuteafd_core::SparkReplyFormat::resolve(cuteafd_core::spark_reply::requested().prefill, false))?;
         ensure!(!fixed.iter().chain(&i.startup).any(|item| item.gpu == demand.gpu && item.group == demand.group),
@@ -1109,7 +1129,7 @@ fn request<const RANKS: usize>(mut i: Inputs<'_, RANKS>) -> Result<PlacementRequ
                 unit_bytes_context: (mla && i.context.is_some()).then_some([record / 2 + index; 2]) },
             fixed_bytes: ModeBytes::default(), extra: vec![], context_indexer: false, colocate: None,
             // admit() installs the checkpoint's TP2 rank-slice costs before solve.
-            experts: (!cfg.dense[layer]).then_some(ExpertCost { whole: Bytes2::default(),
+            experts: (!i.skip_routed_experts && !cfg.dense[layer]).then_some(ExpertCost { whole: Bytes2::default(),
                 half: [Bytes2::default(); 2], tp2: false, whole_supported: true, spark_ok: true }),
             modes: if RANKS == 1 { vec![WHOLE] } else if mla { MODES.to_vec() } else { vec![LayerMode::HeadSplit] } });
     }
@@ -1402,7 +1422,7 @@ pub(super) mod tests {
     }
 
     fn inputs_for_ranks<const RANKS: usize>(cfg: &KimiK3Config) -> Inputs<'_, RANKS> {
-        Inputs { expert_usage: false, cfg, resident_weight_limit: ResidentWeights::DEFAULT_LIMIT, core: Default::default(), cache_format: cuteafd_core::MlaCacheFormat::Bf16, gpus: [GpuBudget { capacity_bytes: 96 << 30, reserve_bytes: 2 << 30,
+        Inputs { skip_routed_experts: false, expert_usage: false, cfg, resident_weight_limit: ResidentWeights::DEFAULT_LIMIT, core: Default::default(), cache_format: cuteafd_core::MlaCacheFormat::Bf16, gpus: [GpuBudget { capacity_bytes: 96 << 30, reserve_bytes: 2 << 30,
             baseline: Baseline::Measured { free_bytes: 96 << 30 } }; RANKS], devices: std::array::from_fn(|rank| rank as i32), peer_access: RANKS == 2, spark_ranks: 6,
             attention: (RANKS == 2).then_some(AttentionPlacement::Layers), context: None, serving_context: cuteafd_loader::placement::planner::Context::pinned(1 << 20), requested_pool: None, state_slots: 2, prefix_marks: 2, rows: 4096, lanes: 2, waves: 2, unit_rows: None, full_prefill_logits: false,
             lane_layouts: vec![std::array::from_fn(|_| LaneLayout::for_ranks(
@@ -2890,6 +2910,28 @@ pub(super) mod tests {
             }
             i.startup.push(changed);
             assert!(admit(i).is_err(), "case {case}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn skipped_routed_golden_has_no_expert_or_transport_demands() -> Result<()> {
+        let cfg = cfg();
+        let mut i = inputs(&cfg);
+        i.skip_routed_experts = true;
+        i.spark_ranks = 0;
+        i.spark_budget = None;
+        let demand = request(i)?;
+        assert!(demand.layers.iter().all(|layer| layer.experts.is_none()));
+        assert!(!demand.fixed.iter().any(|d| d.group.contains("Spark")));
+        for case in 0..3 {
+            let mut i = inputs(&cfg);
+            i.skip_routed_experts = true;
+            i.spark_budget = None;
+            i.spark_ranks = 0;
+            match case { 0 => i.spark_ranks = 1, 1 => i.expert_usage = true,
+                _ => i.skip_routed_experts = false }
+            assert!(request(i).is_err(), "case {case}");
         }
         Ok(())
     }

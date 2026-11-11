@@ -32,7 +32,28 @@ fn stop_before_capture(enabled: bool) -> Result<()> {
     Ok(())
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Role { Serve, Golden { skip_routed_experts: bool } }
+
+impl Role {
+    pub(crate) fn skip_routed_experts(self) -> bool {
+        matches!(self, Self::Golden { skip_routed_experts: true })
+    }
+
+    fn validate(self, cfg: &KimiK3Config, peers: usize, draft: bool) -> Result<()> {
+        cfg.validate_attention_role(matches!(self, Self::Golden { .. }))?;
+        if self.skip_routed_experts() {
+            ensure!(peers == 0 && !draft, "Kimi --skip-routed-experts golden requires zero Spark peers and no drafter");
+        } else {
+            ensure!((1..=cuteafd_core::MAX_SPARK_WORLD).contains(&peers),
+                "Kimi startup requires 1..8 real expert ranks outside the skipped-routed golden");
+        }
+        Ok(())
+    }
+}
+
 pub(crate) struct Options<'a, const RANKS: usize = 2> {
+    pub role: Role,
     pub expert_usage: bool,
     pub expert_usage_reader: cuteafd_core::expert_usage::Reader,
     pub cache_format: cuteafd_core::MlaCacheFormat,
@@ -103,7 +124,8 @@ pub(crate) fn load<'a, const RANKS: usize>(library: &'a Arc<cuteafd_ffi::NativeL
     cfg: &KimiK3Config, mut options: Options<'_, RANKS>) -> Result<Loaded<'a>> {
     ensure!(matches!(RANKS, 1 | 2), "Kimi startup requires one or two physical devices");
     full.validate_speculation(options.draft.is_some())?;
-    full.validate_attention_runtime()?;
+    options.role.validate(full, options.peers.len(), options.draft.is_some())?;
+    let skip_routed_experts = options.role.skip_routed_experts();
     let mut memory = memory_phases(library, &options.devices)?;
     memory.sample("context-before-family-modules")?;
     if RANKS == 2 { options.attention = Some(cuteafd_loader::families::kimi_k3::resolve_attention(options.attention, RANKS)); }
@@ -111,9 +133,6 @@ pub(crate) fn load<'a, const RANKS: usize>(library: &'a Arc<cuteafd_ffi::NativeL
     ensure!(options.draft.as_ref().is_none_or(|draft| draft.cache_format == options.cache_format),
         "Kimi target/draft cache records differ");
     let spark_ranks = options.peers.len();
-    if spark_ranks == 0 {
-        return Err(cuteafd_loader::placement::families::kimi::LOCAL_ONLY_REFUSAL.into());
-    }
     ensure!(spark_ranks <= cuteafd_core::MAX_SPARK_WORLD, "Kimi Spark peer inventory exceeds eight");
     let core = cuteafd_loader::plan::families::kimi::core_inventory(checkpoint)?;
     core.validate_runtime_groups(full)?;
@@ -158,6 +177,7 @@ pub(crate) fn load<'a, const RANKS: usize>(library: &'a Arc<cuteafd_ffi::NativeL
     // The per-Spark cap (`SPARK_MEMORY_CAP`), else Kimi's estimated complete ceiling.
     let spark_budget_bytes = cuteafd_core::memory_policy::MemoryPolicy::current()
         .spark_cap_bytes(cuteafd_loader::families::kimi_k3::SPARK_DEFAULT_BUDGET_BYTES);
+    let (spark_budget, rtx) = if skip_routed_experts { (None, None) } else {
     let catalog = cuteafd_loader::read_expert_catalog_view(checkpoint.view.as_ref()
         .context("Kimi startup requires the immutable selected checkpoint view")?)?;
     let routed = cfg.dense.iter().filter(|dense| !**dense).count();
@@ -177,6 +197,8 @@ pub(crate) fn load<'a, const RANKS: usize>(library: &'a Arc<cuteafd_ffi::NativeL
         let mut inventory = admission::plan_rtx_for_ranks(cfg, &catalog, package, unit, routed, RANKS)?;
         inventory.layers = onboard;
         Some(inventory)
+    };
+    (Some(spark_budget), rtx)
     };
     let expert_modules = devices.iter().map(|&device| rtx.as_ref().map(|inventory| {
         use crate::shared::experts::rtx::{exl3::Exl3Tp2, RtxSelectionPolicy};
@@ -202,7 +224,7 @@ pub(crate) fn load<'a, const RANKS: usize>(library: &'a Arc<cuteafd_ffi::NativeL
             library.peer_abort_initialize()?;
             if diagnostics { library.peer_diagnostic_initialize()?; }
         }
-        library.v41_compact_reducer()?.require_plane_reduction(spark_ranks as u32)?;
+        if !skip_routed_experts { library.v41_compact_reducer()?.require_plane_reduction(spark_ranks as u32)?; }
         Ok(())
     })?;
     memory.sample("modules-shared-peer-reducer")?;
@@ -264,13 +286,13 @@ pub(crate) fn load<'a, const RANKS: usize>(library: &'a Arc<cuteafd_ffi::NativeL
     }).collect::<Vec<_>>().try_into().map_err(|_| anyhow::anyhow!("Kimi GPU sample count"))?;
     let peer_receive = [core.attention_receive_bytes(unit, RANKS)?,
         core.attention_receive_bytes(unit.min(64), RANKS)?];
-    let mut admitted = admission::admit(admission::Inputs { expert_usage: options.expert_usage_reader.configure(options.expert_usage, false).map_err(anyhow::Error::msg)?, cfg, core,
+    let mut admitted = admission::admit(admission::Inputs { skip_routed_experts, expert_usage: options.expert_usage_reader.configure(options.expert_usage, false).map_err(anyhow::Error::msg)?, cfg, core,
         resident_weight_limit: crate::shared::memory::budget::resident_weight_limit(), cache_format: options.cache_format, gpus, devices: options.devices,
         peer_access: RANKS == 2, spark_ranks, attention: options.attention, context: context_layout, serving_context: options.context, requested_pool: options.pool_tokens,
         state_slots: options.slots, prefix_marks: options.marks, rows, lanes: 1, waves: options.waves,
         unit_rows: options.prefill_rows, full_prefill_logits: options.full_prefill_logits, lane_layouts, fixed,
         startup: reserve_demands, pool_bounded: vec![], rtx,
-        spark_budget: Some(spark_budget), draft: draft_layout.clone(), verify_rows, prefix: options.prefix })?;
+        spark_budget, draft: draft_layout.clone(), verify_rows, prefix: options.prefix })?;
     options.max_context = usize::try_from(options.context.served(admitted.placement.pool_tokens))?;
     {
         use sha2::{Digest, Sha256};
@@ -337,7 +359,7 @@ pub(crate) fn load<'a, const RANKS: usize>(library: &'a Arc<cuteafd_ffi::NativeL
     memory.sample("streams-peer-hop")?;
     let draft_layout = admitted.draft_layout().cloned();
     let recorder = crate::shared::experts::rtx::dense::Recorder::start(
-        crate::shared::experts::rtx::push::PushPolicy::for_snapshot(&checkpoint.snapshot)?
+        !skip_routed_experts && crate::shared::experts::rtx::push::PushPolicy::for_snapshot(&checkpoint.snapshot)?
             == crate::shared::experts::rtx::push::PushPolicy::Required)?;
     let draft = options.draft.as_ref().zip(draft_layout.as_ref()).map(|(options, layout)|
         super::draft::NativeDraft::load_for_ranks(&mut admitted, programs, options, lane_streams.to_vec(), layout,
@@ -438,6 +460,28 @@ pub(super) fn exchange_demands(rows: usize, diagnostics: bool) -> Result<Vec<Dem
 mod tests {
     use super::*;
     use cuteafd_loader::families::kimi_k3::core::{CoreInventory,CoreProjection,CoreSplit};
+
+    #[test]
+    fn golden_role_is_explicit_and_skipped_experts_refuse_peers() -> Result<()> {
+        let k3 = cuteafd_loader::plan::testing::kimi_k3_config();
+        let mut k31 = k3.clone();
+        k31["model_type"] = serde_json::json!("kimi_k31");
+        k31["text_config"]["dsa_config"] = serde_json::json!({
+            "dsa_layers":k31["text_config"]["linear_attn_config"]["full_attn_layers"],
+            "index_num_heads":32,"index_head_dim":128,"index_topk":2048,
+            "index_rope_dim":0,"index_k_norm_type":"layernorm","index_topk_freq":1,"index_skip_topk_offset":1});
+        for raw in [k3, k31] {
+            let cfg = KimiK3Config::from_hf(&raw)?;
+            let skipped = Role::Golden { skip_routed_experts: true };
+            skipped.validate(&cfg, 0, false)?;
+            assert!(skipped.validate(&cfg, 1, false).is_err());
+            assert!(skipped.validate(&cfg, 0, true).is_err());
+            assert!(Role::Serve.validate(&cfg, 0, false).is_err());
+            assert!(Role::Golden { skip_routed_experts: false }.validate(&cfg, 0, false).is_err());
+            assert_eq!(Role::Serve.validate(&cfg, 6, false).is_ok(), cfg.dsa.is_none());
+        }
+        Ok(())
+    }
 
     #[test]
     fn memory_diagnostic_defaults_off_and_stops_before_capture() -> Result<()> {

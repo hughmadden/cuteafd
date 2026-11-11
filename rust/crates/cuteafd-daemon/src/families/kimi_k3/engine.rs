@@ -177,7 +177,10 @@ impl<'a> Engine<'a> {
         use crate::shared::placement::{spark_rings, SparkAdmission};
         use cuteafd_core::{ExpertGeometry, SparkEndpoint, SparkIngress};
         use cuteafd_transport::{expert::SparkWorld, worker_selection::ModelAdmission};
-        ensure!(cuteafd_core::expert_geometry() == ExpertGeometry::KIMI_K3 && (1..=8).contains(&peers.len()),
+        let skip_routed_experts = admission.skip_routed_experts;
+        ensure!(if skip_routed_experts { peers.is_empty() } else { !peers.is_empty() },
+            "Kimi expert peer inventory differs from admitted golden treatment");
+        ensure!(cuteafd_core::expert_geometry() == ExpertGeometry::KIMI_K3 && peers.len() <= 8,
             "Kimi startup needs process latent geometry and 1..8 real expert ranks");
         let coordinator_packing_cap = programs.iter().map(|programs| programs.packing_cap).min().unwrap_or(0);
         let plan = admission.execution_plan()?;
@@ -206,6 +209,12 @@ impl<'a> Engine<'a> {
             (None, None) if RANKS == 1 => ensure!(plan.hops().is_empty(), "Kimi single owner cannot have hops"),
             _ => anyhow::bail!("Kimi exchange inventory differs from physical rank count"),
         }
+        let (pending, expert_weights, weights) = if skip_routed_experts {
+            ensure!(draft.is_none(), "Kimi skipped-routed golden cannot use a drafter");
+            let weights = admission.load_skipped_routed(devices, checkpoint,
+                exchange_streams.each_ref().map(|stream| stream.raw), memory)?;
+            (None, (0..RANKS).map(|_| None).collect::<Vec<_>>(), weights)
+        } else {
         let rows = u32::try_from(admission.unit_rows())?;
         let endpoints = vec![SparkEndpoint { ring_depth: None, capacity: rows, ingress: SparkIngress::Fp8K32, partial_reply_bytes: None };
             plan.spec().lanes as usize];
@@ -223,6 +232,8 @@ impl<'a> Engine<'a> {
         // coordinator ranks when the group pushes, else through the mount).
         let (pending, expert_weights, weights) = admission.start_and_load(spark, &peers, devices, checkpoint, &catalog,
             exchange_streams.each_ref().map(|stream| stream.raw), draft_records, memory)?;
+        (Some(pending), expert_weights, weights)
+        };
         let lanes = usize::try_from(plan.spec().lanes)?;
         let allocated = (0..lanes).map(|lane| (0..RANKS).map(|rank|
             admission.allocate_lane_on(devices[rank], rank, lane, lane_streams[rank].clone()))
@@ -276,11 +287,16 @@ impl<'a> Engine<'a> {
         if let Some(draft) = draft.as_mut() { draft.bind_target_ranks(weights.global.clone(), programs[RANKS - 1].clone())?; }
         memory.sample("draft-probe-and-target-bind")?;
         drop((weights, kda, mla));
-        pending.wait()?;
+        if let Some(pending) = pending { pending.wait()?; }
         memory.sample("workers-loaded")?;
-        let world = SparkWorld::canonical(peers.len())?;
-        let routed = local.iter().map(|owners| admission.connect_spark(library, &owners[RANKS - 1],
-            world, peers.clone(), config.clone())).collect::<Result<Vec<_>>>()?;
+        let routed = if skip_routed_experts {
+            local.iter().map(|owners| RoutedLane::skipped_golden(library, &owners[RANKS - 1],
+                admission.waves(), admission.unit_rows())).collect::<Result<Vec<_>>>()?
+        } else {
+            let world = SparkWorld::canonical(peers.len())?;
+            local.iter().map(|owners| admission.connect_spark(library, &owners[RANKS - 1],
+                world, peers.clone(), config.clone())).collect::<Result<Vec<_>>>()?
+        };
         memory.sample("registered-transport-egress-staging")?;
         let prefill = PrefillUnits { unit_rows: admission.unit_rows(), waves: admission.waves() };
         let target_view = checkpoint.view.as_ref()
@@ -288,6 +304,7 @@ impl<'a> Engine<'a> {
         let mut engine = Self::bind(exchange_streams.into(), plan, peer, hops,
             local, routed, io, experts, prefill, coordinator_packing_cap, target_view)?;
         engine.execution.expert_usage = expert_usage;
+        engine.execution.skip_routed_experts = skip_routed_experts;
         engine.max_pool_tokens_no_onboard = admission.placement.max_pool_tokens_no_onboard;
         engine.host_prefix = admission.host_prefix.take();
         engine.draft = draft.map(Rc::new);

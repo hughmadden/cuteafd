@@ -40,6 +40,32 @@ ARITHMETIC = {
 }
 
 
+SKIPPED_ROUTED_TREATMENT = "router+shared-experts; routed contribution zero"
+
+
+def skip_routed_experts(layer):
+    """Explicit diagnostic treatment, shared by the K3 and K3.1 oracle."""
+    block = getattr(layer, "block_sparse_moe", None)
+    if block is None:
+        return layer
+    if getattr(block, "_skip_routed_experts", False):
+        return layer
+    if not hasattr(block, "gate") or not hasattr(block, "shared_experts"):
+        raise ValueError("skipped-routed diagnostic requires router and bundled shared expert")
+    # Remove routed parameters before header validation, memory admission or load.
+    for name in ("experts", "routed_expert_down_proj", "routed_expert_norm", "routed_expert_up_proj"):
+        if hasattr(block, name):
+            delattr(block, name)
+
+    def forward(self, hidden_states):
+        self.gate(hidden_states)
+        return self.shared_experts(hidden_states)
+
+    block.forward = types.MethodType(forward, block)
+    block._skip_routed_experts = True
+    return layer
+
+
 def base_snapshot(snapshot):
     from . import model
     return Path(snapshot).parents[2] / "models--moonshotai--Kimi-K3" / "snapshots" / model.REVISION

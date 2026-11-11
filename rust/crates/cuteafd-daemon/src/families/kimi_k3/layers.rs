@@ -31,6 +31,7 @@ type DraftProbe<'a> = RefCell<Option<crate::shared::memory::device::DeviceOwner<
     crate::shared::draft::probe::RoundProbe<'a>>>>;
 
 pub(crate) struct Execution<'a> {
+    pub skip_routed_experts: bool,
     pub expert_usage: Option<Rc<cuteafd_ffi::expert_usage::ExpertUsage<'a>>>,
     pub usage_phase: Cell<cuteafd_ffi::expert_usage::UsagePhase>,
     pub plan: LayerExecutionPlan,
@@ -96,7 +97,7 @@ impl<'a> Execution<'a> {
             let narrow = streams[0].device.run(|| streams[0].device.library.f32_bf16_narrow())?;
             Ok(LaneJoins { streams, produced, landed, reducer, narrow })
         }).collect::<Result<_>>()?;
-        Ok(Self { expert_usage: None, usage_phase: Cell::new(cuteafd_ffi::expert_usage::UsagePhase::Prefill), plan, lanes, entry_lane: Cell::new(None), state_ready, state_pending })
+        Ok(Self { skip_routed_experts: false, expert_usage: None, usage_phase: Cell::new(cuteafd_ffi::expert_usage::UsagePhase::Prefill), plan, lanes, entry_lane: Cell::new(None), state_ready, state_pending })
     }
 
     /// The family has no second scheduler: use the shared layer-major pipeline
@@ -649,7 +650,7 @@ impl<'e, 'a, 's> Bindings<'e, 'a, 's> {
                 }
                 Ok(())
             })?;
-            if rtx {
+            if self.execution.skip_routed_experts { None } else if rtx {
                 let stream = self.local[0].stream();
                 let expert = self.experts[0].as_mut().context("Kimi whole expert absent")?;
                 ensure!(expert.shard() == RtxShard::Whole && expert.device() == stream.device.id,
@@ -953,7 +954,8 @@ impl PipelineKernels for Bindings<'_, '_, '_> {
         let owner = if dense { 0 } else { super::weights::routed_owner(self.local[0].config(), layer)? };
         let rtx = !dense && self.experts.iter().any(|expert|
             expert.as_ref().is_some_and(|e| e.layers().contains(&layer)));
-        let spark = if dense {
+        let spark = if dense || self.execution.skip_routed_experts {
+            if !dense { self.local[owner].route(layer, self.rows, None)?; }
             for local in self.local.iter_mut() { local.ffn(layer, self.rows)?; }
             None
         } else {
@@ -1104,7 +1106,7 @@ impl crate::shared::prefill_pipeline::PrefillHooks for UnitHooks<'_, '_, '_, '_>
         // ones hold a wave across hooks.
         let cfg = self.binding.local[0].config();
         let rtx = self.binding.experts.iter().any(|expert| expert.as_ref().is_some_and(|e| e.layers().contains(&layer)));
-        if cfg.dense[layer] || rtx { crate::shared::prefill_pipeline::FfnRoute::Local }
+        if cfg.dense[layer] || rtx || self.binding.execution.skip_routed_experts { crate::shared::prefill_pipeline::FfnRoute::Local }
         else { crate::shared::prefill_pipeline::FfnRoute::Spark }
     }
     fn begin_unit(&mut self, unit: &crate::shared::prefill_pipeline::Unit) -> Result<()> {

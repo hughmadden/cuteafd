@@ -316,3 +316,33 @@ def test_rust_golden_vectors_match_pinned_python_reference():
             outputs.append((probabilities @ v[ids]) * gate[position].sigmoid())
         torch.testing.assert_close(torch.stack(outputs), tensor("gated_values", 5, 2),
             rtol=3e-5, atol=3e-6)
+
+
+def test_skipped_routed_diagnostic_keeps_router_and_shared_only():
+    torch = pytest.importorskip("torch")
+    calls = []
+
+    class Gate(torch.nn.Module):
+        def forward(self, hidden):
+            calls.append(hidden.clone())
+            return torch.zeros(1, dtype=torch.long), torch.ones(1)
+
+    block = torch.nn.Module()
+    block.gate = Gate()
+    block.shared_experts = torch.nn.Linear(4, 4, bias=False)
+    block.experts = torch.nn.ModuleList([torch.nn.Linear(4, 4)])
+    block.routed_expert_down_proj = torch.nn.Linear(4, 2)
+    block.routed_expert_up_proj = torch.nn.Linear(2, 4)
+    block.routed_expert_norm = torch.nn.LayerNorm(2)
+    layer = torch.nn.Module()
+    layer.block_sparse_moe = block
+    hidden = torch.randn(2, 4)
+    expected = block.shared_experts(hidden)
+    assert k31.skip_routed_experts(layer) is layer
+    assert k31.skip_routed_experts(layer) is layer
+    assert torch.equal(block(hidden), expected)
+    assert len(calls) == 1
+    assert all(name.startswith("block_sparse_moe.shared_experts.") for name, _ in layer.named_parameters())
+    assert not hasattr(block, "experts")
+    dense = torch.nn.Module()
+    assert k31.skip_routed_experts(dense) is dense

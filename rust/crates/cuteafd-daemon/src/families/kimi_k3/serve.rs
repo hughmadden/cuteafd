@@ -109,7 +109,7 @@ fn load_target<'a, const RANKS: usize>(args: &ServeArgs,
     -> Result<startup::Loaded<'a>> {
     let draft = args.draft.as_ref().map(|snapshot| super::draft::Options {
         snapshot: snapshot.clone(), fp8: args.draft_fp8, tp2_dflash: args.tp2_dflash, cache_format: args.kv_cache });
-    startup::load(library, programs, checkpoint, cfg, cfg, startup::Options {
+    startup::load(library, programs, checkpoint, cfg, cfg, startup::Options { role: startup::Role::Serve,
         expert_usage: args.expert_usage, expert_usage_reader: args.expert_usage_reader.clone(),
         cache_format: args.kv_cache, devices, native_lib: &args.native_lib, manifest: &args.manifest,
         attention: cuteafd_loader::placement::attention::parse(&args.attention_placement).map_err(anyhow::Error::msg)?,

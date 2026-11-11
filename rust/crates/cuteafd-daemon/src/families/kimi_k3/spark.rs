@@ -66,6 +66,15 @@ impl Drop for RoutedLane<'_> {
 }
 
 impl<'a> RoutedLane<'a> {
+    pub(super) fn skipped_golden(library: &'a Arc<cuteafd_ffi::NativeLibrary>,
+        local: &LocalLane<'a>, waves: usize, unit: usize) -> Result<Self> {
+        ensure!(std::ptr::eq(library.as_ref(), local.stream().device.library) && waves > 0 && unit > 0,
+            "Kimi skipped-routed lane binding differs");
+        Ok(Self { stream: local.stream().clone(), link: None, library_owner: Arc::clone(library),
+            terminal: false, capacity: unit, waves, unit, sequence: std::cell::Cell::new(0),
+            outstanding: std::collections::VecDeque::new() })
+    }
+
     pub(super) fn connect(library_owner: &'a Arc<cuteafd_ffi::NativeLibrary>,
         local: &LocalLane<'a>, placement: &Placement, world: SparkWorld,
         peers: Vec<SocketAddr>, config: TcpTransportConfig, waves: usize, unit: usize,
