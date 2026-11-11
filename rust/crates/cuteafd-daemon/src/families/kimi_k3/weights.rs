@@ -348,6 +348,15 @@ impl PackedLayer {
             KimiAttention::Mla => {
                 let owners: Vec<_> = shares.iter().enumerate().filter(|(_, share)| share.present())
                     .map(|(rank, _)| rank).collect();
+                if cfg.dsa.is_some() {
+                    use cuteafd_loader::families::kimi_k3::dsa::{load_native, IndexerOperand};
+                    for operand in IndexerOperand::ALL {
+                        let tensor = load_native(cfg, layer, operand, &mut read)?;
+                        for &owner in &owners {
+                            pair[owner].operands.insert(operand.arena_name(), tensor.bytes.clone());
+                        }
+                    }
+                }
                 for (operand, name) in [(MlaOperand::QkvA, "mla.qkv_a"), (MlaOperand::QNorm, "mla.q_norm"),
                     (MlaOperand::KvNorm, "mla.kv_norm"), (MlaOperand::QB, "mla.q_b"), (MlaOperand::Uk, "mla.uk"),
                     (MlaOperand::Uv, "mla.uv"), (MlaOperand::Gate, "mla.gate"), (MlaOperand::Output, "mla.output")] {
@@ -639,6 +648,39 @@ mod tests {
             }
         }
         for layer in [0, 2, 5, 7, usize::MAX] { assert!(routed_owner(&cfg, layer).is_err()); }
+        Ok(())
+    }
+
+    #[test]
+    fn k31_indexer_native_bytes_follow_every_attention_owner() -> Result<()> {
+        use cuteafd_loader::families::kimi_k3::{config::KimiDsaConfig, dsa::IndexerOperand};
+        let mut cfg = cfg();
+        cfg.dsa = Some(KimiDsaConfig { heads: 2, head_dim: 4, topk: 2 });
+        for mode in [LayerMode::HeadSplit, LayerMode::ContextSplit,
+            LayerMode::Whole { gpu: 1, ffn: FfnMode::Split }] {
+            let packed = PackedLayer::pair(&cfg, 3, mode, |name| {
+                if name.contains(".indexer.") {
+                    let (_, shape) = IndexerOperand::ALL.into_iter().map(|op| op.specification(&cfg, 3).unwrap())
+                        .find(|(key, _)| key == name).unwrap();
+                    let mut value = tensor("test.weight")?;
+                    value.info.name = name.into();
+                    value.info.shape = shape.clone();
+                    value.bytes = (0..shape.iter().product::<usize>() as u16).flat_map(u16::to_le_bytes).collect();
+                    value.info.byte_length = value.bytes.len() as u64;
+                    Ok(value)
+                } else { tensor(name) }
+            })?;
+            for rank in &packed {
+                for operand in IndexerOperand::ALL {
+                    assert_eq!(rank.operands.contains_key(operand.arena_name()), rank.attention.present());
+                    if rank.attention.present() {
+                        let (_, shape) = operand.specification(&cfg, 3)?;
+                        let expected: Vec<u8> = (0..shape.iter().product::<usize>() as u16).flat_map(u16::to_le_bytes).collect();
+                        assert_eq!(rank.operands[operand.arena_name()], expected);
+                    }
+                }
+            }
+        }
         Ok(())
     }
 

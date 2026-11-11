@@ -14,23 +14,29 @@ impl IndexerOperand {
         match self { Self::Query => "mla.indexer.q", Self::Key => "mla.indexer.k",
             Self::Heads => "mla.indexer.weights", Self::Norm => "mla.indexer.norm", Self::Bias => "mla.indexer.bias" }
     }
+
+    pub const ALL: [Self; 5] = [Self::Query, Self::Key, Self::Heads, Self::Norm, Self::Bias];
+
+    pub fn specification(self, cfg: &super::config::KimiK3Config, layer: usize) -> Result<(String, Vec<usize>)> {
+        ensure!(cfg.attention.get(layer) == Some(&super::config::KimiAttention::Mla), "Kimi indexer requires a DSA layer");
+        let index = cfg.dsa.context("Kimi indexer requires K3.1 DSA config")?;
+        index.geometry().validate()?;
+        let width = index.heads.checked_mul(index.head_dim).context("Kimi index query extent overflow")?;
+        let (leaf, shape) = match self {
+            Self::Query => ("wq_b.weight", vec![width, cfg.q_lora_rank]),
+            Self::Key => ("wk.weight", vec![index.head_dim, cfg.hidden]),
+            Self::Heads => ("weights_proj.weight", vec![index.heads, cfg.hidden]),
+            Self::Norm => ("k_norm.weight", vec![index.head_dim]),
+            Self::Bias => ("k_norm.bias", vec![index.head_dim]),
+        };
+        Ok((format!("language_model.model.layers.{layer}.self_attn.indexer.{leaf}"), shape))
+    }
 }
 
 pub fn load_native(cfg: &super::config::KimiK3Config, layer: usize, operand: IndexerOperand,
     mut read: impl FnMut(&str) -> Result<crate::tensors::LoadedTensor>) -> Result<crate::tensors::LoadedTensor> {
-    ensure!(cfg.attention.get(layer) == Some(&super::config::KimiAttention::Mla), "Kimi indexer requires a DSA layer");
-    let index = cfg.dsa.context("Kimi indexer requires K3.1 DSA config")?;
-    index.geometry().validate()?;
-    let width = index.heads.checked_mul(index.head_dim).context("Kimi index query extent overflow")?;
-    let (leaf, shape) = match operand {
-        IndexerOperand::Query => ("wq_b.weight", vec![width, cfg.q_lora_rank]),
-        IndexerOperand::Key => ("wk.weight", vec![index.head_dim, cfg.hidden]),
-        IndexerOperand::Heads => ("weights_proj.weight", vec![index.heads, cfg.hidden]),
-        IndexerOperand::Norm => ("k_norm.weight", vec![index.head_dim]),
-        IndexerOperand::Bias => ("k_norm.bias", vec![index.head_dim]),
-    };
+    let (name, shape) = operand.specification(cfg, layer)?;
     let bytes = shape.iter().try_fold(2usize, |n, &d| n.checked_mul(d)).context("Kimi indexer operand extent overflow")?;
-    let name = format!("language_model.model.layers.{layer}.self_attn.indexer.{leaf}");
     let tensor = read(&name).with_context(|| format!("read native indexer {name}"))?;
     ensure!(tensor.info.name == name && tensor.info.dtype == cuteafd_core::DType::Bf16
         && tensor.info.shape == shape && tensor.bytes.len() == bytes && tensor.info.byte_length == bytes as u64,

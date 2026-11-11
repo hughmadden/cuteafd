@@ -437,6 +437,16 @@ impl<'l, 'a> KimiRecords<'l, 'a> {
         let fused = layouts[owners[0]].operands.contains_key("mla.qkv_a");
         let (heads, nope, v, lat) = (cfg.heads, cfg.qk_nope_dim, cfg.v_head_dim, cfg.kv_lora_rank);
         let local = heads / owners.len();
+        if cfg.dsa.is_some() {
+            use cuteafd_loader::families::kimi_k3::dsa::IndexerOperand;
+            for operand in IndexerOperand::ALL {
+                let (name, shape) = operand.specification(cfg, layer)?;
+                for &owner in &owners {
+                    ops[owner].insert(operand.arena_name(), self.whole(devices[owner],
+                        operand.arena_name(), &name, DType::Bf16, &shape)?);
+                }
+            }
+        }
         let kv_b = format!("{root}.kv_b_proj.weight");
         expect(self.checkpoint, &kv_b, DType::Bf16, &[heads * (nope + v), lat])?;
         for (index, &owner) in owners.iter().enumerate() {

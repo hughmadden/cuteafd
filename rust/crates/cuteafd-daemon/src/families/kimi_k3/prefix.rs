@@ -97,7 +97,10 @@ impl<'a> KimiPrefix<'a> {
         ensure!(mla.iter().all(|bank| bank.parity() == parity), "Kimi prefix page ownership differs between ranks");
         let geometry = cuteafd_loader::families::kimi_k3::kda::cache_geometry_for_ranks(cfg, &resident, mla[0].format())?;
         let resident_page_bytes: usize = geometry.ranks.iter().map(|rank| rank.persistent_unit_bytes as usize).sum();
-        let page_bytes = if parity { resident_page_bytes / 2 } else { resident_page_bytes };
+        let page_bytes = if parity {
+            let index_bytes = resident.iter().sum::<usize>() * mla[0].index_page_bytes();
+            (resident_page_bytes - index_bytes) / 2 + index_bytes
+        } else { resident_page_bytes };
         let mark_bytes = geometry.ranks.iter().map(|rank| rank.retained_mark_bytes as usize).sum();
         ensure!(mark_bytes == kda.iter().map(|bank| bank.mark_bytes()).sum::<usize>(), "Kimi prefix KDA shard geometry differs");
         ensure!(page_bytes > 0, "Kimi prefix has no resident MLA pages");
@@ -210,10 +213,13 @@ impl<'a> KimiPrefix<'a> {
     fn page_buffers(&self, rank: usize, page: u32, rows: usize) -> Result<Vec<CuteafdDeviceBuffer>> {
         ensure!((page as usize) < self.0.layout.pages && (1..=MLA_PAGE_ROWS).contains(&rows),
             "Kimi prefix page copy outside admission");
-        if !self.0.mla[rank].owns_page(page) { return Ok(Vec::new()); }
-        self.0.cfg.attention.iter().enumerate().filter(|(layer, kind)|
-            **kind == KimiAttention::Mla && self.0.mla[rank].layer(*layer).is_ok())
-            .map(|(layer, _)| self.0.mla[rank].page(layer, page as usize, rows)).collect()
+        let mut segments = Vec::new();
+        for (layer, kind) in self.0.cfg.attention.iter().enumerate() {
+            if *kind == KimiAttention::Mla && self.0.mla[rank].layer(layer).is_ok() {
+                segments.extend(self.0.mla[rank].page_segments(layer, page as usize, rows)?);
+            }
+        }
+        Ok(segments)
     }
 
     fn move_mark(&self, mark: MarkSlot, slot: usize, capture: bool) -> Result<()> {
@@ -292,6 +298,12 @@ impl PrefixFamily<SnapshotMeta> for KimiPrefix<'_> {
     }
 
     fn record_format(&self) -> &'static str {
+        if self.0.cfg.dsa.is_some() {
+            return match self.0.mla[0].format() {
+                cuteafd_core::MlaCacheFormat::Bf16 => "kimi_k31_bf16_mla_e4m3_pow2_index_v1",
+                cuteafd_core::MlaCacheFormat::Fp8 => "kimi_k31_fp8_mla_e4m3_pow2_index_v1",
+            };
+        }
         match self.0.mla[0].format() {
             cuteafd_core::MlaCacheFormat::Bf16 => "kimi_k3_bf16_mla_tp2_kda_f32_v1",
             cuteafd_core::MlaCacheFormat::Fp8 => "kimi_k3_ds_fp8_mla_tp2_kda_f32_v1",
