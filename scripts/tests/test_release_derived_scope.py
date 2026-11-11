@@ -568,6 +568,7 @@ def test_kimi_program_sources_agree_with_checkpoint_metadata(tmp_path, monkeypat
     spec = importlib.util.spec_from_file_location('k31_placement_inputs', REPO / 'scripts/build/export-placement-inputs.py')
     publisher = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(publisher)
+    monkeypatch.setattr(publisher, 'live_configs', lambda: [])
     args = publisher.export_jobs()[0][2]
     assert shipped <= set(args[args.index('--geometry') + 1].split(','))
     assert wanted <= shipped
