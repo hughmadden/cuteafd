@@ -8,7 +8,9 @@ only `CORE_VIEW=original` is supported. New WIP examples:
 [min, 1 RTX + 5 Sparks](../../examples/configs/mistral-large4-exl3-k4-min.config)
 and [max, 2 RTX + 6 Sparks](../../examples/configs/mistral-large4-exl3-k4-max.config).
 These preserve the earlier layouts and bundled dSpark; the new checkpoint
-has no benchmark cards yet.
+has no benchmark cards yet. They require an engine with MC `CORE_VIEW` support
+(dev after #1778; first release after v5.0.0); v5.0.0 and the image tags
+retained from the earlier configs cannot run these recipes.
 
 Previously served as `wrldsuksgo2mars/Mistral-Large-4-EXL3-K4-Core-K6`
 at revision `03c80aebaa483d55760703ae5bc0c9734c9d67d6`, with a native K6
