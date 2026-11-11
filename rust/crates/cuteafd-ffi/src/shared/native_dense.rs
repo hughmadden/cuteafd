@@ -428,6 +428,7 @@ impl<'a> DenseLinear<'a> {
 pub struct Mxfp8A8<'a> {
     linear: DenseLinear<'a>,
     quantizer: super::native_dense_glue::Companion<'a>,
+    narrow: super::v41_device_ops::F32Bf16Narrow<'a>,
     library: &'a crate::NativeLibrary,
     device: i32,
 }
@@ -451,7 +452,8 @@ impl<'a> Mxfp8A8<'a> {
         let device = library.cuda_get_device().map_err(|e| invalid(e.to_string()))?;
         let linear = DenseLinear::bind(programs, linear)?;
         let quantizer = Companion::bind(programs, quantizer, expected).map_err(|e| invalid(e.to_string()))?;
-        Ok(Self { linear, quantizer, library, device })
+        let narrow = library.f32_bf16_narrow().map_err(|e| invalid(e.to_string()))?;
+        Ok(Self { linear, quantizer, narrow, library, device })
     }
 
     pub fn geometry(&self) -> DenseGeometry { self.linear.geometry() }
@@ -484,6 +486,20 @@ impl<'a> Mxfp8A8<'a> {
             records.bytes as u64, output.ptr, rows, 0, stream) }
     }
 
+    /// Consume the F32 projection at the reference's BF16 rounding boundary.
+    /// The separately admitted destination remains caller-owned; enqueue this on
+    /// the projection stream before the serial F32 temporary is reused.
+    pub fn narrow(&self, rows: u32, source: crate::CuteafdDeviceBuffer,
+        destination: crate::CuteafdDeviceBuffer, stream: *mut c_void) -> Result<()> {
+        validate_mxfp8_narrow(self.geometry(), rows, [source, destination], self.device)?;
+        self.current_device()?;
+        let count = mxfp8_extent(&[u64::from(rows), self.geometry().output_features])?;
+        // SAFETY: F32/BF16 extents, alignment, bound device and nonaliasing were
+        // checked. The owner orders this after projection and retains both buffers.
+        unsafe { self.narrow.launch(source.ptr, destination.ptr, count, stream) }
+            .map_err(|e| invalid(e.to_string()))
+    }
+
     fn current_device(&self) -> Result<()> {
         if self.library.cuda_get_device().map_err(|e| invalid(e.to_string()))? != self.device {
             return Err(invalid("MXFP8 launch is not on its bound device"));
@@ -495,6 +511,19 @@ impl<'a> Mxfp8A8<'a> {
 fn mxfp8_extent(values: &[u64]) -> Result<usize> {
     values.iter().try_fold(1u64, |a, b| a.checked_mul(*b))
         .and_then(|bytes| usize::try_from(bytes).ok()).ok_or_else(|| invalid("MXFP8 operand extent overflow"))
+}
+
+fn validate_mxfp8_narrow(g: DenseGeometry, rows: u32,
+    buffers: [crate::CuteafdDeviceBuffer; 2], device: i32) -> Result<()> {
+    if g.encoding != Encoding::Mxfp8A8 || buffers[0].device_id != device {
+        return Err(invalid("MXFP8 encoding or bound device"));
+    }
+    g.scratch_bytes(rows)?;
+    let count = mxfp8_extent(&[u64::from(rows), g.output_features])?;
+    let source = count.checked_mul(4).ok_or_else(|| invalid("MXFP8 narrowing extent"))?;
+    let destination = count.checked_mul(2).ok_or_else(|| invalid("MXFP8 narrowing extent"))?;
+    super::projected_buffers::validate_buffers(&[(buffers[0], source), (buffers[1], destination)],
+        &[4, 2], &[1]).map_err(invalid)
 }
 
 fn validate_mxfp8_quantize(g: DenseGeometry, rows: u32,
@@ -778,6 +807,25 @@ mod tests {
                 quant[2], buffer(0x40000000, rows as usize * 32 * 4)];
             validate_mxfp8_quantize(g, rows, quant, 1).unwrap();
             validate_mxfp8_project(g, rows, project, 1).unwrap();
+            let narrow = [project[4], buffer(0x50000000, rows as usize * 32 * 2)];
+            validate_mxfp8_narrow(g, rows, narrow, 1).unwrap();
+            for index in 0..narrow.len() {
+                for mutation in 0..6 {
+                    let mut bad = narrow;
+                    match mutation {
+                        0 => bad[index].bytes -= 1,
+                        1 => bad[index].ptr = std::ptr::null_mut(),
+                        2 => bad[index].device_id = 0,
+                        3 => bad[index].flags = 1,
+                        4 => bad[index].ptr = ((bad[index].ptr as usize) + 1) as *mut c_void,
+                        _ => bad[index].ptr = (usize::MAX - 7) as *mut c_void,
+                    }
+                    assert!(validate_mxfp8_narrow(g, rows, bad, 1).is_err(), "narrow {index}/{mutation}");
+                }
+            }
+            let mut overlapping = narrow;
+            overlapping[1].ptr = overlapping[0].ptr;
+            assert!(validate_mxfp8_narrow(g, rows, overlapping, 1).is_err());
             for index in 0..quant.len() {
                 for mutation in 0..6 {
                     let mut bad = quant;
@@ -820,7 +868,9 @@ mod tests {
             for invalid in [0, 4097, u32::MAX] {
                 assert!(validate_mxfp8_quantize(g, invalid, quant, 1).is_err());
                 assert!(validate_mxfp8_project(g, invalid, project, 1).is_err());
+                assert!(validate_mxfp8_narrow(g, invalid, narrow, 1).is_err());
             }
+            assert!(validate_mxfp8_narrow(g, rows, narrow, 0).is_err());
             assert!(validate_mxfp8_quantize(g, rows, quant, 0).is_err());
             assert!(validate_mxfp8_project(g, rows, project, 0).is_err());
         }
@@ -858,7 +908,7 @@ mod tests {
         let op = Mxfp8A8::bind(&programs, names[0]["name"].as_str().unwrap(), names[1]["name"].as_str().unwrap())?;
         assert_eq!(fixture.events()?.matches('D').count(), 0);
         let mut buffers = Vec::new();
-        for bytes in [8, 17 * 128 * 2, 2 * 4 * 528, 4096, 128, 17 * 32 * 4] {
+        for bytes in [8, 17 * 128 * 2, 2 * 4 * 528, 4096, 128, 17 * 32 * 4, 17 * 32 * 2] {
             buffers.push(library.alloc_device_buffer(bytes, crate::memory_ledger::Tag::workspace("fixture/mxfp8"))?);
         }
         library.copy_h2d(buffers[0], &(buffers[1].ptr as u64).to_le_bytes())?;
@@ -874,10 +924,22 @@ mod tests {
         for _ in 0..2 { op.project(17, views[0], views[3], views[4], views[2], views[5], stream)?; }
         assert_eq!(fixture.events()?.matches('Q').count(), 1);
         assert_eq!(fixture.events()?.matches('P').count(), 2);
-        assert_eq!(fixture.events()?.matches('D').count(), 6);
+        assert_eq!(fixture.events()?.matches('D').count(), 7);
+        let values = [1.0f32, 1.00390625, -2.0078125, 0.33333334];
+        let expected = [0x3f80u16, 0x3f80, 0xc000, 0x3eab];
+        let source = values.iter().cycle().take(17 * 32)
+            .flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>();
+        library.copy_h2d(buffers[5], &source)?;
+        op.narrow(17, views[5], views[6], stream)?;
+        let mut actual = vec![0u8; 17 * 32 * 2];
+        library.copy_d2h(&mut actual, buffers[6])?;
+        for (index, bytes) in actual.chunks_exact(2).enumerate() {
+            assert_eq!(u16::from_le_bytes([bytes[0], bytes[1]]), expected[index % expected.len()]);
+        }
         library.cuda_set_device(1)?;
         assert!(op.quantize(17, views[0], views[1], views[2], stream).is_err());
         assert!(op.project(17, views[0], views[3], views[4], views[2], views[5], stream).is_err());
+        assert!(op.narrow(17, views[5], views[6], stream).is_err());
         library.cuda_set_device(0)?;
         assert_eq!(fixture.events()?.matches('Q').count(), 1);
         assert_eq!(fixture.events()?.matches('P').count(), 2);

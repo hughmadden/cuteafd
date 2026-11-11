@@ -132,12 +132,12 @@ pub(crate) struct Prepared<'o, 'p, 'a> {
     stream: *mut c_void,
 }
 
-impl Prepared<'_, '_, '_> {
-    /// Temporary F32 output: retain/narrow any needed result before the next
-    /// projection. Native checkpoint weights are consumed directly from aliases.
-    pub fn project(&mut self, weights: &TargetWeights<'_>,
+impl<'o, 'p, 'a> Prepared<'o, 'p, 'a> {
+    /// The result borrows this prepared owner exclusively. A sibling cannot
+    /// overwrite its F32 temporary until the result is consumed or discarded.
+    pub fn project<'r>(&'r mut self, weights: &TargetWeights<'_>,
         projection: &cuteafd_loader::families::minimax_m3::weight_layout::Mxfp8Projection)
-        -> Result<CuteafdDeviceBuffer> {
+        -> Result<ProjectionOutput<'r, 'o, 'p, 'a>> {
         ensure!(projection.input == self.width, "MiniMax prepared input width differs");
         let linear = self.programs.linears.get(&projection.program_name())
             .ok_or_else(|| anyhow::anyhow!("MiniMax unbound dense projection"))?;
@@ -151,7 +151,28 @@ impl Prepared<'_, '_, '_> {
         device.run(|| Ok(linear.project(self.rows, self.owner.workspace.inputs.buffer,
             payload.buffer, scales.buffer, self.owner.workspace.records.buffer,
             self.owner.workspace.output.buffer, self.stream)?))?;
-        Ok(self.owner.workspace.output.buffer)
+        Ok(ProjectionOutput { prepared: self, linear })
+    }
+}
+
+/// No raw-buffer accessor or Copy implementation: retaining an output retains
+/// the mutable Prepared borrow, so another projection cannot overwrite it.
+#[must_use = "consume the projection into an admitted BF16 destination or explicitly discard it"]
+pub(crate) struct ProjectionOutput<'r, 'o, 'p, 'a> {
+    prepared: &'r mut Prepared<'o, 'p, 'a>,
+    linear: &'p Mxfp8A8<'a>,
+}
+
+impl ProjectionOutput<'_, '_, '_, '_> {
+    /// MiniMax reference project() narrows gate/up separately before SwiGLU.
+    /// This enqueues the existing BF16-RNE conversion, not a new epilogue.
+    pub fn narrow(self, destination: &Allocation<'_>) -> Result<()> {
+        let prepared = self.prepared;
+        let device = prepared.programs.device;
+        ensure!(std::ptr::eq(device.library, destination.device.library),
+            "MiniMax retained destination library differs");
+        device.run(|| Ok(self.linear.narrow(prepared.rows, prepared.owner.workspace.output.buffer,
+            destination.buffer, prepared.stream)?))
     }
 }
 
