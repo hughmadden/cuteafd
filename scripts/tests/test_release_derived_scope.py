@@ -543,6 +543,11 @@ def test_kimi_program_sources_agree_with_checkpoint_metadata(tmp_path, monkeypat
     # A misleading repository name must not select the K3.1 variant.
     model = 'fixture/Kimi-K3.1-EXL3-K2'
     config = tmp_path / 'hf/hub/models--fixture--Kimi-K3.1-EXL3-K2/snapshots/revision/config.json'
+    checkpoint = {'model_type': 'kimi_k3', **checkpoint}
+    if 'text_config' in checkpoint:
+        checkpoint['text_config'] = {'num_hidden_layers': 93, **checkpoint['text_config']}
+    else:
+        checkpoint['num_hidden_layers'] = 93
     write_json(config, checkpoint)
     (tmp_path / 'kimi.config').write_text(
         f'FAMILY=kimi_k3\nMODEL_ID={model}\nMODEL_REVISION=revision\nSPARK_COUNT=0\nRTX_GPUS=2\n')
