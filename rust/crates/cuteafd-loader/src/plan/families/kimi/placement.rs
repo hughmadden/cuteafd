@@ -169,7 +169,10 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
                     gpus, |_, _| true, |layer| cfg.attention[layer] == crate::families::kimi_k3::config::KimiAttention::Mla,
                     Some(context.decode()))?;
             }
-            let families = if model.core.projections.is_empty() { &["kimik3"][..] } else { &["kimik3", "kimi"][..] };
+            let families: &[&str] = match (cfg.dsa.is_some(), model.core.projections.is_empty()) {
+                (false, true) => &["kimik3"], (false, false) => &["kimik3", "kimi"],
+                (true, true) => &["kimik3", "kimik31"], (true, false) => &["kimik3", "kimik31", "kimi"],
+            };
             let native_manifest = input.programs_manifest(path)?;
             let native = model.core.native_programs(unit, gpus, Some(&native_manifest))?;
             let mut programs = ProgramSet::from_manifest(manifest, families);

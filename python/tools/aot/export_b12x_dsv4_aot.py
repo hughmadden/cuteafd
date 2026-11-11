@@ -953,9 +953,7 @@ def kimi_kda_programs(g, decode_rows: int, prefill_rows: int, max_context: int):
                             lambda m=mode, r=rows, g=mla: kimi_mla.compile_kimi_dense_mla_aot(
                                 g, max_rows=r, max_context=max_context, mode=m)))
     out.extend(kimi_context_programs(decode_rows, max_context))
-    out.extend(kimi_w8_programs())
-    out.extend(kimi_latent_programs())
-    out.extend(kimi_route_programs())
+    out.extend(kimi_shared_programs())
     out.extend(mla_draft_programs(decode_rows, max_context))
     return out
 
@@ -1022,10 +1020,12 @@ def kimi_k31_programs(g, decode_rows: int, prefill_rows: int, max_context: int):
                     {"row_bytes": record_bytes, "page_rows": PAGE_ROWS},
                     lambda rb=record_bytes: context_split.compile_paged_staging_gather_aot(
                         row_bytes=rb, page_rows=PAGE_ROWS)))
-    out.extend(kimi_w8_programs())
-    out.extend(kimi_latent_programs())
-    out.extend(kimi_route_programs())
     return out
+
+
+def kimi_shared_programs():
+    """K3/K3.1 residual, FFN, latent and routing programs retain one namespace."""
+    return kimi_w8_programs() + kimi_latent_programs() + kimi_route_programs()
 
 
 def kimi_context_programs(decode_rows: int, max_context: int):
@@ -1607,6 +1607,11 @@ def main() -> None:
         else:
             family_work = make(g, args.decode_rows, args.prefill_rows, extent)
         work += [(family, *item) for item in family_work]
+    if "kimik31" in geometries and not args.context_split_only and "kimik3" not in geometries:
+        # Runtime intentionally shares these unchanged K3 kernels. A K3.1-only
+        # package must publish them too, without exporting duplicate K3 modules.
+        manifest["families"]["kimik3"] = {k: v for k, v in vars(kimi_kda).items()}
+        work += [("kimik3", *item) for item in kimi_shared_programs()]
     if "glmf" in geometries and not args.context_split_only:
         # Last, so every program above compiles exactly as before.
         work += [("glmf", *item) for item in glmf_wide_decode_programs(GLM53_FLASH, args.decode_rows,

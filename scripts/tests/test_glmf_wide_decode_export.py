@@ -690,6 +690,19 @@ def test_kimi_k31_exports_native_dsa_without_changing_k3_or_enabling_a_drafter(e
             assert "norm_eps" not in vars(build()[2][0])
 
 
+def test_kimi_k31_shared_programs_keep_one_existing_runtime_namespace(exporter):
+    shared = exporter.kimi_shared_programs()
+    k3 = exporter.kimi_kda_programs(GEOMETRY, 64, 4096, 1048576)
+    k31 = exporter.kimi_k31_programs(GEOMETRY, 64, 4096, 1048576)
+    shared_names = {stem for stem, *_ in shared}
+    assert shared_names <= {stem for stem, *_ in k3}
+    assert shared_names.isdisjoint(stem for stem, *_ in k31)
+    assert {"rmsnorm_h7168", "latent_down", "router_scores", "expert_input_quant"} <= shared_names
+    source = EXPORTER.read_text()
+    assert '"kimik31" in geometries and not args.context_split_only and "kimik3" not in geometries' in source
+    assert 'work += [("kimik3", *item) for item in kimi_shared_programs()]' in source
+
+
 def test_kimi_context_exports_native_partial_ranges_and_shared_primitives(exporter, monkeypatch):
     package = sys.modules["b12x.integration.cuteafd"]
     # Deliberately change the fork rule: exporter/runtime metadata must not copy its threshold.
