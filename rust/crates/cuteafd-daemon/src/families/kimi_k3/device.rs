@@ -454,7 +454,7 @@ fn subwave_extent(name: &str, bytes: usize, capacity: usize, window: &std::ops::
     ensure!(capacity > 0 && window.start < window.end && window.end <= capacity,
         "Kimi sub-wave operand {name} differs from admitted row layout");
     if cuteafd_loader::families::kimi_k3::allocation::HOOK_SCRATCH.contains(&name)
-        || name == "native attention FP8 scratch" {
+        || DSA_SCRATCH.contains(&name) || name == "native attention FP8 scratch" {
         return Ok((0, bytes));
     }
     ensure!(bytes % capacity == 0, "Kimi row plane {name} stride differs from admission");
@@ -470,7 +470,7 @@ impl Lane<'_> {
         }
         let buffer = self.operands.get(name).map(|allocation| allocation.buffer)
             .ok_or_else(|| anyhow::anyhow!("unknown Kimi lane operand {name}"))?;
-        if ATTENTION_METADATA.contains(&name) {
+        if ATTENTION_METADATA.contains(&name) || DSA_METADATA.contains(&name) {
             let (offset, bytes) = self.layout.metadata_extent(name, self.metadata_bank)?;
             return view(buffer, offset, bytes);
         }
@@ -489,7 +489,8 @@ impl Lane<'_> {
 
     fn prime_attention(&self) -> Result<()> {
         for bank in 0..self.layout.metadata_banks() {
-            for name in ATTENTION_METADATA {
+            for name in ATTENTION_METADATA.into_iter().chain(DSA_METADATA.into_iter()
+                .filter(|name| self.layout.operands.contains_key(name))) {
                 let (offset, bytes) = self.layout.metadata_extent(name, bank)?;
                 let buffer = view(self.operands[name].buffer, offset, bytes)?;
                 self.stream.device.run(|| {
@@ -505,7 +506,7 @@ impl Lane<'_> {
     fn upload_attention(&self, metadata: &AttentionRows) -> Result<()> {
         metadata.check_layout(&self.layout)?;
         self.stream.device.run(|| {
-            for (name, bytes) in metadata.uploads() {
+            for (name, bytes) in metadata.uploads().into_iter().chain(metadata.dsa.iter().flat_map(DsaRows::uploads)) {
                 // SAFETY: this lane retains the fixed destination and stream;
                 // shared staging retains the pinned source outside capture.
                 // This is an ordered copy fence, not a compute drain.
@@ -663,8 +664,9 @@ impl<'a> LocalLane<'a> {
         self.attention = None;
         self.lane.metadata_bank = 0;
         self.check_page_pool(pool)?;
-        let metadata = AttentionRows::new(sequences, self.lane.layout.unit, self.kda.slots(),
+        let mut metadata = AttentionRows::new(sequences, self.lane.layout.unit, self.kda.slots(),
             self.lane.layout.max_context, pool)?;
+        if self.cfg.dsa.is_some() { metadata.dsa = Some(DsaRows::build(sequences, metadata.rows, metadata.width)?); }
         self.upload_attention(&metadata)?;
         self.attention = Some(AttentionShape { rows: metadata.rows, sequences: metadata.sequences });
         Ok(())
@@ -717,7 +719,13 @@ impl<'a> LocalLane<'a> {
     pub(crate) fn packed_attention(&self, sequences: &[SequenceRows<'_>],
         pool: &cuteafd_engine::prefix::RefPagePool) -> Result<Vec<AttentionRows>> {
         self.check_page_pool(pool)?;
-        AttentionRows::packed(sequences, self.lane.layout.unit, self.kda.slots(), self.max_context(), pool)
+        let mut members = AttentionRows::packed(sequences, self.lane.layout.unit, self.kda.slots(), self.max_context(), pool)?;
+        if self.cfg.dsa.is_some() {
+            for (metadata, sequence) in members.iter_mut().zip(sequences) {
+                metadata.dsa = Some(DsaRows::build(std::slice::from_ref(sequence), metadata.rows, metadata.width)?);
+            }
+        }
+        Ok(members)
     }
 
     pub(crate) fn attention_packed(&mut self, layer: usize, members: &[AttentionRows]) -> Result<()> {
@@ -756,9 +764,11 @@ impl<'a> LocalLane<'a> {
             for (bank, unit) in units.iter().enumerate() {
                 ensure!(unit.index == bank && unit.sequence == 0 && unit.rows.start < unit.rows.end
                     && unit.rows.end <= sequence.rows, "Kimi attention unit metadata extent");
-                let metadata = AttentionRows::build(&[SequenceRows { slot: sequence.slot,
-                    start: sequence.start + unit.rows.start, rows: unit.rows.len(), pages: sequence.pages }],
+                let member = [SequenceRows { slot: sequence.slot,
+                    start: sequence.start + unit.rows.start, rows: unit.rows.len(), pages: sequence.pages }];
+                let mut metadata = AttentionRows::build(&member,
                     local.lane.layout.unit, local.kda.slots(), local.lane.layout.max_context, pool, pool.is_parity())?;
+                if local.cfg.dsa.is_some() { metadata.dsa = Some(DsaRows::build(&member, metadata.rows, metadata.width)?); }
                 local.lane.metadata_bank = bank;
                 local.upload_attention(&metadata)?;
             }
@@ -1622,7 +1632,7 @@ pub(crate) struct SequenceRows<'p> {
     pub pages: &'p [u32],
 }
 
-use cuteafd_loader::families::kimi_k3::allocation::ATTENTION_METADATA;
+use cuteafd_loader::families::kimi_k3::allocation::{ATTENTION_METADATA, DSA_METADATA, DSA_SCRATCH};
 
 #[derive(Clone, Copy)]
 struct AttentionShape {
@@ -1644,6 +1654,64 @@ pub(crate) struct AttentionRows {
     lengths: Vec<u8>,
     offsets: Vec<u8>,
     context: Option<ContextRows>,
+    dsa: Option<DsaRows>,
+}
+
+/// Full-history index addressing never reuses Context's compact MLA table.
+struct DsaRows {
+    positions: Vec<u8>,
+    slots: Vec<u8>,
+    table: Vec<u8>,
+    lengths: Vec<u8>,
+    offsets: Vec<u8>,
+    selected_lengths: Vec<u8>,
+}
+
+impl DsaRows {
+    fn build(sequences: &[SequenceRows<'_>], rows: usize, width: usize) -> Result<Self> {
+        ensure!((1..=4096).contains(&rows) && (1..=16384).contains(&width)
+            && !sequences.is_empty() && (rows <= 64 || sequences.len() == 1), "Kimi index metadata geometry");
+        for sequence in sequences {
+            let end = sequence.start.checked_add(sequence.rows).context("Kimi index position overflow")?;
+            ensure!(sequence.rows > 0 && end <= width * 64 && sequence.pages.len() >= end.div_ceil(64),
+                "Kimi index metadata context/pages too short");
+        }
+        let mut metadata = Self { positions: Vec::with_capacity(rows * 8), slots: Vec::with_capacity(rows * 8),
+            table: vec![0; if rows <= 64 { rows * width * 4 } else { width * 4 }],
+            lengths: Vec::with_capacity(rows * 4), offsets: Vec::with_capacity((rows + 1) * 4),
+            selected_lengths: Vec::with_capacity(rows * 4) };
+        metadata.offsets.extend_from_slice(&0i32.to_le_bytes());
+        let mut row = 0;
+        for sequence in sequences {
+            let end = sequence.start.checked_add(sequence.rows).context("Kimi index position overflow")?;
+            for offset in 0..sequence.rows {
+                let position = sequence.start + offset;
+                let page = *sequence.pages.get(position / 64).context("Kimi index page missing")?;
+                let slot = i64::from(page) * 64 + (position % 64) as i64;
+                metadata.positions.extend_from_slice(&(position as i64).to_le_bytes());
+                metadata.slots.extend_from_slice(&slot.to_le_bytes());
+                metadata.lengths.extend_from_slice(&((position + 1) as i32).to_le_bytes());
+                metadata.selected_lengths.extend_from_slice(&((position + 1).min(2048) as i32).to_le_bytes());
+                metadata.offsets.extend_from_slice(&((row + 1) as i32).to_le_bytes());
+                if rows <= 64 || row == 0 {
+                    let base = if rows <= 64 { row * width * 4 } else { 0 };
+                    for (column, page) in sequence.pages[..end.div_ceil(64)].iter().enumerate() {
+                        let at = base + column * 4;
+                        metadata.table[at..at + 4].copy_from_slice(&page.to_le_bytes());
+                    }
+                }
+                row += 1;
+            }
+        }
+        ensure!(row == rows && (rows <= 64 || sequences.len() == 1), "Kimi index metadata row geometry");
+        Ok(metadata)
+    }
+
+    fn uploads(&self) -> [(&'static str, &[u8]); 6] {
+        [("DSA positions", &self.positions), ("DSA slots", &self.slots), ("DSA page table", &self.table),
+            ("DSA lengths", &self.lengths), ("DSA query offsets", &self.offsets),
+            ("DSA selected lengths", &self.selected_lengths)]
+    }
 }
 
 struct ContextRows {
@@ -1760,7 +1828,8 @@ impl AttentionRows {
         let mut metadata = Self { rows, sequences: sequences.len(), width,
             kda_slots: Vec::with_capacity(rows * 4), kda_first: Vec::with_capacity(rows * 4),
             mla_slots: Vec::with_capacity(rows * 8), page_table: vec![0; requests * width * 4],
-            lengths: Vec::with_capacity(requests * 4), offsets: Vec::with_capacity((requests + 1) * 4), context };
+            lengths: Vec::with_capacity(requests * 4), offsets: Vec::with_capacity((requests + 1) * 4), context,
+            dsa: None };
         let mut row = 0;
         metadata.offsets.extend_from_slice(&0i32.to_le_bytes());
         for sequence in sequences {
@@ -1800,7 +1869,7 @@ impl AttentionRows {
     fn check_layout(&self, layout: &LaneLayout) -> Result<()> {
         ensure!(self.rows <= layout.unit && self.width == layout.max_context.div_ceil(64),
             "Kimi metadata differs from admitted row capacity/page stride");
-        for (name, bytes) in self.uploads() {
+        for (name, bytes) in self.uploads().into_iter().chain(self.dsa.iter().flat_map(DsaRows::uploads)) {
             let (_, capacity) = layout.metadata_extent(name, 0)?;
             ensure!(bytes.len() <= capacity, "Kimi metadata exceeds admitted operand {name}");
         }
@@ -2274,6 +2343,36 @@ mod tests {
                 assert_ne!(shared, expected[0].lengths);
             }
         }
+        Ok(())
+    }
+
+    #[test]
+    fn k31_index_metadata_keeps_full_physical_history_and_per_query_causality() -> Result<()> {
+        for parity in [false, true] {
+            let mut pool = if parity { cuteafd_engine::prefix::RefPagePool::parity(16, 64, 0) }
+                else { cuteafd_engine::prefix::RefPagePool::new(16, 64) };
+            if parity { pool.alloc_for(0..16)?; } else { pool.alloc(16)?; }
+            let pages = [14, 9, 4, 3, 12, 5, 6, 7];
+            for (start, rows) in [(0, 1), (63, 4), (127, 64), (255, 128)] {
+                let sequences = [SequenceRows { slot: 0, start, rows, pages: &pages }];
+                let base = AttentionRows::build(&sequences, 128, 2, 512, &pool, parity)?;
+                let dsa = DsaRows::build(&sequences, rows, 8)?;
+                let slots = dsa.slots.chunks_exact(8).map(|b| i64::from_le_bytes(b.try_into().unwrap())).collect::<Vec<_>>();
+                assert_eq!(slots, (start..start + rows).map(|position|
+                    i64::from(pages[position / 64]) * 64 + (position % 64) as i64).collect::<Vec<_>>());
+                assert_eq!(i32_metadata(&dsa.lengths), (start + 1..=start + rows).map(|n| n as i32).collect::<Vec<_>>());
+                assert_eq!(i32_metadata(&dsa.offsets), (0..=rows as i32).collect::<Vec<_>>());
+                let physical = &i32_metadata(&dsa.table)[..(start + rows).div_ceil(64)];
+                assert_eq!(physical, &pages[..physical.len()].iter().map(|p| *p as i32).collect::<Vec<_>>());
+                if parity { assert_ne!(dsa.table, base.page_table); }
+            }
+        }
+        let pages = [100, 7, 22, 19];
+        let sequences = [SequenceRows { slot: 0, start: 2047, rows: 1, pages: &pages }];
+        assert!(DsaRows::build(&sequences, 1, 8).is_err());
+        let pages = (0..40).collect::<Vec<_>>();
+        let dsa = DsaRows::build(&[SequenceRows { slot: 0, start: 2047, rows: 4, pages: &pages }], 4, 40)?;
+        assert_eq!(i32_metadata(&dsa.selected_lengths), [2048; 4]);
         Ok(())
     }
 
