@@ -138,8 +138,10 @@ def test_original_core_view_is_not_forwarded_to_unsupported_workers(tmp_path, fa
     config = ({"model_type": "mimo_v2_flash", "num_hidden_layers": 2,
                "moe_layer_freq": [0, 1]} if family == "mimo_v2" else {"model_type": family})
     model = "deepseek-ai/DeepSeek-V4.1-Flash" if family == "deepseek_v41" else "test/model"
+    # V4.1 does not accept this family key; its original view is implicit.
+    selector = "" if family == "deepseek_v41" else "CORE_VIEW=original\n"
     result = _family_launch_result(tmp_path, config, model,
-        "CORE_VIEW=original\nSPARK_COUNT=4\nSPECULATOR=off\nVISION=off\nAUDIO=off\n")
+        selector + "SPARK_COUNT=4\nSPECULATOR=off\nVISION=off\nAUDIO=off\n")
     assert result.returncode == 0, result.stderr
     workers = [line for line in result.stderr.splitlines() if "cuteafd expertd-native" in line]
     assert workers, result.stderr
