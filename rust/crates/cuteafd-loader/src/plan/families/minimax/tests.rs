@@ -327,4 +327,11 @@ fn installed_minimax_headers_match_native_contract() {
     assert_eq!(weights[0].projections.len(), 60 * 9);
     assert_eq!(weights[0].records_bytes(2752).unwrap(), (2752 / 16) * (12288 / 32) * 528);
     assert!(weights[0].arena.views().keys().all(|name| !name.contains(".experts.") && !name.starts_with("vision_tower.")));
+    let report = plan::plan(path, &PlanOptions::default()).unwrap();
+    eprintln!("MiniMax installed plan: min_spark_ranks={:?}, spark_budget_bytes={}",
+        report.min_spark_ranks, report.spark_budget_bytes);
+    assert_eq!(report.min_spark_ranks, Some(3));
+    // The export range starts at the physical two-GB10 lower bound. The
+    // planner's default 100-GiB expert budget requires a third Spark.
+    assert_eq!(report.spark_budget_bytes, 100 << 30);
 }
