@@ -291,6 +291,11 @@ mod family_tests {
             let checkpoint = Checkpoint::open_view(&CheckpointView::select(dir.path(), view)?)?;
             let core = CoreInventory::from_checkpoint(&cfg, &checkpoint)?;
             assert!(core.projections.values().all(|p| p.bits == bits));
+            if bits == 16 {
+                assert!(core.projections.is_empty());
+                assert!(!core.native.is_empty());
+                assert!(core.native.values().all(|weight| !weight.fp8));
+            }
             let pair = LayerLayout::ranks(&cfg, 0, 2, &core)?;
             bytes.push(pair.iter().map(|l| l.operands.values().sum::<usize>()
                 + l.core.values().map(|c| c.bytes).sum::<usize>()
@@ -321,7 +326,11 @@ mod family_tests {
         for (view, bits) in [(CoreView::Original, 16), (CoreView::K6Compact, 6), (CoreView::K8Compact, 8)] {
             let checkpoint = Checkpoint::open_view(&CheckpointView::select(dir.path(), view)?)?;
             let core = CoreInventory::from_checkpoint(&cfg, &checkpoint)?;
-            if bits == 16 { assert!(core.projections.is_empty() && core.native.is_empty()); }
+            if bits == 16 {
+                assert!(core.projections.is_empty());
+                assert!(!core.native.is_empty());
+                assert!(core.native.values().all(|weight| !weight.fp8));
+            }
             else { assert!(core.projections.values().all(|p| p.bits == bits)); }
             for layer in 0..cfg.layers { core.layer_weights(&cfg, layer, 2, None)?; }
         }

@@ -2049,10 +2049,9 @@ if [[ "$family" == deepseek_v4 ]]; then
   release_resolve_tp2_dspark_experts "$family" "$((1 + head_split))"
   [[ "$TP2_DSPARK_EXPERTS" != on ]] || dspark_args+=(--tp2-dspark-experts)
 fi
-# GLM 5.3 Flash: MLA and shared-expert projections use the primary checkpoint's
-# FP8 blocks or BF16 quantized to 128x128 blocks at load. Dense MLPs use the
-# same route, or native packed NVFP4. Resolve precision after the split: both
-# layouts default to row128 KDA and an FP8 head; the two-GPU head split adds
+# GLM 5.3 Flash: BF16 target MLA/FFNs and KDA stay BF16 by default; native
+# FP8/NVFP4 checkpoint weights retain their format. Explicit row128/channel
+# KDA conversion on the two-GPU head split adds
 # token-row KDA output ownership (--kda-output-shard --kda-prefill-expanded),
 # which avoids rounding half-K BF16 partials (2026-10-05: C1 +7.6%, paired
 # top-1 453 -> 460/512, KL +0.0008). GLM5_FLASH_KDA_SPLIT=partials keeps the
@@ -2069,7 +2068,7 @@ if [[ $family == glm5_flash ]]; then
   [[ -z "$local_layers" ]] || family_args+=(--rtx-expert-layers "$local_layers")
   kda_fp8="$(key GLM5_FLASH_KDA_FP8 GLMF_KDA_FP8 auto)"
   case "$kda_fp8" in
-    ""|auto) kda_fp8=row128 ;;
+    ""|auto) kda_fp8=off ;;
     off|row128|channel) ;;
     *) echo "GLM5_FLASH_KDA_FP8 must be auto, off, row128 or channel" >&2; exit 2 ;;
   esac
@@ -2107,8 +2106,8 @@ if [[ $family == glm5_flash ]]; then
       echo "PREFILL_ROWS must be a multiple of 64 up to 4096" >&2; exit 2
     fi
   fi
-  # GLM5_FLASH_FP8_HEAD: auto is resolved by the shared checkpoint/topology resolver: packed on one GPU,
-  # FP8 on two GPUs, native heads unchanged. on selects E4M3; off keeps BF16; packed keeps exact 12-bit BF16
+  # GLM5_FLASH_FP8_HEAD: auto preserves the checkpoint BF16 head on every topology.
+  # Native heads stay unchanged. on selects E4M3; off keeps BF16; packed keeps exact 12-bit BF16
   # (mirroring V41_FP8_HEAD=packed): target logits exact, drafts through its coarse plane, about
   # three quarters of the BF16 bytes. The daemon checks packed split support after normalizing
   # native K6/EXLR8 heads, which ignore this conversion setting.
@@ -2294,7 +2293,12 @@ case "$family" in
     [[ -z "$(get PREFILL_SPAN_ROWS)" ]] || lane_env_args+=(-e "CUTEAFD_PREFILL_SPAN_ROWS=$(get PREFILL_SPAN_ROWS)")
     ;;
   glm5)
-    # Prefill units, waves and span come from the deployment plan (units-span).
+    # Plan and serve resolve the same explicit target conversion policy.
+    glm_bf16="$(get CUTEAFD_GLM_BF16 "${CUTEAFD_GLM_BF16:-native}")"
+    case "$glm_bf16" in
+      native|fp8) lane_env_args+=(-e "CUTEAFD_GLM_BF16=$glm_bf16") ;;
+      *) release_die "CUTEAFD_GLM_BF16 must be native or fp8" ;;
+    esac
     ;;
   glm5_flash|qwen4|qwen3_5|kimi_k3|step5|muse_spark|mimo_v2) ;;
   *) echo "missing worker endpoint geometry for $family" >&2; exit 2 ;;

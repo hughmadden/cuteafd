@@ -561,8 +561,8 @@ fn precision_optimizations(family: &str, options: &PlanOptions) -> Vec<String> {
     let mut active = Vec::new();
     match family {
         "glm5" => {
-            if std::env::var("CUTEAFD_GLM_BF16").as_deref() != Ok("native") {
-                active.push("attention, indexer and shared experts: load-time FP8 block weights (existing default; CUTEAFD_GLM_BF16=native disables)".into());
+            if !crate::families::glm5::native_bf16() {
+                active.push("attention, indexer and dense/shared experts: explicit load-time FP8 block weights (CUTEAFD_GLM_BF16=fp8)".into());
             }
             if !options.layout.as_ref().is_some_and(|layout| layout.glm5_drafter_disabled || layout.glm5_draft_bf16) {
                 active.push("external drafter: FP8 weights (existing launcher default)".into());
@@ -570,11 +570,11 @@ fn precision_optimizations(family: &str, options: &PlanOptions) -> Vec<String> {
         }
         "glm5_flash" => {
             let repr = options.layout.as_ref().map(|layout| layout.glmf_representation).unwrap_or_default();
-            active.push("MLA and shared experts: FP8 block weights; W8A8 prefill (existing launcher default)".into());
-            if repr.kda_fp8 { active.push("KDA projections: row-K128 FP8 weights (existing launcher default)".into()); }
+
+            if repr.kda_fp8 { active.push("KDA projections: explicit row-K128 FP8 weights".into()); }
             match repr.head {
                 crate::families::glm5_flash::resident::GlmfHeadFormat::Auto =>
-                    active.push("head: auto (packed BF16 on one GPU, FP8 on two GPUs; native head unchanged)".into()),
+                    active.push("head: auto (checkpoint BF16; native head unchanged)".into()),
                 crate::families::glm5_flash::resident::GlmfHeadFormat::Fp8 =>
                     active.push("head: row-K128 FP8 weights".into()),
                 crate::families::glm5_flash::resident::GlmfHeadFormat::Packed =>
@@ -585,7 +585,11 @@ fn precision_optimizations(family: &str, options: &PlanOptions) -> Vec<String> {
                 active.push("external drafter: FP8 weights and W8A8 draft linear (existing launcher default)".into());
             }
         }
-        "qwen4" => active.push("target/MTP shared head: FP8 weights (existing launcher default; attention projections remain checkpoint precision)".into()),
+        "qwen4" => {
+            if options.layout.as_ref().is_some_and(|layout| layout.qwen_representation.fp8_head) {
+                active.push("target/MTP shared head: explicit FP8 weights".into());
+            }
+        }
         _ => {}
     }
     active

@@ -63,6 +63,24 @@ def _run(repo: Path, hf: Path, *args: str) -> subprocess.CompletedProcess[str]:
                           capture_output=True, text=True, timeout=60)
 
 
+@pytest.mark.parametrize("value,resolved", [(None, "native"), ("native", "native"), ("fp8", "fp8")])
+def test_glm_target_conversion_policy_reaches_plan_and_serve(tmp_path, value, resolved):
+    keys = "SPECULATOR=off\nVISION=off\nAUDIO=off\n"
+    if value is not None:
+        keys += f"CUTEAFD_GLM_BF16={value}\n"
+    result = _family_launch_result(tmp_path, {"model_type": "glm_moe_dsa", "num_hidden_layers": 4, "first_k_dense_replace": 3}, "test/glm", keys)
+    assert result.returncode == 0, result.stderr
+    for command in ["cuteafd plan", "cuteafd serve-glm"]:
+        launch = next(line for line in result.stderr.splitlines() if command in line)
+        assert f"CUTEAFD_GLM_BF16={resolved}" in launch
+
+
+def test_glm_target_conversion_policy_refuses_unknown_value(tmp_path):
+    result = _family_launch_result(tmp_path, {"model_type": "glm_moe_dsa", "num_hidden_layers": 4, "first_k_dense_replace": 3}, "test/glm", "CUTEAFD_GLM_BF16=auto\n")
+    assert result.returncode == 2
+    assert "CUTEAFD_GLM_BF16 must be native or fp8" in result.stderr
+
+
 @pytest.mark.parametrize("gpus", [1, 2])
 @pytest.mark.parametrize("attention", ["auto", "heads", "context", "layers"])
 @pytest.mark.parametrize("wip", [False, True])
@@ -2478,17 +2496,19 @@ def test_glmf_precision_defaults_follow_serving_split(tmp_path, layout, physical
     launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-glmf" in line)
     assert ("--split-device" in launch) == split
     # The shared Rust resolver selects the checkpoint/topology head; shell passes auto.
-    # The split adds token-row KDA output ownership.
-    assert "--kda-fp8 row128" in launch
+    # Native KDA and BF16 heads stay unchanged on every topology.
+    assert "--kda-fp8 off" in launch
     assert "--fp8-head auto" in launch
     plans = [line for line in result.stderr.splitlines() if "cuteafd plan" in line]
     assert plans and all("--fp8-head auto" in plan and plan.count("--fp8-head") == 1 for plan in plans), plans
     assert launch.count("--kda-fp8") == launch.count("--fp8-head") == 1
     assert launch.count("--snapshot ") == 1
-    assert ("--kda-output-shard --kda-prefill-expanded" in launch) == split
+    assert "--kda-output-shard" not in launch
+    assert "--kda-prefill-expanded" not in launch
 
 
-@pytest.mark.parametrize("keys,shard", [("", True), ("GLM5_FLASH_KDA_SPLIT=partials\n", False),
+@pytest.mark.parametrize("keys,shard", [("", False), ("GLM5_FLASH_KDA_FP8=row128\n", True),
+                                        ("GLM5_FLASH_KDA_FP8=row128\nGLM5_FLASH_KDA_SPLIT=partials\n", False),
                                         ("GLM5_FLASH_KDA_FP8=off\n", False)])
 def test_glmf_split_token_rows_follow_fp8_kda(tmp_path, keys, shard):
     result = _family_launch_result(tmp_path, SPLIT_CONFIGS["glm5_flash"], "test/glmf",
@@ -2517,9 +2537,9 @@ def test_glmf_explicit_precision_wins_on_either_layout(tmp_path, layout, prefix,
 
 @pytest.mark.parametrize("layout,keys,kda,head", [
     ("RTX_GPUS=1\n", "GLM5_FLASH_KDA_FP8=off\n", "off", "auto"),
-    ("RTX_GPUS=1\n", "GLM5_FLASH_FP8_HEAD=off\n", "row128", "false"),
+    ("RTX_GPUS=1\n", "GLM5_FLASH_FP8_HEAD=off\n", "off", "false"),
     ("RTX_GPUS=2\n", "GLM5_FLASH_KDA_FP8=off\n", "off", "auto"),
-    ("RTX_GPUS=2\n", "GLM5_FLASH_FP8_HEAD=off\n", "row128", "false"),
+    ("RTX_GPUS=2\n", "GLM5_FLASH_FP8_HEAD=off\n", "off", "false"),
 ])
 def test_glmf_precision_overrides_are_independent(tmp_path, layout, keys, kda, head):
     result = _family_launch_result(tmp_path, SPLIT_CONFIGS["glm5_flash"], "test/glmf",
@@ -2533,7 +2553,7 @@ def test_glmf_precision_overrides_are_independent(tmp_path, layout, keys, kda, h
 @pytest.mark.parametrize("layout,accepted", [("RTX_GPUS=1\n", True), ("RTX_GPUS=2\n", False)])
 def test_glmf_kda_prefill_validation_uses_resolved_precision(tmp_path, layout, accepted):
     result = _family_launch_result(tmp_path, SPLIT_CONFIGS["glm5_flash"], "test/glmf",
-                                  "GLM5_FLASH_FP8_PREFILL=all\n" + layout)
+                                  "GLM5_FLASH_KDA_FP8=row128\nGLM5_FLASH_FP8_PREFILL=all\n" + layout)
     assert result.returncode == (0 if accepted else 2), result.stderr
     if accepted:
         assert "--fp8-prefill all" in result.stderr
@@ -2589,14 +2609,14 @@ def test_glmf_invalid_fp8_options_fail_before_workers_launch(tmp_path, key, valu
                                                   ("COORDINATOR_GPUS=0,1\nCOORDINATOR_SPLIT=off\n", (0, 1))])
 def test_glmf_packed_head_reaches_serve_and_plan_on_one_gpu(tmp_path, layout, physical_gpus):
     """GLM5_FLASH_FP8_HEAD=packed (mirroring V41_FP8_HEAD=packed) keeps the exact 12-bit head:
-    serve-glmf and its plan both get --fp8-head packed, once, beside the default row128 KDA."""
+    serve-glmf and its plan both get --fp8-head packed, once, beside the default native KDA."""
     result = _family_launch_result(tmp_path, SPLIT_CONFIGS["glm5_flash"], "test/glmf",
                                   layout + "GLM5_FLASH_FP8_HEAD=packed\n", physical_gpus=physical_gpus)
     assert result.returncode == 0, result.stderr
     launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-glmf" in line)
     assert "--split-device" not in launch
     assert "--fp8-head packed" in launch and launch.count("--fp8-head") == 1, launch
-    assert "--kda-fp8 row128" in launch
+    assert "--kda-fp8 off" in launch
     plans = [line for line in result.stderr.splitlines() if "cuteafd plan" in line]
     assert plans and all("--fp8-head packed" in plan and plan.count("--fp8-head") == 1 for plan in plans), plans
 

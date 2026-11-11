@@ -330,7 +330,7 @@ impl Default for LayoutOptions {
             qwen_kv: Default::default(),
             step5_kv: crate::families::qwen4::Qwen4KvCache::Fp8,
             qwen_representation: crate::families::qwen4::resident::Qwen4Representation {
-                fp8_projections: false, fp8_head: true },
+                fp8_projections: false, fp8_head: false },
             qwen_attention_plan_rows: None,
             onboard: None,
             exchange_f32: false,

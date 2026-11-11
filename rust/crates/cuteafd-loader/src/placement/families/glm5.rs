@@ -237,6 +237,7 @@ pub fn step_scratch(cfg: &GlmDsaConfig, split: bool, decode: bool,
     }
     let optional = [format!("glm_index_producer_bf16_{cap}"), format!("{prefix}_producer_bf16_{cap}"),
         format!("{prefix}_o_bf16_{cap}"), format!("{prefix}_ffn_i{moe}_bf16_{cap}"),
+        format!("{prefix}_ffn_i{dense}_bf16_{cap}"),
         format!("{prefix}_ffn_i{dense}_pt_{cap}")];
     for name in optional { programs = programs.max(lookup(&name).unwrap_or(0)); }
     let name = format!("glm_index_topk_{mode}_{cap}");

@@ -1415,9 +1415,9 @@ fn declared_numerics_report_preserves_optimizations_and_names_pending_kernel() {
     assert!(numerics_deviations("glm5", &modules).is_empty());
     assert!(numerics_deviations("qwen4", &BTreeMap::new()).is_empty());
     let options = PlanOptions::default();
-    assert!(precision_optimizations("qwen4", &options).iter().any(|text| text.contains("shared head")));
+    assert!(precision_optimizations("qwen4", &options).is_empty());
     let defaults = precision_optimizations("glm5_flash", &options);
-    assert!(defaults.iter().any(|text| text.contains("KDA")));
+    assert!(!defaults.iter().any(|text| text.contains("KDA")));
     assert!(defaults.iter().any(|text| text.contains("head:")));
     let options = PlanOptions { layout: Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)),
         glmf_representation: crate::families::glm5_flash::resident::GlmfRepresentation {

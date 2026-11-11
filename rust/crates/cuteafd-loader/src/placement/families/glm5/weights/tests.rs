@@ -143,6 +143,25 @@ fn core_checkpoint(vocab: usize, core_head: bool) -> (serde_json::Value, Vec<Ten
 }
 
 
+#[test]
+fn bf16_target_keeps_attention_indexer_dense_and_shared_owners_native() -> Result<()> {
+    let (config, tensors) = testing::glm5_compact_weights();
+    let tensors = tensors.into_iter().filter(|tensor| !tensor.0.ends_with("_scale_inv"))
+        .map(|(name, dtype, shape)| (name, if dtype == "F8_E4M3" { "BF16" } else { dtype }, shape))
+        .collect::<Vec<_>>();
+    for ranks in [1, 2] {
+        let inventory = ordinary(&config, &tensors, ranks, None, true, EmbeddingHome::Device(0));
+        assert!(inventory.owners.iter().all(|owner| !owner.format.contains("fp8")));
+        for group in ["attention", "indexer", "dense", "shared_expert"] {
+            assert!(inventory.owners.iter().any(|owner| owner.group == group && owner.format == "bf16"), "{group}");
+        }
+        check_arenas(&inventory)?;
+        let explicit = ordinary(&config, &tensors, ranks, None, false, EmbeddingHome::Device(0));
+        assert!(explicit.owners.iter().any(|owner| owner.group == "dense" && owner.format.contains("fp8")));
+    }
+    Ok(())
+}
+
 fn bytes(inventory: &WeightInventory, suffix: &str) -> u64 {
     inventory
         .owners

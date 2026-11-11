@@ -2777,7 +2777,10 @@ impl<'a> GlmfEngine<'a> {
             RankDevice { device, stream }], if self.kda_output_shard { 6 } else { 4 } * self.prefill_waves,
             rows * self.cfg.hidden * (self.partial_bytes()
                 + if self.weights.layers.iter().chain(&layers).flat_map(|l| l.core.values())
-                    .any(|w| w.side == cuteafd_loader::formats::dense_trellis::TrellisSide::Input) { 2 } else { 0 }),
+                    .any(|w| w.side == cuteafd_loader::formats::dense_trellis::TrellisSide::Input)
+                    || self.weights.layers.iter().chain(&layers).any(|layer|
+                        layer.attention_native.values().any(|w| w.layout.ranks > 1
+                            && w.layout.split == cuteafd_loader::formats::trellis_core::CoreSplit::Input)) { 2 } else { 0 }),
             decode_peer_bytes(self.decode_rows, self.cfg.hidden))?;
         exchange.trace_identity("glmf-target-main");
         // Compact state belongs only to whole MLA owners, or to both context halves.

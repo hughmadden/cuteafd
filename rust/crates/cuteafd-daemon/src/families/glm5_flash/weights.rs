@@ -746,13 +746,14 @@ impl<'a> GlmfLoader<'a> {
     }
 
     fn mla_operands(&self, cfg: &GlmNextConfig, prefix: &str,
-        ops: &mut HashMap<&'static str, DeviceAllocation<'a>>) -> Result<()> {
+        ops: &mut HashMap<&'static str, DeviceAllocation<'a>>, staged: bool) -> Result<()> {
         let a = |name: &str| format!("{prefix}.self_attn.{name}");
         ops.insert("q_a_norm", self.one(&a("q_a_layernorm.weight"))?);
         ops.insert("kv_a_norm", self.one(&a("kv_a_layernorm.weight"))?);
         let (uk, uv) = self.absorbed(cfg, &a("kv_b_proj.weight"), 1)?.remove(0);
         ops.insert("w_uk", uk);
         ops.insert("w_uv", uv);
+        if !staged {
         let block = super::fp8::Layout::Block;
         let projections: Vec<_> = cuteafd_loader::families::glm5_flash::core_fp8_projections("mla")
             .iter().map(|name| a(name)).collect();
@@ -765,6 +766,7 @@ impl<'a> GlmfLoader<'a> {
         let (q, s) = self.fp8(&projections[3..4], block)?;
         ops.insert("w_o_fp8", q);
         ops.insert("w_o_scale", s);
+        }
         let i = |name: &str| a(&format!("indexer.{name}"));
         ops.insert("w_iq", self.one(&i("wq_b.weight"))?);
         ops.insert("w_ik", self.rows_on(0, &[i("wk.weight"), i("weights_proj.weight"),
@@ -784,6 +786,28 @@ impl<'a> GlmfLoader<'a> {
         self.on_rank(rank, || layout.load_recorded_with(Device {
             library: self.library, id: self.rank_device(rank)? }, self.checkpoint, &self.dense, stream,
                 |name, bytes| self.allocate(self.rank_device(rank)?, name, bytes)))
+    }
+
+    fn native_operands(&self, native_layouts: std::collections::BTreeMap<String,
+        cuteafd_loader::formats::native_attention::NativeLayout>, rank: usize)
+        -> Result<std::collections::BTreeMap<String, NativeAttentionWeights<'a>>> {
+        native_layouts.into_iter().map(|(name, layout)| {
+                let selected = self.checkpoint.projection(&layout.stem)?;
+                let [n,k] = layout.shape;
+                let (values, scales) = self.on_rank(rank, || Ok((
+                    self.allocation(rank, &format!("{}.payload", layout.stem), n*k*if layout.fp8 { 1 } else { 2 })?,
+                    if layout.fp8 { Some(self.allocation(rank, &format!("{}.scales", layout.stem), n/128*(k/128)*4)?) } else { None }
+                )))?;
+                let records = attention_records(&self.checkpoint.snapshot, &selected, self.checkpoint.core_view(),
+                    &layout, self.fp8_scales, values.buffer, scales.as_ref().map(|s| s.buffer))?;
+                for record in records {
+                    match record {
+                        AttentionRecord::Operand(record) => self.dense.operand(record)?,
+                        AttentionRecord::Step(record) => self.dense.step(record, self.rank_stream(rank)?)?,
+                    }
+                }
+                Ok((name, NativeAttentionWeights { layout, values, scales }))
+            }).collect::<Result<_>>()
     }
 
     fn native_layer_shares(&self, cfg: &GlmNextConfig, layer: usize, mode: LayerMode,
@@ -872,23 +896,7 @@ impl<'a> GlmfLoader<'a> {
             let expected = if owner.is_some_and(|owner| usize::from(owner) != rank) { 3 } else { 7 };
             ensure!(layouts.len() + native_layouts.len() == expected,
                 "native Flash requires complete attention and FFN operator groups");
-            let attention_native = native_layouts.into_iter().map(|(name, layout)| {
-                let selected = self.checkpoint.projection(&layout.stem)?;
-                let [n,k] = layout.shape;
-                let (values, scales) = self.on_rank(rank, || Ok((
-                    self.allocation(rank, &format!("{}.payload", layout.stem), n*k*if layout.fp8 { 1 } else { 2 })?,
-                    if layout.fp8 { Some(self.allocation(rank, &format!("{}.scales", layout.stem), n/128*(k/128)*4)?) } else { None }
-                )))?;
-                let records = attention_records(&self.checkpoint.snapshot, &selected, self.checkpoint.core_view(),
-                    &layout, self.fp8_scales, values.buffer, scales.as_ref().map(|s| s.buffer))?;
-                for record in records {
-                    match record {
-                        AttentionRecord::Operand(record) => self.dense.operand(record)?,
-                        AttentionRecord::Step(record) => self.dense.step(record, self.rank_stream(rank)?)?,
-                    }
-                }
-                Ok((name, NativeAttentionWeights { layout, values, scales }))
-            }).collect::<Result<_>>()?;
+            let attention_native = self.native_operands(native_layouts, rank)?;
             let core = layouts.into_iter().map(|(name, layout)| Ok((name, self.core_weights(layout, rank)?)))
                 .collect::<Result<_>>()?;
             Ok(GlmfLayer { attention, dense, split: ranks == 2, attention_share, core, operands, attention_native,
@@ -967,10 +975,10 @@ impl<'a> GlmfLoader<'a> {
                     ops.insert("w_o", w_o);
                 }
             }
-            GlmNextAttention::Mla => self.mla_operands(cfg, &p, &mut ops)?,
+            GlmNextAttention::Mla => self.mla_operands(cfg, &p, &mut ops, inventory.staged(&a("q_a_proj")))?,
         }
         let mlp = if dense { format!("{p}.mlp") } else { format!("{p}.mlp.shared_experts") };
-        if !(dense && self.nvfp4_dense(cfg, &mlp, &mut ops)?) {
+        if !inventory.staged(&format!("{mlp}.gate_proj")) && !(dense && self.nvfp4_dense(cfg, &mlp, &mut ops)?) {
             let block = super::fp8::Layout::Block;
             let projections: Vec<_> = cuteafd_loader::families::glm5_flash::core_fp8_projections("mlp")
                 .iter().map(|name| format!("{mlp}.{name}")).collect();
@@ -986,7 +994,7 @@ impl<'a> GlmfLoader<'a> {
             ops.insert("gate.bias", self.f32(&[format!("{p}.mlp.gate.e_score_correction_bias")])?);
         }
         Ok(GlmfLayer { attention, dense, split: false, attention_share: AttentionShare::Whole,
-            core: Default::default(), attention_native: Default::default(), operands: ops, native: HashMap::new(), native_projections: HashMap::new() })
+            core: Default::default(), attention_native: self.native_operands(inventory.layer_native(cfg, layer, 1, None)?.remove(0), 0)?, operands: ops, native: HashMap::new(), native_projections: HashMap::new() })
     }
 
     /// GPUs of the head split this loader fills (1: no split).
@@ -1333,7 +1341,7 @@ impl<'a> GlmfLoader<'a> {
                         loader.stream = self.peers[rank - 1].stream;
                     }
                     loader.peers.clear();
-                    loader.mla_operands(cfg, &p, &mut ops[rank])
+                    loader.mla_operands(cfg, &p, &mut ops[rank], inventory.staged(&a("q_a_proj")))
                 })?;
             }
             GlmNextAttention::Mla => {
@@ -1343,6 +1351,7 @@ impl<'a> GlmfLoader<'a> {
                 let (uk, uv): (Vec<_>, Vec<_>) = self.absorbed(cfg, &a("kv_b_proj.weight"), ranks)?.into_iter().unzip();
                 put(&mut ops, "w_uk", uk);
                 put(&mut ops, "w_uv", uv);
+                if !inventory.staged(&a("q_a_proj")) {
                 let projections: Vec<_> = cuteafd_loader::families::glm5_flash::core_fp8_projections("mla")
                     .iter().map(|name| a(name)).collect();
                 let (q, s): (Vec<_>, Vec<_>) = self.on_every_rank_pair(|r| self.fp8_on(r, &projections[..2],
@@ -1355,6 +1364,7 @@ impl<'a> GlmfLoader<'a> {
                 let (q, s): (Vec<_>, Vec<_>) = self.fp8_split(&projections[3..4], Axis::Cols, ranks)?.into_iter().unzip();
                 put(&mut ops, "w_o_fp8", q);
                 put(&mut ops, "w_o_scale", s);
+                }
                 let i = |name: &str| a(&format!("indexer.{name}"));
                 put(&mut ops, "w_iq", self.on_every_rank(|r| self.one_on(r, &i("wq_b.weight")))?);
                 put(&mut ops, "w_ik", self.on_every_rank(|r| self.rows_on(r, &[i("wk.weight"), i("weights_proj.weight"),
@@ -1366,7 +1376,7 @@ impl<'a> GlmfLoader<'a> {
         }
         let mlp = if dense { format!("{p}.mlp") } else { format!("{p}.mlp.shared_experts") };
         // A ModelOpt NVFP4 dense MLP runs whole on rank 0 (rank 1 adds a zero partial).
-        if !(dense && self.nvfp4_dense(cfg, &mlp, &mut ops[0])?) {
+        if !inventory.staged(&format!("{mlp}.gate_proj")) && !(dense && self.nvfp4_dense(cfg, &mlp, &mut ops[0])?) {
             let projections: Vec<_> = cuteafd_loader::families::glm5_flash::core_fp8_projections("mlp")
                 .iter().map(|name| format!("{mlp}.{name}")).collect();
             let (q, s): (Vec<_>, Vec<_>) = self.fp8_split(&projections[..2], Axis::Rows, ranks)?.into_iter().unzip();
@@ -1382,9 +1392,12 @@ impl<'a> GlmfLoader<'a> {
             put(&mut ops, "gate.bias", self.on_every_rank(|r| self.f32_on(r,
                 &[format!("{p}.mlp.gate.e_score_correction_bias")]))?);
         }
-        Ok(ops.into_iter().zip(attention_shares).map(|(operands, attention_share)|
-            GlmfLayer { attention, dense, split: true, attention_share, core: Default::default(), attention_native: Default::default(), operands,
-                native: HashMap::new(), native_projections: HashMap::new() }).collect())
+        let owner = match mode { LayerMode::Whole { gpu, .. } if ranks == 2 => Some(gpu), _ => None };
+        let layouts = inventory.layer_native(cfg, layer, ranks, owner)?;
+        ops.into_iter().zip(attention_shares).zip(layouts).enumerate().map(|(rank, ((operands, attention_share), layouts))|
+            Ok(GlmfLayer { attention, dense, split: true, attention_share, core: Default::default(),
+                attention_native: self.native_operands(layouts, rank)?, operands,
+                native: HashMap::new(), native_projections: HashMap::new() })).collect()
     }
 
     /// EXLR8 operands follow the shared native records and the admitted layer owners.

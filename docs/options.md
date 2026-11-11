@@ -295,20 +295,28 @@ weights and scratch alongside the KV pool and routed experts.
 
 ## Precision
 
+Target weights keep checkpoint precision unless an explicit conversion option is
+selected: unset = checkpoint/native format. This includes ordinary BF16
+checkpoints and the MC `original` view. Native FP8 checkpoint weights remain
+FP8. Drafters may retain their qualified FP8 defaults: target verification
+controls output. Qwen has one shared target/MTP head: BF16, the draft reads it;
+there is no extra draft-only FP8 copy. KV cache dtype is independent and unchanged.
+
 | Key | Default | Values | Notes |
 | --- | --- | --- | --- |
 | `EXLR8_MANIFEST` | published `bit325` | manifest name (`up1`, `bit325`, …) | Native EXLR8 experts; needs 1–2 RTX and 1–8 Sparks. |
 | `EXLR8_PREFILL_ACTIVATIONS` | `a16` | `a16`, `a8` | Native EXLR8 trellis prefill activations; decode stays A16. |
 | `V41_FP8_HEAD` | `auto` (engine `packed`) | `auto`, `off`, `draft`, `all`, `packed` | V4.1: unset/`auto` selects the exact packed BF16 target head and coarse dSpark plane on single/dual RTX, including push loading. `all` uses E4M3 for both; `off` keeps BF16; `draft` keeps BF16 plus E4M3 and requires mounted loading. Packed adds 300.214 MiB total over `all` (150.107 MiB/GPU on dual RTX); ordinary admission decides fit. |
+| `CUTEAFD_GLM_BF16` | `native` | `native`, `fp8` | GLM 5.3 target MLA, indexer and dense/shared FFNs preserve checkpoint BF16; `fp8` explicitly converts BF16 to block FP8. Also accepted as an environment variable; launch-key value wins. No effect on native FP8 checkpoints or drafter precision. |
 | `FP8_SCALES` | `amax` | `amax`, `pow2`, `best` | Scale rule for FP8 copies made at load. |
 | `L2_PREFETCH` | `off` | `off`, `auto`, MiB | Pull the next layer's weights into L2 during one-lane decode. |
 | `QWEN_FP8_DECODE` | unset | `on`, `off` | Qwen GDN/attention projections to resident E4M3. |
-| `QWEN_FP8_HEAD` | unset | `on`, `off` | Qwen head target to resident E4M3. |
-| `MIMO_FP8_HEAD` | `auto` | `auto`, `on`, `off` | MiMo FP8 head. |
-| `MIMO_FP8_O_PROJ` | `auto` | `auto`, `on`, `off` | MiMo FP8 output projection. |
-| `GLM5_FLASH_FP8_HEAD` (alias `GLMF_FP8_HEAD`) | `auto` = `packed` (1 GPU), `on` (2 GPUs) | `auto`, `on`, `off`, `packed` | GLM Flash BF16 checkpoint head: FP8 copy, BF16, or an exact 12-bit operand copy (one GPU). Native K6/EXLR8 heads ignore this conversion setting. |
+| `QWEN_FP8_HEAD` | unset (BF16) | `on`, `off` | Explicit conversion of the shared target/MTP head to resident E4M3. |
+| `MIMO_FP8_HEAD` | `auto` (checkpoint) | `auto`, `on`, `off` | Target head FP8 is opt-in; native FP8 stays FP8. Drafter defaults are independent. |
+| `MIMO_FP8_O_PROJ` | `auto` (checkpoint) | `auto`, `on`, `off` | Explicit BF16 target O-projection conversion; native FP8 stays FP8. |
+| `GLM5_FLASH_FP8_HEAD` (alias `GLMF_FP8_HEAD`) | `auto` = checkpoint BF16 (1 or 2 GPUs) | `auto`, `on`, `off`, `packed` | GLM Flash BF16 checkpoint head: FP8 copy, BF16, or an exact 12-bit operand copy (one GPU). Native K6/EXLR8 heads ignore this conversion setting. |
 | `GLM5_FLASH_FP8_PREFILL` (alias `GLMF_FP8_PREFILL`) | unset | pass list (`kda-o`, …) | GLM Flash prefill layers run W8A8. |
-| `GLM5_FLASH_KDA_FP8` (alias `GLMF_KDA_FP8`) | `auto` | `auto`, `off`, `row128`, `channel` | GLM Flash KDA FP8 granularity. |
+| `GLM5_FLASH_KDA_FP8` (alias `GLMF_KDA_FP8`) | `auto` = `off` | `auto`, `off`, `row128`, `channel` | GLM Flash KDA FP8 granularity. |
 | `GLM5_FLASH_KDA_SPLIT` | `auto` | `auto`, `partials` | GLM Flash KDA split output. |
 | `GLM5_FLASH_TARGET_HEAD` | `auto` | `auto`, `tensor`, `exact` | GLM Flash's `TARGET_HEAD` spelling. |
 | `TP2_ATTENTION`, `TP2_QUERY_PROJECTION`, `TP2_OUTPUT_PROJECTION` | `off` | `on`, `off` | V4.1 TP2 projections on the RTX pair. |
@@ -507,7 +515,7 @@ weights and F32 block-128 scales; `compact` selects parent K6 attention, while
 | `POOL_TOKENS` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | `HOST_CACHE_BYTES` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | **Attention and KV** | | | | | | | | | | |
-| `CORE_VIEW` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `CORE_VIEW` | ✗ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | `ATTENTION_PLACEMENT` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | ✓ | ✓ | ✓ |
 | `ATTENTION_PLAN_ROWS` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | ✓ | ✓ | ✓ |
 | `MAX_CONTEXT_TOKENS` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
@@ -575,6 +583,7 @@ weights and F32 block-128 scales; `compact` selects parent K6 attention, while
 | `V41_FP8_HEAD` | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
 | `FP8_SCALES` | ✗ | ✗ | ✓ | ✓ | ✓ | ✓ | ✗ | ✗ | ✗ | ✗ |
 | `L2_PREFETCH` | ✓ | ✗ | ✓ | ✓ | ✓ | ✓ | ✗ | ✗ | ✗ | ✗ |
+| `CUTEAFD_GLM_BF16` | ✗ | ✗ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
 | `QWEN_FP8_DECODE` | ✗ | ✗ | ✗ | ✗ | ✗ | ✓ | ✗ | ✗ | ✗ | ✗ |
 | `QWEN_FP8_HEAD` | ✗ | ✗ | ✗ | ✗ | ✗ | ✓ | ✗ | ✗ | ✗ | ✗ |
 | `MIMO_FP8_HEAD` | ✗ | ✗ | ✗ | ✗ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ |

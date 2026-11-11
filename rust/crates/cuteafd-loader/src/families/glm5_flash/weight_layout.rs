@@ -131,7 +131,7 @@ pub fn target(checkpoint: &Checkpoint, cfg: &GlmNextConfig, modes: &[LayerMode],
                         "indexer.k_norm.weight", "indexer.k_norm.bias", "indexer.index_kpool_compress_ape"] { one(out, a(leaf))?; }
                     insert(out, format!("{}.uk", a("kv_b_proj.weight")), cfg.heads*cfg.qk_nope_dim*cfg.kv_lora_rank*2/parts)?;
                     insert(out, format!("{}.uv", a("kv_b_proj.weight")), cfg.heads*cfg.v_head_dim*cfg.kv_lora_rank*2/parts)?;
-                    if !native {
+                    if !core.staged(&a("q_a_proj")) && !native {
                         fp8(out, vec![a("q_a_proj.weight"), a("kv_a_proj_with_mqa.weight")], 1, false)?;
                         fp8(out, vec![a("q_b_proj.weight")], parts, false)?;
                         fp8(out, vec![a("o_proj.weight")], parts, false)?;
@@ -144,7 +144,9 @@ pub fn target(checkpoint: &Checkpoint, cfg: &GlmNextConfig, modes: &[LayerMode],
             }
             if !native {
                 let mlp = if cfg.dense[layer] { format!("{p}.mlp") } else { format!("{p}.mlp.shared_experts") };
-                if cfg.dense[layer] && tensor(&format!("{mlp}.gate_proj.weight"))?.meta.dtype == DType::U8 {
+                if core.staged(&format!("{mlp}.gate_proj")) {
+                    // Native requests are inventoried above.
+                } else if cfg.dense[layer] && tensor(&format!("{mlp}.gate_proj.weight"))?.meta.dtype == DType::U8 {
                     if rank == 0 { for proj in ["gate_proj", "up_proj", "down_proj"] {
                         one(out, format!("{mlp}.{proj}.weight"))?;
                         insert(out, format!("{mlp}.{proj}.weight_scale"), usize::try_from(tensor(&format!("{mlp}.{proj}.weight_scale"))?.meta.byte_length)?+8)?;

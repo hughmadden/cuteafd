@@ -648,7 +648,7 @@ impl WeightInventory {
                 let names = [weight(Op::Gate)?, weight(Op::Up)?, weight(Op::Down)?];
                 let group = if dense { "dense" } else { "shared_expert" };
                 if (dense || !native_shared) && core.get_weight(&names[0]).is_none() {
-                    let shared_bf16 = !dense && native_bf16 && headers.all_bf16(&names)?;
+                    let shared_bf16 = native_bf16 && headers.all_bf16(&names)?;
                     headers.projection(
                         &mut out,
                         rank,

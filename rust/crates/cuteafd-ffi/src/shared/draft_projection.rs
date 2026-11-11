@@ -100,7 +100,7 @@ impl<'a> DraftProjections<'a> {
     /// # Safety
     /// Device buffers hold nonoverlapping BF16 [rows,k], [n,k] and output-typed [rows,n]
     /// on the supplied stream. Their owners survive all queued work. This raw-pointer
-    /// entry bypasses output extent checks; new HQA callers use `launch_checked`.
+    /// entry bypasses output extent checks; new native-core callers use `launch_checked`.
     #[allow(clippy::too_many_arguments)]
     pub unsafe fn launch(&self, x: *const c_void, weight: *const c_void, out: *mut c_void,
         rows: usize, k: usize, n: usize, stream: *mut c_void) -> Result<()> {

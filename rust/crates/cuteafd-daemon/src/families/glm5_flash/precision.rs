@@ -120,6 +120,8 @@ pub(crate) fn check_projection_inputs(primary: &Checkpoint,
                 for scalar in ["weight_scale_2", "input_scale"] {
                     self::scalar(primary, format!("{name}.{scalar}"))?;
                 }
+            } else if core.native.get(&name).is_some_and(|p| !p.fp8) {
+                require(primary, format!("{name}.weight"), DType::Bf16, vec![rows, cols], 2, "native dense/shared BF16 MLP")?;
             } else {
                 block(primary, format!("{name}.weight"), rows, cols, "dense/shared FP8 block MLP")?;
             }

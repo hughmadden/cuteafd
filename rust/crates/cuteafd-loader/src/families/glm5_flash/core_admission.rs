@@ -91,6 +91,8 @@ impl CoreCharges {
         let mut bodies = vec![Vec::new(); ranks];
         let mut native_names = vec![[BTreeSet::new(), BTreeSet::new()]; ranks];
         let mut bf16_shapes = BTreeSet::new();
+        let mut native_bodies = vec![false; ranks];
+        let mut native_split = false;
         for layer in 0..layers {
             let owner = owners.and_then(|o| (cfg.attention[layer] == super::GlmNextAttention::Mla).then_some(o[layer]));
             for (rank, weights) in core.layer_weights(cfg, layer, ranks, owner)?.into_iter().enumerate() {
@@ -98,6 +100,8 @@ impl CoreCharges {
             }
             for (rank, weights) in core.layer_native(cfg, layer, ranks, owner)?.into_iter().enumerate() {
                 for weight in weights.values() {
+                    native_bodies[rank] = true;
+                    native_split |= weight.ranks > 1 && weight.split == super::core::CoreSplit::Input;
                     if !weight.fp8 {
                         bf16_shapes.insert((weight.shape[1], weight.shape[0]));
                         continue;
@@ -139,7 +143,7 @@ impl CoreCharges {
             }
             Ok(bytes)
         };
-        if bodies.iter().any(|b| !b.is_empty()) {
+        if bodies.iter().any(|b| !b.is_empty()) || native_bodies.iter().any(|&b| b) {
             for decode in [true, false] {
                 for name in route_stage_names(cfg, ranks, owned, decode, decode_rows) {
                     lookup(&name)?; programs.insert(name);
@@ -156,7 +160,7 @@ impl CoreCharges {
             Ok(result)
         };
         let head_scratch = |rows| head.as_ref().map(|h| ProjectionScratchLayout::new(h.shape[1], h.shape[0], rows)).transpose();
-        let split = bodies.iter().flatten().any(|w| w.side == TrellisSide::Input);
+        let split = ranks > 1 && (native_split || bodies.iter().flatten().any(|w| w.side == TrellisSide::Input));
         let retained_rows = decode_rows.checked_add(unit.checked_mul(slots).context("Flash K6 live rows overflow")?)
             .context("Flash K6 live rows overflow")?;
         let receive = receive_suffix_bytes(unit.max(decode_rows), cfg.hidden, slots, output_shard)?;
@@ -169,7 +173,8 @@ impl CoreCharges {
         };
         let mut layouts = Vec::new();
         for (rank, body) in bodies.into_iter().enumerate() {
-            let stages = if body.is_empty() { None } else { Some([
+            let active = !body.is_empty() || native_bodies[rank];
+            let stages = if !active { None } else { Some([
                 CoreStageLayout::new(cfg, decode_rows, ranks, owned, scratch(rank, true)?)?,
                 CoreStageLayout::new(cfg, unit, ranks, owned, scratch(rank, false)?)?]) };
             let (decode, prefill) = (projection(&body, decode_rows)?, projection(&body, unit)?);
@@ -183,13 +188,13 @@ impl CoreCharges {
                 allocations.extend(stages.iter().flat_map(|stage|
                     stage.extents.values().map(|&bytes| bytes as u64)));
             }
-            if !body.is_empty() {
+            if active {
                 allocations.extend(retained(decode_rows)?);
                 for _ in 0..slots { allocations.extend(retained(unit)?); }
             }
             layouts.push(CoreRankLayout {
                 stages, decode, prefill, target_head, draft_head,
-                retained_rows: if body.is_empty() { 0 } else { retained_rows },
+                retained_rows: if !active { 0 } else { retained_rows },
                 allocations, receive_suffix: if split { receive } else { 0 }, body,
             });
         }

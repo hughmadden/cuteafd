@@ -508,7 +508,7 @@ mod source_format_tests {
     }
 
     #[test]
-    fn qualified_default_matches_explicit_fp8_bundle_in_a_renamed_local_copy() {
+    fn target_defaults_preserve_bf16_and_drafter_fp8_is_independent() {
         let (_directory, mut args, checkpoint, cfg) = qualified_fixture();
         let automatic = crate::commands::bench::assert_resolved_family_seam("mimo_v2",
             &["max-context-tokens", "pool-tokens", "prefill-rows", "prefill-waves", "prefill-span-rows",
@@ -520,14 +520,16 @@ mod source_format_tests {
                 assert!(shape.unit_rows > 0);
                 resolve_weight_formats(&args, &checkpoint, &cfg)
             }).unwrap();
-        assert_eq!(automatic.default_policy, MimoDefaultPolicy::Fp8);
-        assert_eq!(automatic.head, MimoProjectionRepresentation::Fp8);
+        assert_eq!(automatic.default_policy, MimoDefaultPolicy::Checkpoint);
+        assert_eq!(automatic.head, MimoProjectionRepresentation::Bf16);
         assert_eq!(automatic.draft, MimoDraftRepresentation::Fp8Only);
         assert_eq!(automatic.output.len(), 70);
-        assert!(automatic.output.values().all(|&format| format == MimoProjectionRepresentation::Fp8));
+        assert!(automatic.output.values().all(|&format| format == MimoProjectionRepresentation::Bf16));
         args.fp8_head = Some(true); args.fp8_o_proj = Some(true); args.draft_fp8 = Some(true);
-        assert_eq!(resolve_weight_formats(&args, &checkpoint, &cfg).unwrap(), automatic);
-        assert!(validate_resolved_replay(&automatic, true).unwrap_err().to_string().contains("--weight-policy checkpoint"));
+        let explicit = resolve_weight_formats(&args, &checkpoint, &cfg).unwrap();
+        assert_eq!(explicit.head, MimoProjectionRepresentation::Fp8);
+        assert!(explicit.output.values().all(|&format| format == MimoProjectionRepresentation::Fp8));
+        assert!(validate_resolved_replay(&automatic, true).is_err(), "FP8-only drafter has no BF16 replay fallback");
     }
 
     #[test]
@@ -941,7 +943,8 @@ fn resolve_weight_formats(args: &EngineArgs, checkpoint: &Checkpoint, cfg: &Mimo
         // Drafter precision cannot change committed tokens; FP8 drafts are faster
         // (measured with the target default above), so BF16 drafters convert.
         match native_draft.unwrap_or(MimoDraftRepresentation::Bf16Only) {
-            MimoDraftRepresentation::Bf16Only if default_fp8.is_some() => MimoDraftRepresentation::Fp8Only,
+            MimoDraftRepresentation::Bf16Only if args.weight_policy != WeightPolicyArg::Checkpoint
+                && weight_policy::default_draft_fp8(cfg) => MimoDraftRepresentation::Fp8Only,
             native => native,
         }
     } else { args.draft_storage()? };

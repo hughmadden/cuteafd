@@ -221,7 +221,7 @@ pub(crate) struct EngineArgs {
     /// `packed`: only the exact 12-bit copy of the BF16 values (`shared::packed_head`), packed
     /// and verified at load, then the BF16 released: target logits read it exactly on its
     /// tensor-core GEMV, the drafter through its coarse plane; one GPU (no --split-device).
-    /// `auto` (default): packed on one GPU, FP8 on a head split; native heads stay native.
+    /// `auto` (default): checkpoint BF16 on every topology; native heads stay native.
     #[arg(long = "fp8-head", default_value = "auto", num_args = 0..=1, default_missing_value = "true",
         action = clap::ArgAction::Set)]
     pub head_format: head::GlmfHeadFormat,
@@ -599,8 +599,8 @@ mod draft_cli_tests {
     #[test]
     fn plan_and_serve_auto_share_checkpoint_topology_resolution() {
         use clap::Parser;
-        use head::GlmfHeadFormat::{Bf16, Fp8, Packed};
-        for (native, ranks, expected) in [(false, 1, Packed), (false, 2, Fp8), (true, 1, Bf16), (true, 2, Bf16)] {
+        use head::GlmfHeadFormat::Bf16;
+        for (native, ranks, expected) in [(false, 1, Bf16), (false, 2, Bf16), (true, 1, Bf16), (true, 2, Bf16)] {
             let cli = crate::cli::Cli::try_parse_from(["cuteafd", "plan", "/checkpoint", "--layout", "--rtx", &ranks.to_string()]).unwrap();
             let crate::cli::Commands::Plan(plan) = cli.command else { panic!("plan") };
             let mut serve = if ranks == 2 { parse(&["--split-device", "1"]) } else { parse(&[]) };
@@ -1906,7 +1906,7 @@ impl Opened {
         if self.native { return Ok(None); }
         let headers = Checkpoint::coordinator_view(&self.view, false, false)?;
         let core = CoreInventory::from_checkpoint(&self.cfg, &headers)?;
-        if core.projections.is_empty() { return Ok(None); }
+        if core.projections.is_empty() && core.native.is_empty() { return Ok(None); }
         ensure!(args.kda_state == engine::KdaState::F32, "native K6 requires F32 KDA state programs");
         let owners = (attention.mode == cuteafd_loader::placement::AttentionPlacement::Layers).then(|| {
             let mut next = attention.first_owner as u8;
