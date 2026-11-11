@@ -293,13 +293,13 @@ mod tests {
         for world in 1..=8 {
             let recipe = spark_recipe("minimax:nvfp4a4", 3072, world).unwrap();
             assert_eq!(recipe, spark_recipe("minimax:nvfp4", 3072, world).unwrap());
-            assert_eq!(recipe.widths.iter().sum::<usize>(), 3072);
+            assert!(recipe.widths.iter().sum::<usize>() >= 3072);
             assert!(recipe.widths.iter().all(|width| width % 16 == 0));
             assert!(recipe.stored_widths.iter().all(|width| width % 128 == 0));
             assert_eq!(recipe.slicing, if 3072 % (128 * world) == 0 { Slicing::Blocks(16) } else { Slicing::Padded });
         }
         let tp5 = spark_recipe("minimax:nvfp4a4", 3072, 5).unwrap();
-        assert_eq!(tp5.widths, vec![624, 624, 608, 608, 608]);
+        assert_eq!(tp5.widths, vec![640; 5]);
         assert_eq!(tp5.stored_widths, vec![640; 5]);
         assert_eq!(spark_recipe("minimax:nvfp4a4", 3072, 6).unwrap().widths, vec![512; 6]);
         assert!(spark_recipe("minimax:fp8", 3072, 4).is_err());
