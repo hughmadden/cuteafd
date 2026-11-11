@@ -149,6 +149,42 @@ mod tests {
     }
 
     #[test]
+    fn raw_mount_streams_operands_larger_than_source_window() -> Result<()> {
+        use cuteafd_loader::shared::dense_read::STEP_BYTES;
+        let fixture = Fixture::build_for_tests()?;
+        let library = fixture.load()?;
+        fixture.immediate_copies(&library)?;
+        fixture.strict_device_free(&library, true)?;
+        let capacity = STEP_BYTES * 2;
+        fixture.configure_memory(&library, 1, capacity)?;
+        let dir = tempfile::tempdir_in(fixture.directory())?;
+        let tensors = vec![("payload".into(), "U8", vec![STEP_BYTES / 4096 + 1, 4096])];
+        cuteafd_loader::plan::testing::write_snapshot(dir.path(), &serde_json::json!({"model_type":"fixture"}), &tensors, None);
+        let checkpoint = Checkpoint::open(dir.path())?;
+        let header = checkpoint.header("payload").unwrap();
+        let bytes = header.byte_length as usize;
+        let file = std::fs::OpenOptions::new().write(true).open(dir.path().join(&checkpoint.tensors[0].shard))?;
+        // Distinct markers straddle the reused pinned-buffer boundary.
+        for (offset, marker) in [(0, 17), (STEP_BYTES - 1, 29), (STEP_BYTES, 31), (bytes - 1, 43)] {
+            file.write_all_at(&[marker], header.byte_offset + offset as u64)?;
+        }
+        let layout = CoordinatorWeights { rank: 0, layers: Vec::new(),
+            arena: WeightArenaLayout::new("minimax/target/0", [("payload".into(), bytes)])?, projections: Vec::new() };
+        assert_eq!(layout.mount_load(&checkpoint)?.pinned_source, STEP_BYTES as u64);
+        let device = Device { library: &library, id: 1 };
+        let weights = TargetWeights::mount(device, &checkpoint, &layout)?;
+        let mut actual = vec![0; bytes];
+        device.run(|| library.copy_d2h(&mut actual, weights.operand("payload")?.buffer))?;
+        assert_eq!((actual[0], actual[STEP_BYTES - 1], actual[STEP_BYTES], actual[bytes - 1]), (17, 29, 31, 43));
+        assert_eq!(actual.iter().filter(|value| **value != 0).count(), 4);
+        assert_eq!(fixture.events()?.matches('D').count(), 1);
+        drop(weights);
+        assert_eq!(device.run(|| library.cuda_physical_memory_info())?.0, capacity);
+        assert_eq!(fixture.device_free_mismatch(&library)?, (0, -1, -1));
+        Ok(())
+    }
+
+    #[test]
     fn raw_mount_rejects_recording_before_allocating() -> Result<()> {
         let fixture = Fixture::build_for_tests()?;
         let library = fixture.load()?;
