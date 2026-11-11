@@ -428,7 +428,7 @@ fn official_ml4_native_inventory_keeps_expert_package_refusal() -> Result<()> {
 #[test]
 fn original_ml4_native_inventory_equals_routes_and_single_arena_charges() -> Result<()> {
     let root = tempfile::tempdir()?;
-    let mut tensors = fixture::mistral_large4_tensors(Some(&[1]), false);
+    let mut tensors = fixture::mistral_large4_tensors(None, false);
     let experts = tensors.iter().filter_map(|(name, _, shape)| {
         let stem = name.strip_suffix(".weight")?;
         stem.contains(".experts.").then(|| (stem.to_owned(), shape.clone()))
