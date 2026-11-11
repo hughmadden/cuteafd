@@ -642,7 +642,8 @@ pub fn write_glm5_flash_workspaces(root: &Path) -> std::path::PathBuf {
             "glmf_index_topk_decode_m64", "glmf_index_topk_prefill_m4096",
             "glmf2_kda_w8_norm_m64", "glmf2_kda_output_rows_m64",
             "glmf2_kda_w8_norm_m4096", "glmf2_kda_output_rows_m4096",
-            "glmf2_kda_w8_norm_expanded_m4096", "glmf2_kda_output_rows_expanded_m4096"].map(str::to_string))
+            "glmf2_kda_w8_norm_expanded_m4096", "glmf2_kda_output_rows_expanded_m4096",
+            "glmf2_kda_w8_expanded_m4096"].map(str::to_string))
         .map(|name| json!({"name":name,"scratch_bytes_at_capacity":{"scratch":4096}})).collect();
     let path = share.join("PROGRAMS.json");
     fs::write(&path, json!({"capacities":{"max_context":131072},"programs":programs}).to_string()).unwrap();

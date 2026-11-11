@@ -464,15 +464,16 @@ mod tests {
             let Some(path) = resolved.snapshot_path else { continue };
             let checkpoint = Checkpoint::open(&path).unwrap();
             let cfg = GlmNextConfig::from_hf(&checkpoint.config).unwrap();
+            // Original retains all BF16 KDA projections and the BF16 shared head.
             let single = resident_weights(&checkpoint, &cfg, cfg.layers, 1, Default::default()).unwrap();
             assert_eq!((single[0].embedding, single[0].weights),
-                (1_268_776_960, 8_956_184_320 - 654_213_120 + 956_074_752), "{model}");
+                (1_268_776_960, 14_034_716_416), "{model}");
             let packed = GlmfRepresentation { head: GlmfHeadFormat::Packed, ..Default::default() };
             let packed = resident_weights(&checkpoint, &cfg, cfg.layers, 1, packed).unwrap();
-            assert_eq!(packed[0].weights, 8_956_184_320 - 654_213_120 + 956_074_752, "{model}");
+            assert_eq!(packed[0].weights, 14_034_716_416 - 1_268_776_960 + 956_074_752, "{model}");
             let split = resident_weights(&checkpoint, &cfg, cfg.layers, 2, Default::default()).unwrap();
             assert_eq!((split[0].weights, split[1].weights),
-                (5_660_947_200, 4_907_587_072 + router_replica_bytes(&checkpoint, &cfg, cfg.layers).unwrap()), "{model}");
+                (7_936_512_768, 6_568_588_800 + router_replica_bytes(&checkpoint, &cfg, cfg.layers).unwrap()), "{model}");
             assert_eq!(split[1].embedding, 0);
         }
     }

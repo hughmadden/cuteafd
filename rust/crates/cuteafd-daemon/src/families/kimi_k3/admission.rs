@@ -1682,7 +1682,7 @@ pub(super) mod tests {
             "rope_parameters":{"rope_type":"yarn", "rope_theta":50000.0, "factor":32.0,
                 "original_max_position_embeddings":32768, "beta_fast":32, "beta_slow":1,
                 "mscale":1.0, "mscale_all_dim":1.0},
-            "dflash_config":{"core_view":"mla", "block_size":8,
+            "dflash_config":{"attention_mode":"mla", "block_size":8,
                 "conv_kernel_size":2, "conv_group_size":16, "selector_rank":256,
                 "selector_top_k":16, "target_layer_ids":[0,1], "mask_token_id":163592}});
         MlaDflashConfig::from_json(&config).unwrap().runtime_layout(GlmDraftRepresentation::Fp8Only,

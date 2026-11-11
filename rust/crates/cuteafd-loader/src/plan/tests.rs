@@ -3598,8 +3598,11 @@ fn glm5_flash_layout_charges_the_packed_head_on_one_gpu() {
         let memory = report.memory_layout.unwrap();
         assert!(memory.notes.iter().any(|note|
             note.contains(&format!("shared target/draft head: {}", GlmfHeadFormat::Bf16.name()))));
-        assert!(memory.devices.iter().flat_map(|device| &device.items)
-            .all(|item| !item.group.starts_with("cuBLAS handles:")));
+        // DFlash borrows the BF16 head through tensor-op GEMM even with an Lt target head.
+        let handles: u64 = memory.devices.iter().flat_map(|device| &device.items)
+            .filter(|item| item.group.starts_with("cuBLAS handles: glmf/blas/serve"))
+            .map(|item| item.bytes).sum();
+        assert_eq!(handles, 64 << 20);
         let initialization: u64 = memory.devices.iter().flat_map(|device| &device.items)
             .filter(|item| item.group.starts_with("BLAS device initialization"))
             .map(|item| item.bytes).sum();
