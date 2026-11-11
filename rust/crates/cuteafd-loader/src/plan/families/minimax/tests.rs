@@ -100,4 +100,17 @@ fn installed_minimax_headers_match_native_contract() {
     let model = Model::open(&checkpoint).unwrap();
     assert_eq!(model.cfg.moe_layers(), 57);
     assert_eq!(checkpoint.tensors.len(), 89_632);
+    assert!(checkpoint.spark_input_is_bf16());
+    use crate::plan::checkpoint::{ModuleNumerics, ProjectionStorage};
+    for module in [format!("{TEXT}layers.0.self_attn.q_proj"),
+        format!("{TEXT}layers.59.self_attn.index_k_proj"),
+        format!("{TEXT}layers.3.block_sparse_moe.shared_experts.down_proj")] {
+        assert_eq!(checkpoint.module_numerics(&module).unwrap(), ModuleNumerics::W8A8, "{module}");
+    }
+    let expert = format!("{TEXT}layers.3.block_sparse_moe.experts.0.w1");
+    assert_eq!(checkpoint.module_numerics(&expert).unwrap(), ModuleNumerics::W4A4);
+    assert_eq!(checkpoint.projection(&expert).unwrap().storage,
+        ProjectionStorage::CompressedNvfp4 { shape: vec![3072, 6144] });
+    assert_eq!(checkpoint.module_numerics(&format!("{TEXT}layers.3.block_sparse_moe.gate")).unwrap(),
+        ModuleNumerics::CheckpointPrecision);
 }
