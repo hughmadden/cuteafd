@@ -204,6 +204,33 @@ def test_dense_family_scope_preserves_legacy_and_unions_shared_geometry(monkeypa
             catalog(monkeypatch, families)
 
 
+def test_minimax_native_mxfp8_a8_catalog_preserves_shipping_exlr8(monkeypatch):
+    triples = lambda entries: [(name, op, params) for name, op, params, _ in entries]
+    shipping = catalog(monkeypatch)
+    native = catalog(monkeypatch, ("minimax",))
+    assert len(native) == 12
+    assert len({name for name, *_ in native}) == len(native)
+    gemms = [(name, params) for name, op, params, _ in native if op == "dense_mxfp8"]
+    assert {(p["input_features"], p["output_features"]) for _, p in gemms} == {
+        (6144, 8192), (6144, 512), (6144, 128), (8192, 6144),
+        (6144, 12288), (12288, 6144), (6144, 3072), (3072, 6144)}
+    for name, op, params, thunk in native:
+        assert params["input_dtype"] == "bf16"
+        assert params["rotation_count"] == 1 and params["max_rows"] == 4096
+        assert thunk() == params
+        if op == "dense_mxfp8":
+            assert params["encoding"] == "mxfp8" and params["sharded_side"] == 1
+            assert name == f"mxfp8_k{params['input_features']}_n{params['output_features']}_s1_a8"
+        else:
+            assert op == "dense_mxfp8_quant"
+            assert name == f"quant_k{params['input_features']}_bf16_a8"
+    assert {p["input_features"] for _, op, p, _ in native if op == "dense_mxfp8_quant"} == {
+        3072, 6144, 8192, 12288}
+    union = catalog(monkeypatch, ("minimax", "glmf", "glm", "minimax"))
+    assert triples(union) == triples(shipping) + triples(native)
+    assert len({name for name, *_ in union}) == len(union)
+
+
 def test_flash_index_companions_pack_native_bf16_weights_without_quantization(monkeypatch):
     entries = {name: (op, params, thunk)
                for name, op, params, thunk in catalog(monkeypatch, ("glmf",))}

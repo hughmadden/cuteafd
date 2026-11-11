@@ -180,7 +180,7 @@ def legacy_programs():
     return result
 
 
-def programs(families=("glm",)):
+def exlr8_programs(families=("glm",)):
     requested = set(families)
     if not requested or requested - {"glm", "glmf"}:
         raise ValueError("EXLR8 dense families must contain glm and/or glmf")
@@ -211,6 +211,39 @@ def programs(families=("glm",)):
                     params["sharded_side"]) in NATIVE_MXFP8_GEOMETRIES
         return False
     return [entry for entry in legacy if needed(entry)] + additional_programs()
+
+
+def minimax_programs():
+    from b12x.integration.cuteafd.dense_mxfp8 import (
+        compile_dense_mxfp8_quant_aot, compile_dense_mxfp8_aot)
+
+    # Unique full-layer projections from the vendor's MXFP8 checkpoint headers.
+    shapes = ((6144, 8192), (6144, 512), (6144, 128), (8192, 6144),
+              (6144, 12288), (12288, 6144), (6144, 3072), (3072, 6144))
+    result = []
+    for k, n in shapes:
+        params = dict(input_features=k, output_features=n, encoding="mxfp8",
+                      sharded_side=1, input_dtype="bf16", rotation_count=1,
+                      max_rows=4096)
+        result.append((f"mxfp8_k{k}_n{n}_s1_a8", "dense_mxfp8", params,
+                       partial(compile_dense_mxfp8_aot, **params)))
+    for k in sorted({k for k, _ in shapes}):
+        params = dict(input_features=k, input_dtype="bf16", rotation_count=1,
+                      max_rows=4096)
+        result.append((f"quant_k{k}_bf16_a8", "dense_mxfp8_quant", params,
+                       partial(compile_dense_mxfp8_quant_aot, **params)))
+    return result
+
+
+def programs(families=("glm",)):
+    requested = set(families)
+    if not requested or requested - {"glm", "glmf", "minimax"}:
+        raise ValueError("native dense families must contain glm, glmf and/or minimax")
+    exlr8 = requested - {"minimax"}
+    result = exlr8_programs(exlr8) if exlr8 else []
+    if "minimax" in requested:
+        result += minimax_programs()
+    return result
 
 
 def main():
