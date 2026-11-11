@@ -98,6 +98,59 @@ fn generic_native_validation_rejects_missing_and_drifted_minimax_tensors_early()
 }
 
 #[test]
+fn coordinator_native_arena_preserves_checkpoint_bytes_and_explicit_owners() {
+    use crate::families::minimax_m3::weight_layout::CoordinatorWeights;
+    let (dir, _, _) = fixture();
+    let checkpoint = Checkpoint::open(dir.path()).unwrap();
+    let cfg = MiniMaxM3Config::from_hf(&checkpoint.config).unwrap();
+    let weights = CoordinatorWeights::plan(&checkpoint, &cfg, 2, &[1, 0, 1, 0]).unwrap();
+    assert_eq!(weights[0].layers, [1, 3]);
+    assert_eq!(weights[1].layers, [0, 2]);
+    for (rank, weight) in weights.iter().enumerate() {
+        assert_eq!(weight.arena.id(), format!("minimax/target/{rank}"));
+        assert_eq!(weight.projections.len(), 18);
+        assert_eq!(weight.records_bytes(17).unwrap(), 2 * (12288 / 32) * 528);
+        assert!(weight.records_bytes(0).is_err());
+        assert!(weight.records_bytes(4097).is_err());
+        assert!(weight.dense_programs().contains("exlr8_dense_mxfp8_k6144_n8192_s1_a8"));
+        assert!(weight.dense_programs().contains("exlr8_dense_mxfp8_k12288_n6144_s1_a8"));
+        assert_eq!(weight.arena.payload_bytes(), weight.arena.views().iter().map(|(name, view)| {
+            assert_eq!(view.offset() % 256, 0);
+            let header = checkpoint.header(name).unwrap();
+            assert_eq!(view.bytes() as u64, header.byte_length);
+            assert!(!name.contains(".experts."));
+            header.byte_length as usize
+        }).sum::<usize>());
+        assert!(weight.arena.view(&format!("{TEXT}norm.weight")).is_some());
+        assert_eq!(weight.arena.view(&format!("{TEXT}embed_tokens.weight")).is_some(), rank == 0);
+        assert_eq!(weight.arena.view("language_model.lm_head.weight").is_some(), rank == 1);
+    }
+    assert!(weights[0].arena.view(&format!("{TEXT}layers.3.block_sparse_moe.gate.weight")).is_some());
+    let single = CoordinatorWeights::plan(&checkpoint, &cfg, 1, &[0; 4]).unwrap();
+    // TP2 duplicates only final norm, not layer payloads or global matrices.
+    assert_eq!(weights.iter().map(|w| w.arena.payload_bytes()).sum::<usize>(),
+        single[0].arena.payload_bytes() + cfg.hidden * 2);
+    assert!(CoordinatorWeights::plan(&checkpoint, &cfg, 0, &[0; 4]).is_err());
+    assert!(CoordinatorWeights::plan(&checkpoint, &cfg, 2, &[0; 3]).is_err());
+    assert!(CoordinatorWeights::plan(&checkpoint, &cfg, 2, &[0, 1, 2, 0]).is_err());
+    let mut wrong = cfg.clone();
+    wrong.hidden += 128;
+    assert!(CoordinatorWeights::plan(&checkpoint, &wrong, 1, &[0; 4]).is_err());
+}
+
+#[test]
+fn coordinator_native_arena_refuses_missing_scale_header() {
+    use crate::families::minimax_m3::weight_layout::CoordinatorWeights;
+    let (dir, _, _) = fixture();
+    let mut checkpoint = Checkpoint::open(dir.path()).unwrap();
+    let cfg = MiniMaxM3Config::from_hf(&checkpoint.config).unwrap();
+    let scale = format!("{TEXT}layers.0.self_attn.q_proj.weight_scale_inv");
+    checkpoint.tensors.retain(|tensor| tensor.meta.name != scale);
+    let error = CoordinatorWeights::plan(&checkpoint, &cfg, 1, &[0; 4]).unwrap_err().to_string();
+    assert!(error.contains(&scale), "{error}");
+}
+
+#[test]
 #[ignore = "requires the installed vendor checkpoint"]
 fn installed_minimax_headers_match_native_contract() {
     // Explicitly ignored: requires the installed checkpoint, but never reads payloads or a GPU.
@@ -119,4 +172,9 @@ fn installed_minimax_headers_match_native_contract() {
         ProjectionStorage::CompressedNvfp4 { shape: vec![3072, 6144] });
     assert_eq!(checkpoint.module_numerics(&format!("{TEXT}layers.3.block_sparse_moe.gate")).unwrap(),
         ModuleNumerics::CheckpointPrecision);
+    let weights = crate::families::minimax_m3::weight_layout::CoordinatorWeights::plan(
+        &checkpoint, &model.cfg, 1, &vec![0; model.cfg.layers]).unwrap();
+    assert_eq!(weights[0].projections.len(), 60 * 9);
+    assert_eq!(weights[0].records_bytes(2752).unwrap(), (2752 / 16) * (12288 / 32) * 528);
+    assert!(weights[0].arena.views().keys().all(|name| !name.contains(".experts.") && !name.starts_with("vision_tower.")));
 }
