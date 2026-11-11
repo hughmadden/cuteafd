@@ -131,6 +131,91 @@ fn glm5_native_head_members_classify_and_validate_as_one_operand() {
     assert!(family.classify(model.spec(), "lm_head_other.trellis").is_none());
 }
 
+fn glm_flash_native_core_plan(bits: usize) {
+    let mut config = glm5_flash_config(2);
+    config["text_config"]["vocab_size"] = json!(128);
+    let cfg = crate::families::glm5_flash::GlmNextConfig::from_hf(&config).unwrap();
+    let shapes = crate::families::glm5_flash::core::expected(&cfg);
+    let mut tensors = glm5_flash_tensors(&config);
+    tensors.retain(|(name, _, _)| {
+        let (stem, _) = format::split_stem(name);
+        !shapes.contains_key(&format!("{stem}.weight"))
+    });
+    for (name, shape) in &shapes {
+        tensors.extend(exl3(name.strip_suffix(".weight").unwrap(), shape[0], shape[1], bits));
+    }
+    let dir = snapshot(config, &tensors);
+    let report = plan(dir.path(), &PlanOptions::default()).unwrap();
+    // Header admission is independent of installed workspace exports. The CLI
+    // fixture check covers full placement with the matching PROGRAMS.json.
+    for component in &report.components {
+        assert_eq!(component.rejected, 0, "{}", render(&report));
+    }
+    let checkpoint = Checkpoint::open(dir.path()).unwrap();
+    let core = crate::families::glm5_flash::core::CoreInventory::from_checkpoint(&cfg, &checkpoint).unwrap();
+    assert_eq!(core.projections.len(), shapes.len());
+    assert!(core.projections.values().all(|projection| projection.bits == bits));
+    for kind in [Component::Attention, Component::DenseFfn, Component::SharedExpert, Component::LmHead] {
+        assert!(component(&report, kind).formats.contains_key(&format!("exl3-k{bits}")), "{kind:?}");
+    }
+}
+
+#[test]
+fn glm_flash_k8_native_core_admission() {
+    glm_flash_native_core_plan(8);
+}
+
+#[test]
+fn glm_flash_k4_native_core_admission() {
+    glm_flash_native_core_plan(4);
+}
+
+#[test]
+fn glm_flash_unsupported_native_core_width_is_actionable() {
+    let config = glm5_flash_config(2);
+    let mut tensors = glm5_flash_tensors(&config);
+    let stem = "model.language_model.layers.0.self_attn.q_proj";
+    tensors.retain(|(name, _, _)| name != &format!("{stem}.weight"));
+    tensors.extend(exl3(stem, 8192, 4096, 5));
+    let dir = snapshot(config, &tensors);
+    let report = plan(dir.path(), &PlanOptions::default()).unwrap();
+    assert!(!report.executable());
+    let reasons = rejected(&report, Component::Attention);
+    assert!(reasons.iter().any(|reason| reason.contains(stem)
+        && reason.contains("unsupported dense core width K5")
+        && reason.contains("shipping widths [4, 6, 8]")
+        && reason.contains("trellis_linear exporter program and family dispatch")), "{reasons:?}");
+}
+
+#[test]
+fn glm_and_ml4_planner_native_core_widths_equal_loader_contracts() {
+    let flash = glm5_flash_config(2);
+    let ml4 = tempfile::tempdir().unwrap();
+    write_mistral_large4_snapshot(ml4.path(), Some(&[1]), false);
+    let dirs = [
+        snapshot(glm5_config(), &glm5_tensors(|name, n, k| fp8(name, n, k, None))),
+        snapshot(flash.clone(), &glm5_flash_tensors(&flash)),
+        ml4,
+    ];
+    let cases: [(&dyn family::Family, &str, Vec<usize>, &[usize]); 3] = [
+        (&families::glm::GLM5, "lm_head", vec![64, 6144], crate::families::glm5::core::NATIVE_CORE_WIDTHS),
+        (&families::glm::GLM5_FLASH, "lm_head", vec![64, 4096], crate::families::glm5_flash::core::NATIVE_CORE_WIDTHS),
+        (&families::mistral_large4::MISTRAL_LARGE4, "output", vec![204800, 6144], crate::families::glm5::core::NATIVE_CORE_WIDTHS),
+    ];
+    for ((family, stem, shape, widths), dir) in cases.into_iter().zip(&dirs) {
+        let checkpoint = Checkpoint::open(dir.path()).unwrap();
+        let model = family.open(&checkpoint).unwrap();
+        let role = family.classify(model.spec(), &format!("{stem}.weight")).unwrap();
+        let accepted = (1..=8).filter(|&bits| {
+            let mut operand = format::QuantOperand { encoding: format::Encoding::Exl3 { bits },
+                container: "I16".into(), logical: shape.clone(), stored: vec![], scale: None,
+                global_scale: None, input_scale: None, companions: vec![] };
+            model.accepts(&role, stem, &mut operand).is_ok()
+        }).collect::<Vec<_>>();
+        assert_eq!(accepted, widths, "{}", family.id());
+    }
+}
+
 #[test]
 fn planner_timings_charge_metadata_once_and_preserve_reports() {
     let dir = snapshot(mimo_flash_config(), &mimo_flash_tensors());

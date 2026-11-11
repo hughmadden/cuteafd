@@ -8,6 +8,8 @@ use std::collections::BTreeMap;
 
 const PREFIX: &str = "model.language_model.layers.";
 
+pub(crate) const NATIVE_CORE_WIDTHS: &[usize] = &[4, 6, 8];
+
 fn attention_leaves(kind: GlmNextAttention) -> [&'static str; 4] {
     match kind {
         GlmNextAttention::Kda => ["q_proj", "k_proj", "v_proj", "o_proj"],
@@ -82,7 +84,7 @@ impl CoreInventory {
                 && !leaf.contains(".experts."));
         let expected = expected(cfg);
         let projections = read_projections(checkpoint, &expected, selected,
-            |stem| split(cfg, stem).map(|split| CoreContract { family: "GLM Flash", widths: &[4, 6, 8], split, padded_outputs: false }))?;
+            |stem| split(cfg, stem).map(|split| CoreContract { family: "GLM Flash", widths: NATIVE_CORE_WIDTHS, split, padded_outputs: false }))?;
         let mut inventory = Self { projections, native: BTreeMap::new() };
         // Stage complete native MLA/FFN groups whenever a member is BF16.
         // KDA's packed BF16 path already preserves its source precision.
