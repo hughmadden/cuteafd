@@ -101,15 +101,15 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
         let layout = (|| -> anyhow::Result<_> {
             let manifest = manifest.as_ref().context("Kimi context requires PROGRAMS.json")?;
             let banks = if rows <= 64 { 1 } else { rows.div_ceil(unit) };
-            crate::families::kimi_k3::context::ContextLayout::from_manifest(manifest, opts.mla_kv,
-                context as usize, unit, banks)
+            crate::families::kimi_k3::context::ContextLayout::from_manifest_for_config(manifest, opts.mla_kv,
+                context as usize, unit, banks, &cfg)
         })();
         match layout {
             Ok(layout) => Some(layout),
             Err(error) => {
                 report.refuse_placement(format!("Kimi context program admission refused: {error:#}"),
                     &format!("Install PROGRAMS.json with {}.",
-                        crate::families::kimi_k3::context::program_names(opts.mla_kv).join(", ")));
+                        crate::families::kimi_k3::context::program_names_for_config(opts.mla_kv, &cfg).join(", ")));
                 return memory;
             }
         }

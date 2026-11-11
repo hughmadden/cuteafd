@@ -1360,7 +1360,7 @@ impl<'a> LocalLane<'a> {
                 rows: batch.rows, cache_pages: self.mla.pages(), x: batch.x, q_resid: batch.q_resid,
                 positions: self.lane.buffer("DSA positions")?, slots: self.lane.buffer("DSA slots")?,
                 // NoPE retains the producer's rotary pointer ABI without reading it.
-                cos_sin: self.lane.buffer("DSA positions")?, cache, query_fp8: query, head_weights,
+                cos_sin: weights.norm, cache, query_fp8: query, head_weights,
                 scratch: self.lane.buffer("DSA producer scratch")?,
             }, stream.raw)?;
             programs.selector[unit].launch(cuteafd_ffi::KimiIndexSelection {
