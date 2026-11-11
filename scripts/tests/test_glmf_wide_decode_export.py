@@ -58,6 +58,9 @@ def exporter(monkeypatch):
     class PartialProgram:
         call: tuple
         geometry: dict
+    for fn in ("compile_kimi_index_topk_aot", "compile_kimi_context_index_topk_aot"):
+        setattr(package.kimi_dsa, fn, lambda *args, _fn=fn, **kw: PartialProgram(
+            ("kimi_dsa", _fn, args, kw), {}))
     package.kimi_mla.compile_kimi_mla_partial_aot = lambda *args, **kw: PartialProgram(
         ("kimi_mla", "compile_kimi_mla_partial_aot", args, kw), dict(kw))
     package.glmf.mhc_geometry = lambda g: ("mhc geometry", g)
@@ -658,9 +661,11 @@ def test_kimi_k31_exports_native_dsa_without_changing_k3_or_enabling_a_drafter(e
         assert args[0].index_norm_eps == 1e-5
         for stem, function in [("index_topk", "compile_kimi_index_topk_aot"),
                                ("scored_index_topk", "compile_kimi_context_index_topk_aot")]:
-            module, actual, args, kwargs = catalog[f"{stem}_{mode}_m{rows}"][2]()
+            selected = catalog[f"{stem}_{mode}_m{rows}"][2]()
+            module, actual, args, kwargs = selected.call
             assert (module, actual) == ("kimi_dsa", function)
             assert kwargs == {"max_rows": rows, "max_pages": 16384, "mode": mode}
+            assert selected.geometry == kwargs
         for heads in (48, 96):
             suffix = "" if heads == 48 else "_h96"
             for cache in ("bf16", "fp8"):

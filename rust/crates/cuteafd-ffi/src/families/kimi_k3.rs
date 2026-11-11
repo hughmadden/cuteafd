@@ -239,6 +239,104 @@ fn validate_index_batch(w: KimiIndexWeights, b: KimiIndexBatch, rows: usize, scr
         (b.scratch, scratch)], 9..13, b.x.device_id)
 }
 
+const INDEX_TOPK: &[&str] = &["q_fp8", "weights", "index_k_cache", "page_table", "cache_lengths", "output_indices", "scratch"];
+const SCORED_TOPK: &[&str] = &["q", "weights", "cache", "table", "lengths", "indices", "scores", "scratch"];
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KimiIndexMode { Decode, Prefill }
+impl KimiIndexMode {
+    fn name(self) -> &'static str { match self { Self::Decode => "decode", Self::Prefill => "prefill" } }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct KimiIndexSelection {
+    pub rows: usize, pub cache_pages: usize, pub table_width: usize, pub table_stride: usize,
+    pub query_fp8: Buffer, pub head_weights: Buffer, pub cache: Buffer, pub table: Buffer,
+    /// Per-query causal frontier, including the query's current token.
+    pub lengths: Buffer,
+    pub indices: Buffer, pub scores: Buffer, pub scratch: Buffer,
+}
+
+/// Shared DSA selector. Context always scores the replicated full history and
+/// returns global logical candidates; parity filtering is a later stage.
+pub struct KimiIndexTopK<'a> {
+    program: Program<'a>, rows: usize, pages: usize, mode: KimiIndexMode,
+    scored: bool, runtime_sms: Option<i32>, scratch: usize,
+}
+impl<'a> KimiIndexTopK<'a> {
+    pub fn load(programs: &'a Programs<'a>, rows: usize, pages: usize, mode: KimiIndexMode,
+        context: bool) -> Result<Self> {
+        let stem = if context { "scored_index_topk" } else { "index_topk" };
+        let name = format!("kimik31_{stem}_{}_m{rows}", mode.name());
+        let (scratch, runtime) = validate_topk_manifest(programs.spec(&name)?, rows, pages, mode, context)?;
+        let runtime_sms = runtime.then(|| programs.library().sm_count()).transpose()?
+            .map(|n| i32::try_from(n).map_err(|_| KimiMlaError::Invalid("index selector SM count"))).transpose()?;
+        Ok(Self { program: programs.program(&name, if context { SCORED_TOPK } else { INDEX_TOPK })?,
+            rows, pages, mode, scored: context, runtime_sms, scratch })
+    }
+    pub fn scratch_bytes(&self) -> usize { self.scratch }
+
+    /// Table entries and causal frontiers are device metadata owned by the lane.
+    /// Scratch is zero-initialized once by its admitted owner, before capture.
+    pub fn launch(&self, b: KimiIndexSelection, stream: *mut c_void) -> Result<()> {
+        validate_topk_batch(b, self.rows, self.pages, self.mode, self.scored, self.scratch)?;
+        if self.scored {
+            // SAFETY: writer aliases and extents checked; full-index (1,0)
+            // selection precedes parity filtering, with retained causal metadata.
+            unsafe { self.program.launch(&[b.query_fp8.ptr, b.head_weights.ptr, b.cache.ptr, b.table.ptr,
+                b.lengths.ptr, b.indices.ptr, b.scores.ptr, b.scratch.ptr],
+                &[Scalar::I32(b.rows as i32), Scalar::I32(b.table_width as i32),
+                  Scalar::I32(b.table_stride as i32), Scalar::I32(1), Scalar::I32(0)], stream)?; }
+        } else {
+            let scalars = [Scalar::I32(b.rows as i32), Scalar::I32(b.table_width as i32),
+                Scalar::I32(b.table_stride as i32), Scalar::I32(self.runtime_sms.unwrap_or(0))];
+            // SAFETY: physical index/MLA tables agree for ordinary placement;
+            // outputs/scratch are disjoint and retained through the queued work.
+            unsafe { self.program.launch(&[b.query_fp8.ptr, b.head_weights.ptr, b.cache.ptr, b.table.ptr,
+                b.lengths.ptr, b.indices.ptr, b.scratch.ptr],
+                &scalars[..if self.runtime_sms.is_some() { 4 } else { 3 }], stream)?; }
+        }
+        Ok(())
+    }
+}
+
+fn validate_topk_manifest(spec: &ProgramSpec, rows: usize, pages: usize, mode: KimiIndexMode,
+    scored: bool) -> Result<(usize, bool)> {
+    let g = &spec.geometry;
+    let runtime = !scored && g["runtime_sm_count"].as_bool() == Some(true);
+    let pointers = if scored { SCORED_TOPK } else { INDEX_TOPK };
+    let scalars = if scored { &b"iiiii"[..] } else if runtime { &b"iiii"[..] } else { &b"iii"[..] };
+    if !(1..=4096).contains(&rows) || !(1..=16384).contains(&pages)
+        || spec.capacity_rows as usize != rows || spec.scalar_kinds != scalars
+        || spec.pointers.iter().map(String::as_str).ne(pointers.iter().copied())
+        || g["topk"].as_u64() != Some(2048) || g["heads"].as_u64() != Some(32)
+        || g["max_rows"].as_u64() != Some(rows as u64)
+        || g["max_pages"].as_u64() != Some(pages as u64) || g["mode"].as_str() != Some(mode.name()) {
+        return Err(KimiMlaError::Invalid("K3.1 selector manifest geometry/ABI"));
+    }
+    let scratch = spec.scratch.get("scratch").and_then(|n| usize::try_from(*n).ok())
+        .filter(|n| *n > 0).ok_or(KimiMlaError::Invalid("K3.1 selector scratch"))?;
+    if spec.scratch.len() != 1 { return Err(KimiMlaError::Invalid("K3.1 selector scratch inventory")); }
+    Ok((scratch, runtime))
+}
+
+fn validate_topk_batch(b: KimiIndexSelection, rows: usize, pages: usize, mode: KimiIndexMode,
+    scored: bool, scratch: usize) -> Result<()> {
+    if b.rows == 0 || b.rows > rows || b.cache_pages == 0 || b.cache_pages > i32::MAX as usize / 64
+        || b.table_width == 0 || b.table_width > pages || b.table_stride < b.table_width
+        || b.table_stride > i32::MAX as usize {
+        return Err(KimiMlaError::Invalid("K3.1 selector batch/table geometry"));
+    }
+    let table = if mode == KimiIndexMode::Prefill { b.table_width } else {
+        (b.rows - 1).checked_mul(b.table_stride).and_then(|n| n.checked_add(b.table_width))
+            .ok_or(KimiMlaError::Invalid("K3.1 selector table overflow"))?
+    };
+    let operands = [(b.query_fp8, b.rows * 4096), (b.head_weights, b.rows * 32 * 4),
+        (b.cache, b.cache_pages * 8448), (b.table, table * 4), (b.lengths, b.rows * 4),
+        (b.indices, b.rows * 2048 * 4), (b.scratch, scratch), (b.scores, b.rows * 2048 * 4)];
+    validate_phase(&operands[..if scored { 8 } else { 7 }], 5..if scored { 8 } else { 7 }, b.query_fp8.device_id)
+}
+
 const SPARSE_ATTENTION: &[&str] = &["query", "kv_cache", "indices", "lengths", "query_offsets", "out", "lse", "scratch"];
 
 #[derive(Clone, Copy, Debug)]
@@ -1294,6 +1392,66 @@ mod tests {
                 "page_rows": 64, "norm_eps": 1e-6, "kv_cache": "bf16", "max_context": context,
                 "num_splits": splits, "chunks_per_split": context.div_ceil(64).div_ceil(splits), "mode": mode.name()}),
         })
+    }
+
+    #[test]
+    fn k31_index_selection_checks_causal_metadata_extents_and_writer_aliases() {
+        let buffer = |index| Buffer { ptr: (index * 0x10000000usize) as *mut c_void,
+            bytes: 0x10000000, device_id: 0, flags: 0 };
+        let b = KimiIndexSelection { rows: 17, cache_pages: 128, table_width: 64, table_stride: 80,
+            query_fp8: buffer(1), head_weights: buffer(2), cache: buffer(3), table: buffer(4),
+            lengths: buffer(5), indices: buffer(6), scores: buffer(7), scratch: buffer(8) };
+        for mode in [KimiIndexMode::Decode, KimiIndexMode::Prefill] {
+            for scored in [false, true] {
+                let check = |b| validate_topk_batch(b, 64, 16384, mode, scored, 4096);
+                check(b).unwrap();
+                let table = if mode == KimiIndexMode::Decode { (b.rows - 1) * b.table_stride + b.table_width }
+                    else { b.table_width };
+                for bad in [KimiIndexSelection { rows: 0, ..b }, KimiIndexSelection { rows: 65, ..b },
+                    KimiIndexSelection { table_width: 16385, ..b }, KimiIndexSelection { table_stride: 63, ..b },
+                    KimiIndexSelection { cache_pages: usize::MAX, ..b },
+                    KimiIndexSelection { table: Buffer { bytes: table * 4 - 1, ..b.table }, ..b },
+                    KimiIndexSelection { cache: Buffer { bytes: b.cache_pages * 8448 - 1, ..b.cache }, ..b },
+                    KimiIndexSelection { lengths: Buffer { bytes: b.rows * 4 - 1, ..b.lengths }, ..b }] {
+                    assert!(check(bad).is_err());
+                }
+                for reader in [b.query_fp8, b.head_weights, b.cache, b.table, b.lengths] {
+                    assert!(check(KimiIndexSelection { indices: reader, ..b }).is_err());
+                    assert!(check(KimiIndexSelection { scratch: reader, ..b }).is_err());
+                }
+                if scored {
+                    assert!(check(KimiIndexSelection { scores: b.indices, ..b }).is_err());
+                    assert!(check(KimiIndexSelection { scores: b.cache, ..b }).is_err());
+                } else {
+                    check(KimiIndexSelection { scores: Buffer { ptr: std::ptr::null_mut(), bytes: 0,
+                        device_id: 0, flags: 0 }, ..b }).unwrap();
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn k31_selector_manifest_pins_head_count_and_dynamic_sm_abi() {
+        for mode in [KimiIndexMode::Decode, KimiIndexMode::Prefill] {
+            for (scored, runtime) in [(false,false), (false,true), (true,false)] {
+                let pointers = if scored { SCORED_TOPK } else { INDEX_TOPK };
+                let spec = ProgramSpec { name: "topk".into(), capacity_rows: 64,
+                    pointers: pointers.iter().map(|s| (*s).into()).collect(),
+                    scalar_kinds: if scored { b"iiiii".to_vec() } else if runtime { b"iiii".to_vec() } else { b"iii".to_vec() },
+                    scratch: [("scratch".into(),4096)].into_iter().collect(),
+                    geometry: serde_json::json!({"topk":2048,"heads":32,"max_rows":64,
+                        "max_pages":16384,"mode":mode.name(),"runtime_sm_count":runtime}) };
+                assert_eq!(validate_topk_manifest(&spec,64,16384,mode,scored).unwrap(),(4096,runtime));
+                for (key,value) in [("topk",1024),("heads",64)] {
+                    let mut wrong=spec.clone(); wrong.geometry[key]=serde_json::json!(value);
+                    assert!(validate_topk_manifest(&wrong,64,16384,mode,scored).is_err());
+                }
+                let mut wrong=spec.clone(); wrong.scalar_kinds.push(b'i');
+                assert!(validate_topk_manifest(&wrong,64,16384,mode,scored).is_err());
+                let mut wrong=spec.clone(); wrong.scratch.clear();
+                assert!(validate_topk_manifest(&wrong,64,16384,mode,scored).is_err());
+            }
+        }
     }
 
     #[test]

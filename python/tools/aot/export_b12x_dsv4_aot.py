@@ -971,6 +971,13 @@ def kimi_k31_programs(g, decode_rows: int, prefill_rows: int, max_context: int):
 
     index = kimi_dsa.KimiDsaGeometry()
     pages = (max_context + PAGE_ROWS - 1) // PAGE_ROWS
+
+    def selector(compile_topk, params):
+        program = compile_topk(index, **params)
+        # The shared scored selector omits capacities from its geometry. Carry
+        # them in the installed contract so FFI cannot accept a truncated table.
+        return dataclasses.replace(program, geometry={**program.geometry, **params})
+
     out = [("kda_commit", "kda_commit", {}, lambda: glmf.compile_glmf_kda_commit_aot(g)),
            ("lse_combine2", "lse_combine2", {"heads": 48, "has_sink": False},
             lambda: context_split.compile_lse_combine2_aot(heads=48, has_sink=False)),
@@ -988,7 +995,7 @@ def kimi_k31_programs(g, decode_rows: int, prefill_rows: int, max_context: int):
                                    ("scored_index_topk", kimi_dsa.compile_kimi_context_index_topk_aot)):
             params = {"max_rows": rows, "max_pages": pages, "mode": mode}
             out.append((f"{stem}_{mode}_m{rows}", stem, params,
-                        lambda fn=compile_topk, kw=params: fn(index, **kw)))
+                        lambda fn=compile_topk, kw=params: selector(fn, kw)))
         for heads in (48, 96):
             suffix = "" if heads == 48 else "_h96"
             for cache in ("bf16", "fp8"):
