@@ -62,8 +62,7 @@ pairs share conditions. Slots, images, Spark hosts and container names are check
 before enqueue and again at grant; --preflight adds a shell check at both points, like
 hwlock's. Each container (golden-TASK-ARM) first checks it sees its GPUs (exit 86 when
 not), is removed on any exit before the locks are released, and runs under a per-arm
-timeout. --dry-run runs the checks and prints every docker and worker command without
-taking locks.
+timeout. --dry-run runs the checks and reports the lock set without taking locks or printing argv.
 
 Output, under ~/.cache/cuteafd/builds/TASK/golden/: ARM/rN/{log,exit,argv.json,
 workers/HOST.log} and whatever the run wrote to {out}; argv.json holds the exact docker
@@ -111,7 +110,7 @@ KEY_LINE = re.compile(r'(?i)(admission|prefill logits|decode logits|logits diges
 TEST_RESULT = re.compile(r'test result: (\w+)\. (\d+) passed; (\d+) failed')
 GPU_CHECK_EXIT = 86
 # Golden flags that write files: only the arm's {out} directory is writable.
-WRITERS = ('--save-logits', '--bench-dump', '--replay-dump', '--geometry-trace')
+WRITERS = ('--dump-dir', '--save-logits', '--bench-dump', '--replay-dump', '--geometry-trace')
 CONTAINER_HOME = '/tmp/cuteafd-home'
 OUT = '/out'
 SLOT_LIB, SLOT_BIN, SLOT_SHARE = '/opt/cuteafd/lib', '/opt/cuteafd/bin', '/opt/cuteafd/share'
@@ -800,6 +799,95 @@ def container_exists(name):
     return name in names
 
 
+def sealed_help(slot, subcommand):
+    """Ask the exact sealed executable, without GPUs, networking or a hardware lease."""
+    art = Path(slot['root']) / 'workspace/.cuteafd-wip'
+    result = run(['docker', 'run', '--rm', '--network', 'none',
+                  '--user', f'{os.getuid()}:{os.getgid()}',
+                  '-e', 'LD_LIBRARY_PATH=/opt/cuteafd/lib',
+                  '-e', 'COLUMNS=240', '-v', f'{art}:/opt/cuteafd/lib:ro',
+                  '--entrypoint', '/usr/bin/timeout', slot['image_id'],
+                  '45', '/opt/cuteafd/lib/cuteafd', subcommand, '--help'], timeout=60)
+    return ANSI.sub('', result.stdout)
+
+
+class GoldenCLI(argparse.ArgumentParser):
+    def error(self, message):
+        # Do not echo argv (tokens and paths can contain private data).
+        if message.startswith('unrecognized arguments:'):
+            message = 'unrecognized arguments: ' + ', '.join(re.findall(r'--[\w-]+', message))
+        raise ValueError(f'sealed golden CLI: {message}')
+
+
+def cli_from_help(text):
+    """Build the option schema from Clap help, including required usage operands."""
+    parser = GoldenCLI(add_help=False, allow_abbrev=False)
+    defaults = {}
+    # Clap wraps descriptions/defaults onto following indented lines.
+    entries = list(re.finditer(r'^(?: {6}| {2}-\w, )(--[\w-]+)([^\n]*)', text, re.M))
+    for index, match in enumerate(entries):
+        flag, declaration = match.groups()
+        entry = text[match.start():entries[index + 1].start() if index + 1 < len(entries) else len(text)]
+        operand = re.match(r'(?:[ =]|\[=)(<[^>]+>)(\.\.\.)?', declaration)
+        optional = declaration.startswith('[=')
+        default = re.search(r'\[default: ([^]]+)\]', entry)
+        defaults[flag] = default[1] if default else None
+        choices = re.search(r'\[possible values: ([^]]+)\]', entry)
+        kwargs = {'choices': choices[1].split(', ')} if choices else {}
+        if operand:
+            parser.add_argument(flag, nargs='?' if optional else '+' if operand[2] else None,
+                                required=bool(re.search(re.escape(flag) + r'[ =]<',
+                                                       text.split('Options:', 1)[0]))
+                                and flag not in ('--native-lib', '--manifest'), **kwargs)
+        else:
+            parser.add_argument(flag, action='store_true')
+    if not parser._actions:
+        raise ValueError('sealed golden CLI: no options found in --help')
+    return parser, defaults
+
+
+def validate_golden_cli(state, arm, text):
+    parser, defaults = cli_from_help(text)
+    argv = run_args(state, arm)[1:]
+    parsed = vars(parser.parse_args(argv))
+    for flag in WRITERS:
+        value = parsed.get(flag[2:].replace('-', '_'))
+        if value is not None and not (value == OUT or value.startswith(OUT + '/')):
+            raise ValueError(f'{flag}: write outputs under the arm directory ({flag} {{out}}/NAME)')
+
+    def number(flag):
+        value = parsed.get(flag[2:].replace('-', '_'))
+        value = value if value is not None else defaults.get(flag)
+        if value is None:
+            return None
+        try:
+            return int(value)
+        except (ValueError, TypeError):
+            raise ValueError(f'sealed golden CLI: {flag} must be an integer') from None
+
+    for flag in ('--device', '--split-device'):
+        device = number(flag)
+        if device is not None and not 0 <= device < len(state['gpus']):
+            raise ValueError(f'{flag} must name a container-visible logical ordinal '
+                             f'0..{len(state["gpus"]) - 1}; the GPU selection option names physical GPUs')
+    count = number('--rtx-gpus')
+    if count is not None and not 1 <= count <= len(state['gpus']):
+        raise ValueError('--rtx-gpus exceeds the container-visible GPU count')
+    for flag in ('--prefill-rows', '--prefill-batch-tokens'):
+        rows = number(flag)
+        if rows == 0 and defaults.get(flag) == '0':
+            continue  # This sealed CLI uses zero for automatic prefill resolution.
+        if rows is not None and not (64 <= rows <= 4096 and rows % 64 == 0):
+            raise ValueError(f'{flag} must be page-aligned (64-row pages), in 64..4096')
+        if rows is not None and state['family'] == 'v41' and rows < 256:
+            raise ValueError(f'{flag}: V4.1 prefill unit cap must equal its live rows (at least 256)')
+    waves = number('--prefill-waves')
+    if waves == 0 and defaults.get('--prefill-waves') == '0':
+        return
+    if waves is not None and not 1 <= waves <= 4:
+        raise ValueError('--prefill-waves must be in 1..4')
+
+
 def preflight(state, arms, at_grant=True):
     """CPU-only checks, before enqueue and again at grant: every slot sealed and
     unchanged, its image present, no container of ours left over and, with
@@ -809,6 +897,8 @@ def preflight(state, arms, at_grant=True):
         slot = verify_slot(arm)
         verify_sparkinfer(slot)
         slot['image_record'] = image_record(slot['image_id'])
+        if state['mode'] == 'golden':
+            validate_golden_cli(state, arm, sealed_help(slot, state['golden'][0]))
         if container_exists(container_name(state['task'], name)):
             raise ValueError(f"container {container_name(state['task'], name)} already exists "
                              '(a previous run of this task left it; inspect and docker rm it)')
@@ -927,6 +1017,9 @@ def docker_command(state, name, arm, slot, out_dir, golden, packages=None):
     values = placeholder_values(state)
     for key, value in arm['env'].items():
         env[key] = substitute([value], state['snapshot_container'], **values)[0]
+    # Metadata always describes the sealed image actually launched, not a caller override.
+    env['CUTEAFD_REFERENCE_IMAGE'] = slot['image_id']
+    env['CUTEAFD_REFERENCE_IMAGE_SHA256'] = slot['image_id']
     for key, value in env.items():
         cmd += ['-e', f'{key}={value}']
     # The container first proves it sees its GPUs (a systemd daemon-reload on the
@@ -1340,6 +1433,8 @@ def build_state(args, arms):
     elif args.expert_layers or args.worker_env or args.arm_worker_env or args.worker_arg or args.worker_memory_bytes is not None:
         raise ValueError('--expert-layers, --worker-env, --arm-worker-env, --worker-arg and --worker-memory-bytes need --spark-hosts')
     mode = 'native-test' if args.native_test else 'command' if args.command else 'golden'
+    if mode == 'golden' and snapshot.is_relative_to(namespace_root()) and not (args.rdma or sparks):
+        raise ValueError('SparkNest snapshots require push loading: add --rdma (host network and verbs)')
     if mode == 'golden':
         golden = golden_args(args.family, args.golden, sparks=sparks is not None)
     else:
@@ -1466,20 +1561,13 @@ def main(argv=None):
         if not args.preflight_at_grant:
             hwlock.check_preflight(args.preflight, args.preflight_timeout)
     except (ValueError, OSError, subprocess.SubprocessError, hwlock.PreflightFailed) as error:
-        print(f'golden-run: {error}', file=sys.stderr)
+        message = 'sealed CLI/container check failed' if isinstance(error, subprocess.SubprocessError) else str(error)
+        print(f'golden-run: {message}', file=sys.stderr)
         return 78 if isinstance(error, hwlock.PreflightFailed) else 2
     order = list(schedule(arms, args.repeats, not args.no_interleave))
     if args.preflight_only or args.dry_run:
         if args.dry_run:
             print(f"# locks (fair queue, in order): {','.join(state['locks'])}")
-            for name, repeat in order:
-                out = Path(state['root']) / name / f'r{repeat}'
-                packages = Path(state['root']) / name / 'spark-packages' if state.get('sparks') else None
-                for rank, host in enumerate(state['sparks']['hosts'] if state.get('sparks') else ()):
-                    print(f'# {name} r{repeat} expert rank {rank} on {host}\n'
-                          f"ssh {host} {shlex.quote(shlex.join(worker_command(state, name, rank, state['slots'][name]['sparks'][host])))}")
-                cmd, _ = docker_command(state, name, arms[name], state['slots'][name], out, run_args(state, arms[name]), packages)
-                print(f'# {name} r{repeat}\n{shlex.join(cmd)}')
         print('golden-run: preflight pass')
         return 0
     root = Path(state['root'])
@@ -1524,7 +1612,8 @@ def main(argv=None):
         print(f'golden-run: interrupted ({error}); containers removed, locks released', file=sys.stderr)
         code = 130
     except (ValueError, OSError, subprocess.SubprocessError) as error:
-        print(f'golden-run: {error}', file=sys.stderr)
+        message = 'sealed CLI/container check failed' if isinstance(error, subprocess.SubprocessError) else str(error)
+        print(f'golden-run: {message}', file=sys.stderr)
         code = 2
     finally:
         for signum, handler in previous.items():

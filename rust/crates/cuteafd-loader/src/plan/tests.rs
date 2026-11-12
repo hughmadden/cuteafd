@@ -6783,7 +6783,9 @@ fn config_only_kimi_snapshot_does_not_fit() {
 #[test]
 fn unreadable_quantization_metadata_does_not_fit() {
     let dir = snapshot_tp(mimo_flash_config(), &mimo_flash_tensors(), Some(1));
-    std::fs::write(dir.path().join("hf_quant_config.json"), "not json").unwrap();
+    std::fs::write(dir.path().join("hf_quant_config.json"), json!({
+        "producer": {"name": "modelopt"}, "quantization": {}
+    }).to_string()).unwrap();
     let report = plan(dir.path(), &sparks(4)).unwrap();
     assert!(report.config_error.is_some());
     assert!(!report.fits);
