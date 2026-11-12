@@ -739,7 +739,7 @@ mod tests {
             let mut run = fixture_run(one);
             run.settings = json!({"changed": one.verify_rows});
             Ok(run)
-        }).unwrap_err().to_string().contains("different references or server settings"));
+        }).unwrap_err().to_string().contains("server.changed[0]"));
     }
 
     #[test]
