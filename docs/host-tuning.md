@@ -105,35 +105,33 @@ are not a guarantee that parallel contexts can allocate immediately.
 
 ## TCP policy (both roles)
 
-Recommended, not measured requirements: these serve HTTP, SparkNest and a
-possible future 10G TCP expert transport for an eight-node cluster. They do
-not affect today's RDMA verbs path. Apply checks BBR availability, loads
-`tcp_bbr` when needed, and writes `/etc/modules-load.d/90-cuteafd.conf`.
-The VM and TCP values share `/etc/sysctl.d/90-cuteafd.conf`:
+Cuteafd does not prescribe TCP congestion control, qdiscs, socket-buffer
+limits or listen/backlog limits. Serving exchange uses RDMA verbs, and no
+HTTP/gateway code requires the former enlarged buffers or queues. SparkNest
+chooses CUBIC per socket. Apply rewrites `/etc/sysctl.d/90-cuteafd.conf` with
+only the VM policy and removes a stale `/etc/modules-load.d/90-cuteafd.conf`.
+Existing files get a one-time `.cuteafd.bak` backup before replacement or
+removal; existing backups are never overwritten:
 
 ```ini
 # TJ 2026-10-23: background proactive compaction on GB10 unified memory stalls serving.
 vm.compaction_proactiveness = 0
 vm.zone_reclaim_mode = 0
-net.core.default_qdisc = fq
-net.ipv4.tcp_congestion_control = bbr
-net.core.rmem_max = 134217728
-net.core.wmem_max = 134217728
-net.ipv4.tcp_rmem = 4096 87380 134217728
-net.ipv4.tcp_wmem = 4096 65536 134217728
-net.core.netdev_max_backlog = 500000
-net.core.somaxconn = 65535
 ```
 
-`fq` is required for BBR pacing. Changing `default_qdisc` does not replace
-an existing interface's qdisc; inspect `tc qdisc show` and arrange interface
-recreation/reboot in a maintenance window. The script never runs `tc`.
-BBR v1 can crowd out CUBIC flows on shared links: acceptable on our own
-cluster, but reconsider on a shared network. Buffer maxima are ceilings,
-not per-socket allocations. Existing configuration files get a one-time
-`.cuteafd.bak` backup. Changes are reversible: restore prior sysctl values
-and backups/remove these snippets, then reload sysctls; remove the module
-snippet if no longer wanted. Do not unload a module in active use.
+Removing persistent TCP settings does not reset their live values. A human
+operator can restore the distro congestion-control/qdisc policy as root:
+
+```bash
+sysctl -w net.ipv4.tcp_congestion_control=cubic net.core.default_qdisc=fq_codel
+tc qdisc replace dev <LAN NIC> root fq_codel
+```
+
+Substitute the actual LAN interface. Changing `default_qdisc` alone does not
+replace an existing interface's qdisc. Restore any former buffer/backlog
+overrides from the site's distro configuration or reboot after removing
+them; simply reloading sysctls does not reset omitted keys. The script never
+sets CUBIC or fq_codel, runs `tc`, or unloads a module in active use.
 
 ## Swap policy
 

@@ -7,16 +7,17 @@ import pytest
 
 
 SCRIPT = Path(__file__).resolve().parents[1] / "host/tune.sh"
-TCP = {
-    "net.core.default_qdisc": "fq", "net.ipv4.tcp_congestion_control": "bbr",
-    "net.core.rmem_max": "134217728", "net.core.wmem_max": "134217728",
-    "net.ipv4.tcp_rmem": "4096 87380 134217728",
-    "net.ipv4.tcp_wmem": "4096 65536 134217728",
-    "net.core.netdev_max_backlog": "500000", "net.core.somaxconn": "65535",
-}
 SYSCTL_CONFIG = ("# TJ 2026-10-23: background proactive compaction on GB10 unified memory stalls serving.\n"
-                 "vm.compaction_proactiveness = 0\nvm.zone_reclaim_mode = 0\n") + "\n".join(
-    f"{key} = {value}" for key, value in TCP.items())
+                 "vm.compaction_proactiveness = 0\nvm.zone_reclaim_mode = 0")
+# Obsolete policy is input only, to exercise upgrades without restoring live TCP values.
+LEGACY_TCP_CONFIG = """net.core.default_qdisc = fq
+net.ipv4.tcp_congestion_control = bbr
+net.core.rmem_max = 134217728
+net.core.wmem_max = 134217728
+net.ipv4.tcp_rmem = 4096 87380 134217728
+net.ipv4.tcp_wmem = 4096 65536 134217728
+net.core.netdev_max_backlog = 500000
+net.core.somaxconn = 65535"""
 
 
 def put(root, path, value):
@@ -38,11 +39,7 @@ def fixture(root, role):
             for name, value in {"name": f"arbitrary-{index}", "latency": latency,
                                 "disable": 0, "usage": 123}.items():
                 put(root, f"{state}/{name}", value)
-    for key, value in TCP.items():
-        put(root, "proc/sys/" + key.replace(".", "/"), value)
-    put(root, "proc/sys/net/ipv4/tcp_available_congestion_control", "reno cubic bbr")
     put(root, "etc/sysctl.d/90-cuteafd.conf", SYSCTL_CONFIG)
-    put(root, "etc/modules-load.d/90-cuteafd.conf", "tcp_bbr")
     put(root, "proc/sys/vm/compaction_proactiveness", 20)
     put(root, "proc/sys/vm/swappiness", 60)
     put(root, "proc/sys/vm/zone_reclaim_mode", 0)
@@ -181,22 +178,67 @@ def test_swap_disable_preview_and_default_enforcement(tmp_path):
     assert snapshot(tmp_path) == before
 
 
-def test_tcp_policy_preview_and_persistence(tmp_path):
+def test_sysctl_policy_removal_preview(tmp_path):
     fixture(tmp_path, "spark")
-    for key in TCP:
-        put(tmp_path, "proc/sys/" + key.replace(".", "/"), "0")
-    put(tmp_path, "proc/sys/net/ipv4/tcp_available_congestion_control", "reno cubic")
-    (tmp_path / "etc/sysctl.d/90-cuteafd.conf").unlink()
-    (tmp_path / "etc/modules-load.d/90-cuteafd.conf").unlink()
+    put(tmp_path, "etc/sysctl.d/90-cuteafd.conf", SYSCTL_CONFIG + "\n" + LEGACY_TCP_CONFIG)
+    put(tmp_path, "etc/modules-load.d/90-cuteafd.conf", "tcp_bbr")
     before = snapshot(tmp_path)
+    report = run(tmp_path, "report", "--role", "spark")
+    assert report.returncode == 0, report.stderr
+    assert "[differs] persistent sysctl policy" in report.stdout
+    assert "[differs] obsolete module policy" in report.stdout
     result = run(tmp_path, "apply", "--role", "spark", "--dry-run")
     assert result.returncode == 0, result.stderr
-    for key, value in TCP.items():
-        assert f"{tmp_path}/proc/sys/{key.replace('.', '/')} <- {value}" in result.stdout
-    assert "check tcp_bbr availability (modinfo); command modprobe tcp_bbr" in result.stdout
-    assert f"DRY-RUN write config {tmp_path}/etc/sysctl.d/90-cuteafd.conf" in result.stdout
-    assert f"DRY-RUN write config {tmp_path}/etc/modules-load.d/90-cuteafd.conf <- tcp_bbr" in result.stdout
+    assert (f"DRY-RUN write config {tmp_path}/etc/sysctl.d/90-cuteafd.conf <- "
+            + SYSCTL_CONFIG.replace("\n", "; ")) in result.stdout
+    assert f"DRY-RUN backup {tmp_path}/etc/modules-load.d/90-cuteafd.conf" in result.stdout
+    assert f"DRY-RUN remove config {tmp_path}/etc/modules-load.d/90-cuteafd.conf" in result.stdout
+    for forbidden in ("/proc/sys/net/", "modinfo", "modprobe", "tcp_bbr", "net.core.", "net.ipv4."):
+        assert forbidden not in result.stdout
     assert snapshot(tmp_path) == before
+
+
+def apply_sysctl_fixture(root):
+    # Exercise the production file helpers without root or the full host apply path.
+    script = SCRIPT.read_text()
+    read_value = script.split("read_value() {", 1)[1].split("\nrow() {", 1)[0]
+    policy = script.split("sysctl_policy() {", 1)[1].split("\nprobe() {", 1)[0]
+    command = ("set -euo pipefail\nACTION=apply\nDRY_RUN=0\n"
+               'ETC="$TUNE_SYSFS_ROOT/etc"\nread_value() {' + read_value
+               + "\nsysctl_policy() {" + policy + "\nsysctl_policy\n")
+    return subprocess.run(["bash", "-c", command], text=True, capture_output=True,
+                          env=dict(os.environ, TUNE_SYSFS_ROOT=str(root)), timeout=15)
+
+
+@pytest.mark.parametrize("existing_backup", [False, True])
+def test_sysctl_policy_removes_legacy_files_and_preserves_backups(tmp_path, existing_backup):
+    old_config = SYSCTL_CONFIG + "\n" + LEGACY_TCP_CONFIG + "\n"
+    sysctl = put(tmp_path, "etc/sysctl.d/90-cuteafd.conf", old_config.rstrip("\n"))
+    module = put(tmp_path, "etc/modules-load.d/90-cuteafd.conf", "tcp_bbr")
+    originals = {sysctl: old_config, module: "tcp_bbr\n"}
+    if existing_backup:
+        for path in originals:
+            path.with_name(path.name + ".cuteafd.bak").write_text("original site policy\n")
+    result = apply_sysctl_fixture(tmp_path)
+    assert result.returncode == 0, result.stderr
+    assert sysctl.read_text() == SYSCTL_CONFIG + "\n"
+    assert not module.exists()
+    for path, original in originals.items():
+        expected = "original site policy\n" if existing_backup else original
+        assert path.with_name(path.name + ".cuteafd.bak").read_text() == expected
+    before = snapshot(tmp_path)
+    second = apply_sysctl_fixture(tmp_path)
+    assert second.returncode == 0, second.stderr
+    assert second.stdout == ""
+    assert snapshot(tmp_path) == before
+
+
+def test_sysctl_policy_fresh_install_has_no_module_file(tmp_path):
+    result = apply_sysctl_fixture(tmp_path)
+    assert result.returncode == 0, result.stderr
+    assert (tmp_path / "etc/sysctl.d/90-cuteafd.conf").read_text() == SYSCTL_CONFIG + "\n"
+    assert not (tmp_path / "etc/modules-load.d").exists()
+    assert not list(tmp_path.rglob("*.cuteafd.bak"))
 
 
 def test_unknown_latency_is_never_written(tmp_path):
