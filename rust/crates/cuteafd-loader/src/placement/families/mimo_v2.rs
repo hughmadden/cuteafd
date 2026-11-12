@@ -237,6 +237,48 @@ mod tests {
     }
 
     #[test]
+    fn pushed_expert_weights_start_at_load_without_double_charging_runtime_bytes() {
+        use crate::placement::planner::{ComponentKind, Location, Operation, Phase, Recipe};
+        for ranks in [1, 2] {
+            let (cfg, spark, no_spark) = fixture(ranks, 4096);
+            let mut prepared = input(&cfg, &spark, &no_spark, ranks, 4096).prepare().unwrap();
+            let request = admission::production_request(4096, Some(4096), Onboard::Layers(1),
+                prepared.recipe.prefill, Operation::Serving, ResidentWeights(u64::MAX), Default::default());
+            let mount = prepared.recipe.prepare(&request).unwrap();
+            prepared.recipe.pushed_experts = true;
+            let push = prepared.recipe.prepare(&request).unwrap();
+            for rank in 0..ranks {
+                let id = format!("rtx{rank}.experts.arena");
+                let owners = |contract: &planner::Contract| contract.components.iter().filter_map(|component|
+                    match &component.kind {
+                        ComponentKind::Allocation { template, .. } if template.id == id =>
+                            Some((component.activation.clone(), template.clone())),
+                        _ => None,
+                    }).collect::<Vec<_>>();
+                let mount_owners = owners(&mount);
+                let push_owners = owners(&push);
+                assert_eq!(mount_owners.len(), push_owners.len());
+                for ((activation, old), (selected, new)) in mount_owners.iter().zip(&push_owners) {
+                    assert_eq!(activation, selected);
+                    assert_eq!(new.location, Location::coordinator(rank as u8));
+                    assert_eq!(old.lifetime.first, Phase::Warmup);
+                    assert_eq!(new.lifetime.first, Phase::Load);
+                    assert_eq!(new.lifetime.last, Phase::Growth);
+                    let workspace = push.components.iter().filter_map(|component| match &component.kind {
+                        ComponentKind::Allocation { template, .. } if component.activation == *selected
+                            && template.id == format!("rtx{rank}.experts.workspace") => Some(template),
+                        _ => None,
+                    }).collect::<Vec<_>>();
+                    assert_eq!(workspace.len(), 1);
+                    assert_eq!(workspace[0].lifetime.first, Phase::Warmup);
+                    assert_eq!(new.bytes + workspace[0].bytes, old.bytes);
+                }
+            }
+            prepared.admit(request).unwrap();
+        }
+    }
+
+    #[test]
     fn sampled_context_survives_zero_gpu_reserve() {
         cuteafd_core::memory_policy::MemoryPolicy { gpu_reserve: Some(0), ..Default::default() }.scoped(|| {
             for ranks in [1, 2] {

@@ -583,6 +583,7 @@ fn preflight_shape(
         resident_weights, operation, budgets,
     }.prepare()?;
     if let Some(envelope) = &push_host {
+        prepared.recipe.pushed_experts = true;
         let maximum = prepared.recipe.maximum_pages;
         prepared.recipe.context_owners.extend(envelope.allocations("mimo.load.push")?.into_iter().map(|owner| {
             let bytes = cuteafd_loader::placement::planner::ByteCurve::fixed(owner.bytes, maximum);

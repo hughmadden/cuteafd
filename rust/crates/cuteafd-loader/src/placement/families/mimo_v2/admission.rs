@@ -252,6 +252,8 @@ impl AdmittedMimo {
 
 /// MiMo's resolved physical facts, priced by the shared planner.
 pub struct MimoRecipe<'a> {
+    /// Push commits local resident weights during Load, before runtime workspaces.
+    pub pushed_experts: bool,
     pub startup_probe_bytes: u64,
     pub context_owners: Vec<Component>,
     pub expert_usage: Option<cuteafd_core::expert_usage::Geometry>,
@@ -375,6 +377,7 @@ impl<'a> ProductionInput<'a> {
         }
         Ok(PreparedMimo {
             recipe: MimoRecipe {
+                pushed_experts: false,
                 startup_probe_bytes: self.startup_probe_bytes, context_owners,
                 expert_usage, cfg: self.cfg, gpus: self.gpus, layers: self.layers, routed, counts,
                 experts: self.experts, expert_workspace: self.expert_workspace,
@@ -792,12 +795,14 @@ impl Recipe for MimoRecipe<'_> {
                     } else {
                         format!("resident routed layers {:?}", &self.routed[..count])
                     };
+                    let aggregate = arena[rank].saturating_sub(self.route[rank]);
+                    let (bytes, first_phase) = if self.pushed_experts {
+                        (weights[rank], Phase::Load)
+                    } else { (aggregate, Phase::Warmup) };
                     let owner = Allocation::buffer(format!("rtx{rank}.experts.arena"), location,
-                        arena[rank].saturating_sub(self.route[rank]), Lifetime { first: Phase::Warmup, last: Phase::Growth },
-                        Category::Experts, group);
+                        bytes, Lifetime { first: first_phase, last: Phase::Growth }, Category::Experts, group);
                     let mut component = Component::allocation(owner,
-                        ByteCurve::fixed(arena[rank].saturating_sub(self.route[rank]), maximum),
-                        false, maximum);
+                        ByteCurve::fixed(bytes, maximum), false, maximum);
                     component.activation = activation.clone();
                     contract.components.push(component);
                     if self.route[rank] > 0 {
@@ -806,6 +811,16 @@ impl Recipe for MimoRecipe<'_> {
                             "TP2 canonical routes");
                         let mut component = Component::allocation(owner,
                             ByteCurve::fixed(self.route[rank], maximum), false, maximum);
+                        component.activation = activation.clone();
+                        contract.components.push(component);
+                    }
+                    if self.pushed_experts && aggregate > weights[rank] {
+                        let bytes = aggregate - weights[rank];
+                        let owner = Allocation::buffer(format!("rtx{rank}.experts.workspace"), location,
+                            bytes, Lifetime { first: Phase::Warmup, last: Phase::Growth },
+                            Category::Workspace, "local expert runtime workspace");
+                        let mut component = Component::allocation(owner,
+                            ByteCurve::fixed(bytes, maximum), false, maximum);
                         component.activation = activation.clone();
                         contract.components.push(component);
                     }
