@@ -426,7 +426,7 @@ impl<'a> GlmEngine<'a> {
             .collect();
         self.force_route_check.set(true);
         let mut experts = experts;
-        let result = (|| {
+        let result: Result<()> = (|| {
             self.prefill_device(
                 &mut placement,
                 &tokens,
@@ -441,7 +441,9 @@ impl<'a> GlmEngine<'a> {
             Ok(())
         })();
         self.force_route_check.set(false);
-        result
+        result?;
+        if let Some(pair) = &self.tp2 { pair.publish_route_source(); }
+        Ok(())
     }
 }
 

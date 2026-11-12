@@ -146,6 +146,44 @@ fn validate_served_reference(reference: &Reference, model: &str, dataset: bool) 
     Ok(())
 }
 
+/// Keep the complete identity strict; diagnostics name changes without exposing values.
+fn ensure_server_identity(engine: &str, server: &Value, next_engine: &str, next_server: &Value) -> Result<()> {
+    let mut changed = Vec::new();
+    if engine != next_engine { changed.push("engine".to_owned()); }
+    changed_identity_fields("server", server, next_server, &mut changed);
+    ensure!(changed.is_empty(), "engine build/settings changed during scoring: {}", changed.join(", "));
+    Ok(())
+}
+
+fn changed_identity_fields(path: &str, before: &Value, after: &Value, changed: &mut Vec<String>) {
+    if before == after { return; }
+    match (before, after) {
+        (Value::Object(a), Value::Object(b)) => {
+            let keys: std::collections::BTreeSet<_> = a.keys().chain(b.keys()).collect();
+            for key in keys {
+                let field = format!("{path}.{key}");
+                match (a.get(key), b.get(key)) {
+                    (Some(a), Some(b)) => changed_identity_fields(&field, a, b, changed),
+                    _ => changed.push(field),
+                }
+            }
+        }
+        (Value::Array(a), Value::Array(b)) => {
+            for i in 0..a.len().max(b.len()) {
+                let field = match a.get(i).and_then(|v| v.get("name")).and_then(Value::as_str) {
+                    Some(name) => format!("{path}[{i}:{name}]"),
+                    None => format!("{path}[{i}]"),
+                };
+                match (a.get(i), b.get(i)) {
+                    (Some(a), Some(b)) => changed_identity_fields(&field, a, b, changed),
+                    _ => changed.push(field),
+                }
+            }
+        }
+        _ => changed.push(path.to_owned()),
+    }
+}
+
 fn get(agent: &ureq::Agent, url: &str, key: &Option<String>) -> Result<Value> {
     let mut request = agent.get(url);
     if let Some(key) = key { request = request.set("authorization", &format!("Bearer {key}")); }
@@ -218,8 +256,8 @@ fn run_series(args: &RunArgs, full_prefill: bool,
         runs.push(score(&prefill)?);
     }
     for candidate in runs.iter().skip(1) {
-        ensure!(runs[0].engine == candidate.engine && runs[0].settings == candidate.settings
-            && runs[0].dataset == candidate.dataset && runs[0].reference_sha256 == candidate.reference_sha256,
+        ensure_server_identity(&runs[0].engine, &runs[0].settings, &candidate.engine, &candidate.settings)?;
+        ensure!(runs[0].dataset == candidate.dataset && runs[0].reference_sha256 == candidate.reference_sha256,
             "Scoring paths or widths use different references or server settings");
     }
     Ok(runs)
@@ -449,8 +487,8 @@ pub fn run_with(args: &RunArgs, model: &str, model_record: &Value,
         if i == 0 {
             engine = this_engine; settings = response["server"].clone(); shape = this_shape.into();
         } else {
-            ensure!(engine == this_engine && settings == response["server"] && shape == this_shape,
-                "engine build/settings changed during scoring");
+            ensure_server_identity(&engine, &settings, &this_engine, &response["server"])?;
+            ensure!(shape == this_shape, "scoring shape changed during scoring: {shape} -> {this_shape}");
         }
         let mut f = window.score(&probe.rows);
         if let Some(rows) = &rows {
@@ -554,6 +592,20 @@ mod tests {
         argv.extend_from_slice(extra);
         let Action::Run(args) = Cli::try_parse_from(argv).unwrap().args.action else { panic!("run action") };
         args
+    }
+
+    #[test]
+    fn strict_identity_reports_changed_fields_without_values() {
+        let before = json!({"settings": [{"name": "route-source", "value": "replicated"}], "build": "old"});
+        assert!(ensure_server_identity("engine", &before, "engine", &before).is_ok());
+        let after = json!({"settings": [{"name": "route-source", "value": "broadcast"}], "build": "new"});
+        let error = ensure_server_identity("engine", &before, "other", &after).unwrap_err().to_string();
+        assert!(error.contains("engine, server.build, server.settings[0:route-source].value"), "{error}");
+        assert!(!error.contains("replicated") && !error.contains("broadcast"));
+        for after in [json!({}), json!({"settings": before["settings"], "build": "old", "new_field": 1}),
+            json!({"settings": [{"name": "route-source", "value": "replicated", "counter": 1}], "build": "old"})] {
+            assert!(ensure_server_identity("engine", &before, "engine", &after).is_err());
+        }
     }
 
     #[test]
@@ -687,7 +739,7 @@ mod tests {
             let mut run = fixture_run(one);
             run.settings = json!({"changed": one.verify_rows});
             Ok(run)
-        }).unwrap_err().to_string().contains("different references or server settings"));
+        }).unwrap_err().to_string().contains("server.changed[0]"));
     }
 
     #[test]

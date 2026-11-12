@@ -2232,7 +2232,9 @@ impl<'a> GlmfEngine<'a> {
         *tp2.schedule.borrow_mut() = Some(Default::default());
         tp2.checking.set(true);
         self.decode_step(&mut [(&mut placement, 1)], &[1], None, false, None, None, true)?;
-        self.synchronize()
+        self.synchronize()?;
+        cuteafd_bench::context::set_resolved("route-source", tp2.source.get().label());
+        Ok(())
     }
 
     pub(crate) fn install_local(&mut self, layers: Vec<usize>, experts: Experts<'a>) -> Result<()> {
@@ -2573,9 +2575,7 @@ impl<'a> GlmfEngine<'a> {
             }).collect()
         })?;
         if let Some(identity) = identity {
-            if identity.source() == RouteSource::Broadcast { tp2.source.set(RouteSource::Broadcast); }
-            cuteafd_bench::context::set_resolved("route-source", if tp2.source.get() == RouteSource::Broadcast {
-                "broadcast" } else { "replicated" });
+            tp2.source.set(tp2.source.get().checked(&identity, cuteafd_bench::context::readiness_s().is_some())?);
             tracing::info!(unit = unit.index, slot = unit.slot, layers_checked = identity.layers_checked,
                 rows_checked = identity.rows_checked, "GLM Flash unit route identity");
         }
@@ -2641,11 +2641,9 @@ impl<'a> GlmfEngine<'a> {
                 ranks: hosts.map(|h| h.bytes().to_vec()) }
         }).collect::<Vec<_>>();
         let identity = RouteIdentity::check(&checks);
-        if identity.source() == RouteSource::Broadcast { tp2.source.set(RouteSource::Broadcast); }
+        tp2.source.set(tp2.source.get().checked(&identity, cuteafd_bench::context::readiness_s().is_some())?);
         tracing::info!(layers_checked = identity.layers_checked, rows_checked = identity.rows_checked,
             first_mismatch = ?identity.first_mismatch, source = ?tp2.source.get(), "GLM Flash TP2 route identity");
-        cuteafd_bench::context::set_resolved("route-source", if tp2.source.get() == RouteSource::Broadcast {
-            "broadcast" } else { "replicated" });
         Ok(())
     }
 
