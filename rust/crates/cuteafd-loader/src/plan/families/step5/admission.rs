@@ -481,7 +481,7 @@ pub fn forecast_mtp(checkpoint: &Checkpoint, inputs: &RuntimeInputs, depth: usiz
 }
 
 /// Includes native stage weights, private workspace, independent histories and
-/// the actual host-aware staging mark count before any live allocation.
+/// the actual budgeted device mark count before any live allocation.
 pub fn admit_mtp(checkpoint: &Checkpoint, inputs: &RuntimeInputs, depth: usize) -> Result<Admission> {
     let contract = super::coordinator::CoordinatorContract::from_checkpoint(checkpoint)?;
     admit_mtp_with_contract(checkpoint, inputs, depth, &contract)
@@ -974,7 +974,7 @@ mod tests {
     }
 
     #[test]
-    fn host_retention_reserves_only_shared_staging_marks() -> Result<()> {
+    fn host_retention_reserves_budgeted_device_marks() -> Result<()> {
         for ranks in [1, 2] {
             let mut inputs = inputs(ranks);
             inputs.context = EXTENT;
@@ -986,7 +986,9 @@ mod tests {
                 for budget in [0, 2 << 30, 32 << 30] {
                     inputs.marks.budget_bytes = budget;
                     let admitted = run(&inputs)?;
-                    let slots = if entries == 0 { 0 } else { 2 };
+                    let mark_bytes = admitted.cache.ranks.iter().map(|r| r.bytes).sum::<u64>();
+                    let slots = cuteafd_core::prefix::mark_slots_for(inputs.marks.lanes as u64,
+                        entries as u64, mark_bytes, budget) as usize;
                     assert_eq!(admitted.marks, slots);
                     for rank in 0..ranks {
                         assert_eq!(admitted.reservations[rank].marks as u64,

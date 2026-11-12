@@ -25,7 +25,7 @@ impl MarkArena {
         Self { free: (0..count).rev().collect(), slots, slot_bytes }
     }
 
-    /// Host-enabled caches need only staging slots; host-off caches retain marks on device.
+    /// Both tiers retain device marks until pressure, under the same byte budget.
     pub fn slots_for(lanes: usize, entries: usize, slot_bytes: usize, budget_bytes: usize, host: bool) -> usize {
         cuteafd_core::prefix::mark_slots_with_host(
             lanes as u64, entries as u64, slot_bytes as u64, budget_bytes as u64, host,
