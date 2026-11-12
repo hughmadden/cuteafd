@@ -152,6 +152,46 @@ def test_stage0_candidates_require_globals_and_all_recorded_reads(tmp_path):
     assert records.job_candidates(tmp_path, {"stage0_inputs": inputs}, inputs) == ["missing-recorded-reads"]
 
 
+@pytest.mark.parametrize("cached", ["__pycache__/package.cpython-312.pyc", "package.pyc", "__pycache__/cached"])
+def test_stage0_ignores_legacy_bytecode_reads_but_keeps_source_changes(tmp_path, cached):
+    source = tmp_path / "package.py"
+    source.write_text("TILE = 64\n")
+    bytecode = tmp_path / cached
+    bytecode.parent.mkdir(parents=True, exist_ok=True)
+    bytecode.write_bytes(b"old cache")
+    inputs = {"exporter": "a"}
+    previous = {"stage0_inputs": inputs, "source_reads_sha256": {
+        "package.py": records.digest(source.read_bytes()), cached: records.digest(bytecode.read_bytes())}}
+    bytecode.write_bytes(b"new cache")
+    assert records.job_candidates(tmp_path, previous, inputs) == []
+    bytecode.unlink()
+    assert records.job_candidates(tmp_path, previous, inputs) == []
+    source.write_text("TILE = 128\n")
+    assert records.job_candidates(tmp_path, previous, inputs) == ["package.py"]
+
+
+def test_recorder_import_keeps_source_without_bytecode_reads(tmp_path, monkeypatch, fake_cutlass):
+    import py_compile
+    import sys
+    source = tmp_path / "recorded_import.py"
+    source.write_text("TILE = 64\n")
+    bytecode = Path(py_compile.compile(str(source), doraise=True))
+    recorder = records.Recorder(tmp_path, tmp_path / "output").install()
+    try:
+        spec = importlib.util.spec_from_file_location("recorded_import", source)
+        module = importlib.util.module_from_spec(spec)
+        monkeypatch.setitem(sys.modules, "recorded_import", module)
+        spec.loader.exec_module(module)
+        assert module.TILE == 64
+        assert recorder.reads() == {"recorded_import.py": records.digest(source.read_bytes())}
+        assert records.source_name(bytecode, tmp_path) is None
+        legacy = tmp_path / "recorded_import.pyc"
+        legacy.write_bytes(bytecode.read_bytes())
+        assert records.source_name(legacy, tmp_path) is None
+    finally:
+        stop_recorder(recorder)
+
+
 @pytest.fixture
 def compiler_inputs(tmp_path, monkeypatch):
     import sys

@@ -33,13 +33,18 @@ def job_global_inputs(context):
         "export_sources_sha256", "sms", "capability", "toolchain", "environment", "build_kind")}
 
 
+def is_bytecode(path):
+    return "__pycache__" in path.parts or path.suffix == ".pyc"
+
+
 def source_name(path, root):
     try:
         resolved = Path(path).resolve()
         relative = resolved.relative_to(root.resolve())
     except (ValueError, TypeError, OSError):
         return None
-    return relative.as_posix() if resolved.is_file() else None
+    # Import caches embed worktree paths and timestamps; the .py source is recorded.
+    return relative.as_posix() if not is_bytecode(relative) and resolved.is_file() else None
 
 
 def elf_resources(blob):
@@ -187,6 +192,8 @@ def job_candidates(root, previous, current_inputs):
         path = Path(relative)
         if path.is_absolute() or ".." in path.parts:
             return ["invalid-recorded-path"]
+        if is_bytecode(path):
+            continue
         source = Path(root) / path
         if not source.is_file() or digest(source.read_bytes()) != checksum:
             changed.append(relative)
