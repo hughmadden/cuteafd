@@ -27,30 +27,11 @@ fn push_host_envelope(checkpoint: &cuteafd_loader::plan::Checkpoint, ranks: usiz
     -> Result<Option<cuteafd_loader::push_load::PushHostEnvelope>> {
     use crate::shared::experts::rtx::push::PushPolicy;
     if PushPolicy::for_snapshot(&checkpoint.snapshot)? == PushPolicy::Mount { return Ok(None); }
-    ensure!((1..=2).contains(&ranks), "MiMo push rank count");
-    let slots = cuteafd_ffi::push_ring::DEFAULT_SLOTS as u64;
-    let slot = cuteafd_ffi::push_ring::DEFAULT_SLOT_BYTES as u64;
-    let largest = checkpoint.tensors.iter().filter(|tensor| !tensor.meta.name.contains(".experts."))
-        .map(|tensor| tensor.meta.byte_length).max().unwrap_or(0);
-    let dense = cuteafd_loader::push_load::admitted_push_envelope(largest, slots as usize, slot)?;
-    let expert = if let Some(manifest) = catalog.and_then(|catalog| catalog.exl3()) {
-        // Every candidate local layer is covered; the admitted prefix can only shrink this image.
-        let layers = catalog.context("MiMo push catalog")?.routed_experts();
-        (0..ranks).map(|rank| -> Result<u64> {
-            (layers.first_layer..layers.layers).try_fold(0u64, |bytes, layer| {
-                let plan = manifest.residency(cuteafd_loader::V41Exl3Layer::Backbone(layer), ranks, rank)?;
-                bytes.checked_add(plan.loads.iter().filter(|load| load.tensor.ends_with(".trellis")).count() as u64 * 4)
-                    .context("MiMo push validation overflow")
-            })
-        }).collect::<Result<Vec<_>>>()?
-    } else {
-        let bytes = catalog.into_iter().flat_map(|catalog| catalog.tensors()).filter(|tensor|
-            tensor.metadata.name.ends_with("input_scale") || tensor.metadata.name.ends_with("weight_scale_2"))
-            .map(|tensor| tensor.metadata.byte_length).max().unwrap_or(0).checked_mul(2)
-            .context("MiMo push native validation overflow")?.max(2 << 20);
-        vec![bytes; ranks]
-    };
-    Ok(Some(cuteafd_loader::push_load::PushHostEnvelope::new(expert, vec![dense; ranks], slots, slot)?))
+    let envelope = cuteafd_loader::placement::families::mimo_v2::push_host_envelope(checkpoint, ranks, catalog)?;
+    ensure!(envelope.slots == cuteafd_ffi::push_ring::DEFAULT_SLOTS as u64
+        && envelope.slot_bytes == cuteafd_ffi::push_ring::DEFAULT_SLOT_BYTES as u64,
+        "MiMo admitted push ring differs from runtime ABI");
+    Ok(Some(envelope))
 }
 
 fn routed_costs(opened: &super::Opened, args: &super::EngineArgs, layers: usize, ranks: usize)
@@ -582,14 +563,7 @@ fn preflight_shape(
         spark_reply_formats: cuteafd_core::spark_reply::requested(),
         resident_weights, operation, budgets,
     }.prepare()?;
-    if let Some(envelope) = &push_host {
-        prepared.recipe.pushed_experts = true;
-        let maximum = prepared.recipe.maximum_pages;
-        prepared.recipe.context_owners.extend(envelope.allocations("mimo.load.push")?.into_iter().map(|owner| {
-            let bytes = cuteafd_loader::placement::planner::ByteCurve::fixed(owner.bytes, maximum);
-            cuteafd_loader::placement::planner::Component::allocation(owner, bytes, false, maximum)
-        }));
-    }
+    if let Some(envelope) = &push_host { prepared.admit_push(envelope)?; }
     let admitted = prepared.admit(request).with_context(|| format!(
         "MiMo shared placement; configured-Spark reservation contract {report}"))?;
     let mut expert_resident_bytes = [0usize; 2];

@@ -399,6 +399,17 @@ impl<'a> ProductionInput<'a> {
 }
 
 impl PreparedMimo<'_> {
+    /// Receive owners and early expert residency are one shared loading contract.
+    pub fn admit_push(&mut self, envelope: &crate::push_load::PushHostEnvelope) -> Result<(), Refusal> {
+        self.recipe.pushed_experts = true;
+        let maximum = self.recipe.maximum_pages;
+        self.recipe.context_owners.extend(envelope.allocations("mimo.load.push")?.into_iter().map(|owner| {
+            let bytes = ByteCurve::fixed(owner.bytes, maximum);
+            Component::allocation(owner, bytes, false, maximum)
+        }));
+        Ok(())
+    }
+
     /// One typed admission over the prepared facts. The shared planner picks
     /// the pool and the onboarding prefix; nothing here re-solves.
     pub fn admit(&self, mut request: Request) -> Result<AdmittedMimo, Refusal> {

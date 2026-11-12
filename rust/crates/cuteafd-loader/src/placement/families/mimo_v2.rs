@@ -56,6 +56,34 @@ pub fn add_local_media_weights(weights: &mut [ResidentWeights], devices: &[i32],
     Ok(())
 }
 
+/// Selected-header receive bounds shared by offline placement and live admission.
+pub fn push_host_envelope(checkpoint: &crate::plan::Checkpoint, ranks: usize,
+    catalog: Option<&crate::OfficialV41Catalog>) -> anyhow::Result<crate::push_load::PushHostEnvelope> {
+    use anyhow::{ensure, Context, Result};
+    ensure!((1..=2).contains(&ranks), "MiMo push rank count");
+    let (slots, slot) = (128, 1 << 20);
+    let largest = checkpoint.tensors.iter().filter(|tensor| !tensor.meta.name.contains(".experts."))
+        .map(|tensor| tensor.meta.byte_length).max().unwrap_or(0);
+    let dense = crate::push_load::admitted_push_envelope(largest, slots as usize, slot)?;
+    let expert = if let Some(manifest) = catalog.and_then(|catalog| catalog.exl3()) {
+        let layers = catalog.context("MiMo push catalog")?.routed_experts();
+        (0..ranks).map(|rank| -> Result<u64> {
+            (layers.first_layer..layers.layers).try_fold(0u64, |bytes, layer| {
+                let plan = manifest.residency(crate::V41Exl3Layer::Backbone(layer), ranks, rank)?;
+                bytes.checked_add(plan.loads.iter().filter(|load| load.tensor.ends_with(".trellis")).count() as u64 * 4)
+                    .context("MiMo push validation overflow")
+            })
+        }).collect::<Result<Vec<_>>>()?
+    } else {
+        let bytes = catalog.into_iter().flat_map(|catalog| catalog.tensors()).filter(|tensor|
+            tensor.metadata.name.ends_with("input_scale") || tensor.metadata.name.ends_with("weight_scale_2"))
+            .map(|tensor| tensor.metadata.byte_length).max().unwrap_or(0).checked_mul(2)
+            .context("MiMo push native validation overflow")?.max(2 << 20);
+        vec![bytes; ranks]
+    };
+    Ok(crate::push_load::PushHostEnvelope::new(expert, vec![dense; ranks], slots, slot)?)
+}
+
 /// Exact native weight/scale bytes, shared with the allocation path.
 pub fn expert_layer_bytes(tensors: &crate::formats::fp8_experts::Fp8ExpertTensors,
     tp: usize, rank: usize, slicing: crate::formats::fp8_experts::Slicing) -> anyhow::Result<u64> {
