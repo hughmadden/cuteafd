@@ -110,11 +110,35 @@ mod tests {
         assert_eq!(split.read_bytes(), 2007);
     }
     #[test]
+    fn simultaneous_phases_do_not_cross_account() {
+        let rendezvous = std::sync::Barrier::new(2);
+        std::thread::scope(|scope| {
+            for bytes in [31usize, 73] {
+                let rendezvous = &rendezvous;
+                scope.spawn(move || {
+                    let phase = Split::start();
+                    let context = capture();
+                    std::thread::scope(|workers| {
+                        workers.spawn(|| context.enter(|| {
+                            rendezvous.wait();
+                            read(bytes, || ());
+                            upload(bytes * 2, || ());
+                            quantize(bytes * 3, || ());
+                        }));
+                    });
+                    let totals = phase.totals.lock().unwrap();
+                    assert_eq!(totals.counters.map(|counter| counter.bytes),
+                        [bytes as u64, bytes as u64 * 2, bytes as u64 * 3, 0]);
+                });
+            }
+        });
+    }
+    #[test]
     fn overlapping_worker_time_is_subtracted_only_once() {
         use std::time::Duration;
         let start = Instant::now();
         let at = |seconds| start + Duration::from_secs(seconds);
-        // Six summed worker seconds cover only four wall seconds.
+        // Seven summed worker seconds cover only four wall seconds.
         let intervals = [(at(2), at(5)), (at(1), at(4)), (at(2), at(3))];
         assert_eq!(io_wall_seconds(start, &intervals), 4.0);
         assert_eq!(io_wall_seconds(start, &[]), 0.0);
