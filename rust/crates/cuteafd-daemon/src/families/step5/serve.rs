@@ -381,8 +381,11 @@ fn with_backend<T>(args: &ServeArgs,
             inputs.rows, inputs.logit_rows(), &native_plan)?;
         let mut native = native;
         if rank == usize::from(admission.ownership.execution().spec().head_gpu) {
-            native.workspace = native.workspace.max(
-                cuteafd_loader::plan::families::step5::native::mtp_forecast_workspace(inputs.unit_rows(), usize::from(args.mtp), inputs.kv_format)?);
+            let projection = cuteafd_loader::plan::families::step5::native::native_scratch_bytes(
+                &native_plan.layouts[rank], inputs.unit_rows())?;
+            native.workspace = cuteafd_loader::plan::families::step5::native::with_arena_phase(
+                native.workspace, projection,
+                cuteafd_loader::plan::families::step5::native::mtp_forecast_workspace(inputs.unit_rows(), usize::from(args.mtp), inputs.kv_format)?)?;
         }
         let native = native.check(u64::MAX, &[])?;
         let total = future_allocation_bytes(&admission.placement.items[rank], &inputs.inventory.gpus[rank])?;
@@ -969,8 +972,11 @@ mod tests {
                 let mut native = Execution::serving_admission(&programs, &checkpoint,
                     &admitted.ownership, rank, inputs.unit_rows(), inputs.rows, inputs.logit_rows())?;
                 if rank == head_rank {
-                    native.workspace = native.workspace.max(
-                        plan::families::step5::native::mtp_forecast_workspace(inputs.unit_rows(), usize::from(depth), inputs.kv_format)?);
+                    let projection = plan::families::step5::native::native_scratch_bytes(
+                        &plan::families::step5::coordinator::RankWeightLayout::for_execution(
+                            &checkpoint, rank, &admitted.ownership)?, inputs.unit_rows())?;
+                    native.workspace = plan::families::step5::native::with_arena_phase(native.workspace, projection,
+                        plan::families::step5::native::mtp_forecast_workspace(inputs.unit_rows(), usize::from(depth), inputs.kv_format)?)?;
                 }
                 let native = native.check(u64::MAX, &[])?;
                 let total = future_allocation_bytes(&admitted.placement.items[rank], &inputs.inventory.gpus[rank])?;

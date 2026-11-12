@@ -35,6 +35,15 @@ pub struct RankAdmission {
     pub workspace: u64,
 }
 
+/// Native projection storage remains allocated while the reusable arena runs
+/// the head or predictors. Only the arena's phase-local bytes may overlap.
+pub fn with_arena_phase(workspace: u64, projection_bytes: u64, phase_bytes: u64) -> Result<u64> {
+    let arena = workspace.checked_sub(projection_bytes)
+        .context("Step-5 projection scratch exceeds workspace")?;
+    projection_bytes.checked_add(arena.max(phase_bytes))
+        .context("Step-5 phase workspace overflow")
+}
+
 pub fn program_prefixes(split: bool) -> &'static [&'static str] {
     if split { &["step5", "step52"] } else { &["step5"] }
 }
@@ -468,7 +477,7 @@ pub fn rank_admission_for_layout(contract: &CoordinatorContract, cfg: &Config, l
             .transpose()?.unwrap_or(0) as u64;
         if head_scratch > 0 { private_requests.push(head_scratch); }
         immutable = immutable.checked_add(head_scratch).context("Step-5 private head scratch overflow")?;
-        workspace = workspace.max(plane_bytes(&head_planes(logits)?)?);
+        workspace = with_arena_phase(workspace, projection_bytes, plane_bytes(&head_planes(logits)?)?)?;
     }
     Ok(RankAdmission {
         resident_weights: crate::placement::ResidentWeights(weights),
@@ -560,6 +569,21 @@ pub fn layer_workspace(unit: usize, span: usize, full: bool, heads: usize) -> Re
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn arena_phase_preserves_separate_projection_charge() -> Result<()> {
+        for projection in [0, 257_851_656] {
+            for layer in [0, 1_522_825_664] {
+                for phase in [0, 1024, 4_396_122_112] {
+                    assert_eq!(with_arena_phase(layer + projection, projection, phase)?,
+                        projection + layer.max(phase));
+                }
+            }
+        }
+        assert!(with_arena_phase(1, 2, 0).is_err());
+        assert!(with_arena_phase(u64::MAX, 1, u64::MAX).is_err());
+        Ok(())
+    }
 
     fn end(layout: &[(usize, usize)]) -> usize {
         layout.iter().map(|&(offset, bytes)| offset + bytes).max().unwrap()
