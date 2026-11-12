@@ -38,7 +38,7 @@ fn official_fp8_release_inventory_is_complete_and_classified() {
             else if c.component == Component::RoutedExpert { Status::MissingKernel } else { Status::Ready },
             "{:?}", c.component);
     }
-    assert!(component(&report, Component::RoutedExpert).rejections[0].reason.contains("EXL3 K4 + Core-K6"));
+    assert!(component(&report, Component::RoutedExpert).rejections[0].reason.contains("EXL3 K4 + original FP8/BF16 core"));
     // Official FP8 core forms as the reference loads them.
     let attention = component(&report, Component::Attention);
     assert_eq!(attention.formats.get("fp8-block128x128/f32"), Some(&144), "{:?}", attention.formats);
@@ -448,12 +448,17 @@ fn published_resident_owners_exclude_host_lerope_alpha() {
     let baseline: Vec<_> = layouts.iter().map(|&(ranks, owners)|
         crate::plan::layout::glm5::resident_owned(&checkpoint, ranks, cfg.layers, owners).unwrap()).collect();
 
-    // Independent runtime census from the published checkpoint's GPU1 load
-    // (no onboarding): embedding, ordinary operands, native K6 payload/vectors.
-    // GlmLayer::bytes + final norm + GlmHead::bytes + embedding, not planner groups.
-    let device_owners = [2_516_582_400u64, 2_290_224_128, 12_940_943_872];
-    assert_eq!(baseline[0][0].iter().map(|(_, _, bytes)| bytes).sum::<u64>(),
-        device_owners.into_iter().sum::<u64>());
+    // The original core keeps native FP8/BF16 storage. Independently sum its
+    // published headers, excluding host alpha and the sampled optional towers.
+    let text_headers: Vec<_> = checkpoint.tensors.iter().filter(|t|
+        t.meta.name != "lerope.alpha" && !t.meta.name.starts_with("vision_encoder.")
+            && !t.meta.name.starts_with("mtp_dspark.")).collect();
+    assert_eq!(text_headers.len(), 1720);
+    assert_eq!(text_headers.iter().map(|t| t.meta.byte_length).sum::<u64>(), 23_507_248_640);
+    // 144 128-byte and 88 64-byte vectors each own a 256-byte allocation.
+    let resident_bytes = text_headers.iter().map(|t| t.meta.byte_length.max(256)).sum::<u64>();
+    assert_eq!(resident_bytes, 23_507_283_968);
+    assert_eq!(baseline[0][0].iter().map(|(_, _, bytes)| bytes).sum::<u64>(), resident_bytes);
 
     let alpha = checkpoint.tensors.iter().position(|t| t.meta.name == "lerope.alpha").unwrap();
     assert_eq!(checkpoint.tensors[alpha].meta.byte_length, 64);

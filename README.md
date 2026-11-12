@@ -201,10 +201,10 @@ concurrency point is that limit.
 <td width="27%" valign="top">n/a<br><sub>—</sub></td>
 </tr>
 <tr>
-<td width="19%" valign="top"><a href="docs/models/mistral_large4.md"><b>Mistral Large 4</b></a><br><sub>wrldsuksgo2mars/Mistral-Large-4-EXL3-K4-Core-K6</sub><br><sub>exl3-k4</sub></td>
+<td width="19%" valign="top"><a href="docs/models/mistral_large4.md"><b>Mistral Large 4</b></a><br><sub>wrldsuksgo2mars/Mistral-Large-4-EXL3-K4</sub><br><sub></sub></td>
 <td width="27%" valign="top">n/a<br><sub>doesn&#39;t fit</sub></td>
-<td width="27%" valign="top"><a href="benchmarks/mistral_large4/2026-11-10-smoke-mistral-large-4-exl3-k4-core-k6-1rtx-5spark-ml4-exl3-min/card.svg"><img src="benchmarks/mistral_large4/2026-11-10-smoke-mistral-large-4-exl3-k4-core-k6-1rtx-5spark-ml4-exl3-min/card.svg" alt="wrldsuksgo2mars/Mistral-Large-4-EXL3-K4-Core-K6 on 1× RTX PRO 6000 @ gpu-powerd 465 W (450–600) + 5× DGX Spark"></a><br><sub>1× RTX + 5× Spark</sub></td>
-<td width="27%" valign="top"><a href="benchmarks/mistral_large4/2026-11-10-smoke-mistral-large-4-exl3-k4-core-k6-2rtx-6spark-ml4-exl3-max/card.svg"><img src="benchmarks/mistral_large4/2026-11-10-smoke-mistral-large-4-exl3-k4-core-k6-2rtx-6spark-ml4-exl3-max/card.svg" alt="wrldsuksgo2mars/Mistral-Large-4-EXL3-K4-Core-K6 on 2× RTX PRO 6000 @ gpu-powerd 450/450 W (350–545) + 6× DGX Spark"></a><br><sub>2× RTX + 6× Spark</sub></td>
+<td width="27%" valign="top">pending<br><sub>needs a Release smoke card for the plain K4 repo</sub></td>
+<td width="27%" valign="top">pending<br><sub>needs a Release smoke card for the plain K4 repo</sub></td>
 </tr>
 <tr>
 <td width="19%" valign="top"><a href="docs/models/muse_spark.md"><b>Muse Spark</b></a><br><sub>wrldsuksgo2mars/Muse-Spark-Open-EXL3-K4-Core-K6</sub><br><sub>exl3-k4</sub></td>
