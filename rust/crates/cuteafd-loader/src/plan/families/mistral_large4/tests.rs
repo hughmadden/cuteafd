@@ -71,6 +71,27 @@ fn exl3_publication_form_passes_the_contract() {
 }
 
 #[test]
+fn k8_core_refusal_names_the_missing_ml4_export() {
+    let dir = snapshot(true, Some(&[]));
+    let checkpoint = Checkpoint::open(dir.path()).unwrap();
+    let model = Model::open(&checkpoint).unwrap();
+    for (stem, expected) in &model.expected {
+        if !matches!(expected.form, Form::CoreOrFp8 | Form::CoreOrBf16 { .. }) { continue; }
+        let operand = |bits, logical| QuantOperand { encoding: Encoding::Exl3 { bits }, container: "I16".into(),
+            logical, stored: vec![], scale: None, global_scale: None, input_scale: None, companions: vec![] };
+        let role = TensorRole::new(Component::Attention);
+        model.accepts(&role, stem, &mut operand(6, expected.shape.clone())).unwrap();
+        let error = model.accepts(&role, stem, &mut operand(8, expected.shape.clone())).unwrap_err();
+        assert!(error.contains("K8 core views need ML4 K8 exports")
+            && error.contains("python/tools/aot/export_b12x_dense_trellis_k6_aot.py")
+            && error.contains("ML4_SHAPES, bits=8"), "{stem}: {error}");
+        let mut wrong_shape = expected.shape.clone();
+        wrong_shape[1] += 128;
+        assert!(model.accepts(&role, stem, &mut operand(6, wrong_shape)).is_err(), "{stem}");
+    }
+}
+
+#[test]
 fn exl3_expert_catalog_reads_consolidated_naming() {
     let dir = snapshot(true, None);
     let catalog = crate::read_expert_catalog(dir.path()).unwrap();
