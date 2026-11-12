@@ -3131,10 +3131,8 @@ impl<'a> GlmfEngine<'a> {
         let split = self.peer.is_some();
         for rank in 0..self.ranks() {
             let caches = self.caches_of(rank);
-            if rank == 1 {
-                // SAFETY: the engine owns the peer stream; drained before its tables are rewritten.
-                self.on(1, || unsafe { self.library.cuda_stream_synchronize(self.stream_of(1)) })?;
-            }
+            // Each rank's ordered upload follows its previous commit reader and precedes
+            // the new one on the same stream; put retains the host source in pinned staging.
             self.on(rank, || self.put(&caches.commit_tables, &tables))?;
             let mut pointers = vec![("state", caches.kda_state.buffer.ptr),
                 ("conv_state", caches.kda_conv.buffer.ptr), ("replay", caches.kda_replay.ptr),
@@ -6497,6 +6495,18 @@ mod graph_key_tests {
 #[cfg(test)]
 mod replay_record_tests {
     use super::{replay_bytes, RecordGuard, ReplayRecords, DECODE_ROWS, WIDE_DECODE_ROWS};
+
+    #[test]
+    fn commit_tables_are_uploaded_on_the_consumer_stream_without_a_host_drain() {
+        let source = include_str!("engine.rs");
+        let commit = source.split("    pub fn commit(&self, sequences:").nth(1).unwrap()
+            .split("    fn alloc(").next().unwrap();
+        assert!(!commit.contains("cuda_stream_synchronize"));
+        let upload = commit.find("self.on(rank, || self.put(&caches.commit_tables, &tables))").unwrap();
+        let reader = commit.find("self.run_on(rank, split, &commit_for(").unwrap();
+        assert!(upload < reader);
+        assert!(commit.contains("(\"tables\", caches.commit_tables.buffer.ptr)"));
+    }
 
     #[test]
     fn shared_records_commit_only_what_no_prefill_overwrote() {
