@@ -95,9 +95,8 @@ struct State {
     listen: OnceLock<SocketAddr>,
 }
 
-fn state() -> &'static State {
-    static STATE: OnceLock<State> = OnceLock::new();
-    STATE.get_or_init(|| State {
+impl State {
+    fn new() -> Self { Self {
         context: Mutex::new(ServerContext::default()),
         kv: Mutex::new(None),
         mapped: Mutex::new(None),
@@ -105,7 +104,12 @@ fn state() -> &'static State {
         started: process_start().unwrap_or_else(SystemTime::now),
         ready: OnceLock::new(),
         listen: OnceLock::new(),
-    })
+    } }
+}
+
+fn state() -> &'static State {
+    static STATE: OnceLock<State> = OnceLock::new();
+    STATE.get_or_init(State::new)
 }
 
 /// Records the serve command's resolved settings (called once from `main`).
@@ -164,7 +168,17 @@ pub fn set_resolved(name: &str, value: &str) {
             true
         } else { false }
     }) { return; }
-    if let Ok(mut slot) = state().context.lock() {
+    publish_resolved(state(), name, value);
+}
+
+fn publish_resolved(state: &State, name: &str, value: &str) {
+    if let Ok(mut slot) = state.context.lock() {
+        if state.ready.get().is_some() {
+            tracing::error!(setting = name, "resolved settings are sealed at readiness; publication rejected");
+            drop(slot);
+            debug_assert!(false, "resolved setting {name} published after readiness");
+            return;
+        }
         apply_resolved(&mut slot.settings, name, value);
     }
 }
@@ -260,8 +274,14 @@ pub fn mark_ready(listen: SocketAddr) {
     let placement = get().settings.iter().find(|s| s.name == "attention-placement").and_then(|s| s.value.clone());
     if let Some(placement) = placement { tracing::info!(attention_placement = placement, "ready attention placement"); }
     phase("API listening");
-    let _ = state().ready.set(SystemTime::now());
-    let _ = state().listen.set(listen);
+    seal(state(), listen);
+}
+
+fn seal(state: &State, listen: SocketAddr) {
+    // Serialize the readiness boundary with the last admitted setting.
+    let _context = state.context.lock().unwrap_or_else(|p| p.into_inner());
+    let _ = state.ready.set(SystemTime::now());
+    let _ = state.listen.set(listen);
 }
 
 pub fn started() -> SystemTime {
@@ -382,17 +402,34 @@ mod tests {
 
     #[test]
     fn admitted_attention_overrides_launch_default_before_ready() {
-        set(ServerContext { settings: vec![Setting {
+        let state = State::new();
+        state.context.lock().unwrap().settings.push(Setting {
             name: "attention-placement".into(), value: Some("layers".into()),
             default: Some("layers".into()), source: "resolved".into(),
-        }], ..Default::default() });
-        set_resolved("attention-placement", "context");
-        mark_ready("127.0.0.1:8123".parse().unwrap());
-        let context = get();
+        });
+        publish_resolved(&state, "attention-placement", "context");
+        seal(&state, "127.0.0.1:8123".parse().unwrap());
+        let context = state.context.lock().unwrap().clone();
         let settings = context.settings.iter().filter(|s| s.name == "attention-placement").collect::<Vec<_>>();
         assert_eq!(settings.len(), 1);
         assert_eq!(settings[0].value.as_deref(), Some("context"));
         assert_eq!(settings[0].source, "resolved");
+    }
+
+    #[test]
+    fn every_post_ready_publication_is_rejected_without_mutating_identity() {
+        for name in ["pool-tokens", "route-source", "runtime-counter", "new-field"] {
+            let state = State::new();
+            publish_resolved(&state, name, "before");
+            seal(&state, "127.0.0.1:8123".parse().unwrap());
+            let rejected = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                publish_resolved(&state, name, "after");
+            }));
+            assert_eq!(rejected.is_err(), cfg!(debug_assertions));
+            let context = state.context.lock().unwrap();
+            assert_eq!(context.settings.len(), 1);
+            assert_eq!(context.settings[0].value.as_deref(), Some("before"));
+        }
     }
 
     #[test]

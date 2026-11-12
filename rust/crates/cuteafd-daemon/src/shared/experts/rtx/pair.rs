@@ -442,7 +442,7 @@ impl<'a> Pair<'a> {
     /// Starts a call's route diagnostics: whether this call checks (`force` or
     /// the CUTEAFD_ROUTE_CHECK interval). When it does, every slot's max-row
     /// pinned storage exists before the caller queues any peer wait; strict
-    /// (forced) checks fail on a mismatch, interval checks fall back to broadcast.
+    /// (forced) checks fail on a mismatch; live interval checks reject identity changes.
     pub(crate) fn start_checks(&self, force: bool) -> Result<bool> {
         let steps = self.steps.get() + 1;
         self.steps.set(steps);
@@ -474,7 +474,7 @@ impl<'a> Pair<'a> {
     }
 
     /// Drains both producer streams, then compares the unit's routes trimmed
-    /// to its rows. A mismatch switches to broadcast (strict: an error).
+    /// to its rows. Startup can select broadcast; live identity changes are errors.
     pub(crate) fn finish_unit(&self, slot: usize, unit: usize) -> Result<()> {
         if !self.checking.get() { return Ok(()); }
         let mut checks = self.checks.borrow_mut();
@@ -496,7 +496,7 @@ impl<'a> Pair<'a> {
                 }) }).collect())
         })?;
         *self.active.borrow_mut().get_mut(slot).context("route diagnostic slot")? = None;
-        if let Some(identity) = identity { self.publish_identity(&identity); }
+        if let Some(identity) = identity { self.check_identity(&identity)?; }
         Ok(())
     }
 
@@ -529,20 +529,15 @@ impl<'a> Pair<'a> {
         result.and(span)
     }
 
-    fn publish_identity(&self, identity: &RouteIdentity) {
-        if identity.source() == RouteSource::Broadcast {
-            self.source.set(RouteSource::Broadcast);
-        }
+    fn check_identity(&self, identity: &RouteIdentity) -> Result<()> {
+        self.source.set(self.source.get().checked(identity, cuteafd_bench::context::readiness_s().is_some())?);
         tracing::info!(layers_checked = identity.layers_checked, rows_checked = identity.rows_checked,
             first_mismatch = ?identity.first_mismatch, source = ?self.source.get(), "RTX TP2 route identity");
-        cuteafd_bench::context::set_resolved(
-            "route-source",
-            if self.source.get() == RouteSource::Broadcast {
-                "broadcast"
-            } else {
-                "replicated"
-            },
-        );
+        Ok(())
+    }
+
+    pub(crate) fn publish_route_source(&self) {
+        cuteafd_bench::context::set_resolved("route-source", self.source.get().label());
     }
 
     /// Resolve all lazy backend capacities before either rank queues a peer wait.

@@ -441,7 +441,9 @@ impl<'a> GlmEngine<'a> {
             Ok(())
         })();
         self.force_route_check.set(false);
-        result
+        result?;
+        if let Some(pair) = &self.tp2 { pair.publish_route_source(); }
+        Ok(())
     }
 }
 

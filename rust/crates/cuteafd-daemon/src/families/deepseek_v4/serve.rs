@@ -646,7 +646,7 @@ fn release(family: &Dsv4Prefix<'_, '_>, cache: &mut PrefixCache<CudaCopyEngine<'
 
 /// Serving statistics for `/v1/stats`.
 #[allow(clippy::too_many_arguments)]
-fn publish(stats: &Mutex<serde_json::Value>, requests: u64, generated: u64, active: usize, prefilling: usize,
+fn publish(engine: &super::engine::Engine<'_>, stats: &Mutex<serde_json::Value>, requests: u64, generated: u64, active: usize, prefilling: usize,
     cache: &PrefixCache<CudaCopyEngine<'_>>, reserve: &Reserve, stalled: usize) {
     if active == 0 && prefilling == 0 { cache.refresh_serving_stats(); }
     let prefix_stats = cache.serving_stats();
@@ -658,6 +658,7 @@ fn publish(stats: &Mutex<serde_json::Value>, requests: u64, generated: u64, acti
         *stats = serde_json::json!({"requests": requests, "generated_tokens": generated, "active": active,
             "prefilling": prefilling, "prefix_cache": prefix_stats, "draft_policy": resource::snapshot(),
             "kv_reserve": reserve.snapshot(stalled)});
+        stats["v4_runtime"] = engine.runtime_stats();
         crate::shared::probe::graph_capture_stats(&mut stats);
     }
 }
@@ -785,7 +786,7 @@ fn schedule(
                     if !busy {
                         // Idle: publish the state the server waits in (captures and releases done).
                         cache.tick();
-                        publish(stats, requests, generated_total, 0, 0, &cache, &reserve, 0);
+                        publish(engine, stats, requests, generated_total, 0, 0, &cache, &reserve, 0);
                         console::gauges_now(|| console::Gauges::prefix_cache(&cache, 0, 0, 0));
                         match receive.blocking_recv() {
                             Some(job) => job,
@@ -1080,7 +1081,7 @@ fn schedule(
         if active.is_empty() {
             if !stalled.is_empty() {
                 // Only stalled requests: wait for a capture or prefill to return pages.
-                publish(stats, requests, generated_total, 0, prefills.len(), &cache, &reserve, stalled.len());
+                publish(engine, stats, requests, generated_total, 0, prefills.len(), &cache, &reserve, stalled.len());
                 std::thread::park_timeout(Duration::from_millis(1));
             }
             continue;
@@ -1114,7 +1115,7 @@ fn schedule(
             release(&family, &mut cache, &mut states, &request.placement);
         }
         cache.tick();
-        publish(stats, requests, generated_total, active.len(), prefills.len(), &cache, &reserve, stalled.len());
+        publish(engine, stats, requests, generated_total, active.len(), prefills.len(), &cache, &reserve, stalled.len());
         console::gauges(|| console::Gauges::prefix_cache(&cache, active.len() + stalled.len(), prefills.len(),
             receive.len() + kv_waiter.len()));
         prefills.stepped(cycle.elapsed().as_secs_f64());

@@ -479,9 +479,6 @@ impl<'a> Engine<'a> {
     }
 
     pub(super) fn finish_route_step(&self) -> Result<()> {
-        // Live graph counters reach the bench record on every layout, including
-        // TP1, where there is no TP2 route source to publish.
-        self.publish_route_source();
         let Some(tp2) = &self.tp2 else { return Ok(()) };
         if !tp2.checking.replace(false) { return Ok(()); }
         for rank in 0..2 {
@@ -497,7 +494,7 @@ impl<'a> Engine<'a> {
                     rank1.context("rank1 route check missing")?.bytes().to_vec()] })
         }).collect::<Result<Vec<_>>>()?;
         let identity = RouteIdentity::check(&checks);
-        if identity.source() == RouteSource::Broadcast { tp2.source.set(RouteSource::Broadcast); }
+        tp2.source.set(tp2.source.get().checked(&identity, cuteafd_bench::context::readiness_s().is_some())?);
         tracing::info!(layers_checked = identity.layers_checked, rows_checked = identity.rows_checked,
             first_mismatch = ?identity.first_mismatch, source = ?tp2.source.get(), fallbacks = tp2.fallbacks.get(),
             "V4 TP2 route identity");
@@ -505,10 +502,7 @@ impl<'a> Engine<'a> {
         aggregate.layers_checked += identity.layers_checked;
         aggregate.rows_checked += identity.rows_checked;
         if aggregate.first_mismatch.is_none() { aggregate.first_mismatch = identity.first_mismatch; }
-        cuteafd_bench::context::set_resolved("route-identity", &format!("layers={} rows={} mismatch={:?}",
-            aggregate.layers_checked, aggregate.rows_checked, aggregate.first_mismatch));
         drop(aggregate);
-        self.publish_route_source();
         if let Some(schedule) = tp2.schedule.borrow_mut().take() {
             order::check(&schedule).map_err(|e| anyhow::anyhow!("V4 TP2 recorded schedule: {e}"))?;
             tracing::info!(ops = schedule.streams.iter().map(Vec::len).sum::<usize>(),
@@ -517,15 +511,18 @@ impl<'a> Engine<'a> {
         Ok(())
     }
 
-    fn publish_route_source(&self) {
-        cuteafd_bench::context::set_resolved("v4-graph-captures", &self.graph_captures.get().to_string());
-        cuteafd_bench::context::set_resolved("tp2-expert-graph-captures", &self.expert_graph_captures.get().to_string());
-        cuteafd_bench::context::set_resolved("v4-graph-eager", &self.graph_eager.get().to_string());
-        if let Some(tp2) = &self.tp2 {
-            cuteafd_bench::context::set_resolved("route-source",
-                if tp2.source.get() == RouteSource::Replicated { "replicated" } else { "broadcast" });
-            cuteafd_bench::context::set_resolved("route-fallbacks", &tp2.fallbacks.get().to_string());
-        }
+    pub(crate) fn runtime_stats(&self) -> serde_json::Value {
+        serde_json::json!({
+            "v4-graph-captures": self.graph_captures.get(),
+            "tp2-expert-graph-captures": self.expert_graph_captures.get(),
+            "v4-graph-eager": self.graph_eager.get(),
+            "routes": self.tp2.as_ref().map(|tp2| {
+                let identity = tp2.identity.borrow();
+                serde_json::json!({"source": tp2.source.get().label(), "fallbacks": tp2.fallbacks.get(),
+                    "layers_checked": identity.layers_checked, "rows_checked": identity.rows_checked,
+                    "first_mismatch": identity.first_mismatch})
+            })
+        })
     }
 
     pub fn check_routes(&self, transports: &mut [SparkLink<'_>], runtime: &tokio::runtime::Runtime) -> Result<()> {
@@ -543,7 +540,7 @@ impl<'a> Engine<'a> {
         allocator.release(placement);
         // Cache/state writes were to scratch placement; released slots are overwritten on admission.
         self.warm_broadcast_graphs()?;
-        self.publish_route_source();
+        cuteafd_bench::context::set_resolved("route-source", tp2.source.get().label());
         Ok(())
     }
 
