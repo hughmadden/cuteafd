@@ -99,8 +99,8 @@
           "routed_expert_bytes": 124110911232
         },
         {
-          "model": "brandonmusic/GLM-5.3-Flash-tr3-4bpw",
-          "revision": "a5fee929cf4888b1824323e33e8a19b60129e025",
+          "model": "wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K4-MC",
+          "revision": "91a8dbc9c12e790c65aa1a38c6aede6a3e23a77d",
           "routed_expert_bytes": 152648955648
         }
       ]
@@ -389,8 +389,8 @@
           "routed_expert_bytes": 124110911232
         },
         {
-          "model": "brandonmusic/GLM-5.3-Flash-tr3-4bpw",
-          "revision": "a5fee929cf4888b1824323e33e8a19b60129e025",
+          "model": "wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K4-MC",
+          "revision": "91a8dbc9c12e790c65aa1a38c6aede6a3e23a77d",
           "routed_expert_bytes": 152648955648
         }
       ]

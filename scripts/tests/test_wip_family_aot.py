@@ -604,7 +604,7 @@ def test_ml4_engine_program_names_are_exported_stems():
 
 @pytest.mark.parametrize('family,exl3_model,fp8_model,exl3_scope,extra', [
     ('glm5', 'wrldsuksgo2mars/GLM-5.3-EXL3-K4-v1', 'zai-org/GLM-5.3', 'glm:exl3-k45', {}),
-    ('glm5_flash', 'brandonmusic/GLM-5.3-Flash-tr3-4bpw', 'zai-org/GLM-5.3-Flash', 'glmf:exl3-k34', {}),
+    ('glm5_flash', 'wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K4-MC', 'zai-org/GLM-5.3-Flash', 'glmf:exl3-k34', {}),
     ('mimo_v2', 'test/MiMo-V2.6-Flash-EXL3-K4', 'XiaomiMiMo/MiMo-V2.6-Flash-MOPD', 'mimof:exl3-k45', {}),
     ('qwen4', 'wrldsuksgo2mars/Qwen3.8-Flash-Next-EXL3-K4.25-PLE-FP8-v1', 'nvidia/Qwen3.8-Flash-Next-NVFP4', 'qwen4:exl3-k45', {}),
     ('step5', 'wrldsuksgo2mars/Step-5-Preview-EXL3-K4-Core-K6', 'stepfun-ai/Step-5-Preview', 'step5:exl3-k46', {}),
@@ -652,7 +652,7 @@ def test_expert_scope_derived_from_checkpoint_not_card_name(tmp_path, monkeypatc
 
 @pytest.mark.parametrize('family,exl3_model,fp8_model,exl3_scope,extra', [
     ('glm5', 'wrldsuksgo2mars/GLM-5.3-EXL3-K4-v1', 'zai-org/GLM-5.3', 'glm:exl3-k45', {}),
-    ('glm5_flash', 'brandonmusic/GLM-5.3-Flash-tr3-4bpw', 'zai-org/GLM-5.3-Flash', 'glmf:exl3-k34', {}),
+    ('glm5_flash', 'wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K4-MC', 'zai-org/GLM-5.3-Flash', 'glmf:exl3-k34', {}),
     ('mimo_v2', 'test/MiMo-V2.6-Flash-EXL3-K4', 'XiaomiMiMo/MiMo-V2.6-Flash-MOPD', 'mimof:exl3-k45', {}),
     ('qwen4', 'wrldsuksgo2mars/Qwen3.8-Flash-Next-EXL3-K4.25-PLE-FP8-v1', 'nvidia/Qwen3.8-Flash-Next-NVFP4', 'qwen4:exl3-k45', {}),
     ('step5', 'wrldsuksgo2mars/Step-5-Preview-EXL3-K4-Core-K6', 'stepfun-ai/Step-5-Preview', 'step5:exl3-k46', {}),

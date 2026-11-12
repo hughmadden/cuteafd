@@ -210,30 +210,6 @@
       }
     },
     {
-      "name": "glm53f-tr3-min",
-      "family": "glm5_flash",
-      "config": "examples/configs/glm53-flash-tr3-min.config",
-      "gpus": [
-        1
-      ],
-      "sparks": [
-        "REPLACE-ME-spark-0",
-        "REPLACE-ME-spark-1"
-      ],
-      "set": {
-        "RTX_GPUS": "1",
-        "COORDINATOR_GPUS": "1",
-        "SPARK_COUNT": "2",
-        "ADDR": "0.0.0.0:8814",
-        "EXPERT_PORT": "19914",
-        "SPARK_0_HOST": "REPLACE-ME-spark-0",
-        "SPARK_0_LANE_A": "192.0.2.1",
-        "SPARK_1_HOST": "REPLACE-ME-spark-1",
-        "SPARK_1_LANE_A": "192.0.2.2",
-        "SPECULATOR": "dflash2"
-      }
-    },
-    {
       "name": "mimo26-flash-min",
       "family": "mimo_v2",
       "config": "examples/configs/mimo-v26-flash-mxfp4-min.config",
@@ -630,42 +606,6 @@
       }
     },
     {
-      "name": "glm53f-tr3-5090",
-      "family": "glm5_flash",
-      "config": "examples/configs/glm53-flash-tr3-min.config",
-      "gpus": [
-        0
-      ],
-      "sparks": [
-        "REPLACE-ME-spark-0",
-        "REPLACE-ME-spark-1"
-      ],
-      "set": {
-        "RTX_GPUS": "1",
-        "COORDINATOR_GPUS": "0",
-        "SPARK_COUNT": "2",
-        "ADDR": "0.0.0.0:8838",
-        "EXPERT_PORT": "19938",
-        "SPARK_0_HOST": "REPLACE-ME-spark-0",
-        "SPARK_0_LANE_A": "192.0.2.1",
-        "SPARK_1_HOST": "REPLACE-ME-spark-1",
-        "SPARK_1_LANE_A": "192.0.2.2",
-        "SPECULATOR": "dflash2",
-        "GPU_MEMORY_CAP": "31.8GiB",
-        "EXPERT_BACKEND": "spark",
-        "BENCH_HARDWARE_CLASS": "5090"
-      },
-      "precheck": {
-        "argv": [
-          "sh",
-          "-c",
-          "nvidia-smi --query-gpu=name --format=csv,noheader --id=0 | grep -q 'RTX 5090'"
-        ],
-        "timeout_s": 30,
-        "required": true
-      }
-    },
-    {
       "name": "mimo26-flash-5090",
       "family": "mimo_v2",
       "config": "examples/configs/mimo-v26-flash-mxfp4-min.config",
@@ -769,6 +709,22 @@
         "timeout_s": 30,
         "required": true
       }
+    }
+  ],
+  "retired": [
+    {
+      "name": "glm53f-tr3-min",
+      "config": "examples/configs/glm53-flash-tr3-min.config",
+      "report": "benchmarks/glm5_flash/2026-10-18-smoke-glm-5-3-flash-tr3-4bpw-1rtx-2spark-glm53f-tr3-min",
+      "release": "v3.0.0-rc4",
+      "release_note": "tr3 checkpoint retired 2026-11-12; replaced by GLM-5.3-Flash-EXL3-K4-MC"
+    },
+    {
+      "name": "glm53f-tr3-5090",
+      "config": "examples/configs/glm53-flash-tr3-min.config",
+      "report": "benchmarks/glm5_flash/2026-10-18-smoke-glm-5-3-flash-tr3-4bpw-1rtx-2spark-glm53f-tr3-5090",
+      "release": "v3.0.0-rc4",
+      "release_note": "tr3 checkpoint retired 2026-11-12; replaced by GLM-5.3-Flash-EXL3-K4-MC"
     }
   ]
 }

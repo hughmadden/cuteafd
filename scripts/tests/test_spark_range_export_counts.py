@@ -67,6 +67,18 @@ def test_minimax_native_nvfp4_worlds_cover_the_padded_vendor_slices():
     assert entry['checkpoints'][0]['routed_expert_bytes'] == 57 * 128 * (3 * 3072 * 6144 * 9 // 16 + 3 * 8)
 
 
+def test_glmf_package_witness_is_the_live_mc_checkpoint():
+    entries = json.loads((ROOT / 'scripts/build/spark-package-ranges.json').read_text())['entries']
+    expected = {
+        'model': 'wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K4-MC',
+        'revision': '91a8dbc9c12e790c65aa1a38c6aede6a3e23a77d',
+        # Measured 42 layers, 288 experts, three K4 projections plus native auxiliaries.
+        'routed_expert_bytes': 42 * 288 * 3 * (4096 * 2048 // 2 + 2 * (4096 + 2048) + 4),
+    }
+    for key in ('glmf:exl3', 'glmf:fp8'):
+        assert entries[key]['checkpoints'][1] == expected
+
+
 def count_objects(geometry, worlds, intermediate, unit=128):
     """Today's tp-keyed jobs versus proposed compact width-class jobs.
 
