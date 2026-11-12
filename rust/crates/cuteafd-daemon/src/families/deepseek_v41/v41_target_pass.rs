@@ -224,7 +224,6 @@ impl<'w, 'a> TargetPass<'w, 'a> {
     }
 
     pub(crate) fn visit_graph_banks(&mut self, f: &mut dyn FnMut(i32, &'static str, bool, &mut dyn crate::shared::decode_graph::CacheAttached) -> Result<()>) -> Result<()> {
-        self.resources.embedding.visit_graph_banks(f)?;
         self.resources.lane.visit_graph_banks(f)?;
         self.resources.index.visit_graph_banks(f)?;
         self.resources.execution.visit_graph_banks(f)?;

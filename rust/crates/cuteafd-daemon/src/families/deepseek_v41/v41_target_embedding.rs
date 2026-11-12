@@ -2,7 +2,6 @@
 use crate::shared::memory::Tag;
 use crate::shared::memory::{DeviceAllocation, HostAllocation, LoadStream};
 use crate::families::deepseek_v41::v41_tensors::NativeRtxTensors;
-use crate::shared::decode_graph::RowGraphs;
 use anyhow::{Context, Result, ensure};
 use cuteafd_ffi::{CuteafdDeviceBuffer, NativeLibrary, V41AttentionOps};
 use std::{ffi::c_void, marker::PhantomData, rc::Rc};
@@ -51,7 +50,6 @@ pub(crate) struct TargetEmbeddingWave<'w, 'a> {
     staging: HostAllocation<'a>,
     image_staging: HostAllocation<'a>,
     capacity: usize,
-    graphs: RowGraphs<'a>,
     tokens: Vec<u32>,
     positions: Vec<u64>,
     ready: bool,
@@ -101,7 +99,6 @@ impl<'w, 'a> TargetEmbeddingWave<'w, 'a> {
             ops: library.v41_attention_ops()?, table,
             staging: HostAllocation::new(library, capacity * 4, Tag::staging("v41/target-embedding"))?,
             image_staging: HostAllocation::new(library, capacity * (10240 + 4), Tag::staging("v41/target-embedding"))?, capacity,
-            graphs: RowGraphs::new(library, "target_embedding", cuteafd_core::V41_VERIFY_ROWS, "deepseek_v41"),
             tokens: Vec::with_capacity(capacity), positions: Vec::with_capacity(capacity), ready: false, destinations: None,
         })
     }
@@ -154,7 +151,6 @@ impl<'w, 'a> TargetEmbeddingWave<'w, 'a> {
     }
     /// Initializes text rows in caller order. Positions may repeat across
     /// requests; request ownership remains the scheduler's responsibility.
-    /// Retains decode row shapes over the same fixed weights and stable storage.
     pub fn execute(&mut self, tokens: &[u32], positions: &[u64]) -> Result<TargetEmbedding<'_>> {
         self.execute_to(tokens, positions, None)
     }
@@ -182,47 +178,11 @@ impl<'w, 'a> TargetEmbeddingWave<'w, 'a> {
                 self.storage.ids.buffer, self.staging.buffer,
                 rows * 4, self.storage.stream.raw)?;
         }
-        if self.destinations.is_some() || self.window.is_windowed() || !super::graph_policy::captures_shape(rows as u32)
-            || crate::shared::decode_graph::census::eager("layer_row") {
-            let launched = unsafe { crate::shared::decode_graph::census::dispatch(
-                self.storage.stream.library, self.storage.stream.raw, c"layer_row", rows, None, || self.enqueue(rows)) };
-            if let Err(error) = launched { self.synchronize()?; return Err(error); }
-            // SAFETY: every output write precedes this chain publication.
-            unsafe { chain::finish(self.storage.stream.library, self.storage.stream.raw)?; }
-            self.tokens.extend_from_slice(tokens);
-            self.positions.extend_from_slice(positions);
-            self.ready = true;
-            return self.output();
-        }
-        if let Some(graph) = self.graphs.cached_launch(rows) {
-            let launched = unsafe { crate::shared::decode_graph::census::dispatch(
-                self.storage.stream.library, self.storage.stream.raw, c"layer_row", rows,
-                Some(graph), || self.enqueue(rows)) };
-            launched.and(self.synchronize())?;
-        } else {
-            let warmup = unsafe { self.enqueue(rows) };
-            warmup.and(self.synchronize())?;
-            if let Some(mut ticket) = self.graphs.cache_ticket(&rows,
-                super::graph_policy::pinned_shape(self.storage.ids.buffer.device_id, rows as u32), None) {
-                // SAFETY: warmup completed and the wave pins all recorded storage.
-                unsafe { ticket.capture_result(self.storage.stream.library.cuda_graph_begin_capture(self.storage.stream.raw))?; }
-                let launched = unsafe { self.enqueue(rows) };
-                let captured = unsafe { ticket.capture_result(self.storage.stream.library.cuda_graph_end_capture_topology(self.storage.stream.raw)) };
-                match (launched, captured) {
-                    (Ok(()), Ok((raw, nodes, width, spans, _))) => {
-                        // SAFETY: this owner retains the executable before any replay.
-                        unsafe { self.graphs.cache_insert(rows, raw, ticket, nodes as u64, width, spans)?; }
-                    }
-                    (Err(error), Ok((raw, ..))) => {
-                        // SAFETY: failed capture has never launched.
-                        unsafe { self.storage.stream.library.cuda_graph_exec_destroy(raw)?; }
-                        return Err(error);
-                    }
-                    (Ok(()), Err(error)) if cuteafd_ffi::is_small_graph(&error) => {},
-                    (Err(error), Err(_)) | (Ok(()), Err(error)) => return Err(error),
-                }
-            }
-        }
+        let launched = unsafe { crate::shared::decode_graph::census::dispatch(
+            self.storage.stream.library, self.storage.stream.raw, c"layer_row", rows, None, || self.enqueue(rows)) };
+        if let Err(error) = launched { self.synchronize()?; return Err(error); }
+        // SAFETY: every output write precedes this chain publication.
+        unsafe { chain::finish(self.storage.stream.library, self.storage.stream.raw)?; }
         self.tokens.extend_from_slice(tokens);
         self.positions.extend_from_slice(positions);
         self.ready = true;
@@ -321,21 +281,15 @@ impl<'w, 'a> TargetEmbeddingWave<'w, 'a> {
             _owner: PhantomData,
         })
     }
-    pub(crate) fn visit_graph_banks(&mut self,
-        f: &mut dyn FnMut(i32, &'static str, bool, &mut dyn crate::shared::decode_graph::CacheAttached) -> Result<()>,
-    ) -> Result<()> {
-        f(self.storage.ids.buffer.device_id, "target_embedding", false, &mut self.graphs)
-    }
-    pub fn clear_graph(&mut self) -> Result<()> {
+    pub fn drain(&mut self) -> Result<()> {
         self.invalidate();
-        self.synchronize()?;
-        // SAFETY: synchronize completed all uses of the fixed embedding storage.
-        unsafe { self.graphs.clear() }
+        self.synchronize()
     }
+
 }
 impl Drop for TargetEmbeddingWave<'_, '_> {
     fn drop(&mut self) {
-        if let Err(e) = self.clear_graph() {
+        if let Err(e) = self.drain() {
             crate::shared::decode_graph::fatal_drain(Err(e), "target embedding");
         }
     }

@@ -2149,7 +2149,7 @@ def test_capture_ticket_native_failures_always_report_backoff():
             prefix = source[max(0, native.start() - 180):native.start()]
             assert re.search(r"(?:plan\.)?ticket\.capture_result\([^;{}]*$", prefix), path
             checked += 1
-    assert checked >= 54, "the V4.1 capture inventory must not disappear"
+    assert checked >= 44, "the remaining V4.1 capture inventory must stay covered"
     for family, file, api in [
         ("qwen4", "engine.rs", "cache_ticket_failed"),
         ("qwen3_5", "graphs.rs", "cache_ticket_failed"),

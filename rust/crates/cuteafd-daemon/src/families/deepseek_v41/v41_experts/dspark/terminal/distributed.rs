@@ -11,7 +11,7 @@ enum Phase { Normalize, Project, Assemble, Sample }
 pub(crate) struct DistributedDsparkTerminal<'w, 'a> {
     terminal: DeviceOwner<'a, DsparkTerminal<'w, 'a>>,
     head: DistributedVocabularyWave<'w, 'a>,
-    /// Captured stages indexed [width 5/7][normalize/sample][requests - 1].
+    /// Sampling stages indexed by width, sampling mode and request count.
     graphs: crate::shared::decode_graph::GraphBank<(usize, usize, usize), crate::shared::decode_graph::GraphOwner<'a, ()>>,
     ready: Option<usize>,
     pending: Option<(usize, Phase)>,
@@ -60,11 +60,9 @@ impl<'w, 'a> DistributedDsparkTerminal<'w, 'a> {
         let entries = cuteafd_loader::serving_capacity::v41_graphs::v41_prewarm_drafts(crate::families::deepseek_v41::graph_policy::ranks(), 1, capacity, maximum);
         let original = self.terminal.width();
         let recorded = (|| -> Result<()> {
-            let mut rows = Vec::new();
             for entry in entries {
                 self.set_width(entry.width)?;
-                rows.push(entry.requests * entry.width);
-                for sampling in [false, true] {
+                for sampling in [true] {
                     // SAFETY: records existing normalization and sampling
                     // against stable terminal storage without publishing state.
                     unsafe { self.capture_stage(entry.requests, sampling)?; }
@@ -72,9 +70,6 @@ impl<'w, 'a> DistributedDsparkTerminal<'w, 'a> {
                     crate::shared::decode_graph::device::observe_device(device.library, device.id)?;
                 }
             }
-            rows.sort_unstable();
-            rows.dedup();
-            self.head.capture_startup(&rows, false)?;
             Ok(())
         })();
         let restored = self.set_width(original);
@@ -99,7 +94,7 @@ impl<'w, 'a> DistributedDsparkTerminal<'w, 'a> {
         let terminal = self.terminal.get();
         device.run(|| unsafe {
             let key = (terminal.width(), usize::from(sampling), requests);
-            let graph = self.graphs.cached_launch(&key).map(|owner| owner.raw);
+            let graph = sampling.then(|| self.graphs.cached_launch(&key)).flatten().map(|owner| owner.raw);
             let span = terminal.timing.begin(if sampling { "graph_selector_confidence" } else { "graph_terminal_norm" },
                 None, requests * terminal.width, terminal.stream.raw)?;
             crate::shared::decode_graph::census::dispatch(device.library, terminal.stream.raw, c"dspark", requests,
@@ -109,6 +104,7 @@ impl<'w, 'a> DistributedDsparkTerminal<'w, 'a> {
         })
     }
     unsafe fn capture_stage(&mut self, requests: usize, sampling: bool) -> Result<()> {
+        if !sampling { return Ok(()); }
         let device = self.terminal.device;
         let terminal = self.terminal.get();
         let mode = usize::from(sampling);
@@ -352,6 +348,6 @@ impl DistributedDsparkTerminal<'_, '_> {
     pub(crate) fn visit_graph_banks(&mut self, f: &mut super::super::chain::GraphVisitor<'_>) -> Result<()> {
         f(self.terminal.device.id, "dspark_distributed_terminal", true, &mut self.graphs)?;
         self.terminal.get_mut().visit_graph_banks(&mut |device, site, _, bank| f(device, site, true, bank))?;
-        self.head.visit_graph_banks(f)
+        Ok(())
     }
 }

@@ -75,12 +75,11 @@ impl Drop for ReservedPassGuard<'_, '_, '_, '_, '_> {
 }
 impl<'w, 'a> DistributedTargetPass<'w, 'a> {
     pub(crate) fn visit_graph_banks(&mut self, f: &mut dyn FnMut(i32, &'static str, bool, &mut dyn crate::shared::decode_graph::CacheAttached) -> Result<()>) -> Result<()> {
-        self.resources.embedding.get_mut().visit_graph_banks(f)?;
         for lane in &mut self.resources.lanes { lane.get_mut().visit_graph_banks(f)?; }
         for index in self.resources.indices.iter_mut().flatten() { index.get_mut().visit_graph_banks(f)?; }
         self.resources.execution.visit_graph_banks(f)?;
         self.resources.engram.visit_graph_banks(f)?;
-        self.resources.head.visit_graph_banks(f)
+        Ok(())
     }
     pub(crate) fn capture_startup_prefill(&mut self,
         bank: &crate::families::deepseek_v41::v41_backbone_cache::BackboneCache<'a>, local: &[bool; 40]) -> Result<()> {
@@ -106,7 +105,7 @@ impl<'w, 'a> DistributedTargetPass<'w, 'a> {
             device.run(|| lane.get_mut().capture_startup_prefill(local))?;
         }
         resources.engram.capture_startup(&rows)?;
-        resources.head.capture_startup(&crate::families::deepseek_v41::graph_policy::PREFILL_HEAD_PREWARM_ROWS)
+        Ok(())
     }
     pub(crate) fn capture_startup(&mut self,
         bank: &crate::families::deepseek_v41::v41_backbone_cache::BackboneCache<'a>, local: &[bool; 40]) -> Result<()> {
@@ -130,7 +129,7 @@ impl<'w, 'a> DistributedTargetPass<'w, 'a> {
             device.run(|| lane.get_mut().capture_startup(sinks, &selections, true, local))?;
         }
         resources.engram.capture_startup(&rows)?;
-        resources.head.capture_startup(&rows)
+        Ok(())
     }
     pub fn bind_execution_plan(&mut self, placement: &cuteafd_loader::placement::Placement) -> Result<()> {
         use cuteafd_loader::placement::{HopKind, HopPoint, LayerExecutionPlan};
