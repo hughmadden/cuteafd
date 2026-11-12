@@ -191,7 +191,7 @@ def test_strict_ready_rejects_invalid_tolerance(tmp_path, tolerance):
     assert run(log, plan, strict=True, tolerance=tolerance) == 2
 
 
-def test_pool_following_v4_page_tables_use_the_planners_kv_records_scope(tmp_path):
+def test_pool_following_v4_page_tables_are_views_of_the_planned_kv_arena(tmp_path):
     engine = (Path(__file__).parents[2] / "rust/crates/cuteafd-daemon/src/families/deepseek_v4/engine.rs").read_text()
     def enclosed(source, opening, closing):
         start = source.index(opening)
@@ -204,14 +204,17 @@ def test_pool_following_v4_page_tables_use_the_planners_kv_records_scope(tmp_pat
         raise AssertionError("unclosed source block")
 
     signature = enclosed(engine.split("fn step_buffers", 1)[1], "(", ")")
-    assert re.findall(r"(\w+)\s*:\s*usize", signature) == ["rows", "page_lists", "members"]
+    assert re.findall(r"(\w+)\s*:\s*usize", signature) == ["rank", "lane", "rows", "page_lists", "members"]
     body = enclosed(engine.split("fn step_buffers", 1)[1], "{", "}")
     allocation = enclosed(body.split("c4_page_table:", 1)[1], "{", "}")
-    assert 'const KV_RECORDS: Tag = Tag::kv("v4/kv/records")' in engine
-    assert re.search(r"self\.alloc\(page_lists\s*\*\s*\(self\.shape\.units\s*\+\s*if\s+members\s*>\s*1\s*\{\s*3\s*\}\s*else\s*\{\s*0\s*\}\s*\)\s*\*\s*4,\s*KV_RECORDS\)", allocation)
+    assert 'const KV: Tag = Tag::kv("v4/kv")' in engine
+    assert '"tables.decode"' in allocation and 'format!("tables.prefill{lane}")' in allocation
+    assert 'arena.view(&name)?' in allocation
+    assert 'self.alloc(' not in allocation
+    assert 'rank == 0 { &self.kv_arena } else { &self.peer()?.kv_arena }' in allocation
     call = enclosed(engine.split("self.step_buffers", 1)[1], "(", ")")
     branches = re.findall(r"if\s+shared_page_list\s*\{\s*([\w:]+)\s*\}\s*else\s*\{\s*(\w+)\s*\}", call)
-    assert re.match(r"\s*t\s*,", call)
+    assert re.match(r"\s*rank\s*,\s*index\s*,\s*shared_page_list\s*,\s*t\s*,", call)
     assert len(branches) == 2
     assert [value.rsplit("::", 1)[-1] for value, _ in branches] == ["V4_PACKED_MEMBERS"] * 2
     assert [fallback for _, fallback in branches] == ["t", "1"]
