@@ -186,48 +186,40 @@ swap_policy() {
     done
 }
 
-tcp_policy() {
-    local available config key value file current
-    available=$(read_value "$PROCFS/sys/net/ipv4/tcp_available_congestion_control")
-    if [[ $ACTION == apply && " $available " != *' bbr '* ]]; then
-        if ((DRY_RUN)); then
-            echo 'DRY-RUN check tcp_bbr availability (modinfo); command modprobe tcp_bbr if needed'
-        else
-            if ! modinfo tcp_bbr >/dev/null 2>&1; then
-                echo 'BBR unavailable: install kernel tcp_bbr support before applying.' >&2
-                exit 1
-            fi
-            echo 'command modprobe tcp_bbr'
-            modprobe tcp_bbr
-        fi
-    fi
+sysctl_policy() {
+    local config
     config='# TJ 2026-10-23: background proactive compaction on GB10 unified memory stalls serving.
 vm.compaction_proactiveness = 0
-vm.zone_reclaim_mode = 0
-net.core.default_qdisc = fq
-net.ipv4.tcp_congestion_control = bbr
-net.core.rmem_max = 134217728
-net.core.wmem_max = 134217728
-net.ipv4.tcp_rmem = 4096 87380 134217728
-net.ipv4.tcp_wmem = 4096 65536 134217728
-net.core.netdev_max_backlog = 500000
-net.core.somaxconn = 65535'
-    while IFS='=' read -r key value; do
-        key=${key// /}; value=${value# }
-        [[ $key == net.* ]] || continue
-        file=$PROCFS/sys/${key//./\/}
-        current=$(read_value "$file")
-        # proc formats TCP buffer triples with tabs; compare logical values.
-        current=$(printf '%s\n' "$current" | awk '{$1=$1; print}')
-        setting "$file" "$value" "$current"
-    done <<< "$config"
+vm.zone_reclaim_mode = 0'
     if [[ $ACTION == apply ]]; then
         config_file "$ETC/sysctl.d/90-cuteafd.conf" "$config"
-        config_file "$ETC/modules-load.d/90-cuteafd.conf" tcp_bbr
+        remove_config_file "$ETC/modules-load.d/90-cuteafd.conf"
     else
-        row 'BBR available congestion controls' "$available" 'site policy (read-only)'
         row 'persistent sysctl policy' "$(read_value "$ETC/sysctl.d/90-cuteafd.conf")" "$config"
-        row 'persistent BBR module' "$(read_value "$ETC/modules-load.d/90-cuteafd.conf")" tcp_bbr
+        if [[ -e $ETC/modules-load.d/90-cuteafd.conf || -L $ETC/modules-load.d/90-cuteafd.conf ]]; then
+            row 'obsolete module policy' "$ETC/modules-load.d/90-cuteafd.conf present" absent
+        fi
+    fi
+}
+
+backup_config_file() {
+    local file=$1
+    if [[ -e $file && ! -e $file.cuteafd.bak ]]; then
+        printf 'backup %s -> %s.cuteafd.bak\n' "$file" "$file"
+        cp -p -- "$file" "$file.cuteafd.bak"
+    fi
+}
+
+remove_config_file() {
+    local file=$1
+    [[ -e $file || -L $file ]] || return 0
+    if ((DRY_RUN)); then
+        printf 'DRY-RUN backup %s -> %s.cuteafd.bak (if absent)\n' "$file" "$file"
+        printf 'DRY-RUN remove config %s\n' "$file"
+    else
+        backup_config_file "$file"
+        printf 'remove config %s\n' "$file"
+        rm -- "$file"
     fi
 }
 
@@ -238,10 +230,7 @@ config_file() {
         printf 'DRY-RUN write config %s <- %s\n' "$file" "${content//$'\n'/; }"
     else
         mkdir -p -- "${file%/*}"
-        if [[ -e $file && ! -e $file.cuteafd.bak ]]; then
-            printf 'backup %s -> %s.cuteafd.bak\n' "$file" "$file"
-            cp -p -- "$file" "$file.cuteafd.bak"
-        fi
+        backup_config_file "$file"
         printf 'write config %s <- %s\n' "$file" "${content//$'\n'/; }"
         printf '%s\n' "$content" > "$file"
     fi
@@ -340,7 +329,7 @@ for name in enabled defrag; do
     # likely DGX OS default; enforced because we rely on it.
     setting "$SYSFS/kernel/mm/transparent_hugepage/$name" madvise "$active"
 done
-tcp_policy
+sysctl_policy
 swap_policy
 [[ $ACTION == report ]] || exit 0
 row vm.swappiness "$(read_value "$PROCFS/sys/vm/swappiness")" 'site policy (read-only)'
