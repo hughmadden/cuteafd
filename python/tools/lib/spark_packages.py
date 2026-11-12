@@ -60,9 +60,10 @@ def package_worlds(family: str, format: str) -> list[int]:
         return entry['worlds']
     exl3 = format.startswith('exl3')
     native = family in ('v41', 'dsv4f', 'dsv4p') and not exl3
-    unit = 32 if native or family in ('mimof', 'mimop') else 128
+    nvfp4 = format in ('nvfp4', 'nvfp4a4')
+    unit = 16 if nvfp4 else 32 if native or family in ('mimof', 'mimop') else 128
     intermediate = entry['intermediate']
-    options = dict(exl3=exl3, native=native)
+    options = dict(exl3=exl3, native=native, nvfp4=nvfp4)
     available = set().union(*(width_keys(intermediate, unit, n, **options) for n in entry['worlds']))
     # Emit every metadata alias the planner can admit using these same objects.
     return [n for n in range(1, 9)

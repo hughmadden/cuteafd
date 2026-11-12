@@ -268,3 +268,11 @@ def test_shipped_v4_pro_k2_config_scopes_the_k23_package_the_launcher_loads():
     assert 'dsv4p:exl3-k23' in derived['CUTEAFD_WIP_COORDINATOR_EXPERT_FAMILIES'].split(';')
     assert 'dsv4p:exl3-k23' in derived['CUTEAFD_WIP_EXPERT_FAMILIES'].split(';')
     assert derived['CUTEAFD_WIP_DSV4_AOT'] == 'ON' and 'CUTEAFD_WIP_V41_AOT' not in derived
+
+
+def test_minimax_scope_uses_only_native_w4a4_expert_package():
+    derived = scopes('minimax_m3', 'MiniMax-M3.1-Flash', 4)
+    assert derived['CUTEAFD_WIP_MINIMAX_AOT'] == 'ON'
+    assert derived['CUTEAFD_WIP_EXPERT_FAMILIES'] == 'minimax:nvfp4a4'
+    assert derived['CUTEAFD_WIP_COORDINATOR_EXPERT_FAMILIES'] == 'minimax:nvfp4a4'
+    assert 'minimax=4' in derived['CUTEAFD_WIP_GENERIC_SPARK_COUNTS']

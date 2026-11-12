@@ -517,6 +517,21 @@
         }
       ]
     },
+    "minimax:nvfp4": {
+      "intermediate": 3072,
+      "minimum": 2,
+      "maximum": 8,
+      "basis": "lower_bound",
+      "worlds": [2, 3, 4, 5, 6, 7, 8],
+      "checkpoints": [
+        {
+          "model": "MiniMaxAI/MiniMax-M3.1-Flash",
+          "revision": "54e4e69dfc452b1e94a426c24a4fdeeaa8e3ad5e",
+          "routed_expert_bytes": 232381393920
+        }
+      ],
+      "provenance_note": "Export-only native W4A4 geometry: 57 routed layers x 128 experts x three 3072x6144 projections, packed FP4 plus E4M3 K16 scales and two FP32 globals each. No serving fit witness; family runtime remains gated."
+    },
     "muse:exl3": {
       "intermediate": 4096,
       "minimum": 4,

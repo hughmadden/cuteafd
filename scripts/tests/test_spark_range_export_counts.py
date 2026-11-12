@@ -39,9 +39,10 @@ def test_every_planner_width_covered_world_has_a_package_alias():
         assert 'admitted_worlds' not in entry, key
         exl3 = format == 'exl3'
         native = family in ('v41', 'dsv4f', 'dsv4p') and not exl3
-        unit = 32 if native or family in ('mimof', 'mimop') else 128
+        nvfp4 = format in ('nvfp4', 'nvfp4a4')
+        unit = 16 if nvfp4 else 32 if native or family in ('mimof', 'mimop') else 128
         intermediate = entry['intermediate']
-        options = dict(exl3=exl3, native=native)
+        options = dict(exl3=exl3, native=native, nvfp4=nvfp4)
         available = set().union(*(packages.width_keys(intermediate, unit, n, **options)
                                   for n in entry['worlds']))
         emitted = packages.package_worlds(family, format)
@@ -54,6 +55,16 @@ def test_every_planner_width_covered_world_has_a_package_alias():
     assert 5 not in entries['qwen4:fp8']['worlds']
     assert 5 in packages.geometry_worlds('qwen4')
 
+
+
+def test_minimax_native_nvfp4_worlds_cover_the_padded_vendor_slices():
+    packages = module('minimax_spark_package_coverage', ROOT / 'python/tools/lib/spark_packages.py')
+    assert packages.geometry_worlds('minimax_nvfp4a4') == list(range(2, 9))
+    assert packages.width_keys(3072, 16, 5, nvfp4=True) == {(False, 640)}
+    assert packages.width_keys(3072, 16, 6, nvfp4=True) == {(False, 512)}
+    entry = packages.package_entry('minimax', 'nvfp4a4')
+    assert entry['basis'] == 'lower_bound'
+    assert entry['checkpoints'][0]['routed_expert_bytes'] == 57 * 128 * (3 * 3072 * 6144 * 9 // 16 + 3 * 8)
 
 
 def count_objects(geometry, worlds, intermediate, unit=128):

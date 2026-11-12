@@ -919,6 +919,15 @@ pub(crate) fn expert_catalog_from_checkpoint(checkpoint: &crate::plan::Checkpoin
 
 fn read_expert_catalog_with_checkpoint(snapshot: &Path, config: &serde_json::Value,
     checkpoint: Option<&crate::plan::Checkpoint>) -> Result<OfficialV41Catalog> {
+    if config["model_type"] == "minimax_m3_vl" {
+        let cfg = crate::families::minimax_m3::config::MiniMaxM3Config::from_hf(config)?;
+        let first_layer = cfg.moe.iter().position(|&moe| moe).context("MiniMax M3 has no routed layers")?;
+        let end = cfg.moe.iter().rposition(|&moe| moe).unwrap() + 1;
+        ensure!(cfg.moe[first_layer..end].iter().all(|&moe| moe), "MiniMax M3 routed layer set is not contiguous");
+        return fp8_catalog(snapshot, RoutedExpertShape { layers: end, first_layer,
+            experts: cfg.experts, topk: cfg.topk, hidden: cfg.hidden,
+            intermediate: cfg.moe_intermediate, draft_stages: 0, draft_experts: 0 });
+    }
     if kimi_catalog_config(config) {
         return read_kimi_expert_catalog(snapshot, config, checkpoint);
     }
@@ -1240,8 +1249,9 @@ fn fp8_catalog(snapshot: &Path, shape: RoutedExpertShape) -> Result<OfficialV41C
     let index: Index = crate::families::deepseek_v41::v41_exl3::read_json(&crate::plan::checkpoint::index_path(snapshot)?,
         64 * 1024 * 1024).and_then(|value| Ok(serde_json::from_value(value)?))?;
     let mut coordinator: Vec<V41Tensor> = read_index_headers(snapshot, &index.weight_map)?.into_iter()
-        .filter(|(_, tensor)| !(tensor.name.contains(".mlp.experts.")
-            && hf_layer(&tensor.name).is_some_and(|layer| layer < shape.layers)))
+        .filter(|(_, tensor)| !((tensor.name.contains(".mlp.experts.")
+            || tensor.name.contains(".block_sparse_moe.experts."))
+            && hf_layer(&tensor.name).is_some_and(|layer| (shape.first_layer..shape.layers).contains(&layer))))
         .map(|(shard, metadata)| V41Tensor { shard, metadata, placement: V41TensorPlacement::CoordinatorRtx })
         .collect();
     coordinator.sort_by(|a, b| a.metadata.name.cmp(&b.metadata.name));
@@ -1722,6 +1732,47 @@ mod tests {
                     intermediate, hidden, world, 0).is_err());
             }
         }
+        Ok(())
+    }
+
+    #[test]
+    fn minimax_dispatch_uses_native_experts_before_v41_text_config() -> Result<()> {
+        use crate::plan::testing::{t, write_snapshot};
+        let dir = tempfile::tempdir()?;
+        let mut config = crate::families::minimax_m3::config::tests::release_config();
+        config["text_config"]["num_hidden_layers"] = 4.into();
+        config["text_config"]["num_local_experts"] = 4.into();
+        config["text_config"]["moe_layer_freq"] = serde_json::json!([0, 0, 0, 1]);
+        for key in ["sparse_attention_freq", "sparse_disable_index_value"] {
+            config["text_config"]["sparse_attention_config"][key].as_array_mut().unwrap().truncate(4);
+        }
+        let norm = "language_model.model.layers.3.post_attention_layernorm.weight";
+        let shared = "language_model.model.layers.3.block_sparse_moe.shared_experts.gate_proj.weight";
+        let mut headers = vec![t(norm, "BF16", &[6144]), t(shared, "F8_E4M3", &[3072, 6144])];
+        for expert in 0..4 {
+            for (stem, n, k) in [("w1", 3072, 6144), ("w3", 3072, 6144), ("w2", 6144, 3072)] {
+                let name = format!("language_model.model.layers.3.block_sparse_moe.experts.{expert}.{stem}");
+                headers.extend([t(format!("{name}.weight_packed"), "U8", &[n, k / 2]),
+                    t(format!("{name}.weight_scale"), "F8_E4M3", &[n, k / 16]),
+                    t(format!("{name}.weight_global_scale"), "F32", &[]),
+                    t(format!("{name}.input_global_scale"), "F32", &[])]);
+            }
+        }
+        write_snapshot(dir.path(), &config, &headers, None);
+        let catalog = read_expert_catalog(dir.path())?;
+        assert_eq!((catalog.experts.first_layer, catalog.experts.layers), (3, 4));
+        assert_eq!((catalog.experts.hidden, catalog.experts.intermediate), (6144, 3072));
+        let fp8 = catalog.fp8().context("MiniMax did not select the native worker")?;
+        assert_eq!(fp8.format(), crate::formats::fp8_experts::ExpertFormat::Nvfp4);
+        fp8.validate_layer(3)?;
+        assert!(!fp8.has_layer(2));
+        assert_eq!(catalog.tensors.len(), 2);
+        assert!(catalog.tensor(norm).is_ok());
+        assert!(catalog.tensor(shared).is_ok());
+        assert!(catalog.tensor("language_model.model.layers.3.block_sparse_moe.experts.0.w1.weight_packed").is_err());
+        config["text_config"]["moe_layer_freq"] = serde_json::json!([0, 1, 0, 1]);
+        std::fs::write(dir.path().join("config.json"), serde_json::to_vec(&config)?)?;
+        assert!(format!("{:#}", read_expert_catalog(dir.path()).unwrap_err()).contains("not contiguous"));
         Ok(())
     }
 

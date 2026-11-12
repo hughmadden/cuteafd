@@ -307,6 +307,8 @@ impl ExpertGeometry {
     /// Mistral Large 4 (mistral_large4): routed layers 1..72, softmax top-4,
     /// SiLU unclamped, one shared expert on the coordinator.
     pub const MISTRAL_LARGE4: Self = Self { hidden: 6144, experts: 128, topk: 4, intermediate: 6144, layers: 72 };
+    /// MiniMax M3.1 Flash: native NVFP4 routed layers 3..60, SwiGLU-OAI.
+    pub const MINIMAX_M3: Self = Self { hidden: 6144, experts: 128, topk: 4, intermediate: 3072, layers: 60 };
 
     /// Step-5 routed target layers 3..91 (layer 91 is dense).
     pub const STEP5: Self = Self { hidden: 4096, experts: 352, topk: 8, intermediate: 1536, layers: 91 };
@@ -386,6 +388,7 @@ impl ExpertGeometry {
             (Self::KIMI_K3, "kimik3"),
             (Self::MUSE_SPARK, "muse"),
             (Self::MISTRAL_LARGE4, "ml4"),
+            (Self::MINIMAX_M3, "minimax"),
         ]
         .into_iter()
         .find_map(|(shape, family)| self.same_shape(&shape).then_some(family))
@@ -408,7 +411,7 @@ impl ExpertGeometry {
     /// 10; Step-5 clamps post-SiLU at 7 (see `activation`). GLM 5.x, MiMo,
     /// Qwen 3.8 Flash Next Kimi K3, Muse Spark and Mistral Large 4 are unclamped (`None`).
     pub fn swiglu_limit(&self) -> Option<f32> {
-        if self.same_shape(&Self::STEP5) { return Some(7.0); }
+        if self.same_shape(&Self::STEP5) || self.same_shape(&Self::MINIMAX_M3) { return Some(7.0); }
         (!self.same_shape(&Self::GLM5) && !self.same_shape(&Self::MIMO_V2_FLASH)
             && !self.same_shape(&Self::MIMO_V26_PRO) && !self.same_shape(&Self::QWEN4)
             && !self.same_shape(&Self::KIMI_K3) && !self.same_shape(&Self::MUSE_SPARK) && !self.same_shape(&Self::MISTRAL_LARGE4)).then_some(10.0)
@@ -416,7 +419,9 @@ impl ExpertGeometry {
 
     /// Expert arithmetic; existing families retain their legacy rounding exactly.
     pub fn activation(&self) -> crate::FfnActivation {
-        if self.same_shape(&Self::KIMI_K3) {
+        if self.same_shape(&Self::MINIMAX_M3) {
+            crate::FfnActivation::SwigluOai { alpha: 1.702, beta: 1.0, limit: 7.0 }
+        } else if self.same_shape(&Self::KIMI_K3) {
             crate::FfnActivation::Situ { beta: 4.0, linear_beta: Some(25.0) }
         } else if self.same_shape(&Self::STEP5) {
             crate::FfnActivation::SiluPostClampFp32Product { limit: 7.0 }
@@ -666,6 +671,18 @@ mod tests {
             assert_eq!(*before, *after as usize, "GLM Flash selection changed at {rows}");
             assert_ne!(*after, 16);
         }
+    }
+
+    #[test]
+    fn minimax_native_geometry_keeps_oai_activation() {
+        let g = ExpertGeometry::MINIMAX_M3;
+        assert_eq!(g.family(), Some("minimax"));
+        assert_eq!(g.row_bytes(), 12288);
+        assert_eq!(g.slice(6), Some(512));
+        assert_eq!(g.swiglu_limit(), Some(7.0));
+        assert_eq!(g.activation(), crate::FfnActivation::SwigluOai { alpha: 1.702, beta: 1.0, limit: 7.0 });
+        assert!(!g.same_shape(&ExpertGeometry::MISTRAL_LARGE4));
+        assert_eq!(ExpertGeometry { layers: 61, ..g }.family(), Some("minimax"));
     }
 
     #[test]
