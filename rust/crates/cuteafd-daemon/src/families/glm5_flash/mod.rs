@@ -1858,12 +1858,12 @@ pub(crate) fn open(args: &EngineArgs) -> Result<Opened> {
         cuteafd_loader::plan::checkpoint::CoreView::K6Compact => "k6-compact", cuteafd_loader::plan::checkpoint::CoreView::K8Compact => "k8-compact",
         cuteafd_loader::plan::checkpoint::CoreView::Fp8Compact => "fp8-compact",
     };
-    cuteafd_bench::context::set_resolved("attention-mode", mode);
-    cuteafd_bench::context::set_resolved("attention-bundle-fingerprint", view.fingerprint());
+    cuteafd_bench::context::set_resolved("core-view", mode);
+    cuteafd_bench::context::set_resolved("core-view-fingerprint", view.fingerprint());
     let recipe = if view.mode() == cuteafd_loader::plan::checkpoint::CoreView::Fp8Compact {
         cuteafd_loader::plan::checkpoint::view::FP8_RECIPE
     } else { "none" };
-    cuteafd_bench::context::set_resolved("attention-fp8-recipe", recipe);
+    cuteafd_bench::context::set_resolved("core-fp8-recipe", recipe);
     let active_bytes: u64 = checkpoint.tensors.iter().map(|tensor| tensor.meta.byte_length).sum();
     tracing::info!(core_view = mode, bundle = view.fingerprint(), fp8_recipe = recipe,
         active_dense_source_bytes = active_bytes, "selected immutable attention bundle");

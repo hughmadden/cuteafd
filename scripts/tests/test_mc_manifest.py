@@ -2,6 +2,7 @@
 import copy
 import importlib.util
 import json
+import re
 from pathlib import Path
 import shutil
 
@@ -69,3 +70,17 @@ def test_selected_metadata_tamper_and_shared_drift(tmp_path):
         mc.validate(manifest, tmp_path, "k8-compact")
     with pytest.raises(ValueError, match="missing"):
         mc.shared_inventory_digest({}, ["missing.weight"])
+
+
+@pytest.mark.parametrize("family", ["glm5/mod.rs", "glm5_flash/mod.rs", "kimi_k3/serve.rs",
+                                    "muse_spark/serve.rs", "step5/serve.rs"])
+def test_resolved_core_identity_is_precision_only(family):
+    source = (ROOT / "rust/crates/cuteafd-daemon/src/families" / family).read_text()
+    bench = (ROOT / "rust/crates/cuteafd-bench/src/fidelity.rs").read_text()
+    precision = re.search(r"const PRECISION_SETTINGS:.*?= &\[(.*?)\];", bench, re.S)
+    assert precision is not None
+    allowed = set(re.findall(r'"([^"]+)"', precision.group(1)))
+    identity = {"core-view", "core-view-fingerprint", "core-fp8-recipe"}
+    published = set(re.findall(r'set_resolved\("(core-[^"]+)"', source))
+    assert published == identity, (family, published)
+    assert published <= allowed, (family, published - allowed)

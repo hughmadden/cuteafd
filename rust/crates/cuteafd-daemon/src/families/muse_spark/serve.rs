@@ -169,9 +169,9 @@ pub(super) fn with_backend<T>(args: &ServeArgs, run: impl FnOnce(&super::backend
     let recipe = if view.mode() == cuteafd_loader::plan::checkpoint::CoreView::Fp8Compact {
         cuteafd_loader::plan::checkpoint::view::FP8_RECIPE
     } else { "none" };
-    cuteafd_bench::context::set_resolved("attention-mode", mode);
-    cuteafd_bench::context::set_resolved("attention-bundle-fingerprint", view.fingerprint());
-    cuteafd_bench::context::set_resolved("attention-fp8-recipe", recipe);
+    cuteafd_bench::context::set_resolved("core-view", mode);
+    cuteafd_bench::context::set_resolved("core-view-fingerprint", view.fingerprint());
+    cuteafd_bench::context::set_resolved("core-fp8-recipe", recipe);
     tracing::info!(core_view = mode, bundle = view.fingerprint(), fp8_recipe = recipe,
         "selected immutable Muse attention bundle");
     let core = CoreInventory::from_checkpoint(&cfg, &checkpoint)?;

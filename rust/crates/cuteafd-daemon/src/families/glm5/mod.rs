@@ -869,7 +869,12 @@ pub(crate) fn open(args: &EngineArgs) -> Result<Opened> {
         .map_err(|g| anyhow::anyhow!("geometry already {g:?}"))?;
     let cfg = GlmDsaConfig::from_hf(&view.config()?)?;
     validate_selected_attention(&view, &cfg)?;
-    cuteafd_bench::context::set_resolved("attention-bundle-fingerprint", view.fingerprint());
+    cuteafd_bench::context::set_resolved("core-view", view.mode().name());
+    cuteafd_bench::context::set_resolved("core-view-fingerprint", view.fingerprint());
+    let recipe = if view.mode() == cuteafd_loader::plan::checkpoint::CoreView::Fp8Compact {
+        cuteafd_loader::plan::checkpoint::view::FP8_RECIPE
+    } else { "none" };
+    cuteafd_bench::context::set_resolved("core-fp8-recipe", recipe);
     cuteafd_bench::context::set_family(cfg.family_id());
     let native = catalog.format() == cuteafd_loader::plan::checkpoint::CheckpointFormat::Exlr8;
     if native {
