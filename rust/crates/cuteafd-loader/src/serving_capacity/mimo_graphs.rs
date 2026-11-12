@@ -69,7 +69,7 @@ pub fn mimo_prewarm_layout(cfg: &MimoV2Config, ranks: usize, sparks: bool) -> Mi
         return layout;
     }
     tracing::warn!(%variant, ranks, sparks, "MiMo graph prewarm key is untraced; using bootstrap startup set and byte estimate");
-    let mut reserve_base_bytes = vec![bootstrap_bytes(cfg.layers + 2, MIMO_GRAPH_LEAD_OBSERVED)];
+    let mut reserve_base_bytes = vec![bootstrap_bytes(cfg.layers + 1, MIMO_GRAPH_LEAD_OBSERVED)];
     if ranks == 2 { reserve_base_bytes.push(bootstrap_bytes(cfg.layers, MIMO_GRAPH_PEER_OBSERVED)); }
     MimoLayoutPrewarm {
         variant,

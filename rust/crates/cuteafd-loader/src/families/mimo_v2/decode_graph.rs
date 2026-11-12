@@ -1,7 +1,7 @@
 //! MiMo's decode graph site and reserve inputs.
 //!
 //! MiMo captures one executable per layer segment between the Spark exchanges,
-//! plus both tail head variants. The startup set is a provisional prewarm, not
+//! plus the full-row head tail. Headless tails execute eagerly. The startup set is a provisional prewarm, not
 //! a sealed inventory: serving misses capture-or-run-eager through the shared
 //! bounded device cache, which charges one reserve per physical device.
 use crate::serving_capacity::mimo_graphs::mimo_prewarm_layout;
@@ -10,17 +10,16 @@ use crate::serving_capacity::CacheGeometryError;
 use cuteafd_core::serving_capacity::MemoryReservation;
 
 pub const MIMO_DECODE_ROWS: usize = 64;
-/// Both full-row logits and retained subset logits are reachable in serving.
-pub const MIMO_DECODE_TAIL_HEAD_VARIANTS: [bool; 2] = [true, false];
+/// Only full-row heads are captured; retained subset logits use an eager tail.
+pub const MIMO_DECODE_TAIL_HEAD_VARIANTS: [bool; 1] = [true];
 
 /// Provisional bootstrap observation of the whole 64-shape Pro capture on SM120
 /// (driver/runtime 13020, CUDA 13.2, 2026-11-08): 616 MiB over 4544 lead
 /// executables (70 layers plus one tail-head variant per shape) and 566 MiB
-/// over 4480 peer executables (70 layers per shape). The lead set now carries
-/// the second, headless tail variant; the measured maximum per-shape increment
-/// was 12 MiB. These are the checked-in prewarm reserve numbers until the
+/// over 4480 peer executables (70 layers per shape). Headless tails are eager;
+/// no estimated second-tail increment is included. These are bootstrap inputs until the
 /// family's trace card replaces them.
-pub const MIMO_GRAPH_LEAD_OBSERVED: (u64, u64) = (4608, (616 + 12) << 20);
+pub const MIMO_GRAPH_LEAD_OBSERVED: (u64, u64) = (4544, 616 << 20);
 pub const MIMO_GRAPH_PEER_OBSERVED: (u64, u64) = (4480, 566 << 20);
 
 /// One resolved card layout's graph inputs: its prewarm rows, per-rank reserve
@@ -32,7 +31,7 @@ pub struct MimoGraphLayout {
     pub rows: Vec<usize>,
     /// Row shapes that stay pinned in the cache.
     pub pinned: Vec<usize>,
-    /// Lead rank has each layer plus both full/partial-head tail variants.
+    /// Lead rank has each layer plus the full-row head tail.
     /// A peer has each attention layer and no vocabulary tail.
     pub segments_per_rank: Vec<usize>,
     pub executables_per_rank: Vec<usize>,
@@ -221,7 +220,7 @@ mod tests {
                 Err(CacheGeometryError::Unsupported { .. })));
         }
         let mut cfg = config();
-        cfg.layers = usize::MAX - 1;
+        cfg.layers = usize::MAX;
         assert!(matches!(graph_layout(&cfg, 1, true, true), Err(CacheGeometryError::Overflow(_))));
     }
 }
