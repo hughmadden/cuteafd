@@ -16,7 +16,7 @@ pub(crate) type ProbeRef = Option<Arc<Probe>>;
 /// Activate each adapter only after its paired raw-row and ordinary-layout proof.
 /// Remove this temporary allowlist with the final FULL_PREFILL_LOGITS deletion.
 pub(crate) fn streamed_prefill_scoring(family: &str) -> bool {
-    matches!(family, "glm5_flash" | "qwen4" | "qwen3_5" | "mimo_v2" | "deepseek_v4" | "step5" | "muse_spark" | "glm5")
+    matches!(family, "glm5_flash" | "qwen4" | "qwen3_5" | "mimo_v2" | "deepseek_v4" | "step5" | "muse_spark" | "glm5" | "mistral_large4")
 }
 
 pub(crate) fn prefill_scoring_admitted(family: &str, full_prefill_logits: bool) -> bool {
@@ -635,11 +635,11 @@ mod tests {
 
     #[test]
     fn streamed_scoring_activation_requires_a_proven_family() {
-        for family in ["glm5_flash", "qwen4", "qwen3_5", "mimo_v2", "deepseek_v4", "step5", "muse_spark", "glm5"] {
+        for family in ["glm5_flash", "qwen4", "qwen3_5", "mimo_v2", "deepseek_v4", "step5", "muse_spark", "glm5", "mistral_large4"] {
             assert!(streamed_prefill_scoring(family), "{family}");
             assert!(prefill_scoring_admitted(family, false), "{family}");
         }
-        for family in ["kimi_k3", "mistral_large4", "unknown"] {
+        for family in ["kimi_k3", "unknown"] {
             assert!(!streamed_prefill_scoring(family), "{family}");
             for legacy in [false, true] {
                 assert_eq!(prefill_scoring_admitted(family, legacy), legacy, "{family}");
