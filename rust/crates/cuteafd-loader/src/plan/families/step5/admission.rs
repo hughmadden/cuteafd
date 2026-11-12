@@ -519,7 +519,7 @@ pub fn admit_mtp_with_contract(checkpoint: &Checkpoint, inputs: &RuntimeInputs, 
                 native.vocabulary_heads.extend((0..depth).filter(|stage| !predictor.core.contains_key(
                     &format!("model.layers.{}.transformer.shared_head.output.weight", cfg.layers + stage)))
                     .map(|stage| format!("mtp-{stage}")));
-                native.workspace = native.workspace.max(workspace);
+                native.workspace = super::native::with_arena_phase(native.workspace, native.projection_bytes, workspace)?;
             }
             Ok(native)
         }).collect()

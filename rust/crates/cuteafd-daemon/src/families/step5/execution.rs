@@ -85,11 +85,12 @@ impl RankAdmission {
         Ok(bytes)
     }
 
-    pub(super) fn with_head(self, head: &super::head::HeadPlan) -> Result<Self> {
+    pub(super) fn with_head(self, head: &super::head::HeadPlan, projection_bytes: u64) -> Result<Self> {
         Ok(Self {
             immutable: self.immutable.checked_add(head.private_scratch_bytes()?)
                 .context("Step-5 native head weight overflow")?,
-            workspace: self.workspace.max(head.workspace_bytes()),
+            workspace: cuteafd_loader::plan::families::step5::native::with_arena_phase(
+                self.workspace, projection_bytes, head.workspace_bytes())?,
         })
     }
 }
@@ -140,9 +141,11 @@ impl<'a> NativeOwners<'a> {
         for (rank, admitted) in admission.iter_mut().enumerate() {
             *admitted = Execution::rank_admission(programs, checkpoint, ownership, rank, rows, span, count, plan)?;
             if rank == head_rank {
-                if let Some(head) = &head_plan { *admitted = admitted.with_head(head)?; }
-                admitted.workspace = admitted.workspace.max(
-                    cuteafd_loader::plan::families::step5::native::mtp_forecast_workspace(rows, depth, kv_format)?);
+                let projection = native_scratch_bytes(&plan.layouts[rank], rows, count)?;
+                if let Some(head) = &head_plan { *admitted = admitted.with_head(head, projection)?; }
+                admitted.workspace = cuteafd_loader::plan::families::step5::native::with_arena_phase(
+                    admitted.workspace, projection,
+                    cuteafd_loader::plan::families::step5::native::mtp_forecast_workspace(rows, depth, kv_format)?)?;
             }
         }
         ensure!(weight_arenas.len() == devices.len(), "Step-5 target arena rank inventory");
@@ -389,7 +392,7 @@ impl<'e, 'a> Execution<'e, 'a> {
         let admission = Self::rank_admission(programs, checkpoint, ownership, rank, rows, span, 92, plan)?;
         let admission = if rank == ownership.execution().spec().head_gpu as usize {
             admission.with_head(&super::head::HeadPlan::for_execution(programs, checkpoint, logits, ownership,
-                &plan.layouts[rank])?)?
+                &plan.layouts[rank])?, native_scratch_bytes(&plan.layouts[rank], rows, 92)?)?
         } else { admission };
         // Weight arenas (including rotary and embedding) are separate solved owners.
         Ok(admission)
@@ -2412,13 +2415,22 @@ mod admission_tests {
     fn final_head_only_adds_private_scratch_and_reuses_workspace() -> Result<()> {
         let head = super::super::head::tests::admission_plan(64);
         let base = RankAdmission { immutable: 1000, workspace: 2000 };
-        let plan = base.with_head(&head)?;
+        let plan = base.with_head(&head, 0)?;
         assert_eq!(head.private_scratch_bytes()?, 0);
         assert_eq!(plan.immutable, base.immutable);
         assert_eq!(plan.bytes()?, base.immutable + head.workspace_bytes());
         assert!(plan.check(plan.bytes()? - 1, &[]).is_err());
-        assert!(RankAdmission { immutable: u64::MAX, workspace: 0 }.with_head(&head)?.bytes().is_err());
-        assert_eq!(RankAdmission { immutable: 0, workspace: u64::MAX }.with_head(&head)?.workspace, u64::MAX);
+        assert!(RankAdmission { immutable: u64::MAX, workspace: 0 }.with_head(&head, 0)?.bytes().is_err());
+        assert_eq!(RankAdmission { immutable: 0, workspace: u64::MAX }.with_head(&head, 0)?.workspace, u64::MAX);
+        let projection = 257_851_656;
+        let head = super::super::head::tests::admission_plan(3 * 2752);
+        let layer = cuteafd_loader::plan::families::step5::native::layer_workspace(2752, 3 * 2752, true, 64)?;
+        let base = RankAdmission { immutable: 0, workspace: layer + projection };
+        let runtime = base.with_head(&head, projection)?;
+        let offline = cuteafd_loader::plan::families::step5::native::with_arena_phase(
+            base.workspace, projection, head.workspace_bytes())?;
+        assert_eq!(runtime.workspace, offline);
+        assert_eq!(runtime.workspace - projection, head.workspace_bytes());
         Ok(())
     }
 

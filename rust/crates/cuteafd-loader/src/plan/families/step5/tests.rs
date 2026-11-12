@@ -182,7 +182,8 @@ fn full_context_mtp_forecast_charges_private_predictors_before_allocation() -> a
                 assert!(!admitted.fixed.iter().any(|item| item.group == "Step-5 GPU embedding"
                     || item.group == "Step-5 native target and head"));
                 let workspace = if rank == 0 {
-                    target.workspace.max(native::mtp_forecast_workspace(inputs.unit_rows(), depth, kv_format)?)
+                    native::with_arena_phase(target.workspace, target.projection_bytes,
+                        native::mtp_forecast_workspace(inputs.unit_rows(), depth, kv_format)?)?
                 } else { target.workspace };
                 assert_eq!(item("Step-5 native workspace"), workspace);
                 let mut arenas = target.weight_arenas.clone();

@@ -168,6 +168,36 @@ mod tests {
     }
 
     #[test]
+    fn full_head_arena_keeps_projection_backing_outside_phase_maximum() -> Result<()> {
+        use cuteafd_loader::formats::trellis_core::ProjectionScratchLayout;
+        let (unit, span) = (2752, 3 * 2752);
+        let mut projection = ProjectionScratchLayout::new(13824, 4096, unit)?;
+        for (k, n) in [(4096, 13824), (4096, 768), (12288, 4096), (4096, 12288)] {
+            projection.merge(&ProjectionScratchLayout::new(k, n, unit)?)?;
+        }
+        let projection = projection.packed_bytes()? as u64;
+        assert_eq!(projection, 257_851_656);
+        let layer = native::layer_workspace(unit, span, true, 64)?;
+        let head_planes = native::head_planes(span)?;
+        let head = native::plane_bytes(&head_planes)?;
+        let old_total = (layer + projection).max(head);
+        let old_arena = old_total - projection;
+        assert_eq!(head - old_arena, projection);
+        assert!(view_layout(old_arena as usize, &head_planes, 0).is_err());
+        let total = native::with_arena_phase(layer + projection, projection, head)?;
+        let arena = usize::try_from(total - projection)?;
+        assert_eq!(total, head + projection);
+        view_layout(arena, &head_planes, 0)?;
+        for depth in [0, 1, 3] {
+            let predictor = native::mtp_forecast_workspace(unit, depth,
+                cuteafd_loader::families::qwen4::Qwen4KvCache::Fp8)?;
+            let admitted = native::with_arena_phase(total, projection, predictor)?;
+            assert_eq!(admitted - projection, (arena as u64).max(predictor));
+        }
+        Ok(())
+    }
+
+    #[test]
     fn output_scratch_is_disjoint_and_inventoried_once_per_backing() -> Result<()> {
         for rows in [1, 64, 65, 4096] {
             for sizes in [native::swa_planes(rows, 32)?.to_vec(),
