@@ -157,6 +157,14 @@ impl<'a> NativeRtxTensors<'a> {
             .with_context(|| format!("RTX tensor is not resident: {name}"))?
             .buffer)
     }
+    /// Header-only geometry for workspace construction before payload commit.
+    pub(crate) fn embedding_layout(&self) -> Result<(usize, i32)> {
+        if let Some((_, alias, _)) = &self.mapped_embedding {
+            return Ok((alias.bytes, alias.device_id));
+        }
+        let buffer = self.get("embed.weight")?;
+        Ok((buffer.bytes, buffer.device_id))
+    }
     pub fn resident_bytes(&self) -> usize {
         self.resident_bytes
     }
@@ -443,6 +451,7 @@ mod host_embedding_tests {
         let alias = library.cuda_host_buffer_device_alias(owner.buffer)?;
         let table = NativeRtxTensors { tensors: BTreeMap::new(), resident_bytes: 0,
             mapped_embedding: Some((owner, alias, landing.clone())) };
+        assert_eq!(table.embedding_layout()?, (30, alias.device_id));
         assert!(table.get("embed.weight").unwrap_err().to_string().contains("not committed"));
         landing.ready.store(true, std::sync::atomic::Ordering::Release);
         assert_eq!(table.get("embed.weight")?.ptr, alias.ptr);
