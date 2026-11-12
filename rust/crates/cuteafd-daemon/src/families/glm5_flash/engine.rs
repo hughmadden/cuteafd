@@ -4358,7 +4358,7 @@ impl<'a> GlmfEngine<'a> {
         let cap = decode_cap(t);
         for index in 0..=layers.len() {
             let key = GraphKey::new(index, t, tables);
-            self.replay(key, || -> Result<()> {
+            let segment = || -> Result<()> {
                 // Layer `index - 1`'s output streams land in buffer 0 first thing.
                 let tap = || match (&self.drafter, index.checked_sub(1)) {
                     (Some(drafter), Some(previous)) => drafter.tap_streams(previous, w.streams[0].buffer.ptr, HC, 0, t),
@@ -4404,7 +4404,8 @@ impl<'a> GlmfEngine<'a> {
                     // Real width is runtime data, not part of a bucket graph key.
                     Ok(())
                 }
-            })?;
+            };
+            if index == layers.len() && !head { segment()?; } else { self.replay(key, segment)?; }
             // Outside capture: every replay queues its matching peer landing.
             if index == layers.len() {
                 if let Some(w1) = w1 { self.replicate_terminal(w, w1, 0, t)?; }
