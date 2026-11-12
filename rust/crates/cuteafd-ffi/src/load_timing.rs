@@ -60,25 +60,30 @@ impl Split {
         let elapsed = self.started.elapsed().as_secs_f64();
         let totals = self.totals.lock().unwrap_or_else(|e| e.into_inner());
         let [read, upload, quantize, push] = totals.counters;
-        let mut intervals = totals.busy.clone();
-        intervals.sort_unstable_by_key(|&(start, _)| start);
-        let mut end = self.started;
-        let mut busy = 0.0;
-        for (start, stop) in intervals {
-            if stop > end { busy += (stop - start.max(end)).as_secs_f64(); end = stop; }
-        }
+        let busy = io_wall_seconds(self.started, &totals.busy);
         tracing::info!(label, elapsed_seconds = elapsed, read_bytes = read.bytes, read_seconds = read.seconds,
             upload_bytes = upload.bytes, upload_seconds = upload.seconds,
             quantize_bytes = quantize.bytes, quantize_seconds = quantize.seconds,
             push_bytes = push.bytes, push_seconds = push.seconds,
-            io_wall_seconds = busy, transform_seconds = (elapsed - busy).max(0.0),
-            "coordinator weight load split (operation seconds sum workers; transform excludes union of I/O intervals)");
+            io_wall_seconds = busy, remainder_seconds = (elapsed - busy).max(0.0),
+            "coordinator weight load split (operation seconds sum workers; async copies measure submission; remainder includes waits and uninstrumented transforms)");
     }
 }
 impl Drop for Split {
     fn drop(&mut self) {
         ACTIVE.with(|active| active.borrow_mut().0.retain(|phase| !Arc::ptr_eq(phase, &self.totals)));
     }
+}
+
+fn io_wall_seconds(started: Instant, intervals: &[(Instant, Instant)]) -> f64 {
+    let mut intervals = intervals.to_vec();
+    intervals.sort_unstable_by_key(|&(start, _)| start);
+    let mut end = started;
+    let mut busy = 0.0;
+    for (start, stop) in intervals {
+        if stop > end { busy += (stop - start.max(end)).as_secs_f64(); end = stop; }
+    }
+    busy
 }
 
 #[cfg(test)]
@@ -103,6 +108,16 @@ mod tests {
         drop(totals);
         std::thread::spawn(|| { let other = Split::start(); read(99, || ()); assert_eq!(other.read_bytes(), 99); }).join().unwrap();
         assert_eq!(split.read_bytes(), 2007);
+    }
+    #[test]
+    fn overlapping_worker_time_is_subtracted_only_once() {
+        use std::time::Duration;
+        let start = Instant::now();
+        let at = |seconds| start + Duration::from_secs(seconds);
+        // Six summed worker seconds cover only four wall seconds.
+        let intervals = [(at(2), at(5)), (at(1), at(4)), (at(2), at(3))];
+        assert_eq!(io_wall_seconds(start, &intervals), 4.0);
+        assert_eq!(io_wall_seconds(start, &[]), 0.0);
     }
     #[test]
     fn nested_and_panicking_contexts_restore_the_parent() {
