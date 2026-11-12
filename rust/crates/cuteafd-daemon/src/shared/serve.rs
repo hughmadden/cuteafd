@@ -89,15 +89,18 @@ mod readiness_tests {
             assert!(schedule < signal, "V4.1 readiness must be a scheduler callback");
         }
         let source = include_str!("../families/deepseek_v41/v41_native_serve/scheduler.rs");
+        let finish = source.split_once("fn finish_startup<P>(").unwrap().1.split_once("\n}\n").unwrap().0;
+        assert!(finish.find("decode_share.queue::<P>()?").unwrap() < finish.find("ready()?;").unwrap());
         let startup = source.split_once("pub(super) fn serve<").unwrap().1;
-        let ready = startup.find("    ready()?;").unwrap();
+        let ready = startup.find("    let mut prefills = finish_startup::<").unwrap();
         let loop_at = startup.find("    loop {").unwrap();
         for init in ["native_manifest(", "admission::Media::new(", "args.reserve.limits(",
-            "args.reserve.config(", "args.decode_share.queue::<"] {
+            "args.reserve.config("] {
             assert!(startup.find(init).unwrap() < ready, "{init} must precede readiness");
         }
         assert!(ready < loop_at);
-        assert!(!startup[ready + "    ready()?;".len()..loop_at].contains('?'),
+        let after_ready = startup[ready..].split_once('\n').unwrap().1;
+        assert!(!after_ready[..after_ready.find("    loop {").unwrap()].contains('?'),
             "no fallible startup work may follow readiness");
     }
 

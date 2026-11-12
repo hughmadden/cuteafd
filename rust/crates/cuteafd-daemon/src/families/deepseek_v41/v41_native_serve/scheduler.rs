@@ -798,6 +798,13 @@ fn pack_waiting<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, runtim
     Ok(())
 }
 
+fn finish_startup<P>(decode_share: &crate::shared::prefill_share::DecodeShareArgs,
+    ready: impl FnOnce() -> Result<()>) -> Result<crate::shared::prefill_share::PrefillQueue<P>> {
+    let prefills = decode_share.queue::<P>()?;
+    ready()?;
+    Ok(prefills)
+}
+
 /// Serve until the request channel closes: admitted prompts wait in the decode-share
 /// queue (`--decode-share`) and prefill in rounds between decode rounds.
 #[allow(clippy::too_many_arguments)]
@@ -840,15 +847,13 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
     crate::shared::prefill_packing::log_mode(args.prefill_packing,
         if args.prefill_packing == crate::shared::prefill_packing::PackingMode::Exact { 0 }
         else { args.prefill_batch_tokens as usize });
-    // Admitted prompts wait here and prefill in rounds (`--decode-share`); share
-    // 0 prefills every waiting prompt whole before the next step, as before.
-    let mut prefills = args.decode_share.queue::<QueuedPrompt<'a, P::Suffix>>()?;
     let whole = args.decode_share.decode_share == 0.0;
     let mut times = super::prefill_target::V41PrefillTimes::default();
     // Keep pending owners outside the fallible loop so every fatal exit can drain them.
     let mut admitted = std::collections::VecDeque::<PackedAdmission>::new();
     let mut media_ready = std::collections::VecDeque::new();
-    ready()?;
+    // Validate the final startup owner before publishing a healthy front door.
+    let mut prefills = finish_startup::<QueuedPrompt<'a, P::Suffix>>(&args.decode_share, ready)?;
     let result = crate::shared::api::run_scheduler(|| {
     loop {
         unsafe { // SAFETY: V4.1 graph owners borrow persistent engine storage only.
@@ -2765,6 +2770,19 @@ fn commit_lane<'w, 'a>(lib: &'a NativeLibrary, lane: usize,
 mod sampling_tests {
     use super::*;
     use crate::families::deepseek_v41::v41_native_serve::scores::{ROW_BYTES, VOCAB};
+
+    #[test]
+    fn startup_queue_validation_precedes_readiness() {
+        use crate::shared::prefill_share::DecodeShareArgs;
+        let ready_count = std::cell::Cell::new(0);
+        let ready = || { ready_count.set(ready_count.get() + 1); Ok(()) };
+        let error = finish_startup::<()>(&DecodeShareArgs { decode_share: 1.0 }, ready).err().unwrap();
+        assert!(error.to_string().contains("--decode-share must be in [0, 1)"));
+        assert_eq!(ready_count.get(), 0, "failed startup must not publish Ready");
+        let queue = finish_startup::<()>(&DecodeShareArgs { decode_share: 0.2 }, ready).unwrap();
+        assert!(queue.is_empty());
+        assert_eq!(ready_count.get(), 1, "successful startup publishes Ready exactly once");
+    }
 
     #[test]
     fn packing_group_matches_boot_sized_suffix_arena_through_c64() {
