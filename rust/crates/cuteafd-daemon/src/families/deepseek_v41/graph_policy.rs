@@ -190,7 +190,11 @@ mod tests {
             let end = source[at..].find("pub(crate) fn capture_startup(").unwrap() + at;
             let startup = &source[at..end];
             assert!(startup.contains("select_window(crate::shared::memory::row_window::RowWindow::NONE)?"));
-            assert!(startup.contains("graph_policy::PREFILL_HEAD_PREWARM_ROWS"));
+            if source.contains("resources.head.capture_startup(") {
+                assert!(startup.contains("graph_policy::PREFILL_HEAD_PREWARM_ROWS"));
+            } else {
+                assert!(!startup.contains("head.capture_startup("));
+            }
             assert!(!startup.contains("head.capture_startup(&rows)"));
         }
         let lane = include_str!("v41_backbone_lane.rs");

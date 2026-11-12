@@ -175,6 +175,8 @@ int cudaGraphInstantiate(void** exec, void*, int) {
 }
 int cudaGraphDestroy(void*) { assert(live_graphs > 0); --live_graphs; return outcome(4); }
 int cudaGraphExecDestroy(void*) { assert(live_execs > 0); --live_execs; return outcome(5); }
+int cudaGraphGetNodes(void*, void**, size_t* nodes) { *nodes = 3; return 0; }
+static cuteafd_status_t end_capture_retained(void*, cuteafd_cuda_graph_capture_info_t*, bool);
 int cudaMemGetInfo(size_t* free, size_t* total) { *free = 1 << 20; *total = 2 << 20; return 0; }
 bool graph_census_enabled() { return census; }
 void record_graph_census(void*, void*, int, size_t, int, size_t) {}
@@ -184,12 +186,12 @@ cuteafd_status_t fail_cuda(cuteafd_status_t status, const char* action, int erro
   message = std::string(action) + ": " + std::to_string(error); return status;
 }
 cuteafd_status_t fill_cuda_graph_capture_info(void* graph, void* exec, cuteafd_cuda_graph_capture_info_t* out) {
-  out->graph = graph; out->graph_exec = exec; out->node_count = 2; return ok();
+  out->graph = graph; out->graph_exec = exec; out->node_count = 3; return ok();
 }
 namespace cuteafd {
 ''' + "inline cudaError_t diagnostic_cuda" + clear_error + r'''
 int inspect_graph_topology(void*, size_t* count, size_t* width, int* spans) {
-  *count = 2; *width = 1; *spans = 1; return 0;
+  *count = 3; *width = 1; *spans = 1; return 0;
 }
 }
 ''' + entry_points + r'''
@@ -212,7 +214,7 @@ int main() {
           assert(message == "cudaGraphInstantiate failed; lower GPU_MEMORY_CAP or increase GPU_RESERVE to leave graph headroom: 2" && exec == nullptr);
           ++cancelled[rank]; ++eager[rank];
         } else {
-          assert(nodes == 2 && width == 1 && spans == 1);
+          assert(nodes == 3 && width == 1 && spans == 1);
           ++captures[rank]; assert(cudaGraphExecDestroy(exec) == 0);
         }
         assert(peer_wait_abortable() == 0 && live_execs == 0);

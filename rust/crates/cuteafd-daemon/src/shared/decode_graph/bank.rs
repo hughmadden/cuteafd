@@ -1075,7 +1075,7 @@ mod device_tests {
             for key in 2..100 {
                 let ticket = bank.cache_ticket(&key, false, None);
                 drop(ticket);
-                bank.cache_measured(10);
+                bank.cache_measured(0);
                 bank.cache_tick();
                 assert!(bank.cache_ticket(&1, true, None).is_none());
             }
