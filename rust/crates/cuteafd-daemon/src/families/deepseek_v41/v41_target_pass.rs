@@ -423,33 +423,6 @@ impl<'w, 'a> TargetPass<'w, 'a> {
         ensure!(batch.cache()?.stage() == CacheStage::Encoder, "encoder execute phase differs");
         unsafe { self.execute_phase(requests, batch, transport, placement, &[], Some(suffix), None, HeadTerminal::Regular).await }
     }
-    pub async unsafe fn execute_encoder_replay(
-        &mut self,
-        requests: &Requests<'a>,
-        batch: &mut RequestBatch,
-        transport: &mut NativeTp4Wave<'a>,
-        placement: u64,
-        suffix: &mut EncoderSuffix<'a>,
-    ) -> Result<()> {
-        self.set_attention_decode(false);
-        ensure!(
-            batch.cache()?.stage() == CacheStage::EncoderReplay,
-            "encoder replay phase differs"
-        );
-        unsafe {
-            self.execute_phase(
-                requests,
-                batch,
-                transport,
-                placement,
-                &[],
-                Some(suffix),
-                None,
-                HeadTerminal::Regular,
-            )
-            .await
-        }
-    }
     pub async unsafe fn execute_replay(
         &mut self,
         requests: &Requests<'a>,
@@ -825,7 +798,7 @@ mod tests {
     fn concrete_topologies_share_stage_order_without_receive_dispatch() -> anyhow::Result<()> {
         use super::CacheStage;
         let runtime = tokio::runtime::Builder::new_current_thread().build()?;
-        for stage in [CacheStage::Full, CacheStage::Encoder, CacheStage::EncoderReplay, CacheStage::Replay] {
+        for stage in [CacheStage::Full, CacheStage::Encoder, CacheStage::Replay] {
             let rows = runtime.block_on(async {
                 let mut visited = Vec::new();
                 layer_schedule!(stage; layer, first; {
@@ -854,7 +827,7 @@ mod tests {
         use crate::shared::peer_split::order::{check, host::{check_host, HostSchedule}};
         use super::CacheStage;
         let runtime = tokio::runtime::Builder::new_current_thread().build()?;
-        for stage in [CacheStage::Full, CacheStage::Encoder, CacheStage::EncoderReplay, CacheStage::Replay] {
+        for stage in [CacheStage::Full, CacheStage::Encoder, CacheStage::Replay] {
             // Record the real scheduler's layer order, then interleave independent
             // lanes at its await boundaries. Each direct-input copy and owner
             // reduction queues its producer before its destination wait.

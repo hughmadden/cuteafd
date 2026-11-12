@@ -14,12 +14,20 @@
 //! precedent). [`V41Meta`] describes it as plain data: window spans, the frontier, the Engram
 //! lookback and the drafter's frontier.
 //!
-//! **Restore plans.** Exact frontiers restore the mark byte-exactly. An exact ancestor followed
-//! by a suffix of at least 128 tokens resumes as an encoder continuation (encoder rings and carry
-//! restored, decoder rings rebuilt by the suffix's final replay): still exact. A partial match is
-//! `ApproximateReplay`: sources are shared through the even-aligned common prefix
-//! (`source_end`), encoder windows restart empty 128 tokens earlier (`replay_start`) and Engram
-//! history is rebuilt there from the prompt's native ids.
+//! **Restores are exact** (`ReuseRule::EXACT`, AGENTS "Exact prefix-cache restores"): only a
+//! retained frontier that is a prefix of the prompt is selected, and its mark restores
+//! byte-exactly. An exact ancestor followed by a suffix of at least 128 tokens resumes as an
+//! encoder continuation (encoder rings and carry restored, decoder rings rebuilt by the suffix's
+//! final replay, which covers the whole decoder window): still the state a cold prefill reaches.
+//!
+//! **Copy stream.** Captures, restores and tail copies run on the backbone's private prefix
+//! stream ([`BackboneCache::prefix_drain`]), not on `shared::prefix::PrefixCopies`. That is safe
+//! by ownership rather than by a reader fence: a capture reads only a committed request's
+//! private ring/carry slots and its committed (immutable) source rows, a restore and a tail copy
+//! write only a fresh placement's private slots and freshly forked pages that no kernel reads
+//! until the restore drains, and the engine drains before it releases or stores anything
+//! (`tests::prefix_stream_reads_only_committed_private_state` checks the argument's source;
+//! moving onto the shared copy stream is #1882).
 use super::*;
 use super::scores::RetainedScores;
 use crate::families::deepseek_v41::v41_backbone_cache::{BackboneMark, CacheLease, UNIT_BYTES, UNIT_TOKENS};
@@ -28,9 +36,8 @@ use crate::shared::memory::Tag;
 use crate::shared::memory::device::{Allocation, Device};
 use crate::shared::prefix::{cuda_copy::range, CudaCopyEngine};
 use cuteafd_engine::prefix::{
-    After, BoxError, CaptureTicket, Captured, Eviction, FamilyLayout, LaggedState, Mark, MarkSlot, MarkStore,
-    PrefixCache, PrefixConfig, PrefixFamily, RestoreCandidate, RestoreContext, RestoreFidelity, RestorePlan,
-    ReuseRule, TailCopy,
+    After, BoxError, CaptureTicket, Captured, Eviction, FamilyLayout, Mark, MarkSlot, MarkStore,
+    PrefixCache, PrefixConfig, PrefixFamily, RestoreContext, RestorePlan, ReuseRule, TailCopy,
 };
 use cuteafd_hostcache::copy::DeviceRange;
 use serde::{Deserialize, Serialize};
@@ -66,7 +73,6 @@ pub(crate) struct V41Prefix<'r, 'a, 'w, C: DraftChain<'a>> {
     draft: RefCell<Option<&'r mut DraftRuntime<'w, 'a, C>>>,
     arena: &'r Arenas<'a>,
     units: usize,
-    partial: bool,
     /// Capture lane of the next queued capture (`queue_capture`'s ticket is the lane).
     lane: Cell<usize>,
 }
@@ -118,6 +124,12 @@ impl<'a> Arenas<'a> {
             None => None,
         })
     }
+    pub fn slots(&self) -> usize { self.slots }
+    /// Mark slots for the launch: the shared `MarkRule` (`--prefix-cache-mark-mib`, host tier)
+    /// over one complete mark, as the planner reserves them.
+    pub fn slots_for(args: &crate::cli::NativeServeArgs) -> usize {
+        args.prefix.mark_rule(args.concurrency as usize).slots(mark_bytes(args.dspark))
+    }
     pub fn owners(&self) -> Vec<std::rc::Rc<Allocation<'a>>> {
         self.target.iter().chain(&self.draft).cloned().collect()
     }
@@ -132,42 +144,30 @@ fn boxed(error: anyhow::Error) -> BoxError {
     format!("{error:#}").into()
 }
 
-/// V4.1's geometry for the prefix engine over `units` 512-token units.
-pub(crate) fn layout(units: usize, draft: bool, partial: bool) -> FamilyLayout {
+/// One snapshot's mark bytes: the backbone mark plus, with dSpark, the drafter rings.
+pub(crate) fn mark_bytes(draft: bool) -> usize {
+    BackboneMark::BYTES + if draft { super::speculative::DRAFT_MARK_BYTES } else { 0 }
+}
+
+/// V4.1's geometry for the prefix engine over `units` 512-token units: exact frontiers only.
+pub(crate) fn layout(units: usize, draft: bool) -> FamilyLayout {
     FamilyLayout {
         page_rows: UNIT_TOKENS,
         pages: units,
         page_bytes: UNIT_BYTES,
-        mark_bytes: BackboneMark::BYTES + if draft { super::speculative::DRAFT_MARK_BYTES } else { 0 },
+        mark_bytes: mark_bytes(draft),
         draft_bytes: 0,
-        rule: if partial { ReuseRule::V41 } else { ReuseRule::EXACT },
+        rule: ReuseRule::EXACT,
         mark_store: MarkStore::Arena,
         page_owners: cuteafd_engine::prefix::PageOwners::Uniform,
     }
 }
 
-/// Where V4.1 resumes a snapshot: the default plan, except that an exact ancestor followed by
-/// at least 128 new tokens continues its encoder (exact), and a partial match shares sources
-/// through the even-aligned, media-safe common prefix and replays 128 tokens before it.
-pub(crate) fn plan(hit: RestoreCandidate<'_>, partial: bool) -> RestorePlan {
-    if hit.common == hit.snapshot_end {
-        return RestorePlan::under(ReuseRule::V41, hit);
-    }
-    let source_end = if partial { hit.media_safe(hit.common / 2 * 2) } else { 0 };
-    let replay_start = hit.media_safe(source_end.saturating_sub(128));
-    RestorePlan {
-        snapshot_end: hit.snapshot_end,
-        target_end: hit.target_end,
-        lag: LaggedState { source_end: if replay_start == 0 { 0 } else { source_end }, replay_start },
-        fidelity: RestoreFidelity::ApproximateReplay,
-    }
-}
-
 impl<'r, 'a, 'w, C: DraftChain<'a>> V41Prefix<'r, 'a, 'w, C> {
-    pub fn new(requests: &'r mut Requests<'a>, draft: Option<&'r mut DraftRuntime<'w, 'a, C>>, arena: &'r Arenas<'a>,
-        partial: bool) -> Self {
+    pub fn new(requests: &'r mut Requests<'a>, draft: Option<&'r mut DraftRuntime<'w, 'a, C>>, arena: &'r Arenas<'a>)
+        -> Self {
         let units = requests.cache().unit_capacity();
-        Self { requests: RefCell::new(requests), draft: RefCell::new(draft), arena, units, partial, lane: Cell::new(0) }
+        Self { requests: RefCell::new(requests), draft: RefCell::new(draft), arena, units, lane: Cell::new(0) }
     }
     /// Capture lane for the next queued capture.
     pub fn on_lane(&self, lane: usize) -> &Self {
@@ -187,13 +187,10 @@ impl<'a, C: DraftChain<'a>> PrefixFamily<V41Meta> for V41Prefix<'_, 'a, '_, C> {
     type Placement = V41Placement;
 
     fn layout(&self) -> FamilyLayout {
-        layout(self.units, self.arena.draft.is_some(), self.partial)
+        layout(self.units, self.arena.draft.is_some())
     }
     fn eviction(&self) -> Eviction {
         Eviction::FreesPages
-    }
-    fn plan_restore(&self, hit: RestoreCandidate<'_>) -> RestorePlan {
-        plan(hit, self.partial)
     }
     fn capture_meta(&self, placement: &V41Placement, len: usize) -> Result<V41Meta, BoxError> {
         let requests = self.requests.borrow();
@@ -224,35 +221,30 @@ impl<'a, C: DraftChain<'a>> PrefixFamily<V41Meta> for V41Prefix<'_, 'a, '_, C> {
     }
     fn restore_with(&self, mark: Option<&Mark>, saved: Option<&V41Meta>, placement: &mut V41Placement,
         plan: &RestorePlan, context: &RestoreContext<'_>) -> Result<(), BoxError> {
-        // The forked rows through `source_end` are initialized in the bound pages.
+        if !plan.exact() {
+            return Err("V4.1 restores exact snapshot frontiers only".into());
+        }
+        let (Some(Mark::Slot(slot)), Some(saved)) = (mark, saved) else {
+            return Err("an exact V4.1 restore needs its arena mark and metadata".into());
+        };
+        let _ = context;
+        // The forked rows through the snapshot's frontier are initialized in the bound pages.
         self.bind_units(placement, plan.lag.source_end).map_err(boxed)?;
         let mut requests = self.requests.borrow_mut();
         // Tail copies of forked units were enqueued on the prefix stream; restores below read
         // the pages only through later kernels on the same stream or after its drain.
-        if plan.exact() {
-            let (Some(Mark::Slot(slot)), Some(saved)) = (mark, saved) else {
-                return Err("an exact V4.1 restore needs its arena mark and metadata".into());
-            };
-            let continuation = (plan.target_end - plan.snapshot_end >= 128).then_some(plan.target_end as u64);
-            let target = self.arena.target(*slot).map_err(boxed)?;
-            requests.restore_mark(placement.lease, &saved.request, target, continuation).map_err(boxed)?;
-            if continuation.is_none() {
-                let mut draft = self.draft.borrow_mut();
-                match (placement.draft, draft.as_deref_mut(), saved.draft_end, self.arena.draft(*slot).map_err(boxed)?) {
-                    (Some(id), Some(draft), Some(end), Some(ring)) => draft.restore_mark(id, end, ring).map_err(boxed)?,
-                    (None, None, None, _) | (None, None, _, None) => {}
-                    _ => return Err("retained execution mode differs".into()),
-                }
+        let continuation = (plan.target_end - plan.snapshot_end >= 128).then_some(plan.target_end as u64);
+        let target = self.arena.target(*slot).map_err(boxed)?;
+        requests.restore_mark(placement.lease, &saved.request, target, continuation).map_err(boxed)?;
+        if continuation.is_none() {
+            let mut draft = self.draft.borrow_mut();
+            match (placement.draft, draft.as_deref_mut(), saved.draft_end, self.arena.draft(*slot).map_err(boxed)?) {
+                (Some(id), Some(draft), Some(end), Some(ring)) => draft.restore_mark(id, end, ring).map_err(boxed)?,
+                (None, None, None, _) | (None, None, _, None) => {}
+                _ => return Err("retained execution mode differs".into()),
             }
-            placement.len = plan.snapshot_end;
-        } else {
-            let start = requests.restore_encoder_prefix(placement.lease, plan.lag.source_end, context.native_tokens)
-                .map_err(boxed)?;
-            if start != plan.lag.replay_start {
-                return Err(format!("encoder replay starts at {start}, plan {}", plan.lag.replay_start).into());
-            }
-            placement.len = start;
         }
+        placement.len = plan.snapshot_end;
         placement.plan = Some(*plan);
         Ok(())
     }
@@ -356,7 +348,6 @@ impl<'a, C: DraftChain<'a>> PrefixFamily<V41Meta> for V41Prefix<'_, 'a, '_, C> {
 pub(crate) struct V41Cache<'a> {
     cache: PrefixCache<CudaCopyEngine<'a>, V41Meta>,
     arenas: Arenas<'a>,
-    partial: bool,
     pending: [Option<CaptureTicket>; 2],
     capture_session: Option<String>,
 }
@@ -371,10 +362,11 @@ pub(crate) struct Restored {
 }
 
 impl<'a> V41Cache<'a> {
-    pub fn new(arenas: Arenas<'a>, config: PrefixConfig, partial: bool,
+    pub fn new(arenas: Arenas<'a>, config: PrefixConfig,
         host: Option<(cuteafd_hostcache::config::Config, CudaCopyEngine<'a>)>, layout: FamilyLayout) -> Result<Self> {
+        ensure!(layout.rule == ReuseRule::EXACT, "V4.1 restores exact snapshot frontiers only");
         let cache = PrefixCache::new(layout, config, host).map_err(|e| anyhow::anyhow!("{e}"))?;
-        Ok(Self { cache, arenas, partial, pending: [None, None], capture_session: None })
+        Ok(Self { cache, arenas, pending: [None, None], capture_session: None })
     }
     pub fn arenas(&self) -> &Arenas<'a> { &self.arenas }
     /// A cache that retains nothing (component fixtures).
@@ -387,14 +379,13 @@ impl<'a> V41Cache<'a> {
     #[cfg(test)]
     pub fn configured(entries: usize) -> Self {
         let config = PrefixConfig { entries, mark_slots: 0, keep_logits: true, min_tokens: 1 };
-        Self::new(Arenas { target: None, draft: None, slots: 0 }, config, true, None, layout(1, false, true))
+        Self::new(Arenas { target: None, draft: None, slots: 0 }, config, None, layout(1, false))
             .expect("a fixture prefix cache")
     }
-    pub fn partial(&self) -> bool { self.partial }
     pub fn engine(&self) -> &PrefixCache<CudaCopyEngine<'a>, V41Meta> { &self.cache }
     pub fn family<'r, 'w, C: DraftChain<'a>>(&'r self, requests: &'r mut Requests<'a>,
         draft: Option<&'r mut DraftRuntime<'w, 'a, C>>) -> V41Prefix<'r, 'a, 'w, C> {
-        V41Prefix::new(requests, draft, &self.arenas, self.partial)
+        V41Prefix::new(requests, draft, &self.arenas)
     }
     pub fn capture_session(&mut self, session: Option<String>) {
         self.capture_session = session.clone();
@@ -420,7 +411,7 @@ impl<'a> V41Cache<'a> {
         -> Result<()> {
         let released = requests.take_released_units();
         if released.is_empty() { return Ok(()); }
-        let family = V41Prefix::new(requests, draft, &self.arenas, self.partial);
+        let family = V41Prefix::new(requests, draft, &self.arenas);
         for units in released {
             self.cache.release(&family, &units).map_err(|e| anyhow::anyhow!("{e}"))?;
         }
@@ -436,7 +427,7 @@ impl<'a> V41Cache<'a> {
         lease: CacheLease, draft_id: Option<u64>, keys: &[u32], native: &[u32], media: &[MediaSpan], capacity: usize,
         cold: bool) -> Result<Restored> {
         self.reclaim(requests, draft.as_deref_mut())?;
-        let family = V41Prefix::new(requests, draft, &self.arenas, self.partial);
+        let family = V41Prefix::new(requests, draft, &self.arenas);
         let build = |units: Vec<u32>| V41Placement { units, lease, draft: draft_id, len: 0, plan: None };
         let admitted = if cold || !self.cache.enabled() {
             self.cache.admit_cold(&family, keys.len(), capacity, build)
@@ -471,7 +462,7 @@ impl<'a> V41Cache<'a> {
         let units = requests.units(lease)?.to_vec();
         let len = requests.cache().committed_end(lease)? as usize;
         let mut placement = V41Placement { units, lease, draft: None, len, plan: None };
-        let family = V41Prefix::new(requests, draft, &self.arenas, self.partial);
+        let family = V41Prefix::new(requests, draft, &self.arenas);
         self.cache.extend(&family, &mut placement, rows).map_err(|e| anyhow::anyhow!("{e}"))
     }
 
@@ -493,7 +484,7 @@ impl<'a> V41Cache<'a> {
         let units = requests.units(lease)?.to_vec();
         let placement = V41Placement { units, lease, draft: draft_id, len: end, plan: None };
         let after = After::from_logits(&next.logits()?, true);
-        let family = V41Prefix::new(requests, draft, &self.arenas, self.partial);
+        let family = V41Prefix::new(requests, draft, &self.arenas);
         self.cache.capture_media(&family, kind, &keys[..end], media, &placement, after)
             .map(drop).map_err(|e| anyhow::anyhow!("{e}"))
     }
@@ -510,7 +501,7 @@ impl<'a> V41Cache<'a> {
         let units = requests.units(lease)?.to_vec();
         let placement = V41Placement { units, lease, draft: draft_id, len: end, plan: None };
         let after = After::from_logits(&next.logits()?, true);
-        let family = V41Prefix::new(requests, draft, &self.arenas, self.partial);
+        let family = V41Prefix::new(requests, draft, &self.arenas);
         family.on_lane(lane);
         match self.cache.queue_capture(&family, kind, &keys[..end], media, &placement, after)
             .map_err(|e| anyhow::anyhow!("{e}"))? {
@@ -524,7 +515,7 @@ impl<'a> V41Cache<'a> {
     pub fn poll_retain<C: DraftChain<'a>>(&mut self, lane: usize, requests: &mut Requests<'a>,
         draft: Option<&mut DraftRuntime<'_, 'a, C>>) -> Result<bool> {
         let ticket = self.pending.get(lane).copied().flatten().context("retention is not pending")?;
-        let family = V41Prefix::new(requests, draft, &self.arenas, self.partial);
+        let family = V41Prefix::new(requests, draft, &self.arenas);
         let done = self.cache.poll_capture(&family, ticket).map_err(|e| anyhow::anyhow!("{e}"))?;
         if done { self.pending[lane] = None; }
         Ok(done)
@@ -532,7 +523,7 @@ impl<'a> V41Cache<'a> {
     pub fn abort_retain<C: DraftChain<'a>>(&mut self, lane: usize, requests: &mut Requests<'a>,
         draft: Option<&mut DraftRuntime<'_, 'a, C>>) -> Result<()> {
         let Some(ticket) = self.pending.get_mut(lane).and_then(Option::take) else { return Ok(()) };
-        let family = V41Prefix::new(requests, draft, &self.arenas, self.partial);
+        let family = V41Prefix::new(requests, draft, &self.arenas);
         self.cache.abort_capture(&family, ticket).map_err(|e| anyhow::anyhow!("{e}"))
     }
 }
@@ -572,41 +563,126 @@ pub(crate) fn media_keys(tokens: &[u32], images: &[cuteafd_loader::V41ImageSpan]
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cuteafd_core::ImageKey;
 
-    fn candidate<'m>(common: usize, snapshot_end: usize, target_end: usize, media: &'m [MediaSpan]) -> RestoreCandidate<'m> {
-        RestoreCandidate { common, snapshot_end, target_end, resume: ReuseRule::V41.skipped(common, snapshot_end),
-            media, saved_media: media }
+    use cuteafd_engine::prefix::{RestoreCandidate, RestoreFidelity};
+
+    /// Every hit the radix can select under V4.1's rule, planned the way the engine plans it.
+    fn selected(frontiers: &[&[u32]], prompt: &[u32]) -> Option<RestorePlan> {
+        let rule = layout(8, true).rule;
+        let mut banks = cuteafd_core::prefix::Retention::with_rule(8, rule);
+        for (i, frontier) in frontiers.iter().enumerate() {
+            banks.bank_mut(SnapshotKind::Prompt).insert(frontier, i);
+        }
+        let (common, snapshot_end, _) = banks.lookup_reusable(prompt)?;
+        let hit = RestoreCandidate { common, snapshot_end, target_end: prompt.len(),
+            resume: rule.skipped(common, snapshot_end), media: &[], saved_media: &[] };
+        Some(RestorePlan::under(rule, hit))
     }
 
     #[test]
-    fn exact_frontiers_restore_exactly_and_partial_ones_replay_from_an_even_source_frontier() {
-        let exact = plan(candidate(1001, 1001, 1001, &[]), true);
-        assert_eq!((exact.fidelity, exact.lag), (RestoreFidelity::Exact, LaggedState { source_end: 1001, replay_start: 1001 }));
-        // Odd frontier, long suffix: still exact (encoder continuation is the family's choice).
-        let ancestor = plan(candidate(777, 777, 2000, &[]), true);
-        assert!(ancestor.exact() && ancestor.resume() == 777);
-        // A partial match keeps sources through the even common prefix, replays 128 earlier.
-        let partial = plan(candidate(1001, 1500, 1600, &[]), true);
-        assert_eq!((partial.fidelity, partial.lag),
-            (RestoreFidelity::ApproximateReplay, LaggedState { source_end: 1000, replay_start: 872 }));
-        assert!(partial.check(1001).is_ok());
-        // Too short to replay a window: nothing reused; partial reuse off: nothing either.
-        assert_eq!(plan(candidate(100, 500, 600, &[]), true).resume(), 0);
-        assert_eq!(plan(candidate(1001, 1500, 1600, &[]), false).resume(), 0);
+    fn layout_reuses_exact_frontiers_only() {
+        for draft in [false, true] {
+            let layout = layout(4, draft);
+            assert_eq!(layout.rule, ReuseRule::EXACT);
+            assert!(!layout.rule.partial());
+            assert_eq!(layout.mark_bytes, mark_bytes(draft));
+        }
+        // A partial match saves nothing; only an exact ancestor is reusable.
+        for (common, frontier) in [(1001, 1500), (1000, 1002), (128, 4096), (1, 2)] {
+            assert_eq!(ReuseRule::EXACT.skipped(common, frontier), 0, "{common}/{frontier}");
+        }
+        assert_eq!(ReuseRule::EXACT.skipped(777, 777), 777);
     }
 
     #[test]
-    fn partial_frontiers_never_land_inside_an_image() {
-        let image = [MediaSpan { start: 900, len: 200, key: ImageKey([7; 32]).into() }];
-        // Common prefix inside the image: sources stop at its first row, replay before that.
-        let inside = plan(candidate(1001, 1500, 1600, &image), true);
-        assert_eq!(inside.lag, LaggedState { source_end: 900, replay_start: 772 });
-        // Replay start inside an image rounds down to its first row.
-        let after = [MediaSpan { start: 800, len: 100, key: ImageKey([7; 32]).into() }];
-        let rounded = plan(candidate(1001, 1500, 1600, &after), true);
-        assert_eq!(rounded.lag, LaggedState { source_end: 1000, replay_start: 800 });
-        assert!(rounded.check(1001).is_ok());
+    fn an_exact_restore_never_selects_approximate_replay() {
+        let tokens: Vec<u32> = (0..2048).collect();
+        let mut branch = tokens[..1500].to_vec();
+        branch[1001] = 99_999;
+        branch.extend(3000..3100);
+        // Prompt end, turn end and a long continuation all restore the exact frontier.
+        for (frontiers, prompt, end) in [
+            (vec![&tokens[..1001]], &tokens[..1001], 1001),
+            (vec![&tokens[..1001]], &tokens[..1038], 1001),
+            (vec![&tokens[..777]], &tokens[..2000], 777),
+            (vec![&tokens[..512], &tokens[..1500]], &branch[..], 512),
+        ] {
+            let plan = selected(&frontiers, prompt).expect("an exact ancestor is selected");
+            assert_eq!(plan.fidelity, RestoreFidelity::Exact);
+            assert_eq!((plan.snapshot_end, plan.resume(), plan.lag.source_end), (end, end, end));
+            assert!(plan.check(end).is_ok());
+        }
+        // A branch inside the only retained frontier is a miss, not an approximate replay.
+        assert!(selected(&[&tokens[..1500]], &branch).is_none());
+        assert!(selected(&[&tokens[..1500]], &tokens[..1499]).is_none());
+    }
+
+    #[test]
+    fn the_cache_refuses_a_partial_reuse_rule() {
+        let config = PrefixConfig { entries: 4, mark_slots: 0, keep_logits: true, min_tokens: 64 };
+        let mut partial = layout(1, false);
+        partial.rule = ReuseRule { align: 2, replay: Some(128) };
+        assert!(V41Cache::new(Arenas { target: None, draft: None, slots: 0 }, config, None, partial).is_err());
+        assert!(V41Cache::new(Arenas { target: None, draft: None, slots: 0 }, config, None, layout(1, false)).is_ok());
+    }
+
+    /// The private prefix stream is safe by ownership (module docs): every function that queues
+    /// work on it, or on a capture lane, reads only a committed request's private slots and
+    /// immutable rows, or writes only a fresh placement. A new use must state its guard here.
+    #[test]
+    fn prefix_stream_reads_only_committed_private_state() {
+        fn bodies(source: &str) -> Vec<(&str, &str)> {
+            let mut out = Vec::new();
+            let mut rest = source;
+            while let Some(at) = rest.find("    pub fn ").or_else(|| rest.find("    fn ")) {
+                let tail = &rest[at..];
+                let name_at = tail.find("fn ").unwrap() + 3;
+                let name = &tail[name_at..name_at + tail[name_at..].find(['(', '<']).unwrap()];
+                let end = tail[1..].find("\n    pub fn ").or_else(|| tail[1..].find("\n    fn ")).map_or(tail.len(), |e| e + 1);
+                out.push((name, &tail[..end]));
+                rest = &tail[end..];
+            }
+            out
+        }
+        let prefix = include_str!("../v41_backbone_cache/prefix.rs");
+        let production = &prefix[..prefix.find("#[cfg(test)]").expect("test section")];
+        // (function, the guard it must keep)
+        let allowed: &[(&str, &[&str])] = &[
+            ("diagnostic_state", &["self.capture_mark(lease"]),
+            // Captures: a committed frontier with nothing unpublished (immutable rows).
+            ("capture_mark", &["self.copy_mark(lease"]),
+            ("queue_mark", &["self.copy_mark(lease", "cuda_stream_wait_event(stream, self.prefix_queued.0)"]),
+            ("copy_mark", &["request.phase == CachePhase::Full && request.publication.is_empty()"]),
+            // Restores: only a fresh admission, drained before it is observable.
+            ("restore_retained_phase", &["request.end == 0", "request.version == 0", "cuda_stream_synchronize(self.prefix_stream.raw)"]),
+            ("prefix_drain", &["cuda_stream_synchronize(self.prefix_stream.raw)"]),
+            // Tail copies: into a fresh fork's private page, drained before release.
+            ("copy_unit_rows", &["`to` belongs to the caller's fresh fork and no reader"]),
+            ("publish_units", &["self.prefix_drain()?"]),
+        ];
+        for (name, body) in bodies(production) {
+            if !(body.contains("prefix_stream") || body.contains("prefix_copies")) { continue; }
+            let guards = allowed.iter().find(|(allowed, _)| *allowed == name)
+                .unwrap_or_else(|| panic!("{name} queues prefix-stream work without a stated ownership guard"));
+            for guard in guards.1 {
+                assert!(body.contains(guard), "{name} lost its ownership guard {guard:?}");
+            }
+        }
+        // The request layer captures only a request with no pending prefill or history.
+        let requests = include_str!("../v41_requests.rs");
+        for name in ["pub fn capture_mark", "pub fn queue_mark"] {
+            let body = &requests[requests.find(name).expect(name)..];
+            let body = &body[..body.find("\n    pub fn ").unwrap_or(body.len())];
+            assert!(body.contains("request.prefill.is_none() && request.history.position() == self.cache.committed_end(lease)?"),
+                "{name} captures a request with pending history");
+        }
+        // Nothing outside the backbone cache reaches the private stream.
+        for (file, source) in [("v41_backbone_cache.rs", include_str!("../v41_backbone_cache.rs")),
+            ("v41_native_serve/prefix.rs", include_str!("prefix.rs"))] {
+            let uses = source.matches(["prefix_stream", ".raw"].concat().as_str()).count();
+            assert_eq!(uses, 0, "{file} queues on the private prefix stream outside its guarded owners");
+        }
+        assert!(!include_str!("prefix.rs").contains(["Approximate", "Replay"].concat().as_str()));
     }
 
     #[test]

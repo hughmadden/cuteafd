@@ -149,44 +149,8 @@ fn native_request_image_masks_features_and_history() -> Result<()> {
                 );
             }
         }
-        for position in [
-            start,
-            start + 1,
-            start + 2,
-            start + 183,
-            start + 184,
-            start + 185,
-            start + 186,
-        ] {
-            let mut full = requests.pipeline.new_history()?;
-            let prefix = map.prepare_batch(
-                &full,
-                0,
-                &all_tokens[slot][..position],
-                Some(&expected_masks[slot][..position]),
-                190,
-            )?;
-            full.commit(&prefix, position)?;
-            let restored =
-                requests.encoder_history_at(leases[slot], position, &all_tokens[slot])?;
-            let expected = map.prepare_batch(
-                &full,
-                position as u64,
-                &all_tokens[slot][position..],
-                Some(&expected_masks[slot][position..]),
-                190,
-            )?;
-            let resumed = map.prepare_batch(
-                &restored,
-                position as u64,
-                &all_tokens[slot][position..],
-                Some(&expected_masks[slot][position..]),
-                190,
-            )?;
-            assert_eq!(expected.hashes(), resumed.hashes());
-        }
     }
-    eprintln!("PASS 16 request-owned image spans: masks, exact feature/HC/text rows, repeated positions and bounded Engram history at 112 image boundaries");
+    eprintln!("PASS 16 request-owned image spans: masks, exact feature/HC/text rows, and repeated positions");
     let wrong = vec![false; 190];
     assert!(requests
         .prepare(&[RequestTokens {

@@ -42,9 +42,11 @@ There is no separate scale-only preload. `ENGRAM_WARM` warms the whole mapped ta
 - Speculator: three-stage dSpark drafter (`markov_head`, `confidence_head`,
   `main_proj`) with adaptive width from a calibrated confidence and cost
   model.
-- KV format: compressed MLA latent in FP8 32x32 blocks; a specialized
-  exact prefix cache — radix banks keyed by token ids, shared
-  FP4 pages, a copied SWA "front", pinned-host tier in `cuteafd-hostcache`.
+- KV format: compressed MLA latent in FP8 32x32 blocks. Prefix cache: the
+  shared engine cache with exact frontiers only (`ReuseRule::EXACT`); shared
+  FP4 source pages, a mark holding the window rings, odd compressor carry,
+  Engram lookback and dSpark rings, snapshots at prompt end and turn end,
+  shared `--prefix-cache-*`/`--host-cache-*` flags and pinned-host tier.
 - RTX/Spark layouts: the v2 native MXFP4 minimum is 1 RTX + 3 Sparks;
   the v2 NVFP4 cards use 4 Sparks. Current MXFP4 and NVFP4 support TP3 as a
   fit-minimum option (see the TP3 decision in `PLAN.md`). The current MXFP4

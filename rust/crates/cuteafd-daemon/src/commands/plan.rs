@@ -165,7 +165,8 @@ fn resolve_mimo_drafter(layout: &mut cuteafd_loader::plan::layout::LayoutOptions
 }
 
 fn v41_layout(layout: &mut cuteafd_loader::plan::layout::LayoutOptions, args: &PlanArgs) {
-    layout.prefix_slots = args.prefix_slots.or(Some(cuteafd_core::prefix::mark_slots_with_host(0, args.prefix_cache_entries.unwrap_or_else(|| cuteafd_core::concurrency::prefix_entries(layout.resolved_concurrency("deepseek_v41"))), 1, u64::MAX, layout.host_cache_bytes != Some(0))));
+    // Absent: the loader sizes the arena with serving's `MarkRule` once dSpark is resolved.
+    layout.prefix_slots = args.prefix_slots;
     // Workers must cover both prefill and the 256-row replay bucket.
     layout.spark_capacity_rows = if args.prefill_rows == 0 { 4096 }
         else if args.prefill_rows <= 256 { 256 }
@@ -2053,13 +2054,11 @@ mod tests {
         let mut args = args(std::path::Path::new("/not-read"), 4, false);
         let mut layout = cuteafd_loader::plan::layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)), ..Default::default() };
         for entries in [0, 1, 20, 128] {
-            let slots = cuteafd_core::prefix::mark_slots_with_host(0, entries as u64, 1, u64::MAX,
-                layout.host_cache_bytes != Some(0));
             args.prefix_cache_entries = Some(entries);
             for (rows, capacity) in [(0, 4096), (80, 256), (256, 256), (1024, 1024), (2048, 4096)] {
                 args.prefill_rows = rows;
                 v41_layout(&mut layout, &args);
-                assert_eq!(layout.prefix_slots, Some(slots));
+                assert_eq!(layout.prefix_slots, None);
                 assert_eq!(layout.spark_capacity_rows, capacity);
             }
         }

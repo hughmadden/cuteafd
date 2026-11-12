@@ -37,13 +37,15 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
     cuteafd_core::concurrency::validate("deepseek_v41", shape.concurrency)?;
     let rows = u64::from(cuteafd_core::coordinator_programs::v41_live_rows(
         u32::try_from(shape.prefill_rows)?).context("invalid V4.1 prefill rows")?);
-    let marks = options.prefix_slots.unwrap_or_else(|| cuteafd_core::prefix::mark_slots_with_host(0, options.prefix_entries("deepseek_v41"), 1, u64::MAX, options.host_cache_bytes != Some(0)));
-    ensure!(marks == 0 || (marks >= 2 && marks % 2 == 0 && marks <= 258),
-        "V4.1 prefix slots must be zero or 2 * retained turns + 2 (at most 258)");
+    let dspark = shape.native_layers > 0;
+    // The serving `MarkRule`: concurrency lanes, retained entries, `--prefix-cache-mark-mib`.
+    let marks = options.prefix_slots.unwrap_or_else(|| cuteafd_core::prefix::mark_slots_with_host(shape.concurrency,
+        options.prefix_entries("deepseek_v41"), crate::placement::families::deepseek_v41::resident::prefix_mark_bytes(dspark),
+        options.mimo_prefix_mark_bytes, options.host_cache_bytes != Some(0)));
+    ensure!(marks <= 258, "V4.1 prefix slots exceed 2 * 128 retained turns + 2");
     // Immutable COW tails retain the configured conversations, independently of staging marks.
     let turns = if options.host_cache_bytes != Some(0) && marks > 0 { options.prefix_entries("deepseek_v41") }
         else { marks.saturating_sub(2) / 2 };
-    let dspark = shape.native_layers > 0;
     ensure!(!options.tp2_dspark_experts || (ranks == 2 && dspark),
         "--tp2-dspark-experts requires two RTX GPUs and dSpark");
     ensure!(!dspark || shape.native_layers == 3, "V4.1 dSpark retains all three stages");

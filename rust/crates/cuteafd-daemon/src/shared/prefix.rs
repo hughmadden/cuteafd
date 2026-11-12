@@ -155,8 +155,7 @@ impl PrefixArgs {
         if self.prefix_cache_entries == 0 || !self.host_cache_bytes.enabled() {
             return Ok(None);
         }
-        let chunk = (256u64 << 20).max(layout.page_bytes as u64)
-            .max(layout.mark_bytes as u64).max(layout.draft_bytes as u64);
+        let chunk = Self::host_chunk_bytes(layout);
         let bytes = match self.host_cache_bytes {
             HostBudget::Bytes(bytes) => bytes,
             HostBudget::Auto => {
@@ -169,17 +168,7 @@ impl PrefixArgs {
                 bytes
             }
         };
-        anyhow::ensure!(bytes > 0,
-            "host prefix quota resolves to zero; provide a positive quota or disable it explicitly for device retention");
-        let config = cuteafd_hostcache::config::Config {
-            bytes,
-            eviction_headroom: budget::eviction_headroom(layout, self.host_cache_evict_tokens)?,
-            chunk_bytes: chunk.min(bytes),
-            min_tokens: self.host_cache_min_tokens,
-            max_tokens: u32::try_from(max_context)?,
-            ..Default::default()
-        };
-        config.validate()?;
+        let config = self.host_config_for(layout, max_context, bytes)?;
         let geometry = cuteafd_core::prefix::HostCacheGeometry { unit_rows: layout.page_rows as u64,
             page_bytes: layout.page_bytes as u64, mark_bytes: layout.mark_bytes as u64,
             draft_bytes: layout.draft_bytes as u64 };
@@ -192,6 +181,30 @@ impl PrefixArgs {
                 "host prefix quota holds fewer 50K conversations than concurrency plus four");
         }
         Ok(Some(config))
+    }
+
+    /// The host tier's configuration for a quota of `bytes` another admission already resolved
+    /// (V4.1 sizes it jointly with its other host owners): these flags' limits and the
+    /// layout's chunk and eviction geometry. Validated, not admitted.
+    pub fn host_config_for(&self, layout: FamilyLayout, max_context: usize, bytes: u64)
+        -> Result<cuteafd_hostcache::config::Config> {
+        anyhow::ensure!(bytes > 0,
+            "host prefix quota resolves to zero; provide a positive quota or disable it explicitly for device retention");
+        let config = cuteafd_hostcache::config::Config {
+            bytes,
+            eviction_headroom: budget::eviction_headroom(layout, self.host_cache_evict_tokens)?,
+            chunk_bytes: Self::host_chunk_bytes(layout).min(bytes),
+            min_tokens: self.host_cache_min_tokens,
+            max_tokens: u32::try_from(max_context)?,
+            ..Default::default()
+        };
+        config.validate()?;
+        Ok(config)
+    }
+
+    /// The host tier's pinned allocation granularity for `layout`.
+    pub fn host_chunk_bytes(layout: FamilyLayout) -> u64 {
+        (256u64 << 20).max(layout.page_bytes as u64).max(layout.mark_bytes as u64).max(layout.draft_bytes as u64)
     }
 
     /// Single-device copy engine for the resolved retained-prefix budget.

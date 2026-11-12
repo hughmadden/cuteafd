@@ -9,7 +9,6 @@ struct Run {
     cached: usize,
     generated: Vec<u32>,
     hashes: Vec<String>,
-    rows: Vec<f32>,
     record: cuteafd_api::openai::probe::ProbeRecord,
 }
 
@@ -41,7 +40,6 @@ fn run(queue: &Requests, prompt: &[u32], rows: usize, cold: bool, output_depende
     };
     if let Requests::Remote(client) = queue {
         spec.dump_rows = None;
-        spec.top_k = VOCAB;
         let content = if image { serde_json::json!([
             {"type": "text", "text": "prefix restore gate"},
             {"type": "image_url", "image_url": {"url": IMAGE_URL}}
@@ -51,16 +49,10 @@ fn run(queue: &Requests, prompt: &[u32], rows: usize, cold: bool, output_depende
         let mut record: cuteafd_api::openai::probe::ProbeRecord = serde_json::from_value(value["probe"].clone())?;
         ensure!(record.error.is_none(), "remote probe error: {:?}", record.error);
         record.rows.sort_by_key(|row| row.position);
-        let mut logits = Vec::new();
-        for row in &record.rows {
-            ensure!(row.finite && row.top.len() == VOCAB, "remote probe lacks complete finite rows");
-            let start = logits.len();
-            logits.resize(start + VOCAB, f32::NEG_INFINITY);
-            for &(token, probability) in &row.top { logits[start + token as usize] = probability; }
-        }
+        ensure!(record.rows.iter().all(|row| row.finite), "remote probe recorded a non-finite row");
         std::fs::remove_dir_all(&dump)?;
         return Ok(Run { cached: record.cached_tokens, generated: record.generated.clone(),
-            hashes: record.rows.iter().map(|row| row.hash.clone()).collect(), rows: logits, record });
+            hashes: record.rows.iter().map(|row| row.hash.clone()).collect(), record });
     }
     let probe = Probe::new(spec);
     let (events, mut receive) = tokio::sync::mpsc::unbounded_channel();
@@ -92,19 +84,7 @@ fn run(queue: &Requests, prompt: &[u32], rows: usize, cold: bool, output_depende
     recorded.sort();
     ensure!(recorded.iter().map(|r| r.0).eq(rows_dump.positions.iter().copied()), "probe rows and row dump differ");
     rows_dump.hashes = recorded.into_iter().map(|r| r.1).collect();
-    Ok(Run { cached: record.cached_tokens, generated: record.generated.clone(), hashes: rows_dump.hashes, rows: rows_dump.logits, record })
-}
-
-/// Mean KL(reference || candidate) and top-1 agreement over two runs' rows (log-probabilities).
-fn compare(reference: &Run, candidate: &Run) -> (f64, f64, usize) {
-    let argmax = |row: &[f32]| row.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).map_or(0, |(i, _)| i);
-    let (mut kl, mut agree, mut n) = (0f64, 0usize, 0usize);
-    for (p, q) in reference.rows.chunks_exact(VOCAB).zip(candidate.rows.chunks_exact(VOCAB)) {
-        kl += p.iter().zip(q).map(|(&p, &q)| (p as f64).exp() * (p as f64 - q as f64)).sum::<f64>();
-        agree += usize::from(argmax(p) == argmax(q));
-        n += 1;
-    }
-    (kl / n.max(1) as f64, agree as f64 / n.max(1) as f64, n)
+    Ok(Run { cached: record.cached_tokens, generated: record.generated.clone(), hashes: rows_dump.hashes, record })
 }
 
 fn state<'a>(run: &'a Run, kind: &str) -> Result<&'a cuteafd_api::openai::probe::ProbeState> {
@@ -148,6 +128,7 @@ pub(super) fn check(serve: crate::cli::NativeServeArgs, tokens: &[u32], at: &[us
     let entries = config_value("PREFIX_CACHE_ENTRIES").filter(|value| *value != "auto")
         .map(str::parse::<usize>).transpose()?.unwrap_or(serve.resolved_prefix_entries() as usize);
     ensure!(entries > 0, "--resume-at requires a device prefix cache");
+    let min_tokens = serve.prefix.prefix_cache_min_tokens;
     let (queue, worker) = if let Some(url) = url {
         use cuteafd_api::openai::auth::ApiKey;
         let key = if let Some(path) = serve.api.api_key_file.as_deref() {
@@ -172,7 +153,8 @@ pub(super) fn check(serve: crate::cli::NativeServeArgs, tokens: &[u32], at: &[us
         ensure!(at.len().saturating_mul(2).saturating_mul(namespace_stride) < VOCAB - 1000,
             "too many resume cases for distinct pressure namespaces");
         for (case_index, &p) in at.iter().enumerate() {
-            ensure!(p > 40 && p + 200 < tokens.len(), "--resume-at {p} needs 40 < P and P + 200 < {} golden tokens",
+            ensure!(p > 40 && p >= min_tokens && p + 200 < tokens.len(),
+                "--resume-at {p} needs max(41, --prefix-cache-min-tokens {min_tokens}) <= P and P + 200 < {} golden tokens",
                 tokens.len());
             for image in [false, true] {
                 let mut prompt = tokens[..p].to_vec();
@@ -236,18 +218,16 @@ pub(super) fn check(serve: crate::cli::NativeServeArgs, tokens: &[u32], at: &[us
                 }
 
                 if !image {
+                    // Exact restores only: a branch inside every retained frontier is a miss,
+                    // never an approximate replay of the shared part.
                     let mut branch = prompt[..p - 37].to_vec();
                     branch.extend(&tokens[p + 1..p + 1 + 64]);
-                    let partial = run(&queue, &branch, rows, false, false, false, Vec::new())?;
-                    let cold = run(&queue, &branch, rows, true, false, false, Vec::new())?;
-                    let (kl, top1, n) = compare(&cold, &partial);
-                    ensure!(n > 0, "{label}: approximate replay recorded no rows");
-                    cases.push(serde_json::json!({"name": format!("{label} approximate replay"),
-                        "required": false, "cached_tokens": partial.cached, "rows": n,
-                        "kl": kl, "top1": top1, "nll_proxy": nll(&partial, &cold),
-                        "cold_nll_proxy": nll(&cold, &cold)}));
-                    println!("{label}: partial branch cached {} | approximate replay mean KL {kl:.4e} | top-1 {:.1}% over {n} rows | NLL-proxy {:.4}",
-                        partial.cached, 100.0 * top1, nll(&partial, &cold));
+                    let missed = run(&queue, &branch, rows, false, false, false, Vec::new())?;
+                    cases.push(serde_json::json!({"name": format!("{label} branch inside a frontier misses"),
+                        "required": true, "cached_tokens": missed.cached, "pass": missed.cached == 0}));
+                    ensure!(missed.cached == 0, "{label}: a branch inside the retained frontier reused {} tokens",
+                        missed.cached);
+                    println!("{label}: branch inside the retained frontier is a cold miss PASS");
                 }
             }
         }
@@ -268,14 +248,6 @@ pub(super) fn check(serve: crate::cli::NativeServeArgs, tokens: &[u32], at: &[us
     Ok(())
 }
 
-/// Mean negative log-probability the candidate's rows give the reference's greedy tokens.
-fn nll(candidate: &Run, reference: &Run) -> f64 {
-    let n = candidate.rows.len() / VOCAB;
-    let total: f64 = candidate.rows.chunks_exact(VOCAB).zip(&reference.generated)
-        .map(|(row, &token)| -f64::from(row[token as usize])).sum();
-    total / n.max(1) as f64
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -284,7 +256,7 @@ mod tests {
         record.states.push(cuteafd_api::openai::probe::ProbeState {
             kind: "prompt".into(), end, bytes, sha256: hash.into(),
         });
-        Run { cached: 0, generated: Vec::new(), hashes: Vec::new(), rows: Vec::new(), record }
+        Run { cached: 0, generated: Vec::new(), hashes: Vec::new(), record }
     }
     #[test]
     fn exact_state_requires_hash_frontier_and_initialized_extent() {

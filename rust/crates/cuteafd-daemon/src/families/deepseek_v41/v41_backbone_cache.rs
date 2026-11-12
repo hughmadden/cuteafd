@@ -488,15 +488,6 @@ impl<'a> BackboneCache<'a> {
     pub fn stage(&self, lease: CacheLease) -> Result<CacheStage> {
         Ok(self.request(lease)?.phase.stage())
     }
-    /// Engram advances through encoder replay, while global source ownership
-    /// remains at the cached prefix end. Decoder replay has no Engram work.
-    pub fn history_end(&self, lease: CacheLease) -> Result<u64> {
-        let end = self.committed_end(lease)?;
-        Ok(match self.request(lease)?.phase {
-            CachePhase::EncoderReplay { end, .. } => end,
-            _ => end,
-        })
-    }
     /// Whether every request of `work` can append its tokens inside its bound pages; an error
     /// (`SourcePoolExhausted` past the binding) names the first that cannot.
     pub fn check_append_capacity(&self, work: &[(CacheLease, u32)]) -> Result<()> {

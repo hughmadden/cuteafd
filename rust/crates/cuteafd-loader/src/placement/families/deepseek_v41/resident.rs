@@ -220,6 +220,12 @@ pub fn prefix_bytes(entries: u64, dspark: bool, ranks: usize) -> Vec<u64> {
     prefix_arena_bytes(slots, dspark, ranks)
 }
 
+/// One complete prefix mark: 40 window rings and four compressor carries (the backbone mark)
+/// plus, with dSpark, the three drafter rings. The serving `MarkRule` sizes the arena from it.
+pub const fn prefix_mark_bytes(dspark: bool) -> u64 {
+    40 * (128 * 528 + 8) + 4 * 4096 + if dspark { 3 * 128 * 528 } else { 0 }
+}
+
 pub fn prefix_arena_bytes(slots: u64, dspark: bool, ranks: usize) -> Vec<u64> {
     let mut bytes = vec![0; ranks];
     let target = (40 * (128 * 528 + 8) + 4 * 4096u64).div_ceil(256) * 256;
