@@ -1987,11 +1987,14 @@ impl Drop for GatherAdmissionWait<'_> {
     }
 }
 
-/// A gather job failed in the worker, or the worker itself stopped.
+/// A gather job failed in the worker, the worker itself stopped, or a
+/// synchronous wait gave up while the worker was still alive (#1817: the
+/// caller may then fail its request alone; the slot returns once the job ends).
 #[derive(Debug)]
 pub enum GatherFailure<E> {
     Job(E),
     Worker(MappedTableError),
+    TimedOut(Duration),
 }
 
 pub enum GatherPoll<L> {
@@ -2070,7 +2073,12 @@ impl<S: Send + 'static, J, E> GatherTicket<S, J, E> {
             Ok(result) => match result.map_err(GatherFailure::Job)? {
                 Some(lease) => Ok(GatherPoll::Ready(lease)), None => Ok(GatherPoll::Cancelled),
             },
-            Err(_) => { self.cancel(); Err(GatherFailure::Worker(MappedTableError::Stopped("gather wait timed out or worker stopped"))) }
+            // The worker still owns the slot; cancelling discards its result.
+            Err(mpsc::RecvTimeoutError::Timeout) => { self.cancel(); Err(GatherFailure::TimedOut(timeout)) }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                self.cancel();
+                Err(GatherFailure::Worker(MappedTableError::Stopped("gather worker stopped before completion")))
+            }
         }
     }
 

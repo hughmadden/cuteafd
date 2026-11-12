@@ -2217,6 +2217,38 @@ impl<'a> Qwen4Engine<'a> {
         crate::shared::decode_graph::fatal_drain(result, "Qwen submission shutdown"); Ok(())
     }
 
+    /// Request-local cancellation (#1817, `pair::submit_recoverable`). A
+    /// host-gather timeout is raised at its consumer before that consumer
+    /// queued anything, but earlier layers of the step are already queued.
+    /// With one owner and coordinator-local experts they are plain stream work:
+    /// drop the step's unconsumed table tickets, drain the execution stream,
+    /// then the table's upload stream (returning its copied slots), and
+    /// observe the graph boundary a capture in the step may have opened.
+    /// TP2 and Spark layouts hold peer or Spark waits that only the terminal
+    /// abort words can release, so they refuse and retire as before (#1842).
+    fn cancel_submission(&self, kind: crate::shared::experts::rtx::pair::Recovery) -> Result<()> {
+        use crate::shared::experts::rtx::pair::Recovery;
+        if kind == Recovery::HostGather {
+            ensure!(self.gdn_banks.len() == 1 && self.hops.is_none()
+                && matches!(self.experts, None | Some(Experts::Local(_) | Experts::LocalExl3(_) | Experts::SharedOnly)),
+                "Qwen host-gather recovery needs one owner without peer or Spark work in flight");
+        }
+        drop(self.ple_pending.borrow_mut().take());
+        self.drain_state()?;
+        if let Some(ple) = &self.ple { ple.mapped().drain()?; }
+        // An early return skipped the step's own cursor resets; no later step may
+        // inherit a packed member view, unit slot offset or stale MTP terminal rows.
+        for slot in [&self.workspace, &self.mtp_prefill_workspace, &self.decode_workspace,
+            &self.peer_workspace, &self.peer_decode_workspace] {
+            if let Some(w) = slot.try_borrow()?.as_ref() {
+                w.table_view.set(None); w.row_offset.set(0); w.logit_offset.set(0); w.position.set(0);
+                w.units.set(false); w.terminal_valid.set(false);
+            }
+        }
+        self.last_stream_offset.set(0);
+        self.graph_completed()
+    }
+
     pub(crate) fn drain_state(&self) -> Result<()> {
         let mut failures = Vec::new();
         for bank in &self.gdn_banks {
@@ -2611,8 +2643,8 @@ impl<'a> Qwen4Engine<'a> {
     pub fn prefill_device(&self, placement: &mut Qwen4Placement, tokens: &[u32], on_layer: LayerHook<'_>,
         forced: Forced<'_>, logit_rows: usize) -> Result<Option<DeviceLogits>> {
         if self.prefill_shape.is_some() && on_layer.is_none() && forced.is_none() {
-            return crate::shared::experts::rtx::pair::submit(|| self.require_live(), || self.shutdown_submission(),
-                || self.prefill_units(placement, tokens, logit_rows));
+            return crate::shared::experts::rtx::pair::submit_recoverable(|| self.require_live(), |kind| self.cancel_submission(kind), || self.shutdown_submission(),
+                |_| self.prefill_units(placement, tokens, logit_rows));
         }
         self.last_stream_offset.set(0);
         let (t, start) = (tokens.len(), placement.len);
@@ -2638,7 +2670,7 @@ impl<'a> Qwen4Engine<'a> {
                 .map(crate::shared::probe::ScoreLogits::Device));
         }
         ensure!(logit_rows <= tokens.len(), "Qwen scoring logits extent");
-        crate::shared::experts::rtx::pair::submit(|| self.require_live(), || self.shutdown_submission(), || {
+        crate::shared::experts::rtx::pair::submit_recoverable(|| self.require_live(), |kind| self.cancel_submission(kind), || self.shutdown_submission(), |_| {
             let scoring = crate::shared::probe::ScoringRows { probe, position };
             if self.prefill_shape.is_some() {
                 if self.prefill_units_with(placement, tokens, logit_rows, Some(scoring))?.is_none() { return Ok(None); }
@@ -2769,7 +2801,7 @@ impl<'a> Qwen4Engine<'a> {
         Qwen4Placement, super::speculate::MtpSeq>],
         on_logits: &mut dyn FnMut(usize, DeviceLogits) -> crate::shared::prefill_packing::MemberOutcome)
         -> Result<Vec<Result<()>>> {
-        crate::shared::experts::rtx::pair::submit(|| self.require_live(), || self.shutdown_submission(), || {
+        crate::shared::experts::rtx::pair::submit_recoverable(|| self.require_live(), |kind| self.cancel_submission(kind), || self.shutdown_submission(), |_| {
             ensure!(self.gdn_banks.len() == 1 && self.hops.is_none(), "packed Qwen requires one attention owner");
             let limits = self.packed_limits().context("Qwen packing limits")?;
             let segments = crate::shared::prefill_packing::plan(&sequences.iter()
@@ -3258,7 +3290,7 @@ impl<'a> Qwen4Engine<'a> {
 
     fn step(&self, tables: &Arc<StepTables>, tokens: &[u32], logit_rows: usize, on_layer: LayerHook<'_>,
         forced: Forced<'_>, media: &cuteafd_engine::media::MediaChunk, graphs: bool) -> Result<Option<DeviceLogits>> {
-        crate::shared::experts::rtx::pair::submit(|| self.require_live(), || self.shutdown_submission(), || {
+        crate::shared::experts::rtx::pair::submit_recoverable(|| self.require_live(), |kind| self.cancel_submission(kind), || self.shutdown_submission(), |_| {
             let output = self.step_inner(tables, tokens, logit_rows, on_layer, forced, media, graphs)?;
             self.graph_completed()?;
             Ok(output)
@@ -4554,6 +4586,29 @@ fn validate_prefill_span(rows: usize, start: usize, admitted_span: usize, max_co
         && start.checked_add(rows).is_some_and(|end| end <= max_context),
         "prefill of {rows} rows at {start} exceeds admitted span {admitted_span} or context {max_context}");
     Ok(())
+}
+
+#[cfg(test)]
+mod gather_recovery_tests {
+    /// #1817: every Qwen submission boundary takes the request-local path,
+    /// and host-gather recovery is refused unless one owner holds no peer or
+    /// Spark work (TP2 and Spark retire terminally; #1842).
+    #[test]
+    fn qwen_boundaries_recover_host_gathers_only_without_peer_or_spark_work() {
+        let source = include_str!("engine.rs");
+        let body = source.split("\n#[cfg(test)]\nmod gather_recovery_tests").next().unwrap();
+        assert!(!body.contains("pair::submit(") && !body.contains("pair::submit_scoped("));
+        assert_eq!(body.matches("pair::submit_recoverable(|| self.require_live(), |kind| self.cancel_submission(kind), || self.shutdown_submission(),").count(), 4);
+        let cancel = body.split("    fn cancel_submission(").nth(1).unwrap().split("    pub(crate) fn drain_state(").next().unwrap();
+        assert!(cancel.contains("self.gdn_banks.len() == 1 && self.hops.is_none()"));
+        assert!(cancel.contains("None | Some(Experts::Local(_) | Experts::LocalExl3(_) | Experts::SharedOnly)"));
+        assert!(!cancel.contains("Experts::Tp2") && !cancel.contains("Experts::Spark"));
+        // Drop tickets, drain the consumers, then the table's own copies, then the graph boundary.
+        let order = ["self.ple_pending.borrow_mut().take()", "self.drain_state()?", "ple.mapped().drain()?",
+            "w.terminal_valid.set(false)", "self.graph_completed()"];
+        let at: Vec<_> = order.iter().map(|needle| cancel.find(needle).unwrap_or_else(|| panic!("{needle}"))).collect();
+        assert!(at.windows(2).all(|pair| pair[0] < pair[1]), "cancellation order {at:?}");
+    }
 }
 
 #[cfg(test)]

@@ -120,6 +120,12 @@ impl<L> CopyPool<L> {
     }
 }
 
+/// A synchronous consumer waited `0` for a free staging slot (#1817). Nothing
+/// was submitted for it; the caller may fail its request alone.
+#[derive(Debug, thiserror::Error)]
+#[error("token-table admission timed out after {0:?}")]
+pub struct AdmissionTimedOut(pub std::time::Duration);
+
 /// Family adapters describe a job and native slot. All scheduling, cancellation,
 /// priority, admission and deferred-copy retention live here.
 pub struct TablePipeline<S: Send + 'static, J: Send + 'static> {
@@ -166,7 +172,7 @@ impl<S: Send + 'static, J: Send + 'static> TablePipeline<S, J> {
             self.reclaim_copies()?;
             if let Poll::Ready(result) = future.as_mut().poll(&mut cx) { return result; }
             let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-            ensure!(!remaining.is_zero(), "token-table admission timed out");
+            if remaining.is_zero() { return Err(AdmissionTimedOut(timeout).into()); }
             // CUDA completion does not wake a Rust waker. A bounded sleep lets
             // the owner reclaim copied slots without a hot spin loop.
             std::thread::park_timeout(remaining.min(std::time::Duration::from_millis(1)));
@@ -269,6 +275,40 @@ mod tests {
         };
         assert_eq!(*lease.slot().unwrap(), 22);
         assert_eq!(*lease.job(), 22);
+        Ok(())
+    }
+
+    /// #1817: a consumer's bounded wait that gives up is typed `TimedOut`
+    /// (request-local), cancels its ticket and leaks no staging: the slot
+    /// returns when the slow job ends, admission timeouts are typed too, and
+    /// the next request gathers normally.
+    #[test]
+    fn timed_out_wait_is_typed_and_returns_its_slot_for_the_next_request() -> Result<()> {
+        use crate::GatherFailure;
+        use std::sync::mpsc;
+        let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::sync_channel(1);
+        let pipeline = TablePipeline::new("shared-timeout-test", vec![0usize], move |slot, job: &usize| {
+            if *job == 1 {
+                entered_tx.send(()).unwrap();
+                release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            }
+            *slot = *job;
+            Ok(())
+        }, |_| Ok(true))?;
+        let mut slow = pipeline.try_submit(1, true)?.unwrap();
+        entered_rx.recv_timeout(Duration::from_secs(5))?;
+        let waited = Duration::from_millis(20);
+        assert!(matches!(slow.wait_timeout(waited), Err(GatherFailure::TimedOut(d)) if d == waited));
+        // The worker still owns the slot: admission is typed while it is busy.
+        let error = pipeline.submit_timeout(2, true, Duration::from_millis(20)).err().expect("slot still owned");
+        assert!(error.is::<AdmissionTimedOut>(), "{error:#}");
+        drop(slow);
+        release_tx.send(())?;
+        let mut next = pipeline.submit_timeout(3, true, Duration::from_secs(5))?;
+        let GatherPoll::Ready(lease) = next.wait_timeout(Duration::from_secs(5))
+            .map_err(|_| anyhow::anyhow!("next gather failed"))? else { anyhow::bail!("next gather cancelled") };
+        assert_eq!(*lease.slot().unwrap(), 3, "the timed-out job never published into the reused slot");
         Ok(())
     }
 

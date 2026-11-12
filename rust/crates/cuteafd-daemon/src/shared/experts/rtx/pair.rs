@@ -17,16 +17,80 @@ use std::{
 };
 use crate::shared::memory::Tag;
 
-/// Full submission boundary, including captured graph replays and caller-side
-/// exchanges. Shutdown must publish aborts before draining and retire the engine;
-/// A failed drain may return only if the caller retains every queued owner;
-/// callers without quarantine ownership must terminate in shutdown instead.
+/// Why a submission body's failure may stay local to its request (#1817).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Recovery {
+    /// Nothing of this step was queued on any device, peer or Spark link yet.
+    BeforeSubmission,
+    /// A host-side table gather or its staging admission timed out at the
+    /// consumer, before that consumer queued anything. Earlier layers of the
+    /// step may hold device-local work; only an owner set with no peer or
+    /// Spark work in flight can drain it without terminal abort words.
+    HostGather,
+}
+
+/// The only request-local failure a submission body can raise. Any other
+/// error reaching the boundary is terminal (see [`classify`]).
 #[derive(Debug, thiserror::Error)]
-#[error("submission failed permanently: {cause:#}; {drain}")]
-pub(crate) struct TerminalStepError {
-    #[source]
-    cause: anyhow::Error,
-    drain: String,
+#[error("{message}")]
+pub(crate) struct RecoverableStepError {
+    pub kind: Recovery,
+    message: String,
+}
+
+impl RecoverableStepError {
+    pub(crate) fn new(kind: Recovery, message: impl Into<String>) -> Self {
+        Self { kind, message: message.into() }
+    }
+}
+
+/// Full submission boundary, including captured graph replays and caller-side
+/// exchanges. Every body failure leaves as exactly one of these.
+///
+/// `Terminal`: shutdown published aborts before draining and retired the
+/// engine. A failed drain may return only if the caller retains every queued
+/// owner; callers without quarantine ownership must terminate in shutdown.
+///
+/// `Recoverable`: the family's cancel proved this step's queued work drained
+/// and released its request-owned tickets; the engine keeps serving and the
+/// caller releases only this request's placement.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum StepFailure {
+    #[error("request failed; engine still serving: {cause:#}")]
+    Recoverable {
+        kind: Recovery,
+        #[source]
+        cause: anyhow::Error,
+    },
+    #[error("submission failed permanently: {cause:#}; {drain}")]
+    Terminal {
+        #[source]
+        cause: anyhow::Error,
+        drain: String,
+    },
+}
+
+impl StepFailure {
+    pub(crate) fn is_terminal(error: &anyhow::Error) -> bool {
+        matches!(error.downcast_ref::<Self>(), Some(Self::Terminal { .. }))
+    }
+    pub(crate) fn is_recoverable(error: &anyhow::Error) -> bool {
+        matches!(error.downcast_ref::<Self>(), Some(Self::Recoverable { .. }))
+    }
+}
+
+/// The one classification point (#1817). Fail-safe: only the typed
+/// request-local marker (or an inner submission that already recovered) is
+/// recoverable. CUDA, peer, transport, drain, route-check (#1840
+/// `RouteSourceChanged`) and every untyped error are terminal.
+pub(crate) fn classify(cause: &anyhow::Error) -> Option<Recovery> {
+    match cause.downcast_ref::<StepFailure>() {
+        Some(StepFailure::Recoverable { kind, .. }) => Some(*kind),
+        Some(StepFailure::Terminal { .. }) => None,
+        // A live route-source flip means the ranks' arithmetic identity changed.
+        None if cause.downcast_ref::<super::routes::RouteSourceChanged>().is_some() => None,
+        None => cause.downcast_ref::<RecoverableStepError>().map(|marker| marker.kind),
+    }
 }
 
 /// Families supply owners; this sequence is also exercised by CPU fault tests.
@@ -154,6 +218,9 @@ impl<S: FnOnce() -> Result<()>> SubmissionGuard<S> {
     }
 }
 
+/// Terminal-only boundary: every body failure, including a request-local
+/// marker, retires the engine. Owners that can prove request-local drainage
+/// use [`submit_recoverable`].
 pub(crate) fn submit<T>(
     require_live: impl FnOnce() -> Result<()>,
     shutdown: impl FnOnce() -> Result<()>,
@@ -167,24 +234,68 @@ pub(crate) fn submit_scoped<T>(
     shutdown: impl FnOnce() -> Result<()>,
     body: impl FnOnce(&SubmissionScope<'_>) -> Result<T>,
 ) -> Result<T> {
+    run_submission(require_live, None::<fn(Recovery) -> Result<()>>, shutdown, body)
+}
+
+/// As [`submit_scoped`], but a body failure [`classify`] marks request-local
+/// first runs `cancel(kind)`: it must drain (or prove idle) every stream the
+/// step queued on and drop the request's tickets, and must refuse a kind it
+/// cannot prove for its owner set. Only then is the failure
+/// [`StepFailure::Recoverable`]. A cancel error or panic escalates to the
+/// terminal `shutdown`.
+pub(crate) fn submit_recoverable<T>(
+    require_live: impl FnOnce() -> Result<()>,
+    cancel: impl FnOnce(Recovery) -> Result<()>,
+    shutdown: impl FnOnce() -> Result<()>,
+    body: impl FnOnce(&SubmissionScope<'_>) -> Result<T>,
+) -> Result<T> {
+    run_submission(require_live, Some(cancel), shutdown, body)
+}
+
+fn run_submission<T>(
+    require_live: impl FnOnce() -> Result<()>,
+    cancel: Option<impl FnOnce(Recovery) -> Result<()>>,
+    shutdown: impl FnOnce() -> Result<()>,
+    body: impl FnOnce(&SubmissionScope<'_>) -> Result<T>,
+) -> Result<T> {
     require_live()?;
     let mut guard = SubmissionGuard(Some(shutdown));
-    match body(&guard.scope()) {
+    // Test-only (`shared::fault`): fail a recoverable boundary before its body
+    // queues anything, exercising the same request-local path every adopter uses.
+    let result = if cancel.is_some() && crate::shared::fault::fire(crate::shared::fault::Site::BeforeSubmission) {
+        Err(RecoverableStepError::new(Recovery::BeforeSubmission,
+            "injected failure before submission (dev fault hook)").into())
+    } else {
+        body(&guard.scope())
+    };
+    let mut cause = match result {
         Ok(value) => {
             guard.0.take();
-            Ok(value)
+            return Ok(value);
         }
-        Err(cause) => {
-            // Teardown may abort to retain unsafe-to-release owners. Preserve
-            // the submission error before that fail-safe can hide its cause.
-            tracing::error!(error = %format!("{cause:#}"), "submission failed; draining queued owners");
-            let drain = match guard.shutdown() {
-                Ok(()) => "queued streams drained; engine cannot be reused".to_string(),
-                Err(error) => format!("queued owners retained: {error:#}"),
-            };
-            Err(TerminalStepError { cause, drain }.into())
+        Err(cause) => cause,
+    };
+    if let (Some(kind), Some(cancel)) = (classify(&cause), cancel) {
+        tracing::warn!(error = %format!("{cause:#}"), ?kind,
+            "request-local submission failure; draining this step's queued work");
+        // The terminal guard stays armed: a panicking cancel still retires.
+        match cancel(kind) {
+            Ok(()) => {
+                guard.0.take();
+                if StepFailure::is_recoverable(&cause) { return Err(cause); }
+                return Err(StepFailure::Recoverable { kind, cause }.into());
+            }
+            Err(error) => cause = cause.context(format!("request-local cancellation refused: {error:#}")),
         }
     }
+    // Teardown may abort to retain unsafe-to-release owners. Preserve
+    // the submission error before that fail-safe can hide its cause.
+    tracing::error!(error = %format!("{cause:#}"), "submission failed; draining queued owners");
+    let drain = match guard.shutdown() {
+        Ok(()) => "queued streams drained; engine cannot be reused".to_string(),
+        Err(error) => format!("queued owners retained: {error:#}"),
+    };
+    Err(StepFailure::Terminal { cause, drain }.into())
 }
 
 pub(crate) use cuteafd_loader::placement::families::glm5::local_physical::PackedRoutes;
@@ -1446,10 +1557,7 @@ mod tests {
                     Ok(())
                 },
             );
-            assert!(result
-                .unwrap_err()
-                .downcast_ref::<TerminalStepError>()
-                .is_some());
+            assert!(StepFailure::is_terminal(&result.unwrap_err()));
             owners.borrow().verify_retired().unwrap();
             let replayed = Cell::new(false);
             assert!(submit(
@@ -1487,7 +1595,7 @@ mod tests {
                 assert!(logged.contains("short-prompt prefill: injected original cause"), "{logged}");
                 Ok(())
             }, |_| Err(anyhow::anyhow!("injected original cause").context("short-prompt prefill")));
-            assert!(result.unwrap_err().downcast_ref::<TerminalStepError>().is_some());
+            assert!(StepFailure::is_terminal(&result.unwrap_err()));
         });
     }
 
@@ -1534,6 +1642,147 @@ mod tests {
         assert!(abort < publication && publication < release && release < ranks);
     }
 
+    /// #1817 model: one request's step queues work on a stream and holds table
+    /// tickets; the family cancel must drain the stream and drop every ticket
+    /// before the boundary returns, and nothing is released twice.
+    struct RequestOwners {
+        queued: Cell<usize>,
+        tickets: RefCell<Vec<std::rc::Rc<()>>>,
+        retired: Cell<bool>,
+        cancels: Cell<usize>,
+        fail_cancel: bool,
+    }
+    impl RequestOwners {
+        fn new(fail_cancel: bool) -> Self {
+            Self { queued: Cell::new(0), tickets: RefCell::new(Vec::new()), retired: Cell::new(false),
+                cancels: Cell::new(0), fail_cancel }
+        }
+        fn live(&self) -> Result<()> { ensure!(!self.retired.get(), "retired engine"); Ok(()) }
+        fn cancel(&self, _: Recovery) -> Result<()> {
+            self.cancels.set(self.cancels.get() + 1);
+            ensure!(!self.fail_cancel, "injected stream drain failure");
+            self.queued.set(0);
+            self.tickets.borrow_mut().clear();
+            Ok(())
+        }
+        fn shutdown(&self) -> Result<()> {
+            ensure!(!self.retired.replace(true), "retired twice");
+            self.queued.set(0);
+            self.tickets.borrow_mut().clear();
+            Ok(())
+        }
+        /// One step: queue `layers` launches and hold a ticket, then fail at the
+        /// consumer with `fail` (or succeed).
+        fn step(&self, ticket: &std::rc::Rc<()>, fail: Option<anyhow::Error>) -> Result<usize> {
+            self.queued.set(self.queued.get() + 3);
+            self.tickets.borrow_mut().push(std::rc::Rc::clone(ticket));
+            if let Some(error) = fail { return Err(error); }
+            self.tickets.borrow_mut().clear();
+            Ok(self.queued.replace(0))
+        }
+        fn submit(&self, ticket: &std::rc::Rc<()>, fail: Option<anyhow::Error>) -> Result<usize> {
+            submit_recoverable(|| self.live(), |kind| self.cancel(kind), || self.shutdown(), |_| self.step(ticket, fail))
+        }
+    }
+
+    fn gather_timeout() -> anyhow::Error {
+        anyhow::Error::new(RecoverableStepError::new(Recovery::HostGather, "ple token-table: gather wait timed out"))
+            .context("layer 2 PLE")
+    }
+
+    #[test]
+    fn injected_gather_timeout_fails_only_its_request_and_the_next_succeeds() {
+        let owners = RequestOwners::new(false);
+        let ticket = std::rc::Rc::new(());
+        let error = owners.submit(&ticket, Some(gather_timeout())).unwrap_err();
+        assert!(StepFailure::is_recoverable(&error), "{error:#}");
+        assert!(!StepFailure::is_terminal(&error));
+        assert!(format!("{error:#}").contains("gather wait timed out"));
+        assert_eq!(classify(&error), Some(Recovery::HostGather));
+        // Cancellation drained the request's queued work and every ticket it held.
+        assert_eq!((owners.queued.get(), owners.cancels.get()), (0, 1));
+        assert_eq!(std::rc::Rc::strong_count(&ticket), 1, "a table ticket leaked past cancellation");
+        assert!(!owners.retired.get(), "a request-local failure retired the server");
+        assert_eq!(owners.submit(&ticket, None).unwrap(), 3, "the next request must succeed");
+        assert_eq!(std::rc::Rc::strong_count(&ticket), 1);
+        // A recovered inner submission stays recoverable through an outer one, unwrapped once.
+        let inner = owners.submit(&ticket, Some(gather_timeout())).unwrap_err();
+        let outer = submit_recoverable(|| owners.live(), |kind| owners.cancel(kind), || owners.shutdown(),
+            |_| -> Result<()> { Err(inner) }).unwrap_err();
+        assert!(matches!(outer.downcast_ref::<StepFailure>(),
+            Some(StepFailure::Recoverable { cause, .. }) if cause.downcast_ref::<StepFailure>().is_none()));
+        assert!(!owners.retired.get());
+    }
+
+    #[test]
+    fn cuda_peer_drain_and_untyped_failures_still_retire_the_server() {
+        let route_flip = anyhow::Error::new(super::super::routes::RouteSource::Replicated.checked(
+            &super::super::routes::RouteIdentity { first_mismatch: Some((7, 3)), ..Default::default() }, true)
+            .unwrap_err());
+        assert!(route_flip.downcast_ref::<super::super::routes::RouteSourceChanged>().is_some());
+        for cause in [
+            anyhow::anyhow!("cudaErrorLaunchFailure in qwen4_ple_fp8"),
+            anyhow::Error::new(crate::shared::peer_split::TerminalPeerError::Retain("peer drain failed".into())),
+            anyhow::anyhow!("terminal compute drainage failed: compute drain rank 1"),
+            route_flip,
+        ] {
+            let owners = RequestOwners::new(false);
+            let ticket = std::rc::Rc::new(());
+            let error = owners.submit(&ticket, Some(cause)).unwrap_err();
+            assert!(StepFailure::is_terminal(&error), "{error:#}");
+            assert_eq!(owners.cancels.get(), 0, "terminal causes must not take the request-local path");
+            assert!(owners.retired.get());
+            assert_eq!(std::rc::Rc::strong_count(&ticket), 1);
+            let replayed = Cell::new(false);
+            assert!(owners.submit(&ticket, None).map(|_| replayed.set(true)).is_err());
+            assert!(!replayed.get(), "a retired server accepted another submission");
+        }
+    }
+
+    #[test]
+    fn failed_request_local_cancellation_escalates_to_terminal_retirement() {
+        let owners = RequestOwners::new(true);
+        let ticket = std::rc::Rc::new(());
+        let error = owners.submit(&ticket, Some(gather_timeout())).unwrap_err();
+        assert!(StepFailure::is_terminal(&error), "{error:#}");
+        assert!(format!("{error:#}").contains("request-local cancellation refused: injected stream drain failure"));
+        assert_eq!(owners.cancels.get(), 1);
+        assert!(owners.retired.get());
+        assert_eq!(std::rc::Rc::strong_count(&ticket), 1);
+    }
+
+    #[test]
+    fn terminal_only_boundaries_retire_even_on_request_local_markers() {
+        let retired = Cell::new(false);
+        let error = submit(|| Ok(()), || { retired.set(true); Ok(()) },
+            || -> Result<()> { Err(gather_timeout()) }).unwrap_err();
+        assert!(StepFailure::is_terminal(&error) && retired.get());
+        // Panicking cancellation still runs the armed terminal guard.
+        let owners = RequestOwners::new(false);
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = submit_recoverable(|| Ok(()), |_| -> Result<()> { panic!("cancel panicked") },
+                || owners.shutdown(), |_| -> Result<()> { Err(gather_timeout()) });
+        }));
+        assert!(unwound.is_err() && owners.retired.get());
+    }
+
+    #[test]
+    fn injected_before_submission_hook_recovers_without_running_the_body() {
+        crate::shared::fault::arm_for_test(crate::shared::fault::Site::BeforeSubmission, 1);
+        let owners = RequestOwners::new(false);
+        let ticket = std::rc::Rc::new(());
+        let error = owners.submit(&ticket, None).unwrap_err();
+        assert_eq!(classify(&error), Some(Recovery::BeforeSubmission));
+        assert!(StepFailure::is_recoverable(&error));
+        assert_eq!(owners.cancels.get(), 1);
+        assert_eq!(std::rc::Rc::strong_count(&ticket), 1, "the body must not have run");
+        assert_eq!(owners.submit(&ticket, None).unwrap(), 3);
+        // Terminal-only boundaries never consume the hook.
+        crate::shared::fault::arm_for_test(crate::shared::fault::Site::BeforeSubmission, 1);
+        assert!(submit(|| Ok(()), || Ok(()), || Ok(())).is_ok());
+        crate::shared::fault::arm_for_test(crate::shared::fault::Site::BeforeSubmission, 0);
+    }
+
     #[test]
     fn submission_preserves_primary_cause_and_reports_retained_owners() {
         let error = submit(
@@ -1542,7 +1791,7 @@ mod tests {
             || -> Result<()> { anyhow::bail!("projection enqueue failed") },
         )
         .unwrap_err();
-        assert!(error.downcast_ref::<TerminalStepError>().is_some());
+        assert!(StepFailure::is_terminal(&error));
         assert!(format!("{error:#}").contains("copy drain failed; owners quarantined"));
         assert!(error
             .chain()
@@ -1553,6 +1802,7 @@ mod tests {
         [
             "crate::shared::experts::rtx::pair::submit(",
             "crate::shared::experts::rtx::pair::submit_scoped(",
+            "crate::shared::experts::rtx::pair::submit_recoverable(",
         ]
         .iter()
         .any(|call| {
@@ -1650,6 +1900,10 @@ mod tests {
                 .replace(
                     "crate::shared::experts::rtx::pair::submit_scoped(",
                     "backend.enqueue(",
+                )
+                .replace(
+                    "crate::shared::experts::rtx::pair::submit_recoverable(",
+                    "backend.enqueue(",
                 );
             assert!(
                 !shared_submission_entrypoint(&bypass),
@@ -1672,7 +1926,7 @@ mod tests {
         }
         let mimo = include_str!("../../../families/mimo_v2/engine.rs");
         assert!(shared_submission_entrypoint(mimo));
-        assert!(!mimo.contains("pub(crate) struct TerminalStepError"));
+        assert!(!mimo.contains("pub(crate) enum StepFailure"));
     }
 
     #[test]

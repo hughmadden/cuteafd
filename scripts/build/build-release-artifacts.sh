@@ -227,6 +227,8 @@ echo "Host ISA targets: ${host_isas[*]} (base ${host_isas[0]})"
 cargo_feature_args=()
 if [[ "$role" == coordinator ]]; then
   coordinator_features="${CUTEAFD_RELEASE_COORDINATOR_FEATURES:-}"
+  [[ ! " ${coordinator_features//,/ } " =~ \ dev- ]] ||
+    { echo "release coordinator features may not include dev-* hooks: $coordinator_features" >&2; exit 2; }
   [[ -z "$coordinator_features" ]] || cargo_feature_args=(--features "$coordinator_features")
 fi
 host_isa_jobs=()
