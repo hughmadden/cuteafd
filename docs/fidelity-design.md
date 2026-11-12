@@ -53,12 +53,12 @@ changes using the fixed dataset; its old calibration campaigns are historical.
 
 ### Bounded prefill scoring (2026-11-12)
 
-GLM Flash, dense Qwen, Qwen4, MiMo, V4, Step-5, Muse and GLM 5.3 accept prefill-shaped
-fidelity probes on ordinary serving launches after paired raw-row and
-ordinary-layout Standard proofs, without reserving all-call logits before KV
-sizing. The Kimi and Mistral Large 4 adapters remain staged behind a central
-activation allowlist until their proofs pass; their existing launch admission
-and scoring dispatch are unchanged. Scoring preserves
+GLM Flash, dense Qwen, Qwen4, MiMo, V4, Step-5, Muse, GLM 5.3 and Mistral Large 4
+accept prefill-shaped fidelity probes on ordinary serving launches after paired
+raw-row and ordinary-layout Standard proofs, without reserving all-call logits
+before KV sizing. The Kimi adapter remains staged behind a central activation
+allowlist until its proof passes; its existing launch admission and scoring
+dispatch are unchanged. Scoring preserves
 the serving transformer's prefill calls and unit cuts, projects through existing
 head storage, and consumes selected rows before that storage is reused. Raw
 logits dumps use those same rows for byte-exactness and full-vocabulary KL.
@@ -79,8 +79,19 @@ The ordinary flag-free DFlash2 launch also passed Standard's full 32+32
 windows with automatic admission: 1,371,392 KV tokens, 1,048,576 context and
 zero onboarded expert layers. Decode generated-row KL/top-1 were
 0.037970/0.944911; prefill 0.034099/0.950892, with no missing/nonfinite rows.
-The paired runtime seal was `65a0f104f`; Mistral Large 4 remains unqualified
-and disabled separately despite sharing GLM's engine.
+The paired runtime seal was `65a0f104f`.
+
+Mistral Large 4 K4/original-core qualification (#1444, 2026-11-13): on one RTX
+PRO 6000 and five Sparks, all 16,384 prefill rows in Standard's 32 windows were
+byte-identical between the legacy reservation and bounded scoring, including
+positions, complete-file hashes and payload hashes (full-vocabulary KL 0,
+top-1 agreement 1). The ordinary flag-free bundled dSpark launch passed the full
+32+32 windows with automatic admission: 1,451,264 KV tokens, 1,048,576 context,
+zero onboarded expert layers and 3 x 2752 prefill. Decode generated-row KL/top-1
+were 0.007867/0.976038; prefill 0.007843/0.975557, with no missing/nonfinite rows.
+Ordinary prefill records matched the paired records exactly. The runtime seal
+was `0daaa6523`; media was off, matching the published text-only recipe. The
+five test hosts were ostrich/dodo/emu/kiwi/moa (moa replaced documentation rank 4).
 
 ## 0. Recommendation in one box
 
