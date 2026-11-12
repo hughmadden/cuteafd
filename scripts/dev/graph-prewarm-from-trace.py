@@ -85,6 +85,9 @@ SITE_PREFIX = {"glm5": "glm5.", "mistral_large4": "glm5.",
 GLMF_GEOMETRY = re.compile(
     r"GraphKey \{ segment: \d+, rows: (\d+), spec: (true|false), long: (true|false), "
     r"pool_width: (\d+), page_stride: (\d+), pool_stride: (\d+) \}")
+GLMF_NORMALIZED_GEOMETRY = re.compile(
+    r"GraphKey \{ segment: \d+, rows: (\d+), spec: (true|false), head: (true|false), "
+    r"long: (true|false), pool_width: (\d+), page_stride: (\d+), pool_stride: (\d+) \}")
 QWEN_GEOMETRY = re.compile(
     r"GraphKey \{ segment: (\d+), rows: (\d+), spec: (true|false), long: (true|false), "
     r"pool_width: (\d+), page_stride: (\d+), pool_stride: (\d+) \}")
@@ -1222,10 +1225,21 @@ def glmf_identity(shape):
     Short steps key neither the pool top-k's width nor the pool table stride
     (`GraphGeometry::keyed`), so those identities collapse to one shape.
     """
-    match = GLMF_GEOMETRY.fullmatch(shape.strip())
-    if match is None:
-        raise ValueError(f"cannot parse glm5_flash graph identity: {shape!r}")
-    rows, spec, long, width, page_stride, pool_stride = match.groups()
+    normalized = GLMF_NORMALIZED_GEOMETRY.fullmatch(shape.strip())
+    if normalized is not None:
+        rows, spec, head, long, width, page_stride, pool_stride = normalized.groups()
+        if int(page_stride) == 0:
+            if int(rows) <= 0 or long != "false" or int(width) != 0 or int(pool_stride) != 0 \
+                    or (head == "true" and spec != "false"):
+                raise ValueError("unsupported normalized GLM Flash KDA/head geometry")
+            return (int(rows), spec == "true", False, 0, 0, 0)
+        if head == "true":
+            raise ValueError("unsupported normalized GLM Flash head geometry")
+    else:
+        match = GLMF_GEOMETRY.fullmatch(shape.strip())
+        if match is None:
+            raise ValueError(f"cannot parse glm5_flash graph identity: {shape!r}")
+        rows, spec, long, width, page_stride, pool_stride = match.groups()
     rows, width, page_stride, pool_stride = (int(value) for value in (rows, width, page_stride, pool_stride))
     if rows <= 0 or page_stride <= 0:
         raise ValueError("unsupported prewarm geometry")
@@ -1247,6 +1261,27 @@ def generate_glm5_flash(traces, coverage=0.999, pin_frequency=0.9):
     shared extra keys, not the trace."""
     if not 0 < coverage <= 1 or not 0 < pin_frequency <= 1:
         raise ValueError("coverage and pin frequency must be in (0, 1]")
+    styles = {GLMF_NORMALIZED_GEOMETRY.fullmatch(graph["shape"].strip()) is not None
+              for trace in traces for graph in trace["graphs"]
+              if graph["site"].startswith("glm5_flash.")}
+    if len(styles) > 1:
+        raise ValueError("GLM Flash traces must use one graph-key format")
+    normalized = True in styles
+    if normalized:
+        latest = {}
+        for trace in traces:
+            device = int(trace["cache"].get("device", 0))
+            stamp = int(trace["cache"].get("sampled_at_ms", 0))
+            if device not in latest or stamp >= latest[device][0]:
+                latest[device] = (stamp, trace)
+        traces = [trace for _, trace in latest.values()]
+
+    def compatible(key, graph, step):
+        if not normalized or key[4] != 0:
+            return key == step
+        head = GLMF_NORMALIZED_GEOMETRY.fullmatch(graph["shape"].strip())[3] == "true"
+        return key[0] == step[0] and (head or key[1] == step[1])
+
     counts = {}
     for trace in traces:
         if trace.get("schema_version") != 2:
@@ -1256,7 +1291,7 @@ def generate_glm5_flash(traces, coverage=0.999, pin_frequency=0.9):
         for graph in matching:
             key = glmf_identity(graph["shape"])
             count = glm_request_replays(graph)
-            if count > 0:
+            if count > 0 and (not normalized or key[4] > 0):
                 device_counts[key] = device_counts.get(key, 0) + count
         for key, count in device_counts.items():
             counts[key] = max(counts.get(key, 0), count)
@@ -1288,17 +1323,24 @@ def generate_glm5_flash(traces, coverage=0.999, pin_frequency=0.9):
         seen = set()
         captured = 0
         executables = 0
+        identities = set()
         for graph in trace["graphs"]:
             if not graph["site"].startswith("glm5_flash."):
                 continue
             key = glmf_identity(graph["shape"])
-            if key not in wanted:
+            if not any(compatible(key, graph, step) for step in wanted):
                 continue
+            if normalized:
+                identity = (graph["site"], graph.get("bank", 0), graph.get("key_id", graph["shape"]))
+                if identity in identities:
+                    continue
+                identities.add(identity)
             capture = graph.get("capture_bytes")
             if capture is None:
                 raise ValueError(f"GLM Flash selected shape {key} has no measured capture bytes "
                                  f"on device {device}")
-            seen.add(key)
+            if key in wanted:
+                seen.add(key)
             captured += int(capture)
             executables += int(graph.get("executables", 1) or 0)
         if seen != wanted:

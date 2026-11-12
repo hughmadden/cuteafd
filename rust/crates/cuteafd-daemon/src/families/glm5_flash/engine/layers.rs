@@ -263,7 +263,7 @@ impl Bindings<'_, '_, '_> {
             let attended = if layer.attention_share.split() { self.meet(rank, index)? } else { w.delta.buffer.ptr };
             e.post_pre_on(rank, w, attended, 0, layer, "ffn", "post_norm", rows, self.cap())
         };
-        if self.graphed && active { e.replay_on(rank, GraphKey::new(index, self.rows, self.tables[rank]), body) } else { body() }
+        if self.graphed && active { e.replay_on(rank, GraphKey::new(index, self.rows, self.tables[rank]).normalized(Some(layer.attention)), body) } else { body() }
     }
 
     fn meet(&self, rank: usize, layer: usize) -> Result<*mut c_void> {
@@ -322,7 +322,7 @@ impl Bindings<'_, '_, '_> {
             }
             Ok(())
         };
-        if self.head { e.replay(GraphKey::new(last + 1, self.rows, self.tables[0]), body)?; } else { body()?; }
+        if self.head { e.replay(GraphKey::new(last + 1, self.rows, self.tables[0]).normalized(None), body)?; } else { body()?; }
         e.replicate_terminal(w, self.work[1], 0, self.rows)?;
         self.completed_layer(last)?;
         if !self.head && last + 1 == e.cfg.layers {

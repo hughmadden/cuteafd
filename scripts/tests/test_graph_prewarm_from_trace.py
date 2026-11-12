@@ -345,6 +345,35 @@ def test_flash_shapes_aggregate_segments_and_pin_the_hot_ones():
     ]
 
 
+def test_flash_normalized_mla_shapes_project_kda_and_head_once():
+    def graph(segment, stride=0, spec="false", head="false", hits=1000, share=1 << 20):
+        item = flash_graph(4, spec, "false", 0, stride, 0, hits, segment=segment,
+                           capture_bytes=share)
+        item["shape"] = item["shape"].replace(f"spec: {spec},", f"spec: {spec}, head: {head},")
+        return item
+    data = flash_trace([graph(0), graph(1, stride=64, hits=100, share=2 << 20),
+                        graph(1, stride=128, hits=50, share=3 << 20),
+                        graph(2, head="true", share=4 << 20), graph(3, hits=0),
+                        graph(4, spec="true", share=99 << 20)])
+    result = MODULE.generate([data], "glm5_flash", coverage=1)
+    assert [entry["page_stride"] for entry in result["entries"]] == [64, 128]
+    assert result["measured_bytes"] == [12 << 20]
+    assert result["measured_executables"] == [5]
+    assert result == MODULE.generate([data, data], "glm5_flash", coverage=1)
+    first = MODULE.generate([data], "glm5_flash", coverage=0.6)
+    assert len(first["entries"]) == 1
+    assert first["measured_bytes"] == [8 << 20]
+    assert first["measured_executables"] == [4]
+    missing = copy.deepcopy(data)
+    missing["graphs"][0]["capture_bytes"] = None
+    with pytest.raises(ValueError, match="no measured capture bytes"):
+        MODULE.generate([missing], "glm5_flash")
+    mixed = copy.deepcopy(data)
+    mixed["graphs"].append(flash_graph(4, "false", "false", 0, 64, 0, 10))
+    with pytest.raises(ValueError, match="one graph-key format"):
+        MODULE.generate([mixed], "glm5_flash")
+
+
 def test_flash_short_steps_collapse_the_unkeyed_pool_geometry():
     graphs = [flash_graph(4, "false", "false", 1, 64, 16, 10),
               flash_graph(4, "false", "false", 4, 64, 32, 5)]
