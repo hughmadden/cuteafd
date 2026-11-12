@@ -1322,13 +1322,17 @@ mod tests {
         assert_eq!(embedding.device_bytes(), 0);
         std::fs::write(&path, [vec![0xcc; 7], payload.clone()].concat())?;
         let sockets = tempfile::tempdir_in(fixture.directory())?;
+        // Keep socket evidence on NVMe, but avoid sockaddr_un's 108-byte path cap.
+        use std::os::fd::AsRawFd;
+        let socket_directory = std::fs::File::open(sockets.path())?;
+        let socket_path = PathBuf::from(format!("/proc/self/fd/{}", socket_directory.as_raw_fd()));
         // Exercise the same inherited two-worker boundary as receive_with.
         // SAFETY: the load returns only an integer; the host table is retained
         // and unread until both receivers have joined and drained.
         let (received, ()) = unsafe { cuteafd_ffi::synchronized_load::load_pair_with([Some(records), None], |rank, records| {
             if let Some(records) = records {
                 let weights = push::tests::receive_pushed(Device { library: &library, id: 0 }, None,
-                    root.path(), sockets.path(), &records, None, 0, rank)?;
+                    root.path(), &socket_path, &records, None, 0, rank)?;
                 assert_eq!(weights.len(), 0);
             }
             Ok(rank)
