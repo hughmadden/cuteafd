@@ -168,7 +168,7 @@ def test_generic_linear_blas_remains_outside_serving():
 def test_glmf_blas_owners_follow_resolved_head_not_checkpoint_dtype():
     module = (ROOT / "rust/crates/cuteafd-daemon/src/families/glm5_flash/mod.rs").read_text()
     runtime = module.split("blas_head: args.resolved_target_head().blas_head(", 1)[1].split("representation, resident", 1)[0]
-    assert '!self.native && core.get_weight("lm_head").is_none()' in runtime
+    assert '!self.native && (core.get_weight("lm_head").is_none() && !core.native.contains_key("lm_head"))' in runtime
     assert "representation.head == head::GlmfHeadFormat::Bf16" in runtime
     layout = (ROOT / "rust/crates/cuteafd-loader/src/plan/layout/glm5_flash.rs").read_text()
     assert layout.index("representation.head.resolve(") < layout.index("blas_head:")

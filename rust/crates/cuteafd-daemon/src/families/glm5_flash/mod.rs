@@ -748,7 +748,7 @@ mod draft_cli_tests {
         let config = cuteafd_loader::plan::testing::glm5_flash_config(2);
         let cfg = GlmNextConfig::from_hf(&config).unwrap();
         let mut offset = 0;
-        let tensors = cuteafd_loader::plan::testing::glm5_flash_tensors(&config)
+        let mut tensors: Vec<CheckpointTensor> = cuteafd_loader::plan::testing::glm5_flash_tensors(&config)
             .into_iter().map(|(name, dtype, shape)| {
                 let (dtype, width) = match dtype {
                     "BF16" => (cuteafd_core::DType::Bf16, 2),
@@ -763,6 +763,7 @@ mod draft_cli_tests {
                 offset += byte_length;
                 tensor
             }).collect();
+        tensors.sort_by(|a, b| a.meta.name.cmp(&b.meta.name));
         let mut checkpoint = Checkpoint { view: None, snapshot: "fixture".into(), config, quantize_config: None,
             weight_map: Default::default(), tensors, missing_shards: vec![], shard_bytes: 0 };
         for ranks in [1, 2] {
@@ -792,7 +793,7 @@ mod draft_cli_tests {
         assert!(error.to_string().contains("tie_word_embeddings=true"));
         assert!(runtime_resident_weights(&checkpoint, &cfg, 0, 2, Default::default(), EmbedPlacement::Gpu, Default::default()).is_ok());
         checkpoint.config["tie_word_embeddings"] = serde_json::json!(false);
-        checkpoint.tensors[2].meta.byte_offset = 0;
+        checkpoint.tensors.iter_mut().find(|t| t.meta.name == "lm_head.weight").unwrap().meta.byte_offset = 0;
         let error = runtime_resident_weights(&checkpoint, &cfg, 0, 2, Default::default(), EmbedPlacement::Host, Default::default()).unwrap_err();
         assert!(error.to_string().contains("aliases its storage"));
     }
