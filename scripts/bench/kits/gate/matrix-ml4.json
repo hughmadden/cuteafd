@@ -9,7 +9,7 @@
   {
    "name": "ml4-exl3-min",
    "family": "mistral_large4",
-   "config": "examples/configs/mistral-large4-exl3-k4-core-k6-min.config",
+   "config": "examples/configs/mistral-large4-exl3-k4-min.config",
    "gpus": [
     1
    ],
@@ -41,7 +41,7 @@
   {
    "name": "ml4-exl3-max",
    "family": "mistral_large4",
-   "config": "examples/configs/mistral-large4-exl3-k4-core-k6-max.config",
+   "config": "examples/configs/mistral-large4-exl3-k4-max.config",
    "gpus": [
     0,
     1

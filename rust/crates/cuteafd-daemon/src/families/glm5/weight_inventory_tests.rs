@@ -104,8 +104,8 @@ fn installed_variant_weight_inventory_equals_production_requests() -> Result<()>
             "5a4e83a09a11f3145332ed632d28a9894ea88225",
         ),
         (
-            "wrldsuksgo2mars--Mistral-Large-4-EXL3-K4-Core-K6",
-            "03c80aebaa483d55760703ae5bc0c9734c9d67d6",
+            "wrldsuksgo2mars--Mistral-Large-4-EXL3-K4",
+            "9c354cee78cd6feddb057549b8edde6e3b319822",
         ),
     ] {
         let root = installed(model, revision)?;
@@ -264,7 +264,7 @@ fn arena_inventory(label: &str, inventory: &WeightInventory) -> Result<()> {
 fn installed_arena_cpu_inventory() -> Result<()> {
     for (model, revision) in [
         ("wrldsuksgo2mars--GLM-5.3-EXL3-K4-Core-K6", "5a4e83a09a11f3145332ed632d28a9894ea88225"),
-        ("wrldsuksgo2mars--Mistral-Large-4-EXL3-K4-Core-K6", "03c80aebaa483d55760703ae5bc0c9734c9d67d6"),
+        ("wrldsuksgo2mars--Mistral-Large-4-EXL3-K4", "9c354cee78cd6feddb057549b8edde6e3b319822"),
     ] {
         let root = installed(model, revision)?;
         let checkpoint = cuteafd_loader::plan::Checkpoint::open(&root)?;
@@ -333,8 +333,8 @@ fn installed_glm_and_ml4_draft_arena_charges_equal_shared_load_recipes() -> Resu
                 representation.name(), arena.bytes(), arena.bytes() as u64 + tail, arena.bytes() as u64 + tail - logical);
         }
     }
-    let snapshot = installed("wrldsuksgo2mars--Mistral-Large-4-EXL3-K4-Core-K6",
-        "03c80aebaa483d55760703ae5bc0c9734c9d67d6")?;
+    let snapshot = installed("wrldsuksgo2mars--Mistral-Large-4-EXL3-K4",
+        "9c354cee78cd6feddb057549b8edde6e3b319822")?;
     let layout = ml4_draft_layout(&snapshot, 20, 16, 16384, 188)?;
     let arena = WeightArenaLayout::new("glm/draft/0", layout.immutable_arena_requests())?;
     let logical = layout.owners().iter().map(|owner| owner.resident_weights.0).sum::<u64>();
@@ -364,8 +364,6 @@ fn installed_k6_max_streaming_staging_covers_measured_pools() -> Result<()> {
     for (model, revision, observed, old_dense) in [
         ("wrldsuksgo2mars--GLM-5.3-EXL3-K4-Core-K6", "5a4e83a09a11f3145332ed632d28a9894ea88225",
             [240060416usize, 27942912], 11891580928usize),
-        ("wrldsuksgo2mars--Mistral-Large-4-EXL3-K4-Core-K6", "03c80aebaa483d55760703ae5bc0c9734c9d67d6",
-            [33546240, 16048128], 4750802944),
     ] {
         let root = installed(model, revision)?;
         let checkpoint = cuteafd_loader::plan::Checkpoint::open(&root)?;

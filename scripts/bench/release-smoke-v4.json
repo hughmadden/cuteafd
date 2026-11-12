@@ -1529,76 +1529,6 @@
         "COORDINATOR_GPUS": "0,1",
         "SPARK_COUNT": "0"
       }
-    },
-    {
-      "name": "ml4-exl3-min",
-      "family": "mistral_large4",
-      "config": "examples/configs/mistral-large4-exl3-k4-core-k6-min.config",
-      "gpus": [
-        1
-      ],
-      "sparks": [
-        "REPLACE-ME-spark-0",
-        "REPLACE-ME-spark-1",
-        "REPLACE-ME-spark-2",
-        "REPLACE-ME-spark-3",
-        "REPLACE-ME-spark-4"
-      ],
-      "set": {
-        "ADDR": "0.0.0.0:8750",
-        "EXPERT_PORT": "19850",
-        "COORDINATOR_GPUS": "1",
-        "RTX_GPUS": "1",
-        "SPARK_COUNT": "5",
-        "SPARK_0_HOST": "REPLACE-ME-spark-0",
-        "SPARK_1_HOST": "REPLACE-ME-spark-1",
-        "SPARK_2_HOST": "REPLACE-ME-spark-2",
-        "SPARK_3_HOST": "REPLACE-ME-spark-3",
-        "SPARK_4_HOST": "REPLACE-ME-spark-4",
-        "SPARK_0_LANE_A": "192.0.2.1",
-        "SPARK_1_LANE_A": "192.0.2.2",
-        "SPARK_2_LANE_A": "192.0.2.3",
-        "SPARK_3_LANE_A": "192.0.2.4",
-        "SPARK_4_LANE_A": "192.0.2.5",
-        "SPARK_EXPERT_DOCKER_INFERENCE": "ghcr.io/tpurtell/cuteafd-spark-expert:REPLACE-ME-v4-rc"
-      }
-    },
-    {
-      "name": "ml4-exl3-max",
-      "family": "mistral_large4",
-      "config": "examples/configs/mistral-large4-exl3-k4-core-k6-max.config",
-      "gpus": [
-        0,
-        1
-      ],
-      "sparks": [
-        "REPLACE-ME-spark-0",
-        "REPLACE-ME-spark-1",
-        "REPLACE-ME-spark-2",
-        "REPLACE-ME-spark-3",
-        "REPLACE-ME-spark-4",
-        "REPLACE-ME-spark-5"
-      ],
-      "set": {
-        "ADDR": "0.0.0.0:8751",
-        "EXPERT_PORT": "19851",
-        "COORDINATOR_GPUS": "0,1",
-        "RTX_GPUS": "2",
-        "SPARK_COUNT": "6",
-        "SPARK_0_HOST": "REPLACE-ME-spark-0",
-        "SPARK_1_HOST": "REPLACE-ME-spark-1",
-        "SPARK_2_HOST": "REPLACE-ME-spark-2",
-        "SPARK_3_HOST": "REPLACE-ME-spark-3",
-        "SPARK_4_HOST": "REPLACE-ME-spark-4",
-        "SPARK_5_HOST": "REPLACE-ME-spark-5",
-        "SPARK_0_LANE_A": "192.0.2.1",
-        "SPARK_1_LANE_A": "192.0.2.2",
-        "SPARK_2_LANE_A": "192.0.2.3",
-        "SPARK_3_LANE_A": "192.0.2.4",
-        "SPARK_4_LANE_A": "192.0.2.5",
-        "SPARK_5_LANE_A": "192.0.2.6",
-        "SPARK_EXPERT_DOCKER_INFERENCE": "ghcr.io/tpurtell/cuteafd-spark-expert:REPLACE-ME-v4-rc"
-      }
     }
   ],
   "retired": [
@@ -1748,6 +1678,78 @@
       "report": "benchmarks/step5/2026-10-30-smoke-step-5-preview-nvfp4-1rtx-4spark-step5-nvfp4-min",
       "release": "v4.0.0-rc2",
       "release_note": "Release-candidate build recorded by the report. NVFP4 cards retired in v5 (TJ 2026-10-31)."
+    },
+    {
+      "name": "ml4-exl3-min",
+      "family": "mistral_large4",
+      "config": "examples/configs/mistral-large4-exl3-k4-core-k6-min.config",
+      "gpus": [
+        1
+      ],
+      "sparks": [
+        "REPLACE-ME-spark-0",
+        "REPLACE-ME-spark-1",
+        "REPLACE-ME-spark-2",
+        "REPLACE-ME-spark-3",
+        "REPLACE-ME-spark-4"
+      ],
+      "set": {
+        "ADDR": "0.0.0.0:8750",
+        "EXPERT_PORT": "19850",
+        "COORDINATOR_GPUS": "1",
+        "RTX_GPUS": "1",
+        "SPARK_COUNT": "5",
+        "SPARK_0_HOST": "REPLACE-ME-spark-0",
+        "SPARK_1_HOST": "REPLACE-ME-spark-1",
+        "SPARK_2_HOST": "REPLACE-ME-spark-2",
+        "SPARK_3_HOST": "REPLACE-ME-spark-3",
+        "SPARK_4_HOST": "REPLACE-ME-spark-4",
+        "SPARK_0_LANE_A": "192.0.2.1",
+        "SPARK_1_LANE_A": "192.0.2.2",
+        "SPARK_2_LANE_A": "192.0.2.3",
+        "SPARK_3_LANE_A": "192.0.2.4",
+        "SPARK_4_LANE_A": "192.0.2.5",
+        "SPARK_EXPERT_DOCKER_INFERENCE": "ghcr.io/tpurtell/cuteafd-spark-expert:REPLACE-ME-v4-rc"
+      },
+      "release_note": "Core-K6 checkpoint retired 2026-11-12; replaced by Mistral-Large-4-EXL3-K4"
+    },
+    {
+      "name": "ml4-exl3-max",
+      "family": "mistral_large4",
+      "config": "examples/configs/mistral-large4-exl3-k4-core-k6-max.config",
+      "gpus": [
+        0,
+        1
+      ],
+      "sparks": [
+        "REPLACE-ME-spark-0",
+        "REPLACE-ME-spark-1",
+        "REPLACE-ME-spark-2",
+        "REPLACE-ME-spark-3",
+        "REPLACE-ME-spark-4",
+        "REPLACE-ME-spark-5"
+      ],
+      "set": {
+        "ADDR": "0.0.0.0:8751",
+        "EXPERT_PORT": "19851",
+        "COORDINATOR_GPUS": "0,1",
+        "RTX_GPUS": "2",
+        "SPARK_COUNT": "6",
+        "SPARK_0_HOST": "REPLACE-ME-spark-0",
+        "SPARK_1_HOST": "REPLACE-ME-spark-1",
+        "SPARK_2_HOST": "REPLACE-ME-spark-2",
+        "SPARK_3_HOST": "REPLACE-ME-spark-3",
+        "SPARK_4_HOST": "REPLACE-ME-spark-4",
+        "SPARK_5_HOST": "REPLACE-ME-spark-5",
+        "SPARK_0_LANE_A": "192.0.2.1",
+        "SPARK_1_LANE_A": "192.0.2.2",
+        "SPARK_2_LANE_A": "192.0.2.3",
+        "SPARK_3_LANE_A": "192.0.2.4",
+        "SPARK_4_LANE_A": "192.0.2.5",
+        "SPARK_5_LANE_A": "192.0.2.6",
+        "SPARK_EXPERT_DOCKER_INFERENCE": "ghcr.io/tpurtell/cuteafd-spark-expert:REPLACE-ME-v4-rc"
+      },
+      "release_note": "Core-K6 checkpoint retired 2026-11-12; replaced by Mistral-Large-4-EXL3-K4"
     }
   ]
 }

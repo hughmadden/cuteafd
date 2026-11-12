@@ -12,17 +12,7 @@ has no benchmark cards yet. They require an engine with MC `CORE_VIEW` support
 (dev after #1778; first release after v5.0.0); v5.0.0 and the image tags
 retained from the earlier configs cannot run these recipes.
 
-Previously served as `wrldsuksgo2mars/Mistral-Large-4-EXL3-K4-Core-K6`
-at revision `03c80aebaa483d55760703ae5bc0c9734c9d67d6`, with a native K6
-dense core. Its historical examples remain available:
-[min, 1 RTX + 5 Sparks](../../examples/configs/mistral-large4-exl3-k4-core-k6-min.config)
-and [max, 2 RTX + 6 Sparks](../../examples/configs/mistral-large4-exl3-k4-core-k6-max.config).
-The v5 cards in the changelog and gate cards `ml4-exl3-min` / `ml4-exl3-max`
-in `scripts/bench/kits/gate/matrix-ml4.json` still describe that Core-K6
-checkpoint, not the restored original core. TP2 expert onboarding,
-official-reference image fidelity, exact prefix restores and lossless
-speculation passed on that checkpoint. On two GPUs, `auto` selects
-`context`; explicit `layers` remains available.
+Core-K6 was retired on 2026-11-12; its v5 cards remain archived in the changelog.
 
 ## Original mixed-precision core
 
@@ -49,8 +39,8 @@ names.
   layer 35's latent pages and keep no KV of their own.
 - **DSA indexer:** only on the 44 `full` layers; `shared` layers reuse the last
   full layer's top-k. The query is `wq_b(LayerNorm(h))` with its own query
-  scale. `wq_b` runs in whichever form the checkpoint ships: the K6 core, or
-  the official FP8 block-128 weight through `ml4_index_q` (never
+  scale. `wq_b` runs as the original FP8 block-128 weight through
+  `ml4_index_q` (never
   re-quantized). Ties at the top-k cutoff go to the lower key id, as in the
   reference.
 - **Router and head:** a softmax top-4 of 128 experts, renormalized. The head

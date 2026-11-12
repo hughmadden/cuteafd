@@ -1187,8 +1187,8 @@ fn read_mistral_large4_expert_catalog(snapshot: &Path, config: &serde_json::Valu
     };
     match config["quantization_config"]["quant_method"].as_str() {
         Some("exl3") => exl3_catalog_or_read(snapshot, shape, &[4, 5], checkpoint),
-        Some("fp8") => anyhow::bail!("Mistral Large 4 serves from the EXL3 K4 + Core-K6 publication \
-            (wrldsuksgo2mars/Mistral-Large-4-EXL3-K4-Core-K6); the official FP8 release is the \
+        Some("fp8") => anyhow::bail!("Mistral Large 4 serves from the EXL3 K4 + original FP8/BF16 core publication \
+            (wrldsuksgo2mars/Mistral-Large-4-EXL3-K4); the official FP8 release is the \
             quantization source and fidelity root, with no Spark expert package"),
         other => anyhow::bail!("Mistral Large 4 routed experts stored as {other:?} have no expert package"),
     }

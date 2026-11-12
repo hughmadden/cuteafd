@@ -159,9 +159,8 @@ impl MatrixRow {
 /// The table is this matrix resolved against the accepted reports on disk, not
 /// "whatever is newest under `benchmarks/`": a newer report on an archived
 /// layout, a card from an earlier release, or a simulation where no real card
-/// exists cannot take a cell the matrix gives to another card. Every row keeps
-/// at least one measured cell, because the checkpoint and quant that name the
-/// row are report data.
+/// exists cannot take a cell the matrix gives to another card. Rows without
+/// measured cells use the matrix checkpoint until a report can name them.
 #[derive(Debug, Clone)]
 pub struct Matrix {
     pub rows: Vec<MatrixRow>,
@@ -607,7 +606,7 @@ pub enum Resolved<'a> {
 }
 
 /// Resolves every matrix row against `placed`, in matrix order. Fails when a
-/// measured cell has no accepted report, or a row has nothing to name it with.
+/// measured cell has no accepted report.
 pub fn select<'a>(placed: &'a [Placed], matrix: &Matrix) -> Result<Vec<Row<'a>>> {
     let mut rows = Vec::new();
     for row in &matrix.rows {
@@ -628,11 +627,9 @@ pub fn select<'a>(placed: &'a [Placed], matrix: &Matrix) -> Result<Vec<Row<'a>>>
                     under benchmarks/", row.family, row.checkpoint, column.title());
             }
         }
-        let Some(label) = cells.iter().find_map(|cell| match cell {
-            Resolved::Card(p) => Some(checkpoint(&p.report)), _ => None }) else {
-            bail!("{}/{}: no cell publishes a report; drop the row or measure one",
-                row.family, row.checkpoint);
-        };
+        let label = cells.iter().find_map(|cell| match cell {
+            Resolved::Card(p) => Some(checkpoint(&p.report)), _ => None })
+            .unwrap_or_else(|| row.checkpoint.clone());
         rows.push(Row { family: row.family.clone(), label, cells });
     }
     Ok(rows)
@@ -711,14 +708,13 @@ pub fn results(placed: &[Placed], matrix: &Matrix) -> Result<String> {
     }
     let mut out = String::from("<table>\n<tr><th>Model · quant</th><th>5090</th><th>1× RTX</th><th>2× RTX</th></tr>\n");
     for row in &rows {
-        // select() proved the row names a report; the checkpoint and quant that
-        // name the row are that report's data, not the matrix's.
-        let first = row.cells.iter().find_map(|cell| match cell {
-            Resolved::Card(p) => Some(p), _ => None }).expect("select() names a report");
+        let name = row.cells.iter().find_map(|cell| match cell {
+            Resolved::Card(p) => Some(p.report.server.checkpoint()), _ => None })
+            .unwrap_or_else(|| row.label.clone());
         let quant = row.label.rsplit_once(" (").map_or("", |(_, quant)| quant.trim_end_matches(')'));
         out.push_str(&format!("<tr>\n<td width=\"19%\" valign=\"top\"><a href=\"docs/models/{}.md\"><b>{}</b></a>\
             <br><sub>{}</sub><br><sub>{quant}</sub></td>\n", row.family, family_title(&row.family),
-            first.report.server.checkpoint()));
+            crate::render::svg::escape(&name)));
         for cell in &row.cells {
             out.push_str(&grid_cell(cell));
             out.push('\n');
@@ -1098,9 +1094,35 @@ mod tests {
         assert!(html.contains("n/a<br><sub>no two-GPU split</sub>"), "{html}");
         assert!(!html.contains("pending Hugh"), "{html}");
         assert_eq!(html.matches("<img src=").count(), 1);
-        // A row with no measured cell has nothing to name it.
+        // A row with no measured cell uses the matrix's checkpoint.
         let matrix = v41_row([Cell::pending("a"), Cell::pending("b"), Cell::pending("c")]);
-        assert!(results(&reports, &matrix).unwrap_err().to_string().contains("no cell publishes a report"));
+        let html = results(&reports, &matrix).unwrap();
+        assert!(html.contains("deepseek-ai/DeepSeek-V4.1-Flash"));
+        assert_eq!(html.matches("pending<br>").count(), 3);
+        assert!(!html.contains("<img src="));
+    }
+
+    #[test]
+    fn unmeasured_row_preserves_all_status_reasons() {
+        let matrix = one_row("mistral_large4", "owner/plain-k4<&>", [
+            Cell::na("no fit"), Cell::pending("needs smoke"), Cell::held("quality < threshold")]);
+        let html = results(&[], &matrix).unwrap();
+        assert!(html.contains("owner/plain-k4&lt;&amp;&gt;"));
+        assert!(html.contains("n/a<br><sub>no fit</sub>"));
+        assert!(html.contains("pending<br><sub>needs smoke</sub>"));
+        assert!(html.contains("quality &lt; threshold"));
+        assert!(!html.contains("<img src="));
+    }
+
+    #[test]
+    fn mixed_row_keeps_the_report_checkpoint_label() {
+        let reports = vec![marked("one", 1, None)];
+        let matrix = v41_row([Cell::pending("not measured"), Cell::current(), Cell::na("not supported")]);
+        let rows = select(&reports, &matrix).unwrap();
+        assert_eq!(rows[0].label, checkpoint(&reports[0].report));
+        let html = results(&reports, &matrix).unwrap();
+        assert!(html.contains(&reports[0].report.server.checkpoint()));
+        assert_eq!(html.matches("<img src=").count(), 1);
     }
 
     #[test]

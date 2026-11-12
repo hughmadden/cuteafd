@@ -21,7 +21,7 @@ EXAMPLES = ROOT / "examples" / "configs"
 STARTING = re.compile(r"^(?P<model>[a-z0-9.-]+)-(?P<profile>min|max)(?:-(?:fp8|nvfp4)-reply)?\.config$")
 # WIP qualification configs for families without a release card yet (#273, #274):
 # served from ./wip.sh slots only, checked by test_serve_launch_new_families.py.
-ML4_QUALIFICATION = {f"mistral-large4-exl3-k4-core-k6-{size}.config" for size in ("min", "max")}
+ML4_QUALIFICATION = {f"mistral-large4-exl3-k4-{size}.config" for size in ("min", "max")}
 NEW_PUBLICATIONS = {f"{model}-{size}.config" for model in
                     ("mistral-large4-exl3-k4", "glm53-flash-exl3-k4-mc") for size in ("min", "max")}
 QUALIFICATION = {"kimi-k3-exl3-max.config", "kimi-k3-exl3-k6-min.config", "kimi-k3-exl3-k6-max.config", "step5-fp8-max.config", "step5-nvfp4-min.config",
@@ -84,7 +84,7 @@ CHECKPOINTS = {
     "stepfun-ai/Step-5-Preview-NVFP4": {"model_type": "step3p5", "num_hidden_layers": 8},
     "wrldsuksgo2mars/Step-5-Preview-EXL3-K4-Core-K6": {"model_type": "step3p5", "num_hidden_layers": 8},
     "wrldsuksgo2mars/Kimi-K3-EXL3-K2-Core-K6": {"model_type": "kimi_k3", "num_hidden_layers": 8},
-    "wrldsuksgo2mars/Mistral-Large-4-EXL3-K4-Core-K6": {"model_type": "mistral_large4", "text_config": {
+    "wrldsuksgo2mars/Mistral-Large-4-EXL3-K4": {"model_type": "mistral_large4", "text_config": {
         "model_type": "mistral_large4_text", "num_hidden_layers": 4, "first_k_dense_replace": 1}},
     # Drafters the starting configs name.
     "incoai/GLM-5.3-DFlash2": {"architectures": ["DFlash2DraftModel"]},
@@ -486,7 +486,10 @@ def test_published_matrix_pins_current_reports() -> None:
             assert f'href="{directory.as_posix()}/card.svg"' in results
             assert (ROOT / directory / "card.svg").is_file()
             current.append(cell)
-        assert current, "Every published checkpoint needs a measured card"
+        if not current:
+            assert row["checkpoint"] in results, "Unmeasured checkpoints remain visible"
+            for column in ("5090", "1rtx", "2rtx"):
+                assert row[column]["reason"] in results
     retired_names = set()
     for entry in matrix["retired"]:
         assert entry["name"] and entry["name"] not in retired_names
@@ -552,7 +555,7 @@ def test_v5_smoke_card_inventory() -> None:
             assert host == values[f"SPARK_{rank}_HOST"] == f"REPLACE-ME-spark-{rank}"
         assert "nvfp4" not in name and "nospec" not in name and "reference" not in name
         assert entry.get("baseline", True), "All cards retain baseline quick quality"
-        assert "CORE_VIEW" not in values, "Release cards use the checkpoint's default core"
+        assert values.get("CORE_VIEW", "original") == "original", "Release cards use the checkpoint's default core"
         column = "5090" if name.endswith("-5090") else f"{len(entry['gpus'])}rtx"
         identity = (entry["family"], values["MODEL_ID"], column)
         assert identity not in cards
@@ -715,8 +718,8 @@ def test_ml4_qualification_config_preserves_native_draft_defaults(name: str, tmp
     path = EXAMPLES / name
     values = keys(path)
     minimum = name.endswith("-min.config")
-    assert values["MODEL_ID"] == "wrldsuksgo2mars/Mistral-Large-4-EXL3-K4-Core-K6"
-    assert values["MODEL_REVISION"] == "03c80aebaa483d55760703ae5bc0c9734c9d67d6"
+    assert values["MODEL_ID"] == "wrldsuksgo2mars/Mistral-Large-4-EXL3-K4"
+    assert values["MODEL_REVISION"] == "9c354cee78cd6feddb057549b8edde6e3b319822"
     assert values["SPECULATOR"] == "dspark" and values["POOL_TOKENS"] == "auto"
     assert not {"SPECULATOR_MODEL_ID", "SPECULATOR_DEPTH", "RTX_EXPERT_LAYERS"}.intersection(values)
     assert values["SPARK_COUNT"] == ("5" if minimum else "6")
@@ -747,9 +750,14 @@ def test_new_publications_preserve_pinned_recipe_layouts(name: str) -> None:
     path = EXAMPLES / name
     values = keys(path)
     ml4 = name.startswith("mistral-")
-    old_name = (name.replace("exl3-k4-", "exl3-k4-core-k6-") if ml4
-                else name.replace("exl3-k4-mc-", "exl3-k6-"))
-    expected = keys(EXAMPLES / old_name)
+    if ml4:
+        expected = dict(values)
+        minimum = name.endswith("-min.config")
+        assert values["SPARK_COUNT"] == ("5" if minimum else "6")
+        assert values["RTX_GPUS"] == ("1" if minimum else "2")
+        assert values["SPECULATOR"] == "dspark" and values["POOL_TOKENS"] == "auto"
+    else:
+        expected = keys(EXAMPLES / name.replace("exl3-k4-mc-", "exl3-k6-"))
     expected.update(MODEL_ID=("wrldsuksgo2mars/Mistral-Large-4-EXL3-K4" if ml4
                               else "wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K4-MC"),
                     MODEL_REVISION=("9c354cee78cd6feddb057549b8edde6e3b319822" if ml4
@@ -772,7 +780,7 @@ def test_ml4_smoke_entries_use_published_examples_and_minimum_sparks() -> None:
     entries = {entry["name"]: entry for entry in matrix["entries"]}
     for size, gpus, sparks in (("min", [1], 5), ("max", [0, 1], 6)):
         entry = entries[f"ml4-exl3-{size}"]
-        assert entry["config"] == f"examples/configs/mistral-large4-exl3-k4-core-k6-{size}.config"
+        assert entry["config"] == f"examples/configs/mistral-large4-exl3-k4-{size}.config"
         assert entry["family"] == "mistral_large4" and entry["gpus"] == gpus
         assert len(entry["sparks"]) == sparks and entry["set"]["SPARK_COUNT"] == str(sparks)
         assert not any(k.startswith(f"SPARK_{sparks}_") for k in entry["set"])
@@ -922,7 +930,13 @@ def test_v4_matrix_card_set_and_retired_pins() -> None:
         assert sum(other.get("set", {}).get("ADDR") == entry["set"]["ADDR"]
                    for other in v4["entries"]) == 1
     assert not any(name.startswith("qwen38-nvfp4") for name in entries)
-    retired = v4["retired"]
+    ml4_retired = [entry for entry in v4["retired"] if entry.get("family") == "mistral_large4"]
+    assert {entry["name"] for entry in ml4_retired} == {"ml4-exl3-min", "ml4-exl3-max"}
+    for entry in ml4_retired:
+        assert entry["release_note"] == "Core-K6 checkpoint retired 2026-11-12; replaced by Mistral-Large-4-EXL3-K4"
+        assert not (ROOT / entry["config"]).exists()
+        assert entry["gpus"] and entry["sparks"] and entry["set"]
+    retired = [entry for entry in v4["retired"] if "report" in entry]
     assert len(retired) == 21
     assert "glm53-exl3-max" not in {entry["name"] for entry in retired}
     assert {"qwen38-nvfp4-" + size for size in ("min", "max", "5090")} <= {e["name"] for e in retired}

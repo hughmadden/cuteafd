@@ -993,11 +993,20 @@ fn installed_release_and_example_families_match_dev_d6aecfcb7() {
         let required = !retired.contains(path.strip_prefix(&root).unwrap().to_str().unwrap());
         selected.entry(key).and_modify(|live| *live |= required).or_insert(required);
     }
+    let expected_absent = ("stepfun-ai/Step-5-Preview-NVFP4",
+        "bc246cc2848e17b37f377eda8fd825c5b3018d1f");
+    let expected_installed = expected.keys().copied()
+        .filter(|key| *key != expected_absent).collect::<std::collections::BTreeSet<_>>();
+    let mut installed = std::collections::BTreeSet::new();
+    let mut absent = std::collections::BTreeSet::new();
     let mut tested = 0;
     for ((model, revision), required) in selected {
         let snapshot = installed_example_snapshot(&model, Some(&revision), &hf_home);
         if !required && snapshot.is_none() {
-            eprintln!("retired checkpoint not installed: {model}@{revision}");
+            assert_eq!((model.as_str(), revision.as_str()), expected_absent,
+                "unexpected missing retired checkpoint");
+            absent.insert((model.clone(), revision.clone()));
+            eprintln!("expected retired checkpoint not installed: {model}@{revision}");
             continue;
         }
         let snapshot = snapshot.unwrap_or_else(|| panic!("live checkpoint missing: {model}@{revision}"));
@@ -1012,9 +1021,14 @@ fn installed_release_and_example_families_match_dev_d6aecfcb7() {
         assert_eq!(detected, *pinned, "{model}@{revision}: changed from devd6aecfcb7");
         assert_ne!(detected, "minimax_m3");
         eprintln!("{model}@{revision}: {detected}");
+        installed.insert((model, revision));
         tested += 1;
     }
-    assert!(tested >= 29, "installed checkpoint coverage shrank: {tested}");
+    assert_eq!(absent, std::collections::BTreeSet::from([
+        (expected_absent.0.to_owned(), expected_absent.1.to_owned())]));
+    assert_eq!(installed.iter().map(|(model, revision)| (model.as_str(), revision.as_str()))
+        .collect::<std::collections::BTreeSet<_>>(), expected_installed);
+    assert_eq!(tested, 28, "installed checkpoint revision set changed");
     eprintln!("family detection baselined6aecfcb7: {tested} installed checkpoint revisions unchanged");
 }
 

@@ -402,6 +402,9 @@ fn vision_on_two_rtx_is_charged_by_the_joint_solve() {
 fn published_native_fixture() -> (tempfile::TempDir, serde_json::Value, Vec<crate::SafetensorsTensorMetadata>) {
     let fixture: serde_json::Value = serde_json::from_str(include_str!(
         "../../../../tests/fixtures/ml4-published-native-headers.json")).unwrap();
+    assert_eq!(fixture["shard_count"], 83);
+    assert_eq!(fixture["tensor_count"], 111091);
+    assert_eq!(fixture["coordinator_header_count"], 1721);
     let headers = fixture["headers"].as_object().unwrap().iter().map(|(name, value)| {
         let offsets = value["data_offsets"].as_array().unwrap();
         crate::SafetensorsTensorMetadata {

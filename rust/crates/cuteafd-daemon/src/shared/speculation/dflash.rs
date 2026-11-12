@@ -3247,7 +3247,7 @@ mod checkpoint_header_tests {
     }
 
     #[test]
-    fn ml4_target_resolves_real_consolidated_output_k6_headers() {
+    fn ml4_target_resolves_real_consolidated_output_bf16_headers() {
         use std::io::Write;
         let fixture = expert_only_snapshot();
         let publication: serde_json::Value = serde_json::from_str(include_str!(
@@ -3255,7 +3255,9 @@ mod checkpoint_header_tests {
         let headers = publication["headers"].as_object().unwrap().iter()
             .filter(|(name, _)| name.starts_with("output.")).map(|(name, header)| (name.clone(), header.clone()))
             .collect::<serde_json::Map<_, _>>();
-        assert_eq!(headers.len(), 4);
+        assert_eq!(headers.len(), 1);
+        assert_eq!(headers["output.weight"]["dtype"], "BF16");
+        assert_eq!(headers["output.weight"]["shape"], serde_json::json!([204800, 6144]));
         let extent = headers.values().map(|h| h["data_offsets"][1].as_u64().unwrap()).max().unwrap();
         let bytes = serde_json::to_vec(&headers).unwrap();
         let mut shard = std::fs::File::create(fixture.0.join("model-00073-of-00073.safetensors")).unwrap();

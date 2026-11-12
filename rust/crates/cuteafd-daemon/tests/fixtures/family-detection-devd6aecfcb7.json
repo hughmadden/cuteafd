@@ -122,11 +122,6 @@
       "family": "mistral_large4"
     },
     {
-      "model": "wrldsuksgo2mars/Mistral-Large-4-EXL3-K4-Core-K6",
-      "revision": "03c80aebaa483d55760703ae5bc0c9734c9d67d6",
-      "family": "mistral_large4"
-    },
-    {
       "model": "wrldsuksgo2mars/Muse-Spark-Open-EXL3-K4-Core-K6",
       "revision": "89998fb177acd9a862ac8bd4fb79bfd50e940c97",
       "family": "muse_spark"
