@@ -312,6 +312,42 @@ fn real_v41_full_plan_interleaved_sources_and_file_replay() -> Result<()> {
     Ok(())
 }
 
+#[test]
+fn v41_workspace_components_allocate_once_and_retain_independent_generations() -> Result<()> {
+    use cuteafd_loader::serving_capacity::v41_workspace;
+    use cuteafd_core::memory_layout::ArenaTag;
+    let fixture = cuteafd_ffi::native_library_lifetime_fixture::Fixture::build_for_tests()?;
+    let library = fixture.load()?;
+    fixture.immediate_copies(&library)?;
+    fixture.strict_device_free(&library, true)?;
+    for rank in 0..2 {
+        library.cuda_set_device(rank)?;
+        for layout in [v41_workspace::hc(1)?, v41_workspace::window(1, 1, &[0, 1], 256)?,
+            v41_workspace::engram(1, 256)?, v41_workspace::projection(1, 5120, 512, 256, true)?] {
+            let before = fixture.events()?;
+            let arena = workspace_arena(&library, layout.clone(), ArenaTag::workspace("test/v41-workspace"))?;
+            assert_eq!(arena.layout().bytes(), layout.bytes());
+            let views = layout.views().iter().map(|(name, view)| arena.view(name, view.bytes()))
+                .collect::<Result<Vec<_>>>()?;
+            for (index, view) in views.iter().enumerate() {
+                assert_eq!(view.buffer.ptr as usize % 256, 0);
+                let bytes = vec![index as u8; view.buffer.bytes.min(32)];
+                library.copy_h2d(view.buffer, &bytes)?;
+                let mut actual = vec![0; bytes.len()];
+                library.copy_d2h(&mut actual, view.buffer)?;
+                assert_eq!(actual, bytes);
+            }
+            assert_eq!(fixture.events()?.matches('D').count(), before.matches('D').count() + 1);
+            drop(arena);
+            assert_eq!(fixture.events()?.matches('d').count(), before.matches('d').count());
+            drop(views);
+            assert_eq!(fixture.events()?.matches('d').count(), before.matches('d').count() + 1);
+        }
+    }
+    assert_eq!(fixture.device_free_mismatch(&library)?.0, 0);
+    Ok(())
+}
+
 /// One physical backing per arena, recorded once under the arena's tag; every
 /// view reports that tag, and the arena-less standalone tag never applies to a view.
 #[test]

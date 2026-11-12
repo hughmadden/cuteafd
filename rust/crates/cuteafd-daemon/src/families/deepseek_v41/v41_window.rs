@@ -460,14 +460,17 @@ pub(crate) struct WindowStorage<'a> {
 impl<'a> WindowStorage<'a> {
     /// Plain scratch bytes for units of up to `unit` rows.
     pub fn scratch_bytes(library: &NativeLibrary, unit: u32) -> Result<usize> {
-        Ok(library.v41_fp8_matrix_plan_info(unit, 5120, 512)?.scratch_bytes as usize
-            + 4 + unit as usize * (10240 + 1024 + 1024 + 8 + 256))
+        let scratch = library.v41_fp8_matrix_plan_info(unit, 5120, 512)?.scratch_bytes as usize;
+        let layout = cuteafd_loader::serving_capacity::v41_workspace::window(unit as usize, unit as usize, &[0], scratch)?;
+        Ok(layout.view("layer0.values").context("window proposal boundary")?.offset())
     }
     /// One layer's planes over `rows` rows.
     pub fn plane_bytes(rows: usize) -> usize { rows * (512 + 16 + 8) }
     pub fn device_bytes(library: &NativeLibrary, rows: usize, unit: u32, layers: usize) -> Result<usize> {
         ensure!(unit >= 1 && unit as usize <= rows, "window unit {unit} outside {rows} rows");
-        Ok(Self::scratch_bytes(library, unit)? + layers * Self::plane_bytes(rows))
+        let scratch = library.v41_fp8_matrix_plan_info(unit, 5120, 512)?.scratch_bytes as usize;
+        Ok(cuteafd_loader::serving_capacity::v41_workspace::window(rows, unit as usize,
+            &(0..layers).collect::<Vec<_>>(), scratch)?.bytes())
     }
     /// Planes for `layers` over `rows` reserve rows, scratch for units of up to
     /// `unit` rows. Every wave on this storage issues on its one stream.
@@ -476,21 +479,28 @@ impl<'a> WindowStorage<'a> {
         ensure!(unit >= 1 && unit <= rows && rows <= crate::shared::memory::row_window::MAX_RESERVE_ROWS.max(4096)
             && layers.iter().all(|&l| l < 40), "invalid window storage of {rows} rows, {unit}-row units, layers {layers:?}");
         let fp8 = library.v41_fp8_matrix_plan(unit as u32, 5120, 512)?;
+        let arena = crate::shared::memory::weight_arena::workspace_arena(library,
+            cuteafd_loader::serving_capacity::v41_workspace::window(rows, unit, layers, fp8.info().scratch_bytes as usize)?,
+            cuteafd_core::memory_layout::ArenaTag::workspace("v41/window-proposal"))?;
+        let plane = |name: &str| -> Result<_> {
+            let bytes = arena.layout().view(name).context("window plane")?.bytes();
+            Ok(DeviceAllocation::from_allocation(arena.view(name, bytes)?))
+        };
         let value = Self {
             stream: LoadStream { library, raw: library.cuda_stream_create()? },
             commit_stream: LoadStream { library, raw: library.cuda_stream_create()? },
-            scratch: DeviceAllocation::new(library, fp8.info().scratch_bytes as usize, Tag::workspace("v41/window-proposal"))?,
-            alpha: DeviceAllocation::new(library, 4, Tag::workspace("v41/window-proposal"))?,
-            input: DeviceAllocation::new(library, unit * 10240, Tag::workspace("v41/window-proposal"))?,
-            projected: DeviceAllocation::new(library, unit * 1024, Tag::workspace("v41/window-proposal"))?,
-            normalized: DeviceAllocation::new(library, unit * 1024, Tag::workspace("v41/window-proposal"))?,
-            positions: DeviceAllocation::new(library, unit * 8, Tag::workspace("v41/window-proposal"))?,
-            frequencies: DeviceAllocation::new(library, unit * 256, Tag::workspace("v41/window-proposal"))?,
+            scratch: plane("scratch")?,
+            alpha: plane("alpha")?,
+            input: plane("input")?,
+            projected: plane("projected")?,
+            normalized: plane("normalized")?,
+            positions: plane("positions")?,
+            frequencies: plane("frequencies")?,
             planes: layers.iter().map(|&layer| Ok(WindowPlanes {
                 layer,
-                values: DeviceAllocation::attention_plane(library, rows, 512, "window proposal values", Tag::workspace("v41/window-proposal"))?,
-                scales: DeviceAllocation::attention_plane(library, rows, 16, "window proposal scales", Tag::workspace("v41/window-proposal"))?,
-                destinations: DeviceAllocation::new(library, rows * 8, Tag::workspace("v41/window-proposal"))?,
+                values: plane(&format!("layer{layer}.values"))?,
+                scales: plane(&format!("layer{layer}.scales"))?,
+                destinations: plane(&format!("layer{layer}.destinations"))?,
             })).collect::<Result<Vec<_>>>()?,
             fp8,
             rows,

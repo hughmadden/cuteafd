@@ -706,7 +706,8 @@ pub(crate) struct LaneStorage<'a> {
 impl<'a> LaneStorage<'a> {
     fn allocation_groups(rows: u32, query: usize, output: usize, shared: usize,
         sparse: usize, router: usize, placed: bool) -> [usize; 6] {
-        [2 * rows as usize * crate::families::deepseek_v41::v41_hc::HcStorage::ROW_BYTES,
+        [2 * cuteafd_loader::serving_capacity::v41_workspace::hc(rows as usize)
+            .expect("validated mHC reserve rows").bytes(),
             query, output, if placed { 0 } else { shared }, sparse, router]
     }
 

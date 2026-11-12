@@ -1,5 +1,4 @@
 //! Shared shifted mHC boundaries for backbone and dSpark sublayers.
-use crate::shared::memory::Tag;
 use crate::shared::memory::{DeviceAllocation, LoadStream};
 use crate::families::deepseek_v41::v41_tensors::NativeRtxTensors;
 use anyhow::{ensure, Context, Result};
@@ -35,18 +34,24 @@ impl<'library> HcStorage<'library> {
     fn new_mode(library: &'library NativeLibrary, rows: usize,
         standalone: Option<std::rc::Rc<crate::shared::memory::StandaloneStream<'library>>>) -> Result<std::rc::Rc<Self>> {
         ensure!((1..=crate::shared::memory::row_window::MAX_RESERVE_ROWS).contains(&rows), "invalid mHC storage rows {rows}");
+        let arena = crate::shared::memory::weight_arena::workspace_arena(library,
+            cuteafd_loader::serving_capacity::v41_workspace::hc(rows)?,
+            cuteafd_core::memory_layout::ArenaTag::workspace("v41/hc"))?;
+        let plane = |name| -> Result<_> {
+            Ok(DeviceAllocation::from_allocation(arena.view(name, arena.layout().view(name).context("mHC plane")?.bytes())?))
+        };
         Ok(std::rc::Rc::new(Self {
             stream: if standalone.is_none() { Some(LoadStream { library, raw: library.cuda_stream_create()? }) } else { None },
             standalone,
-            residual: DeviceAllocation::new(library, rows * 40960, Tag::workspace("v41/hc"))?,
-            incoming_pre: DeviceAllocation::new(library, rows * 16, Tag::workspace("v41/hc"))?,
-            next_pre: DeviceAllocation::new(library, rows * 16, Tag::workspace("v41/hc"))?,
-            post: DeviceAllocation::new(library, rows * 16, Tag::workspace("v41/hc"))?,
-            comb: DeviceAllocation::new(library, rows * 64, Tag::workspace("v41/hc"))?,
-            collapsed: DeviceAllocation::new(library, rows * 10240, Tag::workspace("v41/hc"))?,
-            normalized: DeviceAllocation::new(library, rows * 10240, Tag::workspace("v41/hc"))?,
-            sublayer: DeviceAllocation::new(library, rows * 10240, Tag::workspace("v41/hc"))?,
-            output: DeviceAllocation::new(library, rows * 40960, Tag::workspace("v41/hc"))?,
+            residual: plane("residual")?,
+            incoming_pre: plane("incoming_pre")?,
+            next_pre: plane("next_pre")?,
+            post: plane("post")?,
+            comb: plane("comb")?,
+            collapsed: plane("collapsed")?,
+            normalized: plane("normalized")?,
+            sublayer: plane("sublayer")?,
+            output: plane("output")?,
             rows,
         }))
     }
@@ -63,8 +68,6 @@ impl<'library> HcStorage<'library> {
             None => unsafe { self.residual.library.cuda_stream_synchronize(self.stream.as_ref().unwrap().raw) },
         }
     }
-    /// Bytes per row of every plane together.
-    pub(crate) const ROW_BYTES: usize = 112752;
 }
 impl Drop for HcStorage<'_> {
     fn drop(&mut self) {
@@ -178,7 +181,7 @@ impl<'weights, 'library> HcSublayer<'weights, 'library> {
 impl HcSublayer<'_, '_> {
     pub fn device_bytes(capacity: usize) -> Result<usize> {
         ensure!((1..=4096).contains(&capacity), "invalid mHC capacity");
-        Ok(capacity * 112752)
+        Ok(cuteafd_loader::serving_capacity::v41_workspace::hc(capacity)?.bytes())
     }
     /// Stable BF16 residual [capacity,4,5120] and incoming FP32 pre [capacity,4].
     /// The first stage starts with one-hot [1,0,0,0]; subsequent boundaries receive

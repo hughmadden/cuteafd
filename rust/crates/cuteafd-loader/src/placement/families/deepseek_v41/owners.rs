@@ -324,13 +324,19 @@ impl<'a> NativePrograms<'a> {
     }
 
     fn projection(&self, rows: u64, k: u64, n: u64) -> Result<u64> {
-        Ok(self.scratch(rows, k, n)? + rows * (k + n) * 2 + 4)
+        Ok(crate::serving_capacity::v41_workspace::projection(rows as usize, k as usize, n as usize,
+            self.scratch(rows, k, n)? as usize, true)?.bytes() as u64)
+    }
+
+    fn external_projection(&self, rows: u64, k: u64, n: u64) -> Result<u64> {
+        Ok(crate::serving_capacity::v41_workspace::projection(rows as usize, k as usize, n as usize,
+            self.scratch(rows, k, n)? as usize, false)?.bytes() as u64)
     }
 
     fn main_context(&self, rows: u64) -> Result<u64> {
         Ok(self.projection(rows, 15360, 5120)? + 3 * cuteafd_core::V41_WRITE_DESCRIPTOR_BYTES as u64
             + rows * (10240 + 256 + 8 + 3 * 1024)
-            + 3 * (self.projection(rows, 5120, 512)? - rows * 10240))
+            + 3 * self.external_projection(rows, 5120, 512)?)
     }
 
     /// The vocabulary GEMVs' split-K over 128-wide K blocks (gemv_tiles.cuh).
@@ -389,11 +395,13 @@ impl<'a> NativePrograms<'a> {
             let output = 4 + r * 92424 + self.scratch(u, 32768, 8192)? + self.scratch(u, 8192, 5120)?;
             let shared = if placed { 0 } else { self.shared_ffn(u)? + r * 20480 };
             let sparse = sparse64(u);
-            add(&mut out, "lane", 2 * r * 112752 + query + output + shared + sparse + r * 17105);
+            add(&mut out, "lane", 2 * crate::serving_capacity::v41_workspace::hc(r as usize)?.bytes() as u64
+                + query + output + shared + sparse + r * 17105);
             // Cache producers: window storage and the source compressor storage(s).
             let windows = if placed { (0..40).filter(|&l| v41_attention_gpu(l) == rank).count() as u64 } else { 40 };
             let window = if windows == 0 { 0 } else {
-                self.scratch(u, 5120, 512)? + 4 + u * (10240 + 1024 + 1024 + 8 + 256) + windows * r * (512 + 16 + 8)
+                crate::serving_capacity::v41_workspace::window(r as usize, u as usize,
+                    &(0..windows as usize).collect::<Vec<_>>(), self.scratch(u, 5120, 512)? as usize)?.bytes() as u64
             };
             let sources: Vec<u64> = [2u64, 8, 14, 20].into_iter()
                 .filter(|&l| !placed || v41_attention_gpu(l as usize) == rank).collect();
@@ -423,8 +431,8 @@ impl<'a> NativePrograms<'a> {
             let gates = [1usize, 14].iter().filter(|&&l| !placed || v41_attention_gpu(l) == rank).count() as u64;
             if gates > 0 {
                 add(&mut out, "engram rows", r * crate::ENGRAM_DEVICE_ROW_BYTES as u64);
-                add(&mut out, "engram gates", gates * (u * (40960 * 2 + 51200 + 24 * 512 + 1)
-                    + self.scratch(u, 6144, 25600)? + 4));
+                add(&mut out, "engram gates", gates * crate::serving_capacity::v41_workspace::engram(
+                    u as usize, self.scratch(u, 6144, 25600)? as usize)?.bytes() as u64);
             }
             if rank == ranks - 1 { add(&mut out, "target taps", r * 30720); }
             add(&mut out, "target heads", slots as u64 * self.head(ranks, rank, head_mode)?);
@@ -478,17 +486,19 @@ impl<'a> NativePrograms<'a> {
                 let sparse = rows * (64 * 2048 + 88)
                     + rows.min(cuteafd_core::V41_VERIFY_ROWS as u64) * (10 * 64 * 514 * 4 + 120);
                 let shared = if ranks == 1 { self.shared_ffn(rows)? + rows * 20480 } else { 0 };
-                add(&mut out, "backbone", 2 * rows * 112752 + query + output + sparse
+                add(&mut out, "backbone", 2 * crate::serving_capacity::v41_workspace::hc(rows as usize)?.bytes() as u64
+                    + query + output + sparse
                     + rows * (11825 + 5280) + shared);
                 // One shared window producer scratch per pass and GPU; each of
                 // the GPU's window layers keeps only its proposal and commit
                 // destinations until the accepted rows commit.
-                let window_scratch = self.scratch(rows, 5120, 512)? + 4 + rows * (10240 + 1024 + 1024 + 8 + 256);
-                let window_proposal = rows * (512 + 16 + 8);
+                let window = crate::serving_capacity::v41_workspace::window(rows as usize, rows as usize,
+                    &(0..if ranks == 1 { 40 } else { 20 }).collect::<Vec<_>>(),
+                    self.scratch(rows, 5120, 512)? as usize)?.bytes() as u64;
                 let compressor = |ratio2| BLAS + rows * if ratio2 {
                     10240 + 2048 + 2048 + 8 + 1024 + 264 + 512 + 68 + 8 + 288
                 } else { 10240 + 1024 + 1024 + 264 + 512 + 68 + 8 + 288 };
-                add(&mut out, "cache producers", window_scratch + window_proposal * if ranks == 1 { 40 } else { 20 }
+                add(&mut out, "cache producers", window
                     + if rank == 0 { 3 * compressor(true) } else { 0 }
                     + if rank == ranks - 1 { compressor(false) } else { 0 });
                 if window_batch {
@@ -508,8 +518,8 @@ impl<'a> NativePrograms<'a> {
                     // Keep it distinct from gate scratch so admission can assert
                     // k * unit_rows exactly, without charging the upload twice.
                     add(&mut out, "engram rows", rows * crate::ENGRAM_DEVICE_ROW_BYTES as u64);
-                    add(&mut out, "engram gates", 2 * (rows * (40960 * 2 + 51200 + 24 * 512 + 1)
-                        + self.scratch(rows, 6144, 25600)? + 4));
+                    add(&mut out, "engram gates", 2 * crate::serving_capacity::v41_workspace::engram(
+                        rows as usize, self.scratch(rows, 6144, 25600)? as usize)?.bytes() as u64);
                 }
                 if rank == ranks - 1 { add(&mut out, "target taps", index_rows * 30720); }
                 add(&mut out, "target head", self.head(ranks, rank, head_mode)?);
@@ -549,7 +559,8 @@ impl<'a> NativePrograms<'a> {
             + self.projection(capacity, 1280, 32768)?
             + self.projection(capacity, 5120, 512)?;
         let chain = 3 * (expert + self.shared_ffn(capacity)? + capacity * 128 * 4
-            + 2 * capacity * 112752 + attention) + members * 4;
+            + 2 * crate::serving_capacity::v41_workspace::hc(capacity as usize)?.bytes() as u64
+            + attention) + members * 4;
         let terminal = members * (width * VOCAB * 8 + (width + 2) * 4 + 16
             + width * 10240 + width * (40960 + 16)) + BLAS
             + members * (4 + 512 + VOCAB * 4) + BLAS

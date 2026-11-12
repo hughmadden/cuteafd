@@ -50,6 +50,25 @@ impl<'a, C: arena_class::Class> DeviceArena<'a, C> {
     }
 }
 
+/// Independent workspace sets retain their own backing through every plane view.
+/// The instance suffix distinguishes lanes and storage sets with identical layouts.
+pub(crate) fn workspace_arena<'a>(library: &'a cuteafd_ffi::NativeLibrary,
+    layout: cuteafd_loader::serving_capacity::WeightArenaLayout,
+    tag: ArenaTag<arena_class::ReadWrite>) -> Result<DeviceArena<'a, arena_class::ReadWrite>> {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let device = Device { library, id: library.cuda_get_device()? };
+    let id = format!("{}.gpu{}.{}", layout.id(), device.id,
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
+    let mut planes = layout.views().iter().collect::<Vec<_>>();
+    planes.sort_by_key(|(_, view)| view.offset());
+    let renamed = cuteafd_loader::serving_capacity::WeightArenaLayout::new(id,
+        planes.into_iter().map(|(name, view)| (name.clone(), view.bytes())))?;
+    ensure!(renamed.bytes() == layout.bytes() && renamed.views() == layout.views(),
+        "workspace arena identity changed its layout");
+    let layout = renamed;
+    DeviceArena::new(device, layout, tag)
+}
+
 /// Named immutable weights only; scratch, staging and temporary representations
 /// keep their own allocations and retirement. Nonadopted scopes stay standalone.
 /// With an arena, the view carries the arena's tag (a view never chooses its
