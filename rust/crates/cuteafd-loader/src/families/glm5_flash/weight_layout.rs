@@ -83,7 +83,6 @@ pub fn target(checkpoint: &Checkpoint, cfg: &GlmNextConfig, modes: &[LayerMode],
         let owner = match mode { LayerMode::Whole { gpu, .. } if ranks == 2 => Some(usize::from(gpu)), _ => None };
         let native_core = core.layer_weights(cfg, layer, ranks, owner.map(|r| r as u8))?;
         let native_attention = core.layer_native(cfg, layer, ranks, owner.map(|r| r as u8))?;
-        let native = core.projections.keys().chain(core.native.keys()).any(|stem| stem.starts_with(&format!("{p}.")));
         ensure!(owner.is_none_or(|owner| owner < ranks), "Flash arena attention owner outside ranks");
         for (rank, out) in requests.iter_mut().enumerate() {
             for site in ["attn", "ffn"] { for suffix in ["fn", "scale", "base"] {
@@ -100,7 +99,7 @@ pub fn target(checkpoint: &Checkpoint, cfg: &GlmNextConfig, modes: &[LayerMode],
             }
             match cfg.attention[layer] {
                 GlmNextAttention::Kda => {
-                    if native {
+                    if core.staged(&a("q_proj")) {
                         insert(out, format!("{p}.w_aux"), (elements(&a("f_a_proj.weight"))?
                             + elements(&a("g_a_proj.weight"))? + elements(&a("b_proj.weight"))?/ranks)*2)?;
                     } else {
@@ -135,7 +134,7 @@ pub fn target(checkpoint: &Checkpoint, cfg: &GlmNextConfig, modes: &[LayerMode],
                         "indexer.k_norm.weight", "indexer.k_norm.bias", "indexer.index_kpool_compress_ape"] { one(out, a(leaf))?; }
                     insert(out, format!("{}.uk", a("kv_b_proj.weight")), cfg.heads*cfg.qk_nope_dim*cfg.kv_lora_rank*2/parts)?;
                     insert(out, format!("{}.uv", a("kv_b_proj.weight")), cfg.heads*cfg.v_head_dim*cfg.kv_lora_rank*2/parts)?;
-                    if !core.staged(&a("q_a_proj")) && !native {
+                    if !core.staged(&a("q_a_proj")) {
                         fp8(out, vec![a("q_a_proj.weight"), a("kv_a_proj_with_mqa.weight")], 1, false)?;
                         fp8(out, vec![a("q_b_proj.weight")], parts, false)?;
                         fp8(out, vec![a("o_proj.weight")], parts, false)?;
@@ -146,11 +145,9 @@ pub fn target(checkpoint: &Checkpoint, cfg: &GlmNextConfig, modes: &[LayerMode],
                 }
                 GlmNextAttention::Mla => {}
             }
-            if !native {
-                let mlp = if cfg.dense[layer] { format!("{p}.mlp") } else { format!("{p}.mlp.shared_experts") };
-                if core.staged(&format!("{mlp}.gate_proj")) {
-                    // Native requests are inventoried above.
-                } else if cfg.dense[layer] && tensor(&format!("{mlp}.gate_proj.weight"))?.meta.dtype == DType::U8 {
+            let mlp = if cfg.dense[layer] { format!("{p}.mlp") } else { format!("{p}.mlp.shared_experts") };
+            if !core.staged(&format!("{mlp}.gate_proj")) {
+                if cfg.dense[layer] && tensor(&format!("{mlp}.gate_proj.weight"))?.meta.dtype == DType::U8 {
                     if rank == 0 { for proj in ["gate_proj", "up_proj", "down_proj"] {
                         one(out, format!("{mlp}.{proj}.weight"))?;
                         insert(out, format!("{mlp}.{proj}.weight_scale"), usize::try_from(tensor(&format!("{mlp}.{proj}.weight_scale"))?.meta.byte_length)?+8)?;
@@ -311,6 +308,15 @@ mod tests {
             let layouts = target(&checkpoint, &cfg, &modes, ranks, true, false, GlmfHeadFormat::Fp8, None)?;
             for (rank, layout) in layouts.iter().enumerate() {
                 check(layout);
+                for (layer, &kind) in cfg.attention.iter().enumerate() {
+                    if kind != GlmNextAttention::Kda { continue; }
+                    let p = format!("{PREFIX}layers.{layer}");
+                    let bytes = |leaf: &str| checkpoint.tensors.iter().find(|tensor|
+                        tensor.meta.name == format!("{p}.self_attn.{leaf}.weight")).unwrap().meta.byte_length as usize;
+                    let expected = bytes("f_a_proj") + bytes("g_a_proj") + bytes("b_proj") / ranks;
+                    assert_eq!(layout.views()[&format!("{p}.w_aux")].bytes(), expected.max(256),
+                        "staged KDA rank {rank}/{ranks}: f_a/g_a stay whole; only beta splits");
+                }
                 assert_eq!(layout.payload_bytes() as u64, old[rank].weights, "native rank {rank}/{ranks}");
                 for (layer, mode) in modes.iter().enumerate() {
                     if matches!(mode, LayerMode::Whole { gpu, .. } if usize::from(*gpu) != rank) {
@@ -319,6 +325,76 @@ mod tests {
                 }
             }
         }}
+        Ok(())
+    }
+
+    #[test]
+    fn mc_views_keep_operator_arenas_and_loader_groups_consistent() -> Result<()> {
+        use crate::{plan::{checkpoint::{CheckpointView, CoreView}, testing},
+            placement::{AttentionPlacement, FfnMode}};
+        use super::super::{core, resident::{resident_weights_placed, GlmfRepresentation}};
+        let root = tempfile::tempdir()?;
+        let mut config = testing::glm5_flash_config(4);
+        config["text_config"]["vocab_size"] = 256.into();
+        let cfg = GlmNextConfig::from_hf(&config)?;
+        testing::write_mc_snapshot(root.path(), &config, &testing::glm5_flash_tensors(&config), &core::expected(&cfg));
+        for view in [CoreView::Original, CoreView::K6Compact, CoreView::K8Compact, CoreView::Fp8Compact] {
+            let checkpoint = Checkpoint::open_view(&CheckpointView::select(root.path(), view)?)?;
+            let inventory = CoreInventory::from_checkpoint(&cfg, &checkpoint)?;
+            for ranks in [1, 2] { for owned in [false, true] {
+                if ranks == 1 && owned { continue; }
+                let placement = if owned { AttentionPlacement::Layers } else { AttentionPlacement::Heads };
+                let mut owner = 0;
+                let modes = cfg.attention.iter().map(|&kind| if owned && kind == GlmNextAttention::Mla {
+                    let mode = LayerMode::Whole { gpu: owner, ffn: FfnMode::Split };
+                    owner ^= 1; mode
+                } else { LayerMode::HeadSplit }).collect::<Vec<_>>();
+                let repr = GlmfRepresentation::default();
+                let mut previous = resident_weights_placed(&checkpoint, &cfg, 0, ranks, repr, placement, 0)
+                    .map_err(anyhow::Error::msg)?;
+                let layouts = target(&checkpoint, &cfg, &modes, ranks, false, false, GlmfHeadFormat::Auto,
+                    Some((0, previous[0].embedding as usize)))?;
+                for (layer, &kind) in cfg.attention.iter().enumerate() {
+                    let p = format!("{PREFIX}layers.{layer}");
+                    let a = format!("{p}.self_attn");
+                    let mlp = if cfg.dense[layer] { format!("{p}.mlp") } else { format!("{p}.mlp.shared_experts") };
+                    assert_eq!(inventory.staged_layer(&cfg, layer), view != CoreView::Original || kind == GlmNextAttention::Mla,
+                        "{view}: original KDA must keep fused attention beside staged BF16 FFN");
+                    let next = resident_weights_placed(&checkpoint, &cfg, layer + 1, ranks, repr, placement, 0)
+                        .map_err(anyhow::Error::msg)?;
+                    let mla_owner = match modes[layer] { LayerMode::Whole { gpu, .. } => Some(gpu), _ => None };
+                    let trellis = inventory.layer_weights(&cfg, layer, ranks, mla_owner)?;
+                    let native = inventory.layer_native(&cfg, layer, ranks, mla_owner)?;
+                    for (rank, layout) in layouts.iter().enumerate() {
+                        let layer_bytes = layout.views().iter().filter(|(name, _)| name.starts_with(&format!("{p}.")))
+                            .map(|(_, view)| view.bytes() as u64).sum::<u64>();
+                        assert_eq!(layer_bytes, next[rank].weights - previous[rank].weights,
+                            "{view} rank {rank}/{ranks} layer {layer} placement {placement:?}");
+                        for role in [&a, &mlp] {
+                            let staged_bytes = trellis[rank].values().filter(|w| w.stem.starts_with(&format!("{role}.")))
+                                .map(|w| w.bytes as u64).sum::<u64>()
+                                + native[rank].values().filter(|w| w.stem.starts_with(&format!("{role}.")))
+                                    .map(|w| w.bytes().unwrap()).sum::<u64>();
+                            let arena_bytes = layout.views().iter().filter(|(name, _)| name.starts_with(&format!("{role}."))
+                                && (name.ends_with(".payload") || name.ends_with(".scales") || name.contains(".trellis")
+                                    || name.ends_with(".suh") || name.ends_with(".svh") || name.ends_with(".mcg")))
+                                .map(|(_, view)| view.bytes() as u64).sum::<u64>();
+                            assert_eq!(arena_bytes, staged_bytes, "{view} rank {rank}/{ranks} role {role}");
+                        }
+                        if kind == GlmNextAttention::Kda {
+                            assert_eq!(layout.views().contains_key(&format!("{p}.w_in")), view == CoreView::Original);
+                            assert_eq!(layout.views().contains_key(&format!("{p}.w_aux")), view != CoreView::Original);
+                        }
+                    }
+                    previous = next;
+                }
+                for (rank, layout) in layouts.iter().enumerate() {
+                    check(layout);
+                    assert_eq!(layout.payload_bytes() as u64, previous[rank].embedding + previous[rank].weights,
+                        "{view} rank {rank}/{ranks} placement {placement:?}");
+                }
+            }}
+        }
         Ok(())
     }
 

@@ -37,11 +37,11 @@ Stored `k8-compact` and `k6-compact` views are offered by
 `wrldsuksgo2mars/Kimi-K3.1-Pro-EXL3-K2-MC`,
 `wrldsuksgo2mars/Muse-Spark-Open-EXL3-K4-MC` and
 `wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K4-MC`; `cuteafd-mc.json` declares the
-views actually present at the selected revision. Plain checkpoints do not acquire
-stored compact views through this option. Flash `fp8-compact` on qualified plain
-checkpoints explicitly converts its supported MLA/shared-FFN target projections;
-MC Flash refuses it until whole-core conversion is supported. KDA and target-head
-conversion remain separate opt-ins, and no precision lever changes KV defaults.
+views actually present at the selected revision. Plain checkpoints support only
+`original`, including checkpoints that previously accepted Flash `fp8-compact`.
+MC `fp8-compact` converts exactly the original variant's `core_tensors`; published
+Flash MCs include KDA and the target head. Explicit KDA/head conversion keys apply
+only beyond that metadata-selected scope. No precision lever changes KV defaults.
 
 ## How options are set
 

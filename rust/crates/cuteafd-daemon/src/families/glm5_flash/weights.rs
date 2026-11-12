@@ -916,7 +916,7 @@ impl<'a> GlmfLoader<'a> {
 
     pub fn layer(&self, cfg: &GlmNextConfig, layer: usize) -> Result<GlmfLayer<'a>> {
         let inventory = cuteafd_loader::families::glm5_flash::core::CoreInventory::from_checkpoint(cfg, self.checkpoint)?;
-        if inventory.projections.keys().chain(inventory.native.keys()).any(|stem| stem.starts_with(&format!("{PREFIX}layers.{layer}."))) {
+        if inventory.staged_layer(cfg, layer) {
             return self.native_layer_shares(cfg, layer, LayerMode::HeadSplit, &inventory)?
                 .into_iter().next().context("native Flash lead layer");
         }
@@ -1249,7 +1249,7 @@ impl<'a> GlmfLoader<'a> {
     /// docstring); without a split, [`Self::layer`] alone.
     pub fn layer_shares(&self, cfg: &GlmNextConfig, layer: usize, mode: LayerMode) -> Result<Vec<GlmfLayer<'a>>> {
         let inventory = cuteafd_loader::families::glm5_flash::core::CoreInventory::from_checkpoint(cfg, self.checkpoint)?;
-        if inventory.projections.keys().chain(inventory.native.keys()).any(|stem| stem.starts_with(&format!("{PREFIX}layers.{layer}."))) {
+        if inventory.staged_layer(cfg, layer) {
             return self.native_layer_shares(cfg, layer, mode, &inventory);
         }
         let ranks = self.ranks();
@@ -1517,7 +1517,7 @@ impl<'a> GlmfLoader<'a> {
         let mut shares: Vec<Vec<GlmfLayer<'a>>> = (0..self.ranks()).map(|_| Vec::new()).collect();
         ensure!(plan.modes().len() <= cfg.layers, "attention plan exceeds checkpoint layers");
         for (layer, &mode) in plan.modes().iter().enumerate() {
-            let native = inventory.projections.keys().chain(inventory.native.keys()).any(|stem| stem.starts_with(&format!("{PREFIX}layers.{layer}.")));
+            let native = inventory.staged_layer(cfg, layer);
             let parts = if native { self.native_layer_shares(cfg, layer, mode, &inventory)? }
                 else { self.layer_shares(cfg, layer, mode)? };
             for (share, part) in shares.iter_mut().zip(parts) { share.push(part); }

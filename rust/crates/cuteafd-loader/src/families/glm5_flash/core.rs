@@ -160,6 +160,15 @@ impl CoreInventory {
         self.projections.contains_key(stem) || self.native.contains_key(stem)
     }
 
+    /// The all-stage loader owns both operators; a staged FFN alone must not
+    /// divert a fused KDA attention group into that loader.
+    pub fn staged_layer(&self, cfg: &GlmNextConfig, layer: usize) -> bool {
+        let root = format!("{PREFIX}{layer}");
+        let mlp = if cfg.dense[layer] { "mlp" } else { "mlp.shared_experts" };
+        attention_leaves(cfg.attention[layer]).iter().all(|leaf| self.staged(&format!("{root}.self_attn.{leaf}")))
+            && ["gate_proj", "up_proj", "down_proj"].iter().all(|leaf| self.staged(&format!("{root}.{mlp}.{leaf}")))
+    }
+
     pub fn get_weight(&self, name: &str) -> Option<&CoreProjection> {
         self.projections.get(name.strip_suffix(".weight").unwrap_or(name))
     }
