@@ -176,7 +176,7 @@ mod tests {
                 // When MiniMax becomes servable, replace this refusal witness with the
                 // complete N8 launch/count-cap chain below rather than silently accepting it.
                 assert_eq!(report.runtime, Some(cuteafd_loader::plan::RuntimeStatus::Planned), "{key}: qualify the real launch chain");
-                assert!(!report.native_serving_admitted, "{key}: qualify the real launch chain");
+                assert!(!report.wip_launchable(), "{key}: qualify the real launch chain");
                 assert!(report.hints.iter().any(|hint| hint.what
                     == "planned family has no executable serving admission in this build"),
                     "{key}: wrong refusal: {:?}", report.hints);
