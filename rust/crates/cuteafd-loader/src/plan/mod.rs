@@ -1145,7 +1145,8 @@ fn plan_unrestricted(input: &PlanInput, options: &PlanOptions) -> Result<PlanRep
                       algorithm or spelling.".into(),
             });
             report.config_error = Some(error.to_string());
-            None
+            report.fits = false;
+            return Ok(report);
         }
     };
     report.quantization = modelopt.as_ref().map(|m| m.summary());
@@ -1211,6 +1212,7 @@ fn plan_unrestricted(input: &PlanInput, options: &PlanOptions) -> Result<PlanRep
                     (cuteafd-loader/src/families/{}/config.rs); extend it and the engine together.",
                     family.id(), family.id()),
             });
+            report.fits = false;
             report.config_error.get_or_insert_with(|| error.0.clone());
             return Ok(report);
         }

@@ -6768,3 +6768,25 @@ fn kimi_and_muse_refuse_host_embedding_before_placement() {
         assert!(report.memory_layout.unwrap().devices.is_empty());
     }
 }
+
+#[test]
+fn config_only_kimi_snapshot_does_not_fit() {
+    let dir = tempfile::tempdir().unwrap();
+    testing::write_snapshot(dir.path(), &testing::kimi_k3_config(), &[], None);
+    let report = plan(dir.path(), &sparks(6)).unwrap();
+    assert!(report.config_error.is_some());
+    assert!(!report.fits);
+    assert!(report.memory_layout.is_none());
+    assert!(!report.executable());
+}
+
+#[test]
+fn unreadable_quantization_metadata_does_not_fit() {
+    let dir = snapshot_tp(mimo_flash_config(), &mimo_flash_tensors(), Some(1));
+    std::fs::write(dir.path().join("hf_quant_config.json"), "not json").unwrap();
+    let report = plan(dir.path(), &sparks(4)).unwrap();
+    assert!(report.config_error.is_some());
+    assert!(!report.fits);
+    assert!(report.memory_layout.is_none());
+    assert!(!report.executable());
+}
