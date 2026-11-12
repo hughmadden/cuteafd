@@ -59,6 +59,10 @@ pub fn target(checkpoint: &Checkpoint, cfg: &GlmNextConfig, modes: &[LayerMode],
         for (name, bytes) in layout.arena_tensors(&layout.stem)? {
             ensure!(requests[0].insert(name.clone(), bytes).is_none(), "duplicate Flash K6 view {name}");
         }
+    } else if core.native.get("lm_head").is_some_and(|head| head.fp8) {
+        let [n, k] = core.native["lm_head"].shape;
+        insert(&mut requests[0], "lm_head.payload".into(), n*k)?;
+        insert(&mut requests[0], "lm_head.scales".into(), n/128*(k/128)*4)?;
     } else {
         match head.resolve(core.get_weight("lm_head").is_some(), ranks) {
             GlmfHeadFormat::Auto => unreachable!("head resolved"),
@@ -79,7 +83,7 @@ pub fn target(checkpoint: &Checkpoint, cfg: &GlmNextConfig, modes: &[LayerMode],
         let owner = match mode { LayerMode::Whole { gpu, .. } if ranks == 2 => Some(usize::from(gpu)), _ => None };
         let native_core = core.layer_weights(cfg, layer, ranks, owner.map(|r| r as u8))?;
         let native_attention = core.layer_native(cfg, layer, ranks, owner.map(|r| r as u8))?;
-        let native = core.projections.keys().any(|stem| stem.starts_with(&format!("{p}.")));
+        let native = core.projections.keys().chain(core.native.keys()).any(|stem| stem.starts_with(&format!("{p}.")));
         ensure!(owner.is_none_or(|owner| owner < ranks), "Flash arena attention owner outside ranks");
         for (rank, out) in requests.iter_mut().enumerate() {
             for site in ["attn", "ffn"] { for suffix in ["fn", "scale", "base"] {

@@ -34,7 +34,7 @@ pub(super) fn normalize(args: &mut EngineArgs) {
 pub(super) fn normalize_head(args: &mut EngineArgs, native_head: bool) {
     if native_head {
         if args.head_format != super::head::GlmfHeadFormat::Bf16 {
-            tracing::warn!(requested = args.head_format.setting(), "--fp8-head does not apply to the native K6 head");
+            tracing::warn!(requested = args.head_format.setting(), "--fp8-head does not apply to the metadata-selected native head");
         }
     }
     args.head_format = args.head_format.resolve(native_head, 1 + usize::from(args.split_device.is_some()));

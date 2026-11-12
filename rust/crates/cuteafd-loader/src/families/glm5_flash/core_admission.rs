@@ -135,6 +135,10 @@ impl CoreCharges {
             ensure!(matches.len() == 1, "Flash K6 requires one {name}");
             Ok(matches[0]["scratch_bytes_at_capacity"]["scratch"].as_u64().unwrap_or(0).try_into()?)
         };
+        if core.native.get("lm_head").is_some_and(|head| head.fp8) {
+            lookup("glmf_head_block_fp8")?;
+            programs.insert("glmf_head_block_fp8".into());
+        }
         let scratch = |rank: usize, decode: bool| -> Result<usize> {
             let mut bytes = 0;
             for name in route_stage_names(cfg, ranks, owned, decode, decode_rows).iter()

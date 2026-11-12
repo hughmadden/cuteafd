@@ -472,7 +472,9 @@ def glmf_stage_programs(g, decode_rows: int, prefill_rows: int):
                     partial(compile_glmf_projected_index_keys_aot, g, **params)))
     # Append standalone seams; never reorder the existing fused exports.
     for rows in sorted(decode_caps | {prefill_rows}):
-        shapes = {(g.q_lora_rank, g.heads*g.qk_nope_dim), (g.heads*g.v_head_dim, g.hidden),
+        shapes = {(g.hidden, g.dense_inter), (g.dense_inter, g.hidden),
+                  (g.hidden, g.moe_inter), (g.moe_inter, g.hidden),
+                  (g.q_lora_rank, g.heads*g.qk_nope_dim), (g.heads*g.v_head_dim, g.hidden),
                   (g.hidden, g.kda_width), (g.kda_width, g.hidden),
                   (g.hidden, g.q_lora_rank), (g.hidden, g.kv_lora_rank)}
         for k, n in sorted(shapes):
@@ -611,6 +613,39 @@ def mimo_head_split_programs(g, decode_rows: int, prefill_rows: int, max_context
     return [item for item in mimo_programs(g, decode_rows, prefill_rows, max_context) if item[0].startswith(keep)]
 
 
+def compile_glmf_head_block_fp8(g, vocab=154880):
+    """Block-128 FP8 vocabulary projection, sharing the canonical skinny GEMV."""
+    global cute, cuda, Int32
+    import torch
+    import cutlass
+    import cutlass.cute as cute
+    import cuda.bindings.driver as cuda
+    from cutlass import Int32
+    from b12x.integration.cuteafd._fp8_weights import MmaFp8Gemv, fp8_gemv_tuning, fp8_gemv_shipped_warps
+    from b12x.integration.cuteafd._common import Operand, Scalar, compile_program
+    warps, groups = fp8_gemv_tuning(vocab, g.hidden,
+        warps=fp8_gemv_shipped_warps(vocab, g.hidden, warps=4))
+
+    class Head:
+        def __init__(self):
+            self.gemv = MmaFp8Gemv(vocab, g.hidden, max_rows=16, warps=warps,
+                groups=groups, out_dtype=cutlass.Float32)
+
+        @cute.jit
+        def __call__(self, x: cute.Pointer, w_fp8: cute.Pointer, scale: cute.Pointer,
+                     logits: cute.Pointer, rows: Int32, stream: cuda.CUstream):
+            self.gemv(x, w_fp8, scale, logits, rows, stream)
+
+    launch = Head()
+    return compile_program(launch, name="glmf_head_block_fp8", operands=(
+        Operand("x", torch.bfloat16, f"[rows,{g.hidden}]"),
+        Operand("w_fp8", torch.uint8, f"[{vocab},{g.hidden}]"),
+        Operand("scale", torch.float32, f"[{vocab//128},{g.hidden//128}]", align=4),
+        Operand("logits", torch.float32, f"[rows,{vocab}]", "out")),
+        scalars=(Scalar("rows"),), key=(vocab, launch.gemv.key()),
+        geometry=dict(hidden=g.hidden, vocab=vocab, max_rows=16, scale_block=128))
+
+
 def glmf_programs(g, decode_rows: int, prefill_rows: int, max_context: int):
     """GLM 5.3 Flash programs, same (stem suffix, op, params, thunk) shape as ``programs``.
     mHC is the DeepSeek V4 program set at this model's width and epsilons."""
@@ -626,6 +661,7 @@ def glmf_programs(g, decode_rows: int, prefill_rows: int, max_context: int):
         ("mhc_post", "mhc_post", {}, lambda: mhc.compile_dsv4_mhc_post_aot(mg)),
         ("head", "head", {}, lambda: glmf.compile_glmf_head_aot(g)),
         ("head_fp8", "head_fp8", {}, lambda: glmf.compile_glmf_head_fp8_aot(g)),
+        ("head_block_fp8", "head_fp8", {}, lambda: compile_glmf_head_block_fp8(g)),
         ("add", "add", {}, lambda: glmf.compile_glmf_add_aot(g)),
         ("router_scores", "router_scores", {}, lambda: glmf.compile_glmf_router_scores_aot(g)),
         ("expert_input_quant", "expert_input_quant", {}, lambda: glmf.compile_glmf_expert_input_quant_aot(g)),

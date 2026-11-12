@@ -74,6 +74,8 @@ def exporter(monkeypatch):
     spec = importlib.util.spec_from_file_location("export_b12x_dsv4_aot_under_test", EXPORTER)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
+    monkeypatch.setattr(module, "compile_glmf_head_block_fp8",
+        lambda g: ("glmf", "compile_glmf_head_block_fp8", (g,), {}))
     return module
 
 
@@ -106,7 +108,7 @@ def test_flash_native_stage_catalog_preserves_projection_boundaries(exporter, in
     calls = {stem: (op, params, thunk()) for stem, op, params, thunk in programs}
     decode_caps = {decode_rows} | ({64} if decode_rows == 128 else set())
     caps = decode_caps | {prefill_rows}
-    assert len(calls) == len(programs) == 17 * len(caps)
+    assert len(calls) == len(programs)
     existing = []
     for rows in sorted(caps):
         existing.extend([f"kda_core_m{rows}", *[f"{stage}_m{rows}" for stage in ("rank_norm", "absorb", "values")],
@@ -116,7 +118,9 @@ def test_flash_native_stage_catalog_preserves_projection_boundaries(exporter, in
     existing.extend(f"index_projected_c_m{rows}" for rows in sorted(caps))
     existing += [f"index_projected_keys_m{rows}" for rows in sorted(caps)]
     shapes = sorted({(1536, 16384), (16384, 4096), (4096, 8192), (8192, 4096),
-                     (4096, 1536), (4096, 512)})
+                     (4096, 1536), (4096, 512),
+                     *[(k, n) for inter in intermediates for k, n in ((4096, inter), (inter, 4096))]})
+    assert len(calls) == (11 + len(shapes)) * len(caps)
     added = [f"fp8_linear_k{k}_n{n}_m{rows}" for rows in sorted(caps) for k, n in shapes]
     assert list(calls) == existing + added
     for rows in caps:
@@ -216,7 +220,7 @@ def test_flash_wide_native_stages_preserve_narrow_catalog(exporter):
     wide = exporter.glmf_stage_programs(GEOMETRY, 128, 4096)
     describe = lambda programs: {name: (op, params, thunk()) for name, op, params, thunk in programs}
     narrow, wide = describe(narrow), describe(wide)
-    assert len(narrow) == 34 and len(wide) == 51
+    assert len(narrow) == 42 and len(wide) == 63
     assert {name: wide[name] for name in narrow} == narrow
     assert all(name.endswith("_m128") for name in wide.keys() - narrow.keys())
     assert "g, max(args.decode_rows, args.glmf_wide_decode_rows), args.prefill_rows)" in EXPORTER.read_text()

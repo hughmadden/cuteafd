@@ -31,6 +31,7 @@ QUALIFICATION = {"kimi-k3-exl3-max.config", "kimi-k3-exl3-k6-min.config", "kimi-
 V4_PREP = {"qwen35-9b-bf16-min.config", "glm53-exlr8-min.config", "glm53-exlr8-max.config",
            "qwen38-27b-bf16-min.config", "qwen38-27b-fp8-min.config",
            "glm53f-exl3-k4-core-k6-min.config", "glm53f-exl3-k4-core-k6-max.config"}
+FP8_EXAMPLES = {"glm53-flash-exl3-k4-mc-fp8-max.config"}
 PRIVATE = ("raptor", "ostrich", "dodo", "emu", "kiwi", "rhea", "moa", "10.55.", "/home/", "/mnt/",
            "sparknest")
 
@@ -104,7 +105,7 @@ POOL_EXCEPTIONS = {("deepseek_v41", "POOL_TOKENS"): "auto"}
 
 
 def starting_configs() -> list[Path]:
-    return sorted(p for p in EXAMPLES.glob("*.config") if p.name not in QUALIFICATION | V4_PREP)
+    return sorted(p for p in EXAMPLES.glob("*.config") if p.name not in QUALIFICATION | V4_PREP | FP8_EXAMPLES)
 
 
 def keys(path: Path) -> dict[str, str]:
@@ -854,6 +855,24 @@ def test_checkpoint_onboarding_rejects_invalid_grammar(value):
                              "--onboard", value], capture_output=True, text=True)
     assert result.returncode != 0
     assert "RTX_EXPERT_LAYERS must be" in result.stderr
+
+
+@pytest.mark.parametrize("name", sorted(FP8_EXAMPLES))
+def test_mc_fp8_example_declares_only_activation_extras(name: str, tmp_path: Path) -> None:
+    values = keys(EXAMPLES / name)
+    assert values["CORE_VIEW"] == "fp8-compact"
+    assert values["GLM5_FLASH_FP8_PREFILL"] == "mla,ffn,kda-in,kda-o"
+    assert values["RTX_GPUS"] == "2" and values["SPARK_COUNT"] == "0"
+    assert "GLM5_FLASH_FP8_HEAD" not in values and "GLM5_FLASH_KDA_FP8" not in values
+    assert re.fullmatch("[0-9a-f]{40}", values["MODEL_REVISION"])
+    from test_run_family_dispatch import _family_launch_result, _snapshot
+    _snapshot(tmp_path / "hf", values["SPECULATOR_MODEL_ID"], {"model_type": "glmf_dflash"}, "draft-revision")
+    result = _family_launch_result(tmp_path, GLMF, values["MODEL_ID"],
+        "".join(f"{k}={v}\n" for k, v in values.items() if k not in ("MODEL_ID", "MODEL_REVISION")),
+        extra_args=("--wip", "mc-fp8-test"), encoder_plan=LOCAL_PLAN)
+    launch = _coordinator(result)
+    assert "--core-view fp8-compact" in launch
+    assert "--fp8-prefill mla,ffn,kda-in,kda-o" in launch
 
 
 @pytest.mark.parametrize("name", sorted(V4_PREP))

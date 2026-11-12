@@ -151,6 +151,31 @@ impl Checkpoint {
         self.view.as_ref().map_or(CoreView::Original, CheckpointView::mode)
     }
 
+    pub fn converts_to_fp8(&self, name: &str) -> bool {
+        self.view.as_ref().is_some_and(|view| view.converts_to_fp8(name))
+    }
+
+    /// Push conversion is selected per tensor, not by a family's global view mode.
+    pub fn projection_view(&self, stem: &str) -> CoreView {
+        if self.converts_to_fp8(&format!("{stem}.weight")) { CoreView::Fp8Compact }
+        else { CoreView::Original }
+    }
+
+    /// Families declare executable roles, never a second conversion selection.
+    pub fn validate_fp8_roles(&self, family: &str,
+        role: impl Fn(&str) -> (&'static str, bool)) -> Result<()> {
+        for name in self.view.iter().flat_map(|view| view.fp8_tensors()) {
+            let (role, supported) = role(name);
+            ensure!(supported, "{name}: role {role} cannot execute block FP8 in family {family}");
+            let header = self.header(name).with_context(|| format!("{name}: role {role} in family {family}: selected BF16 header missing"))?;
+            ensure!(header.dtype == cuteafd_core::DType::Bf16 && header.shape.len() == 2
+                && header.shape.iter().all(|dim| *dim > 0 && dim % 128 == 0),
+                "{name}: role {role} in family {family}: fp8-compact requires a BF16 matrix with whole 128x128 blocks, found {:?} {:?}",
+                header.dtype, header.shape);
+        }
+        Ok(())
+    }
+
     /// Whether a payload or classification header is available, independent of index membership.
     pub fn has_header(&self, name: &str) -> bool {
         self.header(name).is_some()

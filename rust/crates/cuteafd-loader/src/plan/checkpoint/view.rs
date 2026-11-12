@@ -21,6 +21,7 @@ pub struct CheckpointView {
     config: Arc<Value>,
     quantize_config: Option<Arc<Value>>,
     weight_map: Option<Arc<BTreeMap<String, String>>>,
+    fp8_tensors: Arc<Vec<String>>,
     pub(super) classification_headers: Arc<Vec<super::CheckpointTensor>>,
 }
 
@@ -61,7 +62,7 @@ impl CheckpointView {
     fn select_recipe(snapshot: &Path, mode: CoreView, recipe: &str) -> Result<Self> {
         let mc = Manifest::read(snapshot)?;
         let variant = mc.as_ref().map(|(manifest, _)| manifest.select(mode)).transpose()?;
-        ensure!(!mode.compact() || variant.is_some(),
+        ensure!(mode == CoreView::Original || variant.is_some(),
             "CORE_VIEW={mode} requires {MC_MANIFEST}; no compact view exists in a plain checkpoint");
         let config_name = variant.map_or("config.json", |v| v.config.as_str());
         let config_bytes = metadata_bytes(&snapshot.join(config_name))
@@ -75,22 +76,9 @@ impl CheckpointView {
         let allowed_quant = if variant.is_some() { quant_names.clone() } else {
             ["quantize_config.json", "quantization_config.json", "hf_quant_config.json"].map(str::to_owned).to_vec()
         };
-        if mode == CoreView::Fp8Compact {
-            let model_type = config.get("model_type").and_then(Value::as_str).unwrap_or("");
-            if mc.is_some() || model_type == "kimi_k31" {
-                let family = match model_type {
-                    "kimi_k3" | "kimi_k3_1" | "kimi_k31" | "kimi_linear" => Some("Kimi K3.1"),
-                    "glm_next" | "glm5_flash" | "glm5_next" | "glm5_next_text" => Some("GLM Flash"),
-                    _ => None,
-                };
-                if let Some(family) = family {
-                    anyhow::bail!("fp8-compact not yet supported for {family} MC original; whole-core FP8 pending");
-                }
-            }
-            ensure!(matches!(model_type, "glm_moe_dsa" | "glm5_moe" | "glm5" | "glm_next" | "glm5_flash" | "glm5_next" | "glm5_next_text"
-                | "kimi_k3" | "kimi_k3_1" | "kimi_k31" | "muse_spark" | "step3p5" | "step5" | "step5_vl"),
-                "CORE_VIEW=fp8-compact is unsupported for model_type={model_type}");
-        }
+        let fp8_tensors = if mode == CoreView::Fp8Compact {
+            variant.context("fp8-compact requires MC original core_tensors")?.core_tensors.clone()
+        } else { Vec::new() };
         let mut hash = Sha256::new();
         hash.update(b"cuteafd-core-view-v1\0");
         hash.update(mode.name());
@@ -134,7 +122,13 @@ impl CheckpointView {
         };
         Ok(Self { snapshot: snapshot.into(), mode, config_name: config_name.into(), index_name,
             quant_names, fingerprint: format!("{:x}", hash.finalize()), config: Arc::new(config),
-            quantize_config, weight_map, metadata_digests, classification_headers: Arc::default() })
+            quantize_config, weight_map, fp8_tensors: Arc::new(fp8_tensors), metadata_digests, classification_headers: Arc::default() })
+    }
+
+    /// The quant's original tensor IDs are the complete conversion definition.
+    pub fn fp8_tensors(&self) -> &[String] { &self.fp8_tensors }
+    pub fn converts_to_fp8(&self, name: &str) -> bool {
+        self.fp8_tensors.binary_search_by(|tensor| tensor.as_str().cmp(name)).is_ok()
     }
 
     pub fn snapshot(&self) -> &Path { &self.snapshot }

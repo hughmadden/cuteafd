@@ -1926,7 +1926,25 @@ fn native_outputs_snapshot() -> tempfile::TempDir {
 #[test]
 fn fp8_compact_step_outputs_and_mtp_have_exact_final_storage() -> anyhow::Result<()> {
     use crate::plan::checkpoint::{CoreView, CheckpointView};
+    for rows in [1, 64, 4096] {
+        for heads in [32, 64] {
+            assert_eq!(native::swa_planes(rows, heads)?[native::SWA_OUTPUT_SCRATCH], native::OUTPUT_SCRATCH_BYTES);
+        }
+        assert_eq!(native::csa_planes(rows)?[native::CSA_OUTPUT_SCRATCH], native::OUTPUT_SCRATCH_BYTES);
+    }
     let fixture = native_outputs_snapshot();
+    let original = Checkpoint::open(fixture.path())?;
+    let expected = exl3::expected(&Config::parse(&original)?);
+    let mut tensors = original.tensors.iter().filter(|tensor| !expected.keys().any(|name|
+        tensor.meta.name.starts_with(&format!("{}.", name.strip_suffix(".weight").unwrap()))))
+        .map(|tensor| (tensor.meta.name.clone(),
+            match tensor.meta.dtype { DType::Bf16 => "BF16", DType::F16 => "F16", DType::F32 => "F32",
+                DType::I16 => "I16", DType::I32 => "I32", DType::U8 => "U8", DType::F8E4M3 => "F8_E4M3",
+                _ => panic!("fixture dtype") }, tensor.meta.shape.clone())).collect::<Vec<_>>();
+    tensors.extend(expected.iter().map(|(name, shape)| (name.clone(), "BF16", shape.clone())));
+    let shapes = original.tensors.iter().filter(|tensor| tensor.meta.name.ends_with(".self_attn.o_proj.weight"))
+        .map(|tensor| (tensor.meta.name.clone(), tensor.meta.shape.clone())).collect();
+    testing::write_mc_snapshot(fixture.path(), &original.config, &tensors, &shapes);
     let fp8 = Checkpoint::open_view(&CheckpointView::select(fixture.path(), CoreView::Fp8Compact)?)?;
     let bf16 = Checkpoint::open_view(&CheckpointView::select(fixture.path(), CoreView::Original)?)?;
     let cfg = Config::parse(&fp8)?;
@@ -1958,7 +1976,7 @@ fn fp8_compact_step_outputs_and_mtp_have_exact_final_storage() -> anyhow::Result
     let mtp = coordinator::RankWeightLayout::mtp_from_contract(&fp8, &contract, 3)?;
     selection.validate_layout(&mtp, 2048)?;
     assert_eq!(mtp.operands.iter().filter(|w| w.dtype == DType::F8E4M3).count(), 3);
-    // Final storage admission also proves the dead trellis plane covers the selected ABI.
+    // Final storage admission validates the dedicated output scratch ABI.
     for rows in [1, 64, 65, 2048, 4096] {
         use crate::placement::inventory::ProgramsManifest;
         use cuteafd_ffi::draft_projection::ProjectionOutput;

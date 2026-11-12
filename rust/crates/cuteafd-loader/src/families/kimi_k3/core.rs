@@ -387,6 +387,13 @@ impl CoreInventory {
     /// Both native MCG and MUL1 keep their own unpacked H128 vectors.
     pub fn from_checkpoint(cfg: &KimiK3Config, checkpoint: &Checkpoint,
         expected: &BTreeMap<String, Vec<usize>>) -> Result<Self> {
+        checkpoint.validate_fp8_roles("Kimi", |name| {
+            let stem = name.strip_suffix(".weight").unwrap_or(name);
+            let role = if stem.ends_with("lm_head") { "vocabulary head" }
+                else if stem.contains(".self_attn.") { "attention projection" }
+                else if stem.contains(".mlp.") { "FFN projection" } else { "non-core" };
+            (role, false)
+        })?;
         let projections = crate::formats::trellis_core::read_projections(checkpoint, expected,
             |name| !name.contains(".experts.")
                 && (name.starts_with("language_model.model.") || name.starts_with("language_model.lm_head.")),
@@ -412,11 +419,8 @@ impl CoreInventory {
                 "{stem}: Kimi native attention requires BF16 {shape:?}, found {dtype:?} {actual:?}");
             native.insert(stem.into(), crate::formats::native_attention::NativeProjection {
                 shape: [shape[0], shape[1]], split: split(stem).unwrap(),
-                fp8: checkpoint.core_view() == crate::plan::checkpoint::CoreView::Fp8Compact });
+                fp8: checkpoint.converts_to_fp8(&format!("{stem}.weight")) });
         }
-        ensure!(checkpoint.core_view() != crate::plan::checkpoint::CoreView::Fp8Compact
-            || !native.is_empty(),
-            "CORE_VIEW=fp8-compact has no supported conversion scope for this all-native core; use original until the native projection path supports conversion");
         let largest_selected_dense_bytes = (!native.is_empty()).then(|| checkpoint.weight_map.keys()
             .filter(|name| !name.contains(".experts."))
             .filter_map(|name| checkpoint.header(name))

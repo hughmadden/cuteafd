@@ -61,7 +61,7 @@ pub(super) struct Variant {
     pub config: String,
     pub quantize: String,
     core_bits: u8,
-    core_tensors: Vec<String>,
+    pub(super) core_tensors: Vec<String>,
     metadata_sha256: BTreeMap<String, String>,
     fingerprint: String,
 }
@@ -227,6 +227,26 @@ mod tests {
         Ok(())
     }
     #[test]
+    fn fp8_selection_uses_exact_original_ids_without_opening_alternate_metadata() -> Result<()> {
+        let dir = copy_fixture();
+        let original = CheckpointView::select(dir.path(), CoreView::Original)?;
+        let expected = Manifest::read(dir.path())?.unwrap().0.select(CoreView::Original)?.core_tensors.clone();
+        for mode in [CoreView::K6Compact, CoreView::K8Compact] {
+            for file in mode.files() { std::fs::remove_file(dir.path().join(file))?; }
+        }
+        let selected = CheckpointView::select(dir.path(), CoreView::Fp8Compact)?;
+        assert_eq!(selected.fp8_tensors(), expected);
+        assert_eq!(selected.index_path(), original.index_path());
+        assert_ne!(selected.fingerprint(), original.fingerprint());
+        for name in selected.weight_map().unwrap().keys() {
+            assert_eq!(selected.converts_to_fp8(name), expected.contains(name), "{name}");
+        }
+        std::fs::remove_file(dir.path().join(MC_MANIFEST))?;
+        assert!(CheckpointView::select(dir.path(), CoreView::Fp8Compact).unwrap_err().to_string()
+            .contains("requires cuteafd-mc.json"));
+        Ok(())
+    }
+    #[test]
     fn selected_bytes_are_authenticated_and_immutable() -> Result<()> {
         let dir = copy_fixture();
         let selected = CheckpointView::select(dir.path(), CoreView::K8Compact)?;
@@ -270,8 +290,11 @@ mod family_tests {
             let role = Checkpoint::open_view_for_role(&selected, "experts", |n| n.contains(".experts."))?;
             assert!(role.tensors.iter().all(|t| t.meta.name.contains(".experts.")));
         }
-        let error = CheckpointView::select(dir.path(), CoreView::Fp8Compact).unwrap_err();
-        assert!(error.to_string().contains("fp8-compact not yet supported for Kimi K3.1 MC original"));
+        let fp8 = Checkpoint::open_view(&CheckpointView::select(dir.path(), CoreView::Fp8Compact)?)?;
+        let cfg = KimiK3Config::from_hf(&fp8.config)?;
+        let expected = tensors.iter().map(|(name, _, shape)| (name.clone(), shape.clone())).collect();
+        let error = CoreInventory::from_checkpoint(&cfg, &fp8, &expected).unwrap_err().to_string();
+        assert!(error.contains("lm_head.weight") && error.contains("vocabulary head") && error.contains("Kimi"), "{error}");
         Ok(())
     }
 
@@ -313,12 +336,14 @@ mod family_tests {
         }
         assert_eq!(identities.len(), 3);
         assert!(bytes[0] > bytes[1] && bytes[1] > bytes[2], "{bytes:?}");
-        assert!(CheckpointView::select(dir.path(), CoreView::Fp8Compact).unwrap_err().to_string()
-            .contains("whole-core FP8 pending"));
+        let fp8 = Checkpoint::open_view(&CheckpointView::select(dir.path(), CoreView::Fp8Compact)?)?;
+        let expected = tensors.iter().map(|(name, _, shape)| (name.clone(), shape.clone())).collect();
+        let error = CoreInventory::from_checkpoint(&cfg, &fp8, &expected).unwrap_err().to_string();
+        assert!(error.contains("lm_head.weight") && error.contains("Kimi"), "{error}");
         let plain = tempfile::tempdir()?;
         testing::write_snapshot(plain.path(), &config, &tensors, None);
         assert!(CheckpointView::select(plain.path(), CoreView::Fp8Compact).unwrap_err().to_string()
-            .contains("whole-core FP8 pending"));
+            .contains("requires cuteafd-mc.json"));
         assert!(CheckpointView::select(plain.path(), CoreView::K8Compact).is_err());
         Ok(())
     }
@@ -351,13 +376,8 @@ mod family_tests {
         }
         assert!(bytes[0] > bytes[2] && bytes[2] > bytes[1]);
         let fp8 = Checkpoint::open_view(&CheckpointView::select(dir.path(), CoreView::Fp8Compact)?)?;
-        let fp8_core = CoreInventory::from_checkpoint(&cfg, &fp8)?;
-        assert!(!fp8_core.native.is_empty() && fp8_core.native.values().all(|p| p.fp8));
-        let pair = LayerLayout::ranks(&cfg, 0, 2, &fp8_core)?;
-        let fp8_bytes: usize = pair.iter().map(|l| l.operands.values().sum::<usize>()
-            + l.core.values().map(|c| c.bytes).sum::<usize>()
-            + l.native.values().map(|n| n.bytes().unwrap() as usize).sum::<usize>()).sum();
-        assert!(fp8_bytes < bytes[0], "attention-only conversion changes resident format and bytes");
+        let error = CoreInventory::from_checkpoint(&cfg, &fp8).unwrap_err().to_string();
+        assert!(error.contains("lm_head.weight") && error.contains("vocabulary head") && error.contains("Muse"), "{error}");
         Ok(())
     }
 
@@ -382,8 +402,41 @@ mod family_tests {
             else { assert!(core.projections.values().all(|p| p.bits == bits)); }
             for layer in 0..cfg.layers { core.layer_weights(&cfg, layer, 2, None)?; }
         }
-        let error = CheckpointView::select(dir.path(), CoreView::Fp8Compact).unwrap_err();
-        assert!(error.to_string().contains("fp8-compact not yet supported for GLM Flash MC original"));
+        let selected = CheckpointView::select(dir.path(), CoreView::Fp8Compact)?;
+        let checkpoint = Checkpoint::open_view(&selected)?;
+        let core = CoreInventory::from_checkpoint(&cfg, &checkpoint)?;
+        assert!(core.projections.is_empty());
+        assert_eq!(core.native.len(), shapes.len());
+        assert!(core.native.iter().all(|(stem, weight)| weight.fp8 && selected.converts_to_fp8(&format!("{stem}.weight"))));
+        let arenas = crate::families::glm5_flash::weight_layout::target(&checkpoint, &cfg,
+            &vec![crate::placement::LayerMode::HeadSplit; cfg.layers], 2, false, false,
+            crate::families::glm5_flash::resident::GlmfHeadFormat::Bf16, None)?;
+        for (rank, arena) in arenas.iter().enumerate() {
+            for layer in 0..cfg.layers {
+                for layout in core.layer_native(&cfg, layer, 2, None)?[rank].values() {
+                    let [n, k] = layout.shape;
+                    assert_eq!(arena.view(&format!("{}.payload", layout.stem)).unwrap().bytes(), n*k);
+                    assert_eq!(arena.view(&format!("{}.scales", layout.stem)).unwrap().bytes(), n/128*(k/128)*4);
+                    assert!(arena.view(&format!("{}.weight", layout.stem)).is_none());
+                }
+            }
+            assert_eq!(arena.bytes(), arena.payload_bytes() + arena.padding_bytes());
+        }
+        let [n, k] = core.native["lm_head"].shape;
+        assert_eq!(arenas[0].view("lm_head.payload").unwrap().bytes(), n*k);
+        assert_eq!(arenas[0].view("lm_head.scales").unwrap().bytes(), (n/128*(k/128)*4).max(256));
+        assert!(arenas.iter().all(|arena| arena.view("lm_head.weight").is_none()));
+
+        // Selecting only one member stages its BF16 siblings without converting them.
+        let subset = std::collections::BTreeMap::from([(
+            "model.language_model.layers.0.self_attn.q_proj.weight".to_owned(),
+            shapes["model.language_model.layers.0.self_attn.q_proj.weight"].clone())]);
+        testing::write_mc_snapshot(dir.path(), &config, &tensors, &subset);
+        let checkpoint = Checkpoint::open_view(&CheckpointView::select(dir.path(), CoreView::Fp8Compact)?)?;
+        let core = CoreInventory::from_checkpoint(&cfg, &checkpoint)?;
+        assert_eq!(core.native.values().filter(|weight| weight.fp8).count(), 1);
+        assert!(core.native["model.language_model.layers.0.self_attn.q_proj"].fp8);
+        assert!(!core.native["model.language_model.layers.0.self_attn.k_proj"].fp8);
         Ok(())
     }
 }

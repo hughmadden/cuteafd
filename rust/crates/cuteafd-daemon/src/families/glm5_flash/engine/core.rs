@@ -127,7 +127,8 @@ impl<'a> GlmfEngine<'a> {
     pub(crate) fn bind_core(&mut self, admission: Option<CoreCharges>) -> Result<()> {
         ensure!(self.core.is_empty() && self.core_admission.is_none(), "Flash K6 bound twice");
         let loaded = self.weights.layers.iter().chain(self.peer.iter().flat_map(|p| p.layers.iter()))
-            .any(|l| !l.core.is_empty() || !l.attention_native.is_empty()) || matches!(self.weights.head, GlmfHead::K6(_));
+            .any(|l| !l.core.is_empty() || !l.attention_native.is_empty())
+            || matches!(self.weights.head, GlmfHead::K6(_) | GlmfHead::BlockFp8 { .. });
         if !loaded { ensure!(admission.is_none(), "Flash K6 admission without weights"); return Ok(()); }
         if self.weights.layers.iter().any(|l| l.core.contains_key("self_attn.q_proj")) {
             ensure!(self.kda_state == KdaState::F32 && !self.kda_output_shard,
@@ -216,6 +217,10 @@ impl<'a> GlmfEngine<'a> {
                 if weights.layout.fp8 {
                     let prefix = if layer.attention_share.split() { "glmf2_stage" } else { "glmf_stage" };
                     let capacity = if is_decode(cap) { if cap == "m128" { 128 } else { 64 } } else { 4096 };
+                    let a8 = if name.starts_with("mlp.") { self.fp8_prefill.ffn }
+                        else if layer.attention == GlmNextAttention::Kda {
+                            self.fp8_prefill.kda_bits & if name.ends_with("o_proj") { 2 } else { 1 } != 0
+                        } else { self.fp8_prefill.mla };
                     let name = fp8_projection_name(prefix, weights.layout.shape, capacity);
                     let program = self.programs.program(&name, &["x", "weight", "scales", "out", "scratch"])?;
                     let scratch = w.core.as_ref().context("Flash FP8 slot")?.stage("scratch")?;
@@ -224,7 +229,7 @@ impl<'a> GlmfEngine<'a> {
                     // remain live on this stream throughout graph replay.
                     return unsafe { program.launch(&[input.ptr, weights.values.buffer.ptr, scales.ptr,
                         output.ptr, scratch.ptr], &self.fp8_scalars(Scalar::I32(i32::try_from(rows)?),
-                            is_decode(cap), true), self.stream_of(rank)) };
+                            is_decode(cap), is_decode(cap) || a8), self.stream_of(rank)) };
                 }
                 // SAFETY: selected rank slice and retained stage buffers cover the
                 // checked BF16 geometry and remain live throughout graph replay.

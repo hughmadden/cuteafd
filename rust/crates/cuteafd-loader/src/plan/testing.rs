@@ -1801,6 +1801,9 @@ pub fn write_mc_snapshot(dir: &Path, config: &Value, tensors: &[Tensor],
             .map(|stem| (stem.to_owned(), shape[2]/16, shape[0]*16, shape[1]*16))).collect::<Vec<_>>();
         let mut cfg = config.clone();
         let mut compact = exl3_compact(4);
+        if let Some(source) = config.get("quantization_config").and_then(Value::as_object) {
+            compact.as_object_mut().unwrap().extend(source.clone());
+        }
         compact["per_module_metadata"] = json!(format!("{quant_name}:tensor_storage"));
         cfg["quantization_config"] = compact.clone();
         cfg["transformers_weights"] = json!(index_name);

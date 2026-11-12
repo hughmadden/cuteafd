@@ -20,8 +20,7 @@ BASE_REPO = "wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K3.25-v1"
 BASE_REVISION = "0490d2f708b12145f6516555ab066aaeb401cd21"
 FP8_REPO = "zai-org/GLM-5.3-Flash"
 FP8_REVISION = "eb9eb208eb0d988989d07a6a12d0fdeb5f52574a"
-CONTRACT = (Path(__file__).resolve().parents[2] / "rust/crates/cuteafd-loader/src/"
-            "families/glm5_flash/core-fp8-projections.json")
+CONTRACT = Path(__file__).with_name("vendor-fp8-projections.json")
 
 
 def read_json(path):
@@ -93,7 +92,7 @@ class Hashes:
 
 
 def selection(base, fp8):
-    """Expand the runtime loader's projection contract, not a second tensor list."""
+    """Select the historical vendor-native stitch; unrelated to runtime MC conversion."""
     cfg = read_json(base.root / "config.json")
     text = cfg.get("text_config", cfg)
     contract = read_json(CONTRACT)

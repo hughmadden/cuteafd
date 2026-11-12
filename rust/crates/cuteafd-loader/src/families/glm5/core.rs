@@ -58,7 +58,7 @@ pub fn validate_attention_format(cfg: &GlmDsaConfig, layer: usize, inventory: &C
 /// Validate the whole declared publication, including unused MTP projections.
 /// Serving owners below deliberately stop at the backbone's `cfg.layers`.
 pub fn validate_native_attention(cfg: &GlmDsaConfig, checkpoint: &Checkpoint) -> Result<()> {
-    use crate::plan::checkpoint::{CoreView, ProjectionStorage};
+    use crate::plan::checkpoint::ProjectionStorage;
     use cuteafd_core::DType;
     if !cfg.variant.is_glm() { return Ok(()); }
     let layers = cfg.layers.checked_add(cfg.mtp_layers).context("GLM publication layer overflow")?;
@@ -90,7 +90,7 @@ pub fn validate_native_attention(cfg: &GlmDsaConfig, checkpoint: &Checkpoint) ->
                 } else {
                     crate::formats::native_attention::fp8_scale(&projection, &stem)?;
                 }
-                if checkpoint.core_view() == CoreView::Fp8Compact {
+                if checkpoint.converts_to_fp8(&format!("{stem}.weight")) {
                     return Err(crate::formats::native_attention::UnsupportedFp8Conversion {
                         tensor: format!("{stem}.weight"), found: "E4M3".into() }.into());
                 }
@@ -195,6 +195,13 @@ impl CoreInventory {
                 && !leaf.starts_with("experts.") && !leaf.contains(".experts."));
         // kv_a may store N128 padding (RoPE latent N576 -> N640).
         let kv_a: std::collections::BTreeSet<String> = (0..cfg.layers).filter_map(|l| cfg.stem(l, Op::KvA)).collect();
+        checkpoint.validate_fp8_roles("GLM", |name| {
+            let stem = name.strip_suffix(".weight").unwrap_or(name);
+            let role = if stem.ends_with("lm_head") { "vocabulary head" }
+                else if stem.contains(".self_attn.") { "attention projection" }
+                else if stem.contains(".mlp.") { "FFN projection" } else { "non-core" };
+            (role, false)
+        })?;
         let projections = read_projections(checkpoint, &expected(cfg), selected,
             |stem| split(cfg, stem).map(|split| CoreContract { family: if cfg.variant.is_glm() { "GLM 5.3" } else { "Mistral Large 4" }, widths: NATIVE_CORE_WIDTHS, split,
                 padded_outputs: kv_a.contains(stem) }))?;
@@ -218,14 +225,14 @@ impl CoreInventory {
                     "{stem}: native core requires BF16/E4M3 shape {expected:?}, found {dtype:?} {shape:?}");
                 if *dtype == cuteafd_core::DType::F8E4M3 {
                     crate::formats::native_attention::fp8_scale(&selected, &stem)?;
-                    if checkpoint.core_view() == crate::plan::checkpoint::CoreView::Fp8Compact {
+                    if checkpoint.converts_to_fp8(&format!("{stem}.weight")) {
                         return Err(crate::formats::native_attention::UnsupportedFp8Conversion {
                             tensor: format!("{stem}.weight"), found: "E4M3".into() }.into());
                     }
                 }
-                inventory.native.insert(stem, NativeProjection { shape: [shape[0], shape[1]], split,
+                inventory.native.insert(stem.clone(), NativeProjection { shape: [shape[0], shape[1]], split,
                     fp8: *dtype == cuteafd_core::DType::F8E4M3
-                        || checkpoint.core_view() == crate::plan::checkpoint::CoreView::Fp8Compact });
+                        || checkpoint.converts_to_fp8(&format!("{stem}.weight")) });
             }
         }
         inventory.validate_groups(cfg)?;

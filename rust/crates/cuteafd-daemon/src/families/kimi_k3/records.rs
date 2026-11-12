@@ -299,7 +299,7 @@ impl<'l, 'a> KimiRecords<'l, 'a> {
                     DeviceAllocation::from_allocation(scoped.allocate(device, &format!("{name}.values"), (n * k * if layout.fp8 { 1 } else { 2 }).max(256))?),
                     if layout.fp8 { Some(DeviceAllocation::from_allocation(scoped.allocate(device, &format!("{name}.scales"), (n.div_ceil(128) * k.div_ceil(128) * 4).max(256))?)) } else { None },
                 )))?;
-                let records = attention_records(&scoped.checkpoint.snapshot, &selected, scoped.checkpoint.core_view(),
+                let records = attention_records(&scoped.checkpoint.snapshot, &selected, scoped.checkpoint.projection_view(&layout.stem),
                     layout, crate::shared::fp8_linear::Fp8Scales::Amax, values.buffer,
                     scales.as_ref().map(|scales| scales.buffer))?;
                 let stream = scoped.streams.iter().find(|(id, _)| *id == device.id)
