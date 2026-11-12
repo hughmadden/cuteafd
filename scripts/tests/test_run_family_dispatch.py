@@ -3031,35 +3031,16 @@ def test_packed_prefill_mode_rejects_unknown_value(tmp_path):
     assert result.returncode == 2 and "PREFILL_PACKING must be unrestricted or exact" in result.stderr
 
 
-def test_glmf_default_launch_passes_no_admission_option(tmp_path):
-    """Packed admission prefill is opt-in; the default keeps one pass per prompt."""
-    result = _family_launch_result(tmp_path, GLMF_CONFIG, "test/glmf", "")
-    assert result.returncode == 0, result.stderr
-    launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-glmf" in line)
-    assert "--prefill-batch" not in launch, launch
-
-
-@pytest.mark.parametrize("keys,expected,absent", [
-    ("GLM5_FLASH_PREFILL_BATCH=off\n", (), ("--prefill-batch",)),
-    ("GLM5_FLASH_PREFILL_BATCH=on\n", ("--prefill-batch",), ()),
-])
-def test_glmf_admission_keys_are_forwarded(tmp_path, keys, expected, absent):
+@pytest.mark.parametrize("mode", [None, "unrestricted", "exact"])
+def test_glmf_shared_packing_option_needs_no_batch_gate(tmp_path, mode):
+    keys = f"PREFILL_PACKING={mode}\n" if mode else ""
     result = _family_launch_result(tmp_path, GLMF_CONFIG, "test/glmf", keys)
     assert result.returncode == 0, result.stderr
-    launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-glmf" in line)
-    for option in expected:
-        assert option in launch, (option, launch)
-    for option in absent:
-        assert option not in launch, (option, launch)
-
-
-@pytest.mark.parametrize("keys,message", [
-    ("GLM5_FLASH_PREFILL_BATCH=yes\n", "GLM5_FLASH_PREFILL_BATCH must be"),
-])
-def test_glmf_admission_keys_reject_bad_values_before_launch(tmp_path, keys, message):
-    result = _family_launch_result(tmp_path, GLMF_CONFIG, "test/glmf", keys)
-    assert result.returncode == 2 and message in result.stderr, result.stderr
-    assert not any(line.startswith(("docker ", "ssh ", "nest ")) for line in result.stderr.splitlines())
+    launch = next(shlex.split(line) for line in result.stderr.splitlines() if "cuteafd serve-glmf" in line)
+    if mode is None:
+        assert "--prefill-packing" not in launch
+    else:
+        assert launch[launch.index("--prefill-packing") + 1] == mode
 
 
 @pytest.mark.parametrize("keys,expected,absent", [

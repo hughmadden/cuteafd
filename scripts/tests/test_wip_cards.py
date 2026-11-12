@@ -962,8 +962,8 @@ def test_arm_overrides_only_selected_arm_and_card(entry, tmp_path, monkeypatch, 
     state = tmp_path / 'state'
     monkeypatch.setattr(sys, 'argv', ['wip-cards', '--kit', str(kit), '--cards', 'v41-min', 'other',
         '--interleave', '--repeats', '1', '--arm', 'off=b:s', '--arm', 'on=c:s', '--state', str(state),
-        '--set', 'v41-min:GLM5_FLASH_PREFILL_BATCH=off',
-        '--arm-set', 'on:v41-min:GLM5_FLASH_PREFILL_BATCH=on',
+        '--set', 'v41-min:PREFILL_PACKING=exact',
+        '--arm-set', 'on:v41-min:PREFILL_PACKING=unrestricted',
         '--dry-run'])
     assert cards.main() == 0
     jobs = json.loads((state / 'plan.json').read_text())['jobs']
@@ -971,12 +971,12 @@ def test_arm_overrides_only_selected_arm_and_card(entry, tmp_path, monkeypatch, 
         settings = job['entry']['set']
         base = cards.config(Path(job['state']) / 'base.config')
         if job['card'] == 'other':
-            assert 'GLM5_FLASH_PREFILL_BATCH' not in settings
+            assert 'PREFILL_PACKING' not in settings
         else:
             enabled = job['arm'] == 'on'
-            assert settings['GLM5_FLASH_PREFILL_BATCH'] == ('on' if enabled else 'off')
-            assert base['GLM5_FLASH_PREFILL_BATCH'] == settings['GLM5_FLASH_PREFILL_BATCH']
-    assert '"GLM5_FLASH_PREFILL_BATCH": "on"' in capsys.readouterr().out
+            assert settings['PREFILL_PACKING'] == ('unrestricted' if enabled else 'exact')
+            assert base['PREFILL_PACKING'] == settings['PREFILL_PACKING']
+    assert '"PREFILL_PACKING": "unrestricted"' in capsys.readouterr().out
 
 
 def test_arm_config_edits_apply_after_generation(entry, tmp_path, monkeypatch):

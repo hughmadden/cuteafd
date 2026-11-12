@@ -72,12 +72,6 @@ pub(crate) struct ServeArgs {
     pub thinking_off: GlmThinkingOff,
     #[command(flatten)]
     pub draft_length: crate::shared::draft::length::DraftLength,
-    /// Prefill the prompts that wait together in one pass: each prompt's next chunk, up to the first
-    /// prefill lane's rows, every per-sequence program over its own rows and one Spark wave per MoE
-    /// layer for all of them. Off: one pass per prompt.
-    #[arg(long, env = "CUTEAFD_GLMF_PREFILL_BATCH", default_value_t = false, num_args = 0..=1,
-        default_missing_value = "true", action = clap::ArgAction::Set)]
-    pub prefill_batch: bool,
     #[command(flatten)]
     pub decode_share: DecodeShareArgs,
     #[command(flatten)]
@@ -120,7 +114,6 @@ fn verify_room(verify_rows: usize, sequences: usize) -> usize {
 #[derive(Debug, Clone, Copy)]
 struct Policy {
     length: crate::shared::draft::length::DraftLength,
-    batch: bool,
 }
 
 pub(crate) fn model_id(snapshot: &std::path::Path) -> Option<String> {
@@ -202,7 +195,7 @@ pub(crate) async fn run_serve(mut args: ServeArgs) -> Result<()> {
     let mut engine_args = args.engine.clone();
     resolve_serving_capacity(&mut engine_args, max_sequences);
     let (worker_stats, max_sequences, decode_share) = (stats.clone(), max_sequences, args.decode_share);
-    let policy = Policy { length: args.draft_length, batch: args.prefill_batch };
+    let policy = Policy { length: args.draft_length };
     let prefix = args.prefix.clone();
     let layout = console_layout(&args, &profile.id, max_sequences, None);
     let vision = args.vision;
@@ -378,7 +371,7 @@ struct Prefill<'a> {
     /// prompts by their rows, as their own passes' would compare).
     busy: f64,
     phases: [f64; 3],
-    /// Chunks prefilled in packed passes (`--prefill-batch`).
+    /// Chunks prefilled in packed passes (`--prefill-packing`).
     packed: usize,
     ticket: console::Ticket,
 }
@@ -1196,10 +1189,10 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
         if prefills.due(!active.is_empty()) {
             let caching = cache.enabled();
             // One chunk (a lane wave) of each waiting prompt (whole prompts with --decode-share 0); with
-            // --prefill-batch, adjacent prompts whose chunks fit one pass prefill together.
+            // --prefill-packing, adjacent prompts whose chunks fit one pass prefill together.
             let cx = PrefillCx { engine, library: &opened.library, family: &family, caching,
                 first_prefill_seen: &first_prefill_seen, memory_boundaries: &memory_boundaries };
-            let finished = if policy.batch && engine.packs_prefill() {
+            let finished = if engine.packs_prefill() {
                 let limits = engine.packed_limits();
                 prefills.round_packed(limits.rows, DECODE_ROWS,
                     |p| packs(p).then(|| chunk_end(p) - p.done), |group, next| packable(group, next, &limits),
@@ -1803,7 +1796,7 @@ fn capture_points<'a>(family: &GlmfPrefix<'_, 'a>, cache: &mut PrefixCache<CudaC
     }
 }
 
-/// Whether prompt `p`'s next chunk may run in a packed pass (`--prefill-batch`): still prefilling
+/// Whether prompt `p`'s next chunk may run in a packed pass (`--prefill-packing`): still prefilling
 /// with its client there, no media (its rows' embeddings are injected by its own pass), and not a
 /// cold probe's replayed decode step.
 fn packs(p: &Prefill<'_>) -> bool {
@@ -1817,7 +1810,7 @@ fn packs_chunk(client: bool, left: usize, retained: bool, media: bool, replay_de
     client && left > 0 && !retained && !media && !replay_decode
 }
 
-/// Whether prompt `next` may join `group` in one packed pass (`--prefill-batch`): every member
+/// Whether prompt `next` may join `group` in one packed pass (`--prefill-packing`): every member
 /// [`packs`], and every member's next chunk fits the pass.
 fn packable(group: &[Prefill<'_>], next: &Prefill<'_>, limits: &packing::Limits) -> bool {
     let chunk = |p: &Prefill<'_>| (p.placement.len, chunk_end(p) - p.done);
@@ -1830,7 +1823,7 @@ fn chunk_end(p: &Prefill<'_>) -> usize {
     p.plan.chunks.get(p.chunks).copied().unwrap_or(p.tokens.len())
 }
 
-/// The next chunk of every prompt of `group` in one packed pass (`--prefill-batch`,
+/// The next chunk of every prompt of `group` in one packed pass (`--prefill-packing`,
 /// `GlmfEngine::prefill_packed`): each prompt's first token, prompt row, drafter context and
 /// snapshot points as its own chunk takes them. A group that no longer packs (a client left, a
 /// prompt is done) goes through the one-prompt path, so cleanup stays per prompt.
@@ -2002,12 +1995,14 @@ mod serve_cli_tests {
     }
 
     #[test]
-    fn admission_defaults_to_one_prefill_pass_per_prompt() {
-        let defaults = parse(&[]).unwrap();
-        assert!(!defaults.prefill_batch);
-        assert!(parse(&["--prefill-batch", "true"]).unwrap().prefill_batch);
-        assert!(!parse(&["--prefill-batch", "false"]).unwrap().prefill_batch);
-        assert!(parse(&["--prefill-batch", "sometimes"]).is_err());
+    fn shared_packing_option_alone_controls_packed_admission() {
+        use crate::shared::prefill_packing::PackingMode;
+        assert_eq!(parse(&[]).unwrap().engine.prefill_packing.unwrap_or_default(), PackingMode::Unrestricted);
+        for (name, mode) in [("exact", PackingMode::Exact), ("unrestricted", PackingMode::Unrestricted)] {
+            assert_eq!(parse(&["--prefill-packing", name]).unwrap().engine.prefill_packing, Some(mode));
+        }
+        let source = include_str!("serve.rs");
+        assert!(source.contains("let finished = if engine.packs_prefill()"));
     }
 
 }

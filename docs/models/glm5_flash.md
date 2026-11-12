@@ -150,9 +150,11 @@ router, embedding or routed expert is converted by core selection.
   candidates, and a mark's bytes there would turn decode rows into NaN. Pool
   marks turn the pinned host tier on (`HOST_CACHE_BYTES=auto` unless set; 0
   keeps it off), so the snapshots the pool evicts move to RAM.
-- Packed admission prefill (opt-in until measured): `GLM5_FLASH_PREFILL_BATCH=on`
-  (`--prefill-batch`) prefills the prompts that wait together in one pass, up to the first
-  prefill lane's rows: each prompt's mHC sites, router scores, KDA layers, DSA indexer and LM head
+- Packed admission prefill on one RTX uses the shared `PREFILL_PACKING` option
+  (`--prefill-packing exact|unrestricted`, default `unrestricted`); TP2 remains
+  disabled pending sequence-aware peer hooks (#1865). Prompts that wait together
+  prefill in one pass, up to the first prefill lane's rows: each prompt's mHC sites,
+  router scores, KDA layers, DSA indexer and LM head
   run over its own rows as its own pass would, the rest over all rows, with one Spark wave per
   MoE layer for the burst (`glmf-golden --packed-check N` compares each sequence with its own
   pass). A packed prompt whose own grammar or sampling fails fails alone; the others keep

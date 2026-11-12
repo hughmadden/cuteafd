@@ -3699,6 +3699,7 @@ impl<'a> GlmfEngine<'a> {
     }
 
     /// Whether a packed prefill can run at all: one GPU and every layer resident.
+    /// TP2 needs sequence-aware context tables and peer hooks first (#1865).
     pub(crate) fn packs_prefill(&self) -> bool {
         self.peer.is_none() && self.weights.layers.len() == self.cfg.layers
     }
