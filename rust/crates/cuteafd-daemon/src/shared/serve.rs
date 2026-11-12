@@ -94,8 +94,8 @@ mod readiness_tests {
         let startup = source.split_once("pub(super) fn serve<").unwrap().1;
         let ready = startup.find("    let mut prefills = finish_startup::<").unwrap();
         let loop_at = startup.find("    loop {").unwrap();
-        for init in ["native_manifest(", "admission::Media::new(", "args.reserve.limits(",
-            "args.reserve.config("] {
+        for init in ["native_manifest(", "admission::Media::new(", "args.prefix.reserve.limits(",
+            "args.prefix.reserve.config("] {
             assert!(startup.find(init).unwrap() < ready, "{init} must precede readiness");
         }
         assert!(ready < loop_at);
