@@ -410,6 +410,46 @@ mod tests {
     }
 
     #[test]
+    fn boundary_event_failures_retire_instead_of_recovering_or_reusing_workspaces() {
+        use crate::shared::experts::rtx::pair::{self, StepFailure};
+        use std::cell::Cell;
+        for failed_edge in 0..4 {
+            let edge = Cell::new(0);
+            let retired = Cell::new(false);
+            let cancelled = Cell::new(false);
+            let reused = Cell::new(false);
+            let submit_edge = |operation: &str| -> Result<()> {
+                let current = edge.replace(edge.get() + 1);
+                if current == failed_edge {
+                    return Err(cuteafd_ffi::NativeStatusError {
+                        context: operation.into(), status: cuteafd_ffi::CUTEAFD_STATUS_CUDA_UNAVAILABLE,
+                        detail: "injected boundary event failure".into(),
+                    }.into());
+                }
+                Ok(())
+            };
+            let error = pair::submit_recoverable(|| Ok(()),
+                |_| { cancelled.set(true); Ok(()) },
+                || { retired.set(true); Ok(()) }, |_| {
+                    boundary_edges(|_| submit_edge("cuda_event_record"),
+                        |_, _| submit_edge("cuda_stream_wait_event"))?;
+                    reused.set(true);
+                    Ok(())
+                }).unwrap_err();
+            assert!(StepFailure::is_terminal(&error), "{error:#}");
+            assert!(retired.get());
+            assert!(!cancelled.get(), "CUDA event failures must not take request-local recovery");
+            assert!(!reused.get(), "a failed fence must prevent workspace reuse");
+            assert_eq!(edge.get(), failed_edge + 1);
+        }
+        let source = include_str!("../engine.rs");
+        let entry = source.split("fn step_units_with(").nth(1).unwrap()
+            .split("/// A prefill's logits").next().unwrap();
+        assert!(entry.contains("pair::submit_recoverable("));
+        assert!(entry.contains("|scope| self.step_units_inner(scope,"));
+    }
+
+    #[test]
     fn head_tiles_cover_only_wanted_rows_in_order_with_bounded_tails() {
         for total in [1, 63, 64, 65, 129, 512, 4096] {
             for wanted in [0, 1, total / 2, total] {
