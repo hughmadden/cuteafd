@@ -302,7 +302,7 @@ Each key is also a global `cuteafd` flag (`--gpu-memory-cap`, `--kv-max-tokens`,
 
 | Key | Default | Values | Notes |
 | --- | --- | --- | --- |
-| `PREFILL_PACKING` | engine default | `unrestricted`, `exact` | Pack short prompts; `exact` preserves expert arithmetic routes. |
+| `PREFILL_PACKING` | engine default | `unrestricted`, `exact` | Pack short prompts directly; `exact` preserves expert arithmetic routes. GLM Flash uses this option alone (default `unrestricted`), currently on one RTX only; TP2 packing is tracked in #1865. |
 | `PREFILL_BATCH_TOKENS` | `2048` | 80–4096 | Prefill chunk size. |
 | `PREFILL_ROWS` | planner | multiple of 64, ≤4096 | Per-unit rows override. |
 | `PREFILL_WAVES` | planner | 0–4 | Units in flight. |
@@ -313,7 +313,6 @@ Each key is also a global `cuteafd` flag (`--gpu-memory-cap`, `--kv-max-tokens`,
 | `EXPERT_INPUT` | family default | `fp8`, `bf16`, `bf16-decode` | MiMo Spark expert inputs. |
 | `EXPERT_PARTIAL_BF16_MAX_ROWS` | engine | row count | BF16 expert partials up to this row count. |
 | `MIMO_PREFILL_CHUNK_S` | unset | seconds | MiMo prefill chunk time. |
-| `GLM5_FLASH_PREFILL_BATCH` | `off` | `on`, `off` | GLM Flash one pass for multiple prompts. |
 | `GLM5_FLASH_EXL3_SCHEDULE` | `default` | `default`, `gb10` | GLM Flash Spark EXL3 decode schedule. |
 | `GLM5_FLASH_EXL3_WORKER_PATH` | `async` | `async`, `blocking` | GLM Flash Spark EXL3 upload/wait path. |
 | `GLM5_FLASH_EXL3_ROUTE_DUMP` | unset | absolute dir | Per-Spark EXL3 route dump. |
@@ -617,7 +616,6 @@ original core is already FP8, not an MC publication.
 | `FP8_EXPERT_PREFILL` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | ✓ | ✓ | ✓ |
 | `EXPERT_INPUT` | ✗ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | ✗ | ✗ | ✗ |
 | `EXPERT_PARTIAL_BF16_MAX_ROWS` | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✓ |
-| `GLM5_FLASH_PREFILL_BATCH` | ✗ | ✗ | ✗ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
 | `GLM5_FLASH_EXL3_SCHEDULE` | ✗ | ✗ | ✗ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
 | `GLM5_FLASH_EXL3_WORKER_PATH` | ✗ | ✗ | ✗ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
 | `GLM5_FLASH_EXL3_ROUTE_DUMP` | ✗ | ✗ | ✗ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |

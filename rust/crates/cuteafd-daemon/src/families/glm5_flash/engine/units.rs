@@ -16,6 +16,14 @@ fn head_spans(total: usize, wanted: usize, capacity: usize) -> impl Iterator<Ite
 
 enum Ticket { Spark(crate::shared::spark_waves::WaveTicket), Mixed(layers::Ticket) }
 
+/// Record both old tails before either new stream can wait on its peer.
+fn boundary_edges(mut record: impl FnMut(usize) -> Result<()>,
+    mut wait: impl FnMut(usize, usize) -> Result<()>) -> Result<()> {
+    for rank in 0..2 { record(rank)?; }
+    for rank in 0..2 { wait(rank, 1 - rank)?; }
+    Ok(())
+}
+
 /// The MLA ordinal, not the absolute layer, selects Flash's two staging views.
 fn staging_turn(owners: &mut [Option<(usize, usize)>; 2], ordinal: usize, layer: usize, unit: usize) -> bool {
     let owner = &mut owners[ordinal % 2];
@@ -286,9 +294,22 @@ impl<'a> GlmfEngine<'a> {
         ensure!(forced.is_none() || self.peer.is_none(), "teacher forcing runs without a head split");
         let work = self.prefill_slots_of(0, waves)?;
         let peer = self.peer_workspaces(false, Some(waves))?;
-        for rank in 0..self.ranks() {
-            // SAFETY: one call-boundary drain, never a per-dispatch stream wait.
-            self.on(rank, || unsafe { self.library.cuda_stream_synchronize(self.stream_of(rank)) })?;
+        let boundary = if self.peer.is_some() {
+            (0..2).map(|rank| crate::shared::memory::device::Event::new(
+                crate::shared::memory::device::Device { library: self.library,
+                    id: if rank == 0 { self.device } else { self.peer()?.device } }))
+                .collect::<Result<Vec<_>>>()?
+        } else { Vec::new() };
+        if !boundary.is_empty() {
+            boundary_edges(|rank| self.on(rank, || {
+                // SAFETY: the engine owns both streams; events remain live through
+                // submission. Record every old tail before either cross-wait.
+                unsafe { self.library.cuda_event_record(boundary[rank].raw, self.stream_of(rank)) }
+            }), |rank, peer| self.on(rank, || {
+                // SAFETY: cross-device waits order previous peer readers before
+                // workspace reuse without blocking the issuing thread.
+                unsafe { self.library.cuda_stream_wait_event(self.stream_of(rank), boundary[peer].raw) }
+            }))?;
         }
         let total: usize = steps.iter().map(|(t, _)| t.positions.len()).sum();
         let capacity = logits_capacity(work[0].logits.buffer.bytes, self.cfg.vocab_size)?;
@@ -353,8 +374,8 @@ impl<'a> GlmfEngine<'a> {
         };
         complete?;
         // Partial layer sets are diagnostics read on the host. A chunk without logits
-        // stays queued: the next call's boundary drain (above) or the next reader
-        // (selection, prefix capture) waits for it.
+        // stays queued: rank-local stream order and the next call's peer events
+        // protect reuse; selection/prefix capture waits before a host read.
         if self.weights.layers.len() < self.cfg.layers { self.synchronize()?; return Ok(None); }
         if logit_rows == 0 || scoring.is_some() { return Ok(None); }
         Ok(Some(if device { StepLogits::Device(result.context("last-unit logits")?) }
@@ -367,6 +388,26 @@ mod tests {
     use super::*;
     use crate::shared::prefill_pipeline::{prefill_schedule, sequence_units, Step};
     use std::collections::VecDeque;
+
+    #[test]
+    fn back_to_back_boundaries_record_old_tails_before_peer_workspace_reuse() -> Result<()> {
+        let calls = std::cell::RefCell::new(Vec::new());
+        for call in 0..2 {
+            boundary_edges(|rank| { calls.borrow_mut().push((call, "record", rank, rank)); Ok(()) },
+                |rank, peer| { calls.borrow_mut().push((call, "wait", rank, peer)); Ok(()) })?;
+            calls.borrow_mut().push((call, "reuse", 0, 1));
+        }
+        for (call, edges) in calls.borrow().chunks_exact(5).enumerate() {
+            assert_eq!(edges, [(call, "record", 0, 0), (call, "record", 1, 1),
+                (call, "wait", 0, 1), (call, "wait", 1, 0), (call, "reuse", 0, 1)]);
+        }
+        let source = include_str!("units.rs");
+        let entry = source.split("pub(super) fn step_units_inner").nth(1).unwrap()
+            .split("let total:").next().unwrap();
+        assert!(!entry.contains("cuda_stream_synchronize"));
+        assert!(entry.contains("boundary_edges("));
+        Ok(())
+    }
 
     #[test]
     fn head_tiles_cover_only_wanted_rows_in_order_with_bounded_tails() {

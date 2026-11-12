@@ -984,7 +984,7 @@ release_known_key() {
     GLM5_FLASH_PREFIX_MARKS) return 0 ;;
     GLM5_FLASH_REPLAY_RECORDS) return 0 ;;
     GLM5_FLASH_DECODE_ROWS) return 0 ;;
-    GLM5_FLASH_PREFILL_BATCH|PREFILL_PACKING) return 0 ;;
+    PREFILL_PACKING) return 0 ;;
     GLM5_FLASH_ROUTE_RING_CHECK) return 0 ;;
     PROBE_DUMP_ROOT|MEDIA_FEATURES_DIR|AUDIO_FEATURES_DIR|CORE_VIEW|ATTENTION_PLACEMENT|ATTENTION_PLAN_ROWS) return 0 ;;
     DECODE_LANES|PREFILL_ROWS|PREFILL_WAVES|PREFILL_SPAN_ROWS) return 0 ;; # Shared prefill units: rows each, units in flight, rows per continuous span (PLAN "Prefill contract").
