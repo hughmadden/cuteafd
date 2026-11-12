@@ -228,6 +228,8 @@ pub(crate) fn receive_rank<'a, D: PushDestination<Delivered = ()>>(
     use cuteafd_transport::worker_selection::push;
     use std::os::fd::AsRawFd;
     ensure!(tp2.is_some() || dense.is_some(), "coordinator rank receives nothing");
+    #[cfg(test)]
+    let reads = crate::shared::memory::load_timing::Split::start();
     let library = device.library;
     let (group, token) = credentials;
     tracing::info!(group, rank, device = device.id, tp2 = tp2.is_some(), dense = dense.is_some(),
@@ -287,8 +289,12 @@ pub(crate) fn receive_rank<'a, D: PushDestination<Delivered = ()>>(
         }
         if !plan.native.is_empty() {
             // Native halves: the Spark native post-Done plane transform, then views.
-            let initialize = plan.native.iter().enumerate().map(|(region, layout)|
-                push_initialize::Layer::Native { region, layout, scalars: 0..0 }).collect::<Vec<_>>();
+            let mut scalar_offset = 0;
+            let initialize = plan.native.iter().enumerate().map(|(region, layout)| {
+                let first = scalar_offset;
+                scalar_offset += layout.scalar_bytes();
+                push_initialize::Layer::Native { region, layout, scalars: first..scalar_offset }
+            }).collect::<Vec<_>>();
             let ready = std::rc::Rc::new(push_initialize::initialize(delivered, &initialize, None, plan.scratch_bytes())?);
             return plan.native.iter().zip(&plan.native_layers).enumerate().map(|(region, (layout, &selection))| {
                 let budget = crate::shared::experts::layer::ExpertWeights::plan(library, catalog, selection)?;
@@ -315,6 +321,11 @@ pub(crate) fn receive_rank<'a, D: PushDestination<Delivered = ()>>(
     if let Err(error) = &candidate { tracing::warn!(group, rank, %error, "coordinator push candidate rejected"); }
     if push::completed_with(stream, candidate.as_ref().map(|_| ()).map_err(|error| format!("{error:#}"))).context("coordinator push completion")? {
         let weights = candidate?;
+        #[cfg(test)]
+        {
+            assert_eq!(reads.read_bytes(), 0, "coordinator rank {rank} receiver read the mount");
+            eprintln!("coordinator rank {rank}: zero receiver-thread mount bytes");
+        }
         tracing::info!(group, rank, layers = weights.len(), "coordinator push committed; publishing ready rank arena");
         return Ok(Some(weights));
     }

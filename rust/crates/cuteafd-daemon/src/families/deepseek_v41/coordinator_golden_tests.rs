@@ -304,9 +304,28 @@ pub(crate) fn check(actual: &Digests, subset: bool) -> Result<()> {
 }
 
 #[test]
+fn coordinator_oracle_head_mode_is_independent_of_environment() -> Result<()> {
+    let status = std::process::Command::new(std::env::current_exe()?)
+        .args(["--exact", "families::deepseek_v41::coordinator_golden_tests::coordinator_oracle_head_mode_child",
+            "--ignored"])
+        .env("CUTEAFD_V41_FP8_HEAD", "packed").status()?;
+    anyhow::ensure!(status.success(), "isolated coordinator head-mode check failed");
+    Ok(())
+}
+
+#[test]
+#[ignore = "isolated child of coordinator_oracle_head_mode_is_independent_of_environment"]
+fn coordinator_oracle_head_mode_child() -> Result<()> {
+    super::v41_tensors::use_golden_fp8_head()?;
+    assert_eq!(super::v41_tensors::fp8_head(), super::v41_tensors::Fp8Head::All);
+    Ok(())
+}
+
+#[test]
 #[ignore = "requires CUTEAFD_PUSH_V41, CUTEAFD_NATIVE_LIB and two RTX GPUs"]
 fn installed_coordinator_operands_match_the_mount_golden() -> Result<()> {
     let Some(snapshot) = snapshot() else { return Ok(()) };
+    super::v41_tensors::use_golden_fp8_head()?;
     let library = library()?;
     library.cuda_set_device(0)?;
     for gpu in [0, 1] { Device { library: &library, id: gpu }.run(|| library.cuda_enable_peer(1 - gpu))?; }
@@ -327,14 +346,33 @@ fn installed_coordinator_operands_match_the_mount_golden() -> Result<()> {
 #[test]
 #[ignore = "requires CUTEAFD_PUSH_V41 (a SparkNest namespace), CUTEAFD_NATIVE_LIB and two RTX GPUs"]
 fn installed_pushed_coordinator_operands_match_the_mount_golden() -> Result<()> {
+    pushed_coordinator_operands(false)
+}
+
+#[test]
+#[ignore = "requires SparkNest push endpoint, CUTEAFD_PUSH_V41 and two RTX GPUs"]
+fn installed_sparknest_coordinator_operands_match_current_mount() -> Result<()> {
+    pushed_coordinator_operands(true)
+}
+
+fn pushed_coordinator_operands(real_push: bool) -> Result<()> {
     use crate::shared::experts::rtx::dense::{Recorder, Records, STEP_BYTES};
     let Some(snapshot) = snapshot() else { return Ok(()) };
+    super::v41_tensors::use_golden_fp8_head()?;
     let library = library()?;
     library.cuda_set_device(0)?;
     for gpu in [0, 1] { Device { library: &library, id: gpu }.run(|| library.cuda_enable_peer(1 - gpu))?; }
     let catalog = cuteafd_loader::read_official_v41_catalog(&snapshot)?;
     let (root, _) = cuteafd_loader::push_load::namespace(&snapshot)?;
     let layers = std::env::var("CUTEAFD_V41_GOLDEN_TP2_LAYERS").ok().map(|v| v.parse()).transpose()?.unwrap_or(2);
+    let mut expected = Digests::new();
+    if real_push {
+        let started = std::time::Instant::now();
+        mount_two_gpu(&library, &catalog, &mut expected)?;
+        mount_tp2(&library, &catalog, layers, &mut expected)?;
+        eprintln!("current mount reference: {} operands in {:.2} s", expected.len(), started.elapsed().as_secs_f64());
+    }
+    let reads = crate::shared::memory::load_timing::Split::start();
     let devices = [Device { library: &library, id: 0 }, Device { library: &library, id: 1 }];
     let socket_dir = tempfile::tempdir()?;
     let map = CachePlacement::encoder_decoder();
@@ -374,18 +412,41 @@ fn installed_pushed_coordinator_operands_match_the_mount_golden() -> Result<()> 
     let plans = (0..2).map(|gpu| crate::shared::memory::push_coordinator::CoordinatorExpertPlan::new(&catalog,
         &(0..layers).collect::<Vec<_>>(), gpu, usize::MAX)).collect::<Result<Vec<_>>>()?;
     rss_guard(32)?;
-    let bounds = devices.iter().map(|device| crate::shared::experts::rtx::dense::RankLayout::new(
-        records.operands.clone(), records.steps.clone(), device.id).map(|layout| layout.host_staging))
-        .collect::<Result<Vec<_>>>()?;
-    crate::shared::experts::rtx::dense::testing::PEAKS.with(|p| p.borrow_mut().clear());
-    let mut pushed = Vec::new();
-    for (gpu, plan) in plans.into_iter().enumerate() {
-        let started = std::time::Instant::now();
-        pushed.push(crate::shared::experts::rtx::push::tests::receive_pushed(devices[gpu], Some(&catalog), &root,
-            socket_dir.path(), &records, (layers > 0).then_some(plan), 4, gpu)?);
-        eprintln!("gpu{gpu} rank pushed in {:.2} s", started.elapsed().as_secs_f64());
-        rss_guard(32)?;
+    let mut bounds = Vec::new();
+    for (device, plan) in devices.iter().zip(&plans) {
+        bounds.push(crate::shared::experts::rtx::dense::RankLayout::new(
+            records.operands.clone(), records.steps.clone(), device.id)?.host_staging);
+        // Combined completes dense operands before the expert scale-code staging arena.
+        let scales = plan.scales.host_staging();
+        if layers > 0 && scales.staging_bytes > 0 { bounds.push(scales); }
     }
+    crate::shared::experts::rtx::dense::testing::PEAKS.with(|p| p.borrow_mut().clear());
+    let pushed = if real_push {
+        use crate::shared::experts::rtx::push::{CoordinatorExperts, CoordinatorPush, PushPolicy};
+        let experts = CoordinatorExperts::Tp2 { layers: (0..layers).collect(), budgets: vec![80 << 30; 2] };
+        let dense_bounds = devices.iter().map(|device| crate::shared::experts::rtx::dense::RankLayout::new(
+            records.operands.clone(), records.steps.clone(), device.id).map(|layout| layout.host_staging))
+            .collect::<Result<Vec<_>>>()?;
+        let envelope = experts.host_envelope(&catalog, 2, &dense_bounds)?;
+        let dense = crate::shared::experts::rtx::dense::plan_records(&snapshot, records.clone(), &devices, 0)?;
+        let push = CoordinatorPush::prepare_alone_admitted(&snapshot, Some(&catalog), 2, Some(experts), envelope)?;
+        let started = std::time::Instant::now();
+        let (delivered, ()) = push.receive_with(devices.to_vec(), Some(&catalog), 0, Some(Ok(dense)), || ());
+        let delivered = PushPolicy::Required.committed(delivered)?.context("required SparkNest group commit")?;
+        eprintln!("SparkNest coordinator group committed in {:.2} s", started.elapsed().as_secs_f64());
+        delivered
+    } else {
+        let mut pushed = Vec::new();
+        for (gpu, plan) in plans.into_iter().enumerate() {
+            let started = std::time::Instant::now();
+            pushed.push(crate::shared::experts::rtx::push::tests::receive_pushed(devices[gpu], Some(&catalog), &root,
+                socket_dir.path(), &records, (layers > 0).then_some(plan), 4, gpu)?);
+            eprintln!("gpu{gpu} rank pushed in {:.2} s", started.elapsed().as_secs_f64());
+            rss_guard(32)?;
+        }
+        pushed
+    };
+    assert_eq!(reads.read_bytes(), 0, "coordinator dense and RTX expert receivers must not read the mount");
     collect(&library, owners_ref, |f| weights.visit(f))?;
     collect(&library, owners_ref, |f| producers.visit(f))?;
     collect(&library, owners_ref, |f| index.visit(f))?;
@@ -403,10 +464,59 @@ fn installed_pushed_coordinator_operands_match_the_mount_golden() -> Result<()> 
         collect(&library, owners_ref, |f| native.visit(f))?;
     }
     let peaks = crate::shared::experts::rtx::dense::testing::PEAKS.with(|p| p.take());
-    assert_eq!(peaks.len(), bounds.len(), "one staging measurement per coordinator rank");
-    for ((staged, pinned), bound) in peaks.iter().zip(bounds) {
-        eprintln!("rank staging peak {staged} B in use, {pinned} B pinned, admitted {} B", bound.staging_bytes);
-        assert!(*staged <= bound.staging_bytes as u64 && *pinned <= bound.staging_bytes as u64);
+    if !real_push {
+        assert_eq!(peaks.len(), bounds.len(), "one staging measurement per dense or expert-scale arena");
+        for ((staged, pinned), bound) in peaks.iter().zip(bounds) {
+            eprintln!("rank staging peak {staged} B in use, {pinned} B pinned, admitted {} B", bound.staging_bytes);
+            assert!(*staged <= bound.staging_bytes as u64 && *pinned <= bound.staging_bytes as u64);
+        }
     }
-    check(&owners, true)
+    if real_push {
+        assert_eq!(owners, expected, "SparkNest coordinator operands differ from current mount loaders");
+        eprintln!("PASS {} operands byte-identical to current mount; zero coordinator mount bytes", owners.len());
+        Ok(())
+    } else { check(&owners, true) }
+}
+
+#[test]
+#[ignore = "requires CUTEAFD_PUSH_V41, projection shard AOT and two RTX GPUs"]
+fn checkpoint_pushed_projection_operands_match_mount() -> Result<()> {
+    use crate::shared::experts::rtx::dense;
+    use super::v41_projection_tp2::{Weights, Kind};
+    use cuteafd_core::memory_layout::ArenaTag;
+    let snapshot = snapshot().context("set CUTEAFD_PUSH_V41")?;
+    let library = library()?;
+    let catalog = cuteafd_loader::read_official_v41_catalog(&snapshot)?;
+    let (root, _) = cuteafd_loader::push_load::namespace(&snapshot)?;
+    let sockets = tempfile::tempdir()?;
+    for kind in [Kind::QueryB, Kind::OutputB] {
+        for rank in 0..2 {
+            let device = Device { library: &library, id: rank as i32 };
+            let projection = match kind { Kind::QueryB => "wq_b", Kind::OutputB => "wo_b" };
+            let weight = format!("layers.2.attn.{projection}.weight");
+            let names = [weight.clone(),
+                cuteafd_loader::placement::families::deepseek_v41::weight_layout::packed_scale_name(&weight)];
+            let (k, n) = kind.geometry();
+            let layout = cuteafd_loader::serving_capacity::WeightArenaLayout::new("projection/oracle",
+                [(names[0].clone(), k * n / 2), (names[1].clone(), k * n / 64)])?;
+            let arena = crate::shared::memory::weight_arena::DeviceWeightArena::new(device,
+                layout.clone(), ArenaTag::weights("v41/target"))?;
+            let mounted = device.run(|| Weights::load_in(device, &catalog, 2, kind, rank,
+                Weights::load_peak_device_bytes(kind), Some(&arena)))?;
+            let expected = { let [weight, scales] = mounted.buffers(); [digest(&library, weight)?, digest(&library, scales)?] };
+            drop(mounted);
+            drop(arena);
+            let arena = crate::shared::memory::weight_arena::DeviceWeightArena::new(device,
+                layout, ArenaTag::weights("v41/target"))?;
+            let reads = crate::shared::memory::load_timing::Split::start();
+            let (pushed, records) = dense::recording(|| device.run(|| Weights::load_in(device, &catalog,
+                2, kind, rank, Weights::load_peak_device_bytes(kind), Some(&arena))))?;
+            crate::shared::experts::rtx::push::tests::receive_pushed(device, None, &root,
+                sockets.path(), &records, None, 0, rank)?;
+            assert_eq!(reads.read_bytes(), 0, "projection receiver must not read the mount");
+            assert_eq!({ let [weight, scales] = pushed.buffers(); [digest(&library, weight)?, digest(&library, scales)?] }, expected);
+            eprintln!("{kind:?} rank {rank}: pushed weights and packed scales byte-identical to mount; zero receiver mount bytes");
+        }
+    }
+    Ok(())
 }

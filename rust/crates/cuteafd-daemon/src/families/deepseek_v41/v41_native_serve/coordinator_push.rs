@@ -7,15 +7,10 @@ use crate::shared::memory::device::Device;
 use anyhow::{Context, Result};
 use cuteafd_loader::OfficialV41Catalog;
 
-/// Whether this launch may push its coordinator ranks (records are taken
-/// while loading; unused records then fill through the mount).
-pub(super) fn wanted(args: &crate::cli::NativeServeArgs, catalog: &OfficialV41Catalog) -> Result<bool> {
-    let policy = PushPolicy::for_snapshot(&args.snapshot)?;
-    policy.plan(|| {
-        anyhow::ensure!(catalog.exl3().is_none() && catalog.nvfp4().is_none()
-            && catalog.fp8().is_none() && !args.tp2_query_projection && !args.tp2_output_projection, "V4.1 coordinator push does not support this weight placement yet");
-        Ok(())
-    }).map(|planned| planned.is_some()).map_err(Into::into)
+/// Record coordinator operands when namespace identity requires push.
+/// Nonnamespace checkpoints retain the ordinary mounted loader.
+pub(super) fn wanted(args: &crate::cli::NativeServeArgs, _catalog: &OfficialV41Catalog) -> Result<bool> {
+    Ok(PushPolicy::for_snapshot(&args.snapshot)? == PushPolicy::Required)
 }
 
 /// The coordinator ranks the Spark admission starts with, or none (the
@@ -39,7 +34,10 @@ pub(super) fn plan<'a>(snapshot: &std::path::Path, catalog: &OfficialV41Catalog,
         Ok(WholeOwner { rank, selections, budget: tp2_budgets[rank].checked_add(draft_expert_bytes)
             .context("V4.1 mixed expert admission overflow")? })
     }).collect::<Result<Vec<_>>>()?;
-    let experts = (tp2_layers > 0 || draft_expert_bytes > 0).then_some(CoordinatorExperts::Native { owners });
+    let experts = if draft_expert_bytes > 0 { Some(CoordinatorExperts::Native { owners }) }
+        else if tp2_layers > 0 { Some(CoordinatorExperts::Tp2 {
+            layers: (0..tp2_layers).collect(), budgets: tp2_budgets.to_vec(),
+        }) } else { None };
     let (push, ranks) = if sparks == 0 {
         (CoordinatorPush::prepare_alone_admitted(snapshot, Some(catalog), 2, experts, envelope)?, None)
     } else {

@@ -106,6 +106,8 @@ pub(crate) struct Operand {
 pub(crate) enum Job {
     /// Staged bytes `at..at + bytes` copied unchanged to `dst`.
     Upload { at: usize, bytes: usize, dst: CuteafdDeviceBuffer },
+    /// V4.1 raw UE8M0 TP2 projection grid packed from bounded staging.
+    V41Scales { k: u32, n: u32, packed: CuteafdDeviceBuffer },
     /// Raw UE8M0 block grid expanded by the family's existing AOT program.
     BlockFp8Scales { family: &'static str, n_blocks: usize, k_blocks: usize, dst: CuteafdDeviceBuffer },
     /// Staged I64 IDs narrowed on GPU, with checked range status.
@@ -389,6 +391,17 @@ impl Step {
                     ensure!(at + bytes <= staged.len() && bytes <= dst.bytes, "upload outside its step");
                     load_timing::upload(bytes, || library.copy_h2d(CuteafdDeviceBuffer { bytes, ..dst },
                         &staged[at..at + bytes]))?;
+                }
+                Job::V41Scales { k, n, packed } => {
+                    ensure!(self.bytes() == k as usize * n as usize / 1024,
+                        "V4.1 projection scale staging extent differs");
+                    // Keep the projection loader's admitted raw-grid peak, not
+                    // the larger generic STEP_BYTES transform workspace.
+                    let source = crate::shared::memory::DeviceAllocation::new(library, self.bytes(),
+                        Tag::staging("v41/projection-scales"))?;
+                    load_timing::upload(self.bytes(), || library.copy_h2d(source.buffer, &staged[..self.bytes()]))?;
+                    Finish::V41Scales { capacity: 1, k, n, source: source.buffer, packed }
+                        .run_drained(library, stream)?;
                 }
                 Job::BlockFp8Scales { family, n_blocks, k_blocks, dst } => {
                     let bytes = n_blocks.checked_mul(k_blocks).context("block scale grid overflow")?;
