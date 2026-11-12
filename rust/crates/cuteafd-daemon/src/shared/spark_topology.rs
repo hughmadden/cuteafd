@@ -110,6 +110,7 @@ mod tests {
                 ("dsv4p", "mxfp4") => testing::write_v4_pro_mxfp4_snapshot(&snapshot),
                 ("dsv4p", "exl3") => testing::write_v4_pro_exl3_snapshot(&snapshot),
                 ("kimik3", _) => testing::write_kimi_snapshot(&snapshot, true),
+                ("minimax", "nvfp4") => write_minimax_release_text_snapshot(&snapshot, &source)?,
                 ("muse", _) => testing::write_muse_spark_snapshot(&snapshot, &(0..62).collect::<Vec<_>>()),
                 ("mimo", _) => testing::write_snapshot(&snapshot, &testing::mimo_flash_config(), &testing::mimo_flash_tensors(), None),
                 ("mimof", _) => testing::write_snapshot(&snapshot, &testing::mimo_flash_mopd_config(), &testing::mimo_flash_mopd_tensors(), Some(4)),
@@ -140,7 +141,7 @@ mod tests {
                 ("ml4", _) => testing::write_mistral_large4_snapshot(&snapshot, None, true),
                 _ => anyhow::bail!("missing full launch fixture for covered {key}"),
             }
-            if !matches!(family, "v41" | "kimik3" | "muse" | "ml4") {
+            if !matches!(family, "v41" | "kimik3" | "muse" | "ml4" | "minimax") {
                 expand_eight_rank_fixture(&snapshot)?;
             }
             let catalog = cuteafd_loader::read_expert_catalog(&snapshot)?;
@@ -171,6 +172,15 @@ mod tests {
                     ..Default::default() }), ..Default::default()
             };
             let report = testing::BudgetedPlanInput::open(&snapshot)?.plan(&options)?;
+            if key == "minimax:nvfp4" {
+                // When MiniMax becomes servable, replace this refusal witness with the
+                // complete N8 launch/count-cap chain below rather than silently accepting it.
+                assert_eq!(report.runtime, Some(cuteafd_loader::plan::RuntimeStatus::Planned), "{key}: qualify the real launch chain");
+                assert!(!report.native_serving_admitted, "{key}: qualify the real launch chain");
+                assert!(report.hints.iter().any(|hint| hint.what
+                    == "planned family has no executable serving admission in this build"),
+                    "{key}: wrong refusal: {:?}", report.hints);
+            }
             // Coverage follows each family's own runtime status: a Planned family must
             // be refused at deployment until it serves; flipping it to Serving puts it
             // through the whole chain below (and requires its launch dispatch).
@@ -329,6 +339,58 @@ print(json.dumps(capture_real_eight_rank_launch(*map(Path, sys.argv[2:]))))
         }
         assert!(!tested.is_empty());
         eprintln!("N8 real config -> launch -> clap -> topology -> intake: {}", tested.join(", "));
+        Ok(())
+    }
+
+    fn write_minimax_release_text_snapshot(snapshot: &std::path::Path, source: &std::path::Path) -> Result<()> {
+        use cuteafd_loader::plan::testing::{t, write_snapshot};
+        let mut config: serde_json::Value = serde_json::from_slice(&std::fs::read(source.join(
+            "rust/crates/cuteafd-loader/src/families/minimax_m3/fixtures/config.json"))?)?;
+        config.as_object_mut().unwrap().remove("vision_config");
+        let mut tensors = vec![
+            t("language_model.model.embed_tokens.weight", "BF16", &[200064, 6144]),
+            t("language_model.lm_head.weight", "BF16", &[200064, 6144]),
+            t("language_model.model.norm.weight", "BF16", &[6144]),
+        ];
+        // Independent release-header recipe: full text depth and all 128 native experts.
+        for layer in 0..60 {
+            let p = format!("language_model.model.layers.{layer}.");
+            for norm in ["input_layernorm", "post_attention_layernorm"] {
+                tensors.push(t(format!("{p}{norm}.weight"), "BF16", &[6144]));
+            }
+            for (name, n, k) in [("q_proj", 8192, 6144), ("k_proj", 512, 6144),
+                ("v_proj", 512, 6144), ("o_proj", 6144, 8192),
+                ("index_q_proj", 512, 6144), ("index_k_proj", 128, 6144)] {
+                let stem = format!("{p}self_attn.{name}");
+                tensors.push(t(format!("{stem}.weight"), "F8_E4M3", &[n, k]));
+                tensors.push(t(format!("{stem}.weight_scale_inv"), "U8", &[n, k / 32]));
+            }
+            for norm in ["q_norm", "k_norm", "index_q_norm", "index_k_norm"] {
+                tensors.push(t(format!("{p}self_attn.{norm}.weight"), "BF16", &[128]));
+            }
+            let (stem, intermediate) = if layer < 3 { ("mlp", 12288) }
+                else { ("block_sparse_moe.shared_experts", 3072) };
+            for (proj, n, k) in [("gate", intermediate, 6144), ("up", intermediate, 6144),
+                ("down", 6144, intermediate)] {
+                let stem = format!("{p}{stem}.{proj}_proj");
+                tensors.push(t(format!("{stem}.weight"), "F8_E4M3", &[n, k]));
+                tensors.push(t(format!("{stem}.weight_scale_inv"), "U8", &[n, k / 32]));
+            }
+            if layer < 3 { continue; }
+            tensors.push(t(format!("{p}block_sparse_moe.gate.weight"), "F32", &[128, 6144]));
+            tensors.push(t(format!("{p}block_sparse_moe.e_score_correction_bias"), "F32", &[128]));
+            for expert in 0..128 {
+                for (proj, n, k) in [("w1", 3072, 6144), ("w3", 3072, 6144), ("w2", 6144, 3072)] {
+                    let stem = format!("{p}block_sparse_moe.experts.{expert}.{proj}");
+                    tensors.push(t(format!("{stem}.weight_packed"), "U8", &[n, k / 2]));
+                    tensors.push(t(format!("{stem}.weight_scale"), "F8_E4M3", &[n, k / 16]));
+                    for scale in ["weight_global_scale", "input_global_scale"] {
+                        tensors.push(t(format!("{stem}.{scale}"), "F32", &[]));
+                    }
+                }
+            }
+        }
+        write_snapshot(snapshot, &config, &tensors, None);
         Ok(())
     }
 
