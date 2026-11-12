@@ -390,6 +390,10 @@ impl<'a> Step5Recipe<'a> {
             physical(&mut fixed, &mut backings, rank, Category::Staging, "Step-5 private transaction staging",
                 vec![staging_bytes(&cache, rank, inputs.sequences)? as u64])?;
             exact(&mut fixed, rank, Category::Runtime, "Step-5 pending code", inputs.pending_code[rank]);
+            if depth > 0 {
+                physical(&mut fixed, &mut backings, rank, Category::Workspace, "Step-5 draft route probe",
+                    vec![92 * inputs.rows.min(64) as u64 * 8 * 4])?;
+            }
             if rank == 0 {
                 let rows = inputs.rows as u64;
                 let requests = vec![rows * 4, rows * 4096 * 2, rows * 4096 * 4];
@@ -717,6 +721,11 @@ impl Recipe for Step5Recipe<'_> {
                 ByteCurve::fixed(bytes, self.maximum_pages), false, self.maximum_pages));
         }
         if self.depth > 0 {
+            let bytes = self.ownership.ranks() as u64 * 92 * self.inputs.rows.min(64) as u64 * 8 * 4;
+            let owner = Allocation::buffer("step5.host.draft-probe", Location::PINNED, bytes,
+                Lifetime::TARGET, Category::Staging, "Step-5 draft route probe");
+            contract.components.push(Component::allocation(owner,
+                ByteCurve::fixed(bytes, self.maximum_pages), false, self.maximum_pages));
             let planes = crate::plan::families::step5::native::mtp_metadata_planes(self.inputs.unit_rows())
                 .map_err(|error| Refusal::InvalidFact(error.to_string()))?;
             // Each stage retains its upload sources until its own H2D event completes.

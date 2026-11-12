@@ -271,6 +271,64 @@ mod tests {
     }
 
     #[test]
+    fn step5_owner_local_rings_merge_into_a_policy_observation() -> Result<()> {
+        use crate::shared::draft::{clock::RoundTimes, evidence::DraftSource, resource};
+        let (_directory, fixture) = crate::shared::memory::cpu_stream_fixture()?;
+        let library = fixture.load()?;
+        fixture.immediate_copies(&library)?;
+        let (layers, rows, topk) = (92, 3, 8);
+        let ids = DeviceAllocation::new(&library, rows * topk * 4, crate::shared::memory::TEST)?;
+        let bytes = (0..rows * topk).flat_map(|id| (id as u32).to_le_bytes()).collect::<Vec<_>>();
+        library.copy_h2d(ids.buffer, &bytes)?;
+        let canonical = |layer: usize| usize::from((30..60).contains(&layer));
+        let mut routes = RoundRoutes::new(layers, topk);
+        routes.begin(rows);
+        let mut times = vec![None; layers];
+        let before = fixture.events()?;
+        for rank in 0..2 {
+            let dense = (0..layers).map(|l| !(3..91).contains(&l) || canonical(l) != rank).collect();
+            let mut probe = RoundProbe::new(&library, dense, topk, 64)?;
+            probe.collect_routes = true;
+            probe.collect_timing = true;
+            probe.begin(rows);
+            for layer in (0..layers).filter(|&l| canonical(l) == rank) {
+                // SAFETY: the fixture owns these buffers/events and accepts a synthetic stream.
+                unsafe {
+                    if layer == 0 { probe.mark_entry(layer, std::ptr::null_mut()); }
+                    else if canonical(layer - 1) != rank { probe.mark(layer - 1, std::ptr::null_mut())?; }
+                    if (3..91).contains(&layer) { probe.ring(&library, layer, ids.buffer, rows, std::ptr::null_mut())?; }
+                    probe.mark(layer, std::ptr::null_mut())?;
+                }
+            }
+            probe.end();
+            let (local, timing) = probe.finish().expect("owner ring completed");
+            for layer in (0..layers).filter(|&l| canonical(l) == rank) {
+                if (3..91).contains(&layer) {
+                    let words = rows * topk;
+                    routes.push_narrow(layer, &local.flat()[layer * words..][..words])?;
+                } else { routes.dense(layer)?; }
+                times[layer] = timing[layer];
+            }
+        }
+        routes.complete()?;
+        assert!(times.iter().all(Option::is_some));
+        assert_eq!(fixture.events()?[before.len()..].matches('S').count(), 0, "no probe synchronization");
+        let homes = (0..layers).map(|layer| if (3..91).contains(&layer) {
+            resource::LayerHome::Remote { slice_bytes: 3e6 }
+        } else { resource::LayerHome::Dense }).collect::<Vec<_>>();
+        let geometry = resource::geometry(&homes, 352, topk, 64, 3, 0)?;
+        let mut policy = cuteafd_core::DraftPolicy::new(geometry, cuteafd_core::PolicySeed::weak(3), false)?;
+        let prior = [0.8; 2];
+        let request = [resource::Verified { id: 1, rows, accepted: 2, source: DraftSource::Neural,
+            prior: Some(&prior), features: None, censor: None }];
+        resource::observe_drafted(&mut policy, &request, &routes, &times,
+            RoundTimes { total_us: 70_000, draft_us: Some(3_000) }, 3, None, Some(1))?;
+        assert_eq!(policy.stats().rounds, 1);
+        assert_eq!(policy.stats().verified_rows, rows as u64);
+        Ok(())
+    }
+
+    #[test]
     fn timing_only_probe_records_events_without_copying_routes() -> Result<()> {
         let (_directory, fixture) = crate::shared::memory::cpu_stream_fixture()?;
         let library = fixture.load()?;

@@ -647,7 +647,7 @@ impl<'e, 'a> Backend<'a> for Step5Backend<'e, 'a> {
     }
     fn arm_draft_probe(&self) -> Result<()> {
         ensure!(self.mtp.is_some(), "Step-5 MTP runtime is not admitted");
-        Ok(())
+        self.execution.arm_draft_probe()
     }
     fn prefill_draft(&self, placement: &Placement, start: usize, chunk: &[u32], _next: Option<u32>,
         draft: &mut NoDraft) -> Result<()> {
@@ -698,9 +698,11 @@ impl<'e, 'a> Backend<'a> for Step5Backend<'e, 'a> {
         }
         Ok(())
     }
-    fn probe_begin(&self, _rows: usize) {}
-    fn probe_end(&self) {}
-    fn probe_finish<T>(&self, _observe: impl FnOnce(&RoundRoutes, &[Option<f64>]) -> T) -> Option<T> { None }
+    fn probe_begin(&self, rows: usize) { self.execution.probe_begin(rows); }
+    fn probe_end(&self) { self.execution.probe_end(); }
+    fn probe_finish<T>(&self, observe: impl FnOnce(&RoundRoutes, &[Option<f64>]) -> T) -> Option<T> {
+        self.execution.probe_finish(observe)
+    }
 }
 
 #[cfg(test)]
