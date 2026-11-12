@@ -134,7 +134,7 @@ pub(crate) enum Experts<'a> {
     Spark { decode: RefCell<SparkLink<'a>>, prefill: RefCell<SparkLink<'a>> },
 }
 
-pub(crate) use crate::shared::experts::rtx::pair::TerminalStepError;
+pub(crate) use crate::shared::experts::rtx::pair::StepFailure;
 
 /// Only attention geometry changes under a head split. Rank 1 runs split
 /// target layers exclusively; rank 0 also runs unsplit MTP attention in its

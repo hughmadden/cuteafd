@@ -459,7 +459,7 @@ impl<'a> OwnerReduce<'a> {
 mod token_owner_tests {
     use super::*;
     use std::cell::{Cell, RefCell};
-    use crate::shared::experts::rtx::pair::{submit_scoped, TerminalStepError};
+    use crate::shared::experts::rtx::pair::{submit_scoped, StepFailure};
 
     struct Protocol {
         owner: usize,
@@ -695,7 +695,7 @@ mod token_owner_tests {
                             result
                         })));
                     if cancel { assert!(result.is_err()); }
-                    else { assert!(result.unwrap().unwrap_err().downcast_ref::<TerminalStepError>().is_some()); }
+                    else { assert!(StepFailure::is_terminal(&result.unwrap().unwrap_err())); }
                     assert_eq!(drained.get(), 1);
                     assert!(protocol.borrow().retired.get());
                     assert!(submit_scoped(|| protocol.borrow().require_live(),

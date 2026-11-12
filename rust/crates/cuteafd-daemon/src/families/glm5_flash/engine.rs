@@ -2111,6 +2111,17 @@ impl<'a> GlmfEngine<'a> {
         ensure!(failures.is_empty(), "{}", failures.join("; ")); Ok(())
     }
 
+    /// Request-local cancellation (#1817, `pair::submit_recoverable`). GLM
+    /// Flash reads no host token table, so only a failure raised before the
+    /// body queued anything is request-local: it leaves no device, peer, Spark
+    /// or drafter work to drain and the exchange stays Active. Every other
+    /// failure retires through [`Self::shutdown_submission`].
+    fn cancel_submission(&self, kind: crate::shared::experts::rtx::pair::Recovery) -> Result<()> {
+        use crate::shared::experts::rtx::pair::Recovery;
+        ensure!(kind == Recovery::BeforeSubmission, "GLM Flash has no request-local {kind:?} recovery");
+        Ok(())
+    }
+
     fn shutdown_submission(&self) -> Result<()> {
         use crate::shared::{experts::rtx::pair::{teardown, Teardown}, peer_split::TerminalState};
         if self.terminal.get() == TerminalState::Drained { return Ok(()); }
@@ -4176,8 +4187,8 @@ impl<'a> GlmfEngine<'a> {
     fn decode_primitive(&self, tables: &StepTables, tokens: &[u32], logit_rows: usize,
         on_layer: Option<&mut dyn FnMut(usize, &[u8]) -> Result<()>>,
         trace: Option<&std::path::Path>, media: Option<&cuteafd_engine::media::RequestMedia>) -> Result<Option<DeviceLogits>> {
-        crate::shared::experts::rtx::pair::submit_scoped(
-            || self.require_live(), || self.shutdown_submission(),
+        crate::shared::experts::rtx::pair::submit_recoverable(
+            || self.require_live(), |kind| self.cancel_submission(kind), || self.shutdown_submission(),
             |scope| {
                 let result = self.decode_primitive_inner(scope, tables, tokens, logit_rows, on_layer, trace, media)?;
                 // Every rank's launches are queued now: this completed step is the
@@ -5449,8 +5460,8 @@ impl<'a> GlmfEngine<'a> {
         on_layer: Option<&mut dyn FnMut(usize, &[u8]) -> Result<()>>,
         forced: Option<&dyn Fn(usize) -> Option<Vec<u8>>>,
         scoring: Option<crate::shared::probe::ScoringRows<'_>>) -> Result<Option<StepLogits>> {
-        crate::shared::experts::rtx::pair::submit_scoped(
-            || self.require_live(), || self.shutdown_submission(),
+        crate::shared::experts::rtx::pair::submit_recoverable(
+            || self.require_live(), |kind| self.cancel_submission(kind), || self.shutdown_submission(),
             |scope| self.step_units_inner(scope, units, logit_rows, device, media,
                 waves, on_layer, forced, scoring))
     }

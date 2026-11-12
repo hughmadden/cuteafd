@@ -1520,7 +1520,7 @@ mod tests {
 
     #[test]
     fn pipeline_callback_errors_and_panics_use_real_terminal_teardown() {
-        use crate::shared::experts::rtx::pair::TerminalStepError;
+        use crate::shared::experts::rtx::pair::StepFailure;
         let modes = [LayerMode::HeadSplit, LayerMode::ContextSplit,
             LayerMode::Whole { gpu: 1, ffn: FfnMode::Split },
             LayerMode::Whole { gpu: 0, ffn: FfnMode::Owner },
@@ -1537,7 +1537,7 @@ mod tests {
                             trace.fault = Some((at, panic));
                             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| trace.run(&plan, order, lanes)));
                             if panic { assert!(result.is_err()); }
-                            else { assert!(result.unwrap().unwrap_err().downcast_ref::<TerminalStepError>().is_some()); }
+                            else { assert!(StepFailure::is_terminal(&result.unwrap().unwrap_err())); }
                             trace.owners.borrow().verify_retired().unwrap();
                             assert_eq!(trace.callbacks.borrow().len(), at + 1);
                             let before = trace.schedule.borrow().streams.clone();

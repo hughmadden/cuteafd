@@ -275,7 +275,7 @@ fn run_case(label: &str, captured: bool, lanes: usize, injected: u32, serving: b
         "device/pinned owners freed before shutdown result: {frees:?}"
     );
     if let Some(error) = &error {
-        ensure!(error.downcast_ref::<TerminalStepError>().is_some(), "typed primary submission error lost: {error:#}");
+        ensure!(StepFailure::is_terminal(error), "typed primary submission error lost: {error:#}");
     }
     if serving && injected == 0 {
         ensure!(late_frees[0] >= 3 && late_frees[1] >= 2, "serving owners were never released after drainage: {late_frees:?}");
