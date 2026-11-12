@@ -98,7 +98,7 @@ fn dtype(output: ProjectionOutput) -> TrellisDType {
 }
 
 /// Visit exact BF16-input/F32-output row views before reusing the head scratch.
-fn head_chunks(rows: usize, input: Buffer, output: Buffer, k: usize, n: usize,
+pub(crate) fn head_chunks(rows: usize, input: Buffer, output: Buffer, k: usize, n: usize,
     mut launch: impl FnMut(usize, Buffer, Buffer) -> Result<()>) -> Result<()> {
     let extent = |width: usize, element: usize| -> Result<usize> {
         rows.checked_mul(width).and_then(|v| v.checked_mul(element)).filter(|&v| v > 0)

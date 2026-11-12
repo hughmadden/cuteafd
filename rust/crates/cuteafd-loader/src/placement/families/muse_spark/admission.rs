@@ -181,6 +181,7 @@ pub struct ProductionInput<'a> {
     pub host: HostInput,
     pub prefill: PrefillPlan,
     pub full_prefill_logits: bool,
+    pub bf16_target_head: serving::BlasHead,
     /// Active sequence slots (each owns its sliding rings).
     pub slots: u64,
     /// Device mark slots from the shared prefix rule (the host tier holds retention).
@@ -268,6 +269,7 @@ pub struct MuseRecipe<'a> {
     pub local: LocalPackage,
     /// The DFlash2 drafter whose head-adjacent owner the contract declares.
     pub drafter: Option<MuseDrafter>,
+    pub head_backend: serving::BlasHead,
 }
 
 /// One allocation, dropped when it charges nothing.
@@ -325,7 +327,7 @@ fn tower_options(media: &MediaOptions, gpus: usize, sparks: usize)
 
 impl<'a> ProductionInput<'a> {
     pub fn prepare(self) -> Result<PreparedMuse<'a>, Refusal> {
-        let ProductionInput { cfg, core, projections, catalog, mut budgets, host, prefill, full_prefill_logits, slots, mark_slots,
+        let ProductionInput { cfg, core, projections, catalog, mut budgets, host, prefill, full_prefill_logits, bf16_target_head, slots, mark_slots,
             context, maximum_pool_tokens, partial_bf16_max_rows, partial_reply_formats, local, drafter, fixed,
             media } = self;
         let coordinator = budgets.iter().filter(|budget| budget.locations.iter()
@@ -492,6 +494,11 @@ impl<'a> ProductionInput<'a> {
         components.extend(buffer("muse.head_logits".into(), Location::coordinator(head_gpu),
             (stored + trimmed) as u64, Lifetime::RESIDENT, Category::Workspace, "Muse head logits",
             maximum_pages));
+        if global.head.is_none() {
+            components.extend(buffer("muse.head_workspace".into(), Location::coordinator(head_gpu),
+                crate::serving_capacity::GLMF_HEAD_WORKSPACE, Lifetime::RESIDENT,
+                Category::Workspace, "Muse native target/drafter head workspace", maximum_pages));
+        }
         components.extend(buffer("muse.prefill_logits".into(), Location::coordinator(head_gpu),
             prefill_logits_bytes as u64, Lifetime::RESIDENT, Category::Workspace, "Muse prefill logits",
             maximum_pages));
@@ -671,7 +678,7 @@ impl<'a> ProductionInput<'a> {
         let recipe = MuseRecipe { cfg, context, gpus, maximum_pages,
             prefill: PrefillShape { rows: prefill.unit_rows, waves: prefill.waves }, attention,
             spark_ranks, encoders, modes: (media.vision, media.audio), cases, peaks, local: local.clone(),
-            drafter: drafter.clone() };
+            drafter: drafter.clone(), head_backend: if global.head.is_none() { bf16_target_head } else { serving::BlasHead::Native } };
         Ok(PreparedMuse { recipe, budgets, prefill_logits_bytes, local, drafter, layouts, global, projections,
             spark_budget, host: host_quotas, push })
     }
@@ -938,6 +945,13 @@ impl Recipe for MuseRecipe<'_> {
                 any_of: (0..self.cfg.layers).map(|count| Choice { variable: onboard, option: count }).collect() });
         }
         let mut blas = Vec::new();
+        if self.head_backend.bf16() {
+            blas.push(serving::BlasOwners { name: "Muse shared target/drafter head".into(),
+                process: "coordinator".into(), thread: "muse/blas/serve".into(),
+                location: Location::coordinator((self.gpus - 1) as u8),
+                gemm: self.head_backend.gemm(), lt: self.head_backend.lt(),
+                lifetime: Lifetime::RESIDENT, activation: Activation::always() });
+        }
         for (option, (vision, audio)) in self.encoders.iter().enumerate() {
             for (name, placement) in [("vision", vision), ("audio", audio)] {
                 let locations = match placement.kind {
@@ -1048,7 +1062,7 @@ mod contract_tests {
                 (tower(EncoderKind::Rtx { gpu: 0 }), tower(EncoderKind::Rtx { gpu: 1 })),
                 (tower(EncoderKind::Spark { rank: 1 }), tower(EncoderKind::Spark { rank: 1 }))],
             modes: (MediaMode::Auto, MediaMode::Auto), cases: vec![], peaks: vec![[0; 2]; cfg.layers + 1],
-            local: LocalPackage::Unknown, drafter: None };
+            local: LocalPackage::Unknown, drafter: None, head_backend: serving::BlasHead::Native };
         let request = production_request(64, None, Onboard::Auto, prefill, Operation::Serving, None,
             SparkReplyFormats::default());
         let contract = recipe.prepare(&request).unwrap();
@@ -1139,7 +1153,7 @@ mod contract_tests {
                 attention: vec![LayerMode::HeadSplit; cfg.layers], spark_ranks: 6,
                 encoders: vec![(off.clone(), off)], modes: (MediaMode::Off, MediaMode::Off),
                 cases: vec![], peaks: vec![[0; 2]; cfg.layers + 1], local: LocalPackage::Unknown,
-                drafter: Some(draft.clone()) };
+                drafter: Some(draft.clone()), head_backend: serving::BlasHead::Native };
             let request = production_request(64, None, Onboard::Auto, prefill, Operation::Serving, None,
                 SparkReplyFormats::default());
             let contract = recipe.prepare(&request).unwrap();
@@ -1189,7 +1203,7 @@ mod contract_tests {
             attention: vec![LayerMode::HeadSplit; cfg.layers], spark_ranks: 2,
             encoders: vec![(off.clone(), off)], modes: (MediaMode::Off, MediaMode::Off),
             cases: vec![], peaks: vec![[0; 2]; cfg.layers + 1],
-            local: LocalPackage::Unknown, drafter: None };
+            local: LocalPackage::Unknown, drafter: None, head_backend: serving::BlasHead::Native };
         let request = || production_request(64, None, Onboard::Layers(0), prefill,
             Operation::Serving, None, SparkReplyFormats::default());
         for logical in [96 << 30, 80 << 30] {

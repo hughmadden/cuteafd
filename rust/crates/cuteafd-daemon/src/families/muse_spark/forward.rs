@@ -8,7 +8,7 @@
 //!   gathers its step's rows into `residual` (rank 1 over peer access) and
 //!   runs the weightless `embed_norm` into `hidden`.
 //! - Head (the last rank): `final_norm` of a contiguous range of at most
-//!   [`HEAD_ROWS`] rows, the K6 head into F32 rows at its stored (N128-padded)
+//!   [`HEAD_ROWS`] rows, the selected head into F32 rows at its stored (optionally N128-padded)
 //!   width, trimmed to the vocabulary and softcapped. The logits are
 //!   `[rows, vocab]` F32, contiguous, in the head rank's stored-width plane.
 use super::{device::{PeerExchange, StepPlanes}, engine::RankResources, experts::SparkExperts, step::StepMetadata};
@@ -46,9 +46,9 @@ pub(crate) fn inject_media(cfg: &MuseSparkConfig, rank: &RankResources<'_>, lane
 /// The head over `rows` (a contiguous range of the step's rows) on the head rank.
 pub(crate) fn head(cfg: &MuseSparkConfig, rank: &RankResources<'_>, lane: &super::lane::LaneViews,
     rows: std::ops::Range<usize>, stream: *mut c_void) -> Result<Buffer> {
-    let weights = rank.globals.head.as_ref().context("Muse head on a rank without the head")?;
+    rank.check_head_stream(stream)?;
     let (stored_plane, trimmed) = rank.head.as_ref().context("Muse head rank without logits planes")?;
-    let (h, vocab, stored) = (cfg.hidden, cfg.vocab_size, weights.shape[0]);
+    let (h, vocab, stored) = (cfg.hidden, cfg.vocab_size, rank.globals.head.as_ref().map_or(cfg.vocab_size, |weights| weights.shape[0]));
     let device = rank.device_with(cfg, stream, lane);
     let count = rows.len();
     ensure!(count > 0 && count <= HEAD_ROWS && rows.end <= lane.rows,
@@ -64,14 +64,37 @@ pub(crate) fn head(cfg: &MuseSparkConfig, rank: &RankResources<'_>, lane: &super
     // planes); the backend scores wider steps in calls of at most that many.
     let staged = Buffer { bytes: count * stored * 4, ..stored_plane.buffer };
     let trimmed = Buffer { bytes: count * vocab * 4, ..trimmed.buffer };
-    rank.core.head_f32(count, normed, weights, staged, stream)?;
-    // SAFETY: both planes are this device's, distinct, and ordered on `stream`.
-    unsafe { rank.device.library.copy_d2d_2d_async(trimmed, vocab * 4, staged, stored * 4, vocab * 4, count, stream)?; }
-    // The softcap reads the trimmed rows and writes the logits contiguously into the stored plane.
     let logits = Buffer { bytes: count * vocab * 4, ..stored_plane.buffer };
-    // SAFETY: as above.
-    unsafe { device.programs.launch("softcap", &[trimmed, logits], &[Scalar::I32(i32::try_from(count)?)], stream)?; }
+    project_head(cfg, rank, count, normed, staged, trimmed, logits, stream)?;
     Ok(logits)
+}
+
+/// Already-normalized target or draft rows through the same selected head, crop and softcap.
+/// Logit planes are caller-owned; only the serialized native handle/workspace is borrowed.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn project_head(cfg: &MuseSparkConfig, rank: &RankResources<'_>, rows: usize,
+    input: Buffer, staged: Buffer, trimmed: Buffer, logits: Buffer, stream: *mut c_void) -> Result<()> {
+    rank.check_head_stream(stream)?;
+    let (vocab, stored) = (cfg.vocab_size,
+        rank.globals.head.as_ref().map_or(cfg.vocab_size, |head| head.shape[0]));
+    if let Some(weights) = &rank.globals.head {
+        rank.core.head_f32(rows, input, weights, staged, stream)?;
+    } else {
+        let weights = rank.globals.head_bf16.as_ref().context("Muse BF16 head weights absent")?;
+        let head = rank.native_head.as_ref().context("Muse BF16 head handle absent")?;
+        super::core::head_chunks(rows, input, staged, cfg.hidden, vocab, |count, x, y| {
+            // SAFETY: validated disjoint device row views and rank-owned weights/handle,
+            // serialized target and drafter use on the owning stream.
+            unsafe { crate::shared::target_head::launch(crate::shared::target_head::TargetHead::configured(),
+                head, x.ptr, weights.buffer.ptr, y.ptr.cast(), count, stream) }
+        })?;
+    }
+    // SAFETY: caller retains distinct staged/trimmed planes; logits may reuse staged
+    // only after the ordered copy, exactly as in the trellis target path.
+    unsafe {
+        rank.device.library.copy_d2d_2d_async(trimmed, vocab * 4, staged, stored * 4, vocab * 4, rows, stream)?;
+        rank.programs.launch("softcap", &[trimmed, logits], &[Scalar::I32(i32::try_from(rows)?)], stream)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

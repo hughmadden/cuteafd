@@ -275,10 +275,11 @@ impl<'a> LayerWeights<'a> {
 
 /// One rank's share of the global weights (`GlobalLayout`) beyond the token
 /// embedding (the shared `TokenEmbedding` on the entry rank): the final norm
-/// on every rank and the K6 head on the head rank (the last).
+/// on every rank and the selected BF16/trellis head on the last rank.
 pub(crate) struct GlobalWeights<'a> {
     pub final_norm: Allocation<'a>,
     pub head: Option<CoreWeights<'a>>,
+    pub head_bf16: Option<Allocation<'a>>,
 }
 
 impl<'a> GlobalWeights<'a> {
@@ -289,6 +290,7 @@ impl<'a> GlobalWeights<'a> {
                 owner.inventory(inventory, &format!("global.head.{suffix}"))?;
             }
         }
+        if let Some(head) = &self.head_bf16 { head.inventory(inventory, "global.head")?; }
         Ok(())
     }
 
@@ -302,12 +304,18 @@ impl<'a> GlobalWeights<'a> {
         let rect = checked_rect(checkpoint, &name, DType::Bf16, None, None)?;
         ensure!(rect.bytes() == layout.final_norm, "Muse final norm differs from admitted bytes");
         let final_norm = land(device, arena, "global.final_norm", &dense, rect)?;
-        let head = if rank + 1 == ranks {
-            let core = CoreWeightLayout::from_shared(layout.head.clone().context("Muse serves the K6 head")?);
-            Some(core.load_recorded_with(device, checkpoint, &dense, std::ptr::null_mut(),
-                |name, bytes| allocate(device, arena, name, bytes))?)
-        } else { None };
-        Ok(Self { final_norm, head })
+        let (head, head_bf16) = if rank + 1 == ranks {
+            if let Some(core) = &layout.head {
+                let core = CoreWeightLayout::from_shared(core.clone());
+                (Some(core.load_recorded_with(device, checkpoint, &dense, std::ptr::null_mut(),
+                    |name, bytes| allocate(device, arena, name, bytes))?), None)
+            } else {
+                let rect = checked_rect(checkpoint, "lm_head.weight", DType::Bf16, None, None)?;
+                ensure!(rect.bytes() == layout.head_bf16, "Muse BF16 head differs from admitted bytes");
+                (None, Some(land(device, arena, "global.head", &dense, rect)?))
+            }
+        } else { (None, None) };
+        Ok(Self { final_norm, head, head_bf16 })
     }
 }
 
@@ -425,6 +433,16 @@ mod tests {
                         |name, bytes| allocate(device, &arena, name, bytes)))?;
                     (Some(embedding), weights)
                 } else { (None, load_rank(device, &cfg, &checkpoint, &layouts, rank, &arena)?) };
+                let globals = GlobalWeights::load(device, &checkpoint, &global, rank, ranks, &arena)?;
+                assert!(globals.head.is_none());
+                assert_eq!(globals.head_bf16.is_some(), rank + 1 == ranks);
+                if let Some(head) = &globals.head_bf16 {
+                    let expected = crate::shared::checkpoint_read::read_tensor(&checkpoint, "lm_head.weight")?;
+                    let mut actual = vec![0; head.buffer.bytes];
+                    device.run(|| library.copy_d2h(&mut actual, head.buffer))?;
+                    assert_eq!(actual, expected.bytes);
+                    assert_eq!(head.weight_backing().context("BF16 head lost arena")?.buffer.bytes, arena.layout().bytes());
+                }
                 let backing_bytes = arena.layout().bytes();
                 drop(arena);
                 let device_ids = (0..ranks as i32).collect::<Vec<_>>();
@@ -444,6 +462,7 @@ mod tests {
                         assert_eq!(&actual, bytes, "TP{ranks} rank{rank} layer{layer} {name}");
                     }
                 }
+                globals.inventory(&mut receipts)?;
                 let mut census = crate::shared::memory::receipts::Census::default();
                 census.owners(receipts.receipts);
                 if let Some(embedding) = &embedding {

@@ -12,6 +12,64 @@ fn snapshot(expert_layers: &[usize]) -> tempfile::TempDir {
 
 fn all_layers() -> Vec<usize> { (0..62).collect() }
 
+#[test]
+fn core_contract_follows_header_width_and_charges_native_payload() {
+    use super::Model;
+    use crate::families::muse_spark::weight_layout::{GlobalLayout, LayerLayout, projection_key};
+    use crate::plan::{family::FamilyModel, format::{Encoding, QuantOperand}};
+    let mut resident = Vec::new();
+    for bits in [6, 8] {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut tensors, mut projections) = testing::muse_spark_tensors(&[]);
+        for (name, _, shape) in &mut tensors {
+            if name.ends_with(".trellis") { shape[2] = 16 * bits; }
+        }
+        for (_, width, _, _) in &mut projections { *width = bits; }
+        let compact = testing::exl3_compact(bits);
+        testing::write_quantize_config(dir.path(), &testing::exl3_manifest(&compact, &projections));
+        testing::write_snapshot(dir.path(), &testing::muse_spark_config(), &tensors, None);
+        let checkpoint = Checkpoint::open(dir.path()).unwrap();
+        let mut model = Model::open(&checkpoint).unwrap();
+        assert_eq!(model.core.projections.len(), 373);
+        let operand = |width, logical: Vec<usize>| QuantOperand {
+            encoding: Encoding::Exl3 { bits: width }, container: "I16".into(), logical,
+            stored: vec![], scale: None, global_scale: None, input_scale: None, companions: vec![],
+        };
+        for (stem, projection) in &model.core.projections {
+            assert_eq!(projection.bits, bits, "{stem}");
+            let role = TensorRole::new(if stem == "lm_head" { Component::LmHead } else { Component::Attention });
+            let shape = vec![projection.stored_outputs, projection.shape[1]];
+            let mut op = operand(bits, shape.clone());
+            model.accepts(&role, stem, &mut op).unwrap();
+            assert_eq!(op.logical, projection.shape, "head padding is logical-only");
+            for unsupported in [4, 5, 7, if bits == 6 { 8 } else { 6 }] {
+                assert!(model.accepts(&role, stem, &mut operand(unsupported, shape.clone())).is_err(), "{stem} K{unsupported}");
+            }
+            let mut wrong_shape = shape;
+            wrong_shape[1] += 128;
+            assert!(model.accepts(&role, stem, &mut operand(bits, wrong_shape)).is_err(), "{stem}");
+        }
+        let global = GlobalLayout::new(&model.cfg, &model.core).unwrap();
+        let mut bytes = global.head_bytes();
+        for layer in 0..model.cfg.layers {
+            for layout in LayerLayout::ranks(&model.cfg, layer, 2, &model.core).unwrap() {
+                for projection in layout.core.values() {
+                    assert_eq!(projection_key(projection).4, bits);
+                    let [n, k] = projection.shape;
+                    assert_eq!(projection.bytes, n * k * bits / 8 + 2 * (n + k));
+                    bytes += projection.bytes;
+                }
+            }
+        }
+        resident.push(bytes);
+        model.core.projections.get_mut("lm_head").unwrap().bits = 4;
+        assert!(model.accepts(&TensorRole::new(Component::LmHead), "lm_head",
+            &mut operand(4, vec![202112, 8192])).is_err());
+    }
+    let payload_elements = 202112usize * 8192 + 62 * (2 * 8192 * 8192 + 2 * 1024 * 8192 + 2 * 4096 * 8192);
+    assert_eq!(resident[1] - resident[0], payload_elements / 4);
+}
+
 /// The min card's declared serving context (examples/configs/muse-spark-exl3-min.config):
 /// one RTX PRO 6000 cannot hold the checkpoint's compiled 1M pool together
 /// with DFlash2 and the onboarding needed to keep both bundled towers on Sparks.
@@ -30,6 +88,56 @@ fn with_package(rtx: usize, ranks: usize, dir: &std::path::Path) -> PlanOptions 
     let mut options = with_layout(rtx, ranks);
     options.layout.as_mut().unwrap().workspace_manifest = Some(testing::write_muse_exl3_capacities(dir));
     options
+}
+
+#[test]
+fn selected_head_views_charge_one_native_workspace_with_or_without_drafter() {
+    use crate::families::muse_spark::{core::CoreInventory, MuseSparkConfig};
+    use crate::placement::planner::serving::BlasHead;
+    let cfg = MuseSparkConfig::from_hf(&testing::muse_spark_config()).unwrap();
+    let drafter = tempfile::tempdir().unwrap();
+    std::fs::write(drafter.path().join("config.json"),
+        include_str!("../../../../../cuteafd-daemon/src/families/muse_spark/fixtures/drafters/nvidia.json")).unwrap();
+    for width in [None, Some(6), Some(8)] {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut tensors, _) = testing::muse_spark_tensors(&all_layers());
+        if let Some(bits) = width {
+            for (name, _, shape) in &mut tensors {
+                if name.starts_with("lm_head.") && name.ends_with(".trellis") { shape[2] = 16 * bits; }
+            }
+        } else {
+            tensors.retain(|(name, _, _)| !name.starts_with("lm_head."));
+            tensors.push(testing::t("lm_head.weight", "BF16", &[cfg.vocab_size, cfg.hidden]));
+        }
+        let mut config = testing::muse_spark_config();
+        if let Some(bits) = width { config["quantization_config"]["head_bits"] = serde_json::json!(bits); }
+        else { for key in ["head_bits", "lm_head"] { config["quantization_config"].as_object_mut().unwrap().remove(key); } }
+        for key in ["audio_config", "vision_config"] { config.as_object_mut().unwrap().remove(key); }
+        tensors.retain(|(name, _, _)| !name.starts_with("model.audio_tower.")
+            && !crate::media::muse_vision::is_tensor(name));
+        testing::write_snapshot(dir.path(), &config, &tensors, None);
+        let input = testing::BudgetedPlanInput::open(dir.path()).unwrap();
+        let inventory = CoreInventory::from_checkpoint(&cfg, input.checkpoint()).unwrap();
+        assert_eq!(inventory.head_outputs(&cfg), if width.is_none() { cfg.vocab_size } else { 202112 });
+        for backend in [BlasHead::TensorLt, BlasHead::Gemm] {
+            for draft in [false, true] {
+                let mut options = with_layout(2, 6);
+                let layout = options.layout.as_mut().unwrap();
+                layout.bf16_target_head = backend;
+                if draft { layout.muse_drafter_snapshot = Some(drafter.path().to_path_buf()); }
+                let report = input.plan(&options).unwrap();
+                assert!(report.fits, "{width:?} {backend:?} draft={draft}: {:?}", report.hints);
+                let placed = report.solver_placement.unwrap();
+                let workspace = |gpu: usize| placed.items[gpu].iter().filter(|item|
+                    item.group == "Muse native target/drafter head workspace").map(|item| item.bytes).sum::<u64>();
+                assert_eq!(workspace(0), 0);
+                assert_eq!(workspace(1), if width.is_none() { crate::serving_capacity::GLMF_HEAD_WORKSPACE } else { 0 });
+                let init = placed.items[1].iter().filter(|item|
+                    item.group.starts_with("BLAS device initialization")).map(|item| item.bytes).sum::<u64>();
+                assert_eq!(init, if width.is_none() { 2 << 20 } else { 0 });
+            }
+        }
+    }
 }
 
 #[test]

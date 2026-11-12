@@ -122,6 +122,7 @@ mod tests {
     #[test]
     fn every_family_target_head_takes_the_shared_route() {
         let sources = [
+            ("muse_spark/forward.rs", include_str!("../families/muse_spark/forward.rs"), "shared::target_head::launch("),
             ("glm5/engine.rs", include_str!("../families/glm5/engine.rs"), "shared::target_head::launch("),
             ("glm5_flash/engine.rs", include_str!("../families/glm5_flash/engine.rs"), "shared::target_head::launch("),
             ("mimo_v2/head.rs", include_str!("../families/mimo_v2/head.rs"), "shared::target_head::launch("),

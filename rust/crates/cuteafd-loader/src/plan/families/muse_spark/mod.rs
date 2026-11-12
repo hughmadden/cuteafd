@@ -260,9 +260,11 @@ impl FamilyModel for Model {
                 format!("{stem}: bundled Muse tower needs plain BF16 {shape:?}, found {}", super::describe(operand)));
         }
         if let Some(projection) = self.core.projections.get(stem) {
-            super::require(matches!(operand.encoding, format::Encoding::Exl3 { bits: 6 })
+            super::require(matches!(projection.bits, 6 | 8)
+                && operand.exl3_bits() == Some(projection.bits)
                 && operand.logical == [projection.stored_outputs, projection.shape[1]],
-                || format!("{stem}: expected header-native K6 {:?} (stored N {})", projection.shape, projection.stored_outputs))?;
+                || format!("{stem}: expected header-native K{} {:?} (stored N {}; supported widths K6/K8)",
+                    projection.bits, projection.shape, projection.stored_outputs))?;
             // Report the logical extent; the head's stored N128 padding stays the loader's.
             operand.logical = projection.shape.to_vec();
             return Ok(());

@@ -97,8 +97,7 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
     };
     let drafter = match opts.muse_drafter_snapshot.as_deref().map(|snapshot| -> anyhow::Result<_> {
         let config: serde_json::Value = serde_json::from_slice(&std::fs::read(snapshot.join("config.json"))?)?;
-        let head = model.core.get_weight(crate::families::muse_spark::core::HEAD)
-            .map(|head| head.stored_outputs).context("Muse drafter needs the K6 target head")?;
+        let head = model.core.head_outputs(&cfg);
         let sms = opts.physical_sms.unwrap_or(ArchContext::for_device("sm_120", cards[gpus - 1].physical_bytes).sms);
         let drafter = shared::drafter_inventory(cfg, &config, usize::try_from(slots)?,
             usize::try_from(slots)?, head, u64::from(sms), opts.draft_kv_cache)?;
@@ -175,7 +174,7 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
         if component == Component::Vision { report.encoder = Some(encoder); } else { report.audio_encoder = Some(encoder); }
     }
     let facts = shared::ProductionInput { cfg, core: &model.core, projections, catalog, budgets, host, prefill,
-        full_prefill_logits: opts.full_prefill_logits, slots, mark_slots, context, maximum_pool_tokens,
+        full_prefill_logits: opts.full_prefill_logits, bf16_target_head: opts.bf16_target_head, slots, mark_slots, context, maximum_pool_tokens,
         partial_bf16_max_rows: opts.muse_partial_bf16_max_rows, partial_reply_formats: opts.spark_reply_formats,
         local, drafter, fixed, media };
     let prepared = match facts.prepare() {

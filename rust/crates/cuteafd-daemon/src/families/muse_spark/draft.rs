@@ -11,7 +11,7 @@
 //!   gathers its block's rows (anchor, then the mask token) from it over peer
 //!   access on its own stream (`draft_device_with`), as rank 1's step embed.
 //! - Head: the drafter has no head of its own. Its `TargetHead::Launch` runs
-//!   the target's exact head on the drafter's own scratch: the K6 head into
+//!   the target's selected BF16/trellis head on the drafter's own logit planes, into
 //!   stored-width F32 rows, trimmed to the vocabulary, then `muse_softcap`
 //!   (output multiplier and softcap, the values the drafter was trained on;
 //!   admission refuses a drafter with others).
@@ -21,14 +21,14 @@ use crate::shared::memory::Tag;
 use crate::shared::memory::weight_arena::{weight_allocation, DeviceWeightArena};
 use crate::shared::speculation::dflash::{ContextRow, DflashDrafter, Draft, DraftSeq, TargetHead, TAP_ROWS};
 use anyhow::{ensure, Context, Result};
-use cuteafd_ffi::{programs::Scalar, CuteafdDeviceBuffer as Buffer};
+use cuteafd_ffi::CuteafdDeviceBuffer as Buffer;
 use cuteafd_loader::families::muse_spark::MuseSparkConfig;
 use std::{ffi::c_void, path::Path};
 use cuteafd_core::memory_layout::ArenaTag;
 
 pub(crate) struct MuseDraft<'a> {
     pub drafter: DflashDrafter<'a>,
-    /// The K6 head's stored-width F32 rows for a full draft batch.
+    /// The selected head's stored-width F32 rows for a full draft batch.
     stored: Allocation<'a>,
     /// The trimmed F32 rows the softcap reads.
     trimmed: Allocation<'a>,
@@ -59,6 +59,7 @@ impl<'a> MuseDraft<'a> {
         table: &crate::shared::token_io::TokenEmbedding<'_>, admitted: &cuteafd_loader::placement::families::muse_spark::MuseDrafter,
         kv_cache: cuteafd_loader::families::qwen4::Qwen4KvCache,
         exchange: Option<std::rc::Rc<crate::shared::peer_split::PeerExchange<'a>>>) -> Result<Self> {
+        head.check_head_stream(stream)?;
         let device = head.device;
         let config = crate::shared::speculation::dflash::DflashConfig::read(snapshot)?;
         ensure!(config.hidden == cfg.hidden && config.vocab == cfg.vocab_size && config.block == admitted.block
@@ -101,7 +102,7 @@ impl<'a> MuseDraft<'a> {
                     admitted.sequences, mask, true, representation, Fp8Scales::Amax, Fp8Rows::W8a16, kv_cache, allocate)
             }
         })?;
-        let stored_width = head.globals.head.as_ref().context("Muse drafter on a rank without the head")?.shape[0];
+        let stored_width = head.globals.head.as_ref().map_or(cfg.vocab_size, |weights| weights.shape[0]);
         let rows = admitted.sequences * admitted.block;
         ensure!(admitted.head_scratch == (rows * (stored_width + cfg.vocab_size) * 4) as u64,
             "Muse drafter head scratch differs from its admission");
@@ -145,15 +146,13 @@ impl<'a> MuseDraft<'a> {
     pub(crate) fn draft(&self, cfg: &MuseSparkConfig, head: &RankResources<'a>,
         table: &crate::shared::token_io::TokenEmbedding<'_>, sequences: &[DraftSeq]) -> Result<Vec<Draft>> {
         ensure!(sequences.len() * self.block <= self.rows, "Muse draft batch beyond its admitted rows");
-        let weights = head.globals.head.as_ref().context("Muse drafter head weights")?;
-        let (vocab, stored) = (cfg.vocab_size, weights.shape[0]);
+        let (vocab, stored) = (cfg.vocab_size,
+            head.globals.head.as_ref().map_or(cfg.vocab_size, |weights| weights.shape[0]));
         let (stored_plane, trimmed_plane, ids) = (self.stored.buffer, self.trimmed.buffer, self.ids.buffer);
         let input = |tokens: &[u32], output: Buffer, stream: *mut c_void| -> Result<()> {
             ensure!(stream == self.stream, "Muse draft input on another stream");
             table.embed(tokens, ids, 1, output, stream)
         };
-        let library = self.device.library;
-        let programs = &head.programs;
         let launch = move |x: *const c_void, logits: *mut f32, rows: usize, stream: *mut c_void| -> Result<()> {
             ensure!(stream == self.stream && rows <= self.rows, "Muse draft head on another stream or too wide");
             let device = self.device.id;
@@ -161,14 +160,7 @@ impl<'a> MuseDraft<'a> {
             let staged = Buffer { bytes: rows * stored * 4, ..stored_plane };
             let trimmed = Buffer { bytes: rows * vocab * 4, ..trimmed_plane };
             let out = Buffer { ptr: logits.cast(), bytes: rows * vocab * 4, device_id: device, flags: 0 };
-            // The target head path (`forward::head` after its final norm, which the
-            // drafter's own final norm replaces): K6 head, trim, softcap.
-            head.core.head_f32(rows, input, weights, staged, stream)?;
-            // SAFETY: the drafter's own planes, distinct, ordered on its stream.
-            unsafe {
-                library.copy_d2d_2d_async(trimmed, vocab * 4, staged, stored * 4, vocab * 4, rows, stream)?;
-                programs.launch("softcap", &[trimmed, out], &[Scalar::I32(i32::try_from(rows)?)], stream)
-            }
+            super::forward::project_head(cfg, head, rows, input, staged, trimmed, out, stream)
         };
         self.device.run(|| self.drafter.draft_device_with(sequences, &input, TargetHead::Launch(Box::new(launch))))
     }

@@ -238,8 +238,7 @@ pub(super) fn with_backend<T>(args: &ServeArgs, run: impl FnOnce(&super::backend
         drafter: args.draft.as_deref().map(|snapshot| -> Result<_> {
             let config: serde_json::Value = serde_json::from_slice(&std::fs::read(snapshot.join("config.json"))
                 .with_context(|| format!("Muse drafter config {}", snapshot.display()))?)?;
-            let head = core.get_weight(cuteafd_loader::families::muse_spark::core::HEAD)
-                .map(|head| head.stored_outputs).context("Muse drafter needs the K6 target head")?;
+            let head = core.head_outputs(&cfg);
             let head_device = crate::shared::memory::device::Device { library: &library,
                 id: *device_ids.last().context("Muse devices")? };
             let sms = head_device.run(|| library.sm_count())?;
@@ -346,7 +345,7 @@ pub(super) fn with_backend<T>(args: &ServeArgs, run: impl FnOnce(&super::backend
                 crate::shared::memory::EmbedPlacement::Gpu, || {
                     devices.iter().zip(&programs).enumerate().map(|(rank, (&device, programs))|
                         super::engine::RankResources::load(device, programs, super::engine::RankLoad { cfg: &cfg,
-                            checkpoint: &checkpoint, built: &built, placement, rank, slots: sequences as u64, arena: &arenas[rank],
+                            checkpoint: &checkpoint, built: &built, placement, rank, stream: streams[rank].raw, slots: sequences as u64, arena: &arenas[rank],
                             unit_rows: usize::try_from(prefill.unit_rows)?, waves: usize::try_from(prefill.waves)?, context }))
                         .collect::<Result<Vec<_>>>()
                 }, |name, bytes| crate::shared::memory::weight_arena::weight_allocation(
