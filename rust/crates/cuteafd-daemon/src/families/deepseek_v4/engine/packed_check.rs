@@ -3,6 +3,48 @@ use super::*;
 use crate::shared::prefill_packing::{self, Limits};
 use crate::shared::prefill_pipeline::{self, FfnRoute, PrefillHooks, Unit};
 
+#[test]
+fn kv_arena_allocates_once_per_device_and_views_retain_the_generation() -> Result<()> {
+    let fixture = cuteafd_ffi::native_library_lifetime_fixture::Fixture::build_for_tests()?;
+    let library = fixture.load()?;
+    fixture.immediate_copies(&library)?;
+    fixture.strict_device_free(&library, true)?;
+    let cfg = DeepseekV4Config::from_model_args(&serde_json::json!({
+        "vocab_size":129280,"dim":4096,"moe_inter_dim":2048,"n_layers":3,"n_hash_layers":1,
+        "n_heads":64,"n_routed_experts":256,"n_shared_experts":1,"n_activated_experts":6,
+        "score_func":"sqrtsoftplus","route_scale":1.5,"swiglu_limit":10.0,"q_lora_rank":1024,
+        "head_dim":512,"rope_head_dim":64,"o_groups":8,"o_lora_rank":1024,"window_size":128,
+        "original_seq_len":65536,"rope_theta":10000,"rope_factor":16,"beta_fast":32,"beta_slow":1,
+        "index_n_heads":64,"index_head_dim":128,"index_topk":512,"hc_mult":4,"hc_sinkhorn_iters":20,
+        "compress_rope_theta":160000,"compress_ratios":[0,4,128]
+    }), 3)?;
+    for rank in 0..2 {
+        library.cuda_set_device(rank)?;
+        let layout = cuteafd_loader::serving_capacity::V4KvLayout::new(&cfg, 1, 1, 2,
+            true, if rank == 0 { 3 } else { 0 }, 128, 3, 64)?;
+        let names = layout.views().keys().cloned().collect::<Vec<_>>();
+        let arena = KvArena::new(&library, layout)?;
+        let views = names.iter().map(|name| arena.view(name)).collect::<Result<Vec<_>>>()?;
+        // All KV kernels use at most 16-byte vector/TMA bases. Each named view
+        // preserves 64-byte alignment, including tiny tables and carry arrays.
+        assert!(views.iter().all(|v| v.buffer.ptr as usize % 16 == 0 && v.buffer.ptr as usize % 64 == 0));
+        for (i, view) in views.iter().enumerate() {
+            let value = [i as u8; 32];
+            library.copy_h2d(view.buffer, &value)?;
+            let mut result = [0; 32];
+            library.copy_d2h(&mut result, view.buffer)?;
+            assert_eq!(value, result);
+        }
+        drop(arena);
+        assert_eq!(fixture.events()?.matches('d').count(), rank as usize);
+        drop(views);
+        assert_eq!(fixture.events()?.matches('D').count(), rank as usize + 1);
+        assert_eq!(fixture.events()?.matches('d').count(), rank as usize + 1);
+    }
+    assert_eq!(fixture.device_free_mismatch(&library)?.0, 0);
+    Ok(())
+}
+
 fn limits() -> Limits { Limits { rows: 256, chunk_rows: 256, max_context: 4096, taps: Some(TAP_ROWS) } }
 
 #[test]

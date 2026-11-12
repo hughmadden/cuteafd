@@ -243,8 +243,8 @@ pub fn steps_requests(inputs: &V4Inputs, rank: usize) -> Result<Option<Vec<u64>>
 }
 
 /// Fixed V4 demands plus each GPU's reserve, the ones both sides previously
-/// computed apart. Every pool-owned term (window rings, the per-layer cache
-/// records, lane page tables) is a separate exact owner in `Recipe::prepare`,
+/// computed apart. Every pool-owned term (window rings, records, carry, RoPE and lane page
+/// tables) lives in the single per-device KV owner in `Recipe::prepare`,
 /// so nothing here scales with the pool.
 pub fn fixed_demands(inputs: &V4Inputs) -> Result<(Vec<Demand>, Vec<u64>), PlacementError> {
     let gpus = inputs.gpus.len();
@@ -252,21 +252,12 @@ pub fn fixed_demands(inputs: &V4Inputs) -> Result<(Vec<Demand>, Vec<u64>), Place
         .map_err(|_| PlacementError::Inventory("V4 cache geometry"))?;
     let hidden = inputs.cfg.dim as u64;
     let topk = inputs.cfg.n_activated_experts as u64;
-    let tables = inputs.prefill_waves.checked_mul(crate::serving_capacity::V4_PACKED_MEMBERS as u64)
-        .and_then(|n| n.checked_add(inputs.decode_rows)).ok_or(PlacementError::Overflow("V4 packed lane tables"))?;
-    let table_bytes = tables.checked_mul(4).ok_or(PlacementError::Overflow("V4 lane tables"))?;
     let mut demands = Vec::new();
     let mut reserves = Vec::new();
     for (rank, cache) in geometry.ranks.iter().enumerate() {
         let gpu = rank as u8;
         let role = if gpus == 1 { 0 } else if rank == 0 { 1 } else { 2 };
         let mul = |a: u64, b: u64, what| a.checked_mul(b).ok_or(PlacementError::Overflow(what));
-        // Window rings and the per-layer cache records are exact owners in
-        // `Recipe::prepare`; this keeps the pool-independent replay and
-        // lane-table state.
-        let state = cache.fixed_state_bytes + cache.speculative_replay_bytes
-            + mul(table_bytes, inputs.sequences, "V4 tables")?;
-        let context = mul(cache.context_table_bytes_per_token, inputs.max_context, "V4 RoPE tables")?;
         let intake = requests_bytes("V4 Spark intake", &intake_requests(inputs, rank)?)?;
         let exchange = if gpus == 2 {
             deepseek_v4_expert_exchange_bytes(hidden, topk, inputs.prefill_rows, inputs.decode_rows, rank, inputs.prefill_waves)
@@ -292,8 +283,6 @@ pub fn fixed_demands(inputs: &V4Inputs) -> Result<(Vec<Demand>, Vec<u64>), Place
             demands.push(Demand::new(gpu, Category::Runtime, "loaded code", code, code_basis));
         }
         let basis = if inputs.workspace.is_some() { Basis::Formula } else { Basis::Estimated };
-        demands.push(Demand::new(gpu, Category::Kv, "state", state, Basis::Formula));
-        demands.push(Demand::new(gpu, Category::Kv, "RoPE context tables", context, Basis::Formula));
         if inputs.mark_slots > 0 && cache.retained_mark_bytes > 0 {
             demands.push(Demand::new(gpu, Category::Prefix, "marks",
                 mul(cache.retained_mark_bytes, inputs.mark_slots, "V4 marks")?, Basis::Formula));
@@ -502,40 +491,37 @@ mod default_tests {
         }
     }
 
-    /// The engine allocates one window ring per cached layer plus one per
-    /// dSpark stage, and the lead GPU holds every stage's ring. Each layer's
-    /// cache records are their own allocations (C4 records and index units,
-    /// C128 records), so each is charged its own curve and 2 MiB rounding.
     #[test]
-    fn cache_stages_ring_on_the_lead_gpu_and_records_charge_per_layer() {
-        use crate::placement::planner::Location;
-        let mut cfg = context_cfg();
-        cfg.n_mtp_layers = 3;
-        let mut input = plan_inputs(&cfg);
-        input.cache_stages = 3;
-        input.attention = Some(AttentionPlacement::Heads);
-        let solved = prepare(&input).unwrap().admit(production_request(&input)).unwrap().solved;
-        let owners = |gpu: u8, group: &str| -> Vec<String> { solved.facts.allocations.iter()
-            .filter(|allocation| allocation.group == group
-                && allocation.location == Location::coordinator(gpu))
-            .map(|allocation| allocation.id.clone()).collect() };
-        for gpu in 0..2u8 {
-            let stages = if gpu == 0 { 3 } else { 0 };
-            assert_eq!(owners(gpu, "window rings").len(), 43 + stages,
-                "rtx{gpu} charges 43 cached layers plus its {stages} dSpark stages");
-            let records = owners(gpu, "records");
-            assert_eq!(records.len(), 21 + 21 + 20,
-                "rtx{gpu} charges 21 C4 records, 21 C4 index units and 20 C128 records apart");
-            assert_eq!(records.iter().filter(|id| id.ends_with(".index")).count(), 21);
-            assert_eq!(records.iter().filter(|id| id.ends_with(".records")).count(), 41);
+    fn cache_stages_and_tables_share_one_physical_kv_owner_per_gpu() {
+        use crate::placement::planner::{Location, sm120_request_backing};
+        for attention in [AttentionPlacement::Heads, AttentionPlacement::Context] {
+            let mut cfg = context_cfg();
+            cfg.n_mtp_layers = 3;
+            let mut input = plan_inputs(&cfg);
+            input.cache_stages = 3;
+            input.attention = Some(attention);
+            input.context = (attention == AttentionPlacement::Context)
+                .then_some(V4Context { topk_scratch: 12345, partial_scratch: 56789 });
+            let prepared = prepare(&input).unwrap();
+            let solved = prepared.admit(production_request(&input)).unwrap().solved;
+            for gpu in 0..2u8 {
+                let owners = solved.facts.allocations.iter().filter(|a|
+                    a.category == Category::Kv && a.location == Location::coordinator(gpu)).collect::<Vec<_>>();
+                assert_eq!(owners.len(), 1);
+                assert_eq!(owners[0].id, format!("v4.kv.arena.{gpu}"));
+                let units = host::pool_units(solved.pool_tokens / solved.pool_page_rows, if attention == AttentionPlacement::Context { 512 } else { 256 },
+                    input.sequences, attention == AttentionPlacement::Context).unwrap();
+                let ring = cuteafd_core::prefix::swa_ring(128, input.prefill_rows, 256).unwrap().rows / 256;
+                let layout = crate::serving_capacity::V4KvLayout::new(&cfg, input.sequences as usize,
+                    ring as usize, units as usize, attention == AttentionPlacement::Context,
+                    if gpu == 0 { 3 } else { 0 }, input.max_context as usize,
+                    input.prefill_waves as usize, input.decode_rows as usize).unwrap();
+                assert_eq!(owners[0].bytes, sm120_request_backing(layout.bytes() as u64).unwrap());
+                assert_eq!(layout.views().keys().filter(|n| n.ends_with(".main")).count(), if gpu == 0 { 46 } else { 43 });
+                assert_eq!(layout.views().keys().filter(|n| n.starts_with("layer") && n.ends_with(".compressed")).count(), 41);
+                assert_eq!(layout.views().keys().filter(|n| n.ends_with(".index")).count(), 21);
+            }
         }
-        // A stage ring is the same request as a layer's, so the lead GPU's
-        // three extra owners are exactly the draft stages the engine puts there.
-        let record_bytes = |gpu: u8| solved.facts.allocations.iter()
-            .filter(|allocation| allocation.id.starts_with(&format!("v4.cache.{gpu}."))
-                && allocation.id.ends_with(".records"))
-            .map(|allocation| allocation.bytes).sum::<u64>();
-        assert!(record_bytes(0) > 0 && record_bytes(1) > 0);
     }
 
     /// The pre-weight base and the code still to load are named Runtime owners
@@ -702,9 +688,9 @@ mod default_tests {
                 let auto = admitted(&input).unwrap();
                 assert_eq!(auto.attention_placement, AttentionPlacement::Context);
                 for gpu in 0..2 {
-                    let records = |plan: &Placement| plan.items[gpu].iter().filter(|item| item.group == "records")
+                    let kv = |plan: &Placement| plan.items[gpu].iter().filter(|item| item.group == "KV arena")
                         .map(|item| item.bytes).sum::<u64>();
-                    assert!(records(&heads_plan) > records(&auto));
+                    assert!(kv(&heads_plan) > kv(&auto));
                 }
             }
             let mut one = plan_inputs(&cfg);

@@ -48,10 +48,6 @@ pub(super) const STEP_TABLES: Tag = Tag::workspace("v4/workspace/step");
 pub(super) const DRAFT_WORKSPACE: Tag = Tag::drafter_workspace("v4/draft/workspace");
 /// Target KV pools: window rings, C4/C128 page pools and compressor state.
 pub(super) const KV: Tag = Tag::kv("v4/kv");
-/// Pool-following page tables placement charges as KV records.
-pub(super) const KV_RECORDS: Tag = Tag::kv("v4/kv/records");
-/// Generated RoPE cos/sin tables.
-pub(super) const ROPE: Tag = Tag::weights("v4/rope");
 /// Peer/TP2 reply and reduce landings.
 pub(super) const REDUCE_LANDING: Tag = Tag::transport("v4/transport/reduce");
 
@@ -75,6 +71,37 @@ impl<'a> Dev<'a> {
         let ptr = unsafe { self.buffer.ptr.cast::<u8>().add(offset) }.cast();
         Self { buffer: cuteafd_ffi::CuteafdDeviceBuffer { ptr, bytes, ..self.buffer },
             _owner: std::rc::Rc::clone(&self._owner) }
+    }
+}
+
+struct KvArena<'a> {
+    layout: cuteafd_loader::serving_capacity::V4KvLayout,
+    owner: std::rc::Rc<DeviceAllocation<'a>>,
+    _registration: cuteafd_ffi::memory_ledger::fault::ArenaRegistration,
+}
+
+impl<'a> KvArena<'a> {
+    fn new(library: &'a NativeLibrary, layout: cuteafd_loader::serving_capacity::V4KvLayout) -> Result<Self> {
+        let registration = cuteafd_ffi::memory_ledger::fault::register_arena(cuteafd_ffi::memory_ledger::fault::Arena {
+            id: "v4/kv".into(), kind: KV.kind, device: library.cuda_get_device()?, bytes: layout.bytes(),
+            padding_bytes: layout.bytes() - layout.views().values().map(|r| r.len()).sum::<usize>(), tail_bytes: None,
+            views: layout.views().iter().map(|(name, r)| cuteafd_ffi::memory_ledger::fault::ArenaView {
+                name: name.clone(), offset: r.start, bytes: r.len(),
+            }).collect(),
+        });
+        let owner = std::rc::Rc::new(DeviceAllocation::new(library, layout.bytes(), KV)?);
+        registration.bind(owner.buffer.ptr as usize);
+        library.cuda_zero_bytes(owner.buffer, owner.buffer.bytes)?;
+        Ok(Self { layout, owner, _registration: registration })
+    }
+
+    fn view(&self, name: &str) -> Result<Dev<'a>> {
+        let range = self.layout.view(name)?;
+        let address = (self.owner.buffer.ptr as usize).checked_add(range.start).context("V4 KV view overflow")?;
+        ensure!(address % 64 == 0 && range.end <= self.owner.buffer.bytes, "invalid V4 KV view");
+        Ok(Dev { buffer: cuteafd_ffi::CuteafdDeviceBuffer {
+            ptr: address as *mut c_void, bytes: range.len(), ..self.owner.buffer
+        }, _owner: self.owner.clone() })
     }
 }
 
@@ -102,6 +129,7 @@ pub(crate) struct Engine<'a> {
     pools: Vec<LayerCache<'a>>,
     rope_window: Dev<'a>,
     rope_compressed: Dev<'a>,
+    kv_arena: KvArena<'a>,
     /// Prefill and decode workspaces, reused across steps.
     prefill_workspace: RefCell<Option<Workspace<'a>>>,
     packed_row_cap: Cell<Option<usize>>,
@@ -163,6 +191,7 @@ pub(crate) struct V4Peer<'a> {
     pools: Vec<LayerCache<'a>>,
     rope_window: Dev<'a>,
     rope_compressed: Dev<'a>,
+    kv_arena: KvArena<'a>,
     prefill_workspace: RefCell<Option<Workspace<'a>>>,
     decode_workspace: RefCell<Option<Workspace<'a>>>,
     graphs: RefCell<crate::shared::decode_graph::GraphBank<GraphKey, GraphExec<'a>>>,
@@ -494,15 +523,12 @@ impl<'a> Engine<'a> {
             self.programs.load_matching(|name| self.selected_programs().contains(name))?;
             // The peer's caches and RoPE tables are KV, not exchange storage.
             let _memory_scope = cuteafd_ffi::memory_ledger::scope("kv");
-            let table = |compressed: bool| -> Result<Dev<'a>> {
-                let values = metadata::rope_table(&self.cfg, compressed, self.max_context.max(metadata::WINDOW));
-                let allocation = DeviceAllocation::new(self.library, values.len() * 4, ROPE)?;
-                self.library.copy_h2d(allocation.buffer, bytes_of(&values))?;
-                Ok(allocation.into())
-            };
-            let pools = (0..self.cfg.n_layers).map(|l| Self::pool_layer_for(self.library, &self.cfg, parts.shape, l,
-                self.context_mode.is_some())).collect::<Result<Vec<_>>>()?;
-            Ok(V4Peer { device, stream, layers, pools, rope_window: table(false)?, rope_compressed: table(true)?,
+            let kv_arena = Self::kv_arena(self.library, &self.cfg, parts.shape,
+                self.context_mode.is_some(), 0, self.max_context, self.prefill_waves, self.decode_rows)?;
+            let pools = (0..self.cfg.n_layers).map(|l| Self::pool_layer_for(&kv_arena, &self.cfg, l))
+                .collect::<Result<Vec<_>>>()?;
+            Ok(V4Peer { device, stream, layers, pools, rope_window: kv_arena.view("rope.window")?,
+                rope_compressed: kv_arena.view("rope.compressed")?, kv_arena,
                 prefill_workspace: RefCell::new(None), decode_workspace: RefCell::new(None),
                 graphs: RefCell::new(crate::shared::decode_graph::GraphBank::new(None)) })
         })?;
@@ -527,42 +553,31 @@ impl<'a> Engine<'a> {
         Ok(usize::try_from(self.selected_programs().shared_scratch(sizes))?)
     }
 
-    fn pool_layer(parts: &EngineParts<'a>, layer: usize) -> Result<LayerCache<'a>> {
-        Self::pool_layer_for(parts.library, &parts.cfg, parts.shape, layer, parts.context.is_some())
+    #[allow(clippy::too_many_arguments)]
+    fn kv_arena(library: &'a NativeLibrary, cfg: &DeepseekV4Config, shape: PoolShape,
+        context: bool, stages: usize, positions: usize, waves: usize, decode_rows: usize) -> Result<KvArena<'a>> {
+        let layout = cuteafd_loader::serving_capacity::V4KvLayout::new(cfg, shape.sequences,
+            shape.ring_pages, shape.units, context, stages, positions, waves, decode_rows)?;
+        let arena = KvArena::new(library, layout)?;
+        for compressed in [false, true] {
+            let values = metadata::rope_table(cfg, compressed, positions.max(metadata::WINDOW));
+            let table = arena.view(if compressed { "rope.compressed" } else { "rope.window" })?;
+            library.copy_h2d(table.buffer, bytes_of(&values))?;
+        }
+        Ok(arena)
     }
 
-    /// Layer `layer`'s zeroed caches and compressor state on the current device. Under `context`
-    /// the C4 pools hold this GPU's half of the units (local page `id >> 1`); C128 pools, window
-    /// rings and carry stay whole on both GPUs.
-    fn pool_layer_for(library: &'a NativeLibrary, cfg: &DeepseekV4Config, shape: PoolShape, layer: usize,
-        context: bool) -> Result<LayerCache<'a>> {
-        let _memory_scope = cuteafd_ffi::memory_ledger::scope("kv");
-        let zeroed = |bytes: usize| -> Result<Dev<'a>> {
-            let allocation = DeviceAllocation::new(library, bytes.max(256), KV)?;
-            library.cuda_zero_bytes(allocation.buffer, allocation.buffer.bytes)?;
-            Ok(allocation.into())
-        };
-        let sequences = shape.sequences;
-        let main = zeroed(shape.window_pages() * MAIN_PAGE_BYTES)?;
-        let (compressed, index, states) = match cfg.compress_ratios.get(layer).copied().unwrap_or(0) {
-            4 => (
-                Some(zeroed(c4_units(shape, context) * metadata::compressed_page_bytes(4))?),
-                Some(zeroed(c4_units(shape, context) * INDEX_PAGE_BYTES)?),
-                vec![
-                    zeroed(sequences * 16 * 1024 * 4)?,
-                    zeroed(sequences * 16 * 1024 * 4)?,
-                    zeroed(sequences * 16 * 256 * 4)?,
-                    zeroed(sequences * 16 * 256 * 4)?,
-                ],
-            ),
-            128 => (
-                Some(zeroed(shape.units * metadata::compressed_page_bytes(128))?),
-                None,
-                vec![zeroed(sequences * 256 * 512 * 4)?, zeroed(sequences * 256 * 512 * 4)?],
-            ),
-            _ => (None, None, Vec::new()),
-        };
-        Ok(LayerCache { main, compressed, index, states })
+    /// The pool generation owns one backing; layer handles only retain views.
+    fn pool_layer_for(arena: &KvArena<'a>, cfg: &DeepseekV4Config, layer: usize) -> Result<LayerCache<'a>> {
+        let view = |name: &str| arena.view(&format!("layer{layer}.{name}"));
+        let ratio = cfg.compress_ratios.get(layer).copied().unwrap_or(0);
+        let carry = match ratio { 4 => 4, 128 => 2, _ => 0 };
+        Ok(LayerCache {
+            main: view("main")?,
+            compressed: (ratio != 0).then(|| view("compressed")).transpose()?,
+            index: (ratio == 4).then(|| view("index")).transpose()?,
+            states: (0..carry).map(|i| view(&format!("carry{i}"))).collect::<Result<_>>()?,
+        })
     }
 
     /// Allocates the cache pools and RoPE tables for `parts.shape`.
@@ -575,13 +590,10 @@ impl<'a> Engine<'a> {
         let stages = parts.weights.dspark.as_ref().map_or(0, |d| d.stages.len());
         let attention_reduction = AttentionReductionPlan::new(parts.decode_rows,
             (stages > 0).then_some(parts.cfg.dspark_block_size), None)?;
-        let pools = (0..parts.cfg.n_layers + stages).map(|l| Self::pool_layer(&parts, l)).collect::<Result<Vec<_>>>()?;
-        let table = |compressed: bool| -> Result<Dev<'a>> {
-            let values = metadata::rope_table(&parts.cfg, compressed, parts.max_context.max(metadata::WINDOW));
-            let allocation = DeviceAllocation::new(parts.library, values.len() * 4, ROPE)?;
-            parts.library.copy_h2d(allocation.buffer, bytes_of(&values))?;
-            Ok(allocation.into())
-        };
+        let kv_arena = Self::kv_arena(parts.library, &parts.cfg, parts.shape, parts.context.is_some(),
+            stages, parts.max_context, parts.prefill_waves, parts.decode_rows)?;
+        let pools = (0..parts.cfg.n_layers + stages).map(|l| Self::pool_layer_for(&kv_arena, &parts.cfg, l))
+            .collect::<Result<Vec<_>>>()?;
         let split_family = match (parts.weights.layers.iter().any(|l| l.attention_split || l.ffn_split), parts.family) {
             (false, _) => None,
             (true, "dsv4f") => Some("dsv4f2"),
@@ -612,8 +624,9 @@ impl<'a> Engine<'a> {
             graph_eager: std::cell::Cell::new(0),
             graph_coverage: crate::shared::decode_graph::census::LaunchCoverage::new(),
             draft_probe: RefCell::new(None),
-            rope_window: table(false)?,
-            rope_compressed: table(true)?,
+            rope_window: kv_arena.view("rope.window")?,
+            rope_compressed: kv_arena.view("rope.compressed")?,
+            kv_arena,
             pools,
             library: parts.library,
             programs: parts.programs,
@@ -747,7 +760,7 @@ impl<'a> Engine<'a> {
                 comb: comb.rows(index, t * 16 * 4),
                 tokens: self.alloc(t * 4, WORKSPACE)?,
                 shared: shared.rows(index, t * h * 2),
-                tables: self.step_buffers(t, if shared_page_list { cuteafd_loader::serving_capacity::V4_PACKED_MEMBERS } else { t },
+                tables: self.step_buffers(rank, index, shared_page_list, t, if shared_page_list { cuteafd_loader::serving_capacity::V4_PACKED_MEMBERS } else { t },
                     if shared_page_list { cuteafd_loader::serving_capacity::V4_PACKED_MEMBERS } else { 1 })?,
                 taps: self.alloc(draft_bytes(cuteafd_loader::serving_capacity::deepseek_v4_tap_rows(t, shared_page_list)
                     * self.cfg.dspark_target_layer_ids.len() * h * 2), DRAFT_WORKSPACE)?,
@@ -792,7 +805,7 @@ impl<'a> Engine<'a> {
     }
 
     /// Persistent table buffers for up to `rows` rows.
-    fn step_buffers(&self, rows: usize, page_lists: usize, members: usize) -> Result<StepBuffers<'a>> {
+    fn step_buffers(&self, rank: usize, lane: usize, prefill: bool, rows: usize, page_lists: usize, members: usize) -> Result<StepBuffers<'a>> {
         let _memory_scope = cuteafd_ffi::memory_ledger::scope("workspace/step");
         let ints = |count: usize| self.alloc(count * 4, STEP_TABLES);
         // Each member's compressor headers and 16-byte pointer alignment are private.
@@ -808,10 +821,12 @@ impl<'a> Engine<'a> {
             c4: metadata(4)?,
             c128: metadata(128)?,
             c4_page_table: {
-                // Pool-following tables are KV records, matching placement::solve.
-                let _memory_scope = cuteafd_ffi::memory_ledger::scope("kv/records");
-                // Prefill retains a private, aligned page list per packed member.
-                self.alloc(page_lists * (self.shape.units + if members > 1 { 3 } else { 0 }) * 4, KV_RECORDS)?
+                let arena = if rank == 0 { &self.kv_arena } else { &self.peer()?.kv_arena };
+                let name = if prefill { format!("tables.prefill{lane}") } else { "tables.decode".into() };
+                let view = arena.view(&name)?;
+                ensure!(view.buffer.bytes == (page_lists * (self.shape.units + if members > 1 { 3 } else { 0 }) * 4).max(256),
+                    "V4 lane page table differs from admitted KV view");
+                view
             },
             c4_visible: ints(storage_rows)?,
             c4_indexed_lengths: ints(storage_rows)?,

@@ -1,7 +1,6 @@
 //! Native dSpark main/attention FP8 matrix ownership.
 use crate::shared::decode_graph::{fatal_drain, BindingGraphs};
 use super::DsparkWeights;
-use crate::shared::memory::Tag;
 use crate::shared::memory::{DeviceAllocation, LoadStream};
 use crate::families::deepseek_v41::v41_tensors::NativeRtxTensors;
 use anyhow::{ensure, Context, Result};
@@ -146,22 +145,30 @@ impl<'library> DsparkWeights<'library> {
         );
         let (index, name, k, n) = kind.binding()?;
         let kernel = library.v41_fp8_matrix_plan(capacity, k, n)?;
-        let owned_input = if external.is_none() { Some(DeviceAllocation::new(library, capacity as usize*k as usize*2, Tag::drafter_workspace("v41/draft-projection"))?) } else { None };
+        let arena = crate::shared::memory::weight_arena::workspace_arena(library,
+            cuteafd_loader::serving_capacity::v41_workspace::projection(capacity as usize, k as usize,
+                n as usize, kernel.info().scratch_bytes as usize, external.is_none())?,
+            cuteafd_core::memory_layout::ArenaTag::drafter_workspace("v41/draft-projection"))?;
+        let plane = |name| -> Result<_> {
+            let bytes = arena.layout().view(name).context("draft projection plane")?.bytes();
+            Ok(DeviceAllocation::from_allocation(arena.view(name, bytes)?))
+        };
+        let owned_input = if external.is_none() { Some(plane("input")?) } else { None };
         let input = external.unwrap_or_else(|| owned_input.as_ref().unwrap().buffer);
         ensure!(!input.ptr.is_null() && input.bytes >= capacity as usize*k as usize*2
             && input.device_id == self.tensor(&format!("{name}.weight"))?.device_id,
             "projection input extent or device differs");
         let value = DsparkProjection {
             standalone: &self.standalone,
-            scratch: DeviceAllocation::new(library, kernel.info().scratch_bytes as usize, Tag::drafter_workspace("v41/draft-projection"))?,
+            scratch: plane("scratch")?,
             kernel,
             _weights: self,
             weight: self.tensor(&format!("{name}.weight"))?,
             scales: self.projection_scales[index].buffer,
-            alpha: DeviceAllocation::new(library, 4, Tag::drafter_workspace("v41/draft-projection"))?,
+            alpha: plane("alpha")?,
             input,
             _owned_input: owned_input,
-            output: DeviceAllocation::new(library, capacity as usize * n as usize * 2, Tag::drafter_workspace("v41/draft-projection"))?,
+            output: plane("output")?,
             graph: BindingGraphs::new(library, "dspark_projection")?,
             ready: None,
         };
@@ -187,15 +194,14 @@ impl DsparkProjection<'_, '_> {
     ) -> Result<usize> {
         let (_, _, k, n) = kind.binding()?;
         let info = library.v41_fp8_matrix_plan_info(capacity, k, n)?;
-        usize::try_from(
-            info.scratch_bytes + u64::from(capacity) * (u64::from(k) + u64::from(n)) * 2 + 4,
-        )
-        .context("dSpark projection workspace overflow")
+        Ok(cuteafd_loader::serving_capacity::v41_workspace::projection(capacity as usize,
+            k as usize, n as usize, info.scratch_bytes as usize, true)?.bytes())
     }
     pub fn external_input_bytes(library: &NativeLibrary, kind: ProjectionKind, capacity: u32) -> Result<usize> {
-        let (_, _, k, _) = kind.binding()?;
-        Self::device_bytes(library, kind, capacity)?
-            .checked_sub(capacity as usize*k as usize*2).context("projection input budget underflow")
+        let (_, _, k, n) = kind.binding()?;
+        let info = library.v41_fp8_matrix_plan_info(capacity, k, n)?;
+        Ok(cuteafd_loader::serving_capacity::v41_workspace::projection(capacity as usize,
+            k as usize, n as usize, info.scratch_bytes as usize, false)?.bytes())
     }
     // Storage access for an exclusive containing owner that tracks completion itself.
     pub(super) fn output_storage(&self) -> CuteafdDeviceBuffer {

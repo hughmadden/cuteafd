@@ -65,6 +65,7 @@ pub(crate) use exl3_workspace::exl3_workspace_bytes_from_refs;
 pub use exl3_workspace::{exl3_rtx_output_bytes, exl3_workspace_bytes, Exl3Epilogue, Exl3WorkspaceBinding, Exl3WorkspaceLayout, Exl3WorkspaceOwner};
 pub mod glm_graphs;
 pub mod v41_graphs;
+pub mod v41_workspace;
 pub mod mimo_graphs;
 pub mod muse_graphs;
 pub mod glm_graph_nodes;
@@ -81,6 +82,8 @@ pub mod qwen35_graphs;
 pub mod v4_graphs;
 mod v4_placement;
 pub use v4_placement::{deepseek_v4_expert_cost, deepseek_v4_native_workspace, deepseek_v4_tp2_expert_cost, deepseek_v4_tp2_native_workspace, deepseek_v4_tp2_workspace, V4ExpertCost};
+mod v4_kv;
+pub use v4_kv::V4KvLayout;
 mod v4_workspace;
 pub use v4_workspace::{V4_PACKED_MEMBERS, V4_PACKED_TABLE_EXTRA_ROWS, deepseek_v4_tap_rows, compiled_c128_width, deepseek_v4_expert_exchange_bytes, deepseek_v4_peer_exchange_bytes, deepseek_v4_tp2_payload_bytes, deepseek_v4_workspace_geometry, deepseek_v4_workspace_scratch, deepseek_v4_lane_page_tables, V4LanePageTable, V4WorkspaceRank, V4WorkspaceScratch};
 pub use deepseek::{deepseek_v41_cache_bytes, deepseek_v41_cache_geometry, deepseek_v41_pool_groups,

@@ -1,7 +1,6 @@
 //! Native engram projection carriers and fused residual gate ownership.
 use super::EngramDeviceView;
 use std::rc::Rc;
-use crate::shared::memory::Tag;
 use crate::shared::memory::{chain, row_window::{RowWindow, ScratchGuard, MAX_RESERVE_ROWS}};
 use crate::shared::memory::{DeviceAllocation, LoadStream};
 use crate::families::deepseek_v41::v41_tensors::NativeRtxTensors;
@@ -156,8 +155,7 @@ impl<'weights, 'library> EngramGate<'weights, 'library> {
     pub fn device_bytes(library:&NativeLibrary,capacity:usize)->Result<usize> {
         ensure!(capacity>0 && capacity<=4096,"invalid engram gate capacity");
         let scratch=library.v41_fp8_matrix_plan(capacity as u32,6144,25600)?.info().scratch_bytes as usize;
-        (capacity*(40960*2+51200+24*512+1)).checked_add(scratch).and_then(|b| b.checked_add(4))
-            .context("engram execution budget overflow")
+        Ok(cuteafd_loader::serving_capacity::v41_workspace::engram(capacity, scratch)?.bytes())
     }
     pub fn new(
         weights: &'weights EngramLayerWeights<'library>,
@@ -174,16 +172,23 @@ impl<'weights, 'library> EngramGate<'weights, 'library> {
             && unit <= rows, "invalid Engram gate storage dimensions");
         let kernel = library.v41_fp8_matrix_plan(unit as u32, 6144, 25600)?;
         let scratch_bytes = kernel.info().scratch_bytes as usize;
+        let arena = crate::shared::memory::weight_arena::workspace_arena(library,
+            cuteafd_loader::serving_capacity::v41_workspace::engram(unit, scratch_bytes)?,
+            cuteafd_core::memory_layout::ArenaTag::workspace("v41/engram-layer"))?;
+        let plane = |name| -> Result<_> {
+            let bytes = arena.layout().view(name).context("Engram plane")?.bytes();
+            Ok(DeviceAllocation::from_allocation(arena.view(name, bytes)?))
+        };
         let storage = EngramGateStorage {
             stream: LoadStream { library, raw: library.cuda_stream_create()? },
             guard: ScratchGuard::new(library, &[library.cuda_get_device()?])?,
-            output: DeviceAllocation::new(library, unit * 40960, Tag::workspace("v41/engram-layer"))?,
-            residual: DeviceAllocation::new(library, unit * 40960, Tag::workspace("v41/engram-layer"))?,
-            embeddings: DeviceAllocation::new(library, unit * 24 * 512, Tag::workspace("v41/engram-layer"))?,
-            text_mask: DeviceAllocation::new(library, unit, Tag::workspace("v41/engram-layer"))?,
-            projected: DeviceAllocation::new(library, unit * 51200, Tag::workspace("v41/engram-layer"))?,
-            scratch: DeviceAllocation::new(library, scratch_bytes, Tag::workspace("v41/engram-layer"))?,
-            alpha: DeviceAllocation::new(library, 4, Tag::workspace("v41/engram-layer"))?, kernel, rows, unit,
+            output: plane("output")?,
+            residual: plane("residual")?,
+            embeddings: plane("embeddings")?,
+            text_mask: plane("text_mask")?,
+            projected: plane("projected")?,
+            scratch: plane("scratch")?,
+            alpha: plane("alpha")?, kernel, rows, unit,
         };
         // SAFETY: workspace is owned by storage and initialization drains here.
         unsafe { storage.kernel.initialize_scratch(storage.scratch.buffer,
