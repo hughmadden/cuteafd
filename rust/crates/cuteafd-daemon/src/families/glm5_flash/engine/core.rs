@@ -3,7 +3,7 @@ use super::*;
 use crate::shared::{dense_trellis::{CoreHead, CoreWeights, Projection, ProjectionLayout, ProjectionScratch, codebook, retain_partial},
     memory::{device::{Allocation, Device}, Tag}};
 use cuteafd_ffi::{CuteafdDeviceBuffer as Buffer, dense_trellis::TrellisDType, Bf16F32Add, F32Bf16Narrow};
-use cuteafd_loader::families::glm5_flash::core_admission::{CoreCharges, CoreRankLayout, CoreStageLayout, route_stage_names, fp8_projection_name};
+use cuteafd_loader::families::glm5_flash::core_admission::{CoreCharges, CoreRankLayout, CoreStageLayout, route_stage_names, fp8_projection_name, fp8_projection_prefix};
 use std::collections::BTreeMap;
 
 type Key = (usize, usize, usize, &'static str, usize);
@@ -90,7 +90,7 @@ impl<'a> Rank<'a> {
             }
             for layer in layers {
                 for weight in layer.attention_native.values().filter(|w| w.layout.fp8) {
-                    let prefix = if layer.attention_share.split() { "glmf2_stage" } else { "glmf_stage" };
+                    let prefix = fp8_projection_prefix(&weight.layout);
                     let caps = if index == 0 { vec![64, engine.decode_rows] } else { vec![4096] };
                     for cap in caps {
                         let name = fp8_projection_name(prefix, weight.layout.shape, cap);
@@ -215,7 +215,7 @@ impl<'a> GlmfEngine<'a> {
             } else { output };
             return self.on(rank, || {
                 if weights.layout.fp8 {
-                    let prefix = if layer.attention_share.split() { "glmf2_stage" } else { "glmf_stage" };
+                    let prefix = fp8_projection_prefix(&weights.layout);
                     let capacity = if is_decode(cap) { if cap == "m128" { 128 } else { 64 } } else { 4096 };
                     let a8 = if name.starts_with("mlp.") { self.fp8_prefill.ffn }
                         else if layer.attention == GlmNextAttention::Kda {

@@ -288,6 +288,54 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn owned_mla_fp8_keeps_dense_and_shared_ffns_tensor_parallel() -> Result<()> {
+        use super::super::core_admission::{CoreCharges, fp8_projection_name, fp8_projection_prefix, route_stage_names};
+        use std::collections::BTreeSet;
+        let (cfg, _) = fixture();
+        let mut core = CoreInventory::default();
+        for (name, shape) in expected(&cfg) {
+            let stem = name.strip_suffix(".weight").unwrap();
+            if !stem.starts_with(&format!("{PREFIX}0.")) && !stem.starts_with(&format!("{PREFIX}3.")) { continue; }
+            core.native.insert(stem.into(), NativeProjection { shape: [shape[0], shape[1]], fp8: true,
+                split: split(&cfg, stem).unwrap() });
+        }
+        for owner in [0, 1] {
+            let mut names = BTreeSet::new();
+            for decode in [true, false] { names.extend(route_stage_names(&cfg, 2, true, decode, 64)); }
+            for layer in [0, 3] {
+                let mla_owner = (layer == 3).then_some(owner);
+                for (rank, layouts) in core.layer_native(&cfg, layer, 2, mla_owner)?.iter().enumerate() {
+                    let mlp = if layer == 0 { "mlp" } else { "mlp.shared_experts" };
+                    let inter = if layer == 0 { cfg.dense_intermediate } else { cfg.moe_intermediate };
+                    assert_eq!(layouts[&format!("{mlp}.gate_proj")].shape, [inter / 2, cfg.hidden]);
+                    assert_eq!(layouts[&format!("{mlp}.down_proj")].shape, [cfg.hidden, inter / 2]);
+                    for (leaf, layout) in layouts {
+                        let whole = layer == 3 && leaf.starts_with("self_attn.");
+                        let prefix = if whole { "glmf_stage" } else { "glmf2_stage" };
+                        assert_eq!(layout.ranks, if whole { 1 } else { 2 });
+                        assert_eq!(fp8_projection_prefix(layout), prefix);
+                        for cap in [64, 4096] { names.insert(fp8_projection_name(prefix, layout.shape, cap)); }
+                    }
+                    assert_eq!(layouts.contains_key("self_attn.q_b_proj"), layer == 3 && rank == usize::from(owner));
+                }
+            }
+            // Only the correct whole-attention / half-FFN exports exist. Wrong
+            // attention-based FFN routing must fail this admission lookup.
+            let manifest = serde_json::json!({"programs": names.iter().map(|name| serde_json::json!({
+                "name": name, "scratch_bytes_at_capacity": {"scratch":
+                    if name.starts_with("glmf2_stage_fp8_linear_") { 8192 } else { 4096 }}
+            })).collect::<Vec<_>>()});
+            let charges = CoreCharges::from_package(&cfg, &core, 4, 2, Some(&vec![owner; 4]),
+                4096, 3, 64, None, false, &manifest)?;
+            assert_eq!(charges.programs.into_iter().collect::<BTreeSet<_>>(), names);
+            for rank in charges.ranks {
+                for stage in rank.stages.unwrap() { assert_eq!(stage.extents["scratch"], 8192); }
+            }
+        }
+        Ok(())
+    }
+
     fn fixture() -> (GlmNextConfig, Checkpoint) {
         let mut config = crate::plan::testing::glm5_flash_config(45);
         config["text_config"]["vocab_size"] = serde_json::json!(154880);

@@ -106,7 +106,7 @@ impl CoreCharges {
                         bf16_shapes.insert((weight.shape[1], weight.shape[0]));
                         continue;
                     }
-                    let prefix = if ranks == 1 || owner.is_some() { "glmf_stage" } else { "glmf2_stage" };
+                    let prefix = fp8_projection_prefix(weight);
                     for (index, caps) in [vec![64, decode_rows], vec![4096]].into_iter().enumerate() {
                         for cap in caps {
                             native_names[rank][index].insert(fp8_projection_name(prefix, weight.shape, cap));
@@ -215,6 +215,10 @@ impl CoreCharges {
     pub fn requests(&self) -> impl Iterator<Item = &[u64]> {
         self.ranks.iter().map(|rank| rank.allocations.as_slice())
     }
+}
+
+pub fn fp8_projection_prefix(layout: &super::core::NativeLayout) -> &'static str {
+    if layout.ranks == 1 { "glmf_stage" } else { "glmf2_stage" }
 }
 
 pub fn fp8_projection_name(prefix: &str, [n, k]: [usize; 2], cap: usize) -> String {
