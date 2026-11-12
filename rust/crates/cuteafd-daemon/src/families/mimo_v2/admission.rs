@@ -921,6 +921,40 @@ pub(super) fn workspace_native_scratch(
 #[cfg(test)]
 mod tests {
     #[test]
+    fn push_host_owners_follow_namespace_and_selected_dense_headers() -> anyhow::Result<()> {
+        let root = tempfile::tempdir()?;
+        let tensor = |name: &str, bytes| cuteafd_loader::plan::checkpoint::CheckpointTensor {
+            shard: "header-only.safetensors".into(),
+            meta: cuteafd_loader::SafetensorsTensorMetadata { name: name.into(),
+                dtype: cuteafd_core::DType::Bf16, shape: vec![1], byte_offset: 0, byte_length: bytes },
+        };
+        let checkpoint = cuteafd_loader::plan::Checkpoint {
+            view: None, snapshot: root.path().into(), config: serde_json::json!({}),
+            quantize_config: None, weight_map: Default::default(), tensors: vec![
+                tensor("model.layers.0.self_attn.q_proj.weight", 4096),
+                tensor("model.layers.1.mlp.experts.0.gate_proj.weight", 1 << 30),
+            ],
+            missing_shards: vec![], shard_bytes: 0,
+        };
+        assert!(super::push_host_envelope(&checkpoint, 2, None)?.is_none());
+        let path = std::ffi::CString::new(root.path().as_os_str().as_encoded_bytes())?;
+        let value = br#"{"me":"raptor"}"#;
+        // SAFETY: path, attribute name and value remain valid across setxattr.
+        let status = unsafe { libc::setxattr(path.as_ptr(), c"user.sparknest.cluster".as_ptr(),
+            value.as_ptr().cast(), value.len(), 0) };
+        anyhow::ensure!(status == 0, "setxattr: {}", std::io::Error::last_os_error());
+        let envelope = super::push_host_envelope(&checkpoint, 2, None)?.unwrap();
+        let owners = envelope.allocations("mimo.load.push")?;
+        assert_eq!(owners.iter().map(|owner| owner.bytes).sum::<u64>(), envelope.bytes()?);
+        assert_eq!(envelope.expert_bytes.len(), 2);
+        assert_eq!(envelope.dense_bytes, vec![cuteafd_loader::push_load::admitted_push_envelope(
+            4096, cuteafd_ffi::push_ring::DEFAULT_SLOTS, cuteafd_ffi::push_ring::DEFAULT_SLOT_BYTES as u64)?; 2]);
+        assert!(owners.iter().all(|owner| owner.lifetime.last == cuteafd_loader::placement::planner::Phase::Load));
+        assert!(super::push_host_envelope(&checkpoint, 0, None).is_err());
+        Ok(())
+    }
+
+    #[test]
     fn local_admission_reads_manifest_from_sealed_package_root() {
         let root = tempfile::tempdir().unwrap();
         let directory = root.path().join("tp1");
