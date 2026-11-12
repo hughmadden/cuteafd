@@ -259,7 +259,7 @@ def test_release_smoke_matrix_covers_owned_columns_with_current_defaults() -> No
     matrix = json.loads((ROOT / "scripts/bench/release-smoke.example.json").read_text())
     assert matrix["profile"] == "smoke"
     entries = matrix["entries"]
-    assert len(entries) == 30
+    assert len(entries) == 28
     assert len({entry["name"] for entry in entries}) == len(entries)
     defaults = matrix["defaults"]["set"]
     stale = {"CONCURRENCY", "MAX_CONTEXT_TOKENS", "HOST_CACHE_BYTES", "BENCH_SIMULATED",
@@ -288,14 +288,14 @@ def test_release_smoke_matrix_covers_owned_columns_with_current_defaults() -> No
         }:
             assert not entry["sparks"]
             assert values["EXPERT_BACKEND"] == "local"
-        if entry["name"] in {"glm53f-nvfp4-max", "glm53f-tr3-max", "qwen38-nvfp4-min"}:
+        if entry["name"] in {"glm53f-nvfp4-max", "qwen38-nvfp4-min"}:
             assert entry["sparks"] == ["ostrich", "dodo"]
             assert values["EXPERT_BACKEND"] == "spark"
         for key in ("ADDR", "EXPERT_PORT"):
             assert values[key] not in ports
             ports.add(values[key])
         models.setdefault(values["MODEL_ID"], set()).add(len(entry["gpus"]))
-    assert len(models) == 14
+    assert len(models) == 13
     assert all(columns == {1, 2} for columns in models.values())
 
 
