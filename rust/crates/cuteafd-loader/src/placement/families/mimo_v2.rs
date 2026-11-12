@@ -56,6 +56,34 @@ pub fn add_local_media_weights(weights: &mut [ResidentWeights], devices: &[i32],
     Ok(())
 }
 
+/// Selected-header receive bounds shared by offline placement and live admission.
+pub fn push_host_envelope(checkpoint: &crate::plan::Checkpoint, ranks: usize,
+    catalog: Option<&crate::OfficialV41Catalog>) -> anyhow::Result<crate::push_load::PushHostEnvelope> {
+    use anyhow::{ensure, Context, Result};
+    ensure!((1..=2).contains(&ranks), "MiMo push rank count");
+    let (slots, slot) = (128, 1 << 20);
+    let largest = checkpoint.tensors.iter().filter(|tensor| !tensor.meta.name.contains(".experts."))
+        .map(|tensor| tensor.meta.byte_length).max().unwrap_or(0);
+    let dense = crate::push_load::admitted_push_envelope(largest, slots as usize, slot)?;
+    let expert = if let Some(manifest) = catalog.and_then(|catalog| catalog.exl3()) {
+        let layers = catalog.context("MiMo push catalog")?.routed_experts();
+        (0..ranks).map(|rank| -> Result<u64> {
+            (layers.first_layer..layers.layers).try_fold(0u64, |bytes, layer| {
+                let plan = manifest.residency(crate::V41Exl3Layer::Backbone(layer), ranks, rank)?;
+                bytes.checked_add(plan.loads.iter().filter(|load| load.tensor.ends_with(".trellis")).count() as u64 * 4)
+                    .context("MiMo push validation overflow")
+            })
+        }).collect::<Result<Vec<_>>>()?
+    } else {
+        let bytes = catalog.into_iter().flat_map(|catalog| catalog.tensors()).filter(|tensor|
+            tensor.metadata.name.ends_with("input_scale") || tensor.metadata.name.ends_with("weight_scale_2"))
+            .map(|tensor| tensor.metadata.byte_length).max().unwrap_or(0).checked_mul(2)
+            .context("MiMo push native validation overflow")?.max(2 << 20);
+        vec![bytes; ranks]
+    };
+    Ok(crate::push_load::PushHostEnvelope::new(expert, vec![dense; ranks], slots, slot)?)
+}
+
 /// Exact native weight/scale bytes, shared with the allocation path.
 pub fn expert_layer_bytes(tensors: &crate::formats::fp8_experts::Fp8ExpertTensors,
     tp: usize, rank: usize, slicing: crate::formats::fp8_experts::Slicing) -> anyhow::Result<u64> {
@@ -233,6 +261,48 @@ mod tests {
                 &[0; 2][..ranks], vec![crate::placement::planner::Baseline::Forecast {
                     occupied: 0, source: "unit test".into(), assumed: false }; ranks],
                 (128 << 30, 128 << 30), 108 << 30, 6).unwrap(),
+        }
+    }
+
+    #[test]
+    fn pushed_expert_weights_start_at_load_without_double_charging_runtime_bytes() {
+        use crate::placement::planner::{self, ComponentKind, Location, Operation, Phase, Recipe};
+        for ranks in [1, 2] {
+            let (cfg, spark, no_spark) = fixture(ranks, 4096);
+            let mut prepared = input(&cfg, &spark, &no_spark, ranks, 4096).prepare().unwrap();
+            let request = admission::production_request(4096, Some(4096), Onboard::Layers(1),
+                prepared.recipe.prefill, Operation::Serving, ResidentWeights(u64::MAX), Default::default());
+            let mount = prepared.recipe.prepare(&request).unwrap();
+            prepared.recipe.pushed_experts = true;
+            let push = prepared.recipe.prepare(&request).unwrap();
+            for rank in 0..ranks {
+                let id = format!("rtx{rank}.experts.arena");
+                let owners = |contract: &planner::Contract| contract.components.iter().filter_map(|component|
+                    match &component.kind {
+                        ComponentKind::Allocation { template, .. } if template.id == id =>
+                            Some((component.activation.clone(), template.clone())),
+                        _ => None,
+                    }).collect::<Vec<_>>();
+                let mount_owners = owners(&mount);
+                let push_owners = owners(&push);
+                assert_eq!(mount_owners.len(), push_owners.len());
+                for ((activation, old), (selected, new)) in mount_owners.iter().zip(&push_owners) {
+                    assert_eq!(activation, selected);
+                    assert_eq!(new.location, Location::coordinator(rank as u8));
+                    assert_eq!(old.lifetime.first, Phase::Warmup);
+                    assert_eq!(new.lifetime.first, Phase::Load);
+                    assert_eq!(new.lifetime.last, Phase::Growth);
+                    let workspace = push.components.iter().filter_map(|component| match &component.kind {
+                        ComponentKind::Allocation { template, .. } if component.activation == *selected
+                            && template.id == format!("rtx{rank}.experts.workspace") => Some(template),
+                        _ => None,
+                    }).collect::<Vec<_>>();
+                    assert_eq!(workspace.len(), 1);
+                    assert_eq!(workspace[0].lifetime.first, Phase::Warmup);
+                    assert_eq!(new.bytes + workspace[0].bytes, old.bytes);
+                }
+            }
+            prepared.admit(request).unwrap();
         }
     }
 

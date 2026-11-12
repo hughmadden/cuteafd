@@ -562,7 +562,7 @@ fn apply_selected(input: &super::super::PlanInput, options: &LayoutOptions,
         options.spark_bytes, spark_ranks)?;
     let request = admission::production_request(crate::placement::planner::Context::resolve(context, (options.context_tokens > 0).then_some(options.context_tokens)), options.pool_tokens, onboard, prefill,
         operation, ResidentWeights(options.weight_budget_bytes), options.spark_reply_formats);
-    let prepared = ProductionInput {
+    let mut prepared = ProductionInput {
         startup_probe_bytes: probe,
         expert_usage: options.expert_usage,
         blas_head: if checkpoint.tensors.iter().find(|t| t.meta.name == "lm_head.weight")
@@ -579,6 +579,13 @@ fn apply_selected(input: &super::super::PlanInput, options: &LayoutOptions,
         spark_reply_formats: options.spark_reply_formats,
         resident_weights, operation, budgets,
     }.prepare()?;
+    match crate::push_load::namespace(&checkpoint.snapshot) {
+        Ok(_) => prepared.admit_push(&crate::placement::families::mimo_v2::push_host_envelope(
+            checkpoint, ranks, Some(input.expert_catalog()?))?)?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound
+            && error.raw_os_error().is_none() && checkpoint.snapshot.exists() => {},
+        Err(error) => return Err(error).context("MiMo SparkNest namespace discovery"),
+    }
     let admitted = match prepared.admit(request) {
         Ok(admitted) => admitted,
         Err(error) => {
@@ -636,6 +643,39 @@ use crate::placement::families::mimo_v2::reservation_category;
 mod tests {
     use super::*;
     use crate::plan::{checkpoint::Checkpoint, testing::*, PlanInput};
+
+    #[test]
+    fn namespace_plan_admits_the_same_push_load_owners() -> Result<()> {
+        use crate::placement::planner::{Location, Phase};
+        let dir = tempfile::tempdir()?;
+        write_snapshot(dir.path(), &mimo_flash_mopd_config(), &mimo_flash_mopd_tensors(), Some(4));
+        let input = PlanInput::from_checkpoint(Checkpoint::open(dir.path())?);
+        let options = LayoutOptions { native_mtp_layers: 0, host_memory: Some((128 << 30, 128 << 30)),
+            rtx_bytes: vec![95 * GIB; 2], concurrency: 4, pool_tokens: Some(32768), ..Default::default() };
+        let solve = || {
+            let mut devices = (0..2).map(|index| DeviceLayout { kind: DeviceKind::Rtx, index,
+                capacity_bytes: 95 * GIB, worker_budget_bytes: 0, items: vec![], kv_tokens: 0 }).collect::<Vec<_>>();
+            apply_selected(&input, &options, &mut devices, &vec![Default::default(); 2], 0,
+                4, 4096, 4, 32768, None).map(|(_, _, ledger, _)| ledger)
+        };
+        let mounted = solve()?;
+        let path = std::ffi::CString::new(dir.path().as_os_str().as_encoded_bytes())?;
+        let value = br#"{"me":"raptor"}"#;
+        // SAFETY: the directory path, attribute name and value outlive setxattr.
+        let status = unsafe { libc::setxattr(path.as_ptr(), c"user.sparknest.cluster".as_ptr(),
+            value.as_ptr().cast(), value.len(), 0) };
+        anyhow::ensure!(status == 0, "setxattr: {}", std::io::Error::last_os_error());
+        let pushed = solve()?;
+        let envelope = crate::placement::families::mimo_v2::push_host_envelope(
+            input.checkpoint(), 2, Some(input.expert_catalog()?))?;
+        let host_budget = pushed.budgets.iter().find(|budget| budget.locations.contains(&Location::PINNED))
+            .context("host budget")?;
+        let owned = |ledger: &crate::plan::SolvedPhaseLedger, phase| ledger.phases.iter()
+            .find(|row| row.budget == host_budget.id && row.phase == phase).unwrap().owned;
+        assert_eq!(owned(&pushed, Phase::Load) - owned(&mounted, Phase::Load), envelope.bytes()?);
+        assert_eq!(owned(&pushed, Phase::Ready), owned(&mounted, Phase::Ready));
+        Ok(())
+    }
 
     #[test]
     fn planner_equals_runtime_admission_flash_pro_one_two_rtx() {

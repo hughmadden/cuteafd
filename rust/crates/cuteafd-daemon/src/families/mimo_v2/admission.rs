@@ -18,6 +18,20 @@ pub(super) struct Preflight {
     pub expert_directory: Option<std::path::PathBuf>,
     pub working_set: cuteafd_loader::placement::SparkWorkingSet,
     pub prefill_rows: usize,
+    pub push_host: Option<cuteafd_loader::push_load::PushHostEnvelope>,
+    pub expert_resident_bytes: [usize; 2],
+}
+
+fn push_host_envelope(checkpoint: &cuteafd_loader::plan::Checkpoint, ranks: usize,
+    catalog: Option<&cuteafd_loader::OfficialV41Catalog>)
+    -> Result<Option<cuteafd_loader::push_load::PushHostEnvelope>> {
+    use crate::shared::experts::rtx::push::PushPolicy;
+    if PushPolicy::for_snapshot(&checkpoint.snapshot)? == PushPolicy::Mount { return Ok(None); }
+    let envelope = cuteafd_loader::placement::families::mimo_v2::push_host_envelope(checkpoint, ranks, catalog)?;
+    ensure!(envelope.slots == cuteafd_ffi::push_ring::DEFAULT_SLOTS as u64
+        && envelope.slot_bytes == cuteafd_ffi::push_ring::DEFAULT_SLOT_BYTES as u64,
+        "MiMo admitted push ring differs from runtime ABI");
+    Ok(Some(envelope))
 }
 
 fn routed_costs(opened: &super::Opened, args: &super::EngineArgs, layers: usize, ranks: usize)
@@ -527,7 +541,8 @@ fn preflight_shape(
         serving_context, (args.pool_tokens > 0).then_some(args.pool_tokens as u64),
         args.onboard.resolve(routed_layers), prefill, operation,
         crate::shared::memory::budget::resident_weight_limit(), cuteafd_core::spark_reply::requested());
-    let prepared = ProductionInput {
+    let push_host = push_host_envelope(&opened.checkpoint, ranks, opened.catalog.as_ref())?;
+    let mut prepared = ProductionInput {
         startup_probe_bytes: intake_probe_bytes,
         expert_usage: args.expert_usage_enabled()?,
         blas_head: crate::shared::target_head::TargetHead::configured().blas_head(
@@ -548,8 +563,17 @@ fn preflight_shape(
         spark_reply_formats: cuteafd_core::spark_reply::requested(),
         resident_weights, operation, budgets,
     }.prepare()?;
+    if let Some(envelope) = &push_host { prepared.admit_push(envelope)?; }
     let admitted = prepared.admit(request).with_context(|| format!(
         "MiMo shared placement; configured-Spark reservation contract {report}"))?;
+    let mut expert_resident_bytes = [0usize; 2];
+    for &layer in &admitted.spark.rtx_layers {
+        let cost = prepared.recipe.experts[layer].context("MiMo admitted expert cost")?;
+        for (rank, bytes) in expert_resident_bytes.iter_mut().enumerate().take(ranks) {
+            let resident = if ranks == 2 { cost.half[rank].resident } else { cost.whole.resident };
+            *bytes = bytes.checked_add(usize::try_from(resident)?).context("MiMo pushed expert residency overflow")?;
+        }
+    }
     let mut capacity = contract::resolved_capacity(&admitted,
         u32::try_from(concurrency)?, u32::try_from(args.rings)?)?;
     let working = admitted.spark;
@@ -613,6 +637,7 @@ fn preflight_shape(
         local_expert_budget: usize::try_from(local_expert_budget)?,
         placement, expert_directory, working_set: working,
         prefill_rows: args.prefill_rows,
+        push_host, expert_resident_bytes,
     })
 }
 
@@ -870,6 +895,40 @@ pub(super) fn workspace_native_scratch(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn push_host_owners_follow_namespace_and_selected_dense_headers() -> anyhow::Result<()> {
+        let root = tempfile::tempdir()?;
+        let tensor = |name: &str, bytes| cuteafd_loader::plan::checkpoint::CheckpointTensor {
+            shard: "header-only.safetensors".into(),
+            meta: cuteafd_loader::SafetensorsTensorMetadata { name: name.into(),
+                dtype: cuteafd_core::DType::Bf16, shape: vec![1], byte_offset: 0, byte_length: bytes },
+        };
+        let checkpoint = cuteafd_loader::plan::Checkpoint {
+            view: None, snapshot: root.path().into(), config: serde_json::json!({}),
+            quantize_config: None, weight_map: Default::default(), tensors: vec![
+                tensor("model.layers.0.self_attn.q_proj.weight", 4096),
+                tensor("model.layers.1.mlp.experts.0.gate_proj.weight", 1 << 30),
+            ],
+            missing_shards: vec![], shard_bytes: 0,
+        };
+        assert!(super::push_host_envelope(&checkpoint, 2, None)?.is_none());
+        let path = std::ffi::CString::new(root.path().as_os_str().as_encoded_bytes())?;
+        let value = br#"{"me":"raptor"}"#;
+        // SAFETY: path, attribute name and value remain valid across setxattr.
+        let status = unsafe { libc::setxattr(path.as_ptr(), c"user.sparknest.cluster".as_ptr(),
+            value.as_ptr().cast(), value.len(), 0) };
+        anyhow::ensure!(status == 0, "setxattr: {}", std::io::Error::last_os_error());
+        let envelope = super::push_host_envelope(&checkpoint, 2, None)?.unwrap();
+        let owners = envelope.allocations("mimo.load.push")?;
+        assert_eq!(owners.iter().map(|owner| owner.bytes).sum::<u64>(), envelope.bytes()?);
+        assert_eq!(envelope.expert_bytes.len(), 2);
+        assert_eq!(envelope.dense_bytes, vec![cuteafd_loader::push_load::admitted_push_envelope(
+            4096, cuteafd_ffi::push_ring::DEFAULT_SLOTS, cuteafd_ffi::push_ring::DEFAULT_SLOT_BYTES as u64)?; 2]);
+        assert!(owners.iter().all(|owner| owner.lifetime.last == cuteafd_loader::placement::planner::Phase::Load));
+        assert!(super::push_host_envelope(&checkpoint, 0, None).is_err());
+        Ok(())
+    }
+
     #[test]
     fn local_admission_reads_manifest_from_sealed_package_root() {
         let root = tempfile::tempdir().unwrap();

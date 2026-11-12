@@ -437,12 +437,95 @@ mod draft_storage_tests {
 #[cfg(test)]
 mod source_format_tests {
     use super::*;
+
+    #[test]
+    fn push_expert_selection_uses_admitted_whole_and_tp2_bytes_without_fp8_headers() -> Result<()> {
+        use cuteafd_loader::placement::{ExpertRange, Tp2Range};
+        use crate::shared::experts::rtx::push::CoordinatorExperts;
+        let range = ExpertRange { first: 1, layers: 2, peak_bytes: 8192 };
+        let Some(CoordinatorExperts::Whole { owners }) = coordinator_push_experts(None,
+            &[range], &[1, 2], [4096, 0], 1)? else { panic!("whole push missing") };
+        assert_eq!(owners[0].budget, 4096);
+        assert_eq!(owners[0].selections.len(), 2);
+        let tp2 = Tp2Range { first: 1, layers: 2, peak_bytes: [8192, 9216] };
+        let Some(CoordinatorExperts::Tp2 { layers, budgets }) = coordinator_push_experts(Some(tp2),
+            &[], &[1, 2], [4096, 5120], 2)? else { panic!("TP2 push missing") };
+        assert_eq!(layers, [1, 2]);
+        assert_eq!(budgets, [4096, 5120]);
+        assert!(coordinator_push_experts(Some(tp2), &[], &[1, 2], [8193, 5120], 2).is_err());
+        assert!(coordinator_push_experts(None, &[range], &[2, 3], [4096, 0], 1).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn dense_only_standalone_push_has_no_expert_destinations() -> Result<()> {
+        assert!(coordinator_push_experts(None, &[], &[], [0; 2], 1)?.is_none());
+        assert!(coordinator_push_experts(None, &[], &[], [0; 2], 2)?.is_none());
+        Ok(())
+    }
     use clap::Parser;
     use cuteafd_core::DType;
     use cuteafd_loader::{SafetensorsTensorMetadata, plan::checkpoint::CheckpointTensor};
 
     #[derive(Parser)]
     struct Command { #[command(flatten)] engine: EngineArgs }
+
+    fn check_opened_push_catalog(installed: bool) -> Result<()> {
+        const CHILD: &str = "CUTEAFD_MIMO_OPEN_PUSH_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let name = if installed { "installed_open_checked_prepares_admitted_selected_push" }
+                else { "open_checked_preserves_selected_expert_catalog" };
+            // Expert geometry is process-wide; exercise the real startup in isolation.
+            let mut command = std::process::Command::new("timeout");
+            command.args(["--kill-after=5s", "60s"]).arg(std::env::current_exe()?)
+                .args(["--exact", &format!("families::mimo_v2::source_format_tests::{name}"),
+                    "--nocapture", "--test-threads=1"]).env(CHILD, "1");
+            if installed { command.arg("--ignored"); }
+            let output = command.output()?;
+            ensure!(output.status.success(), "MiMo startup catalog regression: {}\n{}\n{}",
+                output.status, String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+            return Ok(());
+        }
+        let fixture = cuteafd_ffi::native_library_lifetime_fixture::Fixture::build_for_tests()?;
+        let snapshot = if installed {
+            PathBuf::from(std::env::var_os("CUTEAFD_PUSH_MIMO").context("set CUTEAFD_PUSH_MIMO")?)
+        } else {
+            let snapshot = fixture.directory().join("snapshot");
+            cuteafd_loader::plan::testing::write_snapshot(&snapshot,
+                &cuteafd_loader::plan::testing::mimo_flash_mopd_config(),
+                &cuteafd_loader::plan::testing::mimo_flash_mopd_tensors(), Some(4));
+            snapshot
+        };
+        let mut args = Command::try_parse_from(["mimo", "--snapshot", "/missing",
+            "--native-lib", "/missing.so", "--mtp", "0"])?.engine;
+        args.snapshot = snapshot;
+        args.native_lib = fixture.module_path().into();
+        let opened = open_checked(&args, false)?;
+        let view = opened.checkpoint.view.as_ref().context("selected attention view")?;
+        let catalog = opened.catalog.as_ref().context("selected expert catalog")?;
+        let selected = catalog.selected_view().context("startup reopened a default expert catalog")?;
+        assert_eq!(selected.fingerprint(), view.fingerprint());
+        assert_eq!(selected.snapshot(), view.snapshot());
+        if installed {
+            use crate::shared::experts::rtx::push::{CoordinatorPush, push_host_envelope};
+            let envelope = push_host_envelope(&[None], &[])?;
+            let (_push, streams, _ranks) = CoordinatorPush::prepare_view_admitted(
+                view, Some(catalog), 1, None, envelope)?;
+            assert_eq!(streams.len(), 1);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn open_checked_preserves_selected_expert_catalog() -> Result<()> {
+        check_opened_push_catalog(false)
+    }
+
+    #[test]
+    #[ignore = "requires installed MiMo SparkNest headers via CUTEAFD_PUSH_MIMO; CPU only"]
+    fn installed_open_checked_prepares_admitted_selected_push() -> Result<()> {
+        check_opened_push_catalog(true)
+    }
 
     fn fixture() -> (EngineArgs, Checkpoint, MimoV2Config) {
         let args = Command::try_parse_from(["mimo", "--snapshot", "/missing", "--native-lib", "/missing.so", "--mtp", "1"])
@@ -989,7 +1072,8 @@ fn open_checked(args: &EngineArgs, bf16_replay: bool) -> Result<Opened> {
     // The expert geometry is process-wide and must be fixed before the native
     // library loads (its expert helpers size rows from it).
     let catalog = (!args.skip_experts).then(|| {
-        let mut catalog = cuteafd_loader::read_expert_catalog(&args.snapshot)?;
+        let mut catalog = cuteafd_loader::read_expert_catalog_view(checkpoint.view.as_ref()
+            .context("MiMo coordinator checkpoint has no selected view")?)?;
         catalog.select_draft(cuteafd_loader::plan::spec::DraftOwnership::selected("mimo_v2",
             if args.mtp > 0 { "mtp" } else { "off" }))?;
         Ok::<_, anyhow::Error>(catalog)
@@ -1147,7 +1231,7 @@ impl Opened {
             peers: peer_stream.iter().map(|&(device, stream)| crate::shared::peer_split::RankDevice { device, stream }).collect(),
             dense: std::rc::Rc::new(crate::shared::experts::rtx::dense::DenseLoad::mount(&self.library)),
             transient: Default::default(), arenas: Default::default() };
-        use crate::shared::experts::rtx::push::{CoordinatorExperts, CoordinatorPush, PushPolicy};
+        use crate::shared::experts::rtx::push::{CoordinatorPush, PushPolicy};
         let mut pushed_experts = None;
         let embed_placement = args.token_io.embed_placement.context("MiMo embedding placement must resolve before admission")?;
         let prepare_push = |sparks: usize| -> Result<_> {
@@ -1160,30 +1244,16 @@ impl Opened {
             records.extend(load.sink.as_ref().context("push sink")?.take_all());
             records.extend(media.clone());
             let dense = crate::shared::experts::rtx::dense::plan_records(&args.snapshot, records, &devices, sparks)?;
-            let experts = if let Some(tp2) = preflight.placement.tp2 {
-                let tensors = self.catalog.as_ref().and_then(|c| c.fp8()).context("MiMo expert headers")?;
-                let directory = preflight.expert_directory.as_deref().context("MiMo expert package")?;
-                let budgets = (0..2).map(|rank| {
-                    let plan = crate::shared::experts::rtx::fp8moe::Fp8MoeTp2::plan(tensors, directory, &(tp2.first..tp2.first + tp2.layers).collect::<Vec<_>>(), rank,
-                        args.prefill_rows.max(engine::DECODE_ROWS))?;
-                    (tp2.peak_bytes[rank] as usize).checked_sub(plan.workspace_bytes)
-                        .context("MiMo TP2 workspace exceeds admitted peak")
-                }).collect::<Result<Vec<_>>>()?;
-                Some(CoordinatorExperts::Tp2 { layers: (tp2.first..tp2.first + tp2.layers).collect(), budgets })
-            } else if preflight.placement.onboard_layers > 0 {
-                let range = preflight.placement.expert_ranges[0];
-                let tensors = self.catalog.as_ref().and_then(|c| c.fp8()).context("MiMo expert headers")?.for_coordinator();
-                let resident = crate::shared::experts::fp8::Fp8Layer::bytes_for(&tensors, 1, 0, tensors.exact_slicing(1))?
-                    .checked_mul(range.layers).context("MiMo whole expert size overflow")?;
-                ensure!(resident <= range.peak_bytes as usize, "MiMo whole expert residency exceeds admission");
-                Some(CoordinatorExperts::Whole { owners: vec![crate::shared::experts::rtx::push::WholeOwner { rank: 0,
-                    selections: (range.first..range.first + range.layers)
-                        .map(|layer| crate::shared::experts::layer::ExpertLayer::BackboneFull { layer }).collect(), budget: resident }] })
-            } else { None };
+            let experts = coordinator_push_experts(preflight.placement.tp2,
+                &preflight.placement.expert_ranges, &preflight.working_set.rtx_layers,
+                preflight.expert_resident_bytes, devices.len())?;
+            let view = self.checkpoint.view.as_ref().context("MiMo push requires selected checkpoint view")?;
+            let envelope = preflight.push_host.clone().context("MiMo push host receipt")?;
             let prepared = if sparks == 0 {
-                (CoordinatorPush::prepare_alone(&args.snapshot, self.catalog.as_ref(), devices.len(), experts)?, None)
+                (CoordinatorPush::prepare_alone_view_admitted(view, self.catalog.as_ref(), devices.len(), experts, envelope)?, None)
             } else {
-                let (push, streams, ranks) = CoordinatorPush::prepare(&args.snapshot, self.catalog.as_ref(), devices.len(), experts)?;
+                let (push, streams, ranks) = CoordinatorPush::prepare_view_admitted(view,
+                    self.catalog.as_ref(), devices.len(), experts, envelope)?;
                 (push, Some((streams, ranks)))
             };
             Ok((prepared, (loaded, planning.transient.clone(), dense, devices)))
@@ -1208,20 +1278,21 @@ impl Opened {
                 crate::shared::placement::spark_rings(64 << 20)?, executions)?;
             let admission = crate::shared::placement::SparkAdmission::plan_view(self.checkpoint.view.as_ref().context("MiMo Spark admission requires selected checkpoint view")?, geometry, self.catalog.as_ref(),
                 &preflight.working_set, peers.len(), model, None)?;
-            let ranks = push_policy.plan(|| {
-                ensure!(admission.coordinator_pushes(), "MiMo Spark admission did not select required push");
+            let ranks = if admission.coordinator_pushes() { push_policy.plan(|| {
                 prepare_push(peers.len())
-            })?.and_then(|((push, ranks), planned)| {
+            })? } else { None }.and_then(|((push, ranks), planned)| {
                 coordinator_push = Some((push, peers.len(), planned));
                 ranks
             });
             Some(admission.start_with(&peers, ranks)?)
-        } else {
+        } else { None };
+        // Idle peers still acknowledge the model identity. If every routed layer
+        // is onboarded, coordinator operands form their own standalone group.
+        if coordinator_push.is_none() {
             if let Some(((push, _), planned)) = push_policy.plan(|| prepare_push(0))? {
                 coordinator_push = Some((push, 0, planned));
             }
-            None
-        };
+        }
         let (embedding, ((model, mut shares), mtp_weights)) = crate::shared::placement::load_while_admitting(admission, || {
             let Some((push, sparks, (loaded, transient, dense, devices))) = coordinator_push.take() else {
                 return loader.with_embedding(&self.cfg, layers, args.mtp, self.embed_source()?, embed_placement);
@@ -1567,6 +1638,27 @@ impl Opened {
         let tensor = &self.checkpoint.tensors[at];
         crate::shared::token_io::EmbedSource::new(&self.checkpoint.snapshot, &tensor.shard, &tensor.meta, self.cfg.hidden)
     }
+}
+
+fn coordinator_push_experts(tp2: Option<cuteafd_loader::placement::Tp2Range>,
+    ranges: &[cuteafd_loader::placement::ExpertRange], layers: &[usize], resident: [usize; 2], ranks: usize)
+    -> Result<Option<crate::shared::experts::rtx::push::CoordinatorExperts>> {
+    use crate::shared::experts::rtx::push::{CoordinatorExperts, WholeOwner};
+    ensure!((1..=2).contains(&ranks), "MiMo push coordinator rank count");
+    if layers.is_empty() { return Ok(None); }
+    if let Some(tp2) = tp2 {
+        ensure!(ranks == 2 && layers.iter().copied().eq(tp2.first..tp2.first + tp2.layers),
+            "MiMo pushed TP2 layers differ from admission");
+        ensure!(resident.iter().zip(tp2.peak_bytes).all(|(&bytes, peak)| bytes as u64 <= peak),
+            "MiMo pushed TP2 residency exceeds admission");
+        return Ok(Some(CoordinatorExperts::Tp2 { layers: layers.to_vec(), budgets: resident.to_vec() }));
+    }
+    let range = ranges.first().context("MiMo whole expert range")?;
+    ensure!(ranks == 1 && layers.iter().copied().eq(range.first..range.first + range.layers)
+        && resident[0] as u64 <= range.peak_bytes, "MiMo pushed whole experts differ from admission");
+    Ok(Some(CoordinatorExperts::Whole { owners: vec![WholeOwner { rank: 0,
+        selections: layers.iter().map(|&layer| crate::shared::experts::layer::ExpertLayer::BackboneFull { layer }).collect(),
+        budget: resident[0] }] }))
 }
 
 fn bf16s(bytes: &[u8]) -> Vec<f32> {
