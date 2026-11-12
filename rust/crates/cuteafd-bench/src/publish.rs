@@ -1455,7 +1455,15 @@ mod tests {
             root.join("scripts/bench/release-smoke-v5.json")).unwrap()).unwrap();
         let pins = |entries: &[Retired]| entries.iter()
             .map(|entry| (entry.name.clone(), entry.report.clone())).collect::<BTreeMap<_, _>>();
-        let old_pins = pins(&old.retired);
+        let archived_ml4: Vec<_> = old.retired.iter().filter(|entry|
+            matches!(entry.name.as_str(), "ml4-exl3-min" | "ml4-exl3-max")).collect();
+        assert_eq!(archived_ml4.len(), 2);
+        for entry in archived_ml4 {
+            assert_eq!(entry.release, "v5.0.0-rc1");
+            assert!(placed.iter().any(|p| p.dir == entry.report));
+        }
+        let old_pins: BTreeMap<_, _> = pins(&old.retired).into_iter().filter(|(name, _)|
+            !matches!(name.as_str(), "ml4-exl3-min" | "ml4-exl3-max")).collect();
         let current_pins = pins(&current.retired);
         let published_pins = pins(&matrix.retired);
         assert_eq!(published_pins, current_pins);
@@ -1796,17 +1804,28 @@ mod tests {
     }
 
     #[test]
-    fn checked_in_matrix_resolves_every_row_to_a_pinned_pro_card() {
+    fn checked_in_matrix_resolves_pinned_cards_and_explicit_statuses() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
         let placed = scan(&root).unwrap();
         let matrix = Matrix::load(&root.join(MATRIX_FILE)).unwrap();
         let rows = select(&placed, &matrix).unwrap();
         assert_eq!(rows.len(), matrix.rows.len());
-        for row in rows {
-            assert!(matches!(row.cells[0], Resolved::Card(_) | Resolved::Na(_)));
-            // Every published checkpoint has at least one PRO card; other cells say why not.
-            assert!(row.cells[1..].iter().any(|c| matches!(c, Resolved::Card(_))));
-            assert!(row.cells[1..].iter().all(|c| matches!(c, Resolved::Card(_) | Resolved::Na(_))));
+        for (row, source) in rows.iter().zip(&matrix.rows) {
+            for (cell, expected) in row.cells.iter().zip(&source.cells) {
+                match (cell, expected) {
+                    (Resolved::Card(_), Cell { status: Status::Current, .. }) => {},
+                    (Resolved::Pending(reason), Cell { status: Status::Pending, reason: expected, .. })
+                    | (Resolved::Held(reason), Cell { status: Status::Held, reason: expected, .. })
+                    | (Resolved::Na(reason), Cell { status: Status::Na, reason: expected, .. }) => {
+                        assert_eq!(reason, expected);
+                        assert!(!reason.is_empty());
+                    },
+                    _ => panic!("matrix status changed during resolution"),
+                }
+            }
+            if !row.cells.iter().any(|cell| matches!(cell, Resolved::Card(_))) {
+                assert_eq!(row.label, source.checkpoint);
+            }
         }
     }
 

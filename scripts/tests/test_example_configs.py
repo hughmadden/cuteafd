@@ -7,6 +7,7 @@ a user who drops them gets the same launch and the two cannot drift apart.
 """
 from __future__ import annotations
 
+import html
 import json
 import os
 import re
@@ -489,7 +490,7 @@ def test_published_matrix_pins_current_reports() -> None:
         if not current:
             assert row["checkpoint"] in results, "Unmeasured checkpoints remain visible"
             for column in ("5090", "1rtx", "2rtx"):
-                assert row[column]["reason"] in results
+                assert html.escape(row[column]["reason"]).replace("&#x27;", "&#39;") in results
     retired_names = set()
     for entry in matrix["retired"]:
         assert entry["name"] and entry["name"] not in retired_names
@@ -930,13 +931,14 @@ def test_v4_matrix_card_set_and_retired_pins() -> None:
         assert sum(other.get("set", {}).get("ADDR") == entry["set"]["ADDR"]
                    for other in v4["entries"]) == 1
     assert not any(name.startswith("qwen38-nvfp4") for name in entries)
-    ml4_retired = [entry for entry in v4["retired"] if entry.get("family") == "mistral_large4"]
+    ml4_retired = [entry for entry in v4["retired"] if entry["name"] in {"ml4-exl3-min", "ml4-exl3-max"}]
     assert {entry["name"] for entry in ml4_retired} == {"ml4-exl3-min", "ml4-exl3-max"}
     for entry in ml4_retired:
         assert entry["release_note"] == "Core-K6 checkpoint retired 2026-11-12; replaced by Mistral-Large-4-EXL3-K4"
         assert not (ROOT / entry["config"]).exists()
-        assert entry["gpus"] and entry["sparks"] and entry["set"]
-    retired = [entry for entry in v4["retired"] if "report" in entry]
+        assert entry["release"] == "v5.0.0-rc1"
+        assert (ROOT / entry["report"] / "report.json").is_file()
+    retired = [entry for entry in v4["retired"] if entry not in ml4_retired]
     assert len(retired) == 21
     assert "glm53-exl3-max" not in {entry["name"] for entry in retired}
     assert {"qwen38-nvfp4-" + size for size in ("min", "max", "5090")} <= {e["name"] for e in retired}
