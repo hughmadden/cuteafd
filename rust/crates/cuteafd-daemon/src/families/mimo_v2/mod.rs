@@ -470,6 +470,63 @@ mod source_format_tests {
     #[derive(Parser)]
     struct Command { #[command(flatten)] engine: EngineArgs }
 
+    fn check_opened_push_catalog(installed: bool) -> Result<()> {
+        const CHILD: &str = "CUTEAFD_MIMO_OPEN_PUSH_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let name = if installed { "installed_open_checked_prepares_admitted_selected_push" }
+                else { "open_checked_preserves_selected_expert_catalog" };
+            // Expert geometry is process-wide; exercise the real startup in isolation.
+            let mut command = std::process::Command::new("timeout");
+            command.args(["--kill-after=5s", "60s"]).arg(std::env::current_exe()?)
+                .args(["--exact", &format!("families::mimo_v2::source_format_tests::{name}"),
+                    "--nocapture", "--test-threads=1"]).env(CHILD, "1");
+            if installed { command.arg("--ignored"); }
+            let output = command.output()?;
+            ensure!(output.status.success(), "MiMo startup catalog regression: {}\n{}\n{}",
+                output.status, String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+            return Ok(());
+        }
+        let fixture = cuteafd_ffi::native_library_lifetime_fixture::Fixture::build_for_tests()?;
+        let snapshot = if installed {
+            PathBuf::from(std::env::var_os("CUTEAFD_PUSH_MIMO").context("set CUTEAFD_PUSH_MIMO")?)
+        } else {
+            let snapshot = fixture.directory().join("snapshot");
+            cuteafd_loader::plan::testing::write_snapshot(&snapshot,
+                &cuteafd_loader::plan::testing::mimo_flash_mopd_config(),
+                &cuteafd_loader::plan::testing::mimo_flash_mopd_tensors(), Some(4));
+            snapshot
+        };
+        let mut args = Command::try_parse_from(["mimo", "--snapshot", "/missing",
+            "--native-lib", "/missing.so", "--mtp", "0"])?.engine;
+        args.snapshot = snapshot;
+        args.native_lib = fixture.module_path().into();
+        let opened = open_checked(&args, false)?;
+        let view = opened.checkpoint.view.as_ref().context("selected attention view")?;
+        let catalog = opened.catalog.as_ref().context("selected expert catalog")?;
+        let selected = catalog.selected_view().context("startup reopened a default expert catalog")?;
+        assert_eq!(selected.fingerprint(), view.fingerprint());
+        assert_eq!(selected.snapshot(), view.snapshot());
+        if installed {
+            use crate::shared::experts::rtx::push::{CoordinatorPush, push_host_envelope};
+            let envelope = push_host_envelope(&[None], &[])?;
+            let (_push, streams, _ranks) = CoordinatorPush::prepare_view_admitted(
+                view, Some(catalog), 1, None, envelope)?;
+            assert_eq!(streams.len(), 1);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn open_checked_preserves_selected_expert_catalog() -> Result<()> {
+        check_opened_push_catalog(false)
+    }
+
+    #[test]
+    #[ignore = "requires installed MiMo SparkNest headers via CUTEAFD_PUSH_MIMO; CPU only"]
+    fn installed_open_checked_prepares_admitted_selected_push() -> Result<()> {
+        check_opened_push_catalog(true)
+    }
+
     fn fixture() -> (EngineArgs, Checkpoint, MimoV2Config) {
         let args = Command::try_parse_from(["mimo", "--snapshot", "/missing", "--native-lib", "/missing.so", "--mtp", "1"])
             .unwrap().engine;
@@ -1015,7 +1072,8 @@ fn open_checked(args: &EngineArgs, bf16_replay: bool) -> Result<Opened> {
     // The expert geometry is process-wide and must be fixed before the native
     // library loads (its expert helpers size rows from it).
     let catalog = (!args.skip_experts).then(|| {
-        let mut catalog = cuteafd_loader::read_expert_catalog(&args.snapshot)?;
+        let mut catalog = cuteafd_loader::read_expert_catalog_view(checkpoint.view.as_ref()
+            .context("MiMo coordinator checkpoint has no selected view")?)?;
         catalog.select_draft(cuteafd_loader::plan::spec::DraftOwnership::selected("mimo_v2",
             if args.mtp > 0 { "mtp" } else { "off" }))?;
         Ok::<_, anyhow::Error>(catalog)
