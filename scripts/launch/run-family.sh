@@ -2166,7 +2166,7 @@ if [[ $family == glm5_flash ]]; then
   fi
   case ",$fp8_prefill," in
     *,all,*|*,kda-in,*|*,kda-o,*)
-      if [[ $kda_fp8 == off ]]; then
+      if [[ $kda_fp8 == off && $core_view != fp8-compact ]]; then
         echo "GLM5_FLASH_FP8_PREFILL=$fp8_prefill runs KDA W8A8 over FP8 KDA weights; set GLM5_FLASH_KDA_FP8=row128 or channel" >&2
         exit 2
       fi ;;

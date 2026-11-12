@@ -962,7 +962,7 @@ impl<'p, 'a> StepPlan<'p, 'a> {
                 partial_bytes: if settings.kda_fp32_partials { 4 } else { 2 },
                 output_shard: settings.kda_output_shard,
                 // K6 scoring downloads tiles through the ordinary bounded staging.
-                full_prefill_logits: settings.full_prefill_logits && !matches!(head, GlmfHead::K6(_) | GlmfHead::RowFp8(_)),
+                full_prefill_logits: settings.full_prefill_logits && !matches!(head, GlmfHead::K6(_) | GlmfHead::RowFp8(_) | GlmfHead::BlockFp8 { .. }),
                 table_pages,
                 table_pool_pages,
             },
@@ -4532,7 +4532,7 @@ impl<'a> GlmfEngine<'a> {
                 // SAFETY: normalized rows and output logits are live on the owner's stream.
                 unsafe { owner.head_logits(x, w.logits.buffer.ptr.cast(), logit_rows, self.stream) }
             },
-            GlmfHead::Fp8 { .. } => self.timed("glmf_head_fp8", || {
+            GlmfHead::Fp8 { .. } | GlmfHead::BlockFp8 { .. } => self.timed("glmf_head_fp8", || {
                 // SAFETY: `x` holds `logit_rows` normalized rows and `w.logits` their
                 // FP32 logits (the workspace's logit capacity); the engine stream orders them.
                 unsafe { self.weights.head.launch_fp8(self.programs, x, w.logits.buffer.ptr.cast(), logit_rows, h,
@@ -4565,7 +4565,7 @@ impl<'a> GlmfEngine<'a> {
                 // SAFETY: the drafter supplies live normalized rows/output on the target device.
                 unsafe { owner.head_logits(x, logits, rows, stream) }
             })),
-            fp8 @ GlmfHead::Fp8 { .. } => TargetHead::Launch(Box::new(move |x, logits, rows, stream| {
+            fp8 @ (GlmfHead::Fp8 { .. } | GlmfHead::BlockFp8 { .. }) => TargetHead::Launch(Box::new(move |x, logits, rows, stream| {
                 // SAFETY: the drafter passes its live normalized rows and logits
                 // workspace for `rows` rows, on the stream it launches the head on.
                 unsafe { fp8.launch_fp8(self.programs, x, logits, rows, self.cfg.hidden, self.cfg.vocab_size, stream) }

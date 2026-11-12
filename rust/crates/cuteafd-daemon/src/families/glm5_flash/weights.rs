@@ -179,7 +179,8 @@ impl GlmfWeights<'_> {
         for (index, layer) in self.layers.iter().enumerate().filter(|(_, l)| l.attention == GlmNextAttention::Kda) {
             let (bf16, fp8) = (layer.has("w_in") || layer.has("w_o"), layer.has("w_in_fp8") || layer.has("w_o_fp8"));
             ensure!(!(bf16 && fp8), "KDA layer {index} holds BF16 and FP8 in/out projections");
-            let native = layer.core.contains_key("self_attn.q_proj") || layer.native_projections.contains_key("q");
+            let native = layer.core.contains_key("self_attn.q_proj") || layer.native_projections.contains_key("q")
+                || layer.attention_native.contains_key("self_attn.q_proj");
             ensure!(!native || !(bf16 || fp8), "KDA layer {index} has native and converted copies");
             ensure!(native || fp8 == (kda_fp8 != super::fp8::KdaFp8::Off),
                 "KDA layer {index}: --kda-fp8 {kda_fp8:?} but {} projections are resident", if fp8 { "FP8" } else { "BF16" });
@@ -294,6 +295,15 @@ impl<'a> GlmfLoader<'a> {
                 super::head::GlmfHead::K6(self.core_weights(
                     cuteafd_loader::formats::trellis_core::CoreWeightLayout::new(head,
                         cuteafd_loader::formats::dense_trellis::TrellisSide::Output, 0, 1)?, 0)?)
+            } else if let Some(head) = inventory.native.get("lm_head").filter(|head| head.fp8) {
+                let layout = cuteafd_loader::formats::native_attention::NativeLayout {
+                    stem: "lm_head".into(), shape: head.shape, fp8: true, rank: 0, ranks: 1,
+                    split: cuteafd_loader::formats::trellis_core::CoreSplit::Whole,
+                };
+                let mut weights = self.native_operands(std::collections::BTreeMap::from([("head".into(), layout)]), 0)?;
+                let head = weights.remove("head").context("Flash block-FP8 head")?;
+                super::head::GlmfHead::BlockFp8 { values: head.values,
+                    scales: head.scales.context("Flash block-FP8 head scales")? }
             } else if self.fp8_head {
                 let (values, scales) = self.fp8(&["lm_head.weight".to_string()], super::fp8::Layout::Row128)?;
                 super::head::GlmfHead::Fp8 { values, scales }
@@ -755,7 +765,7 @@ impl<'a> GlmfLoader<'a> {
         ops.insert("w_uv", uv);
         if !staged {
         let block = super::fp8::Layout::Block;
-        let projections: Vec<_> = cuteafd_loader::families::glm5_flash::core_fp8_projections("mla")
+        let projections: Vec<_> = ["q_a_proj.weight", "kv_a_proj_with_mqa.weight", "q_b_proj.weight", "o_proj.weight"]
             .iter().map(|name| a(name)).collect();
         let (q, s) = self.fp8(&projections[..2], block)?;
         ops.insert("w_qkv_a_fp8", q);
@@ -798,7 +808,7 @@ impl<'a> GlmfLoader<'a> {
                     self.allocation(rank, &format!("{}.payload", layout.stem), n*k*if layout.fp8 { 1 } else { 2 })?,
                     if layout.fp8 { Some(self.allocation(rank, &format!("{}.scales", layout.stem), n/128*(k/128)*4)?) } else { None }
                 )))?;
-                let records = attention_records(&self.checkpoint.snapshot, &selected, self.checkpoint.core_view(),
+                let records = attention_records(&self.checkpoint.snapshot, &selected, self.checkpoint.projection_view(&layout.stem),
                     &layout, self.fp8_scales, values.buffer, scales.as_ref().map(|s| s.buffer))?;
                 for record in records {
                     match record {
@@ -906,7 +916,7 @@ impl<'a> GlmfLoader<'a> {
 
     pub fn layer(&self, cfg: &GlmNextConfig, layer: usize) -> Result<GlmfLayer<'a>> {
         let inventory = cuteafd_loader::families::glm5_flash::core::CoreInventory::from_checkpoint(cfg, self.checkpoint)?;
-        if inventory.projections.keys().any(|stem| stem.starts_with(&format!("{PREFIX}layers.{layer}."))) {
+        if inventory.staged_layer(cfg, layer) {
             return self.native_layer_shares(cfg, layer, LayerMode::HeadSplit, &inventory)?
                 .into_iter().next().context("native Flash lead layer");
         }
@@ -980,7 +990,7 @@ impl<'a> GlmfLoader<'a> {
         let mlp = if dense { format!("{p}.mlp") } else { format!("{p}.mlp.shared_experts") };
         if !inventory.staged(&format!("{mlp}.gate_proj")) && !(dense && self.nvfp4_dense(cfg, &mlp, &mut ops)?) {
             let block = super::fp8::Layout::Block;
-            let projections: Vec<_> = cuteafd_loader::families::glm5_flash::core_fp8_projections("mlp")
+            let projections: Vec<_> = ["gate_proj.weight", "up_proj.weight", "down_proj.weight"]
                 .iter().map(|name| format!("{mlp}.{name}")).collect();
             let (q, s) = self.fp8(&projections[..2], block)?;
             ops.insert("w_gate_up_fp8", q);
@@ -1239,7 +1249,7 @@ impl<'a> GlmfLoader<'a> {
     /// docstring); without a split, [`Self::layer`] alone.
     pub fn layer_shares(&self, cfg: &GlmNextConfig, layer: usize, mode: LayerMode) -> Result<Vec<GlmfLayer<'a>>> {
         let inventory = cuteafd_loader::families::glm5_flash::core::CoreInventory::from_checkpoint(cfg, self.checkpoint)?;
-        if inventory.projections.keys().any(|stem| stem.starts_with(&format!("{PREFIX}layers.{layer}."))) {
+        if inventory.staged_layer(cfg, layer) {
             return self.native_layer_shares(cfg, layer, mode, &inventory);
         }
         let ranks = self.ranks();
@@ -1352,7 +1362,7 @@ impl<'a> GlmfLoader<'a> {
                 put(&mut ops, "w_uk", uk);
                 put(&mut ops, "w_uv", uv);
                 if !inventory.staged(&a("q_a_proj")) {
-                let projections: Vec<_> = cuteafd_loader::families::glm5_flash::core_fp8_projections("mla")
+                let projections: Vec<_> = ["q_a_proj.weight", "kv_a_proj_with_mqa.weight", "q_b_proj.weight", "o_proj.weight"]
                     .iter().map(|name| a(name)).collect();
                 let (q, s): (Vec<_>, Vec<_>) = self.on_every_rank_pair(|r| self.fp8_on(r, &projections[..2],
                     super::fp8::Layout::Block))?.into_iter().unzip();
@@ -1377,7 +1387,7 @@ impl<'a> GlmfLoader<'a> {
         let mlp = if dense { format!("{p}.mlp") } else { format!("{p}.mlp.shared_experts") };
         // A ModelOpt NVFP4 dense MLP runs whole on rank 0 (rank 1 adds a zero partial).
         if !inventory.staged(&format!("{mlp}.gate_proj")) && !(dense && self.nvfp4_dense(cfg, &mlp, &mut ops[0])?) {
-            let projections: Vec<_> = cuteafd_loader::families::glm5_flash::core_fp8_projections("mlp")
+            let projections: Vec<_> = ["gate_proj.weight", "up_proj.weight", "down_proj.weight"]
                 .iter().map(|name| format!("{mlp}.{name}")).collect();
             let (q, s): (Vec<_>, Vec<_>) = self.fp8_split(&projections[..2], Axis::Rows, ranks)?.into_iter().unzip();
             put(&mut ops, "w_gate_up_fp8", q);
@@ -1507,7 +1517,7 @@ impl<'a> GlmfLoader<'a> {
         let mut shares: Vec<Vec<GlmfLayer<'a>>> = (0..self.ranks()).map(|_| Vec::new()).collect();
         ensure!(plan.modes().len() <= cfg.layers, "attention plan exceeds checkpoint layers");
         for (layer, &mode) in plan.modes().iter().enumerate() {
-            let native = inventory.projections.keys().any(|stem| stem.starts_with(&format!("{PREFIX}layers.{layer}.")));
+            let native = inventory.staged_layer(cfg, layer);
             let parts = if native { self.native_layer_shares(cfg, layer, mode, &inventory)? }
                 else { self.layer_shares(cfg, layer, mode)? };
             for (share, part) in shares.iter_mut().zip(parts) { share.push(part); }

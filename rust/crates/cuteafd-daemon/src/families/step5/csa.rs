@@ -35,6 +35,7 @@ const VALUE: usize = 4;
 const QUERY: usize = 5;
 const KEY: usize = 6;
 const LOGITS: usize = 7;
+const OUTPUT_SCRATCH: usize = cuteafd_loader::plan::families::step5::native::CSA_OUTPUT_SCRATCH;
 const ATTN: usize = 8;
 const GATED: usize = 9;
 const DELTA: usize = 10;
@@ -64,7 +65,7 @@ const IDS: usize = 31;
 struct Admission {
     rows: usize,
     pages: usize,
-    planes: [usize; 32],
+    planes: [usize; 33],
     bytes: u64,
 }
 impl Admission {
@@ -201,6 +202,9 @@ pub(super) struct CsaLayer<'a> {
 impl<'a> CsaLayer<'a> {
     pub(super) fn inventory(&self, inventory: &mut crate::shared::memory::receipts::Inventory<'_>,
         prefix: &str) -> Result<()> {
+        if self.immutable.native_output.as_ref().is_some_and(|output| matches!(output, super::native::OutputProjection::Fp8 { .. })) {
+            self.planes[OUTPUT_SCRATCH].inventory(inventory, &format!("{prefix}.attention.native-output-scratch"))?;
+        }
         let weights = &self.immutable;
         super::native::inventory_owner(inventory, &format!("{prefix}.attention"),
             weights.weights.iter().map(Option::as_ref), &[])?;
@@ -515,9 +519,12 @@ impl<'a> CsaLayer<'a> {
             residual_spec.geometry["width"] == H,
             "CSA residual geometry"
         );
-        let native_output = if native_layer && !native_o {
+        let fp8_o = layout.operands.iter().any(|w| w.name == format!("model.layers.{layer_id}.self_attn.o_proj.weight")
+            && w.dtype == cuteafd_core::DType::F8E4M3);
+        let native_output = if (native_layer || fp8_o) && !native_o {
             Some(device.run(|| super::native::OutputProjection::load(
-                programs, &layout, layer_id, rows.min(4096), Q, H, cuteafd_ffi::draft_projection::ProjectionOutput::Bf16))?)
+                programs, &layout, layer_id, rows.min(4096), Q, H, cuteafd_ffi::draft_projection::ProjectionOutput::Bf16,
+                cuteafd_loader::plan::families::step5::native::OUTPUT_SCRATCH_BYTES))?)
         } else { None };
         let resolved = DEFS
             .iter()
@@ -1130,7 +1137,7 @@ impl<'a> CsaLayer<'a> {
                 // SAFETY: the admitted BF16 tile and whole output weight survive stream drainage.
                 output.launch(self.ptr(GATED, start * Q * 2),
                     self.immutable.weights[7].as_ref().context("CSA O weight")?.buffer,
-                    delta, self.native_scratch.as_deref(), rows, Q, H, stream.raw)?;
+                    delta, self.planes[OUTPUT_SCRATCH].buffer, rows, Q, H, stream.raw)?;
                 Ok(())
             })?;
         } else {

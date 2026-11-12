@@ -13,6 +13,11 @@ const TILE: usize = 64;
 const CAPACITY: usize = 131072;
 const SELECT: usize = 4 * 4104;
 
+/// Native output ABI scratch, a dedicated plane in each attention workspace.
+pub const OUTPUT_SCRATCH_BYTES: usize = 256;
+pub const SWA_OUTPUT_SCRATCH: usize = 16;
+pub const CSA_OUTPUT_SCRATCH: usize = 32;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RankAdmission {
     pub resident_weights: crate::placement::ResidentWeights,
@@ -68,8 +73,9 @@ impl NativeSelection {
             let stem = format!("model.layers.{layer}.self_attn.o_proj");
             let qkv_compressed = ["q", "k", "v"].iter().all(|leaf| contract.core.projections
                 .contains_key(&format!("model.layers.{layer}.self_attn.{leaf}_proj")));
-            if !qkv_compressed || contract.core.projections.contains_key(&stem) { continue; }
             let name = format!("{stem}.weight");
+            let fp8 = contract.fp8_tensors.contains(&name);
+            if (!qkv_compressed && !fp8) || contract.core.projections.contains_key(&stem) { continue; }
             let declared = if layer < cfg.layers {
                 contract.weights.tensors.iter().any(|tensor| tensor.meta.name == name
                     && tensor.meta.dtype == cuteafd_core::DType::Bf16
@@ -78,12 +84,12 @@ impl NativeSelection {
                 contract.mtp_declarations.iter().any(|(key, shape, dtype)| key == &name
                     && *dtype == cuteafd_core::DType::Bf16 && *shape == [cfg.hidden, cfg.heads * cfg.dim])
             };
-            ensure!(declared, NativeOwnerMismatch { operand: name,
+            ensure!(declared, NativeOwnerMismatch { operand: name.clone(),
                 detail: "mixed attention lacks its declared BF16 output matrix".into() });
             let split = layer < cfg.layers && !cfg.full[layer] && ranks == 2;
             requirements.push(NativeRequirement { layout: NativeLayout {
                 stem, shape: [cfg.hidden, cfg.heads * cfg.dim / if split { 2 } else { 1 }],
-                fp8: contract.core_view == crate::plan::checkpoint::CoreView::Fp8Compact, rank: 0, ranks: if split { 2 } else { 1 },
+                fp8, rank: 0, ranks: if split { 2 } else { 1 },
                 split: if split { CoreSplit::Input } else { CoreSplit::Whole },
             }, output: if split { ProjectionOutput::F32 } else { ProjectionOutput::Bf16 } });
         }
@@ -110,7 +116,7 @@ impl NativeSelection {
             let Some(stem) = operand.name.strip_suffix(".weight") else { continue; };
             let mixed = stem.strip_suffix(".o_proj").is_some_and(|prefix| ["q", "k", "v"].iter()
                 .all(|leaf| layout.core.contains_key(&format!("{prefix}.{leaf}_proj.weight"))));
-            if !mixed { continue; }
+            if !mixed && operand.dtype != cuteafd_core::DType::F8E4M3 { continue; }
             let output = if operand.slice == super::coordinator::WeightSlice::Cols && layout.ranks == 2 {
                 ProjectionOutput::F32
             } else { ProjectionOutput::Bf16 };
@@ -121,11 +127,8 @@ impl NativeSelection {
                 && operand.allocation_bytes == request.layout.bytes()?,
                 mismatch(&operand.name, "shape, storage, output precision or capacity changed"));
             if request.layout.fp8 {
-                let prefix = stem.strip_suffix("o_proj").expect("output requirement");
-                let borrowed = layout.core.iter().filter(|(name, _)| name.starts_with(prefix))
-                    .map(|(_, core)| (self.rows * core.shape[1] * 2).max(256) as u64).max().unwrap_or(0);
-                ensure!(self.resolved.fp8_scratch_bytes <= borrowed,
-                    mismatch(&operand.name, "manifest FP8 scratch exceeds serialized trellis rotated plane"));
+                ensure!(self.resolved.fp8_scratch_bytes <= OUTPUT_SCRATCH_BYTES as u64,
+                    mismatch(&operand.name, "manifest FP8 scratch exceeds named output scratch plane"));
             }
         }
         for request in &self.requirements {
@@ -144,7 +147,7 @@ pub fn validate_span_rows(rows: usize) -> Result<()> {
     Ok(())
 }
 
-pub fn swa_planes(rows: usize, heads: usize) -> Result<[usize; 16]> {
+pub fn swa_planes(rows: usize, heads: usize) -> Result<[usize; 17]> {
     ensure!(
         (1..=4096).contains(&rows) && matches!(heads, 32 | 64),
         "Step-5 SWA allocation geometry"
@@ -169,11 +172,12 @@ pub fn swa_planes(rows: usize, heads: usize) -> Result<[usize; 16]> {
         pages * 4,
         rows * 512 * 4,
         rows * H * 4,
+        OUTPUT_SCRATCH_BYTES,
     ]
     .map(|n| n.max(256)))
 }
 
-pub fn csa_planes(rows: usize) -> Result<[usize; 32]> {
+pub fn csa_planes(rows: usize) -> Result<[usize; 33]> {
     ensure!((1..=8192).contains(&rows), "Step-5 CSA allocation rows");
     let pages = rows.div_ceil(64);
     let regions = rows.div_ceil(8);
@@ -210,6 +214,7 @@ pub fn csa_planes(rows: usize) -> Result<[usize; 32]> {
         TILE * 4 * 4,
         TILE * 4 * 512 * 4,
         TILE * 4 * 512 * 4,
+        OUTPUT_SCRATCH_BYTES,
     ]
     .map(|n| n.max(256)))
 }

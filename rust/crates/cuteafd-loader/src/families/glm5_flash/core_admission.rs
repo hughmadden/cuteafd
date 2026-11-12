@@ -106,7 +106,7 @@ impl CoreCharges {
                         bf16_shapes.insert((weight.shape[1], weight.shape[0]));
                         continue;
                     }
-                    let prefix = if ranks == 1 || owner.is_some() { "glmf_stage" } else { "glmf2_stage" };
+                    let prefix = fp8_projection_prefix(weight);
                     for (index, caps) in [vec![64, decode_rows], vec![4096]].into_iter().enumerate() {
                         for cap in caps {
                             native_names[rank][index].insert(fp8_projection_name(prefix, weight.shape, cap));
@@ -135,6 +135,10 @@ impl CoreCharges {
             ensure!(matches.len() == 1, "Flash K6 requires one {name}");
             Ok(matches[0]["scratch_bytes_at_capacity"]["scratch"].as_u64().unwrap_or(0).try_into()?)
         };
+        if core.native.get("lm_head").is_some_and(|head| head.fp8) {
+            lookup("glmf_head_block_fp8")?;
+            programs.insert("glmf_head_block_fp8".into());
+        }
         let scratch = |rank: usize, decode: bool| -> Result<usize> {
             let mut bytes = 0;
             for name in route_stage_names(cfg, ranks, owned, decode, decode_rows).iter()
@@ -211,6 +215,10 @@ impl CoreCharges {
     pub fn requests(&self) -> impl Iterator<Item = &[u64]> {
         self.ranks.iter().map(|rank| rank.allocations.as_slice())
     }
+}
+
+pub fn fp8_projection_prefix(layout: &super::core::NativeLayout) -> &'static str {
+    if layout.ranks == 1 { "glmf_stage" } else { "glmf2_stage" }
 }
 
 pub fn fp8_projection_name(prefix: &str, [n, k]: [usize; 2], cap: usize) -> String {

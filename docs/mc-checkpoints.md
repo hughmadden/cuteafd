@@ -28,14 +28,25 @@ quantized core module, including the head when that family's quantizer includes
 it. Per-view config references name that view's own index and metadata. No index
 aliases or fallback to another compact width are supported.
 
-`fp8-compact` has no files or stored variant. It derives from `original` using
-`FP8_RECIPE`; its identity includes the recipe. Conversion covers only whole-core
-roles supported by that family's existing runtime, never routed experts,
-embeddings, routers, norms, towers or drafters. Initially the converter retains
-the family's existing qualified attention-only scope; whole-core FP8 expansion
-is a separate runtime change. Kimi K3.1 MC and GLM Flash MC refuse
-`fp8-compact` until that work lands. Muse MC converts q/k/v/o attention
-only, not the whole core. Unsupported families refuse it.
+`fp8-compact` has no files or stored variant. It reads exactly the `original`
+variant's `core_tensors` IDs and its BF16 index, config and quantization metadata;
+it never opens a K6/K8 index. Those IDs alone select conversion. Plain checkpoints
+have no definition and refuse this selector, including the former plain GLM
+Flash conversion path. The shared push loader converts each selected BF16 matrix
+into its final arena slot: row-major E4M3, FP32 scales per 128x128 block,
+round-to-nearest-even, scale = amax/448 (`FP8_RECIPE`). Admission charges the FP8
+payload and scale grid once; conversion scratch is transient and no resident
+BF16 copy remains. The view identity includes the metadata and recipe.
+
+Families declare executable roles, not conversion subsets. GLM Flash supports
+its MC core, including the vocabulary head, KDA q/k/v/o, MLA and dense/shared
+FFNs. Muse currently executes block FP8 q/k/v/o; a selected vocabulary head,
+attention gate or pre/post-expert projection refuses by tensor name, role and
+family until its executor lands. Kimi and GLM refuse unsupported selected roles;
+Step-5 uses the same metadata mechanism for its executable O projections. A view
+never silently skips an unsupported tensor or converts an already-FP8 source.
+KDA/head conversion keys remain engine extras for weights outside the selected
+view. Activation-pass keys select W8A8 execution, not target-weight conversion.
 
 An FP8-origin model is not MC and contains no trellis-quantized core tensors,
 including unindexed shards. Mistral Large 4 is published as
@@ -114,7 +125,8 @@ normal inventory validates selected shard headers afterward.
 Publish only after this format specification has been reviewed.
 [`wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K4-MC`](https://huggingface.co/wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K4-MC)
 is published at `91a8dbc9c12e790c65aa1a38c6aede6a3e23a77d`, with BF16
-`original` (default), `k8-compact` and `k6-compact`; `fp8-compact` still refuses.
+`original` (default), `k8-compact` and `k6-compact`. The runtime-derived
+`fp8-compact` selector converts the published original core as described above.
 See its [min](../examples/configs/glm53-flash-exl3-k4-mc-min.config) and
 [max](../examples/configs/glm53-flash-exl3-k4-mc-max.config) configs.
 The other intended MC repositories are Kimi-K3.1-Pro-EXL3-K2-MC and

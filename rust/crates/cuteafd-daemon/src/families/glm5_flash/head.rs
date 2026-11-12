@@ -46,6 +46,7 @@ pub(crate) enum GlmfHead<'a> {
     Bf16(DeviceAllocation<'a>),
     /// Checkpoint row-FP8; the embedding and drafter retain this same owner.
     RowFp8(std::rc::Rc<crate::shared::token_io::native::NativeVocabulary<'a>>),
+    BlockFp8 { values: DeviceAllocation<'a>, scales: DeviceAllocation<'a> },
     Fp8 { values: DeviceAllocation<'a>, scales: DeviceAllocation<'a> },
     /// The exact 12-bit copy of the BF16 head and, once a drafter binds it, the drafter's
     /// coarse-plane GEMV scratch (a workspace, not part of the head's resident bytes).
@@ -61,7 +62,7 @@ impl<'a> GlmfHead<'a> {
                 owner.svh.inventory(inventory, "head.svh")?;
             }
             Self::Bf16(owner) => owner.inventory(inventory, "head")?,
-            Self::Fp8 { values, scales } => {
+            Self::Fp8 { values, scales } | Self::BlockFp8 { values, scales } => {
                 values.inventory(inventory, "head.values")?;
                 scales.inventory(inventory, "head.scales")?;
             }
@@ -79,7 +80,7 @@ impl<'a> GlmfHead<'a> {
             Self::K6(weight) => vec![weight.payload.buffer, weight.suh.buffer, weight.svh.buffer],
             Self::Bf16(weight) => vec![weight.buffer],
             Self::RowFp8(owner) => vec![owner.head.payload(), owner.head.scales()],
-            Self::Fp8 { values, scales } => vec![values.buffer, scales.buffer],
+            Self::Fp8 { values, scales } | Self::BlockFp8 { values, scales } => vec![values.buffer, scales.buffer],
             Self::Packed { head, .. } => vec![head.buffer()],
         }
     }
@@ -92,6 +93,7 @@ impl<'a> GlmfHead<'a> {
         match self {
             Self::K6(_) => "K6",
             Self::RowFp8(_) => "row-FP8",
+            Self::BlockFp8 { .. } => "block-FP8",
             head => head.format().map_or("?", GlmfHeadFormat::name),
         }
     }
@@ -102,7 +104,7 @@ impl<'a> GlmfHead<'a> {
             Self::Bf16(_) => Some(GlmfHeadFormat::Bf16),
             Self::Fp8 { .. } => Some(GlmfHeadFormat::Fp8),
             Self::Packed { .. } => Some(GlmfHeadFormat::Packed),
-            Self::K6(_) | Self::RowFp8(_) => None,
+            Self::K6(_) | Self::RowFp8(_) | Self::BlockFp8 { .. } => None,
         }
     }
 
@@ -110,7 +112,7 @@ impl<'a> GlmfHead<'a> {
     pub fn bf16(&self) -> Option<&DeviceAllocation<'a>> {
         match self {
             Self::Bf16(weight) => Some(weight),
-            Self::Fp8 { .. } | Self::K6(_) | Self::RowFp8(_) | Self::Packed { .. } => None,
+            Self::Fp8 { .. } | Self::BlockFp8 { .. } | Self::K6(_) | Self::RowFp8(_) | Self::Packed { .. } => None,
         }
     }
 
@@ -190,19 +192,32 @@ impl<'a> GlmfHead<'a> {
     }
 
     /// FP32 logits `[rows, vocab]` of BF16 rows `x [rows, hidden]` through the
-    /// FP8 head, in 16-row spans of `glmf_head_fp8`. Errors on a BF16 head.
+    /// FP8 head. Row-FP8 uses 16-row GEMV spans; block-FP8 launches once,
+    /// selecting GEMV through 16 rows and W8A16 GEMM above. Errors on a BF16 head.
     ///
     /// # Safety
     /// `x` and `logits` must hold `rows` rows of `hidden` BF16 and `vocab` FP32
     /// values, live until `stream` reaches these launches.
     pub unsafe fn launch_fp8(&self, programs: &Programs<'_>, x: *const c_void, logits: *mut f32, rows: usize,
         hidden: usize, vocab: usize, stream: *mut c_void) -> Result<()> {
-        let Self::Fp8 { values, scales } = self else {
-            anyhow::bail!("the GLMF head is BF16; the FP8 head program has no weight");
+        let (values, scales, block) = match self {
+            Self::Fp8 { values, scales } => (values, scales, false),
+            Self::BlockFp8 { values, scales } => (values, scales, true),
+            _ => anyhow::bail!("the GLMF head has no FP8 operand"),
         };
-        ensure!(values.buffer.bytes == vocab * hidden && scales.buffer.bytes >= vocab * (hidden / 128) * 4,
+        ensure!(values.buffer.bytes == vocab * hidden
+            && scales.buffer.bytes >= if block { vocab/128*(hidden/128)*4 } else { vocab*(hidden/128)*4 },
             "FP8 head operands do not match [{vocab}, {hidden}]");
-        let program = programs.program("glmf_head_fp8", &["x", "w_fp8", "scale", "logits"])?;
+        ensure!(rows <= i32::MAX as usize, "FP8 head row count {rows} exceeds its scalar ABI");
+        let program = programs.program(if block { "glmf_head_block_fp8" } else { "glmf_head_fp8" }, &["x", "w_fp8", "scale", "logits"])?;
+        if block {
+            if rows > 0 {
+                // SAFETY: the caller's input/output extents and this head's live operands.
+                unsafe { program.launch(&[x.cast_mut(), values.buffer.ptr, scales.buffer.ptr, logits.cast()],
+                    &[Scalar::I32(rows as i32)], stream)?; }
+            }
+            return Ok(());
+        }
         for (first, n) in fp8_head_spans(rows) {
             let x = x.cast::<u8>().wrapping_add(first * hidden * 2).cast_mut().cast();
             let out = logits.cast::<u8>().wrapping_add(first * vocab * 4).cast();

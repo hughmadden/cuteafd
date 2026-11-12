@@ -705,7 +705,7 @@ impl WeightInventory {
                 for (name, layout) in &native_layouts[rank] {
                     let source = core.native.get(&layout.stem).context("native attention source layout")?;
                     out.attention_mount.merge(native_attention_mount(layout, source.shape,
-                        checkpoint.core_view() == crate::plan::checkpoint::CoreView::Fp8Compact)?);
+                        checkpoint.converts_to_fp8(&format!("{}.weight", layout.stem)))?);
                     let [n, k] = layout.shape.map(|n| n as u64);
                     let group = if matches!(*name, "gate" | "up" | "down") { group } else { "attention" };
                     out.add(rank, &format!("layer.{layer}.native.{name}.values"), group,

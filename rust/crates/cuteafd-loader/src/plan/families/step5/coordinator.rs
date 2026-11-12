@@ -15,6 +15,7 @@ use cuteafd_core::DType;
 #[derive(Debug, Clone)]
 pub struct CoordinatorContract {
     pub core_view: crate::plan::checkpoint::CoreView,
+    pub fp8_tensors: Vec<String>,
     pub weights: NativeDenseLayout,
     /// Header-native EXL3 dense projections (empty for FP8/NVFP4 releases).
     pub core: super::exl3::CoreInventory,
@@ -100,7 +101,7 @@ impl CoordinatorContract {
             return Ok(Default::default());
         }
         crate::shared::dense_read::MountLoad::from_headers(self.weights.tensors.iter()
-            .filter(|tensor| tensor.meta.name.ends_with(".self_attn.o_proj.weight"))
+            .filter(|tensor| self.fp8_tensors.contains(&tensor.meta.name))
             .map(|tensor| &tensor.meta), ranks)
     }
 
@@ -145,6 +146,11 @@ impl CoordinatorContract {
 
     /// Reuse the planner's validated model instead of rebuilding its tensor contract.
     pub(super) fn from_model(checkpoint: &Checkpoint, model: &Model) -> Result<Self> {
+        checkpoint.validate_fp8_roles("Step-5", |name| {
+            let attention = name.contains(".self_attn.");
+            (if attention { "attention projection" } else { "core projection" },
+                name.ends_with(".self_attn.o_proj.weight"))
+        })?;
         let cfg: &Config = &model.cfg;
         let declarations = model
             .tensors
@@ -169,6 +175,7 @@ impl CoordinatorContract {
             .map(|(name, tensor)| (name.clone(), tensor.shape.clone(), tensor.dtype.clone())).collect();
         Ok(Self {
             core_view: checkpoint.core_view(),
+            fp8_tensors: checkpoint.view.as_ref().map_or_else(Vec::new, |view| view.fp8_tensors().to_vec()),
             weights,
             mtp_declarations,
             core: model.core.clone(),
@@ -327,7 +334,7 @@ impl RankWeightLayout {
         let mut layout = Self::from_native(&weights, 0, 1, None)?;
         for operand in &mut layout.operands { operand.slice = WeightSlice::Replicated; }
         layout.attach_core(&cfg, &contract.core, None, |layer| layer >= cfg.layers && layer < cfg.layers + depth)?;
-        layout.select_core_view(contract.core_view)?;
+        layout.select_core_view(&contract.fp8_tensors)?;
         Ok(layout)
     }
 
@@ -368,15 +375,15 @@ impl RankWeightLayout {
         if let Some(ownership) = ownership { ownership.validate_config(cfg)?; }
         let mut layout = Self::from_native(&contract.weights, rank, ranks, ownership)?;
         layout.attach_core(cfg, &contract.core, ownership, |layer| layer < cfg.layers)?;
-        layout.select_core_view(contract.core_view)?;
+        layout.select_core_view(&contract.fp8_tensors)?;
         Ok(layout)
     }
 
-    /// FP8-compact replaces only selected native O matrices, never the EXL3 core.
-    fn select_core_view(&mut self, mode: crate::plan::checkpoint::CoreView) -> Result<()> {
-        if mode != crate::plan::checkpoint::CoreView::Fp8Compact { return Ok(()); }
+    /// Replace exactly the metadata-selected native matrices, never the EXL3 core.
+    fn select_core_view(&mut self, tensors: &[String]) -> Result<()> {
+        if tensors.is_empty() { return Ok(()); }
         for operand in &mut self.operands {
-            if !operand.name.ends_with(".self_attn.o_proj.weight") { continue; }
+            if !tensors.contains(&operand.name) { continue; }
             ensure!(operand.dtype == DType::Bf16 && operand.shape.len() == 2
                 && operand.shape.iter().all(|dim| dim % 128 == 0), "Step-5 FP8 output geometry");
             operand.dtype = DType::F8E4M3;
@@ -1007,7 +1014,7 @@ mod tests {
         // FP8-compact attention: each converted O keeps values and scales as one
         // composite view, sized by its packed native layout.
         let mut compact = one.clone();
-        compact.select_core_view(crate::plan::checkpoint::CoreView::Fp8Compact).unwrap();
+        compact.select_core_view(&one.operands.iter().filter(|op| op.name.ends_with(".self_attn.o_proj.weight")).map(|op| op.name.clone()).collect::<Vec<_>>()).unwrap();
         let arena = assert_arena(&compact);
         let converted = compact.operands.iter().filter(|o| o.dtype == DType::F8E4M3).collect::<Vec<_>>();
         assert!(!converted.is_empty() && converted.iter().all(|o| o.name.ends_with(".self_attn.o_proj.weight")));

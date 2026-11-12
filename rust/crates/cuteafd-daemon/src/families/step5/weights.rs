@@ -119,7 +119,7 @@ pub(super) fn load_operand<'a>(
         ensure!(native.bytes()? == operand.allocation_bytes, "Step-5 FP8 owner extent");
         let selected = checkpoint.projection(&native.stem)?;
         let (values, scales) = fp8_buffers(allocation.buffer, &operand.shape)?;
-        let records = attention_records(&checkpoint.snapshot, &selected, checkpoint.core_view(), &native,
+        let records = attention_records(&checkpoint.snapshot, &selected, checkpoint.projection_view(&native.stem), &native,
             crate::shared::fp8_linear::Fp8Scales::Amax, values, Some(scales))?;
         let dense = DenseLoad::mount(device.library);
         dense.admit_mount(cuteafd_loader::shared::dense_read::MountLoad::from_headers(

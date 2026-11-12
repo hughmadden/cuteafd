@@ -251,7 +251,7 @@ impl<'a> LayerWeights<'a> {
         let native = layout.native.iter().map(|(&name, layout)| {
             let weights = allocate_native(device, arena, layout)?;
             let selected = checkpoint.projection(&layout.stem)?;
-            for record in attention_records(&checkpoint.snapshot, &selected, checkpoint.core_view(), layout,
+            for record in attention_records(&checkpoint.snapshot, &selected, checkpoint.projection_view(&layout.stem), layout,
                 crate::shared::fp8_linear::Fp8Scales::Amax, weights.values.buffer,
                 weights.scales.as_ref().map(|scales| scales.buffer))? {
                 match record {
@@ -633,8 +633,9 @@ mod tests {
         let stem = format!("{PREFIX}0.self_attn.o_proj");
         let mut config = testing::muse_spark_config();
         config["quantization_config"] = serde_json::json!({"quant_method":"exl3"});
-        testing::write_snapshot(dir.path(), &config,
-            &[testing::t(format!("{stem}.weight"), "BF16", &[8192, 8192])], None);
+        testing::write_mc_snapshot(dir.path(), &config,
+            &[testing::t(format!("{stem}.weight"), "BF16", &[8192, 8192])],
+            &BTreeMap::from([(format!("{stem}.weight"), vec![8192, 8192])]));
         for mode in [CoreView::Original, CoreView::Fp8Compact] {
             let view = CheckpointView::select(dir.path(), mode)?;
             let checkpoint = Checkpoint::open_view(&view)?;

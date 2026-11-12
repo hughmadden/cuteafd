@@ -1226,8 +1226,18 @@ mod tests {
             fingerprints.insert(view.fingerprint().to_owned());
         }
         assert_eq!(fingerprints.len(), 3);
-        assert!(CheckpointView::select(dir.path(), CoreView::Fp8Compact).unwrap_err()
-            .to_string().contains("whole-core FP8 pending"));
+        let view = CheckpointView::select(dir.path(), CoreView::Fp8Compact)?;
+        let provenance = args.selected_provenance(&view);
+        assert_eq!(provenance["core_view"], "fp8-compact");
+        assert_eq!(provenance["core_view_fingerprint"], view.fingerprint());
+        assert_eq!(provenance["core_fp8_recipe"], cuteafd_loader::plan::checkpoint::view::FP8_RECIPE);
+        assert!(fingerprints.insert(view.fingerprint().to_owned()));
+        let checkpoint = cuteafd_loader::plan::Checkpoint::open_view(&view)?;
+        let cfg = KimiK3Config::from_hf(&checkpoint.config)?;
+        let error = cuteafd_loader::families::kimi_k3::core::CoreInventory::from_checkpoint(
+            &cfg, &checkpoint, &expected).unwrap_err().to_string();
+        assert!(error.contains("language_model.lm_head.weight")
+            && error.contains("role vocabulary head") && error.contains("family Kimi"), "{error}");
         Ok(())
     }
 

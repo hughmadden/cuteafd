@@ -206,7 +206,8 @@ pub(super) enum OutputProjection<'a> {
 }
 impl<'a> OutputProjection<'a> {
     pub(super) fn load(programs: &'a Programs<'a>, layout: &RankWeightLayout, layer: usize,
-        rows: usize, k: usize, n: usize, output: cuteafd_ffi::draft_projection::ProjectionOutput) -> Result<Self> {
+        rows: usize, k: usize, n: usize, output: cuteafd_ffi::draft_projection::ProjectionOutput,
+        scratch_bytes: usize) -> Result<Self> {
         let name = format!("model.layers.{layer}.self_attn.o_proj.weight");
         let operand = layout.operands.iter().find(|w| w.name == name).context("selected native O")?;
         if operand.dtype != cuteafd_core::DType::F8E4M3 {
@@ -214,10 +215,7 @@ impl<'a> OutputProjection<'a> {
                 programs, &[(k, n)], rows, output)?));
         }
         let program = cuteafd_ffi::native_attention::Fp8Projections::load(programs, &[(k,n)], rows, output)?;
-        let prefix = format!("model.layers.{layer}.self_attn.");
-        let borrowed = layout.core.iter().filter(|(name, _)| name.starts_with(&prefix))
-            .map(|(_, core)| rows * core.shape[1] * 2).max().context("FP8 O requires serialized trellis scratch")?.max(256);
-        ensure!(program.scratch_bytes(k,n)? <= borrowed, "FP8 O manifest scratch exceeds borrowed rotated plane");
+        ensure!(program.scratch_bytes(k,n)? <= scratch_bytes, "FP8 O manifest scratch exceeds named output scratch plane");
         Ok(Self::Fp8 { program, output })
     }
 
@@ -226,7 +224,7 @@ impl<'a> OutputProjection<'a> {
     }
 
     pub(super) fn launch(&self, input: *const c_void, weight: Buffer, out: Buffer,
-        scratch: Option<&NativeScratch<'_>>, rows: usize, k: usize, n: usize, stream: *mut c_void) -> Result<()> {
+        scratch: Buffer, rows: usize, k: usize, n: usize, stream: *mut c_void) -> Result<()> {
         match self {
             Self::Bf16(program) => {
                 // SAFETY: caller retains admitted BF16 input, weight and typed output until stream drain.
@@ -234,10 +232,8 @@ impl<'a> OutputProjection<'a> {
             }
             Self::Fp8 { program, .. } => {
                 let (values, scales) = super::weights::fp8_buffers(weight, &[n,k])?;
-                // QKV trellis egress precedes O on this same stream. Its rotated plane is
-                // dead until the next serialized projection; sibling lanes own sibling scratch.
-                let scratch = scratch.context("FP8 O borrowed scratch missing")?.scratch.buffers["rotated"];
-                // SAFETY: disjoint admitted input/output/final weights and borrowed dead scratch,
+                // Dedicated lane-local scratch stays disjoint from every attention plane.
+                // SAFETY: disjoint admitted input/output/final weights and lane-local scratch,
                 // retained by the lane through stream drainage; no hot-path allocation.
                 unsafe { program.launch(input, values.ptr, scales.ptr, out, scratch, rows, k, n, stream)?; }
             }

@@ -31,6 +31,7 @@ const VPAGES: usize = 4;
 const QUERY: usize = 5;
 const KPAGES: usize = 6;
 const LOGITS: usize = 7;
+const OUTPUT_SCRATCH: usize = cuteafd_loader::plan::families::step5::native::SWA_OUTPUT_SCRATCH;
 const ATTN: usize = 8;
 const GATED: usize = 9;
 const DELTA: usize = 10;
@@ -44,7 +45,7 @@ const POST: usize = 15;
 struct Admission {
     rows: usize,
     pages: usize,
-    planes: [usize; 16],
+    planes: [usize; 17],
     bytes: u64,
 }
 impl Admission {
@@ -176,6 +177,9 @@ pub(super) struct SwaLayer<'a> {
 impl<'a> SwaLayer<'a> {
     pub(super) fn inventory(&self, inventory: &mut crate::shared::memory::receipts::Inventory<'_>,
         prefix: &str) -> Result<()> {
+        if self.immutable.native_output.as_ref().is_some_and(|output| matches!(output, super::native::OutputProjection::Fp8 { .. })) {
+            self.planes[OUTPUT_SCRATCH].inventory(inventory, &format!("{prefix}.attention.native-output-scratch"))?;
+        }
         let weights = &self.immutable;
         super::native::inventory_owner(inventory, &format!("{prefix}.attention"),
             weights.weights.iter().map(Option::as_ref), &[])?;
@@ -447,11 +451,13 @@ impl<'a> SwaLayer<'a> {
             "SWA pointwise geometry"
         );
         // HQA target and MTP share one ordered-K16 registry; TP2 keeps F32 partials.
-        let native_output = if native_layer && !native_o {
+        let fp8_o = layout.operands.iter().any(|w| w.name == format!("model.layers.{layer_id}.self_attn.o_proj.weight")
+            && w.dtype == cuteafd_core::DType::F8E4M3);
+        let native_output = if (native_layer || fp8_o) && !native_o {
             let output = if heads == 32 { cuteafd_ffi::draft_projection::ProjectionOutput::F32 }
                 else { cuteafd_ffi::draft_projection::ProjectionOutput::Bf16 };
             Some(device.run(|| super::native::OutputProjection::load(
-                programs, &layout, layer_id, rows, q, H, output))?)
+                programs, &layout, layer_id, rows, q, H, output, cuteafd_loader::plan::families::step5::native::OUTPUT_SCRATCH_BYTES))?)
         } else { None };
         // All composed contracts and aggregate bytes are checked before the first allocation.
         let resolved = DEFS
@@ -665,7 +671,7 @@ impl<'a> SwaLayer<'a> {
             stream.device.run(|| {
                 // SAFETY: admitted BF16 input/weight and typed delta owners survive stream drainage.
                 output.launch(p(GATED), self.immutable.weights[7].as_ref().context("SWA O weight")?.buffer,
-                    delta, self.native_scratch.as_deref(), rows, q, H, stream.raw)?;
+                    delta, self.planes[OUTPUT_SCRATCH].buffer, rows, q, H, stream.raw)?;
                 Ok(())
             })?;
         } else {

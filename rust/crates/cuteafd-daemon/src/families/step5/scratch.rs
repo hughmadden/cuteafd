@@ -15,6 +15,17 @@ pub(super) struct Plane<'a> {
     pub buffer: CuteafdDeviceBuffer,
     _owner: Rc<Allocation<'a>>,
 }
+impl Plane<'_> {
+    pub(super) fn inventory(&self, inventory: &mut crate::shared::memory::receipts::Inventory<'_>, name: &str) -> Result<()> {
+        let first = inventory.receipts.len();
+        inventory.backed_device(name, self.buffer, self._owner.buffer)?;
+        for receipt in &mut inventory.receipts[first..] {
+            receipt.allocation.category = cuteafd_core::memory_layout::Category::Workspace;
+            receipt.allocation.group = "step5 attention workspace".into();
+        }
+        Ok(())
+    }
+}
 impl BufferOwner for Plane<'_> {
     fn buffer(&self) -> CuteafdDeviceBuffer { self.buffer }
 }
@@ -153,6 +164,36 @@ mod tests {
         let lane = standalone(device, None);
         assert_ne!(lane.get()?.raw, first.get()?.raw);
         assert_eq!(fixture.events()?.matches('V').count(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn output_scratch_is_disjoint_and_inventoried_once_per_backing() -> Result<()> {
+        for rows in [1, 64, 65, 4096] {
+            for sizes in [native::swa_planes(rows, 32)?.to_vec(),
+                native::swa_planes(rows, 64)?.to_vec(), native::csa_planes(rows)?.to_vec()] {
+                let views = view_layout(native::plane_bytes(&sizes)? as usize, &sizes, 0)?;
+                let &(offset, bytes) = views.last().unwrap();
+                assert_eq!(bytes, native::OUTPUT_SCRATCH_BYTES);
+                assert!(views[..views.len()-1].iter().all(|&(start, size)| start + size <= offset));
+            }
+        }
+        let (_directory, fixture) = crate::shared::memory::cpu_stream_fixture()?;
+        let library = fixture.load()?;
+        let device = Device { library: &library, id: 0 };
+        let arena = Arena::new(device, 512, crate::shared::memory::Tag::workspace("step5/test-output-scratch"))?;
+        let plane = arena.planes(device, &[256], 256)?.remove(0);
+        use cuteafd_loader::placement::planner::{CoordinatorDevices, Lifetime};
+        use cuteafd_core::memory_layout::Category;
+        let ids = [0];
+        let mut inventory = crate::shared::memory::receipts::Inventory::new(
+            CoordinatorDevices::new(&ids)?, "step5", Lifetime::RESIDENT, Category::Weights, "test");
+        plane.inventory(&mut inventory, "lane0.output-scratch")?;
+        plane.inventory(&mut inventory, "lane1.output-scratch")?;
+        assert_eq!(inventory.receipts.iter().filter(|r| r.allocation.view.is_none()).count(), 1);
+        assert_eq!(inventory.receipts.iter().filter(|r| r.allocation.view.is_some()).count(), 2);
+        assert!(inventory.receipts.iter().all(|r| r.allocation.category == Category::Workspace));
+        assert!(inventory.receipts.iter().filter_map(|r| r.allocation.view.as_ref()).all(|v| v.offset == 256));
         Ok(())
     }
 

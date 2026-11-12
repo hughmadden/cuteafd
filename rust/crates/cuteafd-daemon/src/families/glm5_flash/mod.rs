@@ -563,7 +563,7 @@ mod draft_cli_tests {
         assert!(engine.contains("let name = format!(\"{}_{name}\", if split { \"glmf2\" } else { \"glmf\" });"));
         let head = include_str!("head.rs");
         assert_eq!((head.matches("programs.program(").count(), head.matches("programs.program(\"glmf_head_fp8\"").count()),
-            (1, 1));
+            (1, 0));
     }
 
     #[test]
@@ -748,7 +748,7 @@ mod draft_cli_tests {
         let config = cuteafd_loader::plan::testing::glm5_flash_config(2);
         let cfg = GlmNextConfig::from_hf(&config).unwrap();
         let mut offset = 0;
-        let tensors = cuteafd_loader::plan::testing::glm5_flash_tensors(&config)
+        let mut tensors: Vec<CheckpointTensor> = cuteafd_loader::plan::testing::glm5_flash_tensors(&config)
             .into_iter().map(|(name, dtype, shape)| {
                 let (dtype, width) = match dtype {
                     "BF16" => (cuteafd_core::DType::Bf16, 2),
@@ -763,6 +763,7 @@ mod draft_cli_tests {
                 offset += byte_length;
                 tensor
             }).collect();
+        tensors.sort_by(|a, b| a.meta.name.cmp(&b.meta.name));
         let mut checkpoint = Checkpoint { view: None, snapshot: "fixture".into(), config, quantize_config: None,
             weight_map: Default::default(), tensors, missing_shards: vec![], shard_bytes: 0 };
         for ranks in [1, 2] {
@@ -792,7 +793,7 @@ mod draft_cli_tests {
         assert!(error.to_string().contains("tie_word_embeddings=true"));
         assert!(runtime_resident_weights(&checkpoint, &cfg, 0, 2, Default::default(), EmbedPlacement::Gpu, Default::default()).is_ok());
         checkpoint.config["tie_word_embeddings"] = serde_json::json!(false);
-        checkpoint.tensors[2].meta.byte_offset = 0;
+        checkpoint.tensors.iter_mut().find(|t| t.meta.name == "lm_head.weight").unwrap().meta.byte_offset = 0;
         let error = runtime_resident_weights(&checkpoint, &cfg, 0, 2, Default::default(), EmbedPlacement::Host, Default::default()).unwrap_err();
         assert!(error.to_string().contains("aliases its storage"));
     }
@@ -1642,7 +1643,7 @@ fn check_options(args: &EngineArgs) -> Result<()> {
         matches!(g, Fp8PrefillGroup::KdaO | Fp8PrefillGroup::All)),
         "KDA precise partials require W8A16 output (--fp8-prefill kda-o/all is unsupported)");
     let kda_prefill = args.fp8_prefill.iter().any(|g| matches!(g, Fp8PrefillGroup::KdaIn | Fp8PrefillGroup::KdaO));
-    ensure!(!kda_prefill || args.kda_fp8 != fp8::KdaFp8::Off,
+    ensure!(!kda_prefill || args.kda_fp8 != fp8::KdaFp8::Off || args.attention.mode() == cuteafd_loader::plan::checkpoint::CoreView::Fp8Compact,
         "--fp8-prefill kda-in/kda-o run over FP8 KDA weights; add --kda-fp8 row128 or channel");
     ensure!(!args.fp8_prefill.contains(&Fp8PrefillGroup::None) || args.fp8_prefill.len() == 1,
         "--fp8-prefill none takes no other group");
@@ -1805,7 +1806,7 @@ pub(crate) fn open(args: &EngineArgs) -> Result<Opened> {
     let cfg = GlmNextConfig::from_hf(&checkpoint.config)?;
     let core = if native { Default::default() } else {
         cuteafd_loader::families::glm5_flash::core::CoreInventory::from_checkpoint(&cfg, &checkpoint)? };
-    native::normalize_head(&mut resolved, core.get_weight("lm_head").is_some());
+    native::normalize_head(&mut resolved, core.get_weight("lm_head").is_some() || core.native.contains_key("lm_head"));
     native::publish_resolved(&resolved);
     let args = &resolved;
     check_options(args)?;
@@ -1816,7 +1817,7 @@ pub(crate) fn open(args: &EngineArgs) -> Result<Opened> {
         Ok(())
     })?;
     if let Some(snapshot) = &args.draft {
-        if !native && core.get_weight("lm_head").is_none() {
+        if !native && (core.get_weight("lm_head").is_none() && !core.native.contains_key("lm_head")) {
             let head = checkpoint.tensors.iter().find(|t| t.meta.name == "lm_head.weight")
                 .context("DFlash target has no supported vocabulary head")?;
             crate::shared::speculation::dflash::check_target_head_source(&head.meta, cfg.hidden, cfg.vocab_size)?;
@@ -1858,12 +1859,12 @@ pub(crate) fn open(args: &EngineArgs) -> Result<Opened> {
         cuteafd_loader::plan::checkpoint::CoreView::K6Compact => "k6-compact", cuteafd_loader::plan::checkpoint::CoreView::K8Compact => "k8-compact",
         cuteafd_loader::plan::checkpoint::CoreView::Fp8Compact => "fp8-compact",
     };
-    cuteafd_bench::context::set_resolved("attention-mode", mode);
-    cuteafd_bench::context::set_resolved("attention-bundle-fingerprint", view.fingerprint());
+    cuteafd_bench::context::set_resolved("core-view", mode);
+    cuteafd_bench::context::set_resolved("core-view-fingerprint", view.fingerprint());
     let recipe = if view.mode() == cuteafd_loader::plan::checkpoint::CoreView::Fp8Compact {
         cuteafd_loader::plan::checkpoint::view::FP8_RECIPE
     } else { "none" };
-    cuteafd_bench::context::set_resolved("attention-fp8-recipe", recipe);
+    cuteafd_bench::context::set_resolved("core-fp8-recipe", recipe);
     let active_bytes: u64 = checkpoint.tensors.iter().map(|tensor| tensor.meta.byte_length).sum();
     tracing::info!(core_view = mode, bundle = view.fingerprint(), fp8_recipe = recipe,
         active_dense_source_bytes = active_bytes, "selected immutable attention bundle");
@@ -2029,7 +2030,7 @@ impl Opened {
         let (table_pages, table_pool_pages) = glmf_table_pages(args.max_context as u64);
         let shape = GlmfStepShape { lead: true, split, local_experts: !args.skip_experts && !split && self.fp8().is_some(),
             tp2_experts: !args.skip_experts && split, spark: spark_ranks > 0, partial_bytes: if args.kda_fp32_partials { 4 } else { 2 },
-            output_shard: args.kda_output_shard, full_prefill_logits: args.full_prefill_logits && !self.native && core.get_weight("lm_head").is_none(), table_pages, table_pool_pages };
+            output_shard: args.kda_output_shard, full_prefill_logits: args.full_prefill_logits && !self.native && (core.get_weight("lm_head").is_none() && !core.native.contains_key("lm_head")), table_pages, table_pool_pages };
         let workspaces = |spark, lanes| admission::step_workspace_demands(&self.cfg, lanes,
             args.prefill_rows as u64, args.decode_rows as u64, GlmfStepShape { spark, ..shape }, decode, prefill);
         let mut workspace = workspaces(spark_ranks > 0, lanes);
@@ -2119,7 +2120,7 @@ impl Opened {
             sequences: sequences.min(args.decode_rows) as u64, speculation, state_slots: args.slots as u64,
             mark_slots: marks as u64, pool_marks: args.prefix_marks == prefix::PrefixMarks::Pool, index: index.into(),
             kda_state_bytes: args.kda_state.bytes() as u64, shared_replay: args.replay_records == engine::ReplayRecords::Shared,
-            blas_head: args.resolved_target_head().blas_head(!self.native && core.get_weight("lm_head").is_none()
+            blas_head: args.resolved_target_head().blas_head(!self.native && (core.get_weight("lm_head").is_none() && !core.native.contains_key("lm_head"))
                 && representation.head == head::GlmfHeadFormat::Bf16),
             representation, resident, workspace, local_workspace, experts, expert_workspace, tp2_workspace,
             drafter_bytes, drafter_weights, drafter_scratch, drafter_requests, drafter_bridge, requested_pool: (args.pool_tokens > 0).then_some(args.pool_tokens as u64), onboard,
@@ -2215,7 +2216,7 @@ impl Opened {
             resolved.kda_output_shard = false;
             resolved.kda_prefill_expanded = false;
         }
-        native::normalize_head(&mut resolved, core.get_weight("lm_head").is_some());
+        native::normalize_head(&mut resolved, core.get_weight("lm_head").is_some() || core.native.contains_key("lm_head"));
         if args.split_device.is_some()
             && crate::shared::peer_split::probed_device(&self.library, args.device, args.split_device)?.is_none() {
             resolved.split_device = None;
@@ -2258,7 +2259,9 @@ impl Opened {
         if args.kda_fp8 != fp8::KdaFp8::Off && args.kda_state == engine::KdaState::F32 {
             needed.extend(["glmf_kda_w8_m64", "glmf_kda_w8_m4096"]);
         }
-        if args.head_format == head::GlmfHeadFormat::Fp8 {
+        if core.native.get("lm_head").is_some_and(|head| head.fp8) {
+            needed.push("glmf_head_block_fp8");
+        } else if args.head_format == head::GlmfHeadFormat::Fp8 {
             needed.push("glmf_head_fp8");
         }
         if args.head_format == head::GlmfHeadFormat::Packed {
@@ -2941,7 +2944,8 @@ impl Opened {
         engine.full_prefill_logits = args.full_prefill_logits;
         let group = |g: Fp8PrefillGroup| args.fp8_prefill.iter().any(|&x| x == g || x == Fp8PrefillGroup::All);
         // `all`: every group with FP8 weights (BF16 KDA has none to run W8A8 over).
-        let kda = args.kda_fp8 != fp8::KdaFp8::Off;
+        let kda = args.kda_fp8 != fp8::KdaFp8::Off || core.native.iter().any(|(stem, weight)|
+            stem.contains(".self_attn.") && weight.fp8);
         engine.fp8_prefill = engine::Fp8Prefill { mla: group(Fp8PrefillGroup::Mla), ffn: group(Fp8PrefillGroup::Ffn),
             kda_bits: i32::from(kda && group(Fp8PrefillGroup::KdaIn))
                 | (i32::from(kda && group(Fp8PrefillGroup::KdaO)) << 1) };

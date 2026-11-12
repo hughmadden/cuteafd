@@ -60,6 +60,13 @@ impl CoreInventory {
                 && !leaf.starts_with("mlp.experts."));
         // A trellis head is stored at whole 128-row output blocks (202,112 for the
         // logical 202,048 vocabulary); the engine trims logits before the softcap.
+        checkpoint.validate_fp8_roles("Muse", |name| {
+            let stem = name.strip_suffix(".weight").unwrap_or(name);
+            let role = if stem.ends_with("lm_head") { "vocabulary head" }
+                else if stem.contains(".self_attn.") { "attention projection" }
+                else if stem.contains(".mlp.") { "FFN projection" } else { "non-core" };
+            (role, stem.contains(".self_attn.") && matches!(stem.rsplit('.').next(), Some("q_proj" | "k_proj" | "v_proj" | "o_proj")))
+        })?;
         let projections = read_projections(checkpoint, &expected(cfg), selected,
             |stem| split(cfg, stem).map(|split| CoreContract { family: "Muse", widths: &[4, 6, 8], split, padded_outputs: stem == HEAD }))?;
         if let Some(head) = projections.get(HEAD) {
@@ -92,7 +99,7 @@ impl CoreInventory {
             ensure!(matches!(dtype, cuteafd_core::DType::Bf16 | cuteafd_core::DType::F8E4M3),
                 "{stem}: native Muse attention requires BF16 or block E4M3");
             if *dtype == cuteafd_core::DType::F8E4M3 {
-                if checkpoint.core_view() == crate::plan::checkpoint::CoreView::Fp8Compact {
+                if checkpoint.converts_to_fp8(&format!("{stem}.weight")) {
                     return Err(crate::formats::native_attention::UnsupportedFp8Conversion {
                         tensor: name.clone(), found: "E4M3".into(),
                     }.into());
@@ -102,7 +109,7 @@ impl CoreInventory {
             inventory.native.insert(stem.into(), NativeProjection {
                 shape: [shape[0], shape[1]], split: split(cfg, stem).context("Muse attention split")?,
                 fp8: *dtype == cuteafd_core::DType::F8E4M3
-                    || checkpoint.core_view() == crate::plan::checkpoint::CoreView::Fp8Compact,
+                    || checkpoint.converts_to_fp8(&format!("{stem}.weight")),
             });
         }
         for layer in 0..cfg.layers {

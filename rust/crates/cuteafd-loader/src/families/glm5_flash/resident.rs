@@ -158,6 +158,8 @@ pub fn resident_weights_placed(checkpoint: &Checkpoint, cfg: &GlmNextConfig, lay
     out[0].weights = tensor("model.language_model.norm.weight")?.meta.byte_length.max(256)
         + if let Some(head) = core.get_weight("lm_head") {
             head.resident_bytes(1).map_err(|e| e.to_string())?
+        } else if core.native.get("lm_head").is_some_and(|head| head.fp8) {
+            fp8(&["lm_head.weight".into()], false, false)?
         } else {
             match repr.head.resolve(core.get_weight("lm_head").is_some(), ranks) {
                 GlmfHeadFormat::Auto => unreachable!("head resolved"),
