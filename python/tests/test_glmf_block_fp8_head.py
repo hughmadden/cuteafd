@@ -1,6 +1,7 @@
 """Engine block-FP8 head wrapper against FP64; opt in in the CUDA image."""
 from __future__ import annotations
 
+import ctypes
 import importlib.util
 import json
 import os
@@ -58,6 +59,20 @@ def test_engine_block_fp8_head_fp64_and_write_bounds():
         oracle[:, first:first + count] = x64 @ dequantized.T
         magnitude[:, first:first + count] = x64.abs() @ dequantized.abs().T
         raw_oracle[:, first:first + count] = x64 @ raw.double().T
+    native_spec = importlib.util.spec_from_file_location("native_head_oracle",
+        root / "native/tests/target_head_selftest.py")
+    native = importlib.util.module_from_spec(native_spec)
+    native_spec.loader.exec_module(native)
+    library = native.bind(os.environ["CUTEAFD_NATIVE_LIB"], invariant=True)
+    native_workspace = torch.empty(4 << 20, device="cuda", dtype=torch.uint8)
+    native_handle = native.P()
+    assert library.cuteafd_vocabulary_head_create_vocab(native_workspace.data_ptr(),
+        native_workspace.numel(), hidden, max_rows, vocab, 1, ctypes.byref(native_handle)) == 0
+    def native_launch(rows, out):
+        status = library.cuteafd_vocabulary_head_launch_tensor_op(native_handle, inputs.data_ptr(),
+            bf16_weights.data_ptr(), out.data_ptr(), rows, torch.cuda.current_stream().cuda_stream)
+        assert status == 0, (rows, status)
+
     sentinel = -123456.0
     for rows in (1, 4, 8, 15, 16, 17, 31, 63, 64, 65, 127, 128, 129, 255, 256, 257):
         guarded = torch.full((rows + 2, vocab), sentinel, device="cuda", dtype=torch.float32)
@@ -85,6 +100,9 @@ def test_engine_block_fp8_head_fp64_and_write_bounds():
         torch.cuda.synchronize()
         assert bool(((out.double() - oracle[:rows]).abs() <= bound).all())
         bf16_exact = torch.equal(out, first_result)
+        native_launch(rows, out)
+        torch.cuda.synchronize()
+        assert bool(((out.double() - oracle[:rows]).abs() <= bound).all())
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
             program.launch(inputs[:rows], weights, scales, out, scalars=(rows,))
@@ -101,8 +119,11 @@ def test_engine_block_fp8_head_fp64_and_write_bounds():
             bf16_graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(bf16_graph):
                 bf16_program.launch(inputs[:rows], bf16_weights, out, scalars=(rows,))
+            native_graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(native_graph):
+                native_launch(rows, out)
             times = {}
-            for name, candidate in (("block_fp8", graph), ("bf16", bf16_graph)):
+            for name, candidate in (("block_fp8", graph), ("bf16_tma", bf16_graph), ("bf16_native_lt", native_graph)):
                 for _ in range(3):
                     candidate.replay()
                 start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
@@ -114,4 +135,5 @@ def test_engine_block_fp8_head_fp64_and_write_bounds():
                 times[name] = start.elapsed_time(end) / 20
             print(json.dumps(dict(rows=rows, milliseconds=times,
                 microseconds_per_row={name: ms * 1000 / rows for name, ms in times.items()},
-                speedup=times["bf16"] / times["block_fp8"])))
+                speedup=times["bf16_native_lt"] / times["block_fp8"])))
+    assert library.cuteafd_v41_markov_destroy(native_handle) == 0
