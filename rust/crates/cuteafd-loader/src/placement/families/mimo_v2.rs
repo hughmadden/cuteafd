@@ -266,7 +266,7 @@ mod tests {
 
     #[test]
     fn pushed_expert_weights_start_at_load_without_double_charging_runtime_bytes() {
-        use crate::placement::planner::{ComponentKind, Location, Operation, Phase, Recipe};
+        use crate::placement::planner::{self, ComponentKind, Location, Operation, Phase, Recipe};
         for ranks in [1, 2] {
             let (cfg, spark, no_spark) = fixture(ranks, 4096);
             let mut prepared = input(&cfg, &spark, &no_spark, ranks, 4096).prepare().unwrap();
