@@ -79,6 +79,29 @@ mod readiness_tests {
     }
 
     #[test]
+    fn v41_all_fallible_startup_precedes_readiness_in_both_layouts() {
+        for source in [
+            include_str!("../families/deepseek_v41/v41_native_serve.rs"),
+            include_str!("../families/deepseek_v41/v41_native_serve/distributed.rs"),
+        ] {
+            let schedule = source.find("    scheduler::serve(").unwrap();
+            let signal = source.find(".send(Ok((health,").unwrap();
+            assert!(schedule < signal, "V4.1 readiness must be a scheduler callback");
+        }
+        let source = include_str!("../families/deepseek_v41/v41_native_serve/scheduler.rs");
+        let startup = source.split_once("pub(super) fn serve<").unwrap().1;
+        let ready = startup.find("    ready()?;").unwrap();
+        let loop_at = startup.find("    loop {").unwrap();
+        for init in ["native_manifest(", "admission::Media::new(", "args.reserve.limits(",
+            "args.reserve.config(", "args.decode_share.queue::<"] {
+            assert!(startup.find(init).unwrap() < ready, "{init} must precede readiness");
+        }
+        assert!(ready < loop_at);
+        assert!(!startup[ready + "    ready()?;".len()..loop_at].contains('?'),
+            "no fallible startup work may follow readiness");
+    }
+
+    #[test]
     fn glm_and_v4_capacity_and_all_fallible_startup_precede_readiness() {
         for source in [include_str!("../families/glm5/serve.rs"), include_str!("../families/deepseek_v4/serve.rs")] {
             callback_follows_scheduler(source);

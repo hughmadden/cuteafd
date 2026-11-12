@@ -612,10 +612,13 @@ pub(super) fn worker(mut args: crate::cli::NativeServeArgs, mut receive: mpsc::R
     admission::log_runtime_base(&lib, &pool)?;
     memory_checkpoint("ready")?;
     crate::shared::memory_report::reconcile::capture("ready");
-    ready.take().context("startup readiness missing")?.send(Ok((vision.health_handle(), args.max_context_tokens)))
-        .map_err(|_| anyhow::anyhow!("API startup cancelled"))?;
+    let health = vision.health_handle();
     scheduler::serve(&lib, &args, &runtime, &mut receive, &mut pass, &mut second, &mut requests,
-        &mut transport, &mut second_transport, &mut prefill_slots, draft.as_mut().map(|d| d.get_mut()), &mut vision, stats, prefixes)
+        &mut transport, &mut second_transport, &mut prefill_slots, draft.as_mut().map(|d| d.get_mut()), &mut vision, stats, prefixes, || {
+            ready.take().context("startup readiness missing")?
+                .send(Ok((health, args.max_context_tokens)))
+                .map_err(|_| anyhow::anyhow!("API startup cancelled"))
+        })
 }
 
 

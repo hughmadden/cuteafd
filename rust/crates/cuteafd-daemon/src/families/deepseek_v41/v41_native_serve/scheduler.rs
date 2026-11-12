@@ -810,6 +810,7 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
     vision: &mut crate::families::deepseek_v41::v41_vision_encoder::Encoder,
     stats: std::sync::Arc<std::sync::Mutex<serde_json::Value>>,
     mut prefixes: PrefixCache<'a>,
+    ready: impl FnOnce() -> Result<()>,
 ) -> Result<()> {
     if args.prefill_packing == crate::shared::prefill_packing::PackingMode::Exact {
         let manifest = cuteafd_loader::placement::families::deepseek_v41::owners::native_manifest(
@@ -847,6 +848,7 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
     // Keep pending owners outside the fallible loop so every fatal exit can drain them.
     let mut admitted = std::collections::VecDeque::<PackedAdmission>::new();
     let mut media_ready = std::collections::VecDeque::new();
+    ready()?;
     let result = crate::shared::api::run_scheduler(|| {
     loop {
         unsafe { // SAFETY: V4.1 graph owners borrow persistent engine storage only.
