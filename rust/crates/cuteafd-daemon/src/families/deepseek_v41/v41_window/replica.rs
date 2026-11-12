@@ -225,14 +225,10 @@ mod tests {
                 }
                 state.release(lease)?;
                 assert!(unsafe { replica.view(&state,lease) }.is_err());
-                let replay=state.begin_request(0,3)?;
-                check(&state,replay,&expected_values,&expected_scales)?;
-                state.begin_encoder_replay(replay,900)?;
-                let view=unsafe { replica.view(&state,replay)? };
-                assert_eq!((view.begin,view.end),(900,900));
-                check(&state,replay,&expected_values,&expected_scales)?;
+                let fresh=state.begin_request(0,3)?;
+                check(&state,fresh,&expected_values,&expected_scales)?;
                 let foreign=WindowState::new(&lib,1,2,WindowState::device_bytes(1,2)?)?;
-                assert!(unsafe { replica.view(&foreign,replay) }.is_err());
+                assert!(unsafe { replica.view(&foreign,fresh) }.is_err());
                 Ok(())
             })?;
         }

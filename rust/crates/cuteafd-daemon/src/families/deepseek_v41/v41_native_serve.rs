@@ -150,13 +150,12 @@ pub(crate) fn start_worker(args: crate::cli::NativeServeArgs)
 fn normalize_serving(args: &mut crate::cli::NativeServeArgs) -> Result<u8> {
     args.expert_usage_enabled()?;
     cuteafd_core::concurrency::validate("deepseek_v41", u64::from(args.concurrency))?;
-    if args.prefix_cache_entries == u32::MAX {
-        args.prefix_cache_entries = cuteafd_core::concurrency::prefix_entries(u64::from(args.concurrency)) as u32;
-    }
+    ensure!(args.prefix.prefix_partial == crate::shared::prefix::Toggle::Off,
+        "V4.1 restores exact prefix frontiers only (--prefix-partial off)");
+    args.prefix.resolve_entries(args.concurrency as usize);
     cuteafd_bench::context::set_resolved("max-context-tokens", &args.max_context_tokens.to_string());
     let lanes = cuteafd_loader::plan::resolve_decode_lanes("deepseek_v41", Some(args.decode_lanes), u64::from(args.concurrency))?;
     cuteafd_bench::context::set_resolved("decode-lanes", &lanes.to_string());
-    cuteafd_bench::context::set_resolved("prefix-cache-entries", &args.prefix_cache_entries.to_string());
     Ok(lanes)
 }
 
@@ -178,12 +177,11 @@ fn start(mut args: crate::cli::NativeServeArgs, http: bool) -> Result<Started> {
     }
     ensure!(args.peers.len() <= 8,
         "V4.1 Spark transport supports at most eight peers, got {}", args.peers.len());
-    args.host_cache_config()?;
     // The golden runs the worker without the API, so it loads no keyed policy.
     let api = if http { Some(args.api.load()?) } else { None };
     let listen = args.listen.clone();
     let snapshot = args.snapshot.clone();
-    let reserve = args.reserve.clone();
+    let reserve = args.prefix.reserve.clone();
     let (send, receive) = mpsc::channel(args.http_queue_depth.unwrap_or(args.concurrency) as usize);
     let http_queue_wait = Duration::from_millis(args.http_queue_wait_ms);
     let (ready, readiness) = oneshot::channel();
@@ -613,7 +611,7 @@ fn worker(
     // allocations are counted before choosing KV capacity and local expert layers.
     ensure!(args.resolved_prefix_entries() <= 128, "invalid retained-turn limit");
     admission::startup_phase(&lib, "v41/vision", device_total)?;
-    let snapshot_slots = cuteafd_core::prefix::mark_slots_with_host(0, u64::from(args.resolved_prefix_entries()), 1, u64::MAX, args.host_cache_bytes.enabled()) as usize;
+    let snapshot_slots = prefix::Arenas::slots_for(&args);
     let prefix_arenas = prefix::Arenas::new(
         crate::shared::memory::device::Device { library: &lib, id: lib.cuda_get_device()? },
         draft.as_ref().map(|d| d.mark_device()), snapshot_slots)?;

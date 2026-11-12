@@ -1131,7 +1131,7 @@ mod tests {
                 base.into_iter().chain(["--host-cache-bytes", value])).unwrap().command else {
                 panic!("expected native serving");
             };
-            match (args.host_cache_bytes, bytes) {
+            match (args.prefix.host_cache_bytes, bytes) {
                 (HostBudget::Auto, None) => (),
                 (HostBudget::Bytes(actual), Some(expected)) => assert_eq!(actual, expected),
                 _ => panic!("incorrect host budget mode"),
@@ -1177,7 +1177,7 @@ mod tests {
         };
         assert_eq!(args.max_context_tokens, 0);
         // HTTP limits are created after admission resolves the automatic extent.
-        assert_eq!(args.reserve.limits(1_048_576).unwrap().output(), 131_072);
+        assert_eq!(args.prefix.reserve.limits(1_048_576).unwrap().output(), 131_072);
         assert_eq!(args.concurrency, 16);
         assert_eq!(args.resolved_prefix_entries(), 20);
         assert_eq!(args.draft_length.effective(5), 5);
@@ -1486,10 +1486,6 @@ pub(crate) struct NativeServeArgs {
     #[arg(long, default_value = "auto", value_parser = crate::shared::context::parse_tokens::<u32>)]
     pub max_context_tokens: u32,
 
-    /// Output limit and KV decode reservation (`--max-output-tokens`, `--kv-*`).
-    #[command(flatten)]
-    pub reserve: crate::shared::kv_reserve::ReserveArgs,
-
     #[command(flatten)]
     pub loop_abort: crate::shared::loop_abort::LoopAbortArgs,
 
@@ -1519,46 +1515,10 @@ pub(crate) struct NativeServeArgs {
     #[arg(long, default_value_t = 25000)]
     pub http_queue_wait_ms: u64,
 
-    /// Retained completed turns, plus a separate prompt-repeat bank of this size; zero disables reuse.
-    #[arg(long, default_value_t = u32::MAX)]
-    pub prefix_cache_entries: u32,
-
-    /// Pinned snapshot memory: auto sizes full-context KV for concurrency + 4,
-    /// capped at min(32GiB, 25% host RAM); explicit bytes override both; 0 disables it.
-    #[arg(long, default_value = "0", env = "CUTEAFD_HOST_CACHE_BYTES")]
-    pub host_cache_bytes: crate::shared::prefix::HostBudget,
-    /// KV tokens kept free after host pressure eviction (0 disables batching).
-    #[arg(long, default_value_t = cuteafd_core::prefix::DEFAULT_HOST_CACHE_EVICT_TOKENS)]
-    pub host_cache_evict_tokens: u64,
-    /// Pinned allocation and registration granularity for the snapshot cache.
-    #[arg(long, default_value_t = 256 << 20, env = "CUTEAFD_HOST_CACHE_CHUNK_BYTES")]
-    pub host_cache_chunk_bytes: u64,
-    /// When the device-to-host copy of a retained snapshot is issued.
-    #[arg(long, value_enum, default_value_t = HostCacheStore::OnRetain, env = "CUTEAFD_HOST_CACHE_STORE")]
-    pub host_cache_store: HostCacheStore,
-    /// Longest the device-evict path waits for an in-flight store before dropping it uncached.
-    /// A dropped snapshot costs its next visit a full re-prefill (minutes at long contexts), so the
-    /// budget errs long: a bounded stall of the scheduler beats losing the snapshot.
-    #[arg(long, default_value_t = 1000, env = "CUTEAFD_HOST_CACHE_COPY_BUDGET_MS")]
-    pub host_cache_copy_budget_ms: u64,
-    /// Longest a host restore waits before the request falls through to prefill.
-    #[arg(long, default_value_t = 500, env = "CUTEAFD_HOST_CACHE_RESTORE_BUDGET_MS")]
-    pub host_cache_restore_budget_ms: u64,
-    /// Pace prefill chunks against pending host-cache stores: when the oldest in-flight
-    /// store copy is older than this, each prefill chunk boundary waits on its event for at
-    /// most this long again. Zero disables the guard (no holds, no hold metrics). The
-    /// recommended fleet value is 500 ms.
-    #[arg(long, default_value_t = 0, env = "CUTEAFD_HOST_CACHE_STORE_PACE_MS")]
-    pub host_cache_store_pace_ms: u64,
-    /// Snapshots shorter than this are not cached.
-    #[arg(long, default_value_t = 512, env = "CUTEAFD_HOST_CACHE_MIN_TOKENS")]
-    pub host_cache_min_tokens: u32,
-    /// Snapshots longer than this are not cached.
-    #[arg(long, default_value_t = cuteafd_api::openai::MAX_CONTEXT_TOKENS, env = "CUTEAFD_HOST_CACHE_MAX_TOKENS")]
-    pub host_cache_max_tokens: u32,
-    /// Which retention banks the cache serves: `prompt`, `turn`, or `prompt,turn`.
-    #[arg(long, default_value = "prompt,turn", env = "CUTEAFD_HOST_CACHE_KINDS")]
-    pub host_cache_kinds: String,
+    /// Prefix cache (`--prefix-cache-*`, `--host-cache-*`, `--prefix-point-*`) and the output
+    /// limit and KV decode reservation (`--max-output-tokens`, `--kv-*`).
+    #[command(flatten)]
+    pub prefix: crate::shared::prefix::PrefixArgs,
 
     /// Immutable decode/verify attention reduction width; auto uses active draft limit + 1.
     #[arg(long, env = "CUTEAFD_ATTENTION_PLAN_ROWS")]
@@ -1608,52 +1568,9 @@ impl NativeServeArgs {
     pub fn adaptive_dspark(&self) -> bool {
         self.dspark && self.draft_length.draft_length.is_none()
     }
-}
-
-/// When the host snapshot cache copies a retained snapshot (see `cuteafd_hostcache::config::StoreMode`).
-impl NativeServeArgs {
+    /// Retained snapshots per bank: `--prefix-cache-entries`, or the concurrency-derived default.
     pub(crate) fn resolved_prefix_entries(&self) -> u32 {
-        if self.prefix_cache_entries == u32::MAX {
-            cuteafd_core::concurrency::prefix_entries(u64::from(self.concurrency)) as u32
-        } else { self.prefix_cache_entries }
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
-pub enum HostCacheStore {
-    OnRetain,
-    OnEvict,
-}
-
-impl NativeServeArgs {
-    /// The host snapshot cache configuration these flags describe (validated by the cache).
-    pub fn host_cache_config(&self) -> anyhow::Result<cuteafd_hostcache::config::Config> {
-        use cuteafd_hostcache::config::{Config, Kinds, StoreMode};
-        let mut kinds = Kinds { prompt: false, turn: false };
-        for kind in self.host_cache_kinds.split(',').map(str::trim).filter(|k| !k.is_empty()) {
-            match kind {
-                "prompt" => kinds.prompt = true,
-                "turn" => kinds.turn = true,
-                other => anyhow::bail!("unknown host cache kind {other:?} (expected prompt or turn)"),
-            }
-        }
-        let config = Config {
-            bytes: self.host_cache_bytes.explicit_bytes(),
-            chunk_bytes: self.host_cache_chunk_bytes,
-            eviction_headroom: [0; 4],
-            store: match self.host_cache_store {
-                HostCacheStore::OnRetain => StoreMode::OnRetain,
-                HostCacheStore::OnEvict => StoreMode::OnEvict,
-            },
-            copy_budget_ns: self.host_cache_copy_budget_ms * 1_000_000,
-            restore_budget_ns: self.host_cache_restore_budget_ms * 1_000_000,
-            store_pace_ns: self.host_cache_store_pace_ms * 1_000_000,
-            min_tokens: self.host_cache_min_tokens,
-            max_tokens: self.host_cache_max_tokens,
-            kinds,
-        };
-        config.validate()?;
-        Ok(config)
+        self.prefix.mark_rule(self.concurrency as usize).entries as u32
     }
 }
 

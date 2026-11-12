@@ -437,44 +437,12 @@ impl<'a> Requests<'a> {
             .expect("validated restored request").history = history;
         Ok(())
     }
-    fn encoder_history_at(&self, lease: CacheLease, start: usize, prompt: &[u32]) -> Result<EngramHistory> {
-        ensure!(start <= prompt.len(), "encoder history position exceeds prompt");
-        let recent_start = start.saturating_sub(3);
-        let image_mask = self.request(lease)?.images.mask(recent_start as u64, start - recent_start)?
-            .map(|m| m.into_iter().map(u8::from).collect::<Vec<_>>());
-        self.pipeline.history_at(start as u64, &prompt[recent_start..start], image_mask.as_deref())
-    }
-    /// A partial hit: sources hold the snapshot's rows through the even-aligned `end`; encoder
-    /// windows restart empty at `end - 128` and Engram history is rebuilt there from the
-    /// prompt's native token ids. Returns the replay start.
-    pub fn restore_encoder_prefix(&mut self, lease: CacheLease, end: usize, prompt: &[u32]) -> Result<usize> {
-        let request = self.request(lease)?;
-        ensure!(
-            request.history.position() == 0 && request.prefill.is_none() && end <= prompt.len(),
-            "invalid encoder history restore"
-        );
-        let start = end.saturating_sub(128);
-        let history = self.encoder_history_at(lease, start, prompt)?;
-        if let Err(error) = self.cache.restore_encoder_prefix(lease, end as u64, prompt.len() as u64) {
-            if let Err(cleanup) = self.release_if_present(lease) {
-                tracing::error!(%cleanup, "releasing failed encoder history restore");
-            }
-            return Err(error);
-        }
-        self.slots
-            .iter_mut()
-            .flatten()
-            .find(|r| r.lease == lease)
-            .expect("validated restored request")
-            .history = history;
-        Ok(start)
-    }
     pub fn validate(&self, batch: &RequestBatch) -> Result<()> {
         ensure!(!batch.finished, "request batch finished");
         self.cache.validate_batch(&batch.cache)?;
         for &lease in &batch.leases {
             ensure!(
-                self.request(lease)?.history.position() == self.cache.history_end(lease)?,
+                self.request(lease)?.history.position() == self.cache.committed_end(lease)?,
                 "engram and backbone history differ"
             );
         }
@@ -534,7 +502,7 @@ impl<'a> Requests<'a> {
             ensure!(request.prefill.is_none(), "reserved encoder requires reservation preparation");
             let history = &request.history;
             ensure!(
-                history.position() == self.cache.history_end(r.lease)?,
+                history.position() == self.cache.committed_end(r.lease)?,
                 "request histories differ"
             );
             ensure!(

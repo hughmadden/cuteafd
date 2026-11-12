@@ -202,34 +202,40 @@ fn retire_request<'a, C: DraftChain<'a>>(mut request: Active<'a>, requests: &mut
 /// healthy-looking front door whose worker has already exited.
 pub(super) fn prepare_prefix_cache<'a>(lib: &'a NativeLibrary, args: &crate::cli::NativeServeArgs,
     requests: &Requests<'a>, arenas: super::prefix::Arenas<'a>, draft: bool, admitted: &super::admission::Admitted) -> Result<PrefixCache<'a>> {
+    let prefix = &args.prefix;
+    ensure!(prefix.prefix_partial == crate::shared::prefix::Toggle::Off,
+        "V4.1 restores exact prefix frontiers only (--prefix-partial off)");
     let units = requests.cache().unit_capacity();
-    let layout = super::prefix::layout(units, draft, true);
-    let mut config = args.host_cache_config()?;
-    config.eviction_headroom = crate::shared::prefix::budget::eviction_headroom(layout, args.host_cache_evict_tokens)?;
-    if args.host_cache_evict_tokens > 0 { config.eviction_headroom[3] = super::scores::VOCAB as u64 * 4; }
-    config.bytes = admitted.host.prefix_bytes;
-    config.validate()?;
-    let geometry = cuteafd_core::prefix::HostCacheGeometry { unit_rows: layout.page_rows as u64,
-        page_bytes: layout.page_bytes as u64, mark_bytes: layout.mark_bytes as u64,
-        draft_bytes: layout.draft_bytes as u64 };
-    let max_conversations = geometry.conversations(config.bytes, args.max_context_tokens as u64, config.chunk_bytes);
-    let conversations_50k = geometry.conversations(config.bytes, 50_000, config.chunk_bytes);
-    tracing::info!(mark_bytes = layout.mark_bytes, host_bytes = config.bytes,
-        conversations_max_context = max_conversations, conversations_50k, "host prefix capacity");
-    if config.enabled() && conversations_50k < args.concurrency as u64 + 4 {
-        tracing::warn!(conversations_50k, desired = args.concurrency + 4,
-            "host prefix quota holds fewer 50K conversations than concurrency plus four");
-    }
-    let host = if config.enabled() && args.resolved_prefix_entries() > 0 {
+    let layout = super::prefix::layout(units, draft);
+    let entries = prefix.prefix_cache_entries;
+    // Admission sized the host quota jointly with every other host owner; adopt that exact
+    // quota with the shared tier's geometry and limits.
+    let bytes = admitted.host.prefix_bytes;
+    let host = if prefix.host_cache_bytes.enabled() && entries > 0 && bytes > 0 {
+        let mut config = prefix.host_config_for(layout, args.max_context_tokens as usize, bytes)?;
+        if prefix.host_cache_evict_tokens > 0 { config.eviction_headroom[3] = super::scores::VOCAB as u64 * 4; }
+        config.validate()?;
+        let geometry = cuteafd_core::prefix::HostCacheGeometry { unit_rows: layout.page_rows as u64,
+            page_bytes: layout.page_bytes as u64, mark_bytes: layout.mark_bytes as u64,
+            draft_bytes: layout.draft_bytes as u64 };
+        let conversations_50k = geometry.conversations(bytes, 50_000, config.chunk_bytes);
+        tracing::info!(mark_bytes = layout.mark_bytes, host_bytes = bytes, conversations_50k,
+            conversations_max_context = geometry.conversations(bytes, args.max_context_tokens as u64, config.chunk_bytes),
+            "host prefix capacity");
+        if conversations_50k < args.concurrency as u64 + 4 {
+            tracing::warn!(conversations_50k, desired = args.concurrency + 4,
+                "host prefix quota holds fewer 50K conversations than concurrency plus four");
+        }
         let engine = crate::shared::prefix::CudaCopyEngine::registered_with_owners(lib,
             &requests.cache().source_buffers(), arenas.owners())?;
         tracing::info!(target: "cuteafd::host_cache", config = ?config, "host snapshot cache enabled");
         Some((config, engine))
     } else { None };
-    let entries = args.resolved_prefix_entries() as usize;
-    let prefix = cuteafd_engine::prefix::PrefixConfig { entries, mark_slots: cuteafd_core::prefix::mark_slots_with_host(0, entries as u64, 1, u64::MAX, host.is_some()) as usize,
-        keep_logits: true, min_tokens: 1 };
-    PrefixCache::new(arenas, prefix, true, host, layout)
+    let mark_slots = prefix.mark_rule(args.concurrency as usize).slots(layout.mark_bytes);
+    ensure!(mark_slots == arenas.slots(), "V4.1 mark arena holds {} slots, the mark rule {mark_slots}", arenas.slots());
+    let config = cuteafd_engine::prefix::PrefixConfig { entries, mark_slots, keep_logits: true,
+        min_tokens: prefix.prefix_cache_min_tokens };
+    PrefixCache::new(arenas, config, host, layout)
 }
 
 /// The per-second `stats` payload for the serving worker.
@@ -839,9 +845,9 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
     // still needs wait here for their encodes; decode keeps running.
     let mut media = admission::Media::new(&mut *vision, args.concurrency as usize)?;
     let mut stats_published = Instant::now();
-    let limits = args.reserve.limits(args.max_context_tokens as usize)?;
+    let limits = args.prefix.reserve.limits(args.max_context_tokens as usize)?;
     // KV reservation by decode chunks (issue #951): admission, top-ups and stalls.
-    let mut reserve = KvReserve::new(args.reserve.config(args.max_context_tokens as usize)?, UNIT_TOKENS);
+    let mut reserve = KvReserve::new(args.prefix.reserve.config(args.max_context_tokens as usize)?, UNIT_TOKENS);
     let verify_rows = draft.as_ref().map_or(1, |d| d.max_verify_rows());
     let limit = (args.max_context_tokens as usize).min(prefixes.engine().pool().capacity() * UNIT_TOKENS);
     crate::shared::prefill_packing::log_mode(args.prefill_packing,
@@ -1055,11 +1061,8 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
                 let restore = (restore_started, Instant::now());
                 let resume = if images.is_empty() { prompt.len() } else {
                     let source_end = requests.cache().committed_end(lease)? as usize;
-                    let start = if requests.cache().stage(lease)? == crate::families::deepseek_v41::v41_backbone_cache::CacheStage::EncoderReplay {
-                        requests.cache().history_end(lease)? as usize
-                    } else { source_end };
                     // Encode only when a span from the restored frontier on lacks features.
-                    if requests.images(lease)?.needed(start, prompt.len())?.is_empty() { prompt.len() } else { start }
+                    if requests.images(lease)?.needed(source_end, prompt.len())?.is_empty() { prompt.len() } else { source_end }
                 };
                 Ok((image_keys, hit, restore, resume))
             })();
@@ -2014,12 +2017,10 @@ fn prepare_decode_lane<'a>(requests: &mut Requests<'a>, active: &[Option<Active<
 fn start_admission_lookahead(requests: &mut Requests<'_>, lease: CacheLease, prompt: &[u32],
     args: &crate::cli::NativeServeArgs) {
     let shape = super::PrefillShape::from_args(args);
-    // An encoder-prefix replay re-runs the window before the cached end first.
-    let replay_end = requests.cache().committed_end(lease).map_or(0, |end| end as usize);
     let result = requests.start_lookahead(lease, prompt, |start| {
         if prompt.len() - start <= shape.rows {
             Ok(cuteafd_loader::TableUnitPlan::new(vec![prompt.len() as u64], 1))
-        } else { super::prefill_target::prompt_units(start, replay_end, prompt.len(), shape.rows, shape.waves) }
+        } else { super::prefill_target::prompt_units(start, prompt.len(), shape.rows, shape.waves) }
     });
     if let Err(error) = result { tracing::warn!(%error, "Engram look-ahead not started; rows load on demand"); }
 }

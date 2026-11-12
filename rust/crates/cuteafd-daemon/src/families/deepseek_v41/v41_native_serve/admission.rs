@@ -297,7 +297,7 @@ pub(super) fn admit_startup(
     let mut startup = if ranks == 1 { vec![owners::vocabulary_load_phase(&target_layout.ranks[0],
         crate::families::deepseek_v41::v41_tensors::fp8_head())?] } else { Vec::new() };
     ensure!(args.resolved_prefix_entries() <= 128, "invalid retained-turn limit");
-    let slots = cuteafd_core::prefix::mark_slots_with_host(0, u64::from(args.resolved_prefix_entries()), 1, u64::MAX, args.host_cache_bytes.enabled());
+    let slots = super::prefix::Arenas::slots_for(args) as u64;
     let mut target_owners = owners::TargetOwners::new(weights, target, ranks,
         owners::transports_bytes(u64::from(super::DECODE_LANE_ROWS), u64::from(capacity), args.peers.len(), passes, cuteafd_core::SparkReplyFormat::resolve(cuteafd_core::spark_reply::requested().prefill, false))?, slots)?;
     let draft = if args.dspark {
@@ -638,9 +638,10 @@ pub(super) fn resolve_with_owners(
     let mut host = admission::HostFacts::prepare(&config,
         &catalog.tensors().iter().map(|tensor| &tensor.metadata).collect::<Vec<_>>(),
         prefill, ranks, args.peers.len(), context, args.concurrency as u64,
-        args.dspark, match args.host_cache_bytes { crate::shared::prefix::HostBudget::Auto => None,
+        args.dspark, match args.prefix.host_cache_bytes { crate::shared::prefix::HostBudget::Auto => None,
             crate::shared::prefix::HostBudget::Bytes(bytes) => Some(bytes) },
-        args.host_cache_bytes.enabled() && args.resolved_prefix_entries() > 0, args.host_cache_chunk_bytes,
+        args.prefix.host_cache_bytes.enabled() && args.resolved_prefix_entries() > 0,
+        crate::shared::prefix::PrefixArgs::host_chunk_bytes(super::prefix::layout(1, args.dspark)),
         host_memory, cuteafd_loader::plan::mapped_scale_preload_bytes(args.mapped_scale_preload_gib)?, None, false)?;
     if embedding_placement(args.embedding_placement, memory[0].1) == crate::shared::memory::EmbedPlacement::Host {
         let bytes = catalog.tensors().iter().filter(|tensor| tensor.metadata.name == "embed.weight")
@@ -1123,7 +1124,7 @@ mod admission_tests {
                     args.max_context_tokens = 262_144;
                     args.pool_tokens = pool_tokens;
                     args.concurrency = concurrency;
-                    args.prefix_cache_entries = turns;
+                    args.prefix.prefix_cache_entries = turns as usize;
                     args.rtx_expert_layers = onboard;
                     let admitted = crate::commands::bench::assert_resolved_family_seam("deepseek_v41", &[], || {
                         super::super::normalize_serving(&mut args)?;
@@ -1523,9 +1524,9 @@ mod admission_tests {
             assert!(admitted.placement.pool_tokens >= args.max_context_tokens as u64);
         }
         args.concurrency = 16;
-        args.prefix_cache_entries = 129;
+        args.prefix.prefix_cache_entries = 129;
         assert!(resolve(&args, &memory, no_experts(), 0, &[0], 0, None).is_err());
-        args.prefix_cache_entries = 20;
+        args.prefix.prefix_cache_entries = 20;
         assert!(resolve(&args, &[(97usize << 30, 96usize << 30)], no_experts(), 0, &[0], 0, None).is_err());
         assert!(resolve(&args, &[(0, 0)], no_experts(), 0, &[0], 0, None).is_err());
         Ok(())
