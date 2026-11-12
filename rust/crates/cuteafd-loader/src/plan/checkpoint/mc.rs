@@ -431,7 +431,13 @@ mod family_tests {
         let subset = std::collections::BTreeMap::from([(
             "model.language_model.layers.0.self_attn.q_proj.weight".to_owned(),
             shapes["model.language_model.layers.0.self_attn.q_proj.weight"].clone())]);
-        testing::write_mc_snapshot(dir.path(), &config, &tensors, &subset);
+        let siblings = tensors.iter().filter_map(|(name, dtype, shape)| {
+            if let Some(shape) = shapes.get(name) { return Some((name.clone(), "BF16", shape.clone())); }
+            let core_scale = name.strip_suffix(".weight_scale_inv")
+                .is_some_and(|stem| shapes.contains_key(&format!("{stem}.weight")));
+            (!core_scale).then(|| (name.clone(), *dtype, shape.clone()))
+        }).collect::<Vec<_>>();
+        testing::write_mc_snapshot(dir.path(), &config, &siblings, &subset);
         let checkpoint = Checkpoint::open_view(&CheckpointView::select(dir.path(), CoreView::Fp8Compact)?)?;
         let core = CoreInventory::from_checkpoint(&cfg, &checkpoint)?;
         assert_eq!(core.native.values().filter(|weight| weight.fp8).count(), 1);
