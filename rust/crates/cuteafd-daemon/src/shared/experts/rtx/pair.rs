@@ -87,6 +87,8 @@ pub(crate) fn classify(cause: &anyhow::Error) -> Option<Recovery> {
     match cause.downcast_ref::<StepFailure>() {
         Some(StepFailure::Recoverable { kind, .. }) => Some(*kind),
         Some(StepFailure::Terminal { .. }) => None,
+        // A live route-source flip means the ranks' arithmetic identity changed.
+        None if cause.downcast_ref::<super::routes::RouteSourceChanged>().is_some() => None,
         None => cause.downcast_ref::<RecoverableStepError>().map(|marker| marker.kind),
     }
 }
@@ -1714,7 +1716,10 @@ mod tests {
 
     #[test]
     fn cuda_peer_drain_and_untyped_failures_still_retire_the_server() {
-        let route_flip = anyhow::anyhow!("route source changed mid-run");
+        let route_flip = anyhow::Error::new(super::super::routes::RouteSource::Replicated.checked(
+            &super::super::routes::RouteIdentity { first_mismatch: Some((7, 3)), ..Default::default() }, true)
+            .unwrap_err());
+        assert!(route_flip.downcast_ref::<super::super::routes::RouteSourceChanged>().is_some());
         for cause in [
             anyhow::anyhow!("cudaErrorLaunchFailure in qwen4_ple_fp8"),
             anyhow::Error::new(crate::shared::peer_split::TerminalPeerError::Retain("peer drain failed".into())),
