@@ -134,7 +134,9 @@ pub(super) fn resolve_serving_capacity(engine_args: &mut super::EngineArgs, max_
 }
 
 pub(crate) async fn run_serve(mut args: ServeArgs) -> Result<()> {
-    cuteafd_bench::context::set_resolved("prefill-scoring", "streamed");
+    if probe::streamed_prefill_scoring("mimo_v2") {
+        cuteafd_bench::context::set_resolved("prefill-scoring", "streamed");
+    }
     args.draft_length.report_inactive(args.engine.draft.is_some() || args.engine.mtp > 0);
     let max_sequences = crate::shared::memory::budget::serving_concurrency(
         args.max_sequences, &args.engine.native_lib, args.engine.device)?;
@@ -613,7 +615,7 @@ fn schedule_inner(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path
                             }
                         };
                         failures.watch(&job.events);
-                        if let Err(error) = probe::validate_scoring(&job.probe, true) {
+                        if let Err(error) = probe::validate_scoring(&job.probe, probe::prefill_scoring_admitted("mimo_v2", engine.full_prefill_logits())) {
                             let _ = job.events.send(Err(NativeFailure::BadRequest(format!("scoring: {error:#}"))));
                             continue;
                         }
@@ -749,9 +751,9 @@ fn schedule_inner(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path
                 let mut placement = admitted.placement;
                 let scored = probe::score(engine.library, &job.probe, &tokens, from,
                     engine.prefill_capacity(),
-                    DECODE_ROWS, probe::verify_rows(&job.probe), true, &mut placement,
+                    DECODE_ROWS, probe::verify_rows(&job.probe), probe::prefill_scoring_admitted("mimo_v2", engine.full_prefill_logits()), &mut placement,
                     |placement, chunk, rows, position| {
-                        if rows > 1 && !engine.full_prefill_logits() {
+                        if rows > 1 && !engine.full_prefill_logits() && probe::streamed_prefill_scoring("mimo_v2") {
                             engine.prefill_streamed_scoring(placement, chunk, &request_media,
                                 probe::ScoringRows { probe: &job.probe, position })
                         } else {

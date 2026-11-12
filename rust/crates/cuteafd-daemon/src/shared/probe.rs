@@ -13,6 +13,16 @@ pub(crate) mod features;
 
 pub(crate) type ProbeRef = Option<Arc<Probe>>;
 
+/// Activate each adapter only after its paired raw-row and ordinary-layout proof.
+/// Remove this temporary allowlist with the final FULL_PREFILL_LOGITS deletion.
+pub(crate) fn streamed_prefill_scoring(family: &str) -> bool {
+    matches!(family, "glm5_flash" | "qwen4" | "qwen3_5")
+}
+
+pub(crate) fn prefill_scoring_admitted(family: &str, full_prefill_logits: bool) -> bool {
+    full_prefill_logits || streamed_prefill_scoring(family)
+}
+
 pub(crate) fn image_echo(job: &cuteafd_api::openai::NativeRequest, spans: &[cuteafd_core::MediaSpan]) -> Result<()> {
     if let Some(probe) = &job.probe {
         anyhow::ensure!(spans.len() == job.media.len(), "probe image count differs");
@@ -622,6 +632,58 @@ pub(crate) fn score<S>(library: &NativeLibrary, probe: &ProbeRef, tokens: &[u32]
 mod tests {
     use super::*;
     use cuteafd_api::openai::probe::ProbeSpec;
+
+    #[test]
+    fn streamed_scoring_activation_requires_a_proven_family() {
+        for family in ["glm5_flash", "qwen4", "qwen3_5"] {
+            assert!(streamed_prefill_scoring(family), "{family}");
+            assert!(prefill_scoring_admitted(family, false), "{family}");
+        }
+        for family in ["kimi_k3", "glm5", "mistral_large4", "step5", "muse_spark", "mimo_v2", "deepseek_v4", "unknown"] {
+            assert!(!streamed_prefill_scoring(family), "{family}");
+            for legacy in [false, true] {
+                assert_eq!(prefill_scoring_admitted(family, legacy), legacy, "{family}");
+                for path in [ScorePath::Decode, ScorePath::Prefill] {
+                    let actual = score_plan(20, 4, 8, 8, None, path, prefill_scoring_admitted(family, legacy));
+                    let dev = score_plan(20, 4, 8, 8, None, path, legacy);
+                    match (actual, dev) {
+                        (Ok(actual), Ok(dev)) => assert_eq!(actual, dev, "{family}"),
+                        (Err(actual), Err(dev)) => assert_eq!(actual.to_string(), dev.to_string(), "{family}"),
+                        _ => panic!("{family} changed legacy scoring admission"),
+                    }
+                }
+            }
+            let probe = Some(Probe::new(ProbeSpec { score_from: Some(4), score_path: Some("prefill".into()),
+                ..ProbeSpec::default() }));
+            assert!(validate_scoring(&probe, prefill_scoring_admitted(family, false)).is_err());
+            assert!(validate_scoring(&probe, prefill_scoring_admitted(family, true)).is_ok());
+        }
+    }
+
+    #[test]
+    fn streamed_scoring_activation_gates_capability_validation_and_dispatch() {
+        let scheduler = include_str!("qwen/scheduler.rs").split_once("\npub(crate) fn schedule").unwrap().1;
+        assert!(scheduler.contains("probe::streamed_prefill_scoring(geometry.family) && engine.streamed_prefill_scoring()"));
+        assert!(scheduler.contains("if streamed_scoring {\n            cuteafd_bench::context::set_resolved"));
+        assert_eq!(scheduler.matches("geometry.full_prefill_logits || streamed_scoring").count(), 2);
+        let dispatch = scheduler.split_once("|placement, chunk, rows, position| {").unwrap().1
+            .split_once("|placement, chunk| engine.verify_device_ungraphed").unwrap().0;
+        assert!(dispatch.contains("if streamed_scoring {"));
+        assert!(dispatch.contains("engine.prefill_scoring("));
+        assert!(dispatch.contains("engine.prefill_device(placement, chunk, rows, cache.pool())"));
+        for (family, source) in [
+            ("glm5", include_str!("../families/glm5/serve.rs")),
+            ("glm5_flash", include_str!("../families/glm5_flash/serve.rs")),
+            ("mimo_v2", include_str!("../families/mimo_v2/serve.rs")),
+            ("deepseek_v4", include_str!("../families/deepseek_v4/serve.rs")),
+        ] {
+            assert!(source.contains(&format!("if probe::streamed_prefill_scoring(\"{family}\") {{")));
+            assert_eq!(source.matches(&format!("probe::prefill_scoring_admitted(\"{family}\", engine.full_prefill_logits")).count(), 2);
+            assert!(source.contains(&format!("&& probe::streamed_prefill_scoring(\"{family}\")")));
+        }
+        let kimi = include_str!("../families/kimi_k3/serve.rs");
+        assert!(kimi.contains("if crate::shared::probe::streamed_prefill_scoring(\"kimi_k3\") {"));
+    }
 
     #[test]
     fn head_tiles_cover_the_call_without_changing_its_prefill_steps() {

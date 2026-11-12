@@ -674,7 +674,7 @@ mod readiness_tests {
     fn streamed_scoring_capability_is_published_before_scheduler_readiness() {
         let source = include_str!("scheduler.rs").split_once("\npub(crate) fn schedule").unwrap().1;
         let init = source.split_once("= initialize(|| {").unwrap().1.split_once("}, initialized)?;").unwrap().0;
-        let capability = init.split_once("if engine.streamed_prefill_scoring() {").unwrap().1
+        let capability = init.split_once("if streamed_scoring {").unwrap().1
             .split_once('}').unwrap().0;
         assert!(capability.contains("set_resolved(\"prefill-scoring\", \"streamed\")"));
     }
@@ -783,6 +783,7 @@ pub(crate) fn schedule<'a, B: Backend<'a>>(engine: &B, snapshot: &std::path::Pat
     initialized: impl FnOnce() -> Result<()>)
     -> Result<()> {
     let geometry = engine.geometry();
+    let streamed_scoring = probe::streamed_prefill_scoring(geometry.family) && engine.streamed_prefill_scoring();
     anyhow::ensure!(geometry.decode_rows > 0 && max_sequences <= geometry.decode_rows
         && max_sequences <= geometry.slots, "scheduler lanes exceed target decode/state capacity");
     let width = match drafts { Drafts::Neural { depth, .. } => depth, Drafts::None => 0 };
@@ -793,7 +794,7 @@ pub(crate) fn schedule<'a, B: Backend<'a>>(engine: &B, snapshot: &std::path::Pat
     // Publish readiness only after all fallible scheduler-owned startup work.
     let (family, mut cache, markers, mut grammars, tokenizer, mut selector, mut shared, mut trace, mut prefills) = initialize(|| {
         let (family, cache) = engine.prefix_cache(prefix, max_sequences)?;
-        if engine.streamed_prefill_scoring() {
+        if streamed_scoring {
             cuteafd_bench::context::set_resolved("prefill-scoring", "streamed");
         }
         let markers = crate::shared::prefix::marker_ids(snapshot, engine.message_starts())?;
@@ -856,7 +857,7 @@ pub(crate) fn schedule<'a, B: Backend<'a>>(engine: &B, snapshot: &std::path::Pat
                             }
                         };
                         if let Err(error) = probe::validate_scoring(&job.probe,
-                            geometry.full_prefill_logits || engine.streamed_prefill_scoring()) {
+                            geometry.full_prefill_logits || streamed_scoring) {
                             let _ = job.events.send(Err(NativeFailure::BadRequest(format!("scoring: {error:#}"))));
                             continue;
                         }
@@ -996,9 +997,14 @@ pub(crate) fn schedule<'a, B: Backend<'a>>(engine: &B, snapshot: &std::path::Pat
                 // Teacher-forced scoring: every row's logits, no generation, nothing retained.
                 let scored = probe::score(engine.library(), &job.probe, &tokens, from, geometry.prefill_rows,
                     geometry.decode_rows, probe::verify_rows(&job.probe),
-                    geometry.full_prefill_logits || engine.streamed_prefill_scoring(), &mut placement,
-                    |placement, chunk, rows, position| engine.prefill_scoring(placement, chunk, rows,
-                        position, &job.probe, cache.pool()),
+                    geometry.full_prefill_logits || streamed_scoring, &mut placement,
+                    |placement, chunk, rows, position| {
+                        if streamed_scoring {
+                            engine.prefill_scoring(placement, chunk, rows, position, &job.probe, cache.pool())
+                        } else {
+                            Ok(engine.prefill_device(placement, chunk, rows, cache.pool())?.map(probe::ScoreLogits::Device))
+                        }
+                    },
                     |placement, chunk| engine.verify_device_ungraphed(&mut [(placement, chunk)], false,
                         UngraphedKind::Scoring, cache.pool())?
                         .context("scoring needs every layer"));

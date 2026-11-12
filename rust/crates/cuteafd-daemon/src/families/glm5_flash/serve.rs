@@ -320,7 +320,9 @@ fn serve_loop(mut args: super::EngineArgs, mut receive: mpsc::Receiver<NativeReq
         let encoder = vision.map_or(super::media::Encoder::Off, |vision| vision.encoder);
         let health = encoder.health_handle();
         let mut media = MediaAdmission::new(EmbeddingCache::new(bytes), encoder, 16);
-        cuteafd_bench::context::set_resolved("prefill-scoring", "streamed");
+        if probe::streamed_prefill_scoring("glm5_flash") {
+            cuteafd_bench::context::set_resolved("prefill-scoring", "streamed");
+        }
         anyhow::ensure!(engine.weights.layers.len() == engine.cfg.layers, "serve-glmf needs every layer");
         anyhow::ensure!(engine.has_expert_homes(), "serve-glmf needs an admitted home for every routed layer");
         anyhow::ensure!(preparer.is_none() || media.encoder().available(), "vision encoder unavailable before readiness");
@@ -1021,7 +1023,7 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
                             }
                         };
 
-                        if let Err(error) = probe::validate_scoring(&job.probe, true) {
+                        if let Err(error) = probe::validate_scoring(&job.probe, probe::prefill_scoring_admitted("glm5_flash", engine.full_prefill_logits)) {
                             let _ = job.events.send(Err(NativeFailure::BadRequest(format!("scoring: {error:#}"))));
                             continue;
                         }
@@ -1146,9 +1148,9 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
                 // Teacher-forced scoring: every row's logits, no generation, nothing retained.
                 let mut placement = admitted.placement;
                 let scored = probe::score(&opened.library, &job.probe, &tokens, from, engine.prefill_capacity(),
-                    DECODE_ROWS, probe::verify_rows(&job.probe), true, &mut placement,
+                    DECODE_ROWS, probe::verify_rows(&job.probe), probe::prefill_scoring_admitted("glm5_flash", engine.full_prefill_logits), &mut placement,
                     |placement, chunk, rows, position| {
-                        if rows > 1 && !engine.full_prefill_logits {
+                        if rows > 1 && !engine.full_prefill_logits && probe::streamed_prefill_scoring("glm5_flash") {
                             engine.prefill_streamed_scoring(placement, chunk, &request_media,
                                 probe::ScoringRows { probe: &job.probe, position })
                         } else if rows > 1 {

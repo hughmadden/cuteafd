@@ -3785,7 +3785,7 @@ mod prefill_unit_tests {
         assert!(head.find("self.launch_head(").unwrap() < head.find("scoring.record(").unwrap());
         assert!(!head.contains("Vec::"));
         let serve = include_str!("serve.rs");
-        assert!(serve.contains("probe::validate_scoring(&job.probe, true)"));
+        assert!(serve.contains("probe::prefill_scoring_admitted(\"glm5\", engine.full_prefill_logits)"));
         assert!(serve.contains("else { engine.prefill_capacity() }"));
         assert!(serve.contains("rows > 1 && !engine.full_prefill_logits"));
     }
