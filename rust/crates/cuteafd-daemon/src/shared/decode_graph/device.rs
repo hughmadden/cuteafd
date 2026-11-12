@@ -267,6 +267,7 @@ pub(crate) struct TraceRow {
     capture_bytes: Option<u64>,
     nodes: Option<u64>,
     executables: u64,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
     permanently_eager: bool,
     basis: Basis,
     permanent_bytes: u64,
@@ -1317,7 +1318,7 @@ mod tests {
     fn rejected_small_graph_trace_has_no_executable_or_permanent_bytes() {
         for basis in [Basis::Bytes, Basis::Nodes { node_rate: 2560, graph_rate: 65536 }] {
             for nodes in 0..=2 {
-                let mut cache = DeviceCache::new(-992, 1 << 20);
+                let mut cache = DeviceCache::new(-992, 64 << 20);
                 cache.basis = basis;
                 let mut capture_site = site(Preference::Capture);
                 capture_site.basis = basis;
@@ -1341,7 +1342,7 @@ mod tests {
                 assert_eq!(eager["nodes"], nodes);
                 assert_eq!(eager["captures"], 1, "capture history survives rejection");
                 assert_eq!(eager["pinned"], false);
-                let retained = graphs.iter().find(|row| row["permanently_eager"] == false).unwrap();
+                let retained = graphs.iter().find(|row| row["permanently_eager"].is_null()).unwrap();
                 assert_eq!(retained["executables"], 1);
                 assert!(retained["permanent_bytes"].as_u64().unwrap() > 0);
                 assert_eq!(value["cache"]["charged"], charged);
