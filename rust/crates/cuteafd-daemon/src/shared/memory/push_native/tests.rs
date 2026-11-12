@@ -686,3 +686,38 @@ fn coordinator_mixed_native_backbone_and_dspark_tp2_preserves_sources() -> Resul
     }
     Ok(())
 }
+
+#[test]
+fn coordinator_nvfp4_whole_and_tp2_plan_scalar_tails_without_mount_reads() -> Result<()> {
+    use super::super::push_coordinator::CoordinatorExpertPlan;
+    let root = tempfile::tempdir()?;
+    cuteafd_loader::plan::testing::write_v41_nvfp4_snapshot(root.path());
+    let catalog = cuteafd_loader::read_official_v41_role_catalog(root.path(), "push-test",
+        |name| name.starts_with("layers.0.ffn.experts.") || name.starts_with("layers.1.ffn.experts."))?;
+    for (world, rank) in [(1, 0), (2, 0), (2, 1)] {
+        let make = |budget| if world == 1 { CoordinatorExpertPlan::whole_native(&catalog, &[0, 1], budget) }
+            else { CoordinatorExpertPlan::new(&catalog, &[0, 1], rank, budget) };
+        let reads = crate::shared::memory::load_timing::Split::start();
+        let plan = make(usize::MAX)?;
+        let bytes = plan.layout.bytes();
+        assert_eq!(make(bytes)?.layout.bytes(), bytes);
+        assert!(make(bytes - 1).is_err());
+        assert_eq!(plan.native.len(), 2);
+        assert!(plan.native.iter().all(|p| p.nvfp4 && !p.scale_codes));
+        let scalars = 2 * catalog.routed_experts().experts * 24;
+        assert_eq!(plan.layout.logical_bytes(), bytes + scalars);
+        assert_eq!(plan.host_bytes()?, scalars + catalog.routed_experts().experts * 128);
+        let checked = plan.checked(&catalog, root.path(), 6, 4 + rank)?;
+        checked.plan.check(&checked.file_sizes, &checked.arenas)?;
+        let tail = checked.plan.entries.iter().filter(|entry| entry.dst_base >= bytes as u64)
+            .map(|entry| {
+                let pattern = &checked.plan.patterns[entry.pattern as usize];
+                pattern.runs().into_iter().map(move |(_, dst)| entry.dst_base + dst..entry.dst_base + dst + u64::from(pattern.run))
+            }).flatten().collect::<Vec<_>>();
+        let mut coverage = vec![0u8; scalars];
+        for range in tail { for value in &mut coverage[range.start as usize - bytes..range.end as usize - bytes] { *value += 1; } }
+        assert!(coverage.iter().all(|&n| n == 1));
+        assert_eq!(reads.read_bytes(), 0);
+    }
+    Ok(())
+}

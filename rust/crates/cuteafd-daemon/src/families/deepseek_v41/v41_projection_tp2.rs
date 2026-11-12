@@ -1,6 +1,6 @@
 //! Output-channel FP8 projection shards with lane-owned exchange storage.
 use crate::shared::memory::Tag;
-use crate::shared::memory::{HostAllocation, device::{Allocation, Device, Event, Stream}};
+use crate::shared::memory::{device::{Allocation, Device, Event, Stream}};
 use anyhow::{ensure, Context, Result};
 use crate::shared::decode_graph::{CacheAttached, LayerGraphs};
 use cuteafd_ffi::{CuteafdDeviceBuffer, V41Fp8Plan, V41PeerCopy};
@@ -27,6 +27,8 @@ pub(crate) struct Weights<'a> {
     scales: Allocation<'a>,
 }
 impl<'a> Weights<'a> {
+    #[cfg(test)]
+    pub(crate) fn buffers(&self) -> [CuteafdDeviceBuffer; 2] { [self.weight.buffer, self.scales.buffer] }
     pub(crate) fn inventory(&self, inventory: &mut crate::shared::memory::receipts::Inventory<'_>) -> Result<()> {
         let name = format!("gpu{}.layers.{}.attn.{}.weight", self.device.id, self.layer, self.kind.name());
         self.weight.inventory(inventory, &name)?;
@@ -58,17 +60,24 @@ impl<'a> Weights<'a> {
         let weight=crate::shared::memory::weight_arena::weight_allocation(device,arena,&weight_name,k*n, ArenaTag::weights("v41/target"))?;
         let scales=crate::shared::memory::weight_arena::weight_allocation(device,arena,
             &cuteafd_loader::placement::families::deepseek_v41::weight_layout::packed_scale_name(&weight_name),k*n/32, ArenaTag::weights("v41/target"))?;
-        let raw_scales=Allocation::new(device,k*n/1024,Tag::staging("v41/projection-load"))?;
-        let mut staging=HostAllocation::new(device.library,k*n,Tag::staging("v41/projection"))?;
-        for (name,target) in [(&weight_name,&weight),(&scale_name,&raw_scales)] {
-            let bytes=catalog.read_coordinator_tp2_into(name,0,rank,staging.bytes_mut(),&mut [])?;
-            ensure!(bytes==target.buffer.bytes,"projection shard payload size differs");
-            device.run(||device.library.copy_h2d(target.buffer,&staging.bytes_mut()[..bytes]))?;
-        }
-        let kernel=device.run(||device.library.v41_fp8_matrix_kernel(1,k as u32,n as u32))?;
-        let queued=device.run(||unsafe { kernel.pack_scales(raw_scales.buffer,scales.buffer,stream.raw) });
-        let drained=stream.drain();queued.and(drained)?;
+        let dense = crate::shared::experts::rtx::dense::DenseLoad::mount(device.library);
+        Self::load_operands(&dense, device.id, super::v41_tensors::half(catalog, &weight_name, 0, rank)?,
+            super::v41_tensors::half(catalog, &scale_name, 0, rank)?, k, n, weight.buffer, scales.buffer, stream.raw)?;
         Ok(Self { device,layer,rank,kind,weight,scales })
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn load_operands(dense: &crate::shared::experts::rtx::dense::DenseLoad<'_>, device: i32,
+        weight: crate::shared::experts::rtx::dense::Rect, scales: crate::shared::experts::rtx::dense::Rect,
+        k: usize, n: usize, dst: CuteafdDeviceBuffer, packed: CuteafdDeviceBuffer,
+        stream: *mut std::ffi::c_void) -> Result<()> {
+        use crate::shared::experts::rtx::dense::{Operand, Step, Job};
+        ensure!(weight.bytes() == k * n && scales.bytes() == k * n / 1024,
+            "projection shard payload size differs");
+        dense.operand(Operand { device, buffer: dst, bytes: k * n, lands: vec![(weight, 0)] })?;
+        dense.step(Step { device, rects: vec![scales], jobs: vec![Job::V41Scales {
+            k: k as u32, n: n as u32, packed,
+        }] }, stream)?;
+        Ok(())
     }
 }
 
@@ -405,6 +414,55 @@ impl Drop for Wave<'_,'_> {
 mod tests {
     use super::*;
     use crate::families::deepseek_v41::v41_tensors::NativeRtxTensors;
+    #[test]
+    fn tp2_query_and_output_push_record_without_mount_reads() -> Result<()> {
+        use crate::shared::experts::rtx::dense::{self, Rect, Job};
+        use cuteafd_loader::plan::testing::{t, write_snapshot};
+        let fixture = cuteafd_ffi::native_library_lifetime_fixture::Fixture::build_for_tests()?;
+        let lib = fixture.load()?;
+        let root = tempfile::tempdir_in(fixture.directory())?;
+        let k = 256;
+        let n = 64;
+        for kind in [Kind::QueryB, Kind::OutputB] {
+            let weight = format!("layers.0.attn.{}.weight", kind.name());
+            let scale = format!("layers.0.attn.{}.scale", kind.name());
+            write_snapshot(root.path(), &serde_json::json!({}), &[
+                t(&weight, "F8_E4M3", &[2 * n, k]),
+                t(&scale, "F8_E8M0", &[2 * n / 32, k / 32]),
+            ], None);
+            let checkpoint = cuteafd_loader::plan::Checkpoint::open(root.path())?;
+            let whole = Rect::tensor(&checkpoint, &weight, None, None)?;
+            let grid = Rect::tensor(&checkpoint, &scale, None, None)?;
+            let saved = whole.path.with_extension("held");
+            std::fs::rename(&whole.path, &saved)?;
+            for rank in 0..2 {
+                let device = Device { library: &lib, id: rank as i32 };
+                let requests = [(weight.clone(), k * n), (scale.clone(), k * n / 32)];
+                let arena = crate::shared::memory::weight_arena::DeviceWeightArena::new(device,
+                    cuteafd_loader::serving_capacity::WeightArenaLayout::new("projection/push", requests)?,
+                    ArenaTag::weights("v41/target"))?;
+                let dst = arena.view(&weight, k * n)?;
+                let packed = arena.view(&scale, k * n / 32)?;
+                let reads = crate::shared::memory::load_timing::Split::start();
+                let (_, records) = dense::recording(|| Weights::load_operands(&dense::DenseLoad::mount(&lib),
+                    device.id, whole.sub(rank * n..(rank + 1) * n),
+                    grid.sub(rank * n / 32..(rank + 1) * n / 32), k, n, dst.buffer, packed.buffer,
+                    std::ptr::null_mut()))?;
+                assert_eq!(reads.read_bytes(), 0);
+                assert_eq!(records.summary(), (k * n, 1, k * n / 1024, 1, k * n / 1024, 0));
+                assert_eq!(records.operands[0].buffer.ptr, dst.buffer.ptr);
+                assert_eq!(records.operands[0].lands[0].0.rows, rank * n..(rank + 1) * n);
+                assert_eq!(records.steps[0].rects[0].rows, rank * n / 32..(rank + 1) * n / 32);
+                assert!(matches!(records.steps[0].jobs[0], Job::V41Scales { packed: p, .. } if p.ptr == packed.buffer.ptr));
+                let plan = dense::RankLayout::new(records.operands, records.steps, device.id)?;
+                assert_eq!(plan.operands.len(), 1);
+                assert_eq!(plan.steps.len(), 1);
+            }
+            std::fs::rename(&saved, &whole.path)?;
+        }
+        Ok(())
+    }
+
     #[test]
     #[ignore = "requires checkpoint, projection shard AOT and two CUDA GPUs"]
     fn checkpoint_dual_projection_lanes_match_full() -> Result<()> {

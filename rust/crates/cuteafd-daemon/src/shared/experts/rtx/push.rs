@@ -287,8 +287,12 @@ pub(crate) fn receive_rank<'a, D: PushDestination<Delivered = ()>>(
         }
         if !plan.native.is_empty() {
             // Native halves: the Spark native post-Done plane transform, then views.
-            let initialize = plan.native.iter().enumerate().map(|(region, layout)|
-                push_initialize::Layer::Native { region, layout, scalars: 0..0 }).collect::<Vec<_>>();
+            let mut scalar_offset = 0;
+            let initialize = plan.native.iter().enumerate().map(|(region, layout)| {
+                let first = scalar_offset;
+                scalar_offset += layout.scalar_bytes();
+                push_initialize::Layer::Native { region, layout, scalars: first..scalar_offset }
+            }).collect::<Vec<_>>();
             let ready = std::rc::Rc::new(push_initialize::initialize(delivered, &initialize, None, plan.scratch_bytes())?);
             return plan.native.iter().zip(&plan.native_layers).enumerate().map(|(region, (layout, &selection))| {
                 let budget = crate::shared::experts::layer::ExpertWeights::plan(library, catalog, selection)?;

@@ -62,10 +62,11 @@ pub(crate) fn pushed_routed_weights<'a>(
     budgets: [usize; 2],
     pushed: [Vec<crate::shared::experts::layer::ExpertWeights<'a>>; 2],
 ) -> Result<[OwnerWeights<'a>; 2]> {
-    ensure!(catalog.exl3().is_none() && catalog.nvfp4().is_none(), "pushed coordinator halves are native MXFP4");
+    ensure!(catalog.exl3().is_none(), "pushed coordinator halves require native experts");
+    let nvfp4 = catalog.nvfp4().is_some();
     let OwnerPolicy::Native { selection, output, .. } =
-        devices[0].run(|| OwnerPolicy::native(devices[0].library, false))? else { unreachable!() };
-    let workspace = NativeTp2::workspace_bytes_for_format(devices[0].library, capacity as usize, selection, output, false)?;
+        devices[0].run(|| OwnerPolicy::native(devices[0].library, nvfp4))? else { unreachable!() };
+    let workspace = NativeTp2::workspace_bytes_for_format(devices[0].library, capacity as usize, selection, output, nvfp4)?;
     let budgets = [budgets[0].checked_add(workspace).context("TP2 native budget overflow")?,
         budgets[1].checked_add(workspace).context("TP2 native budget overflow")?];
     Ok(NativeTp2::pushed_pair_weights(devices, catalog, (0..layers).collect(), capacity as usize, budgets,
