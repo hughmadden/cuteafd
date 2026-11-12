@@ -50,7 +50,6 @@ pub(crate) struct DenseBackend<'e, 'a> {
     pub library: &'a NativeLibrary,
     drafter: Option<Rc<DsparkDrafter<'a>>>,
     mtp: Option<Rc<super::engine::mtp::MtpCache<'a>>>,
-    selector: RefCell<Option<crate::shared::token_io::TokenSelector<'a>>>,
     profile: RefCell<[f64; 2]>,
     pending: RefCell<Option<DenseMark<'a>>>,
     probe: RefCell<DenseProbe>,
@@ -149,7 +148,7 @@ impl<'e, 'a> DenseBackend<'e, 'a> {
     }
 
     pub fn new(engine: &'e RefCell<DenseEngine<'a>>, library: &'a NativeLibrary) -> Self {
-        Self { engine, library, drafter: None, mtp: None, selector: RefCell::new(None),
+        Self { engine, library, drafter: None, mtp: None,
             profile: RefCell::new([0.0; 2]), pending: RefCell::new(None),
             probe: RefCell::new(DenseProbe::default()), packing: Default::default() }
     }
@@ -451,15 +450,13 @@ impl<'e, 'a> Backend<'a> for DenseBackend<'e, 'a> {
         draft.anchor = next;
         Ok(())
     }
-    fn draft(&self, sequences: &mut [scheduler::DraftSeq<'_, Placement, DraftState>], timing: &mut scheduler::DraftTiming)
+    fn draft(&self, sequences: &mut [scheduler::DraftSeq<'_, Placement, DraftState>], timing: &mut scheduler::DraftTiming, selector: &mut crate::shared::token_io::TokenSelector<'_>)
         -> Result<Vec<Vec<u32>>> {
         if let Some(mtp) = &self.mtp {
             use crate::shared::token_io::{RowSelect, SelectBatch};
             let begin = std::time::Instant::now();
             let mut output = vec![Vec::new(); sequences.len()];
             let mut engine = self.engine.borrow_mut();
-            let mut selector = self.selector.borrow_mut();
-            let selector = selector.as_mut().context("dense MTP selector was not admitted")?;
             for (index, sequence) in sequences.iter().enumerate().filter(|(_, sequence)| sequence.depth > 0) {
                 output[index] = mtp.draft_chain(&mut engine, sequence.placement.slot,
                     sequence.seq.anchor.context("dense MTP has no anchor")?, sequence.placement.len,
@@ -685,8 +682,6 @@ pub(crate) async fn run_serve(mut args: ServeArgs) -> Result<()> {
                 scheduler::Drafts::Neural { depth }
             } else if let Some(admission) = mtp_admission {
                 backend.mtp = Some(Rc::new(super::engine::mtp::MtpCache::load(&engine.borrow(), &reader, admission)?));
-                backend.selector = RefCell::new(Some(crate::shared::token_io::TokenSelector::new(&library,
-                    crate::shared::token_io::SelectPlacement::Device, engine.borrow().cfg.vocab, 1)?));
                 scheduler::Drafts::Neural { depth: usize::from(engine_args.mtp) }
             } else { scheduler::Drafts::None };
             resolved_prefill_settings(backend.geometry().prefill_rows).publish();
@@ -978,9 +973,18 @@ mod tests {
         let family = DensePrefix::with_mtp(&engine, mtp.clone())?;
         let mut backend = DenseBackend::new(&engine, &library);
         backend.mtp = Some(mtp);
-        backend.selector = RefCell::new(Some(crate::shared::token_io::TokenSelector::new(&library,
-            crate::shared::token_io::SelectPlacement::Device, engine.borrow().cfg.vocab, 1)?));
         super::super::engine::prefix::check_backend_frontiers(&engine, &[1, 2, 3, 4], &backend, family, true)
+    }
+
+    #[test]
+    fn native_mtp_reuses_the_scheduler_selector() {
+        let source = include_str!("serve.rs");
+        let production = source.split("#[cfg(test)]").next().unwrap();
+        assert!(!production.contains("TokenSelector::new("));
+        assert!(!production.contains("selector: RefCell"));
+        assert!(production.contains("selector.select(&logits, &batch)"));
+        let scheduler = include_str!("../../shared/qwen/scheduler.rs");
+        assert!(scheduler.contains("engine.draft(&mut seqs, &mut lane.timing, selector)"));
     }
 
     #[test]

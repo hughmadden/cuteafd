@@ -655,7 +655,7 @@ impl<'e, 'a> Backend<'a> for Step5Backend<'e, 'a> {
         mtp.prefill(&self.ranks[mtp.rank()].borrow(), placement, start, chunk, draft, self.embedding)
     }
     fn draft(&self, sequences: &mut [scheduler::DraftSeq<'_, Placement, NoDraft>],
-        timing: &mut scheduler::DraftTiming) -> Result<Vec<Vec<u32>>> {
+        timing: &mut scheduler::DraftTiming, _selector: &mut crate::shared::token_io::TokenSelector<'_>) -> Result<Vec<Vec<u32>>> {
         let mtp = self.mtp.context("Step-5 MTP runtime is not admitted")?;
         let started = std::time::Instant::now();
         let cache = self.ranks[mtp.rank()].borrow();

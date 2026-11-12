@@ -180,7 +180,7 @@ pub(crate) trait Backend<'a> {
     fn arm_draft_probe(&self) -> Result<()>;
     fn prefill_draft(&self, placement: &Self::Placement, start: usize, chunk: &[u32], next: Option<u32>,
         draft: &mut Self::Draft) -> Result<()>;
-    fn draft(&self, sequences: &mut [DraftSeq<'_, Self::Placement, Self::Draft>], timing: &mut DraftTiming)
+    fn draft(&self, sequences: &mut [DraftSeq<'_, Self::Placement, Self::Draft>], timing: &mut DraftTiming, selector: &mut crate::shared::token_io::TokenSelector<'_>)
         -> Result<Vec<Vec<u32>>>;
     fn accept(&self, verified: &mut [Verified<'_, Self::Placement, Self::Draft, Self::History>],
         speculative: bool) -> Result<()>;
@@ -1371,7 +1371,7 @@ async fn decode_round<'a, B: Backend<'a>>(lease: LaneLease<'_>, engine: &B, geom
                     placement: &a.placement, seq: &mut a.draft, depth }).collect();
                 drafted_requests = depths.iter().filter(|&&n| n > 0).count();
                 drafted_width = depths.iter().copied().max().unwrap_or(0);
-                let proposals = round_clock.draft(|| engine.draft(&mut seqs, &mut lane.timing))?;
+                let proposals = round_clock.draft(|| engine.draft(&mut seqs, &mut lane.timing, selector))?;
                 proposals
             } else {
                 vec![Vec::new(); active.len()]
