@@ -426,7 +426,7 @@ impl<'a> GlmEngine<'a> {
             .collect();
         self.force_route_check.set(true);
         let mut experts = experts;
-        let result = (|| {
+        let result: Result<()> = (|| {
             self.prefill_device(
                 &mut placement,
                 &tokens,
