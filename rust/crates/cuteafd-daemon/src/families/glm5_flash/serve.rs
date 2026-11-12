@@ -3,7 +3,7 @@
 //! every active sequence. With a DFlash2 drafter (--draft), every step first
 //! drafts after each sequence's next token on the GPU and verifies as many
 //! drafts as the shared resource-priced draft policy (`cuteafd_core::
-//! draft_policy` through `draft_binding`) finds worthwhile under one row
+//! draft_policy` through `shared::draft::resource`) finds worthwhile under one row
 //! budget; a copy window anchored to its confident leading positions extends the
 //! drafter's confident horizon; copies never stand alone without a drafter.
 //!
@@ -24,6 +24,7 @@
 //! at its last chunk; a decode whose client left is not retained.
 //! `prompt_cache_hit_tokens` reports the restored rows; `/v1/stats` carries
 //! the cache's counters.
+use crate::shared::draft::resource;
 use super::engine::{GlmfEngine, GlmfPlacement, DECODE_ROWS, PAGE_ROWS, WIDE_DECODE_ROWS};
 use super::prefix::{GlmfPrefix, PrefixMarks};
 use super::packing;
@@ -415,18 +416,18 @@ struct Active<'a> {
 /// The shared draft policy and its per-round plumbing.
 struct SharedPolicy {
     policy: cuteafd_core::DraftPolicy,
-    prior: super::draft_binding::Prior,
+    prior: resource::Prior,
     observed: u64,
     skipped: u64,
     trace: bool,
-    decision: Option<super::draft_binding::DecisionTrace>,
+    decision: Option<resource::DecisionTrace>,
 }
 
 impl SharedPolicy {
     fn new(engine: &GlmfEngine<'_>, opened: &Opened, drafter: &super::dspark::Drafter<'_>,
         ranks: Option<usize>, length: crate::shared::draft::length::DraftLength) -> Result<Self> {
         let geometry = engine.draft_geometry(opened.experts.as_ref(), drafter.drafts(),
-            super::draft_binding::COPY_EXTENSION)?;
+            resource::COPY_EXTENSION)?;
         let layers = &geometry.layers;
         let slice = layers.iter().find(|layer| layer.class.is_some()).map(|layer| layer.slice_bytes);
         tracing::info!(layers = layers.len(), dense = layers.iter().filter(|l| l.class.is_none()).count(),
@@ -435,7 +436,7 @@ impl SharedPolicy {
             first_slice_bytes = slice, rows = geometry.max_requests, width = ?geometry.widths, ranks,
             installed_group_rows = ?layers.iter().map(|l| l.group_rows).collect::<Vec<_>>(),
             "GLM Flash shared draft policy geometry");
-        let policy = length.policy(geometry, super::draft_binding::seed(), drafter.drafts())?;
+        let policy = length.policy(geometry, resource::seed(), drafter.drafts())?;
         engine.arm_draft_probe(engine.decode_rows)?;
         // Drafts through a launcher (the FP8 head, or the packed head's coarse plane, whose E4M3-like
         // numerics have no prior of their own) take the FP8 head's selector prior.
@@ -447,20 +448,20 @@ impl SharedPolicy {
     /// `p0` of the drafter's positions, then of an agreed copy's `extension`.
     fn prior(&self, history: &DraftHistory, draft: &Draft, extension: usize) -> Vec<f64> {
         let evidence = if draft.confidence.is_empty() {
-            super::draft_binding::DraftEvidence::Selector(&draft.features)
+            resource::DraftEvidence::Selector(&draft.features)
         } else {
-            super::draft_binding::DraftEvidence::Head(&draft.confidence)
+            resource::DraftEvidence::Head(&draft.confidence)
         };
-        let mut prior = super::draft_binding::prior(&self.prior, history, &evidence);
+        let mut prior = resource::prior(&self.prior, history, &evidence);
         // A short or invalid prior has no window for a copy to extend.
         if prior.len() == draft.tokens.len() {
-            prior.extend((0..extension).map(super::draft_binding::tail_prior));
+            prior.extend((0..extension).map(resource::tail_prior));
         }
         prior
     }
 
     /// The completed round, once the verify step's stream drained.
-    fn observe(&mut self, engine: &GlmfEngine<'_>, requests: &[super::draft_binding::Verified<'_>],
+    fn observe(&mut self, engine: &GlmfEngine<'_>, requests: &[resource::Verified<'_>],
         times: crate::shared::draft::clock::RoundTimes, width: usize, drafted_requests: usize, predicted: Option<f64>) {
         // The caller captured the round clock before diagnostics; evaluate
         // against the pre-observation policy without charging trace work to its fit.
@@ -474,7 +475,7 @@ impl SharedPolicy {
         } else { None };
         let policy = &mut self.policy;
         let outcome = engine.probe_finish(|routes, layer_us|
-            super::draft_binding::observe_drafted(policy, requests, routes, layer_us, times, width, predicted, Some(drafted_requests)));
+            resource::observe_drafted(policy, requests, routes, layer_us, times, width, predicted, Some(drafted_requests)));
         match outcome {
             Some(Ok(())) => self.observed += 1,
             Some(Err(error)) => {
@@ -504,7 +505,7 @@ impl SharedPolicy {
             if let Some((layers, mismatched)) = ring {
                 tracing::info!(layers, mismatched, "GLM Flash route ring check against staged Spark ids");
             }
-            super::draft_binding::publish(&self.policy, self.observed, self.skipped, ring);
+            resource::publish(&self.policy, self.observed, self.skipped, ring);
         }
     }
 }
@@ -911,7 +912,7 @@ fn publish(stats: &Mutex<serde_json::Value>, requests: u64, generated: u64, acti
         *stats = serde_json::json!({"requests": requests, "generated_tokens": generated, "active": active,
             "prefilling": prefilling, "draft_ring_misses": ring_misses, "prefix_cache": prefix_stats,
             "kv_reserve": reserve.snapshot(stalled),
-            "verify": verify.snapshot(), "draft_policy": super::draft_binding::snapshot(),
+            "verify": verify.snapshot(), "draft_policy": resource::snapshot(),
             "media": media.stats(prefix_stats.media_key_collisions, preparer.map_or(0, |p| p.memo_hits()))});
         // Idle checkpoints only: never sample the process ledger on the decode hot path.
         if active == 0 && prefilling == 0 {
@@ -1504,7 +1505,7 @@ async fn decode_round(lease: LaneLease<'_>, engine: &GlmfEngine<'_>, opened: &Op
     let copies: Vec<_> = active.iter().zip(&drafted).zip(&limits).zip(&mut shared_priors)
         .map(|(((a, draft), &limit), prior)| match (&shared, draft) {
             (Some(shared), Some(d)) if !shared.policy.fixed() =>
-                super::draft_binding::copy_continuation(&shared.policy, active.len(), a.ticket.id(), &a.history,
+                resource::copy_continuation(&shared.policy, active.len(), a.ticket.id(), &a.history,
                     &d.tokens, prior, limit, a.job.sampling.is_greedy()),
             _ => None,
         }).collect();
@@ -1514,12 +1515,12 @@ async fn decode_round(lease: LaneLease<'_>, engine: &GlmfEngine<'_>, opened: &Op
         Some(_) if drafted_width == 0 => vec![0; active.len()],
         Some(shared) => {
             let candidates: Vec<_> = active.iter().zip(&shared_priors).zip(&limits).zip(&drafted)
-                .map(|(((a, prior), &limit), draft)| super::draft_binding::Candidate { id: a.ticket.id(), prior,
+                .map(|(((a, prior), &limit), draft)| resource::Candidate { id: a.ticket.id(), prior,
                     limit, selector: draft.as_ref().is_some_and(|d| d.confidence.is_empty()), cold: a.drafts.cold() })
                 .collect();
-            let selection = super::draft_binding::select_drafted(&mut shared.policy, &candidates, drafted_width, verify_rows, drafted_requests);
+            let selection = resource::select_drafted(&mut shared.policy, &candidates, drafted_width, verify_rows, drafted_requests);
             if shared.trace {
-                shared.decision = Some(super::draft_binding::DecisionTrace::capture(&candidates,
+                shared.decision = Some(resource::DecisionTrace::capture(&candidates,
                     drafted_width, drafted_requests, verify_rows, &selection));
             }
             predicted = selection.predicted;
@@ -1528,7 +1529,7 @@ async fn decode_round(lease: LaneLease<'_>, engine: &GlmfEngine<'_>, opened: &Op
         // No neural drafter means no speculative proposal.
         None => vec![0; active.len()],
     };
-    if super::draft_binding::trim_budget_with_priors(&mut planned, verify_rows, &shared_priors,
+    if resource::trim_budget_with_priors(&mut planned, verify_rows, &shared_priors,
         |i| active[i].ticket.id()) { predicted = None; }
     // A history continuation never competes with or replaces the confident prefix.
     let sequences: Vec<Vec<u32>> = active.iter().enumerate().map(|(i, a)| {
@@ -1655,7 +1656,7 @@ async fn decode_round(lease: LaneLease<'_>, engine: &GlmfEngine<'_>, opened: &Op
         let requests: Vec<_> = active.iter().enumerate().map(|(i, a)| {
             let (rows, accepted, censor) = verified[i];
             let draft = drafted[i].as_ref().filter(|_| rows > 1);
-            super::draft_binding::Verified { id: a.ticket.id(), rows, accepted: accepted.max(1),
+            resource::Verified { id: a.ticket.id(), rows, accepted: accepted.max(1),
                 source: if draft.is_some() { DraftSource::Neural }
                     else { DraftSource::Undrafted },
                 prior: draft.map(|_| shared_priors[i].as_slice()),

@@ -6750,3 +6750,21 @@ fn mimo_and_qwen_all_onboarded_preserve_media_only_spark_and_refuse_unavailable_
     assert!(qwen35_unavail.hints.iter().any(|h| h.what.contains("vision-only Spark workers are not supported")),
         "{:?}", qwen35_unavail.hints);
 }
+
+#[test]
+fn kimi_and_muse_refuse_host_embedding_before_placement() {
+    use crate::plan::testing::{write_kimi_snapshot, write_muse_spark_snapshot};
+    for family in ["Kimi", "Muse Spark"] {
+        let dir = tempfile::tempdir().unwrap();
+        if family == "Kimi" { write_kimi_snapshot(dir.path(), false); }
+        else { write_muse_spark_snapshot(dir.path(), &[]); }
+        let mut options = sparks(6);
+        options.layout = Some(layout::LayoutOptions { host_embedding: true,
+            host_memory: Some((128 << 30, 128 << 30)), ..Default::default() });
+        let report = plan(dir.path(), &options).unwrap();
+        assert!(!report.fits);
+        assert!(report.hints.iter().any(|hint| hint.what ==
+            format!("{family} does not support --embedding-placement host")), "{:?}", report.hints);
+        assert!(report.memory_layout.unwrap().devices.is_empty());
+    }
+}

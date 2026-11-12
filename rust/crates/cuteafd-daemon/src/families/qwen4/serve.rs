@@ -425,7 +425,7 @@ impl<'e, 'a> Backend<'a> for Qwen4Backend<'e, 'a> {
         -> Result<()> {
         super::speculate::prefill_chunk(self.engine, placement, start, chunk, next, draft)
     }
-    fn draft(&self, sequences: &mut [scheduler::DraftSeq<'_, Self::Placement, Self::Draft>], timing: &mut scheduler::DraftTiming)
+    fn draft(&self, sequences: &mut [scheduler::DraftSeq<'_, Self::Placement, Self::Draft>], timing: &mut scheduler::DraftTiming, _selector: &mut crate::shared::token_io::TokenSelector<'_>)
         -> Result<Vec<Vec<u32>>> {
         super::speculate::draft(self.engine, sequences, timing)
     }

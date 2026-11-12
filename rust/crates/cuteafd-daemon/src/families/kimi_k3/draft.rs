@@ -667,7 +667,8 @@ mod tests {
             let propose = |states: &mut [DraftState]| -> Result<Vec<Vec<u32>>> {
                 let mut batch = placements.iter().zip(states).map(|(placement, seq)| scheduler::DraftSeq {
                     placement, seq, depth: draft.drafts() }).collect::<Vec<_>>();
-                backend.draft(&mut batch, &mut scheduler::DraftTiming::default())
+                backend.draft(&mut batch, &mut scheduler::DraftTiming::default(), &mut crate::shared::token_io::TokenSelector::new(&library,
+                    crate::shared::token_io::SelectPlacement::Device, backend.geometry().vocab_size, 1)?)
             };
             regression::draft_dump(&output, sequences, draft.drafts(), draft.common().cfg.block,
                 cfg.vocab_size, || Ok((propose(&mut states)?, draft.common().last_logits(sequences)?)))?;
@@ -806,7 +807,8 @@ mod tests {
             if arm < 2 { states.push(draft.readback(0, suffix.len())?); }
             else { warm_states.push(draft.readback(0, suffix.len())?); }
             let proposed = backend.draft(&mut [scheduler::DraftSeq {
-                placement: &placement, seq: &mut seq, depth: 7 }], &mut scheduler::DraftTiming::default())?.remove(0);
+                placement: &placement, seq: &mut seq, depth: 7 }], &mut scheduler::DraftTiming::default(), &mut crate::shared::token_io::TokenSelector::new(&library,
+                    crate::shared::token_io::SelectPlacement::Device, backend.geometry().vocab_size, 1)?)?.remove(0);
             assert_eq!(proposed.len(), 7);
             if arm == 0 { common_verify = std::iter::once(anchor).chain(proposed.iter().copied()).collect(); }
             else { assert_eq!(common_verify[0], anchor); }

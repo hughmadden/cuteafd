@@ -64,7 +64,6 @@ WIP_INSTANCE
 WIP_ROOT
 SPECULATOR
 DRAFT_LENGTH
-EXPERT_USAGE
 EMBEDDING
 COORDINATOR_GPUS
 CONCURRENCY
@@ -123,6 +122,9 @@ EOF
     # Inventory hosts are accepted but never contacted by this RTX-only family.
     _spark_slot_keys HOST LANE_A
     return
+  fi
+  if [[ "$1" == deepseek_v4 || "$1" == mimo_v2 || "$1" == glm5 || "$1" == kimi_k3 ]]; then
+    printf '%s\n' EXPERT_USAGE
   fi
   # Kimi K3, Step-5 and Muse Spark (WIP slots only): the shared serve contract
   # and Spark workers, no media or family modes yet; Step-5 takes an opt-in

@@ -779,13 +779,13 @@ fn worker(
     admission::log_runtime_base(&lib, &pool)?;
     admission::startup_phase(&lib, "v41/ready", device_total)?;
     crate::shared::memory_report::reconcile::capture("ready");
-    ready
-        .take()
-        .context("startup readiness missing")?
-        .send(Ok((vision.health_handle(), args.max_context_tokens)))
-        .map_err(|_| anyhow::anyhow!("API startup cancelled"))?;
+    let health = vision.health_handle();
     scheduler::serve(&lib, &args, &runtime, &mut receive, &mut pass, &mut second,
-        &mut requests, &mut transport, &mut second_transport, &mut prefill_slots, draft.as_mut(), &mut vision, stats, prefixes)
+        &mut requests, &mut transport, &mut second_transport, &mut prefill_slots, draft.as_mut(), &mut vision, stats, prefixes, || {
+            ready.take().context("startup readiness missing")?
+                .send(Ok((health, args.max_context_tokens)))
+                .map_err(|_| anyhow::anyhow!("API startup cancelled"))
+        })
 }
 
 /// The HC-9 prefill pacing hold at a chunk boundary: bounded by the host cache's store

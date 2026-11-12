@@ -408,3 +408,12 @@ def test_optional_levers_section_is_near_the_top_and_linked():
     assert "[Optional performance levers](#optional-performance-levers)" in text
     agents = (ROOT / "AGENTS.md").read_text()
     assert "docs/options.md#optional-performance-levers" in agents
+
+
+def test_embedding_value_support_and_expert_usage_adapters():
+    text = DOC.read_text()
+    section = text.split("Token embedding placement (`EMBEDDING`", 1)[1].split("Speculator", 1)[0]
+    host = next(line for line in section.splitlines() if line.startswith("| `host` |"))
+    assert [cell.strip() for cell in host.split("|")[2:-1]] == ["✓"] * 7 + ["✗"] * 3
+    assert {family for family in COLUMNS if MATRIX["EXPERT_USAGE"][family]} == {
+        "V4.1", "V4", "GLM 5.3 / ML4", "MiMo", "Kimi K3"}

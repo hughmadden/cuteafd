@@ -259,6 +259,7 @@ pub(super) struct Execution<'e, 'a> {
 struct MainExecution<'e, 'a> {
     graphs: Vec<super::graphs::Graphs<'a>>,
     graph_enabled: Cell<bool>,
+    probe: RefCell<Option<DraftProbe<'a>>>,
     checkpoint: &'a Checkpoint,
     ownership: ExecutionOwnership,
     native: NativeOwners<'a>,
@@ -278,6 +279,19 @@ struct MainExecution<'e, 'a> {
     terminal_output: Cell<Option<CuteafdDeviceBuffer>>,
     poison_scratch: Cell<bool>,
     diagnostic_outputs: RefCell<std::collections::BTreeMap<usize, Vec<u8>>>,
+}
+
+fn probe_owner(ownership: &ExecutionOwnership, layer: usize) -> Result<usize> {
+    Ok(match ownership.execution().mode(layer)? {
+        LayerMode::Whole { gpu, .. } => usize::from(gpu),
+        LayerMode::HeadSplit => 0,
+        LayerMode::ContextSplit => anyhow::bail!("Step-5 context split has no draft probe"),
+    })
+}
+
+struct DraftProbe<'a> {
+    ranks: Vec<DeviceOwner<'a, crate::shared::draft::probe::RoundProbe<'a>>>,
+    routes: crate::shared::draft::routes::RoundRoutes,
 }
 
 enum Exchange<'a> {
@@ -752,7 +766,7 @@ impl<'e, 'a> MainExecution<'e, 'a> {
             }
         };
         let execution = Self { graphs: (0..devices.len()).map(|_| super::graphs::Graphs::new()).collect(),
-            graph_enabled: Cell::new(false), checkpoint, ownership, native, caches, stages, exchange,
+            graph_enabled: Cell::new(false), probe: RefCell::new(None), checkpoint, ownership, native, caches, stages, exchange,
             sequence: RefCell::new(HeadSequence::new(0)?), pending_wave: RefCell::new(std::collections::VecDeque::new()), transport: RefCell::new(transport), routed_reply, tp2, rows, inventory, requests: Cell::new(0), placement_version,
             terminal_output: Cell::new(None), poison_scratch: Cell::new(false),
             diagnostic_outputs: RefCell::new(std::collections::BTreeMap::new()) };
@@ -844,6 +858,50 @@ impl<'e, 'a> MainExecution<'e, 'a> {
         self.ownership.execution().validate_routed_replications(&copies)?;
         Ok(())
     }
+    fn probe_entry(&self, rank: usize, layer: usize) -> Result<()> {
+        if probe_owner(&self.ownership, layer)? != rank { return Ok(()); }
+        let mut slot = self.probe.borrow_mut();
+        let Some(probe) = slot.as_mut() else { return Ok(()); };
+        let owner = &mut probe.ranks[rank];
+        let stream = self.stages[rank].stream.raw;
+        let device = owner.device;
+        device.run(|| {
+            // SAFETY: the rank stream and probe share a device; the input hop is
+            // ordered before this boundary and the verifier drains before reading.
+            unsafe {
+                if layer == 0 { owner.mark_entry(layer, stream); }
+                else if probe_owner(&self.ownership, layer - 1)? != rank { owner.mark(layer - 1, stream)?; }
+            }
+            Ok(())
+        })
+    }
+
+    fn probe_ring(&self, rank: usize, layer: usize, ffn: &RoutedFfn<'a>, rows: usize) -> Result<()> {
+        if probe_owner(&self.ownership, layer)? != rank { return Ok(()); }
+        let mut slot = self.probe.borrow_mut();
+        let Some(probe) = slot.as_mut() else { return Ok(()); };
+        let owner = &mut probe.ranks[rank];
+        let device = owner.device;
+        device.run(|| {
+            // SAFETY: router ids remain live on this rank stream until the next
+            // layer reuses its FFN scratch; ring queues a copy before that reuse.
+            unsafe { owner.ring(device.library, layer, ffn.wave_inputs()[0], rows, self.stages[rank].stream.raw) }
+        })
+    }
+
+    fn probe_mark(&self, layer: usize) -> Result<()> {
+        let mut slot = self.probe.borrow_mut();
+        let Some(probe) = slot.as_mut() else { return Ok(()); };
+        let rank = probe_owner(&self.ownership, layer)?;
+        let owner = &mut probe.ranks[rank];
+        let device = owner.device;
+        device.run(|| {
+            // SAFETY: completion, ring writes and download share the layer's
+            // stream, which the existing execution drain completes before finish.
+            unsafe { owner.mark(layer, self.stages[rank].stream.raw) }
+        })
+    }
+
     /// Both peer exchanges this execution queues waits on.
     fn require_live(&self) -> Result<()> {
         self.exchange.require_live()?;
@@ -914,6 +972,73 @@ impl Drop for GraphEnableRestore<'_> {
 }
 
 impl<'e, 'a> Execution<'e, 'a> {
+    pub(super) fn arm_draft_probe(&self) -> Result<()> {
+        let mut slot = self.main.probe.borrow_mut();
+        if slot.is_some() { return Ok(()); }
+        let layers = self.main.inventory.len();
+        let ranks = (0..self.main.ownership.ranks()).map(|rank| {
+            let device = self.main.device(rank)?;
+            let dense = (0..layers).map(|layer| Ok(!(3..91).contains(&layer)
+                || probe_owner(&self.main.ownership, layer)? != rank)).collect::<Result<Vec<_>>>()?;
+            device.own(|| crate::shared::draft::probe::RoundProbe::new(device.library, dense, 8, self.main.rows.min(64)))
+        }).collect::<Result<Vec<_>>>()?;
+        if crate::shared::inventory::startup_probe_enabled() {
+            use crate::shared::memory::receipts::{Census, Inventory};
+            use cuteafd_loader::placement::planner::{CoordinatorDevices, Lifetime};
+            let ids = (0..self.main.ownership.ranks()).map(|rank| self.main.device(rank).map(|d| d.id))
+                .collect::<Result<Vec<_>>>()?;
+            let mut inventory = Inventory::new(CoordinatorDevices::new(&ids)?, "step5.draft-probe",
+                Lifetime::TARGET, cuteafd_core::memory_layout::Category::Workspace, "Step-5 draft probe");
+            for (rank, probe) in ranks.iter().enumerate() {
+                probe.allocation_receipts(&mut inventory, &format!("gpu.{rank}"))?;
+            }
+            let mut census = Census::default();
+            census.owners(inventory.receipts);
+            crate::shared::inventory::startup_probe(self.main.device(0)?.library, &ids, "step5/draft-probe",
+                crate::shared::inventory::StartupEvidence { census: Some(&census), ..Default::default() })?;
+        }
+        *slot = Some(DraftProbe { ranks, routes: crate::shared::draft::routes::RoundRoutes::new(layers, 8) });
+        Ok(())
+    }
+
+    pub(super) fn probe_begin(&self, rows: usize) {
+        if let Some(probe) = self.main.probe.borrow_mut().as_mut() {
+            probe.routes.begin(rows);
+            for rank in &mut probe.ranks { rank.begin(rows); }
+        }
+    }
+
+    pub(super) fn probe_end(&self) {
+        if let Some(probe) = self.main.probe.borrow_mut().as_mut() {
+            for rank in &mut probe.ranks { rank.end(); }
+        }
+    }
+
+    pub(super) fn probe_finish<T>(&self,
+        observe: impl FnOnce(&crate::shared::draft::routes::RoundRoutes, &[Option<f64>]) -> T) -> Option<T> {
+        let mut slot = self.main.probe.borrow_mut();
+        let probe = slot.as_mut()?;
+        let mut times = vec![None; probe.routes.layers()];
+        for (rank, owner) in probe.ranks.iter_mut().enumerate() {
+            let device = owner.device;
+            let finished = device.run(|| {
+                let Some((routes, timing)) = owner.finish() else { return Ok(false); };
+                for layer in 0..probe.routes.layers() {
+                    if probe_owner(&self.main.ownership, layer)? != rank { continue; }
+                    if (3..91).contains(&layer) && !routes.flat().is_empty() {
+                        let words = probe.routes.rows() * 8;
+                        probe.routes.push_narrow(layer, &routes.flat()[layer * words..][..words])?;
+                    } else { probe.routes.dense(layer)?; }
+                    times[layer] = timing.get(layer).copied().flatten();
+                }
+                Ok(true)
+            }).ok()?;
+            if !finished { return None; }
+        }
+        probe.routes.complete().ok()?;
+        Some(observe(&probe.routes, &times))
+    }
+
     pub(super) fn configure_graphs(&mut self, enabled: bool,
         layout: Option<cuteafd_loader::serving_capacity::step5_graphs::Step5GraphLayout>) -> Result<()> {
         if enabled {
@@ -1373,6 +1498,7 @@ impl<'s, E: CopyEngine> Bindings<'s, '_, '_, '_, '_, E> {
             self.copy(rank, local.ffn_input(), local.post())?;
             let Ffn::Routed(ffn) = &local.ffn else { anyhow::bail!("Step-5 TP2 layer without a routed FFN"); };
             self.step.compose(rank, ffn, |ffn, meta| ffn.frontend_on(meta.rows, meta.stream))?;
+            execution.probe_ring(rank, layer, ffn, rows)?;
             self.step.compose(rank, ffn, |ffn, meta| {
                             if graphing { execution.graphs[rank].run(super::graphs::Key { layer, rows: meta.rows,
                                 section: super::graphs::Section::Shared }, meta.stream, || ffn.shared_on(meta.rows, meta.stream)) }
@@ -1461,6 +1587,7 @@ impl<'s, E: CopyEngine> Bindings<'s, '_, '_, '_, '_, E> {
         }))
     }
     fn attention(&mut self, rank: usize, layer: usize) -> Result<()> {
+        self.execution.probe_entry(rank, layer)?;
         let owner = self.execution.layer(rank, layer)?;
         let source = self.current[rank].unwrap_or(self.input);
         self.copy(rank, owner.input(), source)?;
@@ -1573,6 +1700,7 @@ impl<E: CopyEngine> PipelineKernels for Bindings<'_, '_, '_, '_, '_, E> {
                         } else if dispatch { ffn.frontend_on(meta.rows, meta.stream) }
                         else { ffn.normalize_on(meta.rows, meta.stream) }
                     })?;
+                    if dispatch { execution.probe_ring(rank, layer, ffn, self.rows())?; }
                     if dispatch && execution.ownership.onboarded(layer) {
                         // Onboarded: the entry GPU's EXL3 experts replace the Spark wave.
                         ensure!(wave.is_none(), "Step-5 duplicate routed dispatch");
@@ -1633,7 +1761,10 @@ impl<E: CopyEngine> PipelineKernels for Bindings<'_, '_, '_, '_, '_, E> {
     }
     fn finish_ffn(&mut self, layer: usize, ticket: Self::FfnTicket) -> Result<()> {
         let execution = self.execution;
-        let Some(rank) = ticket else { return self.retain_diagnostic_output(layer); };
+        let Some(rank) = ticket else {
+            execution.probe_mark(layer)?;
+            return self.retain_diagnostic_output(layer);
+        };
         self.select_ffn(layer)?;
         let entry = usize::from(execution.ownership.execution().spec().entry_gpu);
         let Ffn::Routed(ffn) = &execution.layer(rank, layer)?.ffn else { anyhow::bail!("Step-5 routed completion owner"); };
@@ -1677,6 +1808,7 @@ impl<E: CopyEngine> PipelineKernels for Bindings<'_, '_, '_, '_, '_, E> {
                 else { ffn.finish_on(meta.rows, meta.stream) }
             })?;
         }
+        execution.probe_mark(layer)?;
         self.retain_diagnostic_output(layer)
     }
 }
@@ -1704,6 +1836,23 @@ mod tests {
         order::{check_submission_faults, host::{HostSchedule, check_host}}};
     use cuteafd_loader::plan::families::step5::Config;
     use std::cell::Cell;
+
+    #[test]
+    fn draft_probe_uses_canonical_router_and_every_layer_boundary() -> Result<()> {
+        let ownership = super::super::golden::split_ownership(&config(), 64)?;
+        for layer in 0..92 {
+            let owner = probe_owner(&ownership, layer)?;
+            if (3..91).contains(&layer) { assert!(ownership.layer(layer, owner)?.routed_wave); }
+        }
+        let source = include_str!("execution.rs");
+        let hooks = source.split("impl<E: CopyEngine> PipelineKernels").nth(1).unwrap()
+            .split("impl<E: CopyEngine> HeadKernels").next().unwrap();
+        assert_eq!(hooks.matches("execution.probe_mark(layer)?").count(), 2);
+        assert!(hooks.contains("if dispatch { execution.probe_ring(rank, layer, ffn, self.rows())?; }"));
+        let tp2 = source.split("fn tp2_ffn(").nth(1).unwrap().split("fn attention(").next().unwrap();
+        assert!(tp2.contains("execution.probe_ring(rank, layer, ffn, rows)?;"));
+        Ok(())
+    }
 
     #[test]
     fn explicit_eager_guard_restores_policy_on_failure_and_nested_calls() {

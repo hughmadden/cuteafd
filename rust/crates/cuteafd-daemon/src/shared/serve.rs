@@ -79,6 +79,32 @@ mod readiness_tests {
     }
 
     #[test]
+    fn v41_all_fallible_startup_precedes_readiness_in_both_layouts() {
+        for source in [
+            include_str!("../families/deepseek_v41/v41_native_serve.rs"),
+            include_str!("../families/deepseek_v41/v41_native_serve/distributed.rs"),
+        ] {
+            let schedule = source.find("    scheduler::serve(").unwrap();
+            let signal = source.find(".send(Ok((health,").unwrap();
+            assert!(schedule < signal, "V4.1 readiness must be a scheduler callback");
+        }
+        let source = include_str!("../families/deepseek_v41/v41_native_serve/scheduler.rs");
+        let finish = source.split_once("fn finish_startup<P>(").unwrap().1.split_once("\n}\n").unwrap().0;
+        assert!(finish.find("decode_share.queue::<P>()?").unwrap() < finish.find("ready()?;").unwrap());
+        let startup = source.split_once("pub(super) fn serve<").unwrap().1;
+        let ready = startup.find("    let mut prefills = finish_startup::<").unwrap();
+        let loop_at = startup.find("    loop {").unwrap();
+        for init in ["native_manifest(", "admission::Media::new(", "args.reserve.limits(",
+            "args.reserve.config("] {
+            assert!(startup.find(init).unwrap() < ready, "{init} must precede readiness");
+        }
+        assert!(ready < loop_at);
+        let after_ready = startup[ready..].split_once('\n').unwrap().1;
+        assert!(!after_ready[..after_ready.find("    loop {").unwrap()].contains('?'),
+            "no fallible startup work may follow readiness");
+    }
+
+    #[test]
     fn glm_and_v4_capacity_and_all_fallible_startup_precede_readiness() {
         for source in [include_str!("../families/glm5/serve.rs"), include_str!("../families/deepseek_v4/serve.rs")] {
             callback_follows_scheduler(source);

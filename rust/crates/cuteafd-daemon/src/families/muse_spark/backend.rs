@@ -563,7 +563,7 @@ impl<'r, 'a> Backend<'a> for MuseBackend<'r, 'a> {
             Ok(())
         })
     }
-    fn draft(&self, sequences: &mut [scheduler::DraftSeq<'_, Placement, DraftState>], timing: &mut scheduler::DraftTiming)
+    fn draft(&self, sequences: &mut [scheduler::DraftSeq<'_, Placement, DraftState>], timing: &mut scheduler::DraftTiming, _selector: &mut crate::shared::token_io::TokenSelector<'_>)
         -> Result<Vec<Vec<u32>>> {
         crate::shared::experts::rtx::pair::submit(|| self.require_live(), || self.shutdown(), || {
             let draft = self.draft.as_ref().context("Muse drafter was not admitted")?;

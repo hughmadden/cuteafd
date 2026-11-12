@@ -26,6 +26,7 @@
 //! Drafts only steer speculation: the
 //! verify step keeps output identical to plain greedy decoding.
 //! python/reference/families/glm5_flash/dspark/reference.py is the oracle.
+use crate::shared::draft::resource;
 use crate::shared::speculation::dflash::{ContextRow, Draft, DraftSeq, ReplayDrafter, TargetHead};
 use crate::shared::fp8_linear;
 use crate::shared::token_io::TokenEmbedding;
@@ -159,11 +160,11 @@ impl<'a> Drafter<'a> {
 
     /// The shared draft policy's prior: DFlash2's keyed selector fit, or the
     /// dSpark confidence head blended with the history rate.
-    pub fn draft_prior(&self, fp8_head: bool) -> Result<super::draft_binding::Prior> {
+    pub fn draft_prior(&self, fp8_head: bool) -> Result<resource::Prior> {
         Ok(match self {
-            Self::Dflash2(d) => super::draft_binding::Prior::Selector(d.selector_fit("glm5_flash", fp8_head)?),
-            Self::RemoteDflash(d) => super::draft_binding::Prior::Selector(d.draft.selector_fit("glm5_flash", fp8_head)?),
-            Self::Dspark(_) => super::draft_binding::Prior::Head,
+            Self::Dflash2(d) => resource::Prior::Selector(d.selector_fit("glm5_flash", fp8_head)?),
+            Self::RemoteDflash(d) => resource::Prior::Selector(d.draft.selector_fit("glm5_flash", fp8_head)?),
+            Self::Dspark(_) => resource::Prior::Head,
         })
     }
 
