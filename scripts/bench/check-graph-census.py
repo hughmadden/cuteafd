@@ -30,9 +30,40 @@ def finite(value):
     return float(value)
 
 
-def check(log, sweep):
+def topology_records(log, paths):
+    if not paths:
+        directory = Path(log).parent
+        paths = sorted(directory.glob('graph-census-captures-*.jsonl'))
+        # wip-cards keeps coordinator logs under smoke/logs and profiles beside smoke.
+        if not paths and directory.name == 'logs' and directory.parent.name == 'smoke':
+            paths = sorted((directory.parent.parent / 'profile').glob('graph-census-captures-*.jsonl'))
+        if len(paths) > 1:
+            paths = [path for path in paths if path.name == 'graph-census-captures-raptor.jsonl']
+        if len(paths) != 1:
+            raise ValueError('retained census requires one coordinator topology JSONL (--captures)')
+    records = {}
+    for path in paths:
+        for line in Path(path).read_text().splitlines():
+            line = line.removeprefix('CUTEAFD_GRAPH_CENSUS ')
+            record = json.loads(line)
+            if record.get('event') != 'capture':
+                continue
+            identity = (record['id'], record['exec'])
+            if identity in records:
+                raise ValueError('duplicate census capture identity in topology JSONL')
+            if (record.get('node_status') != 0 or not isinstance(record.get('nodes'), int)
+                    or not isinstance(record.get('details'), list)
+                    or record['nodes'] != len(record['details'])):
+                raise ValueError('missing or incomplete census topology')
+            records[identity] = record
+    return records
+
+
+def check(log, sweep, topology=()):
     anchors, captures, stamps = [], [], []
     evidence = False
+    pending, references, joined = {}, set(), set()
+    retained = []
     decoder = json.JSONDecoder()
     for raw in Path(log).open():
         line = ANSI.sub('', raw)
@@ -47,13 +78,38 @@ def check(log, sweep):
             anchors.append(utc - finite(current['queried_s']))
         if 'graph census executable site' in line:
             evidence = True
-        if 'graph census executable site' in line:
             site = SITE.search(line)
             if utc is None or site is None:
                 raise ValueError('capture record lacks timestamp or site')
             captures.append((utc, site[1] or site[2]))
+        if 'CUTEAFD_GRAPH_CENSUS ' in line:
+            record = json.loads(line.split('CUTEAFD_GRAPH_CENSUS ', 1)[1])
+            if record.get('event') == 'capture_ref':
+                identity = (record['id'], record['exec'])
+                if identity in references:
+                    raise ValueError('duplicate native capture_ref')
+                references.add(identity)
+                # Executable pointers may be recycled. Only the nearest preceding
+                # native record in this ordered stream identifies this lifetime.
+                if record['exec'] in pending:
+                    raise ValueError('capture_ref lacks a timestamped capture key')
+                pending[record['exec']] = identity
+        if 'graph census capture key' in line:
+            exec_match = re.search(r'\bexec=(0x[0-9a-fA-F]+)', line)
+            if utc is None or exec_match is None or exec_match[1] not in pending:
+                raise ValueError('capture key lacks timestamp or preceding capture_ref')
+            identity = pending.pop(exec_match[1])
+            joined.add(identity)
+            retained.append((identity, utc, line.split('graph census capture key', 1)[1].strip()))
         if 'capture_write_failed' in line:
             raise ValueError('native census capture records were lost')
+    if references:
+        records = topology_records(log, topology)
+        if pending or references != joined or set(records) != references:
+            raise ValueError('incomplete capture_ref / capture key / topology evidence')
+        for identity, utc, site in retained:
+            captures.append((utc, site))
+        evidence = True
     if not anchors:
         raise ValueError('missing thermal UTC/queried_s clock anchors')
     if not evidence:
@@ -95,9 +151,11 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--log', required=True, type=Path)
     parser.add_argument('--sweep', required=True, type=Path)
+    parser.add_argument('--captures', action='append', type=Path, default=[],
+                        help='coordinator topology JSONL (default: beside log or in the WIP profile directory)')
     args = parser.parse_args()
     try:
-        report = check(args.log, args.sweep)
+        report = check(args.log, args.sweep, args.captures)
     except (OSError, ValueError, KeyError, TypeError) as error:
         print(json.dumps({'status': 'error', 'error': str(error)}))
         return 2
