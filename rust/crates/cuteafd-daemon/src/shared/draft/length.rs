@@ -38,6 +38,9 @@ impl DraftLength {
         if let Some(length) = self.draft_length { policy.set_fixed_length(length.min(native))?; }
         super::apply_length_rule(&mut policy);
         cuteafd_bench::context::set_resolved("draft-mode", &self.label(native));
+        tracing::info!(requested = ?self.draft_length, native_cap = native,
+            effective = self.effective(native), mode = if policy.fixed() { "fixed" } else { "adaptive" },
+            "DRAFT_LENGTH policy");
         Ok(policy)
     }
 }
@@ -96,8 +99,7 @@ mod tests {
         assert!(parse("-1").is_err());
     }
 
-    #[test]
-    fn inactive_override_reports_no_speculation() {
+    fn capture_log<T>(body: impl FnOnce() -> T) -> (T, String) {
         #[derive(Clone)]
         struct Output(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
         impl std::io::Write for Output {
@@ -111,10 +113,34 @@ mod tests {
         let writer = output.clone();
         let subscriber = tracing_subscriber::fmt().without_time().with_ansi(false)
             .with_writer(move || writer.clone()).finish();
-        let (_, settings) = tracing::subscriber::with_default(subscriber, ||
-            cuteafd_bench::context::capture_resolved(||
-                DraftLength { draft_length: Some(4) }.report_inactive(false)));
+        let result = tracing::subscriber::with_default(subscriber, body);
         let log = String::from_utf8(output.0.lock().unwrap().clone()).unwrap();
+        (result, log)
+    }
+
+    #[test]
+    fn policy_reports_requested_native_effective_and_mode() {
+        for (requested, native, effective, mode) in [
+            (Some(4), 7, 4, "fixed"),
+            (Some(9), 3, 3, "fixed"),
+            (None, 7, 7, "adaptive"),
+        ] {
+            let geometry = resource::geometry(&[resource::LayerHome::Dense], 8, 2, 64, native, 0).unwrap();
+            let (policy, log) = capture_log(|| DraftLength { draft_length: requested }
+                .policy(geometry, PolicySeed::weak(native), native).unwrap());
+            assert_eq!(log.matches("DRAFT_LENGTH policy").count(), 1, "{log}");
+            for field in [format!("requested={requested:?}"), format!("native_cap={native}"),
+                format!("effective={effective}"), format!("mode=\"{mode}\"")] {
+                assert!(log.contains(&field), "missing {field}: {log}");
+            }
+            assert_eq!(policy.fixed_length(), requested.map(|_| effective));
+        }
+    }
+
+    #[test]
+    fn inactive_override_reports_no_speculation() {
+        let ((_, settings), log) = capture_log(|| cuteafd_bench::context::capture_resolved(||
+            DraftLength { draft_length: Some(4) }.report_inactive(false)));
         assert_eq!(log.matches("DRAFT_LENGTH=4 ignored: no speculator").count(), 1);
         let mut context = cuteafd_bench::context::ServerContext::default();
         settings.apply(&mut context);
