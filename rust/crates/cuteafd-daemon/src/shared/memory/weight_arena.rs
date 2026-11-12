@@ -542,10 +542,9 @@ impl<'a> LoadingArena<'a> {
         let end = start
             .checked_add(bytes.len())
             .context("validation fragment overflow")?;
-        self.validation
-            .get_mut(start..end)
-            .context("validation fragment exceeds host tail")?
-            .copy_from_slice(bytes);
+        let target = self.validation.get_mut(start..end)
+            .context("validation fragment exceeds host tail")?;
+        super::load_timing::push(bytes.len(), || target.copy_from_slice(bytes));
         self.expected.record(&mut self.coverage, offset, bytes.len() as u64)
     }
 

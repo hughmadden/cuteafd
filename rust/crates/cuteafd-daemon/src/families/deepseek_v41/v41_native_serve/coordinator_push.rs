@@ -1,7 +1,7 @@
 //! V4.1 coordinator ranks receive device-resident dense operands and onboarded
 //! experts in one committed group. Namespace launches require push; planning or
-//! delivery failure never permits a mounted reread. Intentional host-mapped
-//! embedding and Engram tables are not coordinator device operands.
+//! delivery failure never permits a mounted reread. Host embeddings land in
+//! their resident pinned owner; random-access Engram tables stay mapped.
 use crate::shared::experts::rtx::{dense::{self, Records}, push::{CoordinatorPush, PushedExperts, PushPolicy}};
 use crate::shared::memory::device::Device;
 use anyhow::{Context, Result};

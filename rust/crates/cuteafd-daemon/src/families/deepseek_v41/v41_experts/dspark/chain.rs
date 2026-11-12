@@ -150,12 +150,9 @@ impl<'library> DsparkWeights<'library> {
         requests: u32,
         budget: usize,
     ) -> Result<DsparkChain<'weights, 'library>> {
-        ensure!(
-            embedding.get("embed.weight")?.bytes == 129280 * 5120 * 2,
-            "invalid shared embedding extent"
-        );
+        let (table_bytes, table_device) = embedding.embedding_layout()?;
+        ensure!(table_bytes == 129280 * 5120 * 2, "invalid shared embedding extent");
         let mut chain = self.chain(requests, budget)?;
-        let table_device = embedding.get("embed.weight")?.device_id;
         if table_device != chain.tokens.buffer.device_id {
             // Plan peer access once. Draft graphs only read the shared table;
             // tokens, residuals and all transformer work stay on this device.

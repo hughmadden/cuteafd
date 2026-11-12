@@ -813,7 +813,7 @@ pub(crate) fn receive_pushed<'a>(device: Device<'a>, catalog: Option<&cuteafd_lo
     use crate::shared::experts::rtx::dense::RankLayout;
     let rank = sparks + gpu;
     let layout = RankLayout::new(records.operands.clone(), records.steps.clone(), device.id)?
-        .with_finishes(&records.finishes);
+        .with_finishes(&records.finishes).with_hosts(records.host_operands.iter().filter(|h| h.device == device.id).cloned().collect())?;
     let dense_plan = layout.plan();
     let (base, host) = (dense_plan.base, dense_plan.host_bytes);
     let tp2_bytes = tp2.as_ref().map_or(0, |p| p.logical_bytes());

@@ -42,6 +42,7 @@ pub use shared::expert_usage;
 mod cuda_runtime;
 pub mod host_isa;
 pub mod memory_ledger;
+pub mod load_timing;
 mod observer_context;
 pub mod synchronized_load;
 pub mod push_ring;

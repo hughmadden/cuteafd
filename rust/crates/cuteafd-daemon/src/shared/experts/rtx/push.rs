@@ -228,7 +228,6 @@ pub(crate) fn receive_rank<'a, D: PushDestination<Delivered = ()>>(
     use cuteafd_transport::worker_selection::push;
     use std::os::fd::AsRawFd;
     ensure!(tp2.is_some() || dense.is_some(), "coordinator rank receives nothing");
-    #[cfg(test)]
     let reads = crate::shared::memory::load_timing::Split::start();
     let library = device.library;
     let (group, token) = credentials;
@@ -253,6 +252,7 @@ pub(crate) fn receive_rank<'a, D: PushDestination<Delivered = ()>>(
     });
     if let Err(error) = &joined { tracing::info!(group, rank, %error, "coordinator push rank join failed"); }
     push::joined_with(stream, joined.as_ref().map(|_| ()).map_err(|error| format!("{error:#}"))).context("coordinator push joined frame")?;
+    let host_ready = dense.as_ref().map(|rank| rank.destination.host_ready()).unwrap_or_default();
     let candidate = joined.and_then(|(arena, ring, joined)| {
         let delivered = match (arena, dense) {
             (Some(arena), Some(DenseRank { destination, base })) =>
@@ -321,11 +321,13 @@ pub(crate) fn receive_rank<'a, D: PushDestination<Delivered = ()>>(
     if let Err(error) = &candidate { tracing::warn!(group, rank, %error, "coordinator push candidate rejected"); }
     if push::completed_with(stream, candidate.as_ref().map(|_| ()).map_err(|error| format!("{error:#}"))).context("coordinator push completion")? {
         let weights = candidate?;
+        for ready in host_ready { ready.store(true, std::sync::atomic::Ordering::Release); }
         #[cfg(test)]
         {
             assert_eq!(reads.read_bytes(), 0, "coordinator rank {rank} receiver read the mount");
             eprintln!("coordinator rank {rank}: zero receiver-thread mount bytes");
         }
+        reads.log("coordinator receiver push");
         tracing::info!(group, rank, layers = weights.len(), "coordinator push committed; publishing ready rank arena");
         return Ok(Some(weights));
     }
@@ -706,6 +708,7 @@ impl CoordinatorPush {
             None => (vec![(0, 0); gpus.len()], (0..gpus.len()).map(|_| None).collect()),
         };
         let client = match client(socket) { Ok(client) => client, Err(error) => return (Err(error), beside()) };
+        let phase = crate::shared::memory::load_timing::Split::start();
         let (snapshot, namespace_host) = (&snapshot, &host);
         let receive = |gpu: usize, (tp2, mut stream, dense): (Option<CoordinatorExpertPlan>, std::net::TcpStream, Option<D>)| {
             let rank = group_rank(sparks, gpu);
@@ -767,6 +770,7 @@ impl CoordinatorPush {
         };
         let pushed = devices.first().context("peer load copies need a coordinator device")
             .and_then(|device| super::dense::committed_peer_copies(device.library, pushed, &peer_copies));
+        phase.log("coordinator group push");
         (pushed, value)
     }
 }

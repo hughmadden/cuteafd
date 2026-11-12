@@ -91,8 +91,9 @@ impl<'w, 'a> TargetEmbeddingWave<'w, 'a> {
     }
     pub(crate) fn on_storage(library: &'a NativeLibrary, table: &'w NativeRtxTensors<'a>,
         storage: Rc<TargetEmbeddingStorage<'a>>) -> Result<Self> {
-        ensure!(table.get("embed.weight")?.bytes == 129280 * 5120 * 2
-            && table.get("embed.weight")?.device_id == storage.ids.buffer.device_id,
+        let (table_bytes, table_device) = table.embedding_layout()?;
+        ensure!(table_bytes == 129280 * 5120 * 2
+            && table_device == storage.ids.buffer.device_id,
             "invalid embedding table extent or device");
         let capacity = storage.unit;
         Ok(Self { storage, window: RowWindow::NONE,

@@ -132,7 +132,10 @@ impl Opened {
                     let _scope = cuteafd_ffi::memory_ledger::scope("weights");
                     planning.model_placed(&self.cfg, &owners, &ranks, mtp, args.mtp_fp8_head)?
                 };
-                let mut records = load.sink.as_ref().context("push sink")?.take_all();
+                let ((embedding, ()), mut records) = crate::shared::experts::rtx::dense::recording(||
+                    crate::shared::token_io::TokenEmbedding::load_with(&self.library, self.embed_source()?,
+                        args.token_io.embed_placement, || Ok(()), |name, bytes| loader.embedding_allocation(name, bytes)))?;
+                records.extend(load.sink.as_ref().context("push sink")?.take_all());
                 records.extend(media);
                 let (landed, operands, staged, steps, largest, finishes) = records.summary();
                 tracing::info!(landed, operands, staged, steps, largest_step_bytes = largest, finishes,
@@ -141,11 +144,8 @@ impl Opened {
                 let push = CoordinatorPush::prepare_alone_admitted(&args.snapshot, None, 2, None, envelope)
                     .map_err(crate::shared::experts::rtx::push::PushStartupError::Planning)?;
                 let split = crate::shared::memory::load_timing::Split::start();
-                let (pushed, embedding) = push.receive_with(devices.to_vec(), None, 0, Some(planned), ||
-                    crate::shared::token_io::TokenEmbedding::load_with(&self.library, self.embed_source()?,
-                        args.token_io.embed_placement, || Ok(()), |name, bytes| loader.embedding_allocation(name, bytes)));
+                let (pushed, ()) = push.receive_with(devices.to_vec(), None, 0, Some(planned), || ());
                 let pushed = push_policy.committed(pushed).context("Qwen dual coordinator push delivery")?;
-                let (embedding, ()) = embedding?;
                 tracing::info!(pushed = pushed.is_some(), "Qwen dual coordinator dense operands landed");
                 split.log("qwen4 dual dense push");
                 (embedding, model)

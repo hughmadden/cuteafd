@@ -113,6 +113,28 @@ impl Drop for DeviceAllocation<'_> {
         }
     }
 }
+/// Borrowed descriptor of an already admitted pinned owner, retained until load commit.
+#[derive(Clone)]
+pub(crate) struct HostLanding { address: usize, bytes: usize, pub(crate) ready: std::sync::Arc<std::sync::atomic::AtomicBool> }
+impl HostLanding {
+    pub(crate) fn new(storage: &mut HostAllocation<'_>) -> Self {
+        Self { address: storage.buffer.ptr as usize, bytes: storage.buffer.bytes, ready: Default::default() }
+    }
+    pub(crate) fn bytes(&self) -> usize { self.bytes }
+    pub(crate) fn fill(&self, body: impl FnOnce(&mut [u8]) -> Result<()>) -> Result<()> {
+        // SAFETY: the load owns this pinned allocation exclusively through commit.
+        body(unsafe { std::slice::from_raw_parts_mut(self.address as *mut u8, self.bytes) })
+    }
+
+    pub(crate) fn copy(&self, at: usize, source: &[u8]) -> Result<()> {
+        anyhow::ensure!(at.checked_add(source.len()).is_some_and(|end| end <= self.bytes),
+            "host landing outside admitted owner");
+        // SAFETY: the recording loader retains this pinned owner until every rank
+        // joins; checked fragments are disjoint and no reader runs before commit.
+        unsafe { std::ptr::copy_nonoverlapping(source.as_ptr(), (self.address as *mut u8).add(at), source.len()); }
+        Ok(())
+    }
+}
 pub(crate) struct HostAllocation<'a> {
     pub(crate) library: &'a NativeLibrary,
     pub(crate) buffer: CuteafdHostBuffer,

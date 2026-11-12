@@ -135,6 +135,7 @@ pub(crate) struct TokenEmbedding<'a> {
     /// with its head): gathers decode `bf16(e4m3 * scale)` per row and
     /// `table` is an unused 256-byte placeholder.
     row_fp8: Option<std::rc::Rc<native::NativeVocabulary<'a>>>,
+    host_landing: Option<crate::shared::memory::HostLanding>,
 }
 
 impl<'a> TokenEmbedding<'a> {
@@ -218,26 +219,39 @@ impl<'a> TokenEmbedding<'a> {
             ensure!(std::ptr::eq(owner.device.library, library), "embedding allocation library mismatch");
             ResidentWeight::Device(DeviceAllocation::from_allocation(owner))
         };
+        let policy = if placement == EmbedPlacement::Host {
+            Some(crate::shared::experts::rtx::push::PushPolicy::for_snapshot(
+                source.snapshot.as_deref().unwrap_or_else(|| source.path.parent().expect("embedding shard parent")))?)
+        } else { None };
         let device = library.cuda_get_device()?;
+        let host_operand = match &mut table {
+            ResidentWeight::Host { storage, .. } => Some(host_table(device, &source, storage)),
+            _ => None,
+        };
+        let host_landing = host_operand.as_ref().map(|operand| operand.landing.clone());
         ensure!(table.buffer().bytes as u64 == request.bytes
             && table.is_host() == (placement == EmbedPlacement::Host)
             && (table.is_host() || table.buffer().device_id == device), "embedding allocation differs from request");
         let (address, started) = (table.buffer().ptr as usize, std::time::Instant::now());
-        // The recorder is thread-local: record the GPU destination before the
-        // caller's weights, on this thread, without starting a mount reader.
-        let record = placement == EmbedPlacement::Gpu
-            && crate::shared::experts::rtx::dense::is_recording();
+        // Record both residency kinds on the caller before starting workers.
+        let record = crate::shared::experts::rtx::dense::is_recording();
         let result = if record {
-            fill_table(library, device, &source, address)?;
+            match &mut table {
+                ResidentWeight::Host { .. } => crate::shared::experts::rtx::dense::host_operand(host_operand.clone().expect("host operand"), policy.expect("host policy"))?,
+                ResidentWeight::Device(_) => fill_table(library, device, &source, address)?,
+            }
             during()
         } else { std::thread::scope(|scope| -> Result<T> {
+            let timing = crate::shared::memory::load_timing::capture();
             let filler = match &mut table {
-                ResidentWeight::Host { storage, .. } => {
-                    let bytes = storage.bytes_mut();
-                    let (file, offset) = (&file, source.offset);
-                    scope.spawn(move || file.read_exact_at(bytes, offset).map_err(anyhow::Error::from))
+                ResidentWeight::Host { .. } => {
+                    let operand = host_operand.clone().expect("host operand");
+                    scope.spawn(move || timing.enter(|| crate::shared::experts::rtx::dense::host_operand(operand, policy.expect("host policy"))))
                 }
-                ResidentWeight::Device(_) => scope.spawn(|| fill_table(library, device, &source, address)),
+                ResidentWeight::Device(_) => {
+                    let source = &source;
+                    scope.spawn(move || timing.enter(|| fill_table(library, device, source, address)))
+                }
             };
             let value = during();
             let filled = filler.join().map_err(|_| anyhow::anyhow!("embedding table loader panicked"))?;
@@ -247,7 +261,7 @@ impl<'a> TokenEmbedding<'a> {
         tracing::info!(vocab = source.vocab, hidden = source.hidden, gib = source.bytes() as f64 / (1u64 << 30) as f64,
             ?placement, device_bytes = table.device_bytes(), pinned_bytes = if table.is_host() { source.bytes() } else { 0 },
             elapsed_ms = started.elapsed().as_millis() as u64, "token embedding placement (single residency)");
-        Ok((Self { library, source, file, table, row_fp8: None }, result))
+        Ok((Self { library, source, file, table, row_fp8: None, host_landing }, result))
     }
 
     /// The row-FP8 table of an EXLR8 checkpoint's vocabulary owner (`source`
@@ -279,7 +293,7 @@ impl<'a> TokenEmbedding<'a> {
             && table.buffer().device_id == library.cuda_get_device()? && !table.buffer().ptr.is_null(),
             "native embedding placeholder differs from request");
         tracing::info!(vocab = source.vocab, hidden = source.hidden, "token embedding: checkpoint row-FP8 (single residency)");
-        Ok(Self { library, source, file, table, row_fp8: Some(owner) })
+        Ok(Self { library, source, file, table, row_fp8: Some(owner), host_landing: None })
     }
 
     pub fn placement(&self) -> EmbedPlacement {
@@ -331,6 +345,9 @@ impl<'a> TokenEmbedding<'a> {
     /// the bytes every placement reproduces.
     pub fn host_rows(&self, tokens: &[u32]) -> Result<Vec<u8>> {
         self.check(tokens)?;
+        ensure!(self.host_landing.as_ref().is_none_or(|landing|
+            landing.ready.load(std::sync::atomic::Ordering::Acquire)),
+            "host embedding is recorded but not committed");
         let row = self.source.hidden * 2;
         let mut out = vec![0u8; tokens.len() * row];
         if let Some(owner) = &self.row_fp8 {
@@ -344,6 +361,21 @@ impl<'a> TokenEmbedding<'a> {
                 ResidentWeight::Host { storage, .. } => slot.copy_from_slice(&storage.bytes()[token as usize * row..(token as usize + 1) * row]),
                 ResidentWeight::Device(_) => self.file.read_exact_at(slot, self.source.offset + u64::from(token) * row as u64)?,
             }
+        }
+        Ok(out)
+    }
+
+    /// Explicit bounded checkpoint reads for startup constants needed before push commit.
+    pub(crate) fn checkpoint_rows(&self, tokens: &[u32]) -> Result<Vec<u8>> {
+        if self.row_fp8.is_some() { return self.host_rows(tokens); }
+        self.check(tokens)?;
+        let row = self.source.hidden * 2;
+        let mut out = vec![0; tokens.len() * row];
+        for (&token, bytes) in tokens.iter().zip(out.chunks_exact_mut(row)) {
+            crate::shared::experts::rtx::dense::Rect {
+                name: self.source.tensor_name.clone(), path: self.source.path.clone(), base: self.source.offset,
+                row_bytes: row, rows: token as usize..token as usize + 1, cols: 0..row,
+            }.read(bytes)?;
         }
         Ok(out)
     }
@@ -510,6 +542,14 @@ fn bf16_rne(value: f32) -> u16 {
     let bits = value.to_bits();
     if value.is_nan() { return ((bits >> 16) | 0x40) as u16; }
     ((bits + 0x7fff + ((bits >> 16) & 1)) >> 16) as u16
+}
+
+fn host_table(device: i32, source: &EmbedSource, storage: &mut HostAllocation<'_>)
+    -> crate::shared::experts::rtx::dense::HostOperand {
+    use crate::shared::experts::rtx::dense::{HostOperand, Rect};
+    HostOperand { device, landing: crate::shared::memory::HostLanding::new(storage),
+        rect: Rect { name: source.tensor_name.clone(), path: source.path.clone(), base: source.offset,
+            row_bytes: source.hidden * 2, rows: 0..source.vocab, cols: 0..source.hidden * 2 } }
 }
 
 /// One unchanged operand for both pushed and bounded mounted GPU loading.
@@ -1267,6 +1307,119 @@ mod tests {
     }
 
     #[test]
+    fn gpu_embedding_recording_does_not_probe_snapshot_push_policy() -> Result<()> {
+        use cuteafd_ffi::native_library_lifetime_fixture::Fixture;
+        let fixture = Fixture::build_for_tests()?;
+        let library = fixture.load()?;
+        fixture.configure_memory(&library, 0, 1 << 30)?;
+        let path = fixture.directory().join("gpu-embedding.bin");
+        std::fs::write(&path, [])?;
+        let source = EmbedSource { path, offset: 0, vocab: 5, hidden: 3,
+            snapshot: Some(fixture.directory().join("missing-snapshot")),
+            tensor_name: "model.embed_tokens.weight".into() };
+        let ((embedding, ()), records) = crate::shared::experts::rtx::dense::recording(||
+            TokenEmbedding::load(&library, source, EmbedPlacement::Gpu, || Ok(())))?;
+        assert_eq!(records.operands.len(), 1);
+        assert!(records.host_operands.is_empty());
+        assert_eq!(embedding.device_bytes(), 30);
+        Ok(())
+    }
+
+    #[test]
+    fn glm5_host_embedding_dflash_mask_is_exact_and_receiver_has_zero_mount_reads() -> Result<()> {
+        use crate::shared::{experts::rtx::{dense, push}, memory::{device::Device, load_timing}};
+        use cuteafd_ffi::native_library_lifetime_fixture::Fixture;
+        use std::os::unix::ffi::OsStrExt;
+        let fixture = Fixture::build_for_tests()?;
+        let library = fixture.load()?;
+        fixture.configure_memory(&library, 0, 1 << 30)?;
+        fixture.immediate_copies(&library)?;
+        let root = tempfile::tempdir_in(fixture.directory())?;
+        let path = root.path().join("embedding.bin");
+        std::fs::write(&path, [])?;
+        let mark = |path: &Path, name: &std::ffi::CStr, value: &[u8]| -> Result<()> {
+            let path = std::ffi::CString::new(path.as_os_str().as_bytes())?;
+            // SAFETY: live C strings and value extent for the xattr syscall.
+            let status = unsafe { libc::setxattr(path.as_ptr(), name.as_ptr(), value.as_ptr().cast(), value.len(), 0) };
+            ensure!(status == 0, "setxattr: {}", std::io::Error::last_os_error());
+            Ok(())
+        };
+        mark(root.path(), c"user.sparknest.cluster", br#"{"me":"coordinator"}"#)?;
+        mark(&path, c"user.sparknest.hosts", b"coordinator")?;
+        let source = EmbedSource { path: path.clone(), offset: 7, vocab: 5, hidden: 3,
+            snapshot: None, tensor_name: "model.embed_tokens.weight".into() };
+        let payload = (0..source.bytes()).map(|i| (i * 29 + 11) as u8).collect::<Vec<_>>();
+        let phase = load_timing::Split::start();
+        let ((embedding, ()), records) = dense::recording(||
+            TokenEmbedding::load(&library, source.clone(), EmbedPlacement::Host, || Ok(())))?;
+        assert_eq!(phase.read_bytes(), 0, "recording may not touch the empty payload");
+        assert_eq!(records.host_operands.len(), 1);
+        assert!(records.operands.is_empty() && records.steps.is_empty());
+        let layout = dense::RankLayout::new(Vec::new(), Vec::new(), 0)?.with_hosts(records.host_operands.clone())?;
+        assert_eq!(layout.host_staging, dense::HostStaging::default(), "resident landing needs no second staging charge");
+        let physical = [0];
+        let devices = cuteafd_loader::placement::planner::CoordinatorDevices::new(&physical)?;
+        let receipts = embedding.allocation_receipts(devices, "embedding")?;
+        assert_eq!(receipts.len(), 1);
+        assert_eq!(receipts[0].allocation.bytes, payload.len() as u64);
+        assert_eq!(embedding.device_bytes(), 0);
+        assert!(embedding.host_rows(&[4]).unwrap_err().to_string().contains("not committed"));
+        std::fs::write(&path, [vec![0xcc; 7], payload.clone()].concat())?;
+        // Reproduce GLM5 non-EXLR8 + host embedding + DFlash2: the drafter
+        // captures its mask row inside the target's dense recording closure.
+        let ((draft_embedding, mask), draft_records) = dense::recording(|| {
+            let (table, ()) = TokenEmbedding::load(&library, source.clone(), EmbedPlacement::Host, || Ok(()))?;
+            assert!(table.host_rows(&[4]).is_err(), "recorded table must not expose its zero fill");
+            let mask = crate::families::glm5::draft_mask_row(&table, 4)?;
+            Ok::<_, anyhow::Error>((table, mask))
+        })?;
+        assert_eq!(mask, payload[24..30]);
+        assert!(mask.iter().any(|&byte| byte != 0));
+        assert_eq!(phase.read_bytes(), 6, "only the explicit drafter mask row reads the checkpoint");
+        assert!(draft_embedding.host_rows(&[4]).is_err(), "leaving recording does not commit a table");
+        dense::fill_records_by_mount(&library, &draft_records, |_| std::ptr::null_mut())?;
+        assert_eq!(draft_embedding.host_rows(&[4])?, mask);
+        drop(draft_records);
+        drop(draft_embedding);
+        // The caller's snapshot policy wins even when a shard symlink resolves
+        // inside a namespace: this is still an ordinary mount snapshot.
+        let outside = tempfile::tempdir_in(fixture.directory())?;
+        let linked = outside.path().join("embedding.bin");
+        std::os::unix::fs::symlink(&path, &linked)?;
+        let (mounted, ()) = TokenEmbedding::load(&library, EmbedSource { path: linked, ..source.clone() },
+            EmbedPlacement::Host, || Ok(()))?;
+        assert_eq!(mounted.host_rows(&[4])?, mask);
+        drop(mounted);
+        // The actual receiver still inherits an independent zero-read bracket.
+        drop(phase);
+        let phase = load_timing::Split::start();
+        let sockets = tempfile::tempdir_in(fixture.directory())?;
+        // Keep socket evidence on NVMe, but avoid sockaddr_un's 108-byte path cap.
+        use std::os::fd::AsRawFd;
+        let socket_directory = std::fs::File::open(sockets.path())?;
+        let socket_path = PathBuf::from(format!("/proc/self/fd/{}", socket_directory.as_raw_fd()));
+        // Exercise the same inherited two-worker boundary as receive_with.
+        // SAFETY: the load returns only an integer; the host table is retained
+        // and unread until both receivers have joined and drained.
+        let (received, ()) = unsafe { cuteafd_ffi::synchronized_load::load_pair_with([Some(records), None], |rank, records| {
+            if let Some(records) = records {
+                let weights = push::tests::receive_pushed(Device { library: &library, id: 0 }, None,
+                    root.path(), &socket_path, &records, None, 0, rank)?;
+                assert_eq!(weights.len(), 0);
+            }
+            Ok(rank)
+        }, || ()) };
+        received?;
+        assert_eq!(phase.read_bytes(), 0, "aggregate includes the actual receiver thread");
+        assert_eq!(phase.push_bytes(), payload.len() as u64);
+        assert_eq!(embedding.host_rows(&[4, 0])?, [payload[24..30].to_vec(), payload[..6].to_vec()].concat());
+        phase.log("host embedding CPU push");
+        // Required namespaces fail closed if the caller omitted recording.
+        assert!(TokenEmbedding::load(&library, source, EmbedPlacement::Host, || Ok(())).is_err());
+        Ok(())
+    }
+
+    #[test]
     #[ignore = "requires an allocated CPU build slot and explicit NVMe fixture directory"]
     fn embedding_recording_defers_payload_io_and_replays_mount_bytes() -> Result<()> {
         use crate::shared::experts::rtx::dense;
@@ -1334,10 +1487,11 @@ mod tests {
             cuteafd_loader::placement::planner::CoordinatorDevices::new(&physical)?, "embedding", "table")
             .err().context("singular receipt must reject arena views")?;
         assert!(error.to_string().contains("allocation_receipts"));
-        // Mapped-host embeddings remain immediate and never enter the GPU group.
+        // Mapped-host embeddings are recorded in the same group without a second owner.
         let ((host, ()), host_records) = dense::recording(||
             TokenEmbedding::load(&library, source.clone(), EmbedPlacement::Host, || Ok(())))?;
-        assert_eq!(host_records.summary(), (0, 0, 0, 0, 0, 0));
+        assert_eq!(host_records.host_operands.len(), 1);
+        dense::fill_records_by_mount(&library, &host_records, |_| std::ptr::null_mut())?;
         assert_eq!(host.device_bytes(), 0);
         assert_eq!(host.host_rows(&[4, 0])?, [payload[24..30].to_vec(), payload[..6].to_vec()].concat());
         // Flash combines a caller-thread embedding recorder with an explicit

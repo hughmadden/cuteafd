@@ -55,7 +55,7 @@ pub(crate) fn half(catalog: &OfficialV41Catalog, name: &str, axis: usize, rank: 
 pub(crate) struct NativeRtxTensors<'a> {
     tensors: BTreeMap<String, DeviceAllocation<'a>>,
     resident_bytes: usize,
-    mapped_embedding: Option<(HostAllocation<'a>, CuteafdDeviceBuffer)>,
+    mapped_embedding: Option<(HostAllocation<'a>, CuteafdDeviceBuffer, crate::shared::memory::HostLanding)>,
 }
 impl<'a> NativeRtxTensors<'a> {
     /// Target and dSpark borrow the same immutable table on both CED devices.
@@ -75,10 +75,14 @@ impl<'a> NativeRtxTensors<'a> {
         cuteafd_loader::plan::checkpoint::Checkpoint::open(catalog.snapshot())?
             .require_untied_embedding("embed.weight")?;
         let mut storage = HostAllocation::new(library, bytes, Tag::embedding("v41/embedding"))?;
-        catalog.coordinator_tensor_reader("embed.weight")?.read_into(0, storage.bytes_mut())?;
+        let landing = crate::shared::memory::HostLanding::new(&mut storage);
+        crate::shared::experts::rtx::dense::host_operand(crate::shared::experts::rtx::dense::HostOperand {
+            device: library.cuda_get_device()?, landing: landing.clone(),
+            rect: rect(catalog, "embed.weight", None)?,
+        }, crate::shared::experts::rtx::push::PushPolicy::for_snapshot(catalog.snapshot())?)?;
         let alias = library.cuda_host_buffer_device_alias(storage.buffer)?;
         tracing::info!(?placement, device_bytes=0, pinned_bytes=bytes, "V4.1 embedding placement (single residency, shared target/dSpark)");
-        Ok(Self { tensors: BTreeMap::new(), resident_bytes: 0, mapped_embedding: Some((storage, alias)) })
+        Ok(Self { tensors: BTreeMap::new(), resident_bytes: 0, mapped_embedding: Some((storage, alias, landing)) })
     }
 
     pub fn plan(catalog: &OfficialV41Catalog, names: &[String]) -> Result<usize> {
@@ -141,7 +145,11 @@ impl<'a> NativeRtxTensors<'a> {
     /// Borrowed native representation; never free or retain after the owner drops.
     pub fn get(&self, name: &str) -> Result<CuteafdDeviceBuffer> {
         if name == "embed.weight" {
-            if let Some((_, alias)) = &self.mapped_embedding { return Ok(*alias); }
+            if let Some((_, alias, landing)) = &self.mapped_embedding {
+                ensure!(landing.ready.load(std::sync::atomic::Ordering::Acquire),
+                    "host embedding is recorded but not committed");
+                return Ok(*alias);
+            }
         }
         Ok(self
             .tensors
@@ -149,12 +157,20 @@ impl<'a> NativeRtxTensors<'a> {
             .with_context(|| format!("RTX tensor is not resident: {name}"))?
             .buffer)
     }
+    /// Header-only geometry for workspace construction before payload commit.
+    pub(crate) fn embedding_layout(&self) -> Result<(usize, i32)> {
+        if let Some((_, alias, _)) = &self.mapped_embedding {
+            return Ok((alias.bytes, alias.device_id));
+        }
+        let buffer = self.get("embed.weight")?;
+        Ok((buffer.bytes, buffer.device_id))
+    }
     pub fn resident_bytes(&self) -> usize {
         self.resident_bytes
     }
     pub(crate) fn inventory(&self, inventory: &mut crate::shared::memory::receipts::Inventory<'_>) -> Result<()> {
         for (name, allocation) in &self.tensors { allocation.inventory(inventory, name)?; }
-        if let Some((owner, _)) = &self.mapped_embedding { inventory.pinned("embed.weight", owner.buffer)?; }
+        if let Some((owner, _, _)) = &self.mapped_embedding { inventory.pinned("embed.weight", owner.buffer)?; }
         Ok(())
     }
 }
@@ -414,7 +430,33 @@ impl NativeRtxTensors<'_> {
     /// Every resident tensor (golden digests).
     pub(crate) fn visit(&self, prefix: &str, f: &mut dyn FnMut(String, cuteafd_ffi::CuteafdDeviceBuffer)) {
         for (name, allocation) in &self.tensors { f(format!("{prefix}{name}"), allocation.buffer); }
-        if let Some((_, alias)) = &self.mapped_embedding { f(format!("{prefix}embed.weight"), *alias); }
+        if self.mapped_embedding.is_some() {
+            f(format!("{prefix}embed.weight"), self.get("embed.weight").expect("committed host embedding"));
+        }
+    }
+}
+
+#[cfg(test)]
+mod host_embedding_tests {
+    use super::*;
+
+    #[test]
+    fn mapped_embedding_alias_is_unavailable_until_committed() -> Result<()> {
+        use cuteafd_ffi::native_library_lifetime_fixture::Fixture;
+        let fixture = Fixture::build_for_tests()?;
+        let library = fixture.load()?;
+        fixture.configure_memory(&library, 0, 1 << 30)?;
+        let mut owner = HostAllocation::new(&library, 30, Tag::embedding("v41/embedding"))?;
+        let landing = crate::shared::memory::HostLanding::new(&mut owner);
+        let alias = library.cuda_host_buffer_device_alias(owner.buffer)?;
+        let table = NativeRtxTensors { tensors: BTreeMap::new(), resident_bytes: 0,
+            mapped_embedding: Some((owner, alias, landing.clone())) };
+        assert_eq!(table.embedding_layout()?, (30, alias.device_id));
+        assert!(table.get("embed.weight").unwrap_err().to_string().contains("not committed"));
+        landing.ready.store(true, std::sync::atomic::Ordering::Release);
+        assert_eq!(table.get("embed.weight")?.ptr, alias.ptr);
+        assert_eq!(table.resident_bytes(), 0);
+        Ok(())
     }
 }
 

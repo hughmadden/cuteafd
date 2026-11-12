@@ -28,6 +28,8 @@ mod shared {
             pub(crate) mod dense;
             // The query fixture has no push receiver, only dense plan records.
             pub(crate) mod push {
+                pub(crate) mod policy;
+                pub(crate) use policy::PushPolicy;
                 pub(crate) struct DensePlan {
                     pub base: u64,
                     pub host_bytes: u64,
