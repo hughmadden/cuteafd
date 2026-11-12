@@ -6753,10 +6753,11 @@ fn mimo_and_qwen_all_onboarded_preserve_media_only_spark_and_refuse_unavailable_
 
 #[test]
 fn kimi_and_muse_refuse_host_embedding_before_placement() {
-    use crate::plan::testing::{kimi_k3_config, muse_spark_config, write_snapshot};
-    for (config, family) in [(kimi_k3_config(), "Kimi"), (muse_spark_config(), "Muse Spark")] {
+    use crate::plan::testing::{write_kimi_snapshot, write_muse_spark_snapshot};
+    for family in ["Kimi", "Muse Spark"] {
         let dir = tempfile::tempdir().unwrap();
-        write_snapshot(dir.path(), &config, &[], None);
+        if family == "Kimi" { write_kimi_snapshot(dir.path(), false); }
+        else { write_muse_spark_snapshot(dir.path(), &[]); }
         let mut options = sparks(6);
         options.layout = Some(layout::LayoutOptions { host_embedding: true,
             host_memory: Some((128 << 30, 128 << 30)), ..Default::default() });
