@@ -5877,7 +5877,10 @@ mod prefill_lane_tests {
             // Fork #269 adds Kimi-only decode bands and optional tile_k; existing
             // entries retain tile_k=64. Optional wide_min_rows defaults to the old
             // WIDE_PREFILL_MIN_ROWS, preserving GLM keys, floors and exported objects.
-            ("gemm/bf16_gemv/_skinny.py", 0xd0e1685b6faa91ea_u64),
+            // Fork #287 selects a three-stage wide-prefill tile only for (6144, 7168)
+            // and includes that override in its key. Decode routes, floors and tables
+            // are unchanged; GLM Flash's projection shapes do not select the override.
+            ("gemm/bf16_gemv/_skinny.py", 0x9e8c_5d70_3fea_8d81_u64),
         ] {
             let bytes = std::fs::read(root.join(path)).unwrap();
             let hash = bytes.iter().fold(0xcbf2_9ce4_8422_2325_u64,
