@@ -53,10 +53,10 @@ changes using the fixed dataset; its old calibration campaigns are historical.
 
 ### Bounded prefill scoring (2026-11-12)
 
-GLM Flash, dense Qwen, Qwen4, MiMo, V4, Step-5 and Muse accept prefill-shaped
+GLM Flash, dense Qwen, Qwen4, MiMo, V4, Step-5, Muse and GLM 5.3 accept prefill-shaped
 fidelity probes on ordinary serving launches after paired raw-row and
 ordinary-layout Standard proofs, without reserving all-call logits before KV
-sizing. The Kimi and GLM 5.3 / Mistral Large 4 adapters remain staged behind a central
+sizing. The Kimi and Mistral Large 4 adapters remain staged behind a central
 activation allowlist until their proofs pass; their existing launch admission
 and scoring dispatch are unchanged. Scoring preserves
 the serving transformer's prefill calls and unit cuts, projects through existing
