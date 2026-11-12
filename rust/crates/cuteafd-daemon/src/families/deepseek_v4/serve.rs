@@ -659,7 +659,6 @@ fn publish(engine: &super::engine::Engine<'_>, stats: &Mutex<serde_json::Value>,
             "prefilling": prefilling, "prefix_cache": prefix_stats, "draft_policy": resource::snapshot(),
             "kv_reserve": reserve.snapshot(stalled)});
         stats["v4_runtime"] = engine.runtime_stats();
-        crate::shared::probe::graph_capture_stats(&mut stats);
     }
 }
 
@@ -1296,13 +1295,16 @@ mod tests {
     }
 
     #[test]
-    fn publish_includes_shared_graph_cache_and_reconciliation_stats() {
+    fn publish_leaves_graph_stats_to_request_time_and_keeps_reconciliation() {
         let source = include_str!("serve.rs");
         let publish = source.split_once("\nfn publish(").unwrap().1
             .split_once("\n/// Message starts").unwrap().0;
         let replace = publish.find("*stats = serde_json::json!").unwrap();
-        let graph = publish.find("crate::shared::probe::graph_capture_stats(&mut stats)").unwrap();
-        assert!(replace < graph, "publish the shared graph fields after replacing per-request stats");
+        assert!(!publish.contains("graph_capture_stats"),
+            "graph inventory diagnostics belong to the shared request-time stats hook");
+        let api = include_str!("../../shared/api.rs");
+        assert!(api.contains("probe::graph_capture_stats"),
+            "the shared stats endpoint retains graph inventory diagnostics");
         let guard = publish.find("if requests > 0 {").unwrap();
         let once = publish.find("static FIRST: std::sync::Once").unwrap();
         let first = publish.find("reconcile::capture(\"first_request\")").unwrap();
