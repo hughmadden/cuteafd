@@ -18,6 +18,39 @@ pub(super) struct Preflight {
     pub expert_directory: Option<std::path::PathBuf>,
     pub working_set: cuteafd_loader::placement::SparkWorkingSet,
     pub prefill_rows: usize,
+    pub push_host: Option<cuteafd_loader::push_load::PushHostEnvelope>,
+    pub expert_resident_bytes: [usize; 2],
+}
+
+fn push_host_envelope(checkpoint: &cuteafd_loader::plan::Checkpoint, ranks: usize,
+    catalog: Option<&cuteafd_loader::OfficialV41Catalog>)
+    -> Result<Option<cuteafd_loader::push_load::PushHostEnvelope>> {
+    use crate::shared::experts::rtx::push::PushPolicy;
+    if PushPolicy::for_snapshot(&checkpoint.snapshot)? == PushPolicy::Mount { return Ok(None); }
+    ensure!((1..=2).contains(&ranks), "MiMo push rank count");
+    let slots = cuteafd_ffi::push_ring::DEFAULT_SLOTS as u64;
+    let slot = cuteafd_ffi::push_ring::DEFAULT_SLOT_BYTES as u64;
+    let largest = checkpoint.tensors.iter().filter(|tensor| !tensor.meta.name.contains(".experts."))
+        .map(|tensor| tensor.meta.byte_length).max().unwrap_or(0);
+    let dense = cuteafd_loader::push_load::admitted_push_envelope(largest, slots as usize, slot)?;
+    let expert = if let Some(manifest) = catalog.and_then(|catalog| catalog.exl3()) {
+        // Every candidate local layer is covered; the admitted prefix can only shrink this image.
+        let layers = catalog.context("MiMo push catalog")?.routed_experts();
+        (0..ranks).map(|rank| -> Result<u64> {
+            (layers.first_layer..layers.layers).try_fold(0u64, |bytes, layer| {
+                let plan = manifest.residency(cuteafd_loader::V41Exl3Layer::Backbone(layer), ranks, rank)?;
+                bytes.checked_add(plan.loads.iter().filter(|load| load.tensor.ends_with(".trellis")).count() as u64 * 4)
+                    .context("MiMo push validation overflow")
+            })
+        }).collect::<Result<Vec<_>>>()?
+    } else {
+        let bytes = catalog.into_iter().flat_map(|catalog| catalog.tensors()).filter(|tensor|
+            tensor.metadata.name.ends_with("input_scale") || tensor.metadata.name.ends_with("weight_scale_2"))
+            .map(|tensor| tensor.metadata.byte_length).max().unwrap_or(0).checked_mul(2)
+            .context("MiMo push native validation overflow")?.max(2 << 20);
+        vec![bytes; ranks]
+    };
+    Ok(Some(cuteafd_loader::push_load::PushHostEnvelope::new(expert, vec![dense; ranks], slots, slot)?))
 }
 
 fn routed_costs(opened: &super::Opened, args: &super::EngineArgs, layers: usize, ranks: usize)
@@ -527,7 +560,8 @@ fn preflight_shape(
         serving_context, (args.pool_tokens > 0).then_some(args.pool_tokens as u64),
         args.onboard.resolve(routed_layers), prefill, operation,
         crate::shared::memory::budget::resident_weight_limit(), cuteafd_core::spark_reply::requested());
-    let prepared = ProductionInput {
+    let push_host = push_host_envelope(&opened.checkpoint, ranks, opened.catalog.as_ref())?;
+    let mut prepared = ProductionInput {
         startup_probe_bytes: intake_probe_bytes,
         expert_usage: args.expert_usage_enabled()?,
         blas_head: crate::shared::target_head::TargetHead::configured().blas_head(
@@ -548,8 +582,23 @@ fn preflight_shape(
         spark_reply_formats: cuteafd_core::spark_reply::requested(),
         resident_weights, operation, budgets,
     }.prepare()?;
+    if let Some(envelope) = &push_host {
+        let maximum = prepared.recipe.maximum_pages;
+        prepared.recipe.context_owners.extend(envelope.allocations("mimo.load.push")?.into_iter().map(|owner| {
+            let bytes = cuteafd_loader::placement::planner::ByteCurve::fixed(owner.bytes, maximum);
+            cuteafd_loader::placement::planner::Component::allocation(owner, bytes, false, maximum)
+        }));
+    }
     let admitted = prepared.admit(request).with_context(|| format!(
         "MiMo shared placement; configured-Spark reservation contract {report}"))?;
+    let mut expert_resident_bytes = [0usize; 2];
+    for &layer in &admitted.spark.rtx_layers {
+        let cost = prepared.recipe.experts[layer].context("MiMo admitted expert cost")?;
+        for (rank, bytes) in expert_resident_bytes.iter_mut().enumerate().take(ranks) {
+            let resident = if ranks == 2 { cost.half[rank].resident } else { cost.whole.resident };
+            *bytes = bytes.checked_add(usize::try_from(resident)?).context("MiMo pushed expert residency overflow")?;
+        }
+    }
     let mut capacity = contract::resolved_capacity(&admitted,
         u32::try_from(concurrency)?, u32::try_from(args.rings)?)?;
     let working = admitted.spark;
@@ -613,6 +662,7 @@ fn preflight_shape(
         local_expert_budget: usize::try_from(local_expert_budget)?,
         placement, expert_directory, working_set: working,
         prefill_rows: args.prefill_rows,
+        push_host, expert_resident_bytes,
     })
 }
 
