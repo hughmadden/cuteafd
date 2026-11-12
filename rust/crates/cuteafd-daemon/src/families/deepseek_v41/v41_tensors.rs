@@ -176,11 +176,17 @@ pub(crate) struct VocabularyHead<'library> {
 /// exactly, the dSpark drafter its coarse plane. `all` and `packed` release BF16
 /// after packing; `draft` retains BF16 for target projections.
 pub(crate) use cuteafd_loader::placement::families::deepseek_v41::resident::Fp8Head;
+static HEAD_MODE: std::sync::OnceLock<Fp8Head> = std::sync::OnceLock::new();
 pub(crate) fn fp8_head() -> Fp8Head {
-    static MODE: std::sync::OnceLock<Fp8Head> = std::sync::OnceLock::new();
-    *MODE.get_or_init(|| {
-        publish_head(Fp8Head::configured())
-    })
+    *HEAD_MODE.get_or_init(|| publish_head(Fp8Head::configured()))
+}
+
+#[cfg(test)]
+pub(crate) fn use_golden_fp8_head() -> Result<()> {
+    // The pinned operand inventory and its load budgets describe the all-FP8 head.
+    let mode = HEAD_MODE.get_or_init(|| publish_head(Fp8Head::All));
+    ensure!(*mode == Fp8Head::All, "run the coordinator operand oracle in its own test process");
+    Ok(())
 }
 
 fn publish_head(mode: Fp8Head) -> Fp8Head {

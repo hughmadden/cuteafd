@@ -304,9 +304,28 @@ pub(crate) fn check(actual: &Digests, subset: bool) -> Result<()> {
 }
 
 #[test]
+fn coordinator_oracle_head_mode_is_independent_of_environment() -> Result<()> {
+    let status = std::process::Command::new(std::env::current_exe()?)
+        .args(["--exact", "families::deepseek_v41::coordinator_golden_tests::coordinator_oracle_head_mode_child",
+            "--ignored"])
+        .env("CUTEAFD_V41_FP8_HEAD", "packed").status()?;
+    anyhow::ensure!(status.success(), "isolated coordinator head-mode check failed");
+    Ok(())
+}
+
+#[test]
+#[ignore = "isolated child of coordinator_oracle_head_mode_is_independent_of_environment"]
+fn coordinator_oracle_head_mode_child() -> Result<()> {
+    super::v41_tensors::use_golden_fp8_head()?;
+    assert_eq!(super::v41_tensors::fp8_head(), super::v41_tensors::Fp8Head::All);
+    Ok(())
+}
+
+#[test]
 #[ignore = "requires CUTEAFD_PUSH_V41, CUTEAFD_NATIVE_LIB and two RTX GPUs"]
 fn installed_coordinator_operands_match_the_mount_golden() -> Result<()> {
     let Some(snapshot) = snapshot() else { return Ok(()) };
+    super::v41_tensors::use_golden_fp8_head()?;
     let library = library()?;
     library.cuda_set_device(0)?;
     for gpu in [0, 1] { Device { library: &library, id: gpu }.run(|| library.cuda_enable_peer(1 - gpu))?; }
@@ -339,6 +358,7 @@ fn installed_sparknest_coordinator_operands_match_current_mount() -> Result<()> 
 fn pushed_coordinator_operands(real_push: bool) -> Result<()> {
     use crate::shared::experts::rtx::dense::{Recorder, Records, STEP_BYTES};
     let Some(snapshot) = snapshot() else { return Ok(()) };
+    super::v41_tensors::use_golden_fp8_head()?;
     let library = library()?;
     library.cuda_set_device(0)?;
     for gpu in [0, 1] { Device { library: &library, id: gpu }.run(|| library.cuda_enable_peer(1 - gpu))?; }
