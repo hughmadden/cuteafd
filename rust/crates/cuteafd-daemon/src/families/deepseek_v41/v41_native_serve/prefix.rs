@@ -631,16 +631,16 @@ mod tests {
     /// immutable rows, or writes only a fresh placement. A new use must state its guard here.
     #[test]
     fn prefix_stream_reads_only_committed_private_state() {
+        /// Each method of `source`: its name and its text up to its closing `    }` line.
         fn bodies(source: &str) -> Vec<(&str, &str)> {
             let mut out = Vec::new();
-            let mut rest = source;
-            while let Some(at) = rest.find("    pub fn ").or_else(|| rest.find("    fn ")) {
-                let tail = &rest[at..];
-                let name_at = tail.find("fn ").unwrap() + 3;
-                let name = &tail[name_at..name_at + tail[name_at..].find(['(', '<']).unwrap()];
-                let end = tail[1..].find("\n    pub fn ").or_else(|| tail[1..].find("\n    fn ")).map_or(tail.len(), |e| e + 1);
-                out.push((name, &tail[..end]));
-                rest = &tail[end..];
+            for (at, _) in source.match_indices("\n    ") {
+                let line = &source[at + 5..];
+                let Some(fn_at) = ["pub fn ", "fn ", "pub unsafe fn ", "unsafe fn "].iter()
+                    .find_map(|p| line.starts_with(p).then_some(p.len())) else { continue };
+                let name = &line[fn_at..fn_at + line[fn_at..].find(['(', '<']).unwrap()];
+                let end = line.find("\n    }\n").map_or(line.len(), |e| e + 6);
+                out.push((name, &line[..end]));
             }
             out
         }
@@ -661,7 +661,11 @@ mod tests {
             ("publish_units", &["self.prefix_drain()?"]),
         ];
         for (name, body) in bodies(production) {
-            if !(body.contains("prefix_stream") || body.contains("prefix_copies")) { continue; }
+            // Work is queued through a raw stream handle (the prefix stream, a capture lane's) or a
+            // stream parameter; polls and lane aborts only query or drain.
+            let queues = body.contains(["prefix_stream", ".raw"].concat().as_str())
+                || body.contains("copies.stream.raw") || body.contains("stream: *mut");
+            if !queues { continue; }
             let guards = allowed.iter().find(|(allowed, _)| *allowed == name)
                 .unwrap_or_else(|| panic!("{name} queues prefix-stream work without a stated ownership guard"));
             for guard in guards.1 {
@@ -679,7 +683,8 @@ mod tests {
         // Nothing outside the backbone cache reaches the private stream.
         for (file, source) in [("v41_backbone_cache.rs", include_str!("../v41_backbone_cache.rs")),
             ("v41_native_serve/prefix.rs", include_str!("prefix.rs"))] {
-            let uses = source.matches(["prefix_stream", ".raw"].concat().as_str()).count();
+            let production = &source[..source.find("#[cfg(test)]").unwrap_or(source.len())];
+            let uses = production.matches(["prefix_stream", ".raw"].concat().as_str()).count();
             assert_eq!(uses, 0, "{file} queues on the private prefix stream outside its guarded owners");
         }
         assert!(!include_str!("prefix.rs").contains(["Approximate", "Replay"].concat().as_str()));
