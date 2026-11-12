@@ -118,6 +118,21 @@ impl<'e, 'a> Backend<'a> for KimiBackend<'e, 'a> {
         self.engine.step_device(&mut [(placement, tokens)], pool, logit_rows.max(1), true)
             .map(|logits| (logit_rows > 0).then_some(logits))
     }
+    fn streamed_prefill_scoring(&self) -> bool { true }
+    fn prefill_scoring(&self, placement: &mut Placement, tokens: &[u32], logit_rows: usize,
+        position: usize, probe: &crate::shared::probe::ProbeRef, pool: &RefPagePool)
+        -> Result<Option<crate::shared::probe::ScoreLogits>> {
+        if self.geometry.full_prefill_logits || logit_rows <= 1 {
+            return Ok(self.prefill_device(placement, tokens, logit_rows, pool)?
+                .map(crate::shared::probe::ScoreLogits::Device));
+        }
+        self.engine.usage_phase(cuteafd_ffi::expert_usage::UsagePhase::Prefill);
+        let rows = crate::shared::probe::ScoringRows { probe, position };
+        self.engine.prefill_scoring(placement, tokens, logit_rows, pool, &mut |offset, logits| {
+            rows.record(self.library(), offset, &logits)
+        })?;
+        Ok(Some(crate::shared::probe::ScoreLogits::Recorded))
+    }
     fn packed_limits(&self) -> Option<crate::shared::prefill_packing::Limits> {
         self.engine.packed_limits().ok()
     }

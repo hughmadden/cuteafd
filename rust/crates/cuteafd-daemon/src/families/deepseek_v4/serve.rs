@@ -85,6 +85,9 @@ fn prefix_score_path(position: usize, input_rows: usize) -> probe::ScorePath {
 }
 
 pub(crate) async fn run_serve(mut args: ServeArgs) -> Result<()> {
+    if probe::streamed_prefill_scoring("deepseek_v4") {
+        cuteafd_bench::context::set_resolved("prefill-scoring", "streamed");
+    }
     args.draft_length.report_inactive(args.engine.dspark);
     cuteafd_core::concurrency::validate("deepseek_v4", args.engine.max_sequences as u64)?;
     args.prefix.resolve_entries(args.engine.max_sequences);
@@ -799,7 +802,7 @@ fn schedule(
             let reject = |job: &NativeRequest, message: String| {
                 let _ = job.events.send(Err(NativeFailure::BadRequest(message)));
             };
-            if let Err(error) = probe::validate_scoring(&job.probe, engine.full_prefill_logits) {
+            if let Err(error) = probe::validate_scoring(&job.probe, probe::prefill_scoring_admitted("deepseek_v4", engine.full_prefill_logits)) {
                 reject(&job, format!("scoring: {error:#}"));
                 continue;
             }
@@ -860,12 +863,15 @@ fn schedule(
             if let Some(from) = probe::scoring(&job.probe) {
                 // Teacher-forced scoring: every row's logits, no generation, nothing retained.
                 let mut placement = admitted.placement;
-                let scored = probe::score(&loaded.library, &job.probe, &tokens, from, chunk_limit, engine.decode_rows, probe::verify_rows(&job.probe), engine.full_prefill_logits,
+                let scored = probe::score(&loaded.library, &job.probe, &tokens, from, chunk_limit, engine.decode_rows, probe::verify_rows(&job.probe), probe::prefill_scoring_admitted("deepseek_v4", engine.full_prefill_logits),
                     &mut (&mut placement, &mut *transports),
-                    |(placement, transports), chunk, rows| {
+                    |(placement, transports), chunk, rows, position| {
                         if prefix_score_path(placement.len, chunk.len()) == probe::ScorePath::Decode {
                             Ok(Some(probe::ScoreLogits::Device(engine.verify_device(
                                 &mut [(&mut **placement, chunk)], transports, runtime)?)))
+                        } else if rows > 1 && !engine.full_prefill_logits && probe::streamed_prefill_scoring("deepseek_v4") {
+                            Ok(Some(engine.prefill_streamed_scoring(placement, chunk, transports,
+                                probe::ScoringRows { probe: &job.probe, position })?))
                         } else if rows > 1 {
                             Ok(Some(probe::ScoreLogits::Host {
                                 values: engine.prefill(placement, chunk, transports, runtime, rows, None)?,
@@ -1240,7 +1246,7 @@ mod tests {
         let scoring = source.split_once("let scored = probe::score(").unwrap().1
             .split_once("match scored {").unwrap().0;
         let decode = scoring.split_once("if prefix_score_path(placement.len, chunk.len())").unwrap().1
-            .split_once("} else if rows > 1 {").unwrap().0;
+            .split_once("} else if rows > 1 && !engine.full_prefill_logits && probe::streamed_prefill_scoring(\"deepseek_v4\") {").unwrap().0;
         assert!(decode.contains("engine.verify_device("));
         assert!(!decode.contains("engine.prefill_device("));
     }

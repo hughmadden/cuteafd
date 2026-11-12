@@ -1616,7 +1616,7 @@ mod tests {
             ),
             (
                 include_str!("../../../families/glm5/engine.rs"),
-                "step_lanes",
+                "step_lanes_with",
                 "replay_on",
             ),
             (
@@ -1633,6 +1633,14 @@ mod tests {
                 let units = include_str!("../../../families/glm5_flash/engine/units.rs");
                 assert!(wrapper.contains("self.step_units_inner(scope,"));
                 assert!(units.contains("pub(super) fn step_units_inner(&self, _scope: &crate::shared::experts::rtx::pair::SubmissionScope<'_>"));
+            }
+            if step == "step_lanes_with" {
+                let delegate = source.split_once("    fn step_lanes(").unwrap().1
+                    .split_once("\n    }").unwrap().0.split_once('{').unwrap().1;
+                let compact: String = delegate.chars().filter(|c| !c.is_whitespace()).collect();
+                assert_eq!(compact,
+                    "self.step_lanes_with(lanes,chunks,depth,logit_rows,link,runtime,None)",
+                    "step_lanes must only delegate to the audited shared boundary");
             }
             assert!(
                 shared_submission_entrypoint(wrapper),
