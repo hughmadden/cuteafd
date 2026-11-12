@@ -317,6 +317,9 @@ impl<'a> Programs<'a> {
                 }
             } else if name.starts_with("exlr8_") {
                 validate_exlr8_entry(spec, entry)?;
+            } else if name.starts_with("minimax_norm_rope_") || name == "minimax_index_producer"
+                || name.starts_with("minimax_oai_split_") {
+                crate::minimax_m3::producers::validate_producer_entry(spec, entry)?;
             } else if name.starts_with("minimax_") {
                 crate::minimax_m3::validate_entry(spec, entry)?;
             }

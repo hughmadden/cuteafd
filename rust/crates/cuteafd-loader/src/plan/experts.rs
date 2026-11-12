@@ -290,7 +290,8 @@ mod tests {
     #[test]
     fn minimax_nvfp4_retains_native_k16_ownership_and_h128_padding() {
         use crate::formats::fp8_experts::Slicing;
-        for world in 1..=8 {
+        assert!(spark_recipe("minimax:nvfp4a4", 3072, 1).is_err());
+        for world in 2..=8 {
             let recipe = spark_recipe("minimax:nvfp4a4", 3072, world).unwrap();
             assert_eq!(recipe, spark_recipe("minimax:nvfp4", 3072, world).unwrap());
             assert!(recipe.widths.iter().sum::<usize>() >= 3072);

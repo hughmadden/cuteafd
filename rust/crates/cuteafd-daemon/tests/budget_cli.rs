@@ -963,7 +963,7 @@ fn installed_example_deployments_publish_executable_prefill_shapes() {
 }
 
 #[test]
-fn installed_release_and_example_families_match_dev_630e15e82() {
+fn installed_release_and_example_families_match_dev_d6aecfcb7() {
     use cuteafd_loader::plan::{family, Checkpoint};
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
     let hf_home = std::env::var_os("CUTEAFD_DEPLOYMENT_TEST_HF_HOME")
@@ -972,36 +972,12 @@ fn installed_release_and_example_families_match_dev_630e15e82() {
     let matrix: serde_json::Value = serde_json::from_slice(
         &std::fs::read(root.join("benchmarks/current-matrix.json")).unwrap()).unwrap();
     let retired = retired_configs(&matrix);
-    let expected = [
-        ("Qwen/Qwen3.5-9B", "qwen3_5"),
-        ("Qwen/Qwen3.8-27B", "qwen3_5"),
-        ("Qwen/Qwen3.8-27B-FP8", "qwen3_5"),
-        ("XiaomiMiMo/MiMo-V2.6-Flash-MOPD", "mimo_v2"),
-        ("XiaomiMiMo/MiMo-V2.6-Pro-MOPD", "mimo_v2"),
-        ("brandonmusic/GLM-5.3-Flash-tr3-4bpw", "glm5_flash"),
-        ("deepseek-ai/DeepSeek-V4-Flash-0731", "deepseek_v4"),
-        ("deepseek-ai/DeepSeek-V4.1-Flash-1017", "deepseek_v41"),
-        ("kindlingai/glm-5.3-exlr8-k2-k3-k4", "glm5"),
-        ("kindlingai/glm-5.3-flash-exlr8-k2-k3-k4", "glm5_flash"),
-        ("nvidia/GLM-5.3-Flash-NVFP4", "glm5_flash"),
-        ("nvidia/GLM-5.3-NVFP4", "glm5"),
-        ("nvidia/Qwen3.8-Flash-Next-NVFP4", "qwen4"),
-        ("stepfun-ai/Step-5-Preview", "step5"),
-        ("stepfun-ai/Step-5-Preview-NVFP4", "step5"),
-        ("wrldsuksgo2mars/DeepSeek-V4-Pro-0813-EXL3-K2-calibrated-v1", "deepseek_v4"),
-        ("wrldsuksgo2mars/DeepSeek-V4.1-Flash-1017-StridedPLE", "deepseek_v41"),
-        ("wrldsuksgo2mars/GLM-5.3-EXL3-K4-Core-K6", "glm5"),
-        ("wrldsuksgo2mars/GLM-5.3-EXL3-K4-v1", "glm5"),
-        ("wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K3.25-Core-FP8", "glm5_flash"),
-        ("wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K4-Core-K6", "glm5_flash"),
-        ("wrldsuksgo2mars/Kimi-K3-EXL3-K2", "kimi_k3"),
-        ("wrldsuksgo2mars/Kimi-K3-EXL3-K2-Core-K6", "kimi_k3"),
-        ("wrldsuksgo2mars/Mistral-Large-4-EXL3-K4-Core-K6", "mistral_large4"),
-        ("wrldsuksgo2mars/Muse-Spark-Open-EXL3-K4-Core-K6", "muse_spark"),
-        ("wrldsuksgo2mars/Qwen3.8-Flash-Next-EXL3-K4.25-PLE-FP8-v1", "qwen4"),
-        ("wrldsuksgo2mars/Step-5-Preview-EXL3-K4-Core-K6", "step5"),
-        ("zai-org/GLM-5.3-Flash", "glm5_flash"),
-    ].into_iter().collect::<std::collections::BTreeMap<_, _>>();
+    // Captured by running this detector test on the actual devd6aecfcb7 tree.
+    let baseline: serde_json::Value = serde_json::from_str(include_str!(
+        "fixtures/family-detection-devd6aecfcb7.json")).unwrap();
+    let expected = baseline["results"].as_array().unwrap().iter().map(|entry|
+        ((entry["model"].as_str().unwrap(), entry["revision"].as_str().unwrap()),
+         entry["family"].as_str().unwrap())).collect::<std::collections::BTreeMap<_, _>>();
     let mut selected = std::collections::BTreeMap::new();
     for entry in live_release_entries(&root, &matrix) {
         selected.insert((entry["model"].as_str().unwrap().to_owned(),
@@ -1031,14 +1007,15 @@ fn installed_release_and_example_families_match_dev_630e15e82() {
             quantize_config: None, weight_map: Default::default(), tensors: Vec::new(),
             missing_shards: Vec::new(), shard_bytes: 0 };
         let detected = family::detect(&checkpoint).expect("installed checkpoint family").id();
-        let pinned = expected.get(model.as_str()).unwrap_or_else(|| panic!("add baseline family for {model}"));
-        assert_eq!(detected, *pinned, "{model}@{revision}: changed from dev630e15e82");
+        let pinned = expected.get(&(model.as_str(), revision.as_str()))
+            .unwrap_or_else(|| panic!("add verified baseline family for {model}@{revision}"));
+        assert_eq!(detected, *pinned, "{model}@{revision}: changed from devd6aecfcb7");
         assert_ne!(detected, "minimax_m3");
         eprintln!("{model}@{revision}: {detected}");
         tested += 1;
     }
-    assert!(tested >= 27, "installed checkpoint coverage shrank: {tested}");
-    eprintln!("family detection baseline630e15e82: {tested} installed checkpoint revisions unchanged");
+    assert!(tested >= 29, "installed checkpoint coverage shrank: {tested}");
+    eprintln!("family detection baselined6aecfcb7: {tested} installed checkpoint revisions unchanged");
 }
 
 fn retired_configs(matrix: &serde_json::Value) -> std::collections::BTreeSet<String> {

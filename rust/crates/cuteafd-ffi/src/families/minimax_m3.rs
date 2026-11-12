@@ -5,6 +5,7 @@ use crate::{
     CuteafdDeviceBuffer as Buffer,
 };
 use std::ffi::c_void;
+pub mod producers;
 
 #[derive(Debug, thiserror::Error)]
 #[error("invalid MiniMax MSA program: {0}")]

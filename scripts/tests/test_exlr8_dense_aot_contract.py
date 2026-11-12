@@ -356,15 +356,20 @@ def test_minimax_dispatch_cmake_release_and_placement_scopes_agree(monkeypatch, 
         module = types.ModuleType("b12x.integration.cuteafd." + module_name)
         setattr(module, compiler, lambda **kwargs: kwargs)
         monkeypatch.setitem(sys.modules, module.__name__, module)
+    module = types.ModuleType("b12x.integration.cuteafd.minimax_producer")
+    for compiler in ("compile_minimax_norm_rope_aot", "compile_minimax_index_producer_aot",
+                     "compile_minimax_oai_split_aot"):
+        setattr(module, compiler, lambda **kwargs: kwargs)
+    monkeypatch.setitem(sys.modules, module.__name__, module)
     namespace = {"geometries": ["minimax"], "manifest": {"families": {}, "family_capacities": {}},
                  "work": [], "CHECKPOINT_CONTEXTS": {},
                  "args": types.SimpleNamespace(decode_rows=64, prefill_rows=4096, max_context=1048576)}
     helpers = [node for node in tree.body if isinstance(node, ast.FunctionDef)
-               and node.name in ("geometry_context", "minimax_sparse_programs")]
+               and node.name in ("geometry_context", "minimax_sparse_programs", "minimax_producer_programs")]
     exec(compile(ast.Module(body=helpers + [branch], type_ignores=[]), "dispatch", "exec"), namespace)
     assert namespace["manifest"]["families"] == {"minimax": {"abi_version": 1}}
     assert namespace["manifest"]["family_capacities"] == {"minimax": {"max_context": 1048576}}
-    sparse = namespace["work"][len(native):]
+    sparse = namespace["work"][len(native):len(native) + 4]
     assert [(suffix, op, params, thunk()) for _, suffix, op, params, thunk in sparse] == [
         ("index_decode", "minimax_index", dict(max_rows=64, max_pages=16384, mode="decode"),
          dict(max_rows=64, max_pages=16384, mode="decode")),
@@ -390,7 +395,10 @@ def test_minimax_dispatch_cmake_release_and_placement_scopes_agree(monkeypatch, 
         names.append(namespace["stem"])
     assert names[:len(native)] == ["exlr8_dense_" + name for name, *_ in native]
     assert names[len(native):] == ["minimax_index_decode", "minimax_index_prefill",
-                                  "minimax_attention_decode", "minimax_attention_extend"]
+                                  "minimax_attention_decode", "minimax_attention_extend",
+                                  "minimax_norm_rope_h64", "minimax_norm_rope_h4",
+                                  "minimax_index_producer", "minimax_oai_split_i3072",
+                                  "minimax_oai_split_i12288"]
     namespace.update(family="glmf", suffix="sentinel", op="attention")
     exec(compile(ast.Module(body=[stem], type_ignores=[]), "stem", "exec"), namespace)
     assert namespace["stem"] == "glmf_sentinel"
@@ -442,3 +450,42 @@ def test_minimax_dispatch_cmake_release_and_placement_scopes_agree(monkeypatch, 
                             capture_output=True, text=True, timeout=30)
     assert result.returncode == 0, result.stdout + result.stderr
     assert (build / "scope.json").read_text() == "minimax,expert_reply||"
+
+
+def test_minimax_producer_fixture_matches_pinned_fork_without_cuda():
+    import json
+
+    path = ROOT / "third_party/sparkinfer/b12x/integration/cuteafd/minimax_producer.py"
+    tree = ast.parse(path.read_text())
+    nodes = [n for n in tree.body if isinstance(n, ast.FunctionDef)
+             and (n.name.startswith("compile_minimax_") or n.name == "_positive_int")]
+    namespace = {
+        "torch": types.SimpleNamespace(**{name: name for name in
+                 ("bfloat16", "int64", "float32", "uint8", "float8_e4m3fn")}),
+        "Operand": lambda name, dtype, shape, role="in", **kwargs:
+            dict(name=name, dtype=dtype, shape=shape, role=role),
+        "Scalar": lambda name, kind="int32": dict(name=name, type=kind),
+        "compile_program": lambda launch, **kwargs: kwargs,
+        "_NormRope": lambda heads: None, "_Index": lambda: None, "_OaiSplit": lambda width: None,
+    }
+    exec(compile(ast.Module(body=nodes, type_ignores=[]), str(path), "exec"), namespace)
+    exporter = ast.parse((ROOT / "python/tools/aot/export_b12x_dsv4_aot.py").read_text())
+    helper = next(n for n in exporter.body if isinstance(n, ast.FunctionDef)
+                  and n.name == "minimax_producer_programs")
+    dispatch = {}
+    exec(compile(ast.Module(body=[helper], type_ignores=[]), "producers", "exec"), dispatch)
+    # The catalog selects exactly these compiler specializations, in append-only order.
+    import unittest.mock
+    module = types.ModuleType("b12x.integration.cuteafd.minimax_producer")
+    for name, fn in namespace.items():
+        if name.startswith("compile_minimax_"): setattr(module, name, fn)
+    expected = []
+    with unittest.mock.patch.dict(sys.modules, {module.__name__: module}):
+        for suffix, op, params, thunk in dispatch["minimax_producer_programs"](4096):
+            program = thunk()
+            expected.append(dict(name="minimax_" + suffix, family="minimax", op=op,
+                params=params, capacity_rows=4096, geometry=program["geometry"],
+                pointers=list(program["operands"]), scalars=list(program["scalars"]),
+                scratch_bytes_at_capacity={key: fn(4096) for key, fn in program.get("scratch", {}).items()}))
+    fixture = ROOT / "rust/crates/cuteafd-ffi/tests/fixtures/minimax_producer_programs.json"
+    assert json.loads(fixture.read_text()) == {"programs": expected}

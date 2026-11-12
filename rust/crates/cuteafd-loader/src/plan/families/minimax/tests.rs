@@ -327,4 +327,16 @@ fn installed_minimax_headers_match_native_contract() {
     assert_eq!(weights[0].projections.len(), 60 * 9);
     assert_eq!(weights[0].records_bytes(2752).unwrap(), (2752 / 16) * (12288 / 32) * 528);
     assert!(weights[0].arena.views().keys().all(|name| !name.contains(".experts.") && !name.starts_with("vision_tower.")));
+    let report = plan::plan(path, &PlanOptions::default()).unwrap();
+    eprintln!("MiniMax installed plan: min_spark_ranks={:?}, spark_budget_bytes={}",
+        report.min_spark_ranks, report.spark_budget_bytes);
+    // Runtime placement remains gated, so this is not a serving-fit witness.
+    assert_eq!(report.min_spark_ranks, None);
+    let routed_bytes = checkpoint.tensors.iter()
+        .filter(|tensor| tensor.meta.name.contains(".block_sparse_moe.experts."))
+        .map(|tensor| tensor.meta.byte_length).sum::<u64>();
+    assert_eq!(routed_bytes, 232_381_393_920);
+    assert!(routed_bytes > 121 << 30, "one GB10 cannot hold the native experts");
+    eprintln!("MiniMax installed routed expert bytes={routed_bytes}; one GB10 is physically insufficient");
+    assert_eq!(report.spark_budget_bytes, 100 << 30);
 }

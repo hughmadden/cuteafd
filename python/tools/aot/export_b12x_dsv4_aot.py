@@ -272,6 +272,27 @@ def minimax_sparse_programs(decode_rows: int, prefill_rows: int, max_context: in
     return result
 
 
+def minimax_producer_programs(prefill_rows: int):
+    from functools import partial
+    from b12x.integration.cuteafd.minimax_producer import (
+        compile_minimax_norm_rope_aot, compile_minimax_index_producer_aot,
+        compile_minimax_oai_split_aot,
+    )
+
+    result = []
+    for heads in (64, 4):
+        result.append((f"norm_rope_h{heads}", "minimax_norm_rope",
+                       dict(heads=heads, max_rows=prefill_rows),
+                       partial(compile_minimax_norm_rope_aot, heads=heads)))
+    result.append(("index_producer", "minimax_index_producer",
+                   dict(max_rows=prefill_rows), compile_minimax_index_producer_aot))
+    for width in (3072, 12288):
+        result.append((f"oai_split_i{width}", "minimax_oai_split",
+                       dict(width=width, max_rows=prefill_rows),
+                       partial(compile_minimax_oai_split_aot, width=width)))
+    return result
+
+
 def validate_table_residency(stem: str, geometry: dict, *, diagnostic: bool = False) -> None:
     # Fused top-k has fixed CTA-group spin barriers. The native table has no
     # loaded-kernel occupancy gate/fallback; even a new decode bucket must not
@@ -1696,6 +1717,7 @@ def main() -> None:
         manifest["family_capacities"]["minimax"] = {"max_context": geometry_context("minimax", args.max_context)}
         work += [("minimax", *item) for item in minimax_sparse_programs(
             args.decode_rows, args.prefill_rows, args.max_context)]
+        work += [("minimax", *item) for item in minimax_producer_programs(args.prefill_rows)]
     # Per-program reuse (python/tools/lib/_export_cache.py): only under the export
     # cache's recorder. Programs compile independently of which others the
     # geometry list requests; their recipes read every argument except these.
