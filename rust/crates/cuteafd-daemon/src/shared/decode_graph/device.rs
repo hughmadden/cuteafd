@@ -1327,7 +1327,7 @@ mod tests {
                         bytes: node_rate * 3 + graph_rate, nodes: Some(3),
                         node_rate, graph_rate, parallel_width: 1 }),
                 };
-                let Miss::Capture(rejected) = cache.miss(key(1), capture_site, estimate, true) else { panic!() };
+                let Miss::Capture(rejected) = cache.miss(key(1), capture_site, estimate.clone(), true) else { panic!() };
                 cache.measured_capture(10);
                 cache.capture_too_small(rejected, nodes);
                 assert!(matches!(cache.miss(key(2), capture_site, estimate, false), Miss::Capture(_)));
