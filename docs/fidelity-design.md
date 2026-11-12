@@ -53,10 +53,10 @@ changes using the fixed dataset; its old calibration campaigns are historical.
 
 ### Bounded prefill scoring (2026-11-12)
 
-GLM Flash, dense Qwen, Qwen4, MiMo, V4, Step-5 and Muse accept prefill-shaped
+GLM Flash, dense Qwen, Qwen4, MiMo, V4, Step-5, Muse and GLM 5.3 accept prefill-shaped
 fidelity probes on ordinary serving launches after paired raw-row and
 ordinary-layout Standard proofs, without reserving all-call logits before KV
-sizing. The Kimi and GLM 5.3 / Mistral Large 4 adapters remain staged behind a central
+sizing. The Kimi and Mistral Large 4 adapters remain staged behind a central
 activation allowlist until their proofs pass; their existing launch admission
 and scoring dispatch are unchanged. Scoring preserves
 the serving transformer's prefill calls and unit cuts, projects through existing
@@ -70,6 +70,17 @@ cuts into a serial diagnostic call. Their paired comparison therefore reports
 coverage and delta KL against the same reference, not byte identity across
 different transformer cuts. Standard-tier wall time measures the host-gather
 cost; a device reducer is follow-up work only if that cost is unacceptable.
+
+GLM 5.3 K4/Core-K6 qualification (#1444, 2026-11-13): on one RTX PRO 6000
+and four Sparks, all 16,384 prefill rows in Standard's 32 windows were
+byte-identical between the legacy reservation and bounded scoring, including
+positions and raw payload hashes (full-vocabulary KL 0, top-1 agreement 1).
+The ordinary flag-free DFlash2 launch also passed Standard's full 32+32
+windows with automatic admission: 1,371,392 KV tokens, 1,048,576 context and
+zero onboarded expert layers. Decode generated-row KL/top-1 were
+0.037970/0.944911; prefill 0.034099/0.950892, with no missing/nonfinite rows.
+The paired runtime seal was `65a0f104f`; Mistral Large 4 remains unqualified
+and disabled separately despite sharing GLM's engine.
 
 ## 0. Recommendation in one box
 

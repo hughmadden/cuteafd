@@ -16,7 +16,7 @@ pub(crate) type ProbeRef = Option<Arc<Probe>>;
 /// Activate each adapter only after its paired raw-row and ordinary-layout proof.
 /// Remove this temporary allowlist with the final FULL_PREFILL_LOGITS deletion.
 pub(crate) fn streamed_prefill_scoring(family: &str) -> bool {
-    matches!(family, "glm5_flash" | "qwen4" | "qwen3_5" | "mimo_v2" | "deepseek_v4" | "step5" | "muse_spark")
+    matches!(family, "glm5_flash" | "qwen4" | "qwen3_5" | "mimo_v2" | "deepseek_v4" | "step5" | "muse_spark" | "glm5")
 }
 
 pub(crate) fn prefill_scoring_admitted(family: &str, full_prefill_logits: bool) -> bool {
@@ -635,11 +635,11 @@ mod tests {
 
     #[test]
     fn streamed_scoring_activation_requires_a_proven_family() {
-        for family in ["glm5_flash", "qwen4", "qwen3_5", "mimo_v2", "deepseek_v4", "step5", "muse_spark"] {
+        for family in ["glm5_flash", "qwen4", "qwen3_5", "mimo_v2", "deepseek_v4", "step5", "muse_spark", "glm5"] {
             assert!(streamed_prefill_scoring(family), "{family}");
             assert!(prefill_scoring_admitted(family, false), "{family}");
         }
-        for family in ["kimi_k3", "glm5", "mistral_large4", "unknown"] {
+        for family in ["kimi_k3", "mistral_large4", "unknown"] {
             assert!(!streamed_prefill_scoring(family), "{family}");
             for legacy in [false, true] {
                 assert_eq!(prefill_scoring_admitted(family, legacy), legacy, "{family}");
@@ -672,7 +672,6 @@ mod tests {
         assert!(dispatch.contains("engine.prefill_scoring("));
         assert!(dispatch.contains("engine.prefill_device(placement, chunk, rows, cache.pool())"));
         for (family, source) in [
-            ("glm5", include_str!("../families/glm5/serve.rs")),
             ("glm5_flash", include_str!("../families/glm5_flash/serve.rs")),
             ("mimo_v2", include_str!("../families/mimo_v2/serve.rs")),
             ("deepseek_v4", include_str!("../families/deepseek_v4/serve.rs")),
@@ -681,6 +680,10 @@ mod tests {
             assert_eq!(source.matches(&format!("probe::prefill_scoring_admitted(\"{family}\", engine.full_prefill_logits")).count(), 2);
             assert!(source.contains(&format!("&& probe::streamed_prefill_scoring(\"{family}\")")));
         }
+        let glm = include_str!("../families/glm5/serve.rs");
+        assert!(glm.contains("if probe::streamed_prefill_scoring(engine.cfg.family_id()) {"));
+        assert_eq!(glm.matches("probe::prefill_scoring_admitted(engine.cfg.family_id(), engine.full_prefill_logits)").count(), 2);
+        assert!(glm.contains("&& probe::streamed_prefill_scoring(engine.cfg.family_id())"));
         let kimi = include_str!("../families/kimi_k3/serve.rs");
         assert!(kimi.contains("if crate::shared::probe::streamed_prefill_scoring(\"kimi_k3\") {"));
     }
