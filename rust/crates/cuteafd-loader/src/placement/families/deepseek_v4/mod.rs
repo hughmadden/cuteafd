@@ -500,6 +500,8 @@ mod default_tests {
             let mut input = plan_inputs(&cfg);
             input.cache_stages = 3;
             input.attention = Some(attention);
+            input.context = (attention == AttentionPlacement::Context)
+                .then_some(V4Context { topk_scratch: 12345, partial_scratch: 56789 });
             let prepared = prepare(&input).unwrap();
             let solved = prepared.admit(production_request(&input)).unwrap().solved;
             for gpu in 0..2u8 {
