@@ -1074,7 +1074,7 @@ mod tests {
     }
 
     #[test]
-    fn serving_mark_arena_honors_zero_budget_and_host_staging() {
+    fn serving_mark_arena_honors_zero_budget_with_either_tier() {
         use clap::Parser;
         #[derive(Parser)]
         struct Cli {
@@ -1085,7 +1085,7 @@ mod tests {
         // Device-only retention is disabled when no complete mark fits.
         assert_eq!(mark_slots(&cli.prefix, 16, 37_500_000).unwrap(), 0);
         let hosted = Cli::parse_from(["serve", "--prefix-cache-mark-mib", "0", "--host-cache-bytes", "auto"]);
-        assert_eq!(mark_slots(&hosted.prefix, 16, 37_500_000).unwrap(), 2);
+        assert_eq!(mark_slots(&hosted.prefix, 16, 37_500_000).unwrap(), 0);
         let disabled = Cli::parse_from(["serve", "--prefix-cache-entries", "0"]);
         assert_eq!(mark_slots(&disabled.prefix, 16, 37_500_000).unwrap(), 0);
         assert!(mark_slots(&cli.prefix, 65, 37_500_000).is_err());

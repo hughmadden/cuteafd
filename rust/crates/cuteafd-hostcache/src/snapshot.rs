@@ -150,6 +150,9 @@ pub struct Snapshots {
     order: EvictionOrder,
     /// Stores plus lookup hits so far: the clock `HostSnapshot::last_use` is stamped from.
     uses: u64,
+    /// Soft ownership references from the device tier, independent of DMA restore pins.
+    device_references: HashSet<Key>,
+    device_reference_evictions: u64,
 }
 
 impl Snapshots {
@@ -172,6 +175,8 @@ impl Snapshots {
             device_map: HashMap::new(),
             next_key: 0,
             uses: 0,
+            device_references: HashSet::new(),
+            device_reference_evictions: 0,
         }
     }
 
@@ -265,9 +270,7 @@ impl Snapshots {
             .lookup(&meta.tokens)
             .and_then(|(position, &old)| (position == meta.tokens.len()).then_some(old));
         if let Some(old) = replaced {
-            if let Some(snapshot) = self.snapshots.remove(&old) {
-                self.release_snapshot(snapshot);
-            }
+            self.remove(old);
         }
         self.retention.bank_mut(kind).insert(&meta.tokens, key);
         self.uses += 1;
@@ -337,6 +340,15 @@ impl Snapshots {
         self.snapshots.get(&key)
     }
 
+    /// Replace the device tier's soft references. Unlike a restore pin, these may be
+    /// evicted when no other victim can satisfy pressure; the device rechecks residency.
+    pub(crate) fn set_device_references(&mut self, keys: impl IntoIterator<Item = Key>) {
+        self.device_references.clear();
+        self.device_references.extend(keys);
+    }
+
+    pub(crate) fn device_reference_evictions(&self) -> u64 { self.device_reference_evictions }
+
     /// Add one pin to `key`. Invariant: a pinned snapshot is never evicted; an unknown key is a
     /// no-op (the engine may pin a snapshot that was already evicted).
     pub fn pin(&mut self, key: Key) {
@@ -385,7 +397,7 @@ impl Snapshots {
             start = end;
         }
         let mut candidates: Vec<_> = self.snapshots.values().filter(|s| s.pins == 0).collect();
-        candidates.sort_unstable_by_key(|s| (ancestors.contains(&s.key), s.last_use));
+        candidates.sort_unstable_by_key(|s| (self.device_references.contains(&s.key), ancestors.contains(&s.key), s.last_use));
         candidates.into_iter().map(|s| s.key).collect()
     }
 
@@ -413,6 +425,10 @@ impl Snapshots {
                 .flat_map(|kind| self.retention.bank(kind).eviction_order().into_iter().copied())
                 .filter(|key| self.snapshots.get(key).is_some_and(|s| s.pins == 0)).collect(),
         };
+        // Stable: preserve each policy's order among equally protected snapshots.
+        if self.order == EvictionOrder::Banks {
+            candidates.sort_by_key(|key| self.device_references.contains(key));
+        }
         let before = self.bytes_used();
         let mut target = self.pool.pressure_target(demand, headroom);
         let mut evicted = Vec::new();
@@ -443,20 +459,13 @@ impl Snapshots {
             self.remove(key);
             return Some((key, before - self.pool.bytes_used()));
         }
-        loop {
-            let next = {
-                let snapshots = &self.snapshots;
-                self.retention.evict_one_where(&|key: &Key| {
-                    snapshots.get(key).is_some_and(|snapshot| snapshot.pins > 0)
-                })
-            };
-            let (_kind, key) = next?;
-            let before = self.pool.bytes_used();
-            if let Some(snapshot) = self.snapshots.remove(&key) {
-                self.release_snapshot(snapshot);
-                return Some((key, before - self.pool.bytes_used()));
-            }
-        }
+        let key = [SnapshotKind::Prompt, SnapshotKind::Turn].into_iter()
+            .flat_map(|kind| self.retention.bank(kind).eviction_order().into_iter().copied())
+            .filter(|key| self.snapshots.get(key).is_some_and(|s| s.pins == 0))
+            .min_by_key(|key| self.device_references.contains(key))?;
+        let before = self.pool.bytes_used();
+        self.remove(key);
+        Some((key, before - self.pool.bytes_used()))
     }
 
     /// Evict in this store's order until `bytes_used() <= quota`, skipping pinned snapshots;
@@ -481,6 +490,7 @@ impl Snapshots {
         let Some(snapshot) = self.snapshots.remove(&key) else {
             return false;
         };
+        self.device_reference_evictions += u64::from(self.device_references.remove(&key));
         self.retention
             .bank_mut(snapshot.meta.kind)
             .remove_exact(&snapshot.meta.tokens);
@@ -1067,6 +1077,32 @@ mod tests {
             store.bytes_used(),
             (layout.tail + layout.scores + layout.page) as u64
         );
+    }
+
+    #[test]
+    fn device_references_outlast_other_victims_but_yield_to_pressure() {
+        for order in [EvictionOrder::LeastRecent, EvictionOrder::Banks] {
+            let mut store = super::testing::snapshots_ordered(1 << 30, order);
+            let mut commit = |tokens: &[u32]| {
+                let plan = store.plan_store(meta(SnapshotKind::Prompt, tokens, false), &pages(&[])).unwrap();
+                store.commit_store(plan, 0)
+            };
+            let referenced_leaf = commit(&[1, 2]);
+            let ancestor = commit(&[1]);
+            let other = commit(&[3]);
+            store.set_device_references([referenced_leaf]);
+            store.pin(other);
+            assert_eq!(store.evict_one().map(|v| v.0), Some(ancestor));
+            assert_eq!(store.device_reference_evictions(), 0);
+            assert_eq!(store.evict_one().map(|v| v.0), Some(referenced_leaf));
+            assert_eq!(store.device_reference_evictions(), 1);
+            assert!(store.get(referenced_leaf).is_none());
+            assert_eq!(store.evict_one(), None, "restore pins remain hard protection");
+            store.unpin(other);
+            store.set_device_references([]);
+            assert_eq!(store.evict_one().map(|v| v.0), Some(other));
+            assert_eq!(store.bytes_used(), 0);
+        }
     }
 
     #[test]

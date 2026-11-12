@@ -1084,7 +1084,8 @@ mod tests {
                     .slots_on(&cfg, cfg.layers, index, state).unwrap();
                 assert_eq!(planned as u64, cuteafd_core::prefix::mark_slots_with_host(lanes as u64,
                     hosted.prefix_cache_entries as u64, bytes, (hosted.prefix_cache_mark_mib as u64) << 20, true));
-                assert_eq!(planned, 2);
+                assert_eq!(planned as u64, cuteafd_core::prefix::mark_slots_for(lanes as u64,
+                    hosted.mark_rule(lanes).entries as u64, bytes, (hosted.prefix_cache_mark_mib as u64) << 20));
             }
         }
         // Device-only arenas stay within the byte budget at every concurrency.

@@ -145,8 +145,8 @@ pub fn round_counters(client: &Client) -> Option<(f64, f64)> {
 }
 
 /// Prefix-cache tier counters (`/v1/stats` `prefix_cache`); absent fields read as zero.
-const PREFIX_TIER_COUNTERS: [&str; 6] =
-    ["device_hits", "host_hits", "mark_promotions", "promotions", "capture_stalls", "capture_stall_ns"];
+const PREFIX_TIER_COUNTERS: [&str; 7] =
+    ["device_hits", "host_hits", "mark_promotions", "promotions", "capture_stalls", "capture_stall_ns", "mark_restore_misses"];
 
 /// The server's cumulative prefix-cache tier counters, `None` when it publishes none.
 pub fn prefix_tier_counters(client: &Client) -> Option<Value> {

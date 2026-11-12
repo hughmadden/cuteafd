@@ -418,6 +418,12 @@ impl<E: CopyEngine, P> HostCache<E, P> {
         }
     }
 
+    /// Prefer other victims while these host snapshots supply live device marks.
+    /// The caller rechecks `payload` before reuse: soft references can yield under pressure.
+    pub fn set_device_references(&mut self, keys: impl IntoIterator<Item = Key>) {
+        if let Some(snapshots) = &mut self.snapshots { snapshots.set_device_references(keys); }
+    }
+
     /// The engine's payload for a resident snapshot.
     pub fn payload(&self, key: Key) -> Option<&P> {
         self.payloads.get(&key)
@@ -1004,6 +1010,8 @@ impl<E: CopyEngine, P> HostCache<E, P> {
         let quota = self.config.bytes;
         let submissions = self.engine.submission_count();
         let metrics = self.metrics.get_mut();
+        metrics.device_reference_evictions = self.snapshots.as_ref()
+            .map_or(0, Snapshots::device_reference_evictions);
         metrics.resident_snapshots = resident;
         metrics.bytes_used = bytes;
         metrics.quota_bytes = quota;
