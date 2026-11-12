@@ -100,6 +100,8 @@ def test_engine_block_fp8_head_fp64_and_write_bounds():
         torch.cuda.synchronize()
         assert bool(((out.double() - oracle[:rows]).abs() <= bound).all())
         bf16_exact = torch.equal(out, first_result)
+        if rows > 16:
+            assert bf16_exact, f"rows={rows}: W8A16 differs from BF16 TMA arithmetic"
         native_launch(rows, out)
         torch.cuda.synchronize()
         assert bool(((out.double() - oracle[:rows]).abs() <= bound).all())
