@@ -163,3 +163,13 @@ fn installed_flash_drafters_push_byte_identical_to_mount_within_admitted_staging
         "expected every drafter/representation arm, ran {arms}, skipped {skipped}");
     Ok(())
 }
+
+#[test]
+fn draft_policy_calls_shared_resource_directly() {
+    for source in [include_str!("mod.rs"), include_str!("serve.rs"), include_str!("dspark.rs")] {
+        assert!(!source.contains("draft_binding"));
+    }
+    let serve = include_str!("serve.rs");
+    assert!(serve.contains("resource::observe_drafted("));
+    assert!(serve.contains("resource::select_drafted("));
+}
