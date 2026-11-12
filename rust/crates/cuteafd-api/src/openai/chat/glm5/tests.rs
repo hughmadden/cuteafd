@@ -424,22 +424,18 @@ mod vision_template {
     }
 
     #[test]
-    fn installed_official_and_tr3_templates_follow_vision_policy_when_present() {
+    fn installed_official_and_mc_templates_follow_vision_policy_when_present() {
         let root = Path::new("/mnt/sparknest/hf-home/hub");
         let official = root.join("models--zai-org--GLM-5.3-Flash/snapshots/eb9eb208eb0d988989d07a6a12d0fdeb5f52574a");
-        let tr3 = root.join("models--brandonmusic--GLM-5.3-Flash-tr3-4bpw/snapshots/a5fee929cf4888b1824323e33e8a19b60129e025");
-        if !official.is_dir() || !tr3.is_dir() { return; }
-        assert_eq!(GlmEncoding::from_snapshot_for_vision(&official, None, None).unwrap()
-            .template_provenance().unwrap().selection, "checkpoint");
-        let error = GlmEncoding::from_snapshot_for_vision(&tr3, None, None).unwrap_err().to_string();
-        assert!(error.contains("CHAT_TEMPLATE_FROM"), "{error}");
-        assert!(GlmEncoding::vision_template_gap(&tr3).unwrap().is_some());
-        assert_eq!(GlmEncoding::vision_template_gap(&official).unwrap(), None);
-        let old = GlmEncoding::from_snapshot(&tr3).unwrap();
-        let fallback = GlmEncoding::from_snapshot_for_vision(&tr3, Some(official.to_str().unwrap()), None).unwrap();
-        assert_eq!(old.tokens(), fallback.tokens());
-        assert!(fallback.render(&body(), &options()).unwrap().contains("<|begin_of_image|><|image|><|end_of_image|>"));
-        assert!(old.render(&body(), &options()).unwrap().contains("unable to process"));
+        let mc = root.join("models--wrldsuksgo2mars--GLM-5.3-Flash-EXL3-K4-MC/snapshots/91a8dbc9c12e790c65aa1a38c6aede6a3e23a77d");
+        if !official.is_dir() || !mc.is_dir() { return; }
+        for snapshot in [&official, &mc] {
+            let encoding = GlmEncoding::from_snapshot_for_vision(snapshot, None, None).unwrap();
+            assert_eq!(encoding.template_provenance().unwrap().selection, "checkpoint");
+            assert_eq!(GlmEncoding::vision_template_gap(snapshot).unwrap(), None);
+            assert!(encoding.render(&body(), &options()).unwrap()
+                .contains("<|begin_of_image|><|image|><|end_of_image|>"));
+        }
     }
 }
 

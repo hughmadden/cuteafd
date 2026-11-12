@@ -27,11 +27,6 @@
       "family": "mimo_v2"
     },
     {
-      "model": "brandonmusic/GLM-5.3-Flash-tr3-4bpw",
-      "revision": "a5fee929cf4888b1824323e33e8a19b60129e025",
-      "family": "glm5_flash"
-    },
-    {
       "model": "deepseek-ai/DeepSeek-V4-Flash-0731",
       "revision": "9e165c30e2704aec5d9d593cce3eebd58bbef1cb",
       "family": "deepseek_v4"
@@ -119,11 +114,6 @@
     {
       "model": "wrldsuksgo2mars/Mistral-Large-4-EXL3-K4",
       "revision": "9c354cee78cd6feddb057549b8edde6e3b319822",
-      "family": "mistral_large4"
-    },
-    {
-      "model": "wrldsuksgo2mars/Mistral-Large-4-EXL3-K4-Core-K6",
-      "revision": "03c80aebaa483d55760703ae5bc0c9734c9d67d6",
       "family": "mistral_large4"
     },
     {

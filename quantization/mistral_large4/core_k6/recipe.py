@@ -1,5 +1,7 @@
 """Pinned native Mistral Large 4 FP8 -> EXL3 K4 experts / K6 core recipe.
 
+Retired 2026-11-12; retained for the historical quantization tools.
+
 Every source tensor is accounted for before payload reads. Selected FP8
 weights and their block scales are replaced together; retained weights,
 including the FP8 indexer, keep their original payload bytes.

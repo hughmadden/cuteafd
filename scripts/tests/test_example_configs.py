@@ -7,6 +7,7 @@ a user who drops them gets the same launch and the two cannot drift apart.
 """
 from __future__ import annotations
 
+import html
 import json
 import os
 import re
@@ -21,7 +22,7 @@ EXAMPLES = ROOT / "examples" / "configs"
 STARTING = re.compile(r"^(?P<model>[a-z0-9.-]+)-(?P<profile>min|max)(?:-(?:fp8|nvfp4)-reply)?\.config$")
 # WIP qualification configs for families without a release card yet (#273, #274):
 # served from ./wip.sh slots only, checked by test_serve_launch_new_families.py.
-ML4_QUALIFICATION = {f"mistral-large4-exl3-k4-core-k6-{size}.config" for size in ("min", "max")}
+ML4_QUALIFICATION = {f"mistral-large4-exl3-k4-{size}.config" for size in ("min", "max")}
 NEW_PUBLICATIONS = {f"{model}-{size}.config" for model in
                     ("mistral-large4-exl3-k4", "glm53-flash-exl3-k4-mc") for size in ("min", "max")}
 QUALIFICATION = {"kimi-k3-exl3-max.config", "kimi-k3-exl3-k6-min.config", "kimi-k3-exl3-k6-max.config", "step5-fp8-max.config", "step5-nvfp4-min.config",
@@ -63,7 +64,6 @@ CHECKPOINTS = {
     "wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K4-Core-K6": {**GLMF, "quantization_config": {
         "quant_method": "exl3", "bits": 4.0, "core_bits": 6.0, "head_bits": 6.0, "mtp_bits": 4.0}},
     "nvidia/GLM-5.3-Flash-NVFP4": GLMF,
-    "brandonmusic/GLM-5.3-Flash-tr3-4bpw": GLMF,
     "XiaomiMiMo/MiMo-V2.6-Flash-MOPD": {**MIMO, "hidden_size": 4096},
     "XiaomiMiMo/MiMo-V2.6-Pro-MOPD": {**MIMO, "hidden_size": 6144},
     "wrldsuksgo2mars/Qwen3.8-Flash-Next-EXL3-K4.25-PLE-FP8-v1": {**QWEN, "quantization_config": {"quant_method": "exl3"}},
@@ -84,7 +84,7 @@ CHECKPOINTS = {
     "stepfun-ai/Step-5-Preview-NVFP4": {"model_type": "step3p5", "num_hidden_layers": 8},
     "wrldsuksgo2mars/Step-5-Preview-EXL3-K4-Core-K6": {"model_type": "step3p5", "num_hidden_layers": 8},
     "wrldsuksgo2mars/Kimi-K3-EXL3-K2-Core-K6": {"model_type": "kimi_k3", "num_hidden_layers": 8},
-    "wrldsuksgo2mars/Mistral-Large-4-EXL3-K4-Core-K6": {"model_type": "mistral_large4", "text_config": {
+    "wrldsuksgo2mars/Mistral-Large-4-EXL3-K4": {"model_type": "mistral_large4", "text_config": {
         "model_type": "mistral_large4_text", "num_hidden_layers": 4, "first_k_dense_replace": 1}},
     # Drafters the starting configs name.
     "incoai/GLM-5.3-DFlash2": {"architectures": ["DFlash2DraftModel"]},
@@ -246,7 +246,7 @@ def test_one_starting_config_per_release_card() -> None:
     expected = {f"{model}-{profile}.config" for model in (
         "deepseek-v41-mxfp4", "v41-flash-strided", "deepseek-v4-flash-mxfp4", "deepseek-v4-pro-exl3",
         "glm53-exl3", "glm53-exl3-k6core", "glm53-nvfp4", "glm53-flash-fp8", "glm53-flash-exl3", "glm53-flash-exl3-k6", "glm53-flash-nvfp4",
-        "glm53-flash-tr3", "glm53-flash-exlr8-k4", "mimo-v26-flash-mxfp4", "mimo-v26-pro-mxfp4") for profile in ("min", "max")}
+        "glm53-flash-exlr8-k4", "mimo-v26-flash-mxfp4", "mimo-v26-pro-mxfp4") for profile in ("min", "max")}
     # Qwen fits one RTX: the 2x RTX column is n/a, so only min exists.
     expected |= {"qwen38-exl3-min.config", "qwen38-nvfp4-min.config"}
     expected |= {f"deepseek-v41-mxfp4-max-{codec}-reply.config" for codec in ("fp8", "nvfp4")}
@@ -259,7 +259,7 @@ def test_release_smoke_matrix_covers_owned_columns_with_current_defaults() -> No
     matrix = json.loads((ROOT / "scripts/bench/release-smoke.example.json").read_text())
     assert matrix["profile"] == "smoke"
     entries = matrix["entries"]
-    assert len(entries) == 30
+    assert len(entries) == 28
     assert len({entry["name"] for entry in entries}) == len(entries)
     defaults = matrix["defaults"]["set"]
     stale = {"CONCURRENCY", "MAX_CONTEXT_TOKENS", "HOST_CACHE_BYTES", "BENCH_SIMULATED",
@@ -288,14 +288,14 @@ def test_release_smoke_matrix_covers_owned_columns_with_current_defaults() -> No
         }:
             assert not entry["sparks"]
             assert values["EXPERT_BACKEND"] == "local"
-        if entry["name"] in {"glm53f-nvfp4-max", "glm53f-tr3-max", "qwen38-nvfp4-min"}:
+        if entry["name"] in {"glm53f-nvfp4-max", "qwen38-nvfp4-min"}:
             assert entry["sparks"] == ["ostrich", "dodo"]
             assert values["EXPERT_BACKEND"] == "spark"
         for key in ("ADDR", "EXPERT_PORT"):
             assert values[key] not in ports
             ports.add(values[key])
         models.setdefault(values["MODEL_ID"], set()).add(len(entry["gpus"]))
-    assert len(models) == 14
+    assert len(models) == 13
     assert all(columns == {1, 2} for columns in models.values())
 
 
@@ -367,7 +367,7 @@ def test_v3_release_matrix_covers_shipped_quants_reference_layouts_and_real_5090
     assert all("REPLACE-ME-v3-rc" in defaults[key] for key in
                ("COORDINATOR_DOCKER_INFERENCE", "SPARK_EXPERT_DOCKER_INFERENCE"))
     entries = {entry["name"]: entry for entry in matrix["entries"]}
-    assert len(entries) == len(matrix["entries"]) == 24
+    assert len(entries) == len(matrix["entries"]) == 22
     columns = {}
     ports = set()
     for name, entry in entries.items():
@@ -393,11 +393,11 @@ def test_v3_release_matrix_covers_shipped_quants_reference_layouts_and_real_5090
             assert len(entry["gpus"]) == 1
             assert "BENCH_SIMULATED" not in entry["set"]
     # v3 publishes one column per checkpoint, except V4.1 and GLM Flash EXL3 (both).
-    assert len(columns) == 12
+    assert len(columns) == 11
     assert {model: sorted(sides) for model, sides in columns.items() if len(sides) == 2} == {
         values_of(entries["v41-flash-min"])["MODEL_ID"]: ["max", "min"],
         values_of(entries["glm53f-exl3-min"])["MODEL_ID"]: ["max", "min"]}
-    assert len([name for name in entries if name.endswith("-5090")]) == 8
+    assert len([name for name in entries if name.endswith("-5090")]) == 7
     assert len(entries["v41-flash-reference-tp4"]["sparks"]) == 4
     assert len(entries["v41-flash-reference-tp6"]["sparks"]) == 6
     for name in ("glm53f-exl3-max", "qwen38-exl3-min"):
@@ -406,6 +406,13 @@ def test_v3_release_matrix_covers_shipped_quants_reference_layouts_and_real_5090
     assert not any("reference-all-spark" in name or "reference-half" in name for name in entries)
     text = json.dumps(matrix)
     assert not any(private in text for private in PRIVATE)
+
+    retired = {entry["name"]: entry for entry in matrix["retired"]}
+    assert set(retired) == {"glm53f-tr3-min", "glm53f-tr3-5090"}
+    for entry in retired.values():
+        assert not (ROOT / entry["config"]).exists()
+        report = json.loads((ROOT / entry["report"] / "report.json").read_text())
+        assert entry["release"] == report["server"]["build"]["release"] == "v3.0.0-rc4"
 
 
 @pytest.mark.parametrize("gpu_name,expected", [
@@ -486,12 +493,15 @@ def test_published_matrix_pins_current_reports() -> None:
             assert f'href="{directory.as_posix()}/card.svg"' in results
             assert (ROOT / directory / "card.svg").is_file()
             current.append(cell)
-        assert current, "Every published checkpoint needs a measured card"
+        if not current:
+            assert row["checkpoint"] in results, "Unmeasured checkpoints remain visible"
+            for column in ("5090", "1rtx", "2rtx"):
+                assert html.escape(row[column]["reason"]).replace("&#x27;", "&#39;") in results
     retired_names = set()
     for entry in matrix["retired"]:
         assert entry["name"] and entry["name"] not in retired_names
         retired_names.add(entry["name"])
-        assert (ROOT / entry["config"]).is_file()
+        assert_archived_config(entry)
         report = json.loads((ROOT / entry["report"] / "report.json").read_text())
         assert report["profile"] == "smoke" and report.get("baseline")
         assert_retired_release(entry, report)
@@ -502,6 +512,14 @@ def test_published_matrix_pins_current_reports() -> None:
         assert f'build {label}; commit {build["commit"]};' in row
         assert f'href="{entry["report"]}/card.svg"' in results
     assert "simulated-5090" not in json.dumps(matrix)
+
+
+def assert_archived_config(entry: dict) -> None:
+    path = ROOT / entry["config"]
+    if path.name in {"glm53-flash-tr3-min.config", "glm53-flash-tr3-max.config"}:
+        assert not path.exists(), "Retired checkpoint recipes must not remain launchable"
+    else:
+        assert path.is_file()
 
 
 def assert_retired_release(entry: dict, report: dict) -> None:
@@ -529,7 +547,7 @@ def test_v5_smoke_card_inventory() -> None:
         name = entry["name"]
         assert name not in names
         names.add(name)
-        assert (ROOT / entry["config"]).is_file()
+        assert_archived_config(entry)
         values = {**keys(ROOT / entry["config"]), **smoke["defaults"]["set"], **entry["set"]}
         assert re.fullmatch(r"[a-f0-9]{40}", values["MODEL_REVISION"])
         family = entry["family"]
@@ -552,7 +570,7 @@ def test_v5_smoke_card_inventory() -> None:
             assert host == values[f"SPARK_{rank}_HOST"] == f"REPLACE-ME-spark-{rank}"
         assert "nvfp4" not in name and "nospec" not in name and "reference" not in name
         assert entry.get("baseline", True), "All cards retain baseline quick quality"
-        assert "CORE_VIEW" not in values, "Release cards use the checkpoint's default core"
+        assert values.get("CORE_VIEW", "original") == "original", "Release cards use the checkpoint's default core"
         column = "5090" if name.endswith("-5090") else f"{len(entry['gpus'])}rtx"
         identity = (entry["family"], values["MODEL_ID"], column)
         assert identity not in cards
@@ -715,8 +733,8 @@ def test_ml4_qualification_config_preserves_native_draft_defaults(name: str, tmp
     path = EXAMPLES / name
     values = keys(path)
     minimum = name.endswith("-min.config")
-    assert values["MODEL_ID"] == "wrldsuksgo2mars/Mistral-Large-4-EXL3-K4-Core-K6"
-    assert values["MODEL_REVISION"] == "03c80aebaa483d55760703ae5bc0c9734c9d67d6"
+    assert values["MODEL_ID"] == "wrldsuksgo2mars/Mistral-Large-4-EXL3-K4"
+    assert values["MODEL_REVISION"] == "9c354cee78cd6feddb057549b8edde6e3b319822"
     assert values["SPECULATOR"] == "dspark" and values["POOL_TOKENS"] == "auto"
     assert not {"SPECULATOR_MODEL_ID", "SPECULATOR_DEPTH", "RTX_EXPERT_LAYERS"}.intersection(values)
     assert values["SPARK_COUNT"] == ("5" if minimum else "6")
@@ -747,9 +765,14 @@ def test_new_publications_preserve_pinned_recipe_layouts(name: str) -> None:
     path = EXAMPLES / name
     values = keys(path)
     ml4 = name.startswith("mistral-")
-    old_name = (name.replace("exl3-k4-", "exl3-k4-core-k6-") if ml4
-                else name.replace("exl3-k4-mc-", "exl3-k6-"))
-    expected = keys(EXAMPLES / old_name)
+    if ml4:
+        expected = dict(values)
+        minimum = name.endswith("-min.config")
+        assert values["SPARK_COUNT"] == ("5" if minimum else "6")
+        assert values["RTX_GPUS"] == ("1" if minimum else "2")
+        assert values["SPECULATOR"] == "dspark" and values["POOL_TOKENS"] == "auto"
+    else:
+        expected = keys(EXAMPLES / name.replace("exl3-k4-mc-", "exl3-k6-"))
     expected.update(MODEL_ID=("wrldsuksgo2mars/Mistral-Large-4-EXL3-K4" if ml4
                               else "wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K4-MC"),
                     MODEL_REVISION=("9c354cee78cd6feddb057549b8edde6e3b319822" if ml4
@@ -772,7 +795,7 @@ def test_ml4_smoke_entries_use_published_examples_and_minimum_sparks() -> None:
     entries = {entry["name"]: entry for entry in matrix["entries"]}
     for size, gpus, sparks in (("min", [1], 5), ("max", [0, 1], 6)):
         entry = entries[f"ml4-exl3-{size}"]
-        assert entry["config"] == f"examples/configs/mistral-large4-exl3-k4-core-k6-{size}.config"
+        assert entry["config"] == f"examples/configs/mistral-large4-exl3-k4-{size}.config"
         assert entry["family"] == "mistral_large4" and entry["gpus"] == gpus
         assert len(entry["sparks"]) == sparks and entry["set"]["SPARK_COUNT"] == str(sparks)
         assert not any(k.startswith(f"SPARK_{sparks}_") for k in entry["set"])
@@ -922,7 +945,14 @@ def test_v4_matrix_card_set_and_retired_pins() -> None:
         assert sum(other.get("set", {}).get("ADDR") == entry["set"]["ADDR"]
                    for other in v4["entries"]) == 1
     assert not any(name.startswith("qwen38-nvfp4") for name in entries)
-    retired = v4["retired"]
+    ml4_retired = [entry for entry in v4["retired"] if entry["name"] in {"ml4-exl3-min", "ml4-exl3-max"}]
+    assert {entry["name"] for entry in ml4_retired} == {"ml4-exl3-min", "ml4-exl3-max"}
+    for entry in ml4_retired:
+        assert entry["release_note"] == "Core-K6 checkpoint retired 2026-11-12; replaced by Mistral-Large-4-EXL3-K4"
+        assert not (ROOT / entry["config"]).exists()
+        assert entry["release"] == "v5.0.0-rc1"
+        assert (ROOT / entry["report"] / "report.json").is_file()
+    retired = [entry for entry in v4["retired"] if entry not in ml4_retired]
     assert len(retired) == 21
     assert "glm53-exl3-max" not in {entry["name"] for entry in retired}
     assert {"qwen38-nvfp4-" + size for size in ("min", "max", "5090")} <= {e["name"] for e in retired}
@@ -939,7 +969,7 @@ def test_v4_matrix_card_set_and_retired_pins() -> None:
     }
     reports = [(path, json.loads(path.read_text())) for path in (ROOT / "benchmarks").glob("*/*/report.json")]
     for entry in retired:
-        assert (ROOT / entry["config"]).is_file()
+        assert_archived_config(entry)
         report = json.loads((ROOT / entry["report"] / "report.json").read_text())
         assert report["profile"] == "smoke" and report["baseline"]
         build = report["server"]["build"]

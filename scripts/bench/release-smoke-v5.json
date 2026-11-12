@@ -1177,7 +1177,7 @@
     {
       "name": "ml4-exl3-min",
       "family": "mistral_large4",
-      "config": "examples/configs/mistral-large4-exl3-k4-core-k6-min.config",
+      "config": "examples/configs/mistral-large4-exl3-k4-min.config",
       "gpus": [
         1
       ],
@@ -1195,8 +1195,8 @@
         "RTX_GPUS": "1",
         "SPARK_COUNT": "5",
         "SPARK_EXPERT_DOCKER_INFERENCE": "ghcr.io/tpurtell/cuteafd-spark-expert:REPLACE-ME-v5-rc",
-        "MODEL_ID": "wrldsuksgo2mars/Mistral-Large-4-EXL3-K4-Core-K6",
-        "MODEL_REVISION": "03c80aebaa483d55760703ae5bc0c9734c9d67d6",
+        "MODEL_ID": "wrldsuksgo2mars/Mistral-Large-4-EXL3-K4",
+        "MODEL_REVISION": "9c354cee78cd6feddb057549b8edde6e3b319822",
         "SPARK_0_HOST": "REPLACE-ME-spark-0",
         "SPARK_0_LANE_A": "192.0.2.1",
         "SPARK_1_HOST": "REPLACE-ME-spark-1",
@@ -1213,7 +1213,7 @@
     {
       "name": "ml4-exl3-max",
       "family": "mistral_large4",
-      "config": "examples/configs/mistral-large4-exl3-k4-core-k6-max.config",
+      "config": "examples/configs/mistral-large4-exl3-k4-max.config",
       "gpus": [
         0,
         1
@@ -1233,8 +1233,8 @@
         "RTX_GPUS": "2",
         "SPARK_COUNT": "6",
         "SPARK_EXPERT_DOCKER_INFERENCE": "ghcr.io/tpurtell/cuteafd-spark-expert:REPLACE-ME-v5-rc",
-        "MODEL_ID": "wrldsuksgo2mars/Mistral-Large-4-EXL3-K4-Core-K6",
-        "MODEL_REVISION": "03c80aebaa483d55760703ae5bc0c9734c9d67d6",
+        "MODEL_ID": "wrldsuksgo2mars/Mistral-Large-4-EXL3-K4",
+        "MODEL_REVISION": "9c354cee78cd6feddb057549b8edde6e3b319822",
         "SPARK_0_HOST": "REPLACE-ME-spark-0",
         "SPARK_0_LANE_A": "192.0.2.1",
         "SPARK_1_HOST": "REPLACE-ME-spark-1",

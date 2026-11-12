@@ -43,7 +43,7 @@ Cards and quality findings are in the main README and each family doc.
 | [GLM 5.3 Flash · EXL3 K4 + Core K6](../../docs/models/glm5_flash.md) | [1 RTX + 2 Spark](glm53-flash-exl3-k6-min.config) | [2 RTX, 0 Spark](glm53-flash-exl3-k6-max.config) | `dflash2` `incoai/GLM-5.3-Flash-DFlash2` | `auto` |
 | [GLM 5.3 Flash · native EXLR8 K4](../../docs/models/glm5_flash.md) | [1 RTX + 1 Spark](glm53-flash-exlr8-k4-min.config) | [2 RTX, 0 Spark](glm53-flash-exlr8-k4-max.config) | `dflash2` `incoai/GLM-5.3-Flash-DFlash2` | `auto` |
 | [GLM 5.3 Flash · NVFP4](../../docs/models/glm5_flash.md) | [1 RTX + 2 Spark](glm53-flash-nvfp4-min.config) | [2 RTX + 4 Spark](glm53-flash-nvfp4-max.config) | `dflash2` `incoai/GLM-5.3-Flash-DFlash2` | `auto` |
-| [GLM 5.3 Flash · tr3 4bpw](../../docs/models/glm5_flash.md) | [1 RTX + 2 Spark](glm53-flash-tr3-min.config) | [2 RTX + 4 Spark](glm53-flash-tr3-max.config) | `dflash2` `incoai/GLM-5.3-Flash-DFlash2` | `auto` |
+| [GLM 5.3 Flash · EXL3 K4 MC, original core](../../docs/models/glm5_flash.md) | [1 RTX + 2 Spark](glm53-flash-exl3-k4-mc-min.config) | [2 RTX, 0 Spark](glm53-flash-exl3-k4-mc-max.config) | `dflash2` `incoai/GLM-5.3-Flash-DFlash2` | `auto` |
 | [MiMo V2.6 Flash MOPD · MXFP4](../../docs/models/mimo_v2.md) | [1 RTX + 2 Spark](mimo-v26-flash-mxfp4-min.config) | [2 RTX + 4 Spark](mimo-v26-flash-mxfp4-max.config) | `dflash2` (bundled `dflash/`) | `auto` |
 | [MiMo V2.6 Pro MOPD · MXFP4](../../docs/models/mimo_v2.md) | [1 RTX + 6 Spark](mimo-v26-pro-mxfp4-min.config) | [2 RTX + 6 Spark](mimo-v26-pro-mxfp4-max.config) | `dflash2` (bundled `dflash/`) | `auto` |
 | [Qwen 3.8 Flash Next · EXL3 K4.25](../../docs/models/qwen4.md) | [1 RTX, local experts](qwen38-exl3-min.config) | n/a (fits one RTX) | `mtp`, depth 3 | `auto` |
@@ -87,7 +87,6 @@ outside a matching WIP slot.
 | GLM 5.3 Flash · EXL3 K4 + native K6 core | [min](glm53f-exl3-k4-core-k6-min.config) · [max](glm53f-exl3-k4-core-k6-max.config) | 1 RTX + 2 Spark / 2 RTX, no Sparks; DFlash2, admitted KV pool |
 | Kimi K3 · EXL3 K2 (#273) | [max](kimi-k3-exl3-max.config) | 2 RTX (TP2 attention) + 6 Spark (TP6 experts), 5 routed layers on the RTX |
 | Kimi K3 · EXL3 K2 + K6 core (#1178) | [min](kimi-k3-exl3-k6-min.config) · [max](kimi-k3-exl3-k6-max.config) | 1 RTX + 6 Spark (110 GiB Spark budget) / 2 RTX + 6 Spark; native K6 core, automatic pool and placement, DFlash2 |
-| Mistral Large 4 · EXL3 K4 + native K6 core (#924) | [min](mistral-large4-exl3-k4-core-k6-min.config) · [max](mistral-large4-exl3-k4-core-k6-max.config) | 1 RTX + 5 Spark / 2 RTX + 6 Spark; bundled dSpark depth 3, pool-first; TP2 qualification pending |
 | Step-5-Preview · FP8 (#274) | [max](step5-fp8-max.config) | 2 RTX + 6 Spark |
 | Step-5-Preview · NVFP4 (#274) | [min](step5-nvfp4-min.config) | 1 RTX + 4 Spark |
 | Muse Spark · EXL3 K4 + Core K6 (#923) | [min](muse-spark-exl3-min.config) · [max](muse-spark-exl3-max.config) | 1 RTX + 4 Spark text qualified / 2 RTX + 6 Spark planned; pinned NVIDIA DFlash2, pool-first; media off |

@@ -2373,8 +2373,8 @@ fn glm5_flash_mixed_exl3_tiers_share_one_package() {
     assert_eq!(report.expert_storage, Some(Exl3StorageSource::Headers));
 }
 
-/// A standard exllamav3 GLM 5.3 Flash checkpoint (brandonmusic/GLM-5.3-Flash-
-/// tr3-4bpw): the exllamav3 config block, no storage map, uniform K4 with
+/// A standard exllamav3 GLM 5.3 Flash checkpoint: the exllamav3 config
+/// block, no storage map, uniform K4 with
 /// `[1]` MCG markers. Its experts run on the K3/K4 package with an empty K3
 /// tier; its BF16 coordinator block projections are quantized to FP8 blocks at load.
 #[test]

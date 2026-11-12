@@ -18,9 +18,8 @@ release after v5.0.0); v5.0.0 and the retained image tags cannot run these recip
 - `wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K3.25-Core-FP8`: unchanged EXL3
   routed experts with official native FP8 MLA/dense/shared projections bundled
   in the same checkpoint. No second weight checkpoint is read at runtime.
-- `brandonmusic/GLM-5.3-Flash-tr3-4bpw` and other standard exllamav3 EXL3
-  tr3 publications — read directly from `config.json` + tensor headers, no
-  CuteAFD-specific side files required.
+- `wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K4-MC`: EXL3 K4 experts with the original BF16 core
+  and optional compact core views, read directly from `config.json` + tensor headers.
 - NVIDIA ModelOpt NVFP4 (`nvidia/GLM-5.3-Flash-NVFP4`) — routed experts and
   dense MLPs both run natively in NVFP4.
 
@@ -32,7 +31,7 @@ release after v5.0.0); v5.0.0 and the retained image tags cannot run these recip
   prefix-continuation exactness remain unqualified for this checkpoint.
 
 **Starting configs** (current primary-only recipes, natural minimum and maximum; replace the
-placeholder Spark hosts and addresses): Official FP8 [min](../../examples/configs/glm53-flash-fp8-min.config) · [max](../../examples/configs/glm53-flash-fp8-max.config); EXL3 K3.25 [min](../../examples/configs/glm53-flash-exl3-min.config) · [max](../../examples/configs/glm53-flash-exl3-max.config); EXL3 K4 + Core K6 [min](../../examples/configs/glm53-flash-exl3-k6-min.config) · [max](../../examples/configs/glm53-flash-exl3-k6-max.config); NVFP4 [min](../../examples/configs/glm53-flash-nvfp4-min.config) · [max](../../examples/configs/glm53-flash-nvfp4-max.config); tr3 4bpw [min](../../examples/configs/glm53-flash-tr3-min.config) · [max](../../examples/configs/glm53-flash-tr3-max.config).
+placeholder Spark hosts and addresses): Official FP8 [min](../../examples/configs/glm53-flash-fp8-min.config) · [max](../../examples/configs/glm53-flash-fp8-max.config); EXL3 K3.25 [min](../../examples/configs/glm53-flash-exl3-min.config) · [max](../../examples/configs/glm53-flash-exl3-max.config); EXL3 K4 + Core K6 [min](../../examples/configs/glm53-flash-exl3-k6-min.config) · [max](../../examples/configs/glm53-flash-exl3-k6-max.config); NVFP4 [min](../../examples/configs/glm53-flash-nvfp4-min.config) · [max](../../examples/configs/glm53-flash-nvfp4-max.config); EXL3 K4 MC [min](../../examples/configs/glm53-flash-exl3-k4-mc-min.config) · [max](../../examples/configs/glm53-flash-exl3-k4-mc-max.config).
 
 ## Core views
 

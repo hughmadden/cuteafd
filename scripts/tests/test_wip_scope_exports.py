@@ -43,7 +43,7 @@ def test_v41_scope_requests_v41_exports_only(count, roles):
 
 @pytest.mark.parametrize('family,model', [('glm5_flash', 'GLM-5.3-Flash-NVFP4'), ('qwen4', 'Qwen3.8-Flash-Next-EXL3'),
                                           ('muse_spark', 'Muse-Spark-Open-EXL3-K4-Core-K6'),
-                                          ('mistral_large4', 'Mistral-Large-4-EXL3-K4-Core-K6')])
+                                          ('mistral_large4', 'Mistral-Large-4-EXL3-K4')])
 def test_vision_families_request_vision_unless_off(family, model):
     assert scopes(family, model, 4)['CUTEAFD_WIP_VISION_ATTENTION_AOT'] == 'ON'
     assert 'CUTEAFD_WIP_VISION_ATTENTION_AOT' not in scopes(family, model, 4, VISION='off')

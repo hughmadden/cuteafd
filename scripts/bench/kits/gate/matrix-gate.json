@@ -143,9 +143,9 @@
    }
   },
   {
-   "name": "glmf-tr3-sim5090",
+   "name": "glmf-k4-mc-sim5090",
    "family": "glm5_flash",
-   "config": "examples/configs/glm53-flash-tr3-min.config",
+   "config": "examples/configs/glm53-flash-exl3-k4-mc-min.config",
    "gpus": [
     0
    ],
