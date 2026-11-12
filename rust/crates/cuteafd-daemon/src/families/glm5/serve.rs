@@ -1520,8 +1520,8 @@ mod draft_tests {
         assert_eq!(ml4.family_id(), "mistral_large4");
         assert!(probe::streamed_prefill_scoring(glm.family_id()));
         assert!(probe::prefill_scoring_admitted(glm.family_id(), false));
-        assert!(!probe::streamed_prefill_scoring(ml4.family_id()));
-        assert!(!probe::prefill_scoring_admitted(ml4.family_id(), false));
+        assert!(probe::streamed_prefill_scoring(ml4.family_id()));
+        assert!(probe::prefill_scoring_admitted(ml4.family_id(), false));
         assert!(probe::prefill_scoring_admitted(ml4.family_id(), true));
         Ok(())
     }
