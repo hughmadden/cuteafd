@@ -352,12 +352,12 @@ pub(super) mod tests {
             // The private owner survives while only the logit planes alias this larger arena.
             let arena = plan.workspace_bytes() + 1024;
             let admitted = super::super::execution::RankAdmission { immutable: 1000, workspace: arena }
-                .with_head(&plan)?;
+                .with_head(&plan, 0)?;
             assert_eq!(admitted.immutable, 1000 + private_scratch);
             assert_eq!(admitted.workspace, arena);
             assert_eq!(admitted.bytes()?, 1000 + private_scratch + arena);
             assert!(super::super::execution::RankAdmission { immutable: u64::MAX, workspace: 0 }
-                .with_head(&plan).is_err());
+                .with_head(&plan, 0).is_err());
         }
         Ok(())
     }
