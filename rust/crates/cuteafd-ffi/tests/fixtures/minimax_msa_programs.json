@@ -1,0 +1,408 @@
+{
+  "programs": [
+    {
+      "name": "minimax_index_decode",
+      "family": "minimax",
+      "op": "minimax_index",
+      "params": {
+        "max_rows": 64,
+        "mode": "decode",
+        "max_pages": 16384
+      },
+      "capacity_rows": 64,
+      "geometry": {
+        "max_rows": 64,
+        "max_pages": 16384,
+        "heads": 4,
+        "head_dim": 128,
+        "block_tokens": 128,
+        "topk": 16,
+        "mode": "decode"
+      },
+      "pointers": [
+        {
+          "name": "q_fp8",
+          "dtype": "float8_e4m3fn",
+          "shape": "[rows,4,128]",
+          "role": "in"
+        },
+        {
+          "name": "q_scale",
+          "dtype": "float32",
+          "shape": "[rows,4]",
+          "role": "in"
+        },
+        {
+          "name": "index_k_cache",
+          "dtype": "uint8",
+          "shape": "[pool_pages,8448]",
+          "role": "in"
+        },
+        {
+          "name": "page_table",
+          "dtype": "int32",
+          "shape": "[rows,table_stride]",
+          "role": "in"
+        },
+        {
+          "name": "cache_lengths",
+          "dtype": "int32",
+          "shape": "[rows]",
+          "role": "in"
+        },
+        {
+          "name": "q2k_indices",
+          "dtype": "int32",
+          "shape": "[4,64,16]",
+          "role": "out"
+        },
+        {
+          "name": "scratch",
+          "dtype": "uint8",
+          "shape": "[25202688]",
+          "role": "scratch"
+        }
+      ],
+      "scalars": [
+        {
+          "name": "rows",
+          "type": "int32"
+        },
+        {
+          "name": "table_width",
+          "type": "int32"
+        },
+        {
+          "name": "table_stride",
+          "type": "int32"
+        },
+        {
+          "name": "pool_pages",
+          "type": "int64"
+        }
+      ],
+      "scratch_bytes_at_capacity": {
+        "scratch": 25202688
+      }
+    },
+    {
+      "name": "minimax_index_prefill",
+      "family": "minimax",
+      "op": "minimax_index",
+      "params": {
+        "max_rows": 4096,
+        "mode": "prefill",
+        "max_pages": 16384
+      },
+      "capacity_rows": 4096,
+      "geometry": {
+        "max_rows": 4096,
+        "max_pages": 16384,
+        "heads": 4,
+        "head_dim": 128,
+        "block_tokens": 128,
+        "topk": 16,
+        "mode": "prefill"
+      },
+      "pointers": [
+        {
+          "name": "q_fp8",
+          "dtype": "float8_e4m3fn",
+          "shape": "[rows,4,128]",
+          "role": "in"
+        },
+        {
+          "name": "q_scale",
+          "dtype": "float32",
+          "shape": "[rows,4]",
+          "role": "in"
+        },
+        {
+          "name": "k_fp8",
+          "dtype": "float8_e4m3fn",
+          "shape": "[ceil(k_rows/256)*256,128]",
+          "role": "in"
+        },
+        {
+          "name": "k_scale",
+          "dtype": "float32",
+          "shape": "[ceil(k_rows/256)*256]",
+          "role": "in"
+        },
+        {
+          "name": "k_start",
+          "dtype": "int32",
+          "shape": "[rows] request base, multiple of 128",
+          "role": "in"
+        },
+        {
+          "name": "k_end",
+          "dtype": "int32",
+          "shape": "[rows] exclusive causal end",
+          "role": "in"
+        },
+        {
+          "name": "q2k_indices",
+          "dtype": "int32",
+          "shape": "[4,4096,16]",
+          "role": "out"
+        },
+        {
+          "name": "scratch",
+          "dtype": "uint8",
+          "shape": "[539197952]",
+          "role": "scratch"
+        }
+      ],
+      "scalars": [
+        {
+          "name": "rows",
+          "type": "int32"
+        },
+        {
+          "name": "k_rows",
+          "type": "int32"
+        }
+      ],
+      "scratch_bytes_at_capacity": {
+        "scratch": 539197952
+      }
+    },
+    {
+      "name": "minimax_attention_decode",
+      "family": "minimax",
+      "op": "minimax_attention",
+      "params": {
+        "max_rows": 64,
+        "mode": "decode",
+        "max_batch": 64
+      },
+      "capacity_rows": 64,
+      "geometry": {
+        "max_rows": 64,
+        "max_batch": 64,
+        "page_rows": 64,
+        "query_heads": 64,
+        "kv_heads": 4,
+        "head_dim": 128,
+        "block_tokens": 128,
+        "topk": 16,
+        "mode": "decode",
+        "softmax_scale": 0.08838834764831845
+      },
+      "pointers": [
+        {
+          "name": "query",
+          "dtype": "bfloat16",
+          "shape": "[rows,64,128]",
+          "role": "in"
+        },
+        {
+          "name": "key_cache",
+          "dtype": "uint8",
+          "shape": "[pool_pages,64,4,128] E4M3 bytes",
+          "role": "in"
+        },
+        {
+          "name": "value_cache",
+          "dtype": "uint8",
+          "shape": "[pool_pages,64,4,128] E4M3 bytes",
+          "role": "in"
+        },
+        {
+          "name": "k_descale",
+          "dtype": "float32",
+          "shape": "[batch,4]",
+          "role": "in"
+        },
+        {
+          "name": "v_descale",
+          "dtype": "float32",
+          "shape": "[batch,4]",
+          "role": "in"
+        },
+        {
+          "name": "page_table",
+          "dtype": "int32",
+          "shape": "[batch,table_stride]",
+          "role": "in"
+        },
+        {
+          "name": "cache_lengths",
+          "dtype": "int32",
+          "shape": "[batch] including appended queries",
+          "role": "in"
+        },
+        {
+          "name": "cu_seqlens_q",
+          "dtype": "int32",
+          "shape": "[batch+1] packed query offsets; decode arange",
+          "role": "in"
+        },
+        {
+          "name": "q2k_indices",
+          "dtype": "int32",
+          "shape": "[4,64,16]",
+          "role": "in"
+        },
+        {
+          "name": "output",
+          "dtype": "bfloat16",
+          "shape": "[rows,64,128]",
+          "role": "out"
+        },
+        {
+          "name": "lse",
+          "dtype": "float32",
+          "shape": "[rows,64] base-2",
+          "role": "out"
+        },
+        {
+          "name": "scratch",
+          "dtype": "uint8",
+          "shape": "[1280]",
+          "role": "scratch"
+        }
+      ],
+      "scalars": [
+        {
+          "name": "rows",
+          "type": "int32"
+        },
+        {
+          "name": "batch",
+          "type": "int32"
+        },
+        {
+          "name": "table_stride",
+          "type": "int32"
+        },
+        {
+          "name": "pool_pages",
+          "type": "int64"
+        }
+      ],
+      "scratch_bytes_at_capacity": {
+        "scratch": 1280
+      }
+    },
+    {
+      "name": "minimax_attention_extend",
+      "family": "minimax",
+      "op": "minimax_attention",
+      "params": {
+        "max_rows": 4096,
+        "mode": "extend",
+        "max_batch": 64
+      },
+      "capacity_rows": 4096,
+      "geometry": {
+        "max_rows": 4096,
+        "max_batch": 64,
+        "page_rows": 64,
+        "query_heads": 64,
+        "kv_heads": 4,
+        "head_dim": 128,
+        "block_tokens": 128,
+        "topk": 16,
+        "mode": "extend",
+        "softmax_scale": 0.08838834764831845
+      },
+      "pointers": [
+        {
+          "name": "query",
+          "dtype": "bfloat16",
+          "shape": "[rows,64,128]",
+          "role": "in"
+        },
+        {
+          "name": "key_cache",
+          "dtype": "uint8",
+          "shape": "[pool_pages,64,4,128] E4M3 bytes",
+          "role": "in"
+        },
+        {
+          "name": "value_cache",
+          "dtype": "uint8",
+          "shape": "[pool_pages,64,4,128] E4M3 bytes",
+          "role": "in"
+        },
+        {
+          "name": "k_descale",
+          "dtype": "float32",
+          "shape": "[batch,4]",
+          "role": "in"
+        },
+        {
+          "name": "v_descale",
+          "dtype": "float32",
+          "shape": "[batch,4]",
+          "role": "in"
+        },
+        {
+          "name": "page_table",
+          "dtype": "int32",
+          "shape": "[batch,table_stride]",
+          "role": "in"
+        },
+        {
+          "name": "cache_lengths",
+          "dtype": "int32",
+          "shape": "[batch] including appended queries",
+          "role": "in"
+        },
+        {
+          "name": "cu_seqlens_q",
+          "dtype": "int32",
+          "shape": "[batch+1] packed query offsets; decode arange",
+          "role": "in"
+        },
+        {
+          "name": "q2k_indices",
+          "dtype": "int32",
+          "shape": "[4,4096,16]",
+          "role": "in"
+        },
+        {
+          "name": "output",
+          "dtype": "bfloat16",
+          "shape": "[rows,64,128]",
+          "role": "out"
+        },
+        {
+          "name": "lse",
+          "dtype": "float32",
+          "shape": "[rows,64] base-2",
+          "role": "out"
+        },
+        {
+          "name": "scratch",
+          "dtype": "uint8",
+          "shape": "[2377728]",
+          "role": "scratch"
+        }
+      ],
+      "scalars": [
+        {
+          "name": "rows",
+          "type": "int32"
+        },
+        {
+          "name": "batch",
+          "type": "int32"
+        },
+        {
+          "name": "table_stride",
+          "type": "int32"
+        },
+        {
+          "name": "pool_pages",
+          "type": "int64"
+        }
+      ],
+      "scratch_bytes_at_capacity": {
+        "scratch": 2377728
+      }
+    }
+  ]
+}

@@ -254,6 +254,24 @@ def geometry_context(name: str, requested: int) -> int:
     return min(requested, checkpoint[1]) if checkpoint else requested
 
 
+def minimax_sparse_programs(decode_rows: int, prefill_rows: int, max_context: int):
+    from functools import partial
+    from b12x.integration.cuteafd.minimax_indexer import compile_minimax_index_aot
+    from b12x.integration.cuteafd.minimax_attention import compile_minimax_attention_aot
+
+    max_pages = (geometry_context("minimax", max_context) + 63) // 64
+    result = []
+    for mode, rows in (("decode", decode_rows), ("prefill", prefill_rows)):
+        params = dict(max_rows=rows, max_pages=max_pages, mode=mode)
+        result.append((f"index_{mode}", "minimax_index", params,
+                       partial(compile_minimax_index_aot, **params)))
+    for mode, rows in (("decode", decode_rows), ("extend", prefill_rows)):
+        params = dict(max_rows=rows, max_batch=decode_rows, mode=mode)
+        result.append((f"attention_{mode}", "minimax_attention", params,
+                       partial(compile_minimax_attention_aot, **params)))
+    return result
+
+
 def validate_table_residency(stem: str, geometry: dict, *, diagnostic: bool = False) -> None:
     # Fused top-k has fixed CTA-group spin barriers. The native table has no
     # loaded-kernel occupancy gate/fallback; even a new decode bucket must not
@@ -1675,6 +1693,9 @@ def main() -> None:
         from export_b12x_exlr8_dense_aot import minimax_programs
         manifest["families"]["minimax"] = {"abi_version": 1}
         work += [("minimax", *item) for item in minimax_programs()]
+        manifest["family_capacities"]["minimax"] = {"max_context": geometry_context("minimax", args.max_context)}
+        work += [("minimax", *item) for item in minimax_sparse_programs(
+            args.decode_rows, args.prefill_rows, args.max_context)]
     # Per-program reuse (python/tools/lib/_export_cache.py): only under the export
     # cache's recorder. Programs compile independently of which others the
     # geometry list requests; their recipes read every argument except these.
@@ -1685,7 +1706,8 @@ def main() -> None:
         if selected is not None and suffix not in selected:
             continue
         stem = (suffix if family == "kimi_split" else
-                f"exlr8_dense_{suffix}" if family == "minimax" else f"{family}_{suffix}")
+                f"exlr8_dense_{suffix}" if family == "minimax" and op in ("dense_mxfp8", "dense_mxfp8_quant")
+                else f"{family}_{suffix}")
         object_selection = globals().get("_selected_object_labels")
         if object_selection is not None and not any(label == stem or label.startswith(stem + "_sm")
                                                    for label in object_selection):

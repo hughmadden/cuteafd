@@ -317,6 +317,8 @@ impl<'a> Programs<'a> {
                 }
             } else if name.starts_with("exlr8_") {
                 validate_exlr8_entry(spec, entry)?;
+            } else if name.starts_with("minimax_") {
+                crate::minimax_m3::validate_entry(spec, entry)?;
             }
         }
         Ok(self)
