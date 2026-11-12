@@ -71,6 +71,17 @@ coverage and delta KL against the same reference, not byte identity across
 different transformer cuts. Standard-tier wall time measures the host-gather
 cost; a device reducer is follow-up work only if that cost is unacceptable.
 
+GLM 5.3 K4/Core-K6 qualification (#1444, 2026-11-13): on one RTX PRO 6000
+and four Sparks, all 16,384 prefill rows in Standard's 32 windows were
+byte-identical between the legacy reservation and bounded scoring, including
+positions and raw payload hashes (full-vocabulary KL 0, top-1 agreement 1).
+The ordinary flag-free DFlash2 launch also passed Standard's full 32+32
+windows with automatic admission: 1,371,392 KV tokens, 1,048,576 context and
+zero onboarded expert layers. Decode generated-row KL/top-1 were
+0.037970/0.944911; prefill 0.034099/0.950892, with no missing/nonfinite rows.
+The paired runtime seal was `65a0f104f`; Mistral Large 4 remains unqualified
+and disabled separately despite sharing GLM's engine.
+
 ## 0. Recommendation in one box
 
 - **Hard bar (paired, same engine, same positions, decode-shaped scoring):**
