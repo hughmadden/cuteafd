@@ -88,6 +88,9 @@ GLMF_GEOMETRY = re.compile(
 QWEN_GEOMETRY = re.compile(
     r"GraphKey \{ segment: (\d+), rows: (\d+), spec: (true|false), long: (true|false), "
     r"pool_width: (\d+), page_stride: (\d+), pool_stride: (\d+) \}")
+QWEN_NORMALIZED_GEOMETRY = re.compile(
+    r"GraphKey \{ segment: (\d+), rows: (\d+), spec: (true|false), head: (true|false), "
+    r"long: (true|false), page_width: (\d+), page_stride: (\d+), pool_stride: (\d+) \}")
 QWEN_SHAPES = ("single_0spark", "single_sparks", "dual_0spark", "dual_sparks")
 KIMI_ROWS = re.compile(r"rows=(\d+)")
 KIMI_RANK = re.compile(r"rank=(\d+)")
@@ -1388,6 +1391,18 @@ def generate_muse(traces, ranks, onboard_layers):
 
 
 def qwen_geometry(graph):
+    match = QWEN_NORMALIZED_GEOMETRY.fullmatch(graph["shape"])
+    if match is not None:
+        segment, rows, spec, head, long, page_width, page_stride, pool_stride = match.groups()
+        rows, page_width, page_stride, pool_stride = map(int, (rows, page_width, page_stride, pool_stride))
+        if rows <= 0 or page_width != page_stride:
+            raise ValueError("unsupported normalized Qwen prewarm geometry")
+        if page_stride == 0:
+            if long != "false" or pool_stride != 0 or (head == "true" and spec != "false"):
+                raise ValueError("invalid normalized Qwen GDN/head geometry")
+        elif head == "true" or (long == "true") != (pool_stride > 0):
+            raise ValueError("invalid normalized Qwen Full geometry")
+        return (rows, spec == "true", long == "true", 0, page_stride, pool_stride)
     match = QWEN_GEOMETRY.search(graph["shape"])
     if match is None:
         raise ValueError(f"cannot parse qwen4 identity: {graph['shape']!r}")
@@ -1448,6 +1463,20 @@ def generate_qwen(traces, shape, coverage=0.999, pin_report=None, summary=None):
     devices = sorted(devices)
     if len(devices) != owners:
         raise ValueError(f"{shape} needs {owners} device traces, found {devices}")
+    styles = {QWEN_NORMALIZED_GEOMETRY.fullmatch(graph["shape"]) is not None
+              for _, trace in latest.values() for graph in trace["graphs"]
+              if graph["site"].startswith("qwen4.")}
+    if len(styles) != 1:
+        raise ValueError("Qwen traces must use one graph-key format")
+    normalized = True in styles
+
+    def compatible(key, graph, step):
+        if not normalized or key[4] != 0:
+            return key == step
+        # GDN has only rows/spec; the explicit terminal head ignores spec too.
+        head = QWEN_NORMALIZED_GEOMETRY.fullmatch(graph["shape"])[4] == "true"
+        return key[0] == step[0] and (head or key[1] == step[1])
+
     # Frequency and heat use only each device's latest complete inventory:
     # identities missing from it have been forgotten and must not survive.
     # Only replayed graphs rank the working set: a startup capture is an event
@@ -1468,7 +1497,7 @@ def generate_qwen(traces, shape, coverage=0.999, pin_report=None, summary=None):
             replay = qwen_replay(graph)
             # Every layer segment runs once per decode step: rank a shape by its
             # busiest segment rather than summing all of them.
-            if replay > 0:
+            if replay > 0 and (not normalized or geometry[4] > 0):
                 counts[geometry] = max(counts.get(geometry, 0), replay)
     if not counts:
         raise ValueError("trace records no replayed graph identities")
@@ -1504,6 +1533,11 @@ def generate_qwen(traces, shape, coverage=0.999, pin_report=None, summary=None):
             reasons.setdefault(key, set()).add("sustained_heat")
         if int(graph.get("evictions", 0)) >= 2 and int(graph.get("recaptures", 0)) >= 2:
             reasons.setdefault(key, set()).add("repeated_recapture")
+    if normalized:
+        for _, (key, graph) in identities.items():
+            for step in counts:
+                if key in reasons and compatible(key, graph, step):
+                    reasons.setdefault(step, set()).update(reasons[key])
     ranked = sorted(counts, key=lambda key: (-counts[key], key))
     total = sum(counts.values())
     covered = 0
@@ -1527,7 +1561,7 @@ def generate_qwen(traces, shape, coverage=0.999, pin_report=None, summary=None):
                 continue
             for device in devices:
                 graphs = [graph for identity, (geometry, graph) in identities.items()
-                          if identity[0] == device and geometry == key]
+                          if identity[0] == device and compatible(geometry, graph, key)]
                 if not graphs:
                     continue
                 cost = sum(int(graph["permanent_bytes"]) for graph in graphs) \
@@ -1549,10 +1583,13 @@ def generate_qwen(traces, shape, coverage=0.999, pin_report=None, summary=None):
     zero_share = []
     for device in devices:
         total = 0
+        charged = set()
         for selected_key in sorted(selected):
             for identity, (geometry, graph) in identities.items():
-                if identity[0] != device or geometry != selected_key:
+                if (identity[0] != device or identity in charged
+                        or not compatible(geometry, graph, selected_key)):
                     continue
+                charged.add(identity)
                 share = graph.get("capture_bytes")
                 if share is None:
                     raise ValueError(

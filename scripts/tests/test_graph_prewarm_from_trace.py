@@ -853,6 +853,57 @@ def test_qwen_regeneration_reproduces_a_checked_in_generation_exactly():
     assert generated == expected
 
 
+
+def normalized_qwen_identity(segment, rows=64, spec=False, head=False, long=False,
+                             page_width=0, page_stride=0, pool_stride=0):
+    return (f"GraphKey {{ segment: {segment}, rows: {rows}, spec: {str(spec).lower()}, "
+            f"head: {str(head).lower()}, long: {str(long).lower()}, page_width: {page_width}, "
+            f"page_stride: {page_stride}, pool_stride: {pool_stride} }}")
+
+
+def test_qwen_normalized_full_shapes_project_gdn_and_explicit_head_once():
+    data = qwen_trace(capture=(1 << 20, 2 << 20, 4 << 20))
+    template = data["graphs"][0]
+    data["graphs"] = []
+    for identity, hits, share in [
+            (normalized_qwen_identity(0), 1000, 1 << 20),
+            (normalized_qwen_identity(1, page_width=64, page_stride=64), 100, 2 << 20),
+            (normalized_qwen_identity(1, long=True, page_width=128, page_stride=128, pool_stride=32), 50, 3 << 20),
+            (normalized_qwen_identity(2, head=True), 1000, 4 << 20),
+            # A startup-only GDN sibling belongs to selected Full steps too.
+            (normalized_qwen_identity(3), 0, 1 << 20),
+            # Same rows but different spec is not a compatible GDN identity.
+            (normalized_qwen_identity(4, spec=True), 1000, 99 << 20)]:
+        graph = copy.deepcopy(template)
+        graph.update(shape=identity, key_id=len(data["graphs"]), hits=hits, capture_bytes=share)
+        data["graphs"].append(graph)
+    result = MODULE.generate_qwen([data], "single_0spark", coverage=1)
+    assert result["trace"]["entries"] == [
+        {"rows": 64, "spec": False, "long": False, "pool_width": 0,
+         "page_stride": 64, "pool_stride": 0, "pin": False},
+        {"rows": 64, "spec": False, "long": True, "pool_width": 0,
+         "page_stride": 128, "pool_stride": 32, "pin": False}]
+    assert result["reserve_base_bytes"] == [12 << 20]  # 1+2+3+4+1, rounded once.
+    # Ranking uses Full demand, not the much hotter zero-geometry identities.
+    first = MODULE.generate_qwen([data], "single_0spark", coverage=0.6)
+    assert len(first["trace"]["entries"]) == 1
+    assert first["reserve_base_bytes"] == [8 << 20]
+    repeated = MODULE.generate_qwen([data, data], "single_0spark", coverage=1)
+    assert repeated["trace"]["entries"] == result["trace"]["entries"]
+    assert repeated["reserve_base_bytes"] == result["reserve_base_bytes"]
+    assert repeated["reserve_extra_bytes"] == result["reserve_extra_bytes"]
+
+
+def test_qwen_normalized_trace_rejects_unrepresentable_and_mixed_geometries():
+    data = qwen_trace()
+    data["graphs"][0]["shape"] = normalized_qwen_identity(0, page_width=32, page_stride=64)
+    with pytest.raises(ValueError, match="one graph-key format"):
+        MODULE.generate_qwen([data], "single_0spark")
+    data["graphs"] = [data["graphs"][0]]
+    with pytest.raises(ValueError, match="unsupported normalized"):
+        MODULE.generate_qwen([data], "single_0spark")
+
+
 def qwen_list():
     def shape(name, owners):
         return {"shape": name, "reserve_base_bytes": [5 << 30] * owners,
