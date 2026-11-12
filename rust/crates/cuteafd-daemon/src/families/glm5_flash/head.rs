@@ -192,7 +192,8 @@ impl<'a> GlmfHead<'a> {
     }
 
     /// FP32 logits `[rows, vocab]` of BF16 rows `x [rows, hidden]` through the
-    /// FP8 head, in 16-row spans of `glmf_head_fp8`. Errors on a BF16 head.
+    /// FP8 head. Row-FP8 uses 16-row GEMV spans; block-FP8 launches once,
+    /// selecting GEMV through 16 rows and W8A16 GEMM above. Errors on a BF16 head.
     ///
     /// # Safety
     /// `x` and `logits` must hold `rows` rows of `hidden` BF16 and `vocab` FP32
@@ -207,7 +208,16 @@ impl<'a> GlmfHead<'a> {
         ensure!(values.buffer.bytes == vocab * hidden
             && scales.buffer.bytes >= if block { vocab/128*(hidden/128)*4 } else { vocab*(hidden/128)*4 },
             "FP8 head operands do not match [{vocab}, {hidden}]");
+        ensure!(rows <= i32::MAX as usize, "FP8 head row count {rows} exceeds its scalar ABI");
         let program = programs.program(if block { "glmf_head_block_fp8" } else { "glmf_head_fp8" }, &["x", "w_fp8", "scale", "logits"])?;
+        if block {
+            if rows > 0 {
+                // SAFETY: the caller's input/output extents and this head's live operands.
+                unsafe { program.launch(&[x.cast_mut(), values.buffer.ptr, scales.buffer.ptr, logits.cast()],
+                    &[Scalar::I32(rows as i32)], stream)?; }
+            }
+            return Ok(());
+        }
         for (first, n) in fp8_head_spans(rows) {
             let x = x.cast::<u8>().wrapping_add(first * hidden * 2).cast_mut().cast();
             let out = logits.cast::<u8>().wrapping_add(first * vocab * 4).cast();

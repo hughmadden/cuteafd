@@ -79,6 +79,24 @@ def exporter(monkeypatch):
     return module
 
 
+def test_block_fp8_head_keeps_exact_w8a16_wide_route():
+    tree = ast.parse(EXPORTER.read_text())
+    compiler = next(node for node in tree.body if isinstance(node, ast.FunctionDef)
+                    and node.name == "compile_glmf_head_block_fp8")
+    source = ast.get_source_segment(EXPORTER.read_text(), compiler)
+    assert 'TmaFp8Gemm(vocab, g.hidden, scales="block", out_dtype=cutlass.Float32)' in source
+    assert 'if rows <= Int32(16):' in source
+    assert 'self.gemv(x, w_fp8, scale, logits, rows, stream)' in source
+    assert 'self.gemm(x, w_fp8, scale, logits, rows, stream)' in source
+    assert 'max_rows=4096' in source
+    assert 'launch.gemm.key()' in source
+    assert 'BlockFp8Projection' not in source
+    runtime = (ROOT / "rust/crates/cuteafd-daemon/src/families/glm5_flash/head.rs").read_text()
+    single = runtime.split('        if block {', 1)[1].split('        for (first, n)', 1)[0]
+    assert 'Scalar::I32(rows as i32)' in single
+    assert 'return Ok(());' in single
+
+
 def test_ml4_context_fc_exports_the_canonical_bf16_projection(exporter, monkeypatch):
     package = sys.modules["b12x.integration.cuteafd"]
     ml4 = _Compilers("b12x.integration.cuteafd.mistral_large4")

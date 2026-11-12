@@ -614,14 +614,14 @@ def mimo_head_split_programs(g, decode_rows: int, prefill_rows: int, max_context
 
 
 def compile_glmf_head_block_fp8(g, vocab=154880):
-    """Block-128 FP8 vocabulary projection, sharing the canonical skinny GEMV."""
+    """Block-128 FP8 head: skinny GEMV through 16 rows, exact-BF16 W8A16 above."""
     global cute, cuda, Int32
     import torch
     import cutlass
     import cutlass.cute as cute
     import cuda.bindings.driver as cuda
     from cutlass import Int32
-    from b12x.integration.cuteafd._fp8_weights import MmaFp8Gemv, fp8_gemv_tuning, fp8_gemv_shipped_warps
+    from b12x.integration.cuteafd._fp8_weights import MmaFp8Gemv, TmaFp8Gemm, fp8_gemv_tuning, fp8_gemv_shipped_warps
     from b12x.integration.cuteafd._common import Operand, Scalar, compile_program
     warps, groups = fp8_gemv_tuning(vocab, g.hidden,
         warps=fp8_gemv_shipped_warps(vocab, g.hidden, warps=4))
@@ -630,11 +630,15 @@ def compile_glmf_head_block_fp8(g, vocab=154880):
         def __init__(self):
             self.gemv = MmaFp8Gemv(vocab, g.hidden, max_rows=16, warps=warps,
                 groups=groups, out_dtype=cutlass.Float32)
+            self.gemm = TmaFp8Gemm(vocab, g.hidden, scales="block", out_dtype=cutlass.Float32)
 
         @cute.jit
         def __call__(self, x: cute.Pointer, w_fp8: cute.Pointer, scale: cute.Pointer,
                      logits: cute.Pointer, rows: Int32, stream: cuda.CUstream):
-            self.gemv(x, w_fp8, scale, logits, rows, stream)
+            if rows <= Int32(16):
+                self.gemv(x, w_fp8, scale, logits, rows, stream)
+            else:
+                self.gemm(x, w_fp8, scale, logits, rows, stream)
 
     launch = Head()
     return compile_program(launch, name="glmf_head_block_fp8", operands=(
@@ -642,8 +646,8 @@ def compile_glmf_head_block_fp8(g, vocab=154880):
         Operand("w_fp8", torch.uint8, f"[{vocab},{g.hidden}]"),
         Operand("scale", torch.float32, f"[{vocab//128},{g.hidden//128}]", align=4),
         Operand("logits", torch.float32, f"[rows,{vocab}]", "out")),
-        scalars=(Scalar("rows"),), key=(vocab, launch.gemv.key()),
-        geometry=dict(hidden=g.hidden, vocab=vocab, max_rows=16, scale_block=128))
+        scalars=(Scalar("rows"),), key=(vocab, launch.gemv.key(), launch.gemm.key()),
+        geometry=dict(hidden=g.hidden, vocab=vocab, max_rows=4096, scale_block=128, gemv_rows=16))
 
 
 def glmf_programs(g, decode_rows: int, prefill_rows: int, max_context: int):
