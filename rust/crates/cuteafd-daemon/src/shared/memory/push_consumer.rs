@@ -257,9 +257,9 @@ pub(crate) fn consume<'a, A: PushDestination>(
                 let stream = copies.streams[stream_index];
                 // SAFETY: checked live arena/ring views, retained through the slot's
                 // event or the teardown drain; the copies stream is non-default.
-                device.run(|| unsafe {
+                super::load_timing::push(lens.iter().sum(), || device.run(|| unsafe {
                     device.library.copy_host_buffers_h2d_batch_async(&dsts, &srcs, &lens, stream)
-                })?;
+                }))?;
                 // SAFETY: event and stream belong to device and remain retained by Copies.
                 device.run(|| unsafe { device.library.cuda_event_record(event, stream) })?;
                 copies.pending.insert(index, fragments);

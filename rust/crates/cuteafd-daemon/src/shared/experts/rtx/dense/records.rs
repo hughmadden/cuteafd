@@ -101,6 +101,31 @@ pub(crate) struct Operand {
     pub bytes: usize,
 }
 
+/// Unchanged rectangles landing directly in an existing resident pinned owner.
+#[derive(Clone)]
+pub(crate) struct HostOperand {
+    pub device: i32,
+    pub landing: crate::shared::memory::HostLanding,
+    pub rect: Rect,
+}
+impl HostOperand {
+    pub fn mount(&self) -> Result<()> {
+        self.landing.fill(|out| self.rect.read(out))
+    }
+}
+/// Record without reading, or use the mount only outside a SparkNest namespace.
+pub(crate) fn host_operand(operand: HostOperand) -> Result<()> {
+    ensure!(operand.rect.bytes() == operand.landing.bytes(), "host operand extent differs from owner");
+    let mut pending = Some(operand);
+    if recorded(|r| r.host_operands.push(pending.take().expect("one host operand"))) { return Ok(()); }
+    let operand = pending.expect("host operand");
+    match cuteafd_loader::push_load::namespace(&operand.rect.path) {
+        Ok(_) => anyhow::bail!("SparkNest host embedding requires an admitted push group"),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => operand.mount(),
+        Err(error) => Err(error.into()),
+    }
+}
+
 /// One GPU transform of a step's staged bytes (byte offsets are into the staging).
 #[derive(Clone)]
 pub(crate) enum Job {
@@ -646,7 +671,7 @@ impl DenseSink {
     }
     /// Every record, finishes included (leaves the sink empty).
     pub fn take_all(&self) -> Records {
-        Records { operands: self.operands.take(), steps: self.steps.take(), finishes: self.finishes.take(),
+        Records { host_operands: Vec::new(), operands: self.operands.take(), steps: self.steps.take(), finishes: self.finishes.take(),
             peer_copies: self.peer_copies.take() }
     }
 }
@@ -777,6 +802,7 @@ pub(crate) fn committed_peer_copies<T>(library: &NativeLibrary, delivered: Resul
 #[derive(Clone, Default)]
 pub(crate) struct Records {
     pub operands: Vec<Operand>,
+    pub host_operands: Vec<HostOperand>,
     pub steps: Vec<Step>,
     pub finishes: Vec<Finish>,
     pub peer_copies: Vec<PeerCopy>,
@@ -786,6 +812,7 @@ impl Records {
     /// `other`'s records after these (loader order).
     pub fn extend(&mut self, other: Records) {
         self.operands.extend(other.operands);
+        self.host_operands.extend(other.host_operands);
         self.steps.extend(other.steps);
         self.finishes.extend(other.finishes);
         self.peer_copies.extend(other.peer_copies);
@@ -976,6 +1003,7 @@ pub(crate) fn fill_by_mount(library: &NativeLibrary, operands: &[Operand], steps
 /// [`fill_by_mount`] for a whole record set, then its finishes.
 pub(crate) fn fill_records_by_mount(library: &NativeLibrary, records: &Records,
     stream: impl Fn(i32) -> *mut c_void) -> Result<()> {
+    for host in &records.host_operands { host.mount()?; }
     fill_by_mount(library, &records.operands, &records.steps, &stream)?;
     records.run_finishes(library, stream)?;
     run_peer_copies(library, &records.peer_copies)

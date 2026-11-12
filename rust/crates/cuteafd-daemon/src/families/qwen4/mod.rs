@@ -660,23 +660,23 @@ impl Opened {
                 let _memory_scope = cuteafd_ffi::memory_ledger::scope("weights");
                 planning.model(&self.cfg, layers, with_mtp, args.mtp_fp8_head)?
             };
-            let mut records = load.sink.as_ref().context("push sink")?.take_all();
+            let ((embedding, ()), mut records) = crate::shared::experts::rtx::dense::recording(||
+                crate::shared::token_io::TokenEmbedding::load_with(&self.library, source.clone(), args.token_io.embed_placement,
+                    || Ok(()), |name, bytes| loader.embedding_allocation(name, bytes)))?;
+            records.extend(load.sink.as_ref().context("push sink")?.take_all());
             records.extend(media.clone());
             let (landed, operands, staged, steps, largest, finishes) = records.summary();
             tracing::info!(landed, operands, staged, steps, largest_step_bytes = largest, finishes,
                 "Qwen coordinator dense records planned");
             let dense = crate::shared::experts::rtx::dense::plan_records(&args.snapshot, records.clone(), &[device], 0)?;
             let push = crate::shared::experts::rtx::push::CoordinatorPush::prepare_alone(&args.snapshot, None, 1, None)?;
-            Ok((push, model, records, dense))
+            Ok((push, embedding, model, records, dense))
         }).context("Qwen coordinator dense push planning")?;
         let (embedding, model) = match planned {
-            Some((push, model, records, dense)) => {
+            Some((push, embedding, model, records, dense)) => {
                 let split = crate::shared::memory::load_timing::Split::start();
-                let (pushed, embedding) = push.receive_with(vec![device], None, 0, Some(Ok(dense)), ||
-                    crate::shared::token_io::TokenEmbedding::load_with(&self.library, source, args.token_io.embed_placement,
-                        || Ok(()), |name, bytes| loader.embedding_allocation(name, bytes)));
+                let (pushed, ()) = push.receive_with(vec![device], None, 0, Some(Ok(dense)), || ());
                 let pushed = push_policy.committed(pushed).context("Qwen coordinator dense push delivery")?;
-                let (embedding, ()) = embedding?;
                 tracing::info!(pushed = pushed.is_some(), operands = records.operands.len(),
                     "Qwen coordinator dense operands landed");
                 split.log("qwen4 dense push");

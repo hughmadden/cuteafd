@@ -55,6 +55,7 @@ impl Split {
         Self { started: Instant::now(), totals, _thread: Default::default() }
     }
     pub fn read_bytes(&self) -> u64 { self.totals.lock().unwrap_or_else(|e| e.into_inner()).counters[0].bytes }
+    pub fn push_bytes(&self) -> u64 { self.totals.lock().unwrap_or_else(|e| e.into_inner()).counters[3].bytes }
     pub fn log(self, label: &str) {
         let elapsed = self.started.elapsed().as_secs_f64();
         let totals = self.totals.lock().unwrap_or_else(|e| e.into_inner());
@@ -90,7 +91,7 @@ mod tests {
         // SAFETY: integer results are unaliased and have no device work.
         unsafe { crate::synchronized_load::load_pair(|rank| {
             let nested = Split::start();
-            read(1000, || ()); // deliberately outside the inherited parent
+            read(1000, || ()); // inherited parent plus receiver-local bracket
             assert_eq!(nested.read_bytes(), 1000);
             context.enter(|| { read(rank + 3, || ()); upload(5, || ()); quantize(7, || ()); push(11, || ()); });
             Ok(rank)

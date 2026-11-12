@@ -123,6 +123,7 @@ pub(crate) struct RankLayout {
     pub device: i32,
     /// (logical start, operand), ascending, device space `[0, base)`.
     pub operands: Vec<(u64, Operand)>,
+    pub host_operands: Vec<(u64, HostOperand)>,
     /// (start relative to `base`, step), ascending.
     pub steps: Vec<(u64, Step)>,
     pub base: u64,
@@ -206,8 +207,18 @@ impl RankLayout {
         }
         let host_staging = HostStaging::for_steps(staged.iter().map(|(_, step)| step.rects.as_slice()), table_bytes)?;
         host_staging.bytes()?;
-        Ok(Self { device, operands: placed, steps: staged, base, host_bytes: if cursor == 0 { 0 } else { cursor },
+        Ok(Self { device, host_operands: Vec::new(), operands: placed, steps: staged, base, host_bytes: if cursor == 0 { 0 } else { cursor },
             finishes: Vec::new(), host_staging })
+    }
+
+    pub fn with_hosts(mut self, hosts: Vec<HostOperand>) -> Result<Self> {
+        for host in hosts {
+            ensure!(host.device == self.device, "host operand belongs to another receiver");
+            let at = self.host_bytes.next_multiple_of(256);
+            self.host_bytes = at.checked_add(host.rect.bytes() as u64 + 1).context("host landing overflow")?;
+            self.host_operands.push((at, host));
+        }
+        Ok(self)
     }
 
     /// [`Self::new`] with `device`'s finishes from `finishes`.
@@ -222,11 +233,13 @@ impl RankLayout {
         let operands: Vec<(u64, Vec<(Rect, usize)>)> = self.operands.iter()
             .map(|(start, o)| (*start, o.lands.clone())).collect();
         let steps: Vec<(u64, Vec<Rect>)> = self.steps.iter().map(|(start, s)| (*start, s.rects.clone())).collect();
+        let hosts = self.host_operands.iter().map(|(at, host)| (*at, host.rect.clone())).collect::<Vec<_>>();
         super::push::DensePlan { base: self.base, host_bytes: self.host_bytes, host_staging: self.host_staging, peer_copies: Vec::new(),
             append: Box::new(move |builder, rank, host_base| {
                 for (start, lands) in &operands {
                     for (rect, at) in lands { append(rect, builder, rank, start + *at as u64)?; }
                 }
+                for (at, rect) in &hosts { append(rect, builder, rank, host_base + at)?; }
                 for (start, rects) in &steps {
                     let mut at = host_base + start;
                     for rect in rects { append(rect, builder, rank, at)?; at += rect.bytes() as u64; }
@@ -296,6 +309,15 @@ impl<'a> DenseArena<'a> {
         Ok((operand.buffer, at))
     }
 
+    fn host(&self, offset: u64, bytes: u64) -> Option<(&HostOperand, usize)> {
+        let relative = offset.checked_sub(self.layout.base)?;
+        let index = self.layout.host_operands.partition_point(|(start, _)| *start <= relative).checked_sub(1)?;
+        let (start, host) = &self.layout.host_operands[index];
+        let at = usize::try_from(relative - start).ok()?;
+        at.checked_add(usize::try_from(bytes).ok()?).filter(|&end| end <= host.rect.bytes())?;
+        Some((host, at))
+    }
+
     fn step(&self, offset: u64, bytes: u64) -> Result<(usize, usize)> {
         let relative = offset.checked_sub(self.layout.base).context("host fragment below the steps")?;
         let index = self.layout.steps.partition_point(|(start, _)| *start <= relative).checked_sub(1)
@@ -330,7 +352,7 @@ impl PushDestination for DenseArena<'_> {
     fn device_bytes(&self) -> usize { self.layout.base as usize }
     fn check_fragment(&self, offset: u64, bytes: u64) -> Result<()> {
         ensure!(bytes > 0 && self.expected.contains(offset, bytes), "fragment outside checked footprint");
-        if offset < self.layout.base { self.operand(offset, bytes).map(|_| ()) } else { self.step(offset, bytes).map(|_| ()) }
+        if offset < self.layout.base { self.operand(offset, bytes).map(|_| ()) } else if self.host(offset, bytes).is_some() { Ok(()) } else { self.step(offset, bytes).map(|_| ()) }
     }
     fn destination(&self, offset: usize, bytes: usize) -> Result<CuteafdDeviceBuffer> {
         let (buffer, at) = self.operand(offset as u64, bytes as u64)?;
@@ -340,6 +362,10 @@ impl PushDestination for DenseArena<'_> {
     fn copy_validation(&mut self, offset: u64, bytes: &[u8]) -> Result<()> {
         let length = bytes.len() as u64;
         ensure!(self.expected.contains(offset, length), "staged fragment outside checked footprint");
+        if let Some((host, at)) = self.host(offset, length) {
+            crate::shared::memory::load_timing::push(bytes.len(), || host.landing.copy(at, bytes))?;
+            return self.expected.record(&mut self.coverage, offset, length);
+        }
         let (index, at) = self.step(offset, length)?;
         let need = self.layout.steps[index].1.bytes();
         if !self.open.contains_key(&index) {
@@ -368,7 +394,8 @@ impl PushDestination for DenseArena<'_> {
             self.open.insert(index, (staging, 0));
         }
         let (staging, delivered) = self.open.get_mut(&index).context("open step")?;
-        staging.bytes_mut()[at..at + bytes.len()].copy_from_slice(bytes);
+        crate::shared::memory::load_timing::push(bytes.len(), ||
+            staging.bytes_mut()[at..at + bytes.len()].copy_from_slice(bytes));
         *delivered += length;
         self.expected.record(&mut self.coverage, offset, length)?;
         if *delivered == need as u64 {
@@ -399,6 +426,8 @@ impl PushDestination for DenseArena<'_> {
         })?;
         let finish_ms = finished.elapsed().as_secs_f64() * 1e3;
         tracing::info!(device = self.device.id, operands = self.layout.operands.len(), steps = self.run,
+            host_operands = self.layout.host_operands.len(),
+            host_operand_bytes = self.layout.host_operands.iter().map(|(_, h)| h.rect.bytes() as u64).sum::<u64>(),
             finishes = self.layout.finishes.len(), finish_ms,
             peak_staged_mib = self.peak as f64 / (1u64 << 20) as f64,
             peak_pinned_mib = self.peak_held as f64 / (1u64 << 20) as f64, "coordinator dense rank delivered");
@@ -422,7 +451,7 @@ pub(crate) fn plan_ranks<'a>(snapshot: &std::path::Path, operands: Vec<Operand>,
 pub(crate) fn plan_records<'a>(snapshot: &std::path::Path, records: Records,
     devices: &[Device<'a>], sparks: usize)
     -> Result<(Vec<super::push::DensePlan>, Vec<DenseArena<'a>>)> {
-    let Records { operands, steps, finishes, peer_copies } = records;
+    let Records { operands, host_operands, steps, finishes, peer_copies } = records;
     ensure!(peer_copies.iter().all(|copy| devices.iter().any(|d| d.id == copy.source_device)
         && devices.iter().any(|d| d.id == copy.destination_device)), "peer load copy outside the push group");
     ensure!(finishes.iter().all(|f| devices.iter().any(|d| d.id == f.device())),
@@ -430,6 +459,7 @@ pub(crate) fn plan_records<'a>(snapshot: &std::path::Path, records: Records,
     let (root, _) = cuteafd_loader::push_load::namespace(snapshot)?;
     let world = sparks + devices.len();
     let mut operands = operands;
+    let mut hosts = host_operands;
     let mut steps = steps;
     let mut out = (Vec::new(), Vec::new());
     for (gpu, device) in devices.iter().enumerate() {
@@ -437,7 +467,9 @@ pub(crate) fn plan_records<'a>(snapshot: &std::path::Path, records: Records,
         operands = rest;
         let (my_steps, rest): (Vec<_>, Vec<_>) = steps.into_iter().partition(|s| s.device == device.id);
         steps = rest;
-        let layout = RankLayout::new(mine, my_steps, device.id)?.with_finishes(&finishes);
+        let (my_hosts, rest): (Vec<_>, Vec<_>) = hosts.into_iter().partition(|h| h.device == device.id);
+        hosts = rest;
+        let layout = RankLayout::new(mine, my_steps, device.id)?.with_finishes(&finishes).with_hosts(my_hosts)?;
         let checked = layout.checked(&root, world, sparks + gpu)?;
         ensure!(checked.plan.files.iter().all(|f| cuteafd_loader::push_load::is_push_shard(&root.join(f))),
             "coordinator dense source is not a SparkNest shard");
@@ -447,7 +479,7 @@ pub(crate) fn plan_records<'a>(snapshot: &std::path::Path, records: Records,
         out.0.push(plan);
         out.1.push(DenseArena::new(*device, layout, expected)?);
     }
-    ensure!(operands.is_empty() && steps.is_empty(), "dense records on a GPU outside the push group");
+    ensure!(operands.is_empty() && steps.is_empty() && hosts.is_empty(), "dense records on a GPU outside the push group");
     Ok(out)
 }
 
