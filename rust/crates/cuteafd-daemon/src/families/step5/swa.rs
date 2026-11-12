@@ -1198,7 +1198,7 @@ mod tests {
             let enqueue = chain.enqueue(rows);
             let raw = device.run(|| {
                 // SAFETY: end capture even if enqueue failed.
-                unsafe { library.cuda_graph_end_capture(chain.stream.get()?.raw) }
+                unsafe { library.cuda_graph_end_capture_for_test(chain.stream.get()?.raw) }
             })?;
             // SAFETY: mutable chain borrow retains every stream, allocation and program.
             let graph = unsafe {

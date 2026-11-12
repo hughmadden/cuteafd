@@ -208,7 +208,7 @@ mod tests {
                         stream.raw,
                     )
                 };
-                let captured = unsafe { lib.cuda_graph_end_capture(stream.raw) };
+                let captured = unsafe { lib.cuda_graph_end_capture_for_test(stream.raw) };
                 let graph = captured?;
                 let checked = (|| -> Result<()> {
                     queued?;

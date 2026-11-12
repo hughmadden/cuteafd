@@ -276,7 +276,7 @@ fn step5_checkpoint_mixed_native_execution_and_graph_replay() -> Result<()> {
         let result = launch();
         // End capture even if a launch fails; retain/drain all graph resources on every exit.
         // SAFETY: begin_capture succeeded on this owned stream.
-        let raw = unsafe { library.cuda_graph_end_capture(stream.raw)? };
+        let raw = unsafe { library.cuda_graph_end_capture_for_test(stream.raw)? };
         // SAFETY: external owners are in this scope and all replays are drained before drop.
         let graph = unsafe { GraphOwner::new(&library, 0, raw, ())? };
         result?;

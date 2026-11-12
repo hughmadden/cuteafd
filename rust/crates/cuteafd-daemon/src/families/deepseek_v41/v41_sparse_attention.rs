@@ -320,6 +320,7 @@ impl<'a,const HEADS:usize> LocalSparseAttentionWave<'a,HEADS> {
                 unsafe { self.storage.stream.library.cuda_graph_exec_destroy(graph)?; }
                 Err(error)
             }
+            (Ok(()), Err(error)) if cuteafd_ffi::is_small_graph(&error) => Ok(()),
             (Err(error), Err(_)) | (Ok(()), Err(error)) => Err(error),
         }
     }
@@ -493,7 +494,21 @@ impl<'a,const HEADS:usize> LocalSparseAttentionWave<'a,HEADS> {
         ensure!(plan.tail_identity == tail.as_ref().map(|t| t.identity()), "cold attention tail identity changed");
         if let Some(tail) = tail.as_deref_mut() { unsafe { tail.restore_warmup()?; } }
         self.warmed_kernels |= plan.needed;
-        let graph = unsafe { self.capture_plan(&mut plan, &mut tail)? };
+        let graph = match unsafe { self.capture_plan(&mut plan, &mut tail) } {
+            Ok(graph) => graph,
+            Err(error) if cuteafd_ffi::is_small_graph(&error) => {
+                // SAFETY: the cold plan and tail retain the exact recorded backing.
+                unsafe {
+                    self.enqueue(plan.sink, &plan.launches, plan.selected, plan.batch.as_ref())?;
+                    if let Some(tail) = tail.as_deref_mut() { tail.enqueue(&QueuedSparseAttention {
+                        values: slice(self.storage.output.buffer, 0, plan.rows * (HEADS*1024)),
+                        layer: plan.layer, rows: plan.rows }, self.storage.stream.raw)?; }
+                }
+                return Ok(QueuedSparseAttention { values: slice(self.storage.output.buffer, 0, plan.rows * (HEADS*1024)),
+                    layer: plan.layer, rows: plan.rows });
+            }
+            Err(error) => return Err(error),
+        };
         self.insert_graph((plan.layer, plan.fingerprint), graph.0, plan.ticket, graph.1, graph.2, graph.3)?;
         let graph = graph.0;
         let launched = unsafe { self.storage.stream.library.cuda_graph_launch(graph, self.storage.stream.raw) };
@@ -858,7 +873,18 @@ impl<'a,const HEADS:usize> LocalSparseAttentionWave<'a,HEADS> {
             }
             // Metadata uploads remain ordered on this stream; capture itself
             // contains no await. Evictions are drained at the enclosing completed-step boundary.
-            let graph = unsafe { self.capture_plan(&mut plan, &mut tail)? };
+            let graph = match unsafe { self.capture_plan(&mut plan, &mut tail) } {
+                Ok(graph) => graph,
+                Err(error) if cuteafd_ffi::is_small_graph(&error) => {
+                    // SAFETY: same persistent plan and tail as the rejected recording.
+                    unsafe {
+                        self.enqueue(plan.sink, &plan.launches, plan.selected, plan.batch.as_ref())?;
+                        if let Some(tail) = tail.as_deref_mut() { tail.enqueue(&queued, self.storage.stream.raw)?; }
+                    }
+                    return Ok(Some(queued));
+                }
+                Err(error) => return Err(error),
+            };
             self.insert_graph((layer, plan.fingerprint), graph.0, plan.ticket, graph.1, graph.2, graph.3)?;
             graph.0
         };

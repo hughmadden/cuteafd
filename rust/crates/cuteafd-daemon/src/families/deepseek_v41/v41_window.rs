@@ -726,6 +726,7 @@ impl WindowWave<'_, '_> {
                     unsafe { library.cuda_graph_exec_destroy(graph)?; }
                     return Err(error);
                 }
+                (Ok(()), Err(error)) if cuteafd_ffi::is_small_graph(&error) => {},
                 (Err(error), Err(_)) | (Ok(()), Err(error)) => return Err(error),
             }
             crate::shared::decode_graph::device::observe_device(library, self.storage.input.buffer.device_id)?;
@@ -782,15 +783,17 @@ impl WindowWave<'_, '_> {
                 unsafe { ticket.capture_result(self.stream().library.cuda_graph_begin_capture(self.stream().raw))?; }
                 let queued = unsafe { self.enqueue(prepared.rows) };
                 let captured = unsafe { ticket.capture_result(self.stream().library.cuda_graph_end_capture_topology(self.stream().raw)) };
-                let (graph, nodes, width, spans, _) = match (queued, captured) {
-                    (Ok(()), Ok(topology)) => topology,
+                match (queued, captured) {
+                    (Ok(()), Ok((graph, nodes, width, spans, _))) => {
+                        self.insert_graph(prepared.rows, state.owner, graph, ticket, nodes as u64, width, spans)?;
+                    }
                     (Err(error), Ok((graph, ..))) => {
                         unsafe { self.stream().library.cuda_graph_exec_destroy(graph)?; }
                         return Err(error);
                     }
+                    (Ok(()), Err(error)) if cuteafd_ffi::is_small_graph(&error) => {},
                     (Err(error), Err(_)) | (Ok(()), Err(error)) => return Err(error),
-                };
-                self.insert_graph(prepared.rows, state.owner, graph, ticket, nodes as u64, width, spans)?;
+                }
                 // Eager proposal is complete. Capture records future work without
                 // committing cache state; publish the existing result below.
             }
@@ -911,6 +914,7 @@ impl WindowWave<'_, '_> {
                 }
                 return Err(e);
             }
+            (Ok(()), Err(error)) if cuteafd_ffi::is_small_graph(&error) => {},
             (Err(e), Err(_)) | (Ok(()), Err(e)) => return Err(e),
         }
         self.ready = Some(p);

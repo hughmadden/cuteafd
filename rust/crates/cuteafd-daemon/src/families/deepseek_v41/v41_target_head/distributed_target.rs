@@ -99,6 +99,7 @@ impl<'w, 'a> Normalize<'w, 'a> {
                     }
                 },
                 (Err(error), Ok((graph, ..))) => { unsafe { lib.cuda_graph_exec_destroy(graph)?; } return Err(error); }
+                (Ok(()), Err(error)) if cuteafd_ffi::is_small_graph(&error) => {},
                 (Err(error), Err(_)) | (Ok(()), Err(error)) => return Err(error),
             }
         }

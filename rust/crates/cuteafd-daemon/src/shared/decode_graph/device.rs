@@ -153,6 +153,7 @@ struct Record {
     spans_devices: bool,
     oom: Option<OomBackoff>,
     oom_warned: bool,
+    permanently_eager: bool,
     stats: Box<KeyStats>,
 }
 
@@ -591,6 +592,12 @@ impl DeviceCache {
 
     fn floor_skip(&mut self, old: Option<u64>, cycle: Cycle) -> Miss {
         if let Some(record) = old.and_then(|id| self.records.get_mut(&id)) {
+            if record.permanently_eager {
+                record.stats.event(site.cycle, 1);
+                record.stats.misses += 1;
+                self.counters.entry(site.cycle).or_default().eager_runs += 1;
+                return Miss::Eager;
+            }
             record.stats.event(cycle, 1);
             record.stats.misses += 1;
         }
@@ -836,7 +843,7 @@ impl DeviceCache {
                 let id = self.next_id;
                 self.identities.insert(identity.clone(), id);
                 self.records.insert(id, Record { identity, cycle: site.cycle, bytes: 0, list: None,
-                    previous: None, next: None, pinned, pending_destroy: false, pending_capture: false, frequent: false, nodes, node_rate: metadata.node_rate, graph_rate: metadata.graph_rate, parallel_width: metadata.parallel_width, spans_devices: site.spans_devices, oom: None, oom_warned: false, stats: KeyStats::new(now) });
+                    previous: None, next: None, pinned, pending_destroy: false, pending_capture: false, frequent: false, nodes, node_rate: metadata.node_rate, graph_rate: metadata.graph_rate, parallel_width: metadata.parallel_width, spans_devices: site.spans_devices, oom: None, oom_warned: false, permanently_eager: false, stats: KeyStats::new(now) });
                 id
             };
             let record = self.records.get_mut(&id).unwrap();
@@ -882,7 +889,7 @@ impl DeviceCache {
             let id = self.next_id;
             self.identities.insert(identity.clone(), id);
             self.records.insert(id, Record { identity: identity.clone(), cycle: site.cycle, bytes: estimate,
-                list: None, previous: None, next: None, pinned: false, pending_destroy: false, pending_capture: false, frequent: false, nodes, node_rate: metadata.node_rate, graph_rate: metadata.graph_rate, parallel_width: metadata.parallel_width, spans_devices: site.spans_devices, oom: None, oom_warned: false, stats: KeyStats::new(now) });
+                list: None, previous: None, next: None, pinned: false, pending_destroy: false, pending_capture: false, frequent: false, nodes, node_rate: metadata.node_rate, graph_rate: metadata.graph_rate, parallel_width: metadata.parallel_width, spans_devices: site.spans_devices, oom: None, oom_warned: false, permanently_eager: false, stats: KeyStats::new(now) });
             self.push(id, List::RecentGhost);
             self.trim_ghosts();
         }
@@ -917,6 +924,26 @@ impl DeviceCache {
         self.push(id, ghost);
         self.trim_ghosts();
         warn
+    }
+
+    /// Retain exact rejected identities outside ARC's evictable ghost lists.
+    /// Captured commands did not run and no executable was instantiated.
+    pub fn capture_too_small(&mut self, id: u64, nodes: usize) {
+        let Some(record) = self.records.get_mut(&id) else { return };
+        if record.permanently_eager { return }
+        if record.pending_capture {
+            self.pending_bytes = self.pending_bytes.saturating_sub(record.bytes);
+            self.pools.live_nodes = self.pools.live_nodes.saturating_sub(record.nodes);
+            self.pools.live_execs = self.pools.live_execs.saturating_sub(1);
+        }
+        record.pending_capture = false;
+        record.pinned = false;
+        record.permanently_eager = true;
+        record.stats.native_nodes = Some(nodes as u64);
+        tracing::info!(device = self.device, site = record.identity.site,
+            key = %record.identity.shape, nodes, "small graph permanently eager");
+        self.unlink(id);
+        // Physical charge remains a monotone high-water, including failed captures.
     }
 
     pub fn cancel_capture(&mut self, id: u64) {

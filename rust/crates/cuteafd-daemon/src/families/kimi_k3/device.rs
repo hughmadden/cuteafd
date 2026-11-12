@@ -3637,7 +3637,7 @@ mod expert_usage_tests {
             unsafe {
                 library.cuda_graph_begin_capture(fixture.stream)?;
                 route()?;
-                fixture.graph = library.cuda_graph_end_capture(fixture.stream)?;
+                fixture.graph = library.cuda_graph_end_capture_for_test(fixture.stream)?;
                 library.cuda_graph_launch(fixture.graph, fixture.stream)?;
             }
             let captures = cuteafd_ffi::graph_captures();

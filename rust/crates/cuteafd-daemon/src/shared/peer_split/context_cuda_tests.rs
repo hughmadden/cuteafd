@@ -200,7 +200,7 @@ fn time_rounds(ctx: &Ctx<'_>, rounds: usize, body: &dyn Fn(usize) -> Result<()>)
             let captured = (0..rounds).try_for_each(|_| body(rank));
             library.cuda_set_device(ctx.ranks[rank].device)?;
             // SAFETY: ends the capture begun above.
-            let graph = unsafe { library.cuda_graph_end_capture(ctx.ranks[rank].stream) };
+            let graph = unsafe { library.cuda_graph_end_capture_for_test(ctx.ranks[rank].stream) };
             captured.and(graph)
         })?;
     }

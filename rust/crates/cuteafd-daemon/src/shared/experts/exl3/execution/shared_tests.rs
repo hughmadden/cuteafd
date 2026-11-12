@@ -71,7 +71,7 @@ fn shared_capacity_scratch_matches_private_and_graph_replay() -> Result<()> {
             unsafe { library.cuda_graph_begin_capture(stream.raw)?; }
             let captured = unsafe { states[i].launch(input_buffers(), capacity, stream.raw) };
             let graph = Graph { library: &library,
-                exec: unsafe { library.cuda_graph_end_capture(stream.raw)? }, stream: stream.raw };
+                exec: unsafe { library.cuda_graph_end_capture_for_test(stream.raw)? }, stream: stream.raw };
             graphs.push((graph, captured?, expected));
         }
         // Replay every capacity after larger and smaller kernels have overwritten

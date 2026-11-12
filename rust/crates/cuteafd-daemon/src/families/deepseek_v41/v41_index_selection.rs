@@ -406,6 +406,7 @@ impl<'a> IndexSelectionWave<'a> {
                 unsafe { self.storage.stream.library.cuda_graph_exec_destroy(graph)?; }
                 Err(error)
             }
+            (Ok(()), Err(error)) if cuteafd_ffi::is_small_graph(&error) => Ok(()),
             (Err(error), Err(_)) | (Ok(()), Err(error)) => Err(error),
         }
     }
@@ -711,7 +712,7 @@ impl<'a> IndexSelectionWave<'a> {
         // Prefill tails (and any other uncached large shape) bind eagerly.
         let forced_eager = self.window.is_windowed() || crate::shared::decode_graph::census::eager("index")
             || !super::graph_policy::captures_shape(rows as u32);
-        let capture = if forced_eager || !self.warmed { false } else { self.select_graph(&fingerprint)? };
+        let mut capture = if forced_eager || !self.warmed { false } else { self.select_graph(&fingerprint)? };
         // Local ownership cancels admission on every metadata/capture failure.
         let ticket = self.capture_ticket.take();
         if defer {
@@ -756,6 +757,7 @@ impl<'a> IndexSelectionWave<'a> {
                     }
                     return Err(e);
                 }
+                (Ok(()), Err(error)) if cuteafd_ffi::is_small_graph(&error) => { capture = false; },
                 (Err(e), Err(_)) | (Ok(()), Err(e)) => return Err(e),
             }
         }

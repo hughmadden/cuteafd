@@ -218,6 +218,7 @@ impl<'w, 'a> TargetEmbeddingWave<'w, 'a> {
                         unsafe { self.storage.stream.library.cuda_graph_exec_destroy(raw)?; }
                         return Err(error);
                     }
+                    (Ok(()), Err(error)) if cuteafd_ffi::is_small_graph(&error) => {},
                     (Err(error), Err(_)) | (Ok(()), Err(error)) => return Err(error),
                 }
             }

@@ -117,7 +117,7 @@ impl<'w, 'a> DistributedDsparkTerminal<'w, 'a> {
         if !self.graphs.contains(&key) && !crate::shared::decode_graph::census::eager("dspark") {
             let pinned = cuteafd_loader::serving_capacity::v41_graphs::v41_pinned_draft(crate::families::deepseek_v41::graph_policy::ranks(), 1, requests, width);
             let Some(mut ticket) = self.graphs.cache_ticket(&key, pinned, None) else { return Ok(()); };
-            let (graph, nodes, width, spans, inspection) = device.run(|| unsafe {
+            let capture = device.run(|| unsafe {
                 ticket.capture_result(device.library.cuda_graph_begin_capture(terminal.stream.raw))?;
                 // Capture records commands only; runtime begin/enqueue retain
                 // sampling validation before any execution or graph replay.
@@ -125,13 +125,15 @@ impl<'w, 'a> DistributedDsparkTerminal<'w, 'a> {
                     else { terminal.enqueue_normalize_geometry(requests, terminal.stream.raw) };
                 let captured = ticket.capture_result(device.library.cuda_graph_end_capture_topology(terminal.stream.raw));
                 match (queued, captured) {
-                    (Ok(()), Ok(graph)) => Ok(graph),
+                    (Ok(()), Ok(graph)) => Ok(Some(graph)),
                     (Err(error), Ok((graph, _, _, _, _))) => { device.library.cuda_graph_exec_destroy(graph)?; Err(error) }
+                    (Ok(()), Err(error)) if cuteafd_ffi::is_small_graph(&error) => Ok(None),
                     (Ok(()), Err(error)) => Err(error),
                     // A plain enqueue error must not hide a tagged capture error.
                     (Err(queued), Err(captured)) => Err(super::super::chain::prefer_device(queued, captured)),
                 }
             })?;
+            let Some((graph, nodes, width, spans, inspection)) = capture else { return Ok(()) };
             // SAFETY: terminal pins all storage and Drop drains its device stream.
             let owner = unsafe { crate::shared::decode_graph::GraphOwner::new(device.library, device.id, graph, ())? };
             super::super::chain::warn_topology(inspection);

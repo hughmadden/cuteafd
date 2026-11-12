@@ -125,7 +125,7 @@ fn real_rows_phases_canonical_rank_and_graph_replays() -> Result<()> {
                 true,
                 fixture.stream,
             )?;
-            fixture.graph = library.cuda_graph_end_capture(fixture.stream)?;
+            fixture.graph = library.cuda_graph_end_capture_for_test(fixture.stream)?;
             for _ in 0..3 {
                 library.cuda_graph_launch(fixture.graph, fixture.stream)?;
             }

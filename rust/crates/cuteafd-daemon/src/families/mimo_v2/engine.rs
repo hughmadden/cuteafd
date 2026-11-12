@@ -3701,7 +3701,7 @@ mod tests {
         // SAFETY: verify uses the actual three rows, including rejected candidates, not capacity four.
         unsafe {
             record_mimo_routes(Some(&usage), 0, 0, 2, ids.ptr, 3, true, fixture.stream)?;
-            fixture.graph = library.cuda_graph_end_capture(fixture.stream)?;
+            fixture.graph = library.cuda_graph_end_capture_for_test(fixture.stream)?;
         }
         let captures = cuteafd_ffi::graph_capture_sites();
         for _ in 0..3 {

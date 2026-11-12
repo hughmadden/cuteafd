@@ -100,7 +100,7 @@ mod tests {
                             library.cuda_graph_begin_capture(stream.raw)?;
                             let queued=reducer.launch(pointers,shared_ptr,output.buffer.ptr.cast(),rows as u32,
                                 ranks as u32,topk as u32,stream.raw);
-                            let captured=library.cuda_graph_end_capture(stream.raw);
+                            let captured=library.cuda_graph_end_capture_for_test(stream.raw);
                             match (queued,captured) {
                                 (Ok(()),Ok(graph))=>Ok(graph),
                                 (Err(error),Ok(graph))=>{library.cuda_graph_exec_destroy(graph)?;Err(error)},

@@ -214,6 +214,7 @@ impl<'a> DsparkWindow<'a> {
                 unsafe { library.cuda_graph_exec_destroy(raw)?; }
                 Err(error)
             }
+            (Ok(()), Err(error)) if cuteafd_ffi::is_small_graph(&error) => Ok(()),
             (Err(error), Err(_)) | (Ok(()), Err(error)) => Err(error),
         }
     }

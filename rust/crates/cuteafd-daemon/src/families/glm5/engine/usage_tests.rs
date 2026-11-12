@@ -122,7 +122,7 @@ fn glm_ml4_known_routes_packed_padding_warmup_replay_phase_and_devices() -> Resu
             // SAFETY: graph retains both phase tallies with replay-time real rows.
             unsafe {
                 record_glm_routes(Some(&usage), cuda, 0, 2, ids.ptr, 4, Some(rows.ptr.cast()), stream)?;
-                fixture.graph = library.cuda_graph_end_capture(stream)?;
+                fixture.graph = library.cuda_graph_end_capture_for_test(stream)?;
                 // warm_decode_graphs capture-then-replay must count zero, even though
                 // its exchange_rows is one and its router executes four bucket rows.
                 library.cuda_graph_launch(fixture.graph, stream)?;

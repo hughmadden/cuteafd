@@ -109,6 +109,7 @@ impl<'w, 'a> Rank<'w, 'a> {
                 },
                 (Err(error), Ok((graph, ..))) => { unsafe { lib.cuda_graph_exec_destroy(graph)?; } return Err(error); }
                 (Err(first), Err(second)) => return Err(crate::families::deepseek_v41::v41_experts::dspark::prefer_device(first, second)),
+                (Ok(()), Err(error)) if cuteafd_ffi::is_small_graph(&error) => {},
                 (Ok(()), Err(error)) => return Err(error),
             }
             // Warmup already produced the result. The captured graph runs on

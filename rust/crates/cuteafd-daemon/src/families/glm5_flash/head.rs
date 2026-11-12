@@ -320,7 +320,7 @@ mod tests {
             library.cuda_graph_begin_capture(stream)?;
             let launched = head.launch_packed(&library, input.buffer.ptr, replayed.buffer.ptr.cast(), rows, false,
                 Some(scratch.buffer), stream);
-            let exec = library.cuda_graph_end_capture(stream)?;
+            let exec = library.cuda_graph_end_capture_for_test(stream)?;
             launched?;
             library.cuda_graph_launch(exec, stream)?;
             library.cuda_stream_synchronize(stream)?;

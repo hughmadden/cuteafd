@@ -203,6 +203,10 @@ impl<'a> DualAttentionWave<'a> {
             let (graph,nodes,width,_spans,inspection)=match (queued,captured) {
                 (Ok(()),Ok(graph))=>graph,
                 (Err(error),Ok((graph,_,_,_,_)))=> { library.cuda_graph_exec_destroy(graph)?;return Err(error); },
+                (Ok(()),Err(error)) if cuteafd_ffi::is_small_graph(&error) => {
+                    // Warmup restored host tail state; complete that same tail eagerly.
+                    return tail.enqueue(&attention, stream);
+                }
                 (Err(error),Err(_)) | (Ok(()),Err(error))=>return Err(error),
             };
             if let Some(error) = inspection { tracing::warn!(%error, "dual attention tail topology inspection failed"); }

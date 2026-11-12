@@ -44,7 +44,8 @@ pub(crate) fn prefer_device(first: anyhow::Error, second: anyhow::Error) -> anyh
 pub(crate) fn settle(launched: Result<()>, drained: Result<()>) -> Result<()> {
     match (launched, drained) {
         (Ok(()), Ok(())) => Ok(()),
-        (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+        (Err(error), Ok(())) | (Ok(()), Err(error)) if cuteafd_ffi::is_small_graph(&error) => Ok(()),
+            (Ok(()), Err(error)) => Err(error),
         (Err(first), Err(second)) => Err(prefer_device(first, second)),
     }
 }
@@ -514,6 +515,7 @@ impl DsparkChain<'_, '_> {
                 }
                 Err(error)
             }
+            (Ok(()), Err(error)) if cuteafd_ffi::is_small_graph(&error) => Ok(()),
             (Ok(()), Err(error)) => Err(error),
             (Err(launched), Err(captured)) => Err(prefer_device(launched, captured)),
         }
