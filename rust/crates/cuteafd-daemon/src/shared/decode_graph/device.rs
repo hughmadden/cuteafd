@@ -592,12 +592,6 @@ impl DeviceCache {
 
     fn floor_skip(&mut self, old: Option<u64>, cycle: Cycle) -> Miss {
         if let Some(record) = old.and_then(|id| self.records.get_mut(&id)) {
-            if record.permanently_eager {
-                record.stats.event(cycle, 1);
-                record.stats.misses += 1;
-                self.counters.entry(cycle).or_default().eager_runs += 1;
-                return Miss::Eager;
-            }
             record.stats.event(cycle, 1);
             record.stats.misses += 1;
         }
@@ -767,6 +761,12 @@ impl DeviceCache {
         }
         let old = self.identities.get(&identity).copied();
         if let Some(record) = old.and_then(|id| self.records.get_mut(&id)) {
+            if record.permanently_eager {
+                record.stats.event(site.cycle, 1);
+                record.stats.misses += 1;
+                self.counters.entry(site.cycle).or_default().eager_runs += 1;
+                return Miss::Eager;
+            }
             if let Some(backoff) = &mut record.oom {
                 let level_recovered = backoff.level.zip(self.level)
                     .is_some_and(|(before, now)| before.saturating_sub(now) >= OOM_LEVEL_DROP);
