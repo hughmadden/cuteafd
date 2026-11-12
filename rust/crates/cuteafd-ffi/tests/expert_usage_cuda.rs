@@ -1,4 +1,5 @@
 //! Run in the matching coordinator dev image through golden-run's native-test mode.
+#![cfg(feature = "test-support")]
 use anyhow::{ensure, Result};
 use cuteafd_core::expert_usage::{Geometry, Reader};
 use cuteafd_ffi::{

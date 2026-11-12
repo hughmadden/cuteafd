@@ -156,7 +156,7 @@ fn native_host_embedding_exact_512() -> Result<()> {
             let graph = unsafe {
                 lib.cuda_graph_begin_capture(wave.storage.stream.raw)?;
                 ops.embed(table.get("embed.weight")?, ids.buffer, residual.buffer, pre.buffer, 16, wave.storage.stream.raw)?;
-                lib.cuda_graph_end_capture(wave.storage.stream.raw)?
+                lib.cuda_graph_end_capture_for_test(wave.storage.stream.raw)?
             };
             // SAFETY: captured graph references these live buffers; destroy follows a drain.
             unsafe { lib.cuda_graph_launch(graph, wave.storage.stream.raw)?; }

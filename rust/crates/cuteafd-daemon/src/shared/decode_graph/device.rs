@@ -593,9 +593,9 @@ impl DeviceCache {
     fn floor_skip(&mut self, old: Option<u64>, cycle: Cycle) -> Miss {
         if let Some(record) = old.and_then(|id| self.records.get_mut(&id)) {
             if record.permanently_eager {
-                record.stats.event(site.cycle, 1);
+                record.stats.event(cycle, 1);
                 record.stats.misses += 1;
-                self.counters.entry(site.cycle).or_default().eager_runs += 1;
+                self.counters.entry(cycle).or_default().eager_runs += 1;
                 return Miss::Eager;
             }
             record.stats.event(cycle, 1);

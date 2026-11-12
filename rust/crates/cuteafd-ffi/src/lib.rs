@@ -1751,7 +1751,6 @@ native_symbols! {
     cuteafd_cuda_graph_census_end: unsafe extern "C" fn(*mut c_void) -> CuteafdStatus,
     cuteafd_cuda_graph_begin_capture: CudaGraphBeginCaptureFn,
     cuteafd_cuda_graph_end_capture: CudaGraphEndCaptureFn,
-    cuteafd_cuda_graph_end_capture_for_test: unsafe extern "C" fn(*mut c_void, *mut *mut c_void) -> CuteafdStatus,
     cuteafd_cuda_graph_end_capture_topology: unsafe extern "C" fn(*mut c_void, *mut *mut c_void, *mut usize, *mut usize, *mut i32) -> CuteafdStatus,
     cuteafd_cuda_graph_launch: CudaGraphLaunchFn,
     cuteafd_cuda_graph_exec_destroy: CudaGraphExecDestroyFn,
@@ -3048,8 +3047,10 @@ impl NativeLibrary {
     /// Correctness-oracle bypass; serving uses the guarded topology capture.
     /// # Safety
     /// The test owns the stream capture and retains every captured pointer.
+    #[cfg(any(test, feature = "test-support"))]
     pub unsafe fn cuda_graph_end_capture_for_test(&self, stream: *mut c_void) -> Result<*mut c_void> {
-        let end = self.cuteafd_cuda_graph_end_capture_for_test()?;
+        // SAFETY: the test-only export has this fixed C ABI; self retains its DSO.
+        let end = unsafe { self.lib.get::<unsafe extern "C" fn(*mut c_void, *mut *mut c_void) -> CuteafdStatus>(b"cuteafd_cuda_graph_end_capture_for_test")? };
         let mut exec = std::ptr::null_mut();
         // SAFETY: caller owns capture; output is a valid local pointer.
         let status = unsafe { end(stream, &mut exec) };
