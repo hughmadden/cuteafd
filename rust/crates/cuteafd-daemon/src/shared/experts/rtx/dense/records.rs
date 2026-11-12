@@ -110,19 +110,20 @@ pub(crate) struct HostOperand {
 }
 impl HostOperand {
     pub fn mount(&self) -> Result<()> {
-        self.landing.fill(|out| self.rect.read(out))
+        self.landing.fill(|out| self.rect.read(out))?;
+        self.landing.ready.store(true, std::sync::atomic::Ordering::Release);
+        Ok(())
     }
 }
 /// Record without reading, or use the mount only outside a SparkNest namespace.
-pub(crate) fn host_operand(operand: HostOperand) -> Result<()> {
+pub(crate) fn host_operand(operand: HostOperand, policy: super::super::push::PushPolicy) -> Result<()> {
     ensure!(operand.rect.bytes() == operand.landing.bytes(), "host operand extent differs from owner");
     let mut pending = Some(operand);
     if recorded(|r| r.host_operands.push(pending.take().expect("one host operand"))) { return Ok(()); }
     let operand = pending.expect("host operand");
-    match cuteafd_loader::push_load::namespace(&operand.rect.path) {
-        Ok(_) => anyhow::bail!("SparkNest host embedding requires an admitted push group"),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => operand.mount(),
-        Err(error) => Err(error.into()),
+    match policy {
+        super::super::push::PushPolicy::Required => anyhow::bail!("SparkNest host embedding requires an admitted push group"),
+        super::super::push::PushPolicy::Mount => operand.mount(),
     }
 }
 

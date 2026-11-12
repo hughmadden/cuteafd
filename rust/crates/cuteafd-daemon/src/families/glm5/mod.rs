@@ -21,6 +21,12 @@ use std::ffi::c_void;
 use std::path::PathBuf;
 use std::time::Instant;
 
+/// DFlash needs this startup constant while the target table is still only recorded.
+pub(crate) fn draft_mask_row(embedding: &crate::shared::token_io::TokenEmbedding<'_>, token: u32) -> Result<Vec<u8>> {
+    if crate::shared::experts::rtx::dense::is_recording() { embedding.checkpoint_rows(&[token]) }
+    else { embedding.host_rows(&[token]) }
+}
+
 /// One enum for the engine flag and `cuteafd plan`, so the planner charges what admission charges.
 pub(crate) use cuteafd_loader::plan::exlr8::PrefillActivations as Exlr8PrefillActivations;
 
@@ -1898,7 +1904,7 @@ impl Opened {
             let cfg = dflash::DflashConfig::read(snapshot)?;
             ensure!(cfg.hidden == self.cfg.hidden && cfg.vocab == self.cfg.vocab_size
                 && cfg.taps.iter().all(|&l| l < self.cfg.layers), "the DFlash2 drafter does not fit this target");
-            let mask = embedding.host_rows(&[cfg.mask_token])?;
+            let mask = draft_mask_row(embedding, cfg.mask_token)?;
             tracing::info!(mask_source = "target mask_token row", mask_token = cfg.mask_token, "drafter mask source");
             let file = if crate::shared::experts::rtx::dense::is_recording() {
                 Vec::new()

@@ -20,6 +20,8 @@ use std::{
 /// rank's single admitted arena; coordinator ranks may map it differently.
 pub(crate) trait PushDestination {
     type Delivered;
+    /// Flags published only after the rank's whole-group commit acknowledgment.
+    fn host_ready(&self) -> Vec<std::sync::Arc<std::sync::atomic::AtomicBool>> { Vec::new() }
     fn belongs_to(&self, device: Device<'_>) -> bool;
     fn logical_bytes(&self) -> usize;
     fn device_bytes(&self) -> usize;

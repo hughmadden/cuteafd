@@ -78,7 +78,7 @@ impl<'a> NativeRtxTensors<'a> {
         crate::shared::experts::rtx::dense::host_operand(crate::shared::experts::rtx::dense::HostOperand {
             device: library.cuda_get_device()?, landing: crate::shared::memory::HostLanding::new(&mut storage),
             rect: rect(catalog, "embed.weight", None)?,
-        })?;
+        }, crate::shared::experts::rtx::push::PushPolicy::for_snapshot(catalog.snapshot())?)?;
         let alias = library.cuda_host_buffer_device_alias(storage.buffer)?;
         tracing::info!(?placement, device_bytes=0, pinned_bytes=bytes, "V4.1 embedding placement (single residency, shared target/dSpark)");
         Ok(Self { tensors: BTreeMap::new(), resident_bytes: 0, mapped_embedding: Some((storage, alias)) })

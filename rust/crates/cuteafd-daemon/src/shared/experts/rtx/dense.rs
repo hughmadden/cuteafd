@@ -344,6 +344,9 @@ impl Drop for DenseArena<'_> {
 }
 
 impl PushDestination for DenseArena<'_> {
+    fn host_ready(&self) -> Vec<std::sync::Arc<std::sync::atomic::AtomicBool>> {
+        self.layout.host_operands.iter().map(|(_, host)| host.landing.ready.clone()).collect()
+    }
     type Delivered = ();
     fn belongs_to(&self, device: Device<'_>) -> bool {
         self.device.id == device.id && std::ptr::eq(self.device.library, device.library)

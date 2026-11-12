@@ -66,7 +66,7 @@ impl Split {
             quantize_bytes = quantize.bytes, quantize_seconds = quantize.seconds,
             push_bytes = push.bytes, push_seconds = push.seconds,
             io_wall_seconds = busy, remainder_seconds = (elapsed - busy).max(0.0),
-            "coordinator weight load split (operation seconds sum workers; async copies measure submission; remainder includes waits and uninstrumented transforms)");
+            "coordinator weight load split (operation seconds sum workers; push = bytes received, upload = H2D bytes (overlapping categories); async copies measure submission; remainder includes waits and uninstrumented transforms)");
     }
 }
 impl Drop for Split {

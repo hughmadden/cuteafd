@@ -115,10 +115,10 @@ impl Drop for DeviceAllocation<'_> {
 }
 /// Borrowed descriptor of an already admitted pinned owner, retained until load commit.
 #[derive(Clone)]
-pub(crate) struct HostLanding { address: usize, bytes: usize }
+pub(crate) struct HostLanding { address: usize, bytes: usize, pub(crate) ready: std::sync::Arc<std::sync::atomic::AtomicBool> }
 impl HostLanding {
     pub(crate) fn new(storage: &mut HostAllocation<'_>) -> Self {
-        Self { address: storage.buffer.ptr as usize, bytes: storage.buffer.bytes }
+        Self { address: storage.buffer.ptr as usize, bytes: storage.buffer.bytes, ready: Default::default() }
     }
     pub(crate) fn bytes(&self) -> usize { self.bytes }
     pub(crate) fn fill(&self, body: impl FnOnce(&mut [u8]) -> Result<()>) -> Result<()> {
