@@ -149,7 +149,7 @@ support draft/MTP comparisons or `--save-logits`.
 | `EXPERT_BACKEND` | `auto` | `auto`, `local`, `spark` | `local` requires `SPARK_COUNT=0`. Dense Qwen is local-only; the planner admits other families by fit. |
 | `RTX_EXPERT_LAYERS` | `auto` | `auto`, `all`, `N` | Pool-first onboarding of routed-expert layers on the RTX pair. |
 | `RTX_EXPERT_PEER` | `off` | `off` | `on` is refused; TP2 halves replaced it. |
-| `EMBEDDING` | `gpu` | `host`, `gpu` | Untied token-embedding placement. |
+| `EMBEDDING` | `gpu` | `host`, `gpu` | Untied token-embedding placement. Kimi, Step-5 and Muse accept `gpu` only; plan and serve refuse `host`. |
 | `EXPERT_PORT` | `19441` | 1–65535 | Expert-worker port. |
 | `SPARK_REDUCTION_MIN_ROWS` | `16` | positive int | Row threshold for the reduction path. |
 | `HOST_ISA` | `auto` | `auto`, `x86-64-v2`, `x86-64-v4` | Native library ISA. |
@@ -456,6 +456,25 @@ mode whose image lacks its programs. ⁴ Kimi K3 accepts explicit `heads`,
 on two GPUs and retains whole-owned layers on one. KDA stays head-split on
 two GPUs, independent of the MLA placement.
 
+Token embedding placement (`EMBEDDING`; `cuteafd plan --embedding-placement`):
+
+| Value | V4.1 | V4 | GLM 5.3 / ML4 | GLM Flash | MiMo | Qwen4 | Qwen dense | Kimi K3 | Step-5 | Muse |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| `gpu` (default) | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `host` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | ✗ | ✗ |
+
+Host placement additionally requires an untied embedding/head. Kimi and Muse
+keep their admitted GPU embedding: host offload would save 2.19 GiB and
+3.08 GiB respectively, but add mapped-PCIe gathers to every token and prefill;
+no runtime benefit is qualified for their current fitting layouts. Both plan
+and serve refuse it rather than silently planning a GPU table. Step-5 likewise
+requires its embedding on the GPU entry owner. The launch-key table records
+whether a key is accepted at all, not whether all its values are supported.
+
+`EXPERT_USAGE` has a live adapter only for V4.1, V4, GLM 5.3 / ML4, MiMo
+and Kimi. Other families reject an explicit key instead of accepting a no-op;
+the `/experts` placeholder remains available without telemetry.
+
 Speculator (`SPECULATOR`):
 
 | Value | V4.1 | V4 | GLM 5.3 / ML4 | GLM Flash | MiMo | Qwen4 | Qwen dense | Kimi K3 | Step-5 | Muse |
@@ -665,7 +684,7 @@ original core is already FP8, not an MC publication.
 | `ENABLE_BENCH` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | `GATEWAY` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | `USAGE` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| `EXPERT_USAGE` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `EXPERT_USAGE` | ✓ | ✓ | ✓ | ✗ | ✓ | ✗ | ✗ | ✓ | ✗ | ✗ |
 | `CONSOLE_ASSETS` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | `CONSOLE_TEXT` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | ✓ | ✓ | ✓ |
 | `HOST_WAIT` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | ✓ | ✓ | ✓ |

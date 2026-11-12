@@ -24,6 +24,11 @@ fn program_families(dsa: bool, projected: bool) -> &'static [&'static str] {
 
 pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut PlanReport, opts: &mut crate::plan::layout::LayoutOptions,
     requested: ExpertPlacement) -> MemoryLayout {
+    if opts.host_embedding {
+        report.refuse_placement("Kimi does not support --embedding-placement host".into(),
+            "Use --embedding-placement gpu (EMBEDDING=gpu); the serving embedding is GPU-resident.");
+        return MemoryLayout { devices: Vec::new(), pool_tokens: 0, waste: Vec::new(), notes: Vec::new() };
+    }
     let limits = crate::plan::Family::prefill_limits(&super::KIMI_K3);
     let prefill = match crate::plan::layout::resolve_prefill(input, report, opts, requested.spark_ranks(), limits) {
         Ok(prefill) => prefill,

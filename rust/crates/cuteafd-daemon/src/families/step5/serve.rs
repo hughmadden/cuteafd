@@ -1077,7 +1077,7 @@ mod tests {
                 }
                 let drafts = backend.draft(&mut [scheduler::DraftSeq { placement: &source,
                     seq: &mut source_draft, depth: 3 }], &mut scheduler::DraftTiming::default(), &mut crate::shared::token_io::TokenSelector::new(&library,
-                    crate::shared::token_io::SelectPlacement::Device, backend.geometry().vocab, 1)?)?.remove(0);
+                    crate::shared::token_io::SelectPlacement::Device, backend.geometry().vocab_size, 1)?)?.remove(0);
                 ensure!(drafts.len() == 3, "live MTP did not propose every admitted stage");
                 ensure!(expected == backend.diagnostic_state(&source)?, "draft mutated committed mark at {frontier}");
                 let rows = std::iter::once(tokens[frontier]).chain(drafts).collect::<Vec<_>>();
