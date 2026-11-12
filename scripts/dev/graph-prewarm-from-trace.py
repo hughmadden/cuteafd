@@ -1261,6 +1261,9 @@ def generate_glm5_flash(traces, coverage=0.999, pin_frequency=0.9):
     shared extra keys, not the trace."""
     if not 0 < coverage <= 1 or not 0 < pin_frequency <= 1:
         raise ValueError("coverage and pin frequency must be in (0, 1]")
+    traces = [{**trace, "graphs": [graph for graph in trace["graphs"]
+                                  if not graph.get("permanently_eager", False)]}
+              for trace in traces]
     styles = {GLMF_NORMALIZED_GEOMETRY.fullmatch(graph["shape"].strip()) is not None
               for trace in traces for graph in trace["graphs"]
               if graph["site"].startswith("glm5_flash.")}
@@ -1480,6 +1483,9 @@ def generate_qwen(traces, shape, coverage=0.999, pin_report=None, summary=None):
     """
     if not 0 < coverage <= 1:
         raise ValueError("coverage must be in (0, 1]")
+    traces = [{**trace, "graphs": [graph for graph in trace["graphs"]
+                                  if not graph.get("permanently_eager", False)]}
+              for trace in traces]
     counts = {}
     reserves = {}
     reasons = {}

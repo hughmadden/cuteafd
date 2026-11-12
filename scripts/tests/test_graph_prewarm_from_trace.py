@@ -374,6 +374,26 @@ def test_flash_normalized_mla_shapes_project_kda_and_head_once():
         MODULE.generate([mixed], "glm5_flash")
 
 
+@pytest.mark.parametrize("family", ["qwen4", "glm5_flash"])
+@pytest.mark.parametrize("nodes", [0, 1, 2])
+def test_eager_records_do_not_affect_prewarm_style_or_selected_sibling_cost(family, nodes):
+    data = qwen_trace() if family == "qwen4" else flash_trace()
+
+    def generate(trace):
+        return (MODULE.generate_qwen([trace], "single_0spark") if family == "qwen4"
+                else MODULE.generate([trace], family))
+
+    expected = generate(data)
+    for shape in [data["graphs"][0]["shape"], "unparseable eager identity"]:
+        eager = copy.deepcopy(data["graphs"][0])
+        eager.update(key_id=9999, shape=shape, permanently_eager=True, executables=0,
+                     permanent_bytes=0, nodes=nodes, capture_bytes=None, hits=0, count=1,
+                     cycles={"other": 1})
+        candidate = copy.deepcopy(data)
+        candidate["graphs"].append(eager)
+        assert generate(candidate) == expected
+
+
 def test_flash_short_steps_collapse_the_unkeyed_pool_geometry():
     graphs = [flash_graph(4, "false", "false", 1, 64, 16, 10),
               flash_graph(4, "false", "false", 4, 64, 32, 5)]
