@@ -109,7 +109,13 @@ fn selected_head_views_charge_one_native_workspace_with_or_without_drafter() {
             tensors.retain(|(name, _, _)| !name.starts_with("lm_head."));
             tensors.push(testing::t("lm_head.weight", "BF16", &[cfg.vocab_size, cfg.hidden]));
         }
-        testing::write_snapshot(dir.path(), &testing::muse_spark_config(), &tensors, None);
+        let mut config = testing::muse_spark_config();
+        if let Some(bits) = width { config["quantization_config"]["head_bits"] = serde_json::json!(bits); }
+        else { for key in ["head_bits", "lm_head"] { config["quantization_config"].as_object_mut().unwrap().remove(key); } }
+        for key in ["audio_config", "vision_config"] { config.as_object_mut().unwrap().remove(key); }
+        tensors.retain(|(name, _, _)| !name.starts_with("model.audio_tower.")
+            && !crate::media::muse_vision::is_tensor(name));
+        testing::write_snapshot(dir.path(), &config, &tensors, None);
         let input = testing::BudgetedPlanInput::open(dir.path()).unwrap();
         let inventory = CoreInventory::from_checkpoint(&cfg, input.checkpoint()).unwrap();
         assert_eq!(inventory.head_outputs(&cfg), if width.is_none() { cfg.vocab_size } else { 202112 });

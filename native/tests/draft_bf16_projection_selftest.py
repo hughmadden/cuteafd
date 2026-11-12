@@ -46,7 +46,7 @@ def shapes():
     for k, n in ((2048, 16384), (2048, 8192), (16384, 6144), (8192, 6144),
                  (1536, 18432), (1536, 9216), (12288, 7168), (6144, 7168),
                  (12288, 4096), (6144, 4096), (8192, 8192), (4096, 8192),
-                 (8192, 4096)):
+                 (8192, 4096), (8192, 1024), (8192, 512)):
         result.setdefault((k, n), []).append("checkpoint-native")
     for n in (512, 576):
         result.setdefault((6144, n), []).append("ml4-native-kv-a")
@@ -71,6 +71,7 @@ def main():
     if any(rows < 1 or rows > 4096 for rows in args.rows):
         parser.error("--rows must be between 1 and 4096")
     row_counts = tuple(sorted({1, 4, 8, 16, 17, 32, 64, 128, 140, 2048, *args.rows}))
+    max_rows = max(row_counts)
     assert not (args.screen and args.skinny_screen), "select one screen"
     assert args.out_dtype == "bf16" or not (args.screen or args.skinny_screen), "screens require BF16 output"
     output_dtype = torch.bfloat16 if args.out_dtype == "bf16" else torch.float32
@@ -126,8 +127,8 @@ def main():
     torch.backends.cuda.matmul.allow_tf32 = False
     try:
         for (k, n), families in sorted(inventory.items()):
-            x = (torch.randn(2048, k, device="cuda") * .1).bfloat16()
-            offsets = (0, 1, 17, 63, 64, 65, 127, 139, 511, 1023, 2047)
+            x = (torch.randn(max_rows, k, device="cuda") * .1).bfloat16()
+            offsets = tuple(sorted({0, 1, 17, 63, 64, 65, 127, 139, 511, 1023, 2047, max_rows - 1}))
             row = x[0].clone()
             for offset in offsets:
                 x[offset].copy_(row)
@@ -193,8 +194,9 @@ def main():
                         arms[f"tma_m16_n{tile_n}"] = skinny_tma
                 # Include staging copies in padding costs, not just the larger GEMM.
                 for name, multiple in ((("pad64", 64), ("pad2048", 2048)) if args.screen else ()):
-                    padded_x = torch.zeros_like(x)
-                    padded_out = torch.empty((2048, n), dtype=torch.bfloat16, device="cuda")
+                    extent = ((max_rows + multiple - 1) // multiple) * multiple
+                    padded_x = torch.zeros((extent, k), dtype=torch.bfloat16, device="cuda")
+                    padded_out = torch.empty((extent, n), dtype=torch.bfloat16, device="cuda")
 
                     def padded(input_, output, px=padded_x, po=padded_out, tile=multiple):
                         rows = input_.shape[0]
@@ -211,7 +213,7 @@ def main():
                 outputs, timing = {}, {}
                 graph_exact = True
                 for rows in row_counts:
-                    storage = torch.empty((2049, n), dtype=output_dtype, device="cuda")
+                    storage = torch.empty((max_rows + 1, n), dtype=output_dtype, device="cuda")
                     storage.view(bits_dtype).fill_(poison)
                     out = storage[:rows]
                     operation(x[:rows], out)
@@ -245,8 +247,8 @@ def main():
                     timing[f"n{rows}_us"] = start.elapsed_time(end) * 1000 / 30
                 mismatches = []
                 for rows, out in outputs.items():
-                    if not torch.equal(out.view(bits_dtype), outputs[2048][:rows].view(bits_dtype)):
-                        mismatches.append(f"n{rows}/n2048")
+                    if not torch.equal(out.view(bits_dtype), outputs[max_rows][:rows].view(bits_dtype)):
+                        mismatches.append(f"n{rows}/n{max_rows}")
                     for offset in offsets:
                         if offset < rows and not torch.equal(outputs[1][0].view(bits_dtype), out[offset].view(bits_dtype)):
                             mismatches.append(f"n{rows}/offset{offset}")

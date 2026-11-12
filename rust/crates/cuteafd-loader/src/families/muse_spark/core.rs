@@ -144,6 +144,38 @@ mod head_tests {
     use crate::plan::testing;
 
     #[test]
+    fn original_attention_uses_whole_and_tp2_native_shapes() -> Result<()> {
+        use super::super::weight_layout::LayerLayout;
+        use cuteafd_ffi::draft_projection::ProjectionOutput;
+        let cfg = MuseSparkConfig::from_hf(&testing::muse_spark_config())?;
+        let dir = tempfile::tempdir()?;
+        let mut tensors = vec![testing::t("lm_head.weight", "BF16", &[cfg.vocab_size, cfg.hidden])];
+        for (leaf, n) in [("q_proj", 8192), ("k_proj", 1024), ("v_proj", 1024), ("o_proj", 8192)] {
+            tensors.push(testing::t(format!("{PREFIX}0.self_attn.{leaf}.weight"), "BF16", &[n, 8192]));
+        }
+        testing::write_snapshot(dir.path(), &testing::muse_spark_config(), &tensors, None);
+        let inventory = CoreInventory::from_checkpoint(&cfg, &Checkpoint::open(dir.path())?)?;
+        assert_eq!(inventory.native.len(), 4);
+        for ranks in [1, 2] {
+            for layout in LayerLayout::ranks(&cfg, 0, ranks, &inventory)? {
+                let shapes = [("attn.q", [8192 / ranks, 8192]), ("attn.k", [1024 / ranks, 8192]),
+                    ("attn.v", [1024 / ranks, 8192]), ("attn.o", [8192, 8192 / ranks])];
+                for (name, shape) in shapes {
+                    let native = &layout.native[name];
+                    assert_eq!(native.shape, shape);
+                    assert!(!native.fp8);
+                    let output = if ranks == 2 && name == "attn.o" { ProjectionOutput::F32 }
+                        else { ProjectionOutput::Bf16 };
+                    let suffix = if output == ProjectionOutput::F32 { "_f32" } else { "" };
+                    assert_eq!(output.program_name(shape[1], shape[0]),
+                        format!("draft_bf16_k{}_n{}{suffix}", shape[1], shape[0]));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
     fn selected_head_is_validated_without_cross_view_fallback() -> Result<()> {
         let cfg = MuseSparkConfig::from_hf(&testing::muse_spark_config())?;
         for bits in [6, 8] {

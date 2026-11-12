@@ -163,9 +163,7 @@ def jobs(scope):
     result.append(("draft-bf16", "export_b12x_dsv4_aot.py",
                    ["--geometry", "qwen38", "--only", ",".join(
                        f"k{k}_n{n}" for k, n in sorted(drafter.draft_bf16_shapes()))]))
-    native_bf16 = {(k, n) for family, shapes in drafter.native_attention_shapes().items()
-                   if family != "ml4" for n, k in shapes}
-    native_bf16.update((6144, n) for n in (512, 576))
+    native_bf16 = drafter.native_attention_bf16_shapes()
     native_names = [f"k{k}_n{n}" for k, n in sorted(native_bf16)]
     native_names += [f"k{k}_n{n}_f32" for n, k in sorted(drafter.native_attention_bf16_f32_shapes())]
     result.append(("native-attention-bf16", "export_b12x_dsv4_aot.py",

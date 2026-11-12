@@ -167,6 +167,13 @@ def native_attention_programs():
     return out
 
 
+def native_attention_bf16_shapes():
+    # Muse original K/V are separate projections, whole and TP2 output splits.
+    shapes = {(k, n) for family, operands in native_attention_shapes().items()
+              if family != "ml4" for n, k in operands}
+    return shapes | {(6144, 512), (6144, 576), (8192, 1024), (8192, 512), (8192, 4096)}
+
+
 def draft_bf16_shapes():
     # hidden, query heads, KV heads, head width, MLP width, tap count
     families = {
@@ -200,12 +207,10 @@ def draft_bf16_shapes():
     for h in (2048, 4096, 5120, 6144):
         result.setdefault((2 * h, h), []).append("mimo/qwen-mtp")
     result.setdefault((30720, 6144), []).append("ml4-context-fc")
-    for n in (512, 576):
-        result.setdefault((6144, n), []).append("native-core")
     for shape in flash_native_bf16_shapes():
         result.setdefault(shape, []).append("native-glmf")
-    for n, k in set().union(*(shapes for family, shapes in native_attention_shapes().items() if family != "ml4")):
-        result.setdefault((k, n), []).append("native-core")
+    for shape in native_attention_bf16_shapes():
+        result.setdefault(shape, []).append("native-core")
     return result
 
 
@@ -219,8 +224,8 @@ def compile_draft_bf16_projection(k, n, output="bf16"):
     if output not in ("bf16", "f32"):
         raise ValueError("projection output is bf16 or f32")
     dtype = torch.bfloat16 if output == "bf16" else torch.float32
-    native_shapes = {(k, n) for family, shapes in native_attention_shapes().items()
-                     if family != "ml4" for n, k in shapes}
+    # Preserve fixed-M16 routes already shared by GLM Flash, MiMo and drafters.
+    native_shapes = native_attention_bf16_shapes() - {(6144, 512), (6144, 576), (8192, 4096)}
     tiles = DECODE_TMA_TILES.get((n, k), ()) if (k, n) in native_shapes else ((16, 1, 4, 16, 64, 6),)
     launch = TmaBf16Projection(n, k, out_dtype=cutlass.BFloat16 if output == "bf16" else cutlass.Float32,
                                tiles_by_rows=tiles)
