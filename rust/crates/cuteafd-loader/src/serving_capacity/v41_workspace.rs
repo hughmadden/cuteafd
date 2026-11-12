@@ -46,6 +46,52 @@ mod tests {
     use super::*;
 
     #[test]
+    fn census9_components_match_payloads_and_independent_backing_tails() -> Result<()> {
+        use crate::placement::planner::independent_backing_slack;
+        // #1714 census9: V4.1 Flash, one RTX + three Sparks, decode 64,
+        // prefill 2752 x 3. Each entry is an independently retired storage set.
+        let hc_sets = [64; 4].into_iter().chain([40; 12]).chain([8256; 2])
+            .map(hc).collect::<Result<Vec<_>>>()?;
+        let layers = (0..40).collect::<Vec<_>>();
+        let window_sets = vec![window(64, 64, &layers, 629760)?,
+            window(64, 64, &layers, 629760)?, window(8256, 2752, &layers, 22912000)?];
+        let engram_sets = [64; 4].into_iter().map(|rows| engram(rows, 587776))
+            .chain([2752; 2].into_iter().map(|rows| engram(rows, 27326464)))
+            .collect::<Result<Vec<_>>>()?;
+        let mut projection_sets = Vec::new();
+        for _ in 0..6 {
+            for (k, n, scratch) in [(5120, 1280, 146432), (1280, 32768, 918528),
+                (5120, 512, 714752), (8192, 5120, 923648)] {
+                projection_sets.push(projection(40, k, n, scratch, true)?);
+            }
+        }
+        for (rows, scratch) in [(64, 1509376), (2752, 68356096)] {
+            projection_sets.push(projection(rows, 15360, 5120, scratch, true)?);
+        }
+        for _ in 0..3 {
+            for (rows, scratch) in [(64, 629760), (2752, 22912000)] {
+                projection_sets.push(projection(rows, 5120, 512, scratch, false)?);
+            }
+        }
+        for (sets, old_count, old_payload, new_payload, old_tail, new_tail) in [
+            (hc_sets, 162, 1_944_746_496, 1_944_751_104, 38_535_168, 26_571_776),
+            (window_sets, 381, 240_074_252, 240_075_008, 86_664_192, 3_194_624),
+            (engram_sets, 42, 894_559_896, 894_560_792, 29_495_296, 3_020_264),
+            (projection_sets, 122, 309_213_312, 309_213_312, 18_226_176, 15_590_308),
+        ] {
+            let old_requests = sets.iter().flat_map(|set| set.views().values()
+                .map(|view| view.bytes() as u64)).collect::<Vec<_>>();
+            let new_requests = sets.iter().map(|set| set.bytes() as u64).collect::<Vec<_>>();
+            assert_eq!(old_requests.len(), old_count);
+            assert_eq!(old_requests.iter().sum::<u64>(), old_payload);
+            assert_eq!(new_requests.iter().sum::<u64>(), new_payload);
+            assert_eq!(independent_backing_slack(old_requests)?, old_tail);
+            assert_eq!(independent_backing_slack(new_requests)?, new_tail);
+        }
+        Ok(())
+    }
+
+    #[test]
     fn packed_components_preserve_planes_and_one_physical_extent() -> Result<()> {
         for rows in [1, 16, 64, 256, 4096] {
             for layout in [hc(rows)?, window(rows, rows, &(0..40).collect::<Vec<_>>(), 12345)?,

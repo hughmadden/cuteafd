@@ -516,7 +516,7 @@ mod default_tests {
                     input.prefill_waves as usize, input.decode_rows as usize).unwrap();
                 assert_eq!(owners[0].bytes, sm120_request_backing(layout.bytes() as u64).unwrap());
                 assert_eq!(layout.views().keys().filter(|n| n.ends_with(".main")).count(), if gpu == 0 { 46 } else { 43 });
-                assert_eq!(layout.views().keys().filter(|n| n.ends_with(".compressed")).count(), 41);
+                assert_eq!(layout.views().keys().filter(|n| n.starts_with("layer") && n.ends_with(".compressed")).count(), 41);
                 assert_eq!(layout.views().keys().filter(|n| n.ends_with(".index")).count(), 21);
             }
         }
@@ -686,9 +686,9 @@ mod default_tests {
                 let auto = admitted(&input).unwrap();
                 assert_eq!(auto.attention_placement, AttentionPlacement::Context);
                 for gpu in 0..2 {
-                    let records = |plan: &Placement| plan.items[gpu].iter().filter(|item| item.group == "records")
+                    let kv = |plan: &Placement| plan.items[gpu].iter().filter(|item| item.group == "KV arena")
                         .map(|item| item.bytes).sum::<u64>();
-                    assert!(records(&heads_plan) > records(&auto));
+                    assert!(kv(&heads_plan) > kv(&auto));
                 }
             }
             let mut one = plan_inputs(&cfg);

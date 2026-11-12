@@ -418,3 +418,33 @@ impl Drop for HcSublayer<'_, '_> {
         }
     }
 }
+
+#[cfg(test)]
+mod arena_tests {
+    use super::*;
+
+    #[test]
+    fn storage_constructor_uses_one_backing_on_each_device() -> Result<()> {
+        let fixture = cuteafd_ffi::native_library_lifetime_fixture::Fixture::build_for_tests()?;
+        let library = fixture.load()?;
+        fixture.strict_device_free(&library, true)?;
+        for device in 0..2 {
+            library.cuda_set_device(device)?;
+            let before = fixture.events()?;
+            let storage = HcStorage::new(&library, 17)?;
+            assert_eq!(fixture.events()?.matches('D').count(), before.matches('D').count() + 1);
+            let planes = [&storage.residual, &storage.incoming_pre, &storage.next_pre,
+                &storage.post, &storage.comb, &storage.collapsed, &storage.normalized,
+                &storage.sublayer, &storage.output];
+            assert!(planes.iter().all(|plane| plane.buffer.device_id == device
+                && plane.buffer.ptr as usize % 256 == 0));
+            let retained = std::rc::Rc::clone(&storage);
+            drop(storage);
+            assert_eq!(fixture.events()?.matches('d').count(), before.matches('d').count());
+            drop(retained);
+            assert_eq!(fixture.events()?.matches('d').count(), before.matches('d').count() + 1);
+        }
+        assert_eq!(fixture.device_free_mismatch(&library)?.0, 0);
+        Ok(())
+    }
+}
