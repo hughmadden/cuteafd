@@ -37,7 +37,7 @@ use crate::shared::memory::device::{Allocation, Device};
 use crate::shared::prefix::{cuda_copy::range, CudaCopyEngine};
 use cuteafd_engine::prefix::{
     After, BoxError, CaptureTicket, Captured, Eviction, FamilyLayout, Mark, MarkSlot, MarkStore,
-    PrefixCache, PrefixConfig, PrefixFamily, RestoreContext, RestorePlan, ReuseRule, TailCopy,
+    PrefixCache, PrefixConfig, PrefixFamily, RestoreCandidate, RestoreContext, RestoreFidelity, RestorePlan, ReuseRule, TailCopy,
 };
 use cuteafd_hostcache::copy::DeviceRange;
 use serde::{Deserialize, Serialize};
@@ -163,6 +163,15 @@ pub(crate) fn layout(units: usize, draft: bool) -> FamilyLayout {
     }
 }
 
+/// The restore route and its accounting share the decoder-window admission rule.
+fn plan(hit: RestoreCandidate<'_>) -> RestorePlan {
+    let mut plan = RestorePlan::under(ReuseRule::EXACT, hit);
+    if plan.exact() && plan.target_end.saturating_sub(plan.snapshot_end) >= 128 {
+        plan.fidelity = RestoreFidelity::ExactEncoderContinuation;
+    }
+    plan
+}
+
 impl<'r, 'a, 'w, C: DraftChain<'a>> V41Prefix<'r, 'a, 'w, C> {
     pub fn new(requests: &'r mut Requests<'a>, draft: Option<&'r mut DraftRuntime<'w, 'a, C>>, arena: &'r Arenas<'a>)
         -> Self {
@@ -192,6 +201,8 @@ impl<'a, C: DraftChain<'a>> PrefixFamily<V41Meta> for V41Prefix<'_, 'a, '_, C> {
     fn eviction(&self) -> Eviction {
         Eviction::FreesPages
     }
+    fn plan_restore(&self, hit: RestoreCandidate<'_>) -> RestorePlan { plan(hit) }
+    fn refused_partial_rule(&self) -> Option<ReuseRule> { Some(ReuseRule::V41) }
     fn capture_meta(&self, placement: &V41Placement, len: usize) -> Result<V41Meta, BoxError> {
         let requests = self.requests.borrow();
         let backbone = requests.cache().mark_meta(placement.lease).map_err(boxed)?;
@@ -233,7 +244,7 @@ impl<'a, C: DraftChain<'a>> PrefixFamily<V41Meta> for V41Prefix<'_, 'a, '_, C> {
         let mut requests = self.requests.borrow_mut();
         // Tail copies of forked units were enqueued on the prefix stream; restores below read
         // the pages only through later kernels on the same stream or after its drain.
-        let continuation = (plan.target_end - plan.snapshot_end >= 128).then_some(plan.target_end as u64);
+        let continuation = (plan.fidelity == RestoreFidelity::ExactEncoderContinuation).then_some(plan.target_end as u64);
         let target = self.arena.target(*slot).map_err(boxed)?;
         requests.restore_mark(placement.lease, &saved.request, target, continuation).map_err(boxed)?;
         if continuation.is_none() {
@@ -576,7 +587,7 @@ mod tests {
         let (common, snapshot_end, _) = banks.lookup_reusable(prompt)?;
         let hit = RestoreCandidate { common, snapshot_end, target_end: prompt.len(),
             resume: rule.skipped(common, snapshot_end), media: &[], saved_media: &[] };
-        Some(RestorePlan::under(rule, hit))
+        Some(plan(hit))
     }
 
     #[test]
@@ -608,7 +619,9 @@ mod tests {
             (vec![&tokens[..512], &tokens[..1500]], &branch[..], 512),
         ] {
             let plan = selected(&frontiers, prompt).expect("an exact ancestor is selected");
-            assert_eq!(plan.fidelity, RestoreFidelity::Exact);
+            assert_eq!(plan.fidelity, if prompt.len() - end >= 128 {
+                RestoreFidelity::ExactEncoderContinuation
+            } else { RestoreFidelity::Exact });
             assert_eq!((plan.snapshot_end, plan.resume(), plan.lag.source_end), (end, end, end));
             assert!(plan.check(end).is_ok());
         }
@@ -624,6 +637,39 @@ mod tests {
         partial.rule = ReuseRule { align: 2, replay: Some(128) };
         assert!(V41Cache::new(Arenas { target: None, draft: None, slots: 0 }, config, None, partial).is_err());
         assert!(V41Cache::new(Arenas { target: None, draft: None, slots: 0 }, config, None, layout(1, false)).is_ok());
+    }
+
+    #[test]
+    fn exact_continuation_fidelity_tracks_the_decoder_window_threshold() {
+        let tokens: Vec<u32> = (0..1024).collect();
+        for end in [512, 513] {
+            for suffix in [0, 1, 127, 128, 129] {
+                let plan = selected(&[&tokens[..end]], &tokens[..end + suffix]).unwrap();
+                assert!(plan.exact());
+                assert_eq!(plan.resume(), end);
+                assert_eq!(plan.fidelity, if suffix >= 128 {
+                    RestoreFidelity::ExactEncoderContinuation
+                } else { RestoreFidelity::Exact });
+            }
+        }
+    }
+
+    #[test]
+    fn serving_refuses_partial_on_before_native_startup() {
+        use clap::Parser;
+        for value in [None, Some("off"), Some("on")] {
+            let mut argv = vec!["cuteafd", "serve-native", "--snapshot", "/model", "--native-lib", "/native.so"];
+            if let Some(value) = value { argv.extend(["--prefix-partial", value]); }
+            let crate::cli::Commands::ServeNative(mut args) = crate::cli::Cli::try_parse_from(argv).unwrap().command else {
+                panic!("expected serve-native");
+            };
+            let result = super::super::normalize_serving(&mut args);
+            if value == Some("on") {
+                assert!(result.unwrap_err().to_string().contains("exact prefix frontiers only"));
+            } else {
+                result.unwrap();
+            }
+        }
     }
 
     /// The private prefix stream is safe by ownership (module docs): every function that queues

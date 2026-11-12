@@ -598,6 +598,12 @@ v41_l2_prefetch="$(get L2_PREFETCH)"
 # a smaller cap that holds the scales (about 6 GiB) preloads those alone.
 v41_engram_warm="$(get ENGRAM_WARM off)"
 case "$v41_engram_warm" in on|off) ;; *) release_die "ENGRAM_WARM must be on or off" ;; esac
+v41_prefix_partial="$(get PREFIX_PARTIAL off)"
+case "$v41_prefix_partial" in
+  off) ;;
+  on) release_die "V4.1 restores exact prefix frontiers only (PREFIX_PARTIAL=off)" ;;
+  *) release_die "PREFIX_PARTIAL must be on or off" ;;
+esac
 case "$RTX_GPUS" in auto|1|2) ;; *) release_die "RTX_GPUS must be auto, 1, or 2" ;; esac
 [[ "$RTX_EXPERT_LAYERS" == auto || "$RTX_EXPERT_LAYERS" == all || "$RTX_EXPERT_LAYERS" =~ ^[0-9]+$ ]] ||
   release_die "DeepSeek V4.1 RTX_EXPERT_LAYERS must be auto, all or a non-negative layer count"
@@ -1062,6 +1068,7 @@ fi
 start_coordinator() {
 echo "== starting native RTX coordinator =="
 local -a args=(--vision "$VISION" --audio "$AUDIO" serve-native "${vision_args[@]}" --snapshot "$(readlink -f "$hf_home/$snapshot_rel")" --native-lib /opt/cuteafd/lib/libcuteafd_native.so --peers "$peers" --rtx-gpus "$RELEASE_RTX_GPUS" --embedding-placement "$EMBEDDING" --listen "$ADDR" --prefill-batch-tokens "$PREFILL_BATCH_TOKENS" --concurrency "$CONCURRENCY" --prefix-cache-entries "$PREFIX_CACHE_ENTRIES" --max-context-tokens "$MAX_CONTEXT_TOKENS" --max-output-tokens "$MAX_OUTPUT_TOKENS" --mapped-scale-preload-gib "$(get MAPPED_SCALE_PRELOAD_GIB 0)")
+[[ -z "$(get PREFIX_PARTIAL)" ]] || args+=(--prefix-partial "$v41_prefix_partial")
 case "$(get EXPERT_USAGE on)" in
   on) args+=(--expert-usage) ;;
   off) args+=(--expert-usage=false) ;;

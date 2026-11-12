@@ -115,6 +115,10 @@ struct Fake {
     record_format: Cell<&'static str>,
     drains: Cell<usize>,
     rule: ReuseRule,
+    /// Diagnostic-only partial rule; never changes this fake's lookup or restores.
+    refused_partial_rule: Option<ReuseRule>,
+    /// Model an exact encoder-continuation route for restore accounting tests.
+    encoder_window: Option<usize>,
     /// A pages-only family (GLM 5.3): no mark; restores resume at the snapshot's length and the
     /// host tier keeps a one-byte stand-in tail.
     markless: bool,
@@ -135,7 +139,8 @@ impl Fake {
         let bytes = (pages * ROWS + rings * RING + slots * WINDOW) * ROW;
         let mem = Rc::new(RefCell::new(StubCopyEngine::new(CopyModel::default(), bytes, 1 << 26)));
         Self { mem, pages, rings, slots, writable_lag: 0, queue: RefCell::new(Vec::new()), fail_restore: Cell::new(false), fail_copy: Cell::new(false), fail_drain: Cell::new(false), record_format: Cell::new("opaque_v1"), drains: Cell::new(0),
-            rule: ReuseRule::EXACT, markless: false, pooled: false, reserved: 0, draft: RefCell::new(None) }
+            rule: ReuseRule::EXACT, refused_partial_rule: None, encoder_window: None,
+            markless: false, pooled: false, reserved: 0, draft: RefCell::new(None) }
     }
     /// Marks in pool pages: no arena slot exists (any use of one panics). `pages` pages hand
     /// out, past the reserved page 0.
@@ -235,6 +240,15 @@ impl PrefixFamily for Fake {
     }
     fn layout(&self) -> FamilyLayout {
         Fake::layout(self)
+    }
+    fn refused_partial_rule(&self) -> Option<ReuseRule> { self.refused_partial_rule }
+    fn plan_restore(&self, hit: RestoreCandidate<'_>) -> RestorePlan {
+        let mut plan = RestorePlan::under(self.rule, hit);
+        if plan.exact() && self.encoder_window.is_some_and(|window|
+            hit.target_end.saturating_sub(hit.snapshot_end) >= window) {
+            plan.fidelity = RestoreFidelity::ExactEncoderContinuation;
+        }
+        plan
     }
     fn discard(&self, placement: &mut Placement) -> Result<(), BoxError> {
         if let Some(draft) = self.draft.borrow_mut().as_mut() {
@@ -493,6 +507,106 @@ fn serve(cache: &mut PrefixCache<Shared>, fake: &Fake, ring: usize, prompt: &[u3
 
 fn seq(base: u32, n: usize) -> Vec<u32> {
     (0..n as u32).map(|i| base + i).collect()
+}
+
+#[test]
+fn restore_fidelity_counts_successes_and_preserves_legacy_hit_counters() {
+    let mut fake = Fake::new(64, 3, 8);
+    fake.encoder_window = Some(WINDOW);
+    let mut cache = cache(&fake, 4, 0);
+    let prompt = seq(100, 21);
+    let (_, _, a) = serve(&mut cache, &fake, 0, &prompt, &[], 32);
+    cache.release(&fake, &a.pages).unwrap();
+    for suffix in [0, WINDOW - 1, WINDOW] {
+        let mut next = prompt.clone();
+        next.extend(seq(900, suffix));
+        let admitted = cache.admit(&fake, &next, 32, false,
+            |pages| Placement { pages, ring: 1, len: 0, ring_from: 0 }).unwrap();
+        assert_eq!(admitted.resume, prompt.len());
+        assert!(admitted.source.unwrap().plan.exact());
+        let mut restored = admitted.placement;
+        fake.forward(&mut restored, &next).unwrap();
+        cache.release(&fake, &restored.pages).unwrap();
+    }
+    let stats = cache.stats();
+    assert_eq!((stats.hits, stats.exact_hits, stats.partial_hits), (3, 1, 0));
+    assert_eq!((stats.exact_snapshot_restores, stats.exact_encoder_continuation_restores), (2, 1));
+    assert_eq!((stats.approximate_replay_restores, stats.replayed_tokens), (0, 0));
+    // A failed restore must never count as successful fidelity, even after it queued copies.
+    fake.fail_restore.set(true);
+    let cold = cache.admit(&fake, &prompt, 32, false,
+        |pages| Placement { pages, ring: 2, len: 0, ring_from: 0 }).unwrap();
+    assert_eq!(cold.resume, 0);
+    assert_eq!(cache.stats().exact_snapshot_restores, 2);
+    cache.release(&fake, &cold.placement.pages).unwrap();
+}
+
+#[test]
+fn exact_only_partial_misses_count_both_tiers_and_keep_exact_ancestors() {
+    for host_bytes in [0, 1 << 20] {
+        let mut fake = Fake::new(64, 3, 8);
+        fake.refused_partial_rule = Some(ReuseRule { align: 2, replay: Some(WINDOW) });
+        let mut cache = cache(&fake, 4, host_bytes);
+        let prompt = seq(100, 41);
+        let (_, _, a) = serve(&mut cache, &fake, 0, &prompt, &[], 48);
+        cache.release(&fake, &a.pages).unwrap();
+        fake.mem.borrow_mut().advance(10_000_000);
+        cache.tick();
+        if host_bytes > 0 {
+            // Leave the snapshot in RAM alone; the device has no retained match.
+            assert!(cache.make_room(&fake, 64, None).unwrap());
+            assert_eq!(cache.stats().entries_prompt, 0);
+        }
+        let mut branch = prompt[..33].to_vec();
+        branch.extend(seq(900, 6));
+        assert_eq!(cache.peek(&branch, false), 0);
+        assert_eq!(cache.stats().exact_only_partial_misses, 0, "peeks never count requests");
+        let cold = cache.admit(&fake, &branch, 48, false,
+            |pages| Placement { pages, ring: 1, len: 0, ring_from: 0 }).unwrap();
+        assert_eq!(cold.resume, 0);
+        assert_eq!(cache.stats().exact_only_partial_misses, 1);
+        cache.release(&fake, &cold.placement.pages).unwrap();
+        // A full prompt hit from either tier is still exact.
+        let full = cache.admit(&fake, &prompt, 48, false,
+            |pages| Placement { pages, ring: 1, len: 0, ring_from: 0 }).unwrap();
+        assert_eq!(full.resume, prompt.len());
+        assert_eq!(full.source.unwrap().host, host_bytes > 0);
+        cache.release(&fake, &full.placement.pages).unwrap();
+        // Retain an older complete ancestor. It wins over the rejected deeper partial match.
+        let (_, _, ancestor) = serve(&mut cache, &fake, 2, &prompt[..20], &[], 48);
+        cache.release(&fake, &ancestor.pages).unwrap();
+        let hit = cache.admit(&fake, &branch, 48, false,
+            |pages| Placement { pages, ring: 1, len: 0, ring_from: 0 }).unwrap();
+        assert_eq!(hit.resume, 20);
+        assert!(hit.source.unwrap().plan.exact());
+        assert_eq!(cache.stats().exact_only_partial_misses, 2, "only the ancestor's cold admission also missed");
+        cache.release(&fake, &hit.placement.pages).unwrap();
+        // Neither an unrelated miss nor a prefix shorter than the replay window is useful.
+        for next in [seq(5000, 12), prompt[..WINDOW].to_vec()] {
+            let cold = cache.admit(&fake, &next, 48, false,
+                |pages| Placement { pages, ring: 1, len: 0, ring_from: 0 }).unwrap();
+            assert_eq!(cold.resume, 0);
+            cache.release(&fake, &cold.placement.pages).unwrap();
+        }
+        assert_eq!(cache.stats().exact_only_partial_misses, 2);
+        cache.clear(&fake).unwrap();
+        assert_eq!(cache.pool().free(), 64);
+    }
+}
+
+#[test]
+fn exact_only_partial_misses_exclude_failed_cold_allocations() {
+    let mut fake = Fake::new(16, 2, 4);
+    fake.refused_partial_rule = Some(ReuseRule { align: 2, replay: Some(WINDOW) });
+    let mut cache = cache(&fake, 4, 0);
+    let prompt = seq(100, 41);
+    let (_, _, active) = serve(&mut cache, &fake, 0, &prompt, &[], 48);
+    let mut branch = prompt[..33].to_vec();
+    branch.extend(seq(900, 6));
+    assert!(cache.admit(&fake, &branch, 64, false,
+        |pages| Placement { pages, ring: 1, len: 0, ring_from: 0 }).is_err());
+    assert_eq!(cache.stats().exact_only_partial_misses, 0);
+    cache.release(&fake, &active.pages).unwrap();
 }
 
 #[test]

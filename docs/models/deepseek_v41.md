@@ -47,6 +47,17 @@ There is no separate scale-only preload. `ENGRAM_WARM` warms the whole mapped ta
   FP4 source pages, a mark holding the window rings, odd compressor carry,
   Engram lookback and dSpark rings, snapshots at prompt end and turn end,
   shared `--prefix-cache-*`/`--host-cache-*` flags and pinned-host tier.
+  `PREFIX_PARTIAL=off` (CLI `--prefix-partial off`, environment
+  `CUTEAFD_PREFIX_PARTIAL=off`) preserves exact-only reuse; `on` is refused.
+  Exact ancestors with at least 128 new tokens use encoder continuation;
+  shorter suffixes restore the complete mark. Prefix stats distinguish
+  `exact_snapshot_restores`, `exact_encoder_continuation_restores`,
+  `approximate_replay_restores`, `replayed_tokens` and
+  `exact_only_partial_misses`. The last counter counts cold admissions with
+  useful rejected partial matches in either tier, excluding failed restores
+  and resource failures. Approximate replay and its replayed-token count stay
+  zero for V4.1. Existing `exact_hits` still means a whole-prompt hit with
+  retained logits, rather than all exact restores.
 - RTX/Spark layouts: the v2 native MXFP4 minimum is 1 RTX + 3 Sparks;
   the v2 NVFP4 cards use 4 Sparks. Current MXFP4 and NVFP4 support TP3 as a
   fit-minimum option (see the TP3 decision in `PLAN.md`). The current MXFP4
