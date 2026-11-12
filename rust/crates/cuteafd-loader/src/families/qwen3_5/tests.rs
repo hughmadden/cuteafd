@@ -300,7 +300,7 @@ fn native_planner_refuses_unimplemented_prefill_shapes() {
 }
 
 #[test]
-fn dense_default_prefix_geometry_releases_retention_with_host() {
+fn dense_default_prefix_geometry_retains_device_marks_with_host() {
     use cuteafd_core::prefix::{mark_slots_for, mark_slots_with_host};
     use crate::placement::families::qwen3_5::NativeBuffers;
     for (name, hidden, intermediate, heads, values, layers, expected_mark) in [
@@ -312,7 +312,7 @@ fn dense_default_prefix_geometry_releases_retention_with_host() {
         assert_eq!(mark, expected_mark);
         let old = mark_slots_for(16, 20, mark, 2 << 30);
         let staged = mark_slots_with_host(16, 20, mark, 2 << 30, true);
-        assert_eq!((old, staged), (if layers == 32 { 41 } else { 13 }, 2));
+        assert_eq!((old, staged), if layers == 32 { (41, 41) } else { (13, 13) });
         println!("{name}: C16 entries=20 mark_bytes={mark} slots={old}->{staged} arena_GiB={:.6}->{:.6} freed_GiB={:.6}",
             old as f64 * mark as f64 / (1u64 << 30) as f64,
             staged as f64 * mark as f64 / (1u64 << 30) as f64,

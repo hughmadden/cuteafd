@@ -23,8 +23,8 @@ pub(crate) struct PrefixArgs {
     /// Device snapshots per bank; the host tier is limited only by --host-cache-bytes.
     #[arg(long, env = "CUTEAFD_PREFIX_CACHE_ENTRIES", default_value_t = cuteafd_core::concurrency::AUTO_ENTRIES)]
     pub prefix_cache_entries: usize,
-    /// Device mark budget in MiB. With host retention, two staging marks are reserved;
-    /// host-off retains the legacy entry/budget count with two per decoding sequence plus two.
+    /// Device mark budget in MiB, with or without host retention. The arena holds both
+    /// snapshot banks plus two capture/restore slots, capped by this budget.
     #[arg(long, env = "CUTEAFD_PREFIX_CACHE_MARK_MIB", default_value_t = 2048)]
     pub prefix_cache_mark_mib: usize,
     /// Shortest prompt or turn worth a snapshot.
@@ -281,6 +281,8 @@ mod tests {
                         let arena = cuteafd_engine::prefix::MarkArena::slots_for(lanes, entries as usize, bytes,
                             rule.budget_bytes as usize, host != "0");
                         assert_eq!((rule.slots(bytes), arena), (planned, planned));
+                        assert_eq!(planned as u64, cuteafd_core::prefix::mark_slots_for(
+                            lanes as u64, entries, bytes as u64, rule.budget_bytes));
                     }
                 }
             }
