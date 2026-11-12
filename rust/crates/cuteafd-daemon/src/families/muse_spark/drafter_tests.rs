@@ -32,6 +32,17 @@ fn nvidia_drafter_binds_the_head_dim_64_kernels() {
     assert_eq!(cfg.heads / cfg.kv_heads * cfg.block, 64);
 }
 
+#[test]
+fn drafter_borrows_the_serialized_target_projection_not_its_workspace() {
+    let draft = include_str!("draft.rs");
+    let forward = include_str!("forward.rs");
+    assert!(draft.contains("head.check_head_stream(stream)?"));
+    assert!(draft.contains("super::forward::project_head(cfg, head, rows, input, staged, trimmed, out, stream)"));
+    assert!(!draft.contains("vocabulary_head_rows(") && !draft.contains("VOCABULARY_HEAD_WORKSPACE"));
+    assert!(forward.contains("rank.check_head_stream(stream)?"));
+    assert!(forward.contains("project_head(cfg, rank, count, normed, staged, trimmed, logits, stream)?"));
+}
+
 /// Both candidates are charged on the head GPU from their own configs and
 /// pass the target-head check (softcap 20, the target's output multiplier).
 #[test]
@@ -41,9 +52,12 @@ fn both_drafters_are_charged_against_the_target_head() {
     for (name, head_dim) in [("radixark.json", 128), ("nvidia.json", 64)] {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/families/muse_spark/fixtures/drafters").join(name);
         let config: serde_json::Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
-        let drafter = cuteafd_loader::placement::families::muse_spark::drafter_inventory(&target, &config, 16, 16, 202_112,
-            188, cuteafd_loader::families::qwen4::Qwen4KvCache::Fp8).unwrap_or_else(|error| panic!("{name}: {error:#}"));
-        assert_eq!((drafter.head_dim, drafter.block, drafter.sequences), (head_dim, 8, 16), "{name}");
-        assert!(drafter.owned > 0 && drafter.scratch > 0, "{name}");
+        for stored in [target.vocab_size, 202_112] {
+            let drafter = cuteafd_loader::placement::families::muse_spark::drafter_inventory(&target, &config, 16, 16, stored,
+                188, cuteafd_loader::families::qwen4::Qwen4KvCache::Fp8).unwrap_or_else(|error| panic!("{name}: {error:#}"));
+            assert_eq!((drafter.head_dim, drafter.block, drafter.sequences), (head_dim, 8, 16), "{name}");
+            assert!(drafter.owned > 0 && drafter.scratch > 0, "{name}");
+            assert_eq!(drafter.head_scratch, (16 * 8 * (stored + target.vocab_size) * 4) as u64);
+        }
     }
 }

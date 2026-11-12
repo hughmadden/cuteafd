@@ -6,7 +6,7 @@
 //! device layer (`RankDevice`) its view for one step.
 use super::{core::CorePrograms, device::{RankDevice, RankPrograms, StepPlanes, Tp2Ops}, lane::Lane, step::StepMetadata,
     storage::RankKv, weights::{load_rank, GlobalWeights, LayerWeights}};
-use crate::shared::memory::{device::Allocation, Tag};
+use crate::shared::memory::{device::{Allocation, DeviceOwner}, Tag};
 use cuteafd_ffi::CuteafdDeviceBuffer as Buffer;
 use cuteafd_loader::families::muse_spark::lane::StepTables;
 use crate::shared::{memory::device::Device, rope::{RotaryTables, Table}};
@@ -24,6 +24,7 @@ pub(crate) struct RankLoad<'c, 'a> {
     pub built: &'c AdmittedMuse,
     pub placement: &'c Placement,
     pub rank: usize,
+    pub stream: *mut c_void,
     /// Active sequence slots (each owns its sliding rings).
     pub slots: u64,
     /// Prefill unit rows and waves in flight (the lane's span).
@@ -48,10 +49,14 @@ pub(crate) struct RankResources<'a> {
     pub wire_grid: crate::shared::launch_grid::Fp8QuantizeGrid,
     pub step: StepStorage<'a>,
     pub globals: GlobalWeights<'a>,
-    /// Head rank: the K6 head's F32 rows at the stored width, then the
+    /// Head rank: F32 rows at the selected head's stored width, then the
     /// softcapped logits trimmed to the vocabulary (`lane::head_planes`).
     pub head: Option<(Allocation<'a>, Allocation<'a>)>,
     pub prefill_logits: Option<Allocation<'a>>,
+    // Handle before its retained workspace: destruction must not outlive scratch.
+    pub native_head: Option<DeviceOwner<'a, cuteafd_ffi::programs::VocabularyHead<'a>>>,
+    _head_workspace: Option<Allocation<'a>>,
+    head_stream: *mut c_void,
 }
 
 /// The step metadata planes beyond the lane (`StepTables`, as admitted).
@@ -114,7 +119,7 @@ impl<'a> StepStorage<'a> {
 
 impl<'a> RankResources<'a> {
     pub(crate) fn load(device: Device<'a>, programs: &'a Programs<'a>, load: RankLoad<'_, 'a>) -> Result<Self> {
-        let RankLoad { cfg, checkpoint, built, placement, rank, slots, unit_rows, waves, context, arena } = load;
+        let RankLoad { cfg, checkpoint, built, placement, rank, slots, unit_rows, waves, context, arena, stream } = load;
         let tables = shared::step_tables(unit_rows, usize::try_from(slots)?, context, waves)?;
         let ranks = built.layouts.first().map_or(0, Vec::len);
         ensure!(rank < ranks && placement.items.len() == ranks, "Muse rank {rank} of {ranks} placement ranks");
@@ -143,21 +148,31 @@ impl<'a> RankResources<'a> {
         let step = StepStorage::allocate(device, tables)?;
         let global_layout = cuteafd_loader::families::muse_spark::weight_layout::GlobalLayout::new(cfg, &actual_core)?;
         let globals = GlobalWeights::load(device, checkpoint, &global_layout, rank, ranks, arena)?;
-        let head = match &globals.head {
-            Some(weights) => {
-                let (stored, trimmed) = cuteafd_loader::families::muse_spark::lane::head_planes(weights.shape[0],
-                    cfg.vocab_size)?;
-                Some((Allocation::new(device, stored, Tag::workspace("muse/head-logits"))?,
-                    Allocation::new(device, trimmed, Tag::workspace("muse/head-logits"))?))
-            }
-            None => None,
-        };
-        let prefill_logits = if globals.head.is_some() && built.prefill_logits_bytes > 0 {
+        let has_head = globals.head.is_some() || globals.head_bf16.is_some();
+        let head = if has_head {
+            let (stored, trimmed) = cuteafd_loader::families::muse_spark::lane::head_planes(
+                actual_core.head_outputs(cfg), cfg.vocab_size)?;
+            Some((Allocation::new(device, stored, Tag::workspace("muse/head-logits"))?,
+                Allocation::new(device, trimmed, Tag::workspace("muse/head-logits"))?))
+        } else { None };
+        let head_workspace = globals.head_bf16.as_ref().map(|_| Allocation::new(device,
+            cuteafd_ffi::programs::VOCABULARY_HEAD_WORKSPACE, Tag::workspace("muse/head-workspace"))).transpose()?;
+        let native_head = head_workspace.as_ref().map(|workspace| device.own(|| {
+            // SAFETY: the rank retains this device's admitted workspace beyond the handle.
+            unsafe { library.vocabulary_head_rows(workspace.buffer.ptr, u32::try_from(cfg.hidden)?,
+                u32::try_from(cuteafd_loader::families::muse_spark::lane::HEAD_ROWS)?,
+                u32::try_from(cfg.vocab_size)?, crate::shared::target_head::TargetHead::configured().native_mode()) }
+        })).transpose()?;
+        let prefill_logits = if has_head && built.prefill_logits_bytes > 0 {
             Some(Allocation::new(device, built.prefill_logits_bytes, Tag::workspace("muse/prefill-logits"))?)
         } else { None };
         let wire_grid = crate::shared::launch_grid::Fp8QuantizeGrid::new(device.run(|| library.sm_count())?, None)?;
         Ok(Self { device, programs: bound, core, layers, kv, lane, rope, _rotary: rotary, tp2, ranks, rank, wire_grid, step,
-            globals, head, prefill_logits })
+            globals, head, prefill_logits, native_head, _head_workspace: head_workspace, head_stream: stream })
+    }
+
+    pub(crate) fn check_head_stream(&self, stream: *mut c_void) -> Result<()> {
+        check_head_stream(self.head_stream, stream)
     }
 
     /// The device layer's view of this rank for one step on `stream`.
@@ -172,6 +187,13 @@ impl<'a> RankResources<'a> {
             layers: &self.layers, lane, rope: self.rope.buffers(), kv: &self.kv.layers,
             ranks: self.ranks, rank: self.rank, tp2: self.tp2.as_ref(), wire_grid: self.wire_grid, stream, graphs: None }
     }
+}
+
+/// Target and drafter borrow one native handle/workspace, serialized on the rank stream.
+fn check_head_stream(owner: *mut c_void, borrower: *mut c_void) -> Result<()> {
+    ensure!(owner == borrower, "Muse target/drafter head must share the owning rank stream");
+    debug_assert_eq!(owner, borrower);
+    Ok(())
 }
 
 /// What the Spark link of an admitted Muse layout needs at connect.
@@ -316,4 +338,14 @@ mod terminal_tests {
         }
     }
 
+}
+
+#[cfg(test)]
+mod head_stream_tests {
+    #[test]
+    fn shared_target_and_drafter_handle_requires_one_stream() {
+        let stream = 0x1000usize as *mut std::ffi::c_void;
+        assert!(super::check_head_stream(stream, stream).is_ok());
+        assert!(super::check_head_stream(stream, 0x2000usize as *mut std::ffi::c_void).is_err());
+    }
 }

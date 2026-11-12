@@ -88,7 +88,8 @@ pub(crate) fn admit(options: Options<'_>) -> Result<shared::AdmittedMuse> {
         audio: cuteafd_loader::plan::MediaMode::Off, replicas: 1, vision_bytes: (0, 0), audio_bytes: (0, 0) });
     let prepared = shared::ProductionInput { cfg: options.cfg, core: options.core, projections: options.projections,
         catalog: options.catalog,
-        budgets, host: options.host, prefill: options.prefill, full_prefill_logits: options.full_prefill_logits, slots: options.slots,
+        budgets, host: options.host, prefill: options.prefill, full_prefill_logits: options.full_prefill_logits,
+        bf16_target_head: crate::shared::target_head::TargetHead::configured().blas_head(true), slots: options.slots,
         mark_slots: options.mark_slots, context, maximum_pool_tokens,
         partial_bf16_max_rows: options.partial_bf16_max_rows, partial_reply_formats: options.partial_reply_formats,
         local: options.local, drafter: options.drafter, fixed, media }.prepare()?;

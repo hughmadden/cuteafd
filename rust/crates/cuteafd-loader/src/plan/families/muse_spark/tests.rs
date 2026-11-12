@@ -91,6 +91,50 @@ fn with_package(rtx: usize, ranks: usize, dir: &std::path::Path) -> PlanOptions 
 }
 
 #[test]
+fn selected_head_views_charge_one_native_workspace_with_or_without_drafter() {
+    use crate::families::muse_spark::{core::CoreInventory, MuseSparkConfig};
+    use crate::placement::planner::serving::BlasHead;
+    let cfg = MuseSparkConfig::from_hf(&testing::muse_spark_config()).unwrap();
+    let drafter = tempfile::tempdir().unwrap();
+    std::fs::write(drafter.path().join("config.json"),
+        include_str!("../../../../../cuteafd-daemon/src/families/muse_spark/fixtures/drafters/nvidia.json")).unwrap();
+    for width in [None, Some(6), Some(8)] {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut tensors, _) = testing::muse_spark_tensors(&all_layers());
+        if let Some(bits) = width {
+            for (name, _, shape) in &mut tensors {
+                if name.starts_with("lm_head.") && name.ends_with(".trellis") { shape[2] = 16 * bits; }
+            }
+        } else {
+            tensors.retain(|(name, _, _)| !name.starts_with("lm_head."));
+            tensors.push(testing::t("lm_head.weight", "BF16", &[cfg.vocab_size, cfg.hidden]));
+        }
+        testing::write_snapshot(dir.path(), &testing::muse_spark_config(), &tensors, None);
+        let input = testing::BudgetedPlanInput::open(dir.path()).unwrap();
+        let inventory = CoreInventory::from_checkpoint(&cfg, input.checkpoint()).unwrap();
+        assert_eq!(inventory.head_outputs(&cfg), if width.is_none() { cfg.vocab_size } else { 202112 });
+        for backend in [BlasHead::TensorLt, BlasHead::Gemm] {
+            for draft in [false, true] {
+                let mut options = with_layout(2, 6);
+                let layout = options.layout.as_mut().unwrap();
+                layout.bf16_target_head = backend;
+                if draft { layout.muse_drafter_snapshot = Some(drafter.path().to_path_buf()); }
+                let report = input.plan(&options).unwrap();
+                assert!(report.fits, "{width:?} {backend:?} draft={draft}: {:?}", report.hints);
+                let placed = report.solver_placement.unwrap();
+                let workspace = |gpu: usize| placed.items[gpu].iter().filter(|item|
+                    item.group == "Muse native target/drafter head workspace").map(|item| item.bytes).sum::<u64>();
+                assert_eq!(workspace(0), 0);
+                assert_eq!(workspace(1), if width.is_none() { crate::serving_capacity::GLMF_HEAD_WORKSPACE } else { 0 });
+                let init = placed.items[1].iter().filter(|item|
+                    item.group.starts_with("BLAS device initialization")).map(|item| item.bytes).sum::<u64>();
+                assert_eq!(init, if width.is_none() { 2 << 20 } else { 0 });
+            }
+        }
+    }
+}
+
+#[test]
 fn graph_reserve_matches_the_chosen_onboarding_candidate() {
     const CHILD: &str = "CUTEAFD_MUSE_GRAPH_RESERVE_TEST";
     if std::env::var_os(CHILD).is_none() {

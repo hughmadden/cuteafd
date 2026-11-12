@@ -58,10 +58,29 @@ impl CoreInventory {
             .and_then(|rest| rest.split_once('.'))
             .is_some_and(|(layer, leaf)| layer.parse::<usize>().is_ok_and(|layer| layer < cfg.layers)
                 && !leaf.starts_with("mlp.experts."));
-        // The K6 head is stored at whole 128-row output blocks (202,112 for the
+        // A trellis head is stored at whole 128-row output blocks (202,112 for the
         // logical 202,048 vocabulary); the engine trims logits before the softcap.
         let projections = read_projections(checkpoint, &expected(cfg), selected,
             |stem| split(cfg, stem).map(|split| CoreContract { family: "Muse", widths: &[4, 6, 8], split, padded_outputs: stem == HEAD }))?;
+        if let Some(head) = projections.get(HEAD) {
+            ensure!(matches!(head.bits, 6 | 8), "Muse {HEAD}: target head requires K6/K8 trellis or BF16");
+        } else {
+            ensure!(!["weight_packed", "trellis"].iter().any(|suffix|
+                checkpoint.contains_tensor(&format!("{HEAD}.{suffix}"))),
+                "Muse {HEAD}: conflicting or unsupported selected target head storage");
+            // Index-only planner inventories do not open ordinary native headers.
+            // Resolve only the selected view's indexed shard, never another view.
+            let name = format!("{HEAD}.weight");
+            let header = if let Some(tensor) = checkpoint.tensors.iter().find(|t| t.meta.name == name) {
+                tensor.meta.clone()
+            } else {
+                let shard = checkpoint.weight_map.get(&name).context("Muse selected BF16 head is not indexed")?;
+                crate::read_safetensors_metadata(&checkpoint.snapshot.join(shard))?.into_iter()
+                    .find(|meta| meta.name == name).context("Muse selected BF16 head header is missing")?
+            };
+            ensure!(header.dtype == cuteafd_core::DType::Bf16 && header.shape == [cfg.vocab_size, cfg.hidden],
+                "Muse {HEAD}: selected native target head must be BF16 [{}, {}]", cfg.vocab_size, cfg.hidden);
+        }
         let mut inventory = Self { projections, native: BTreeMap::new() };
         for (name, shape) in expected(cfg) {
             let stem = name.strip_suffix(".weight").unwrap();
@@ -102,6 +121,12 @@ impl CoreInventory {
         Ok(inventory)
     }
 
+    /// The selected target head: padded for header-native trellis, logical for BF16.
+    /// `from_checkpoint` validates the native operand, never a fallback from another view.
+    pub fn head_outputs(&self, cfg: &MuseSparkConfig) -> usize {
+        self.get_weight(HEAD).map_or(cfg.vocab_size, |head| head.stored_outputs)
+    }
+
     pub fn get_weight(&self, name: &str) -> Option<&CoreProjection> {
         self.projections.get(name.strip_suffix(".weight").unwrap_or(name))
     }
@@ -110,5 +135,47 @@ impl CoreInventory {
     pub fn complete(&self, cfg: &MuseSparkConfig) -> bool {
         (0..cfg.layers).all(|layer| ["self_attn.q_proj", "mlp.pre_expert_proj"].iter()
             .all(|leaf| self.projections.contains_key(&format!("{PREFIX}{layer}.{leaf}"))))
+    }
+}
+
+#[cfg(test)]
+mod head_tests {
+    use super::*;
+    use crate::plan::testing;
+
+    #[test]
+    fn selected_head_is_validated_without_cross_view_fallback() -> Result<()> {
+        let cfg = MuseSparkConfig::from_hf(&testing::muse_spark_config())?;
+        for bits in [6, 8] {
+            let dir = tempfile::tempdir()?;
+            let tensors = testing::exl3(HEAD, cfg.vocab_size.next_multiple_of(128), cfg.hidden, bits);
+            testing::write_snapshot(dir.path(), &testing::muse_spark_config(), &tensors, None);
+            let checkpoint = Checkpoint::open(dir.path())?;
+            let inventory = CoreInventory::from_checkpoint(&cfg, &checkpoint)?;
+            assert_eq!(inventory.head_outputs(&cfg), cfg.vocab_size.next_multiple_of(128));
+            assert_eq!(inventory.get_weight(HEAD).unwrap().bits, bits);
+        }
+        let dir = tempfile::tempdir()?;
+        testing::write_snapshot(dir.path(), &testing::muse_spark_config(),
+            &[testing::t("lm_head.weight", "BF16", &[cfg.vocab_size, cfg.hidden])], None);
+        let mut checkpoint = Checkpoint::open(dir.path())?;
+        let inventory = CoreInventory::from_checkpoint(&cfg, &checkpoint)?;
+        assert_eq!(inventory.head_outputs(&cfg), cfg.vocab_size);
+        assert!(inventory.get_weight(HEAD).is_none());
+        let mut index_only = Checkpoint::open(dir.path())?;
+        index_only.tensors.clear();
+        assert_eq!(CoreInventory::from_checkpoint(&cfg, &index_only)?.head_outputs(&cfg), cfg.vocab_size);
+        index_only.weight_map.insert("lm_head.weight_packed".into(), "absent.safetensors".into());
+        assert!(CoreInventory::from_checkpoint(&cfg, &index_only).is_err());
+        for (dtype, shape) in [(cuteafd_core::DType::F32, vec![cfg.vocab_size, cfg.hidden]),
+            (cuteafd_core::DType::Bf16, vec![cfg.vocab_size + 64, cfg.hidden])] {
+            checkpoint.tensors[0].meta.dtype = dtype;
+            checkpoint.tensors[0].meta.shape = shape;
+            assert!(CoreInventory::from_checkpoint(&cfg, &checkpoint).is_err());
+        }
+        checkpoint.tensors.clear();
+        checkpoint.weight_map.clear();
+        assert!(CoreInventory::from_checkpoint(&cfg, &checkpoint).is_err());
+        Ok(())
     }
 }

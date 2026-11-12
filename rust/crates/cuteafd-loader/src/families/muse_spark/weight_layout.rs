@@ -341,7 +341,7 @@ mod tests {
             native.native.insert(stem.clone(), NativeProjection { shape: projection.shape, fp8: true,
                 split: projection.split });
         }
-        // The served head stays K6; BF16 head variants remain CPU-layout coverage.
+        // Attention format varies independently of the selected target head.
         let mut native_bf16 = native.clone();
         for projection in native_bf16.native.values_mut() { projection.fp8 = false; }
         for (format, core) in [("K6", release), ("native-fp8", native), ("native-bf16", native_bf16),

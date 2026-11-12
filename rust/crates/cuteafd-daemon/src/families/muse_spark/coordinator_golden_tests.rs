@@ -81,8 +81,7 @@ fn dump_max_group_plan_from_installed_headers() -> Result<()> {
             let path = std::path::PathBuf::from(path);
             let config: serde_json::Value = serde_json::from_slice(&std::fs::read(path.join("config.json"))
                 .with_context(|| format!("drafter config {}", path.display()))?)?;
-            let head = core.get_weight(cuteafd_loader::families::muse_spark::core::HEAD)
-                .map(|head| head.stored_outputs).context("Muse drafter needs the K6 target head")?;
+            let head = core.head_outputs(&cfg);
             let sms = std::env::var("CUTEAFD_PUSH_SMS").ok()
                 .map(|sms| sms.parse::<u64>().context("CUTEAFD_PUSH_SMS")).transpose()?.unwrap_or(188);
             Some(shared::drafter_inventory(&cfg, &config, SEQUENCES, SEQUENCES, head, sms,
