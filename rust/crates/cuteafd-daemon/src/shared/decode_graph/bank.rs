@@ -107,7 +107,10 @@ pub(crate) struct CaptureTicket {
 
 fn capture_failed(cache: &super::device::SharedCache, id: u64, error: &anyhow::Error) -> bool {
     let mut cache = cache.lock().unwrap_or_else(|p| p.into_inner());
-    if error.downcast_ref::<cuteafd_ffi::NativeStatusError>()
+    if let Some(small) = error.downcast_ref::<cuteafd_ffi::SmallGraphCapture>() {
+        cache.capture_too_small(id, small.nodes);
+        false
+    } else if error.downcast_ref::<cuteafd_ffi::NativeStatusError>()
         .is_some_and(|error| error.status == cuteafd_ffi::CUTEAFD_STATUS_ALLOCATION_FAILED) {
         cache.capture_oom(id)
     } else {
@@ -1054,6 +1057,31 @@ mod device_tests {
         bank.cache_tick();
         assert!(!bank.cache_keys.contains_key(&2));
         assert!(bank.cache_ticket(&2, false, None).is_some(), "non-OOM has no cooldown");
+    }
+
+    #[test]
+    fn small_capture_remains_eager_across_boundaries_and_ghost_pressure() {
+        for nodes in 0..=2 {
+            let mut bank: GraphBank<u32, u32> = GraphBank::new(None);
+            bank.attach_device_for_test(-330 - nodes as i32, 1000,
+                Site { spans_devices: true, ..site() }).unwrap();
+            let mut ticket = bank.cache_ticket(&1, true, None).unwrap();
+            let small = anyhow::Error::new(cuteafd_ffi::SmallGraphCapture { nodes });
+            assert!(ticket.capture_result::<()>(Err(small)).is_err());
+            drop(ticket);
+            bank.cache_measured(10);
+            bank.cache_tick();
+            let charged = super::super::device::snapshots().into_iter().find(|row| row.device == -330 - nodes as i32).unwrap().charged;
+            for key in 2..100 {
+                let ticket = bank.cache_ticket(&key, false, None);
+                drop(ticket);
+                bank.cache_measured(0);
+                bank.cache_tick();
+                assert!(bank.cache_ticket(&1, true, None).is_none());
+            }
+            assert_eq!(bank.cache_keys.len(), 1);
+            assert_eq!(super::super::device::snapshots().into_iter().find(|row| row.device == -330 - nodes as i32).unwrap().charged, charged);
+        }
     }
 
     #[test]

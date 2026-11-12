@@ -126,7 +126,6 @@ pub(crate) struct DsparkWindow<'a> {
     ring: DeviceAllocation<'a>,
     descriptors: DeviceAllocation<'a>,
     staging: HostAllocation<'a>,
-    graphs: crate::shared::decode_graph::GraphBank<(), crate::shared::decode_graph::GraphOwner<'a, ()>>,
     slots: [Slot; cuteafd_core::V41_MAX_REQUESTS],
     access: SlotAccess,
     slot_count: usize,
@@ -172,50 +171,19 @@ impl<'a> DsparkWindow<'a> {
             ring: DeviceAllocation::new(library, slots * V41DsparkCache::SLOT_BYTES, Tag::drafter_kv("v41/draft-cache"))?,
             descriptors: DeviceAllocation::new(library, cuteafd_core::V41_WRITE_DESCRIPTOR_BYTES, Tag::drafter_workspace("v41/draft-cache"))?,
             staging: HostAllocation::new(library, cuteafd_core::V41_WRITE_DESCRIPTOR_BYTES, Tag::staging("v41/draft-cache"))?,
-            graphs: crate::shared::decode_graph::GraphBank::new(None),
             slots: [Slot::default(); cuteafd_core::V41_MAX_REQUESTS],
             access: SlotAccess::default(),
             slot_count: slots,
             source_rows,
             owner,
         };
-        // Inactive descriptors warm/capture the fixed launch without reading source.
+        // Inactive descriptors warm the fixed launch without reading source.
         library.copy_h2d(value.descriptors.buffer, value.staging.bytes_mut())?;
         unsafe {
             value.enqueue()?;
         }
         value.synchronize()?;
         Ok(value)
-    }
-    pub(crate) fn visit_graph_banks(&mut self,
-        f: &mut dyn FnMut(i32, &'static str, bool, &mut dyn crate::shared::decode_graph::CacheAttached) -> Result<()>,
-    ) -> Result<()> {
-        f(self.ring.buffer.device_id, "dspark_cache", false, &mut self.graphs)
-    }
-    fn capture_ready(&mut self) -> Result<()> {
-        let Some(mut ticket) = self.graphs.cache_ticket(&(), true, None) else { return Ok(()) };
-        let library = self.stream.library;
-        // SAFETY: all earlier writes completed and this window pins every buffer.
-        unsafe { ticket.capture_result(library.cuda_graph_begin_capture(self.stream.raw))?; }
-        let queued = unsafe { self.enqueue() };
-        let captured = unsafe { ticket.capture_result(library.cuda_graph_end_capture_topology(self.stream.raw)) };
-        match (queued, captured) {
-            (Ok(()), Ok((raw, nodes, width, spans, _))) => {
-                // SAFETY: Drop drains before clearing this owner and its allocations.
-                let owner = unsafe { crate::shared::decode_graph::GraphOwner::new(library,
-                    self.ring.buffer.device_id, raw, ())? };
-                crate::shared::decode_graph::census::capture_device_key("deepseek_v41", "dspark_cache",
-                    self.owner as usize, self.ring.buffer.device_id, None, &(), raw);
-                self.graphs.cache_commit((), owner, ticket, nodes as u64, width, spans);
-                Ok(())
-            }
-            (Err(error), Ok((raw, ..))) => {
-                // SAFETY: failed capture has never launched.
-                unsafe { library.cuda_graph_exec_destroy(raw)?; }
-                Err(error)
-            }
-            (Err(error), Err(_)) | (Ok(()), Err(error)) => Err(error),
-        }
     }
     fn synchronize(&self) -> Result<()> {
         unsafe { self.stream.library.cuda_stream_synchronize(self.stream.raw) }
@@ -356,11 +324,7 @@ impl<'a> DsparkWindow<'a> {
             self.stream
                 .library
                 .copy_h2d(self.descriptors.buffer, self.staging.bytes_mut())?;
-            if let Some(owner) = self.graphs.cached_launch(&()) {
-                self.stream.library.cuda_graph_launch(owner.raw, self.stream.raw)
-            } else {
-                self.enqueue()
-            }
+            self.enqueue()
         })();
         let drained = self.synchronize();
         if let Err(error) = launched.and(drained) {
@@ -373,7 +337,6 @@ impl<'a> DsparkWindow<'a> {
             }
             return Err(error);
         }
-        if self.graphs.get(&()).is_none() { self.capture_ready()?; }
         for slot in 0..self.slot_count {
             if seen[slot] {
                 self.slots[slot].end = ends[slot];
@@ -442,7 +405,6 @@ impl<'a> DsparkWindow<'a> {
 impl Drop for DsparkWindow<'_> {
     fn drop(&mut self) {
         crate::shared::decode_graph::fatal_drain(self.synchronize(), "dSpark window");
-        self.graphs.cache_clear_drained();
     }
 }
 

@@ -1118,7 +1118,7 @@ fn gpu_decode_reduction_captured_before_first_wave_reads_replay_format() -> Resu
         library.cuda_stream_synchronize(stream.raw())?;
         library.cuda_graph_begin_capture(stream.raw())?;
         binding.launch(&library, std::ptr::null(), output.buffer.ptr.cast(), rows, stream.raw())?;
-        let raw = library.cuda_graph_end_capture(stream.raw())?;
+        let raw = library.cuda_graph_end_capture_for_test(stream.raw())?;
         crate::shared::decode_graph::GraphOwner::new(&library, library.cuda_get_device()?, raw, binding)?
     };
     for mode in [0u32, 1, 2, 0, 2, 1] {

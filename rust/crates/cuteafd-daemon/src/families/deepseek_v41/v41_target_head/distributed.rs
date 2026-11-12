@@ -14,7 +14,6 @@ struct Rank<'w, 'a> {
     candidates: DeviceAllocation<'a>,
     weights: &'w VocabularyShard<'a>,
     capacity: usize,
-    graphs: [crate::shared::decode_graph::RowGraphs<'a>; 2],
     /// Scratch of the shard's copy (E4M3, or exact 12-bit read exactly for target
     /// logits and through its coarse plane for drafts) when this wave projects through it.
     fp8_scratch: Option<crate::families::deepseek_v41::v41_tensors::HeadScratch<'a>>,
@@ -44,7 +43,7 @@ impl<'w, 'a> Rank<'w, 'a> {
             projection, _workspace: workspace, input,
             logits: DeviceAllocation::new(library, capacity * weights.tokens().len() * 4, Tag::workspace("v41/target-head"))?,
             candidates: DeviceAllocation::new(library, capacity * 8, Tag::workspace("v41/target-head"))?,
-            weights, capacity, graphs: std::array::from_fn(|mode| crate::shared::decode_graph::RowGraphs::new(library, if mode == 0 { "vocabulary_logits" } else { "vocabulary_greedy" }, capacity, "deepseek_v41")), fp8_scratch: native,
+            weights, capacity, fp8_scratch: native,
             sm: Some(library.v41_peer_copy()?),
         })
     }
@@ -67,7 +66,6 @@ impl<'w, 'a> Rank<'w, 'a> {
         }
     }
     unsafe fn begin(&mut self, input: CuteafdDeviceBuffer, rows: usize, greedy: bool) -> Result<()> {
-        let mode = usize::from(greedy);
         unsafe {
             let lib = self.stream.library;
             if input.device_id == self.input.buffer.device_id {
@@ -80,47 +78,15 @@ impl<'w, 'a> Rank<'w, 'a> {
             }
             let span = self.draft_timing.as_ref().map(|timing| timing.begin("head_shard", None, rows, self.stream.raw)).transpose()?.flatten();
             crate::shared::decode_graph::census::dispatch(lib, self.stream.raw, c"head", rows,
-                self.graphs[mode].cached_launch(rows), || self.enqueue(rows, greedy))?;
+                None, || self.enqueue(rows, greedy))?;
             if let Some(timing) = &self.draft_timing { timing.end(span, self.stream.raw)?; }
             Ok(())
         }
     }
-    unsafe fn capture_ready(&mut self, rows: usize, greedy: bool) -> Result<()> {
-        let mode = usize::from(greedy);
-        if self.graphs[mode].get(rows).is_none() && self.graphs[mode].capture_allowed(rows)
-            && !crate::shared::decode_graph::census::eager("head") {
-            let lib = self.stream.library;
-            let Some(mut ticket) = self.graphs[mode].cache_ticket(&rows, crate::families::deepseek_v41::graph_policy::pinned_shape(self.input.buffer.device_id, rows as u32), None) else {
-                crate::shared::decode_graph::note_eager("deepseek_v41", &format!("head rows={rows}"), || "cache admission".into());
-                return Ok(());
-            };
-            unsafe { ticket.capture_result(lib.cuda_graph_begin_capture(self.stream.raw))?; }
-            let queued = unsafe { self.enqueue(rows, greedy) };
-            let captured = unsafe { ticket.capture_result(lib.cuda_graph_end_capture_topology(self.stream.raw)) };
-            match (queued, captured) {
-                (Ok(()), Ok((graph, nodes, width, spans, _))) => {
-                    // SAFETY: rank storage is stable and the eager projection drained.
-                    unsafe {
-                        if let Err(error) = self.graphs[mode].cache_insert(rows, graph, ticket, nodes as u64, width, spans) {
-                            lib.cuda_graph_exec_destroy(graph)?;
-                            return Err(error);
-                        }
-                    }
-                },
-                (Err(error), Ok((graph, ..))) => { unsafe { lib.cuda_graph_exec_destroy(graph)?; } return Err(error); }
-                (Err(first), Err(second)) => return Err(crate::families::deepseek_v41::v41_experts::dspark::prefer_device(first, second)),
-                (Ok(()), Err(error)) => return Err(error),
-            }
-            // Warmup already produced the result. The captured graph runs on
-            // the next use of this shape, without repeating this projection.
-        }
-        Ok(())
-    }
     async unsafe fn execute(&mut self, input: CuteafdDeviceBuffer, rows: usize, greedy: bool) -> Result<()> {
         let queued = unsafe { self.begin(input, rows, greedy) };
         let drained = self.stream.wait().await;
-        crate::families::deepseek_v41::v41_experts::dspark::settle(queued, drained)?;
-        unsafe { self.capture_ready(rows, greedy) }
+        crate::families::deepseek_v41::v41_experts::dspark::settle(queued, drained)
     }
 
 }
@@ -130,12 +96,7 @@ impl Drop for Rank<'_, '_> {
         if let Err(error) = unsafe { lib.cuda_stream_synchronize(self.stream.raw) } {
             crate::shared::decode_graph::fatal_drain(Err(error), "vocabulary rank");
         }
-        for graphs in &mut self.graphs {
-            // SAFETY: the rank drained its stream before releasing captured pointers.
-            if let Err(error) = unsafe { graphs.clear() } {
-                tracing::error!(%error, "destroying vocabulary rank graph");
-            }
-        }
+
     }
 }
 
@@ -152,38 +113,6 @@ pub(crate) struct DistributedVocabularyWave<'w, 'a> {
     copy_pending: bool,
 }
 impl<'w, 'a> DistributedVocabularyWave<'w, 'a> {
-    pub(crate) fn visit_graph_banks(&mut self,
-        f: &mut dyn FnMut(i32, &'static str, bool, &mut dyn crate::shared::decode_graph::CacheAttached) -> Result<()>,
-    ) -> Result<()> {
-        for rank in &mut self.ranks {
-            let device = rank.device.id;
-            for (mode, graphs) in rank.get_mut().graphs.iter_mut().enumerate() {
-                f(device, if mode == 0 { "vocabulary_logits" } else { "vocabulary_greedy" }, true, graphs)?;
-            }
-        }
-        Ok(())
-    }
-
-    pub(crate) fn capture_startup(&mut self, rows: &[usize], greedy: bool) -> Result<()> {
-        ensure!(self.ready.is_none() && self.pending_logits.is_none() && !self.copy_pending,
-            "vocabulary startup requires an idle owner");
-        for rank in &mut self.ranks {
-            let device = rank.device;
-            device.run(|| {
-                let rank = rank.get_mut();
-                rank.stream.require_complete()?;
-                for &row in rows {
-                    ensure!(row <= rank.capacity, "vocabulary startup row exceeds capacity");
-                    // SAFETY: capture records only this owner's live mode:
-                    // target ranks include argmax, draft ranks retain logits.
-                    unsafe { rank.capture_ready(row, greedy)?; }
-                    crate::shared::decode_graph::device::observe_device(device.library, device.id)?;
-                }
-                Ok(())
-            })?;
-        }
-        Ok(())
-    }
     pub fn device_bytes(capacity: usize, split: usize) -> Result<[usize; 2]> {
         ensure!((1..=cuteafd_core::V41_VOCAB_ROWS).contains(&capacity) && (1..129280).contains(&split), "invalid distributed vocabulary geometry");
         Ok([V41VocabularyProjection::WORKSPACE_BYTES + capacity * (10240 + split * 4 + 8),
@@ -270,7 +199,7 @@ impl<'w, 'a> DistributedVocabularyWave<'w, 'a> {
 
     /// Whether both ranks replay captured greedy projections of `rows` rows.
     pub fn warm_greedy(&self, rows: usize) -> bool {
-        (1..=self.capacity).contains(&rows) && self.ranks.iter().all(|rank| rank.graphs[1].get(rows).is_some())
+        (1..=self.capacity).contains(&rows)
     }
     /// The greedy projection queued in a device-ordered pass (warm shapes, see
     /// [`Self::warm_greedy`]): both ranks follow the chain head (`normalized`,
@@ -357,7 +286,7 @@ impl<'w, 'a> DistributedVocabularyWave<'w, 'a> {
                     complete[index] = device.run(|| unsafe {
                         if !rank.stream.library.cuda_stream_query(rank.stream.raw)? { return Ok(false); }
                         if let Some(timing) = &rank.draft_timing { timing.publish_completed()?; }
-                        rank.get_mut().capture_ready(rows, false)?;
+
                         Ok(true)
                     })?;
                 }
@@ -465,32 +394,6 @@ impl Drop for DistributedVocabularyWave<'_, '_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[test]
-    fn vocabulary_capture_preserves_device_error_over_host_enqueue_error() -> Result<()> {
-        let fixture = cuteafd_ffi::native_library_lifetime_fixture::Fixture::build_for_tests()?;
-        let lib = fixture.load()?;
-        fixture.extent_only(&lib)?;
-        let weights = VocabularyShard::without_resident_weights_for_test();
-        let mut rank = Rank::new(&lib, &weights, 1, Fp8Head::All)?;
-        use crate::shared::decode_graph::device::{Basis, Cycle, Preference, Site};
-        // Capture now requires admission, just like the serving-reachable bank.
-        rank.graphs[0].attach_device(&lib, -8814, 64 << 20, Site {
-            name: "v41-vocabulary-error-fixture", cycle: Cycle::Other,
-            preference: Preference::Capture, bootstrap: 2 << 20,
-            basis: Basis::Bytes, spans_devices: false,
-        })?;
-        fixture.configure_capture(&lib, 98)?;
-        // SAFETY: the real enqueue guard rejects absent resident weights before launching;
-        // the CPU fixture fails end_capture without publishing a graph or queued work.
-        let error = unsafe { rank.capture_ready(1, false) }.unwrap_err();
-        assert!(crate::families::deepseek_v41::v41_experts::dspark::is_device_failure(&error));
-        let mut failure = crate::families::deepseek_v41::v41_experts::dspark::DraftFailure::default();
-        failure.record(&error);
-        assert!(failure.check("draft").is_err());
-        fixture.configure_capture(&lib, 0)?;
-        Ok(())
-    }
-
     #[test]
     #[ignore = "requires CUTEAFD_NATIVE_LIB, CUTEAFD_SNAPSHOT and two CUDA GPUs"]
     fn distributed_vocabulary_real_weights_match_full_and_cancel_safely() -> Result<()> {

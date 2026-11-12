@@ -171,7 +171,7 @@ fn run_case(label: &str, captured: bool, lanes: usize, injected: u32, serving: b
                     library.cuda_graph_begin_capture(engine.stream_of(rank))?;
                 }
                 queue(rank)?;
-                unsafe { library.cuda_graph_end_capture(engine.stream_of(rank)) }
+                unsafe { library.cuda_graph_end_capture_for_test(engine.stream_of(rank)) }
             })?;
             let key = GraphKey {
                 layer: 0,

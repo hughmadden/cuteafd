@@ -514,6 +514,7 @@ impl DsparkChain<'_, '_> {
                 }
                 Err(error)
             }
+            (Ok(()), Err(error)) if cuteafd_ffi::is_small_graph(&error) => Ok(()),
             (Ok(()), Err(error)) => Err(error),
             (Err(launched), Err(captured)) => Err(prefer_device(launched, captured)),
         }

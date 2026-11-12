@@ -11,7 +11,7 @@ enum Phase { Normalize, Project, Assemble, Sample }
 pub(crate) struct DistributedDsparkTerminal<'w, 'a> {
     terminal: DeviceOwner<'a, DsparkTerminal<'w, 'a>>,
     head: DistributedVocabularyWave<'w, 'a>,
-    /// Captured stages indexed [width 5/7][normalize/sample][requests - 1].
+    /// Sampling stages indexed by width, sampling mode and request count.
     graphs: crate::shared::decode_graph::GraphBank<(usize, usize, usize), crate::shared::decode_graph::GraphOwner<'a, ()>>,
     ready: Option<usize>,
     pending: Option<(usize, Phase)>,
@@ -60,11 +60,9 @@ impl<'w, 'a> DistributedDsparkTerminal<'w, 'a> {
         let entries = cuteafd_loader::serving_capacity::v41_graphs::v41_prewarm_drafts(crate::families::deepseek_v41::graph_policy::ranks(), 1, capacity, maximum);
         let original = self.terminal.width();
         let recorded = (|| -> Result<()> {
-            let mut rows = Vec::new();
             for entry in entries {
                 self.set_width(entry.width)?;
-                rows.push(entry.requests * entry.width);
-                for sampling in [false, true] {
+                for sampling in [true] {
                     // SAFETY: records existing normalization and sampling
                     // against stable terminal storage without publishing state.
                     unsafe { self.capture_stage(entry.requests, sampling)?; }
@@ -72,9 +70,6 @@ impl<'w, 'a> DistributedDsparkTerminal<'w, 'a> {
                     crate::shared::decode_graph::device::observe_device(device.library, device.id)?;
                 }
             }
-            rows.sort_unstable();
-            rows.dedup();
-            self.head.capture_startup(&rows, false)?;
             Ok(())
         })();
         let restored = self.set_width(original);
@@ -99,7 +94,7 @@ impl<'w, 'a> DistributedDsparkTerminal<'w, 'a> {
         let terminal = self.terminal.get();
         device.run(|| unsafe {
             let key = (terminal.width(), usize::from(sampling), requests);
-            let graph = self.graphs.cached_launch(&key).map(|owner| owner.raw);
+            let graph = sampling.then(|| self.graphs.cached_launch(&key)).flatten().map(|owner| owner.raw);
             let span = terminal.timing.begin(if sampling { "graph_selector_confidence" } else { "graph_terminal_norm" },
                 None, requests * terminal.width, terminal.stream.raw)?;
             crate::shared::decode_graph::census::dispatch(device.library, terminal.stream.raw, c"dspark", requests,
@@ -109,6 +104,7 @@ impl<'w, 'a> DistributedDsparkTerminal<'w, 'a> {
         })
     }
     unsafe fn capture_stage(&mut self, requests: usize, sampling: bool) -> Result<()> {
+        if !sampling { return Ok(()); }
         let device = self.terminal.device;
         let terminal = self.terminal.get();
         let mode = usize::from(sampling);
@@ -117,7 +113,7 @@ impl<'w, 'a> DistributedDsparkTerminal<'w, 'a> {
         if !self.graphs.contains(&key) && !crate::shared::decode_graph::census::eager("dspark") {
             let pinned = cuteafd_loader::serving_capacity::v41_graphs::v41_pinned_draft(crate::families::deepseek_v41::graph_policy::ranks(), 1, requests, width);
             let Some(mut ticket) = self.graphs.cache_ticket(&key, pinned, None) else { return Ok(()); };
-            let (graph, nodes, width, spans, inspection) = device.run(|| unsafe {
+            let capture = device.run(|| unsafe {
                 ticket.capture_result(device.library.cuda_graph_begin_capture(terminal.stream.raw))?;
                 // Capture records commands only; runtime begin/enqueue retain
                 // sampling validation before any execution or graph replay.
@@ -125,13 +121,15 @@ impl<'w, 'a> DistributedDsparkTerminal<'w, 'a> {
                     else { terminal.enqueue_normalize_geometry(requests, terminal.stream.raw) };
                 let captured = ticket.capture_result(device.library.cuda_graph_end_capture_topology(terminal.stream.raw));
                 match (queued, captured) {
-                    (Ok(()), Ok(graph)) => Ok(graph),
+                    (Ok(()), Ok(graph)) => Ok(Some(graph)),
                     (Err(error), Ok((graph, _, _, _, _))) => { device.library.cuda_graph_exec_destroy(graph)?; Err(error) }
+                    (Ok(()), Err(error)) if cuteafd_ffi::is_small_graph(&error) => Ok(None),
                     (Ok(()), Err(error)) => Err(error),
                     // A plain enqueue error must not hide a tagged capture error.
                     (Err(queued), Err(captured)) => Err(super::super::chain::prefer_device(queued, captured)),
                 }
             })?;
+            let Some((graph, nodes, width, spans, inspection)) = capture else { return Ok(()) };
             // SAFETY: terminal pins all storage and Drop drains its device stream.
             let owner = unsafe { crate::shared::decode_graph::GraphOwner::new(device.library, device.id, graph, ())? };
             super::super::chain::warn_topology(inspection);
@@ -350,6 +348,6 @@ impl DistributedDsparkTerminal<'_, '_> {
     pub(crate) fn visit_graph_banks(&mut self, f: &mut super::super::chain::GraphVisitor<'_>) -> Result<()> {
         f(self.terminal.device.id, "dspark_distributed_terminal", true, &mut self.graphs)?;
         self.terminal.get_mut().visit_graph_banks(&mut |device, site, _, bank| f(device, site, true, bank))?;
-        self.head.visit_graph_banks(f)
+        Ok(())
     }
 }

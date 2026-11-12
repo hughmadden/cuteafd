@@ -85,9 +85,15 @@ SITE_PREFIX = {"glm5": "glm5.", "mistral_large4": "glm5.",
 GLMF_GEOMETRY = re.compile(
     r"GraphKey \{ segment: \d+, rows: (\d+), spec: (true|false), long: (true|false), "
     r"pool_width: (\d+), page_stride: (\d+), pool_stride: (\d+) \}")
+GLMF_NORMALIZED_GEOMETRY = re.compile(
+    r"GraphKey \{ segment: \d+, rows: (\d+), spec: (true|false), head: (true|false), "
+    r"long: (true|false), pool_width: (\d+), page_stride: (\d+), pool_stride: (\d+) \}")
 QWEN_GEOMETRY = re.compile(
     r"GraphKey \{ segment: (\d+), rows: (\d+), spec: (true|false), long: (true|false), "
     r"pool_width: (\d+), page_stride: (\d+), pool_stride: (\d+) \}")
+QWEN_NORMALIZED_GEOMETRY = re.compile(
+    r"GraphKey \{ segment: (\d+), rows: (\d+), spec: (true|false), head: (true|false), "
+    r"long: (true|false), page_width: (\d+), page_stride: (\d+), pool_stride: (\d+) \}")
 QWEN_SHAPES = ("single_0spark", "single_sparks", "dual_0spark", "dual_sparks")
 KIMI_ROWS = re.compile(r"rows=(\d+)")
 KIMI_RANK = re.compile(r"rank=(\d+)")
@@ -1219,10 +1225,21 @@ def glmf_identity(shape):
     Short steps key neither the pool top-k's width nor the pool table stride
     (`GraphGeometry::keyed`), so those identities collapse to one shape.
     """
-    match = GLMF_GEOMETRY.fullmatch(shape.strip())
-    if match is None:
-        raise ValueError(f"cannot parse glm5_flash graph identity: {shape!r}")
-    rows, spec, long, width, page_stride, pool_stride = match.groups()
+    normalized = GLMF_NORMALIZED_GEOMETRY.fullmatch(shape.strip())
+    if normalized is not None:
+        rows, spec, head, long, width, page_stride, pool_stride = normalized.groups()
+        if int(page_stride) == 0:
+            if int(rows) <= 0 or long != "false" or int(width) != 0 or int(pool_stride) != 0 \
+                    or (head == "true" and spec != "false"):
+                raise ValueError("unsupported normalized GLM Flash KDA/head geometry")
+            return (int(rows), spec == "true", False, 0, 0, 0)
+        if head == "true":
+            raise ValueError("unsupported normalized GLM Flash head geometry")
+    else:
+        match = GLMF_GEOMETRY.fullmatch(shape.strip())
+        if match is None:
+            raise ValueError(f"cannot parse glm5_flash graph identity: {shape!r}")
+        rows, spec, long, width, page_stride, pool_stride = match.groups()
     rows, width, page_stride, pool_stride = (int(value) for value in (rows, width, page_stride, pool_stride))
     if rows <= 0 or page_stride <= 0:
         raise ValueError("unsupported prewarm geometry")
@@ -1244,6 +1261,30 @@ def generate_glm5_flash(traces, coverage=0.999, pin_frequency=0.9):
     shared extra keys, not the trace."""
     if not 0 < coverage <= 1 or not 0 < pin_frequency <= 1:
         raise ValueError("coverage and pin frequency must be in (0, 1]")
+    traces = [{**trace, "graphs": [graph for graph in trace["graphs"]
+                                  if not graph.get("permanently_eager", False)]}
+              for trace in traces]
+    styles = {GLMF_NORMALIZED_GEOMETRY.fullmatch(graph["shape"].strip()) is not None
+              for trace in traces for graph in trace["graphs"]
+              if graph["site"].startswith("glm5_flash.")}
+    if len(styles) > 1:
+        raise ValueError("GLM Flash traces must use one graph-key format")
+    normalized = True in styles
+    if normalized:
+        latest = {}
+        for trace in traces:
+            device = int(trace["cache"].get("device", 0))
+            stamp = int(trace["cache"].get("sampled_at_ms", 0))
+            if device not in latest or stamp >= latest[device][0]:
+                latest[device] = (stamp, trace)
+        traces = [trace for _, trace in latest.values()]
+
+    def compatible(key, graph, step):
+        if not normalized or key[4] != 0:
+            return key == step
+        head = GLMF_NORMALIZED_GEOMETRY.fullmatch(graph["shape"].strip())[3] == "true"
+        return key[0] == step[0] and (head or key[1] == step[1])
+
     counts = {}
     for trace in traces:
         if trace.get("schema_version") != 2:
@@ -1253,7 +1294,7 @@ def generate_glm5_flash(traces, coverage=0.999, pin_frequency=0.9):
         for graph in matching:
             key = glmf_identity(graph["shape"])
             count = glm_request_replays(graph)
-            if count > 0:
+            if count > 0 and (not normalized or key[4] > 0):
                 device_counts[key] = device_counts.get(key, 0) + count
         for key, count in device_counts.items():
             counts[key] = max(counts.get(key, 0), count)
@@ -1285,17 +1326,24 @@ def generate_glm5_flash(traces, coverage=0.999, pin_frequency=0.9):
         seen = set()
         captured = 0
         executables = 0
+        identities = set()
         for graph in trace["graphs"]:
             if not graph["site"].startswith("glm5_flash."):
                 continue
             key = glmf_identity(graph["shape"])
-            if key not in wanted:
+            if not any(compatible(key, graph, step) for step in wanted):
                 continue
+            if normalized:
+                identity = (graph["site"], graph.get("bank", 0), graph.get("key_id", graph["shape"]))
+                if identity in identities:
+                    continue
+                identities.add(identity)
             capture = graph.get("capture_bytes")
             if capture is None:
                 raise ValueError(f"GLM Flash selected shape {key} has no measured capture bytes "
                                  f"on device {device}")
-            seen.add(key)
+            if key in wanted:
+                seen.add(key)
             captured += int(capture)
             executables += int(graph.get("executables", 1) or 0)
         if seen != wanted:
@@ -1388,6 +1436,18 @@ def generate_muse(traces, ranks, onboard_layers):
 
 
 def qwen_geometry(graph):
+    match = QWEN_NORMALIZED_GEOMETRY.fullmatch(graph["shape"])
+    if match is not None:
+        segment, rows, spec, head, long, page_width, page_stride, pool_stride = match.groups()
+        rows, page_width, page_stride, pool_stride = map(int, (rows, page_width, page_stride, pool_stride))
+        if rows <= 0 or page_width != page_stride:
+            raise ValueError("unsupported normalized Qwen prewarm geometry")
+        if page_stride == 0:
+            if long != "false" or pool_stride != 0 or (head == "true" and spec != "false"):
+                raise ValueError("invalid normalized Qwen GDN/head geometry")
+        elif head == "true" or (long == "true") != (pool_stride > 0):
+            raise ValueError("invalid normalized Qwen Full geometry")
+        return (rows, spec == "true", long == "true", 0, page_stride, pool_stride)
     match = QWEN_GEOMETRY.search(graph["shape"])
     if match is None:
         raise ValueError(f"cannot parse qwen4 identity: {graph['shape']!r}")
@@ -1423,6 +1483,9 @@ def generate_qwen(traces, shape, coverage=0.999, pin_report=None, summary=None):
     """
     if not 0 < coverage <= 1:
         raise ValueError("coverage must be in (0, 1]")
+    traces = [{**trace, "graphs": [graph for graph in trace["graphs"]
+                                  if not graph.get("permanently_eager", False)]}
+              for trace in traces]
     counts = {}
     reserves = {}
     reasons = {}
@@ -1448,6 +1511,20 @@ def generate_qwen(traces, shape, coverage=0.999, pin_report=None, summary=None):
     devices = sorted(devices)
     if len(devices) != owners:
         raise ValueError(f"{shape} needs {owners} device traces, found {devices}")
+    styles = {QWEN_NORMALIZED_GEOMETRY.fullmatch(graph["shape"]) is not None
+              for _, trace in latest.values() for graph in trace["graphs"]
+              if graph["site"].startswith("qwen4.")}
+    if len(styles) != 1:
+        raise ValueError("Qwen traces must use one graph-key format")
+    normalized = True in styles
+
+    def compatible(key, graph, step):
+        if not normalized or key[4] != 0:
+            return key == step
+        # GDN has only rows/spec; the explicit terminal head ignores spec too.
+        head = QWEN_NORMALIZED_GEOMETRY.fullmatch(graph["shape"])[4] == "true"
+        return key[0] == step[0] and (head or key[1] == step[1])
+
     # Frequency and heat use only each device's latest complete inventory:
     # identities missing from it have been forgotten and must not survive.
     # Only replayed graphs rank the working set: a startup capture is an event
@@ -1468,7 +1545,7 @@ def generate_qwen(traces, shape, coverage=0.999, pin_report=None, summary=None):
             replay = qwen_replay(graph)
             # Every layer segment runs once per decode step: rank a shape by its
             # busiest segment rather than summing all of them.
-            if replay > 0:
+            if replay > 0 and (not normalized or geometry[4] > 0):
                 counts[geometry] = max(counts.get(geometry, 0), replay)
     if not counts:
         raise ValueError("trace records no replayed graph identities")
@@ -1504,6 +1581,11 @@ def generate_qwen(traces, shape, coverage=0.999, pin_report=None, summary=None):
             reasons.setdefault(key, set()).add("sustained_heat")
         if int(graph.get("evictions", 0)) >= 2 and int(graph.get("recaptures", 0)) >= 2:
             reasons.setdefault(key, set()).add("repeated_recapture")
+    if normalized:
+        for _, (key, graph) in identities.items():
+            for step in counts:
+                if key in reasons and compatible(key, graph, step):
+                    reasons.setdefault(step, set()).update(reasons[key])
     ranked = sorted(counts, key=lambda key: (-counts[key], key))
     total = sum(counts.values())
     covered = 0
@@ -1527,7 +1609,7 @@ def generate_qwen(traces, shape, coverage=0.999, pin_report=None, summary=None):
                 continue
             for device in devices:
                 graphs = [graph for identity, (geometry, graph) in identities.items()
-                          if identity[0] == device and geometry == key]
+                          if identity[0] == device and compatible(geometry, graph, key)]
                 if not graphs:
                     continue
                 cost = sum(int(graph["permanent_bytes"]) for graph in graphs) \
@@ -1549,10 +1631,13 @@ def generate_qwen(traces, shape, coverage=0.999, pin_report=None, summary=None):
     zero_share = []
     for device in devices:
         total = 0
+        charged = set()
         for selected_key in sorted(selected):
             for identity, (geometry, graph) in identities.items():
-                if identity[0] != device or geometry != selected_key:
+                if (identity[0] != device or identity in charged
+                        or not compatible(geometry, graph, selected_key)):
                     continue
+                charged.add(identity)
                 share = graph.get("capture_bytes")
                 if share is None:
                     raise ValueError(

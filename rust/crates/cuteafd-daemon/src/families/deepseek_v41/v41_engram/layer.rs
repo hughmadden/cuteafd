@@ -416,6 +416,7 @@ impl<'weights, 'library> EngramGate<'weights, 'library> {
                 }
                 Err(error)
             }
+            (Ok(()), Err(error)) if cuteafd_ffi::is_small_graph(&error) => Ok(()),
             (Err(error), Err(_)) | (Ok(()), Err(error)) => Err(error),
         }
     }

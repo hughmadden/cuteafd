@@ -322,7 +322,7 @@ fn extend_padded(table: &mut Vec<i32>, pages: &[i32], stride: usize) {
 }
 
 /// Host tables of one step.
-#[derive(Default)]
+#[derive(Default, Clone)]
 struct StepTables {
     decode: bool,
     /// A speculative verify: GDN and PLE record replay inputs instead of
@@ -642,6 +642,60 @@ mod tests {
             let unique: std::collections::HashSet<_> = geometries.iter().collect();
             assert_eq!(unique.len(), geometries.len());
         }
+    }
+
+    #[test]
+    fn normalized_graph_keys_preserve_every_checked_in_prewarm_identity() {
+        use super::*;
+        use cuteafd_loader::serving_capacity::qwen_graphs::*;
+        for layout in [QwenGraphShapeKey::Single0Spark, QwenGraphShapeKey::SingleSparks,
+            QwenGraphShapeKey::Dual0Spark, QwenGraphShapeKey::DualSparks] {
+            let prewarm = qwen_shape_prewarm(layout);
+            let entries = prewarm.trace.as_ref().map_or(&qwen_prewarm_list().bootstrap.entries,
+                |trace| &trace.entries);
+            let pages = match layout { QwenGraphShapeKey::Single0Spark => 10_744,
+                QwenGraphShapeKey::Dual0Spark => 32_768, _ => 8192 };
+            let retained = qwen_prewarm_shapes(layout, 262_144, pages, 2051, 16, true);
+            let tables = |shape: QwenGraphShape| StepTables { spec: shape.spec, long: shape.long,
+                page_width: shape.page_stride, page_stride: shape.page_stride,
+                pool_stride: shape.pool_stride, pool_width: shape.pool_width, ..Default::default() };
+            for attention in [Some(Qwen4Attention::Full), Some(Qwen4Attention::Gdn), None] {
+                for entry in entries {
+                    let old = GraphKey::new(3, entry.shape.rows, attention, &tables(entry.shape));
+                    assert!(retained.iter().any(|&shape| old == GraphKey::new(3, shape.rows, attention,
+                        &tables(shape))), "{layout:?}/{attention:?}/{:?}", entry.shape);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn graph_keys_retain_only_baked_attention_scalars() {
+        use super::*;
+        let tables = StepTables { spec: true, long: true, page_width: 64, page_stride: 64,
+            pool_width: 8, pool_stride: 16, ..Default::default() };
+        let mut changed = tables.clone();
+        changed.pool_width = 32;
+        for attention in [Some(Qwen4Attention::Full), Some(Qwen4Attention::Gdn), None] {
+            let key = |tables: &StepTables| GraphKey::new(3, 8, attention, tables);
+            assert_eq!(key(&tables), key(&changed));
+            let mut geometry = tables.clone();
+            geometry.page_width *= 2;
+            geometry.page_stride *= 2;
+            geometry.pool_stride *= 2;
+            assert_eq!(key(&tables) == key(&geometry), attention != Some(Qwen4Attention::Full));
+            let mut spec = tables.clone();
+            spec.spec = false;
+            assert_eq!(key(&tables) == key(&spec), attention.is_none());
+        }
+        let mut short = tables.clone();
+        short.long = false;
+        let mut other = short.clone();
+        other.pool_stride *= 2;
+        assert_eq!(GraphKey::new(3, 8, Some(Qwen4Attention::Full), &short),
+            GraphKey::new(3, 8, Some(Qwen4Attention::Full), &other));
+        assert_ne!(GraphKey::new(3, 8, Some(Qwen4Attention::Gdn), &other),
+            GraphKey::new(3, 8, None, &other));
     }
 
     #[test]
@@ -1302,10 +1356,22 @@ struct GraphKey {
     segment: usize,
     rows: usize,
     spec: bool,
+    head: bool,
     long: bool,
-    pool_width: usize,
+    page_width: usize,
     page_stride: usize,
     pool_stride: usize,
+}
+
+impl GraphKey {
+    fn new(segment: usize, rows: usize, attention: Option<Qwen4Attention>, tables: &StepTables) -> Self {
+        let full = attention == Some(Qwen4Attention::Full);
+        Self { segment, rows, spec: attention.is_some() && tables.spec, head: attention.is_none(),
+            long: full && tables.long,
+            page_width: if full { tables.page_width } else { 0 },
+            page_stride: if full { tables.page_stride } else { 0 },
+            pool_stride: if full && tables.long { tables.pool_stride } else { 0 } }
+    }
 }
 
 struct GraphExec<'a>(*mut c_void, Device<'a>);
@@ -1706,7 +1772,7 @@ impl<'a> Qwen4Engine<'a> {
         let shape = self.graph_shape();
         let shapes = cuteafd_loader::serving_capacity::qwen_graphs::qwen_prewarm_shapes(shape,
             self.max_context, self.pages, self.cfg.dense_context(), sequences, speculation);
-        let segments = self.weights.layers.len() + if self.gdn_banks.len() == 2 { 3 } else { 1 };
+        let segments = self.weights.layers.len() + 1;
         tracing::info!(shape = ?shape, shapes = shapes.len(), graphs = shapes.len() * segments,
             plain_rows = ?PLAIN_BUCKETS, spec_rows = ?SPEC_BUCKETS, "Qwen prewarm admission");
         let started = std::time::Instant::now();
@@ -3456,18 +3522,17 @@ impl<'a> Qwen4Engine<'a> {
         let real_rows = tables.positions.iter().take_while(|&&position| position >= 0).count();
         ensure!(tables.positions[real_rows..].iter().all(|&position| position < 0), "Qwen decode mask tail");
         let expert_rows = Scalar::I32(i32::try_from(real_rows)?);
-        let key = |segment| GraphKey { segment, rows: t, spec: tables.spec, long: tables.long,
-            pool_width: tables.pool_width, page_stride: tables.page_stride, pool_stride: tables.pool_stride };
+        let key = |segment| GraphKey::new(segment, t, layers.get(segment).map(|layer| layer.attention), tables);
         let mut cur = [0; 2];
         for (index, layer) in layers.iter().enumerate() {
             let owner = self.state_map.layers[index].owner;
             let w = work[owner];
             let boundary = index > 0 && self.state_map.layers[index - 1].owner != owner;
             if boundary {
-                self.on_owner(0, || self.replay(key(n + 1), || {
+                self.on_owner(0, || {
                     let mut c = cur[0];
                     self.post(work[0], &mut c, rows)
-                }))?;
+                })?;
                 cur[0] ^= 1;
                 let ticket = hops.send(0, 0, work[0].streams[cur[0]].buffer.ptr, t)?;
                 let landed = hops.land(ticket)?;
@@ -3528,10 +3593,10 @@ impl<'a> Qwen4Engine<'a> {
                 self.on_owner(self.state_map.layers[index].owner, || self.probe_layer(w, index, real_rows))?;
             }
         }
-        self.on_owner(1, || self.replay(key(n + 2), || {
+        self.on_owner(1, || {
             let mut c = cur[1];
             self.post(work[1], &mut c, rows)
-        }))?;
+        })?;
         cur[1] ^= 1;
         let ticket = hops.send(1, 0, work[1].streams[cur[1]].buffer.ptr, t)?;
         let landed = hops.land(ticket)?;
@@ -3540,13 +3605,12 @@ impl<'a> Qwen4Engine<'a> {
             let src = cuteafd_ffi::CuteafdDeviceBuffer { ptr: landed, ..dst };
             // SAFETY: exit land precedes persistent root stream copy/head graph.
             unsafe { crate::shared::memory::device::copy_device_ordered(self.library, dst, src, t * HC * self.cfg.hidden * 2, self.execution_stream())?; }
-            self.replay(key(n), || {
-                if head {
+            if head {
+                self.replay(key(n), || {
                     self.head(work[0], &work[0].streams[cur[0]], t, rows, t)?;
-                    self.select_greedy(work[0], t)?;
-                }
-                Ok(())
-            })?;
+                    self.select_greedy(work[0], t)
+                })?;
+            }
             self.last_streams.set((true, cur[0]));
             if n < self.cfg.layers { self.drain_partial_step()?; return Ok(None); }
             if !head { self.head(work[0], &work[0].streams[cur[0]], t, rows, logit_rows)?; }
@@ -3666,13 +3730,12 @@ impl<'a> Qwen4Engine<'a> {
         let expert_rows = Scalar::I32(real_rows as i32);
         let mut cur = 0usize;
         for index in 0..=layers.len() {
-            let key = GraphKey { segment: index, rows: t, spec: tables.spec, long: tables.long, pool_width: tables.pool_width,
-                page_stride: tables.page_stride, pool_stride: tables.pool_stride };
+            let key = GraphKey::new(index, t, layers.get(index).map(|layer| layer.attention), tables);
             let start = cur;
             if self.cfg.ple_layers.contains(&index) {
                 self.finish_ple(w)?;
             }
-            self.replay(key, || -> Result<()> {
+            let segment = || -> Result<()> {
                 let mut c = start;
                 let Some(layer) = layers.get(index) else {
                     self.post(w, &mut c, rows)?;
@@ -3704,7 +3767,8 @@ impl<'a> Qwen4Engine<'a> {
                 self.post_pre(w, c, layer, "mlp", rows)?;
                 // Routed experts run between segments (and outside capture).
                 Ok(())
-            })?;
+            };
+            if index == layers.len() && !head { segment()?; } else { self.replay(key, segment)?; }
             cur ^= if index == 0 || index == layers.len() { 1 } else { 0 };
             if index < layers.len() {
                 let clear_tail = |tail: std::ops::Range<usize>| -> Result<()> {
@@ -3822,9 +3886,13 @@ impl<'a> Qwen4Engine<'a> {
 
     /// Whether the resolved shape's prewarm pins this key.
     fn graph_pinned(&self, key: &GraphKey) -> bool {
-        self.graph_pins.borrow().contains(&QwenGraphShape { rows: key.rows, spec: key.spec,
-            long: key.long, pool_width: key.pool_width, page_stride: key.page_stride,
-            pool_stride: key.pool_stride })
+        let attention = self.weights.layers.get(key.segment).map(|layer| layer.attention);
+        self.graph_pins.borrow().iter().any(|shape| {
+            let tables = StepTables { spec: shape.spec, long: shape.long,
+                page_width: shape.page_stride, page_stride: shape.page_stride,
+                pool_stride: shape.pool_stride, ..Default::default() };
+            GraphKey::new(key.segment, shape.rows, attention, &tables) == *key
+        })
     }
 
     /// Record and warn about one ungraphed decode shape. The warning names the
@@ -3833,8 +3901,8 @@ impl<'a> Qwen4Engine<'a> {
     /// `graph_missing_variants` inventory that `probe::graph_capture_stats`
     /// publishes.
     fn miss_graph(&self, key: GraphKey) {
-        let variant = format!("rows={} spec={} long={} pool_width={} page_stride={} pool_stride={}",
-            key.rows, key.spec, key.long, key.pool_width, key.page_stride, key.pool_stride);
+        let variant = format!("rows={} spec={} head={} long={} page_width={} page_stride={} pool_stride={}",
+            key.rows, key.spec, key.head, key.long, key.page_width, key.page_stride, key.pool_stride);
         crate::shared::decode_graph::note_eager("qwen4", &variant, || format!(
             "segment={} max_context={} slots={} pages={}",
             key.segment, self.max_context, self.slots, self.pages));

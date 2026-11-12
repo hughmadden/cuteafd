@@ -1521,7 +1521,7 @@ pub(crate) struct Fp8Prefill {
 // and do not enlarge the startup graph set. Counters still count every capture.
 use crate::shared::decode_graph::{check_bucket_thresholds, masked_row, ProjectionThreshold};
 
-pub(crate) use cuteafd_loader::serving_capacity::glmf_graphs::{DecodeBuckets, GraphGeometry, GlmfLayout, decode_strides, glmf_pinned, glmf_prewarm_shapes};
+pub(crate) use cuteafd_loader::serving_capacity::glmf_graphs::{DecodeBuckets, GraphGeometry, GlmfLayout, decode_strides, glmf_prewarm_list, glmf_prewarm_shapes};
 #[allow(unused_imports)]
 use cuteafd_loader::serving_capacity::glmf_graphs::{graph_geometries, MIN_PAGE_STRIDE, PLAIN_DECODE_BUCKETS, SPEC_DECODE_BUCKETS};
 // Inclusive arithmetic crossovers audited against the pinned AOT exporter: an FP8 decode
@@ -1601,6 +1601,7 @@ struct GraphKey {
     segment: usize,
     rows: usize,
     spec: bool,
+    head: bool,
     long: bool,
     pool_width: usize,
     page_stride: usize,
@@ -1612,8 +1613,20 @@ impl GraphKey {
     /// ([`GraphGeometry::keyed`]: a short step keys no pool-table width or stride).
     fn new(segment: usize, rows: usize, tables: &StepTables) -> Self {
         let geometry = GraphGeometry::keyed(tables.pool_width, tables.page_stride, tables.pool_stride, tables.long);
-        Self { segment, rows, spec: tables.spec, long: geometry.long, pool_width: geometry.pool_width,
+        Self { segment, rows, spec: tables.spec, head: false, long: geometry.long, pool_width: geometry.pool_width,
             page_stride: geometry.page_stride, pool_stride: geometry.pool_stride }
+    }
+
+    fn normalized(mut self, attention: Option<GlmNextAttention>) -> Self {
+        self.head = attention.is_none();
+        if self.head { self.spec = false; }
+        if attention != Some(GlmNextAttention::Mla) {
+            self.long = false;
+            self.pool_width = 0;
+            self.page_stride = 0;
+            self.pool_stride = 0;
+        }
+        self
     }
 }
 
@@ -1900,9 +1913,15 @@ impl<'a> GlmfEngine<'a> {
     /// only what that layout's trace shows is always hot. A layout with no
     /// trace prewarms its bootstrap set unpinned and lets ARC decide.
     fn graph_pinned(&self, key: &GraphKey) -> bool {
-        let shape = (key.rows, key.spec, GraphGeometry { pool_width: key.pool_width,
-            page_stride: key.page_stride, pool_stride: key.pool_stride, long: key.long });
-        glmf_pinned(self.graph_layout(), &shape)
+        let attention = self.weights.layers.get(key.segment).map(|layer| layer.attention);
+        glmf_prewarm_list().layout(self.graph_layout()).is_some_and(|layout| {
+            layout.entries.iter().filter(|entry| entry.pin).any(|entry| {
+                let (rows, spec, geometry) = entry.shape();
+                GraphKey { segment: key.segment, rows, spec, head: false, long: geometry.long,
+                    pool_width: geometry.pool_width, page_stride: geometry.page_stride,
+                    pool_stride: geometry.pool_stride }.normalized(attention) == *key
+            })
+        })
     }
 
     /// Every rank's launches for the completed step are queued: observe the
@@ -4118,7 +4137,8 @@ impl<'a> GlmfEngine<'a> {
     /// layer's FFN exchange and this layer's attention-site collapse (layer 0: rank 0's
     /// streams), its attention half and FFN half.
     fn peer_segment(&self, index: usize, w1: &Workspace<'_>, t: usize, tables: &StepTables) -> Result<()> {
-        let key = GraphKey::new(index, t, tables);
+        let key = GraphKey::new(index, t, tables)
+            .normalized(self.weights.layers.get(index).map(|layer| layer.attention));
         self.replay_on(1, key, || {
             if let Some(previous) = index.checked_sub(1) {
                 self.peer_post(previous, 0, w1, t, decode_cap(t))?;
@@ -4355,8 +4375,9 @@ impl<'a> GlmfEngine<'a> {
         // graph key, so one capacity per captured segment).
         let cap = decode_cap(t);
         for index in 0..=layers.len() {
-            let key = GraphKey::new(index, t, tables);
-            self.replay(key, || -> Result<()> {
+            let key = GraphKey::new(index, t, tables)
+            .normalized(self.weights.layers.get(index).map(|layer| layer.attention));
+            let segment = || -> Result<()> {
                 // Layer `index - 1`'s output streams land in buffer 0 first thing.
                 let tap = || match (&self.drafter, index.checked_sub(1)) {
                     (Some(drafter), Some(previous)) => drafter.tap_streams(previous, w.streams[0].buffer.ptr, HC, 0, t),
@@ -4402,7 +4423,8 @@ impl<'a> GlmfEngine<'a> {
                     // Real width is runtime data, not part of a bucket graph key.
                     Ok(())
                 }
-            })?;
+            };
+            if index == layers.len() && !head { segment()?; } else { self.replay(key, segment)?; }
             // Outside capture: every replay queues its matching peer landing.
             if index == layers.len() {
                 if let Some(w1) = w1 { self.replicate_terminal(w, w1, 0, t)?; }
@@ -6300,7 +6322,7 @@ mod wide_decode_tests {
             for (rows, spec, geometry) in added {
                 assert_eq!((rows, spec), (127, true));
                 let tables = startup_tables(rows, spec, geometry);
-                assert_eq!(GraphKey::new(0, rows, &tables), GraphKey { segment: 0, rows, spec, long: geometry.long,
+                assert_eq!(GraphKey::new(0, rows, &tables), GraphKey { segment: 0, rows, spec, head: false, long: geometry.long,
                     pool_width: geometry.pool_width, page_stride: geometry.page_stride, pool_stride: geometry.pool_stride });
             }
             // The plain set is unchanged.
@@ -6471,9 +6493,41 @@ mod graph_key_tests {
                     (rows, rows * geometry.page_stride, rows * geometry.pool_stride, 0));
                 assert!(tables.positions.iter().all(|&p| p == -1) && tables.kv_slots.iter().all(|&s| s == -1));
                 for segment in [0, 45] {
-                    assert_eq!(GraphKey::new(segment, rows, &tables), GraphKey { segment, rows, spec,
+                    assert_eq!(GraphKey::new(segment, rows, &tables), GraphKey { segment, rows, spec, head: false,
                         long: geometry.long, pool_width: geometry.pool_width, page_stride: geometry.page_stride,
                         pool_stride: geometry.pool_stride });
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn normalized_keys_preserve_every_checked_in_prewarm_identity() {
+        use super::*;
+        let list = glmf_prewarm_list();
+        for layout in [GlmfLayout::resolved(1, false), GlmfLayout::resolved(1, true),
+            GlmfLayout::resolved(2, false), GlmfLayout::resolved(2, true)] {
+            if let Some(traced) = list.layout(layout) {
+                for entry in &traced.entries {
+                    let (rows, spec, geometry) = entry.shape();
+                    let tables = startup_tables(rows, spec, geometry);
+                    let raw = GraphKey::new(3, rows, &tables);
+                    for attention in [Some(GlmNextAttention::Mla), Some(GlmNextAttention::Kda), None] {
+                        let normalized = raw.normalized(attention);
+                        assert_eq!(normalized.rows, rows);
+                        assert_eq!(normalized.spec, attention.is_some() && spec);
+                        assert_eq!(normalized.head, attention.is_none());
+                        if attention == Some(GlmNextAttention::Mla) { assert_eq!(normalized, raw); }
+                        else {
+                            assert_eq!((normalized.long, normalized.pool_width, normalized.page_stride,
+                                normalized.pool_stride), (false, 0, 0, 0));
+                            let other = GraphKey { long: !raw.long, pool_width: 999,
+                                page_stride: 999, pool_stride: 999, ..raw };
+                            assert_eq!(normalized, other.normalized(attention));
+                        }
+                        let other = GraphKey { spec: !raw.spec, ..raw }.normalized(attention);
+                        assert_eq!(normalized == other, attention.is_none());
+                    }
                 }
             }
         }

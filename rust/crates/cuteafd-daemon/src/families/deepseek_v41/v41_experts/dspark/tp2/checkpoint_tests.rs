@@ -125,7 +125,7 @@ fn cuda_dspark_tp2_checkpoint_experts_and_graph() -> Result<()> {
                     include_shared.then_some(shared),
                     root.raw,
                 );
-                let captured = lib.cuda_graph_end_capture(root.raw);
+                let captured = lib.cuda_graph_end_capture_for_test(root.raw);
                 match (queued, captured) {
                     (Ok(()), Ok(graph)) => Ok(graph),
                     (Err(e), Ok(graph)) => {

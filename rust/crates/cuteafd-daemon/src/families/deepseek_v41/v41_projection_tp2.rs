@@ -164,6 +164,7 @@ impl<'w,'a> Rank<'w,'a> {
                     Ok(())
                 },
                 (Err(error),Ok((graph, _, _, _, _))) => { device.library.cuda_graph_exec_destroy(graph)?;Err(error) },
+                (Ok(()),Err(error)) if cuteafd_ffi::is_small_graph(&error) => Ok(()),
                 (Err(error),Err(_)) | (Ok(()),Err(error)) => Err(error),
             }
         })
@@ -318,6 +319,7 @@ impl<'w,'a> Wave<'w,'a> {
                     Ok(())
                 },
                 (Err(error),Ok((graph, _, _, _, _))) => { device.library.cuda_graph_exec_destroy(graph)?;Err(error) },
+                (Ok(()),Err(error)) if cuteafd_ffi::is_small_graph(&error) => Ok(()),
                 (Err(error),Err(_)) | (Ok(()),Err(error)) => Err(error),
             }
         })

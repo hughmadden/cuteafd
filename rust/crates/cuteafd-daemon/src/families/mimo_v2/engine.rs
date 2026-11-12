@@ -196,10 +196,19 @@ enum Previous {
 struct GraphKey {
     layer: usize,
     rows: usize,
+    /// Full attention bakes this scalar; sliding attention and the tail do not.
     table_stride: usize,
     previous: Previous,
     /// The last segment ends in the LM head and the greedy selection of every row.
     head: bool,
+}
+
+impl GraphKey {
+    fn new(layer: usize, rows: usize, table_stride: usize, previous: Previous,
+        attention: Option<MimoAttention>, head: bool) -> Self {
+        Self { layer, rows, table_stride: if attention == Some(MimoAttention::Full) { table_stride } else { 0 },
+            previous, head }
+    }
 }
 
 struct GraphExec<'a>(*mut c_void, &'a NativeLibrary);
@@ -2147,7 +2156,8 @@ impl<'a> MimoEngine<'a> {
         let mut pending: Option<crate::shared::spark_waves::WaveTicket> = None;
         for (index, previous) in previous_segments.into_iter().enumerate() {
             let last = index == layers.len();
-            let key = GraphKey { layer: index, rows: t, table_stride: tables.table_stride, previous, head: head && last };
+            let key = GraphKey::new(index, t, tables.table_stride, previous,
+                layers.get(index).map(|layer| layer.attention), head && last);
             let landed = match (pending.take(), link.as_mut()) {
                 (Some(wave), Some(link)) => {
                     let slot = wave.slot();
@@ -2157,8 +2167,14 @@ impl<'a> MimoEngine<'a> {
                 (Some(_), None) => anyhow::bail!("MiMo decode wave without its Spark link"),
                 (None, _) => None,
             };
-            self.graph(0, key, || self.decode_segment(index, previous, w, w1, tables, t, gather, key.head,
-                reduction.clone(), bf16_input))?;
+            let segment = || self.decode_segment(index, previous, w, w1, tables, t, gather, key.head,
+                reduction.clone(), bf16_input);
+            if last && !head {
+                // Keep the preceding FFN reduction, norm and draft tap ordered on this stream.
+                segment()?;
+            } else {
+                self.graph(0, key, segment)?;
+            }
             if let (Some(slot), Some(link)) = (landed, link.as_mut()) {
                 // The planes are free for the next wave once the stream passes this segment's reduce.
                 link.exchange()?.consumed(slot, self.stream)?;
@@ -2308,7 +2324,8 @@ impl<'a> MimoEngine<'a> {
             Some(before) if self.tp2_layer(before) => Previous::Tp2,
             Some(_) => Previous::Delta,
         };
-        let key = GraphKey { layer: index, rows: t, table_stride: tables.table_stride, previous, head: false };
+        let key = GraphKey::new(index, t, tables.table_stride, previous,
+            Some(peer.layers[index].attention), false);
         self.graph(1, key, || {
             let rows = Scalar::I32(t as i32);
             let bytes = t * self.cfg.hidden * 2;
@@ -3429,6 +3446,15 @@ mod tests {
     }
 
     #[test]
+    fn graph_keys_only_full_attention_bakes_table_stride() {
+        use super::{GraphKey, Previous, MimoAttention};
+        for attention in [None, Some(MimoAttention::Sliding), Some(MimoAttention::Full)] {
+            let key = |stride| GraphKey::new(3, 6, stride, Previous::Delta, attention, attention.is_none());
+            assert_eq!(key(128) == key(256), attention != Some(MimoAttention::Full));
+        }
+    }
+
+    #[test]
     fn empty_prewarm_with_nonzero_reserve_captures_on_first_runtime_miss() -> anyhow::Result<()> {
         use super::*;
         use crate::shared::memory::device::Stream;
@@ -3701,7 +3727,7 @@ mod tests {
         // SAFETY: verify uses the actual three rows, including rejected candidates, not capacity four.
         unsafe {
             record_mimo_routes(Some(&usage), 0, 0, 2, ids.ptr, 3, true, fixture.stream)?;
-            fixture.graph = library.cuda_graph_end_capture(fixture.stream)?;
+            fixture.graph = library.cuda_graph_end_capture_for_test(fixture.stream)?;
         }
         let captures = cuteafd_ffi::graph_capture_sites();
         for _ in 0..3 {

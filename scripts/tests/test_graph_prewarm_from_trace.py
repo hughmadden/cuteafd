@@ -345,6 +345,55 @@ def test_flash_shapes_aggregate_segments_and_pin_the_hot_ones():
     ]
 
 
+def test_flash_normalized_mla_shapes_project_kda_and_head_once():
+    def graph(segment, stride=0, spec="false", head="false", hits=1000, share=1 << 20):
+        item = flash_graph(4, spec, "false", 0, stride, 0, hits, segment=segment,
+                           capture_bytes=share)
+        item["shape"] = item["shape"].replace(f"spec: {spec},", f"spec: {spec}, head: {head},")
+        return item
+    data = flash_trace([graph(0), graph(1, stride=64, hits=100, share=2 << 20),
+                        graph(1, stride=128, hits=50, share=3 << 20),
+                        graph(2, head="true", share=4 << 20), graph(3, hits=0),
+                        graph(4, spec="true", share=99 << 20)])
+    result = MODULE.generate([data], "glm5_flash", coverage=1)
+    assert [entry["page_stride"] for entry in result["entries"]] == [64, 128]
+    assert result["measured_bytes"] == [12 << 20]
+    assert result["measured_executables"] == [5]
+    assert result == MODULE.generate([data, data], "glm5_flash", coverage=1)
+    first = MODULE.generate([data], "glm5_flash", coverage=0.6)
+    assert len(first["entries"]) == 1
+    assert first["measured_bytes"] == [8 << 20]
+    assert first["measured_executables"] == [4]
+    missing = copy.deepcopy(data)
+    missing["graphs"][0]["capture_bytes"] = None
+    with pytest.raises(ValueError, match="no measured capture bytes"):
+        MODULE.generate([missing], "glm5_flash")
+    mixed = copy.deepcopy(data)
+    mixed["graphs"].append(flash_graph(4, "false", "false", 0, 64, 0, 10))
+    with pytest.raises(ValueError, match="one graph-key format"):
+        MODULE.generate([mixed], "glm5_flash")
+
+
+@pytest.mark.parametrize("family", ["qwen4", "glm5_flash"])
+@pytest.mark.parametrize("nodes", [0, 1, 2])
+def test_eager_records_do_not_affect_prewarm_style_or_selected_sibling_cost(family, nodes):
+    data = qwen_trace() if family == "qwen4" else flash_trace()
+
+    def generate(trace):
+        return (MODULE.generate_qwen([trace], "single_0spark") if family == "qwen4"
+                else MODULE.generate([trace], family))
+
+    expected = generate(data)
+    for shape in [data["graphs"][0]["shape"], "unparseable eager identity"]:
+        eager = copy.deepcopy(data["graphs"][0])
+        eager.update(key_id=9999, shape=shape, permanently_eager=True, executables=0,
+                     permanent_bytes=0, nodes=nodes, capture_bytes=None, hits=0, count=1,
+                     cycles={"other": 1})
+        candidate = copy.deepcopy(data)
+        candidate["graphs"].append(eager)
+        assert generate(candidate) == expected
+
+
 def test_flash_short_steps_collapse_the_unkeyed_pool_geometry():
     graphs = [flash_graph(4, "false", "false", 1, 64, 16, 10),
               flash_graph(4, "false", "false", 4, 64, 32, 5)]
@@ -851,6 +900,57 @@ def test_qwen_regeneration_reproduces_a_checked_in_generation_exactly():
     generated = MODULE.generate_qwen(traces, "single_0spark", coverage=0.99)
     expected = json.loads((fixture / "expected-single_0spark.json").read_text())
     assert generated == expected
+
+
+
+def normalized_qwen_identity(segment, rows=64, spec=False, head=False, long=False,
+                             page_width=0, page_stride=0, pool_stride=0):
+    return (f"GraphKey {{ segment: {segment}, rows: {rows}, spec: {str(spec).lower()}, "
+            f"head: {str(head).lower()}, long: {str(long).lower()}, page_width: {page_width}, "
+            f"page_stride: {page_stride}, pool_stride: {pool_stride} }}")
+
+
+def test_qwen_normalized_full_shapes_project_gdn_and_explicit_head_once():
+    data = qwen_trace(capture=(1 << 20, 2 << 20, 4 << 20))
+    template = data["graphs"][0]
+    data["graphs"] = []
+    for identity, hits, share in [
+            (normalized_qwen_identity(0), 1000, 1 << 20),
+            (normalized_qwen_identity(1, page_width=64, page_stride=64), 100, 2 << 20),
+            (normalized_qwen_identity(1, long=True, page_width=128, page_stride=128, pool_stride=32), 50, 3 << 20),
+            (normalized_qwen_identity(2, head=True), 1000, 4 << 20),
+            # A startup-only GDN sibling belongs to selected Full steps too.
+            (normalized_qwen_identity(3), 0, 1 << 20),
+            # Same rows but different spec is not a compatible GDN identity.
+            (normalized_qwen_identity(4, spec=True), 1000, 99 << 20)]:
+        graph = copy.deepcopy(template)
+        graph.update(shape=identity, key_id=len(data["graphs"]), hits=hits, capture_bytes=share)
+        data["graphs"].append(graph)
+    result = MODULE.generate_qwen([data], "single_0spark", coverage=1)
+    assert result["trace"]["entries"] == [
+        {"rows": 64, "spec": False, "long": False, "pool_width": 0,
+         "page_stride": 64, "pool_stride": 0, "pin": False},
+        {"rows": 64, "spec": False, "long": True, "pool_width": 0,
+         "page_stride": 128, "pool_stride": 32, "pin": False}]
+    assert result["reserve_base_bytes"] == [12 << 20]  # 1+2+3+4+1, rounded once.
+    # Ranking uses Full demand, not the much hotter zero-geometry identities.
+    first = MODULE.generate_qwen([data], "single_0spark", coverage=0.6)
+    assert len(first["trace"]["entries"]) == 1
+    assert first["reserve_base_bytes"] == [8 << 20]
+    repeated = MODULE.generate_qwen([data, data], "single_0spark", coverage=1)
+    assert repeated["trace"]["entries"] == result["trace"]["entries"]
+    assert repeated["reserve_base_bytes"] == result["reserve_base_bytes"]
+    assert repeated["reserve_extra_bytes"] == result["reserve_extra_bytes"]
+
+
+def test_qwen_normalized_trace_rejects_unrepresentable_and_mixed_geometries():
+    data = qwen_trace()
+    data["graphs"][0]["shape"] = normalized_qwen_identity(0, page_width=32, page_stride=64)
+    with pytest.raises(ValueError, match="one graph-key format"):
+        MODULE.generate_qwen([data], "single_0spark")
+    data["graphs"] = [data["graphs"][0]]
+    with pytest.raises(ValueError, match="unsupported normalized"):
+        MODULE.generate_qwen([data], "single_0spark")
 
 
 def qwen_list():
@@ -2149,7 +2249,7 @@ def test_capture_ticket_native_failures_always_report_backoff():
             prefix = source[max(0, native.start() - 180):native.start()]
             assert re.search(r"(?:plan\.)?ticket\.capture_result\([^;{}]*$", prefix), path
             checked += 1
-    assert checked >= 54, "the V4.1 capture inventory must not disappear"
+    assert checked >= 44, "the remaining V4.1 capture inventory must stay covered"
     for family, file, api in [
         ("qwen4", "engine.rs", "cache_ticket_failed"),
         ("qwen3_5", "graphs.rs", "cache_ticket_failed"),

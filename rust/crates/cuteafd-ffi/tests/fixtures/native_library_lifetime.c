@@ -424,11 +424,15 @@ int cuteafd_cuda_graph_end_capture(void *stream, void **out) {
     event('G');
     return 0;
 }
+int cuteafd_cuda_graph_end_capture_for_test(void *stream, void **out) {
+    return cuteafd_cuda_graph_end_capture(stream, out);
+}
 int cuteafd_cuda_graph_end_capture_topology(void *stream, void **out,
                                            size_t *nodes, size_t *width, int *spans_devices) {
     *out = NULL;
     *nodes = *width = 0;
     *spans_devices = 0;
+    if (capture_status == 10) { *nodes = 2; return capture_status; }
     int status = cuteafd_cuda_graph_end_capture(stream, out);
     if (status) return status;
     *nodes = *width = 1;

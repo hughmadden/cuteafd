@@ -687,40 +687,6 @@ impl<'weights, 'library> ExpertExecution<'weights, 'library> {
         Ok(())
     }
     /// # Safety
-    /// Same initialized-buffer and ordering contract as launch; captures fixed rows
-    /// and shared-output participation. Input values may change between replays.
-    pub unsafe fn capture(&mut self, rows: u32, include_shared: bool) -> Result<()> {
-        ensure!(
-            self.graph.is_none(),
-            "expert execution already has a captured graph"
-        );
-        unsafe {
-            self.launch(rows, include_shared)?;
-        }
-        self.synchronize()?;
-        unsafe {
-            self.library.cuda_graph_begin_capture(self.stream())?;
-        }
-        let launch = unsafe { self.launch(rows, include_shared) };
-        // End capture on both paths so an error cannot leave the stream capturing.
-        let captured = unsafe { self.library.cuda_graph_end_capture(self.stream()) };
-        match (launch, captured) {
-            (Ok(()), Ok(graph)) => {
-                self.graph = Some((graph, rows, include_shared, self.kernel.info().role,
-                    self.kernel.info().logical_intermediate));
-                Ok(())
-            }
-            (Err(error), Ok(graph)) => {
-                unsafe {
-                    self.library.cuda_graph_exec_destroy(graph)?;
-                }
-                Err(error)
-            }
-            (Err(error), Err(_)) => Err(error),
-            (Ok(()), Err(error)) => Err(error),
-        }
-    }
-    /// # Safety
     /// The captured rows' inputs (and optional shared output) must satisfy launch's
     /// contract, with writes ordered before replay and reads ordered after it.
     pub unsafe fn replay(&mut self) -> Result<()> {

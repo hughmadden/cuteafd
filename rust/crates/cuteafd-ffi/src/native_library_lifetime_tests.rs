@@ -419,3 +419,16 @@ fn failed_allocations_keep_the_attempted_tag_and_untagged_requests_are_refused()
     library.free_host_buffer(&mut host)?;
     Ok(())
 }
+
+#[test]
+fn small_graph_capture_is_typed_and_keeps_native_node_count() -> Result<()> {
+    let fixture = native_library_lifetime_fixture::Fixture::build_for_tests()?;
+    let library = fixture.load()?;
+    fixture.configure_capture(&library, CUTEAFD_STATUS_GRAPH_TOO_SMALL)?;
+    // SAFETY: the CPU fake has no stream or device work.
+    let error = unsafe { library.cuda_graph_end_capture_topology(std::ptr::null_mut()) }.unwrap_err();
+    assert_eq!(error.downcast_ref::<SmallGraphCapture>(), Some(&SmallGraphCapture { nodes: 2 }));
+    assert!(is_small_graph(&error));
+    assert!(error.downcast_ref::<NativeStatusError>().is_none());
+    Ok(())
+}

@@ -190,7 +190,11 @@ mod tests {
             let end = source[at..].find("pub(crate) fn capture_startup(").unwrap() + at;
             let startup = &source[at..end];
             assert!(startup.contains("select_window(crate::shared::memory::row_window::RowWindow::NONE)?"));
-            assert!(startup.contains("graph_policy::PREFILL_HEAD_PREWARM_ROWS"));
+            if source.contains("resources.head.capture_startup(") {
+                assert!(startup.contains("graph_policy::PREFILL_HEAD_PREWARM_ROWS"));
+            } else {
+                assert!(!startup.contains("head.capture_startup("));
+            }
             assert!(!startup.contains("head.capture_startup(&rows)"));
         }
         let lane = include_str!("v41_backbone_lane.rs");
@@ -234,7 +238,7 @@ mod tests {
                 unsafe {
                     library.cuda_graph_begin_capture(stream.raw)?;
                     library.copy_d2d_async(output.buffer, input.buffer, rows * 4, stream.raw)?;
-                    let graph = library.cuda_graph_end_capture(stream.raw)?;
+                    let graph = library.cuda_graph_end_capture_for_test(stream.raw)?;
                     bank.insert(rows, graph)?;
                 }
             }
@@ -283,7 +287,7 @@ mod tests {
                 unsafe {
                     library.cuda_graph_begin_capture(stream.raw)?;
                     library.copy_d2d_async(output.buffer, weights.buffer, rows as usize * 4, stream.raw)?;
-                    let graph = library.cuda_graph_end_capture(stream.raw)?;
+                    let graph = library.cuda_graph_end_capture_for_test(stream.raw)?;
                     bank.insert(0, &weights, rows, graph)?;
                 }
             }
@@ -308,7 +312,7 @@ mod tests {
         unsafe {
             library.cuda_graph_begin_capture(stream.raw)?;
             library.copy_d2d_async(output.buffer, other.buffer, 8, stream.raw)?;
-            let graph = library.cuda_graph_end_capture(stream.raw)?;
+            let graph = library.cuda_graph_end_capture_for_test(stream.raw)?;
             bank.insert(0, &other, 2, graph)?;
         }
         assert!(bank.get_shape(0, &weights, 2).is_none());
@@ -339,7 +343,7 @@ mod tests {
             unsafe {
                 library.cuda_graph_begin_capture(stream.raw)?;
                 library.copy_d2d_async(output.buffer, weights.buffer, rows * 4, stream.raw)?;
-                let graph = library.cuda_graph_end_capture(stream.raw)?;
+                let graph = library.cuda_graph_end_capture_for_test(stream.raw)?;
                 bank.insert(0, &weights, rows as u32, graph)?;
             }
         }
@@ -420,7 +424,7 @@ mod tests {
                                     expected.len(),
                                     streams[lane].raw,
                                 )?;
-                                let graph = library.cuda_graph_end_capture(streams[lane].raw)?;
+                                let graph = library.cuda_graph_end_capture_for_test(streams[lane].raw)?;
                                 bank.insert(layer, &weights[layer], rows, graph)?;
                             }
                             captures += 1;
@@ -474,7 +478,7 @@ mod tests {
         unsafe {
             library.cuda_graph_begin_capture(streams[0].raw)?;
             library.copy_d2d_async(outputs[0].buffer, replacement.buffer, 4, streams[0].raw)?;
-            let graph = library.cuda_graph_end_capture(streams[0].raw)?;
+            let graph = library.cuda_graph_end_capture_for_test(streams[0].raw)?;
             bank.insert(0, &replacement, 1, graph)?;
             assert!(bank.get(0, &weights[0]).is_none());
             assert!(bank.get(39, &weights[39]).is_some());

@@ -19,6 +19,7 @@ typedef enum cuteafd_status_t {
   CUTEAFD_STATUS_RDMA_UNAVAILABLE = 7,
   CUTEAFD_STATUS_NCCL_UNAVAILABLE = 8,
   CUTEAFD_STATUS_CAPTURE_REQUIRES_PREPARE = 9,
+  CUTEAFD_STATUS_GRAPH_TOO_SMALL = 10,
 } cuteafd_status_t;
 
 typedef enum cuteafd_xgrammar_kind_t {
@@ -359,6 +360,8 @@ cuteafd_status_t cuteafd_cuda_prepare_cublas_stream(void* cuda_stream);
 cuteafd_status_t cuteafd_cuda_prepare_cublas_handle();
 cuteafd_status_t cuteafd_cuda_graph_begin_capture(void* cuda_stream);
 cuteafd_status_t cuteafd_cuda_graph_end_capture(void* cuda_stream, void** out_cuda_graph_exec);
+// Test oracles only: permit tiny graphs for eager/replay exactness checks.
+cuteafd_status_t cuteafd_cuda_graph_end_capture_for_test(void* cuda_stream, void** out_cuda_graph_exec);
 // Topology is queried before destroying the source graph, without synchronizing.
 // Inspection failure retains the executable: width=0 (unknown), diagnostic in
 // cuteafd_last_error. Only capture/instantiation/lifetime errors fail the call.

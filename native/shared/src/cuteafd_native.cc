@@ -40,6 +40,9 @@
 #include <nccl.h>
 #endif
 
+static cuteafd_status_t end_capture_retained(void* stream,
+    cuteafd_cuda_graph_capture_info_t* out, bool allow_small);
+
 namespace {
 #if CUTEAFD_NATIVE_ENABLE_RDMA
 inline ibv_mr* cuteafd_checked_registration(ibv_pd* pd, void* buffer, size_t bytes, int access, const char* file, int line) {
@@ -1786,6 +1789,7 @@ extern "C" cuteafd_status_t cuteafd_cuda_graph_end_capture_topology(
   *out_spans_devices = 0;
   cuteafd_cuda_graph_capture_info_t capture = {};
   cuteafd_status_t status = cuteafd_cuda_graph_end_capture_retained(cuda_stream, &capture);
+  *out_nodes = capture.node_count;
   if (status != CUTEAFD_STATUS_OK) return status;
 #if CUTEAFD_NATIVE_ENABLE_CUDA
   cudaGraph_t graph = reinterpret_cast<cudaGraph_t>(capture.graph);
@@ -1816,6 +1820,32 @@ extern "C" cuteafd_status_t cuteafd_cuda_graph_end_capture_topology(
 
 extern "C" cuteafd_status_t cuteafd_cuda_graph_end_capture_retained(
     void* cuda_stream, cuteafd_cuda_graph_capture_info_t* out) {
+  return end_capture_retained(cuda_stream, out, false);
+}
+
+// GPU correctness oracles intentionally replay individual kernels.
+extern "C" cuteafd_status_t cuteafd_cuda_graph_end_capture_for_test(
+    void* cuda_stream, void** out_exec) {
+  if (!out_exec) return fail(CUTEAFD_STATUS_INVALID_ARGUMENT, "null test graph output");
+  *out_exec = nullptr;
+  cuteafd_cuda_graph_capture_info_t capture = {};
+  cuteafd_status_t status = end_capture_retained(cuda_stream, &capture, true);
+  if (status != CUTEAFD_STATUS_OK) return status;
+#if CUTEAFD_NATIVE_ENABLE_CUDA
+  cudaError_t err = cudaGraphDestroy(reinterpret_cast<cudaGraph_t>(capture.graph));
+  if (err != cudaSuccess) {
+    cudaGraphExecDestroy(reinterpret_cast<cudaGraphExec_t>(capture.graph_exec));
+    return fail_cuda(CUTEAFD_STATUS_INTERNAL_ERROR, "test graph destroy failed", err);
+  }
+  *out_exec = capture.graph_exec;
+  return ok();
+#else
+  return fail(CUTEAFD_STATUS_CUDA_UNAVAILABLE, "test graph capture unavailable");
+#endif
+}
+
+static cuteafd_status_t end_capture_retained(void* cuda_stream,
+    cuteafd_cuda_graph_capture_info_t* out, bool allow_small) {
   if (cuda_stream == nullptr) {
     return fail(CUTEAFD_STATUS_INVALID_ARGUMENT, "CUDA graph capture stream is null");
   }
@@ -1833,6 +1863,20 @@ extern "C" cuteafd_status_t cuteafd_cuda_graph_end_capture_retained(
   }
   if (graph == nullptr) {
     return fail(CUTEAFD_STATUS_INTERNAL_ERROR, "cudaStreamEndCapture returned a null graph");
+  }
+  size_t nodes = 0;
+  err = cudaGraphGetNodes(graph, nullptr, &nodes);
+  if (err != cudaSuccess) {
+    cudaGraphDestroy(graph);
+    return fail_cuda(CUTEAFD_STATUS_INTERNAL_ERROR, "cudaGraphGetNodes failed", err);
+  }
+  out->node_count = nodes;
+  if (!allow_small && nodes <= 2) {
+    err = cudaGraphDestroy(graph);
+    if (err != cudaSuccess) {
+      return fail_cuda(CUTEAFD_STATUS_INTERNAL_ERROR, "small graph destroy failed", err);
+    }
+    return CUTEAFD_STATUS_GRAPH_TOO_SMALL;
   }
   cudaGraphExec_t graph_exec = nullptr;
   size_t before_free = 0, after_free = 0, total = 0;

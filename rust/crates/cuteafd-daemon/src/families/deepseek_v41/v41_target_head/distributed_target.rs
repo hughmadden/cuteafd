@@ -11,7 +11,6 @@ struct Normalize<'w, 'a> {
     buffers: Vec<DeviceAllocation<'a>>,
     weights: &'w TargetHeadWeights<'a>,
     hc: V41Hc<'a>,
-    graphs: crate::shared::decode_graph::RowGraphs<'a>,
 }
 fn part(buffer: CuteafdDeviceBuffer, offset: usize, bytes: usize) -> Result<CuteafdDeviceBuffer> {
     ensure!(offset <= buffer.bytes && bytes <= buffer.bytes - offset, "target head slice exceeds storage");
@@ -24,7 +23,7 @@ impl<'w, 'a> Normalize<'w, 'a> {
             .collect::<Result<Vec<_>>>()?;
         ensure!(weights.norm.get("norm.weight")?.device_id == buffers[0].buffer.device_id, "target norm device differs");
         Ok(Self { stream: LoadStream { library: lib, raw: lib.cuda_stream_create()? },
-            buffers, weights, hc: lib.v41_hc()?, graphs: crate::shared::decode_graph::RowGraphs::new(lib, "target_norm", capacity, "deepseek_v41") })
+            buffers, weights, hc: lib.v41_hc()? })
     }
     unsafe fn enqueue(&self, rows: usize) -> Result<()> {
         unsafe {
@@ -35,10 +34,9 @@ impl<'w, 'a> Normalize<'w, 'a> {
         }
     }
     /// Device-ordered form of [`Self::execute`] for a warm row count: row copies
-    /// and the captured norm follow the chain head and become it.
+    /// and the eager norm follow the chain head and become it.
     unsafe fn execute_chained(&mut self, block: &BlockOutput<'_>, selected: &[usize]) -> Result<()> {
         let rows = selected.len();
-        let graph = self.graphs.cached_launch(rows);
         let lib = self.weights.library;
         unsafe {
             crate::shared::memory::chain::join(lib, self.stream.raw)?;
@@ -53,7 +51,7 @@ impl<'w, 'a> Normalize<'w, 'a> {
                 first += count;
             }
             crate::shared::decode_graph::census::dispatch(lib, self.stream.raw, c"head", rows,
-                graph, || self.enqueue(rows))?;
+                None, || self.enqueue(rows))?;
             crate::shared::memory::chain::finish(lib, self.stream.raw)
         }
     }
@@ -71,46 +69,16 @@ impl<'w, 'a> Normalize<'w, 'a> {
                 first += count;
             }
             crate::shared::decode_graph::census::dispatch(self.weights.library, self.stream.raw, c"head", rows,
-                self.graphs.cached_launch(rows), || self.enqueue(rows))
+                None, || self.enqueue(rows))
         } })();
         let drained = self.stream.wait().await;
-        queued.and(drained)?;
-        self.capture_ready(rows)
-    }
-    fn capture_ready(&mut self, rows: usize) -> Result<()> {
-        if self.graphs.get(rows).is_none() && self.graphs.capture_allowed(rows)
-            && !crate::shared::decode_graph::census::eager("head") {
-            let lib = self.weights.library;
-            let Some(mut ticket) = self.graphs.cache_ticket(&rows, crate::families::deepseek_v41::graph_policy::pinned_shape(self.buffers[0].buffer.device_id, rows as u32), None) else {
-                crate::shared::decode_graph::note_eager("deepseek_v41", &format!("head rows={rows}"), || "cache admission".into());
-                return Ok(());
-            };
-            unsafe { ticket.capture_result(lib.cuda_graph_begin_capture(self.stream.raw))?; }
-            let queued = unsafe { self.enqueue(rows) };
-            let captured = unsafe { ticket.capture_result(lib.cuda_graph_end_capture_topology(self.stream.raw)) };
-            match (queued, captured) {
-                (Ok(()), Ok((graph, nodes, width, spans, _))) => {
-                    // SAFETY: eager execution drained, Normalize pins all captured buffers.
-                    unsafe {
-                        if let Err(error) = self.graphs.cache_insert(rows, graph, ticket, nodes as u64, width, spans) {
-                            lib.cuda_graph_exec_destroy(graph)?;
-                            return Err(error);
-                        }
-                    }
-                },
-                (Err(error), Ok((graph, ..))) => { unsafe { lib.cuda_graph_exec_destroy(graph)?; } return Err(error); }
-                (Err(error), Err(_)) | (Ok(()), Err(error)) => return Err(error),
-            }
-        }
-        Ok(())
+        queued.and(drained)
     }
 }
 impl Drop for Normalize<'_, '_> {
     fn drop(&mut self) {
         let lib = self.weights.library;
         if let Err(error) = unsafe { lib.cuda_stream_synchronize(self.stream.raw) } { crate::shared::decode_graph::fatal_drain(Err(error), "target normalization"); }
-        // SAFETY: Normalize drained its only stream before releasing captured pointers.
-        if let Err(error) = unsafe { self.graphs.clear() } { tracing::error!(%error, "destroying target norm graph"); }
     }
 }
 
@@ -147,25 +115,6 @@ pub(crate) struct DistributedTargetHead<'w, 'a> {
     greedy: Vec<(u32, f32)>,
 }
 impl<'w, 'a> DistributedTargetHead<'w, 'a> {
-    pub(crate) fn visit_graph_banks(&mut self,
-        f: &mut dyn FnMut(i32, &'static str, bool, &mut dyn crate::shared::decode_graph::CacheAttached) -> Result<()>,
-    ) -> Result<()> {
-        f(self.normalize.device.id, "target_norm", true, &mut self.normalize.get_mut().graphs)?;
-        self.vocabulary.visit_graph_banks(f)
-    }
-
-    pub(crate) fn capture_startup(&mut self, rows: &[usize]) -> Result<()> {
-        ensure!(self.binding.is_none() && self.selected.is_empty(), "target head startup requires an idle owner");
-        ensure!(rows.iter().all(|&row| row <= self.capacity), "target head startup row exceeds capacity");
-        let device = self.normalize.device;
-        device.run(|| {
-            let norm = self.normalize.get_mut();
-            norm.stream.require_complete()?;
-            for &row in rows { norm.capture_ready(row)?; }
-            Ok(())
-        })?;
-        self.vocabulary.capture_startup(rows, true)
-    }
     pub fn device_bytes(capacity: usize, split: usize) -> Result<[usize; 2]> {
         let mut bytes = DistributedVocabularyWave::device_bytes(capacity, split)?;
         bytes[1] += capacity * INPUT_STRIDES.iter().sum::<usize>()
@@ -219,7 +168,7 @@ impl<'w, 'a> DistributedTargetHead<'w, 'a> {
         let rows = selected.len();
         let normalized = self.normalize.buffers[3].buffer;
         let chained = greedy && crate::shared::memory::chain::deferred()
-            && self.normalize.graphs.get(rows).is_some() && self.vocabulary.warm_greedy(rows);
+            && self.vocabulary.warm_greedy(rows);
         if chained {
             // Device-ordered pass, warm shapes: norm, both vocabulary halves and
             // the merge follow the chain; the download below is the one wait.

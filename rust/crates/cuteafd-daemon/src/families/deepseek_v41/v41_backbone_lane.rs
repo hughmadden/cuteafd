@@ -192,6 +192,7 @@ impl<'w,'a> Tp2FfnGraphs<'w,'a> {
                     Ok(())
                 },
                 (Err(error),Ok((graph,..)))=> {self.device.library.cuda_graph_exec_destroy(graph)?;Err(error)},
+                (Ok(_),Err(error)) if cuteafd_ffi::is_small_graph(&error) => Ok(()),
                 (Err(error),Err(_)) | (Ok(_),Err(error))=>Err(error),
             }
         })

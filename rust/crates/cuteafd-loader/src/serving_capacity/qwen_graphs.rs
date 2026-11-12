@@ -40,6 +40,11 @@ pub struct QwenGraphShape {
 }
 
 impl QwenGraphShape {
+    /// Full-attention capture geometry; GDN and head keys normalize further.
+    pub fn capture_shape(self) -> Self {
+        Self { pool_width: 0, pool_stride: if self.long { self.pool_stride } else { 0 }, ..self }
+    }
+
     pub fn geometry(&self) -> QwenGraphGeometry {
         QwenGraphGeometry { pool_width: self.pool_width, page_stride: self.page_stride, pool_stride: self.pool_stride, long: self.long }
     }
@@ -164,23 +169,23 @@ pub fn qwen_prewarm_shapes(key: QwenGraphShapeKey, context: usize, pages: usize,
     use std::sync::Once;
     static WARNED: [Once; 4] = [Once::new(), Once::new(), Once::new(), Once::new()];
     let prewarm = qwen_shape_prewarm(key);
-    let Some(trace) = &prewarm.trace else {
+    if prewarm.trace.is_none() {
         WARNED[key.index()].call_once(|| {
             tracing::warn!(shape = ?key,
                 "qwen4 has no graph trace for this shape; prewarming the bootstrap startup set");
         });
-        let bootstrap = &qwen_prewarm_list().bootstrap.entries;
-        let allowed = qwen_serving_graph_shapes(context, pages, dense, sequences, speculation);
-        return bootstrap.iter().map(|entry| entry.shape)
-            .filter(|shape| allowed.contains(&(shape.rows, shape.spec, shape.geometry()))).collect();
-    };
-    let allowed = qwen_serving_graph_shapes(context, pages, dense, sequences, speculation);
-    let mut shapes: Vec<QwenGraphShape> = trace.entries.iter().map(|entry| entry.shape)
-        .filter(|shape| allowed.contains(&(shape.rows, shape.spec, shape.geometry()))).collect();
-    // The traced list is sized to the base by construction; warming its pinned
-    // (trace-chosen hot) shapes first means an explicit user total below the
-    // base evicts the rare tail rather than a hot shape.
-    shapes.sort_by_key(|shape| !trace.entries.iter().any(|entry| entry.pin && entry.shape == *shape));
+    }
+    let entries = prewarm.trace.as_ref().map_or(&qwen_prewarm_list().bootstrap.entries, |trace| &trace.entries);
+    let allowed: std::collections::HashSet<_> = qwen_serving_graph_shapes(context, pages, dense, sequences, speculation)
+        .into_iter().map(|(rows, spec, geometry)| QwenGraphShape { rows, spec,
+            long: geometry.long, pool_width: geometry.pool_width, page_stride: geometry.page_stride,
+            pool_stride: geometry.pool_stride }.capture_shape()).collect();
+    let pins = qwen_prewarm_pinned(key);
+    let mut seen = std::collections::HashSet::new();
+    let mut shapes: Vec<_> = entries.iter().map(|entry| entry.shape.capture_shape())
+        .filter(|shape| allowed.contains(shape) && seen.insert(*shape)).collect();
+    // A pinned old geometry pins its capture-equivalent normalized identity.
+    shapes.sort_by_key(|shape| !pins.contains(shape));
     shapes
 }
 
@@ -188,7 +193,9 @@ pub fn qwen_prewarm_shapes(key: QwenGraphShapeKey, context: usize, pages: usize,
 pub fn qwen_prewarm_pinned(key: QwenGraphShapeKey) -> Vec<QwenGraphShape> {
     let prewarm = qwen_shape_prewarm(key);
     let entries = prewarm.trace.as_ref().map_or(&qwen_prewarm_list().bootstrap.entries, |trace| &trace.entries);
-    entries.iter().filter(|entry| entry.pin).map(|entry| entry.shape).collect()
+    let mut seen = std::collections::HashSet::new();
+    entries.iter().filter(|entry| entry.pin).map(|entry| entry.shape.capture_shape())
+        .filter(|shape| seen.insert(*shape)).collect()
 }
 
 
@@ -254,9 +261,8 @@ pub fn qwen_pool_pages(pool_tokens: usize) -> Option<usize> {
     pool_tokens.div_ceil(QWEN_UNIT_ROWS).checked_mul(QWEN_UNIT_PAGES)
 }
 
-/// Owner-local layer fronts, owner0 head, and (for a dual owner chain) the
-/// materialized owner0 cutover post and owner1 final post. This is the same
-/// segment inventory as the executor, not a duplicated whole set per GPU.
+/// Owner-local layer fronts and owner0 head. Cutover and exit posts run eagerly;
+/// each physical rank owns only its layer fronts, not a duplicated whole set.
 pub fn qwen_graph_segments(owners: &[usize]) -> Option<Vec<u64>> {
     if owners.is_empty() || owners[0] != 0 || owners.iter().any(|&owner| owner > 1) { return None; }
     let dual = owners.contains(&1);
@@ -264,8 +270,7 @@ pub fn qwen_graph_segments(owners: &[usize]) -> Option<Vec<u64>> {
         || owners.windows(2).filter(|pair| pair[0] != pair[1]).count() != 1) { return None; }
     let mut counts = vec![0u64; if dual { 2 } else { 1 }];
     for &owner in owners { counts[owner] = counts[owner].checked_add(1)?; }
-    counts[0] = counts[0].checked_add(if dual { 2 } else { 1 })?;
-    if dual { counts[1] = counts[1].checked_add(1)?; }
+    counts[0] = counts[0].checked_add(1)?;
     Some(counts)
 }
 
@@ -279,8 +284,8 @@ mod owner_graph_tests {
         for cut in [1, 24, 47] {
             let owners: Vec<_> = (0..48).map(|layer| usize::from(layer >= cut)).collect();
             let segments = qwen_graph_segments(&owners).unwrap();
-            assert_eq!(segments, vec![cut as u64 + 2, (48 - cut) as u64 + 1]);
-            assert_eq!(segments.iter().sum::<u64>(), 51);
+            assert_eq!(segments, vec![cut as u64 + 1, (48 - cut) as u64]);
+            assert_eq!(segments.iter().sum::<u64>(), 49);
         }
     }
 
@@ -298,8 +303,8 @@ mod owner_graph_tests {
         for key in [QwenGraphShapeKey::SingleSparks, QwenGraphShapeKey::DualSparks] {
             // Untraced: every shape falls back to the bootstrap set, never another shape's list.
             assert!(qwen_shape_prewarm(key).trace.is_none(), "{key:?}");
-            assert_eq!(qwen_prewarm_shapes(key, 262_144, 8192, 2051, 16, true).len(), 682, "{key:?}");
-            assert_eq!(qwen_prewarm_shapes(key, 8192, 8192, 2051, 16, true).len(), 253, "{key:?}");
+            assert_eq!(qwen_prewarm_shapes(key, 262_144, 8192, 2051, 16, true).len(), 187, "{key:?}");
+            assert_eq!(qwen_prewarm_shapes(key, 8192, 8192, 2051, 16, true).len(), 88, "{key:?}");
             assert!(qwen_prewarm_shapes(key, 8192, 8192, 2051, 1, false).len() < 253, "{key:?}");
             assert!(qwen_prewarm_pinned(key).is_empty(), "{key:?}");
         }
@@ -310,8 +315,11 @@ mod owner_graph_tests {
             (QwenGraphShapeKey::Dual0Spark, 32_768)] {
             let prewarm = qwen_shape_prewarm(key);
             let trace = prewarm.trace.as_ref().expect("traced shape");
-            assert_eq!(qwen_prewarm_shapes(key, 262_144, pages, 2051, 16, true).len(),
-                trace.entries.len(), "{key:?} traced entries are all reachable");
+            let retained = qwen_prewarm_shapes(key, 262_144, pages, 2051, 16, true);
+            assert_eq!(retained.len(), if key == QwenGraphShapeKey::Single0Spark { 13 } else { 15 });
+            for entry in &trace.entries {
+                assert!(retained.contains(&entry.shape.capture_shape()), "{key:?}: {entry:?}");
+            }
             assert!(qwen_prewarm_pinned(key).is_empty(), "{key:?}");
         }
         assert_eq!(QwenGraphShapeKey::resolve(1, false), QwenGraphShapeKey::Single0Spark);

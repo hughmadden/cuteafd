@@ -1130,7 +1130,7 @@ mod tests {
                 let gathered = embedding.gather(ids.buffer.ptr, std::ptr::null(), 5, 4,
                     std::ptr::null(), expanded.buffer.ptr, Some(output.buffer),
                     crate::shared::peer_split::RankDevice { device: stream.device.id, stream: stream.raw });
-                let graph = library.cuda_graph_end_capture(stream.raw)?;
+                let graph = library.cuda_graph_end_capture_for_test(stream.raw)?;
                 gathered?;
                 let replayed = library.cuda_graph_launch(graph, stream.raw);
                 let drained = stream.drain();

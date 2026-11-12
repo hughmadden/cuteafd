@@ -943,7 +943,7 @@ mod tests {
             let enqueue = chain.enqueue(rows);
             let graph = device.run(|| {
                 // SAFETY: capture was begun on this stream above, even if enqueue failed.
-                unsafe { library.cuda_graph_end_capture(chain.stream.get()?.raw) }
+                unsafe { library.cuda_graph_end_capture_for_test(chain.stream.get()?.raw) }
             })?;
             // SAFETY: the mutable borrow pins the entire chain until this graph is dropped.
             let graph = unsafe {

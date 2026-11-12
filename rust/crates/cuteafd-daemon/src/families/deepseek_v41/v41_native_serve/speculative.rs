@@ -575,7 +575,6 @@ impl<'w, 'a, C: DraftChain<'a>> DraftRuntime<'w, 'a, C> {
     pub(crate) fn visit_graph_banks(&mut self, f: &mut dyn FnMut(i32, &'static str, bool, &mut dyn crate::shared::decode_graph::CacheAttached) -> Result<()>) -> Result<()> {
         for main in &mut self.mains { main.visit_graph_banks(f)?; }
         for chain in &mut self.chains { chain.visit_graph_banks(f)?; }
-        for window in &mut self.windows { window.visit_graph_banks(f)?; }
         Ok(())
     }
     fn graph_cycle(&mut self) -> Result<()> {

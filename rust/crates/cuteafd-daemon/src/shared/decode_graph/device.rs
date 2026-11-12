@@ -153,6 +153,7 @@ struct Record {
     spans_devices: bool,
     oom: Option<OomBackoff>,
     oom_warned: bool,
+    permanently_eager: bool,
     stats: Box<KeyStats>,
 }
 
@@ -266,6 +267,8 @@ pub(crate) struct TraceRow {
     capture_bytes: Option<u64>,
     nodes: Option<u64>,
     executables: u64,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    permanently_eager: bool,
     basis: Basis,
     permanent_bytes: u64,
     pinned: bool,
@@ -760,6 +763,12 @@ impl DeviceCache {
         }
         let old = self.identities.get(&identity).copied();
         if let Some(record) = old.and_then(|id| self.records.get_mut(&id)) {
+            if record.permanently_eager {
+                record.stats.event(site.cycle, 1);
+                record.stats.misses += 1;
+                self.counters.entry(site.cycle).or_default().eager_runs += 1;
+                return Miss::Eager;
+            }
             if let Some(backoff) = &mut record.oom {
                 let level_recovered = backoff.level.zip(self.level)
                     .is_some_and(|(before, now)| before.saturating_sub(now) >= OOM_LEVEL_DROP);
@@ -836,7 +845,7 @@ impl DeviceCache {
                 let id = self.next_id;
                 self.identities.insert(identity.clone(), id);
                 self.records.insert(id, Record { identity, cycle: site.cycle, bytes: 0, list: None,
-                    previous: None, next: None, pinned, pending_destroy: false, pending_capture: false, frequent: false, nodes, node_rate: metadata.node_rate, graph_rate: metadata.graph_rate, parallel_width: metadata.parallel_width, spans_devices: site.spans_devices, oom: None, oom_warned: false, stats: KeyStats::new(now) });
+                    previous: None, next: None, pinned, pending_destroy: false, pending_capture: false, frequent: false, nodes, node_rate: metadata.node_rate, graph_rate: metadata.graph_rate, parallel_width: metadata.parallel_width, spans_devices: site.spans_devices, oom: None, oom_warned: false, permanently_eager: false, stats: KeyStats::new(now) });
                 id
             };
             let record = self.records.get_mut(&id).unwrap();
@@ -882,7 +891,7 @@ impl DeviceCache {
             let id = self.next_id;
             self.identities.insert(identity.clone(), id);
             self.records.insert(id, Record { identity: identity.clone(), cycle: site.cycle, bytes: estimate,
-                list: None, previous: None, next: None, pinned: false, pending_destroy: false, pending_capture: false, frequent: false, nodes, node_rate: metadata.node_rate, graph_rate: metadata.graph_rate, parallel_width: metadata.parallel_width, spans_devices: site.spans_devices, oom: None, oom_warned: false, stats: KeyStats::new(now) });
+                list: None, previous: None, next: None, pinned: false, pending_destroy: false, pending_capture: false, frequent: false, nodes, node_rate: metadata.node_rate, graph_rate: metadata.graph_rate, parallel_width: metadata.parallel_width, spans_devices: site.spans_devices, oom: None, oom_warned: false, permanently_eager: false, stats: KeyStats::new(now) });
             self.push(id, List::RecentGhost);
             self.trim_ghosts();
         }
@@ -917,6 +926,26 @@ impl DeviceCache {
         self.push(id, ghost);
         self.trim_ghosts();
         warn
+    }
+
+    /// Retain exact rejected identities outside ARC's evictable ghost lists.
+    /// Captured commands did not run and no executable was instantiated.
+    pub fn capture_too_small(&mut self, id: u64, nodes: usize) {
+        let Some(record) = self.records.get_mut(&id) else { return };
+        if record.permanently_eager { return }
+        if record.pending_capture {
+            self.pending_bytes = self.pending_bytes.saturating_sub(record.bytes);
+            self.pools.live_nodes = self.pools.live_nodes.saturating_sub(record.nodes);
+            self.pools.live_execs = self.pools.live_execs.saturating_sub(1);
+        }
+        record.pending_capture = false;
+        record.pinned = false;
+        record.permanently_eager = true;
+        record.stats.native_nodes = Some(nodes as u64);
+        tracing::info!(device = self.device, site = record.identity.site,
+            key = %record.identity.shape, nodes, "small graph permanently eager");
+        self.unlink(id);
+        // Physical charge remains a monotone high-water, including failed captures.
     }
 
     pub fn cancel_capture(&mut self, id: u64) {
@@ -1153,11 +1182,11 @@ fn raw_row(device: i32, basis: Basis, record: &RawRecord, now: u64) -> TraceRow 
             last_hit_ms: stats.last_hit_ms, hit_histogram: HitHistogram {
                 rolling: true, interval_ms: HIT_INTERVAL_MS, start_ms: start * HIT_INTERVAL_MS, counts },
             capture_bytes: stats.capture_bytes, nodes: stats.native_nodes.or_else(|| matches!(basis, Basis::Nodes { .. }).then_some(record.nodes)),
-            executables: 1, basis,
-            permanent_bytes: match basis {
+            executables: u64::from(!record.permanently_eager), permanently_eager: record.permanently_eager, basis,
+            permanent_bytes: if record.permanently_eager { 0 } else { match basis {
                 Basis::Bytes => record.bytes,
                 Basis::Nodes { node_rate, graph_rate } => record.nodes.saturating_mul(node_rate).saturating_add(graph_rate),
-            }, pinned: record.pinned, declared_capture_streams: stats.declared_capture_streams,
+            } }, pinned: record.pinned, declared_capture_streams: stats.declared_capture_streams,
             max_parallel_width: stats.max_parallel_width, spans_devices: stats.spans_devices }
  }
 
@@ -1182,12 +1211,14 @@ struct RawRecord {
     bytes: u64,
     nodes: u64,
     pinned: bool,
+    permanently_eager: bool,
     stats: KeyStats,
 }
 impl RawRecord {
     fn copy(record: &Record) -> Self {
         Self { identity: record.identity.clone(), cycle: record.cycle, bytes: record.bytes,
-            nodes: record.nodes, pinned: record.pinned, stats: (*record.stats).clone() }
+            nodes: record.nodes, pinned: record.pinned, permanently_eager: record.permanently_eager,
+            stats: (*record.stats).clone() }
     }
 }
 struct TraceSnapshot {
@@ -1282,6 +1313,41 @@ mod tests {
         let Miss::Capture(id) = cache.miss(key(n), site(Preference::Capture), None, pinned) else { panic!("capture expected") };
         cache.measured_capture(10);
         id
+    }
+    #[test]
+    fn rejected_small_graph_trace_has_no_executable_or_permanent_bytes() {
+        for basis in [Basis::Bytes, Basis::Nodes { node_rate: 2560, graph_rate: 65536 }] {
+            for nodes in 0..=2 {
+                let mut cache = DeviceCache::new(-992, 64 << 20);
+                cache.basis = basis;
+                let mut capture_site = site(Preference::Capture);
+                capture_site.basis = basis;
+                let estimate = match basis {
+                    Basis::Bytes => None,
+                    Basis::Nodes { node_rate, graph_rate } => Some(Estimate {
+                        bytes: node_rate * 3 + graph_rate, nodes: Some(3),
+                        node_rate, graph_rate, parallel_width: 1 }),
+                };
+                let Miss::Capture(rejected) = cache.miss(key(1), capture_site, estimate.clone(), true) else { panic!() };
+                cache.measured_capture(10);
+                cache.capture_too_small(rejected, nodes);
+                assert!(matches!(cache.miss(key(2), capture_site, estimate, false), Miss::Capture(_)));
+                cache.measured_capture(10);
+                let charged = cache.charged;
+                let value: serde_json::Value = serde_json::from_slice(&cache.trace_snapshot().bytes().unwrap()).unwrap();
+                let graphs = value["graphs"].as_array().unwrap();
+                let eager = graphs.iter().find(|row| row["permanently_eager"] == true).unwrap();
+                assert_eq!(eager["executables"], 0);
+                assert_eq!(eager["permanent_bytes"], 0);
+                assert_eq!(eager["nodes"], nodes);
+                assert_eq!(eager["captures"], 1, "capture history survives rejection");
+                assert_eq!(eager["pinned"], false);
+                let retained = graphs.iter().find(|row| row["permanently_eager"].is_null()).unwrap();
+                assert_eq!(retained["executables"], 1);
+                assert!(retained["permanent_bytes"].as_u64().unwrap() > 0);
+                assert_eq!(value["cache"]["charged"], charged);
+            }
+        }
     }
     #[test]
     fn oom_backoff_skips_256_misses_preserves_accounting_and_warns_once() {

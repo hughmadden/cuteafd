@@ -153,6 +153,8 @@ using cudaGraphExec_t = void*;
 constexpr int cudaSuccess = 0, cudaErrorMemoryAllocation = 2, cudaErrorStreamCaptureInvalidated = 901;
 constexpr int cudaErrorIllegalAddress = 700, cudaStreamCaptureModeThreadLocal = 1;
 static int last_error = 0, sticky_error = 0, injected = 0, point = 0, live_graphs = 0, live_execs = 0;
+static size_t graph_nodes = 3;
+static int instantiate_calls = 0;
 static bool active = false, partial_exec = false, census = false;
 static std::string message;
 int cudaGetLastError() { int status = sticky_error ? sticky_error : last_error; last_error = 0; return status; }
@@ -169,12 +171,15 @@ int cudaStreamEndCapture(void*, void** graph) {
   return status;
 }
 int cudaGraphInstantiate(void** exec, void*, int) {
+  ++instantiate_calls;
   const int status = outcome(3);
   if (!status || partial_exec) { *exec = reinterpret_cast<void*>(0x2000); ++live_execs; }
   return status;
 }
 int cudaGraphDestroy(void*) { assert(live_graphs > 0); --live_graphs; return outcome(4); }
 int cudaGraphExecDestroy(void*) { assert(live_execs > 0); --live_execs; return outcome(5); }
+int cudaGraphGetNodes(void*, void**, size_t* nodes) { *nodes = graph_nodes; return 0; }
+static cuteafd_status_t end_capture_retained(void*, cuteafd_cuda_graph_capture_info_t*, bool);
 int cudaMemGetInfo(size_t* free, size_t* total) { *free = 1 << 20; *total = 2 << 20; return 0; }
 bool graph_census_enabled() { return census; }
 void record_graph_census(void*, void*, int, size_t, int, size_t) {}
@@ -184,18 +189,44 @@ cuteafd_status_t fail_cuda(cuteafd_status_t status, const char* action, int erro
   message = std::string(action) + ": " + std::to_string(error); return status;
 }
 cuteafd_status_t fill_cuda_graph_capture_info(void* graph, void* exec, cuteafd_cuda_graph_capture_info_t* out) {
-  out->graph = graph; out->graph_exec = exec; out->node_count = 2; return ok();
+  out->graph = graph; out->graph_exec = exec; out->node_count = 3; return ok();
 }
 namespace cuteafd {
 ''' + "inline cudaError_t diagnostic_cuda" + clear_error + r'''
 int inspect_graph_topology(void*, size_t* count, size_t* width, int* spans) {
-  *count = 2; *width = 1; *spans = 1; return 0;
+  *count = 3; *width = 1; *spans = 1; return 0;
 }
 }
 ''' + entry_points + r'''
 int peer_wait_abortable() { return cudaGetLastError(); }
 int main() {
   void* stream = reinterpret_cast<void*>(0x3000);
+  // A rejected recording must never reach instantiate, even under the census.
+  for (bool with_census : {false, true}) for (size_t count : {0u, 1u, 2u}) {
+    census = with_census;
+    graph_nodes = count;
+    for (int wrapper : {0, 1, 2}) {
+      assert(cuteafd_cuda_graph_begin_capture(stream) == CUTEAFD_STATUS_OK);
+      void* exec = nullptr; size_t nodes = 99, width = 99; int spans = 99;
+      cuteafd_cuda_graph_capture_info_t info{};
+      const int before = instantiate_calls;
+      const auto status = wrapper == 0 ? cuteafd_cuda_graph_end_capture(stream, &exec)
+        : wrapper == 1 ? cuteafd_cuda_graph_end_capture_topology(stream, &exec, &nodes, &width, &spans)
+        : cuteafd_cuda_graph_end_capture_retained(stream, &info);
+      assert(status == CUTEAFD_STATUS_GRAPH_TOO_SMALL && instantiate_calls == before);
+      assert(!active && live_graphs == 0 && live_execs == 0 && exec == nullptr);
+      if (wrapper == 1) assert(nodes == count && width == 0 && spans == 0);
+      if (wrapper == 2) assert(info.node_count == count && !info.graph && !info.graph_exec);
+      assert(peer_wait_abortable() == 0);
+    }
+    assert(cuteafd_cuda_graph_begin_capture(stream) == CUTEAFD_STATUS_OK);
+    void* exec = nullptr;
+    const int before = instantiate_calls;
+    assert(cuteafd_cuda_graph_end_capture_for_test(stream, &exec) == CUTEAFD_STATUS_OK);
+    assert(instantiate_calls == before + 1 && live_graphs == 0 && live_execs == 1);
+    assert(cudaGraphExecDestroy(exec) == 0 && peer_wait_abortable() == 0);
+  }
+  graph_nodes = 3;
   for (bool with_census : {false, true}) {
     census = with_census;
     // Both ranks share this host thread's last-error slot. A valid eager wait
@@ -212,7 +243,7 @@ int main() {
           assert(message == "cudaGraphInstantiate failed; lower GPU_MEMORY_CAP or increase GPU_RESERVE to leave graph headroom: 2" && exec == nullptr);
           ++cancelled[rank]; ++eager[rank];
         } else {
-          assert(nodes == 2 && width == 1 && spans == 1);
+          assert(nodes == 3 && width == 1 && spans == 1);
           ++captures[rank]; assert(cudaGraphExecDestroy(exec) == 0);
         }
         assert(peer_wait_abortable() == 0 && live_execs == 0);
