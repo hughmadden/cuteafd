@@ -219,8 +219,10 @@ impl<'a> TokenEmbedding<'a> {
             ensure!(std::ptr::eq(owner.device.library, library), "embedding allocation library mismatch");
             ResidentWeight::Device(DeviceAllocation::from_allocation(owner))
         };
-        let policy = crate::shared::experts::rtx::push::PushPolicy::for_snapshot(
-            source.snapshot.as_deref().unwrap_or_else(|| source.path.parent().expect("embedding shard parent")))?;
+        let policy = if placement == EmbedPlacement::Host {
+            Some(crate::shared::experts::rtx::push::PushPolicy::for_snapshot(
+                source.snapshot.as_deref().unwrap_or_else(|| source.path.parent().expect("embedding shard parent")))?)
+        } else { None };
         let device = library.cuda_get_device()?;
         let host_operand = match &mut table {
             ResidentWeight::Host { storage, .. } => Some(host_table(device, &source, storage)),
@@ -235,7 +237,7 @@ impl<'a> TokenEmbedding<'a> {
         let record = crate::shared::experts::rtx::dense::is_recording();
         let result = if record {
             match &mut table {
-                ResidentWeight::Host { .. } => crate::shared::experts::rtx::dense::host_operand(host_operand.clone().expect("host operand"), policy)?,
+                ResidentWeight::Host { .. } => crate::shared::experts::rtx::dense::host_operand(host_operand.clone().expect("host operand"), policy.expect("host policy"))?,
                 ResidentWeight::Device(_) => fill_table(library, device, &source, address)?,
             }
             during()
@@ -244,7 +246,7 @@ impl<'a> TokenEmbedding<'a> {
             let filler = match &mut table {
                 ResidentWeight::Host { .. } => {
                     let operand = host_operand.clone().expect("host operand");
-                    scope.spawn(move || timing.enter(|| crate::shared::experts::rtx::dense::host_operand(operand, policy)))
+                    scope.spawn(move || timing.enter(|| crate::shared::experts::rtx::dense::host_operand(operand, policy.expect("host policy"))))
                 }
                 ResidentWeight::Device(_) => {
                     let source = &source;
@@ -1302,6 +1304,25 @@ mod tests {
         for device in [0, 1] { check_selector_device(device, device).unwrap(); }
         let error = check_selector_device(0, 1).unwrap_err().to_string();
         assert!(error.contains("output operand on device 0") && error.contains("logits stream on device 1"), "{error}");
+    }
+
+    #[test]
+    fn gpu_embedding_recording_does_not_probe_snapshot_push_policy() -> Result<()> {
+        use cuteafd_ffi::native_library_lifetime_fixture::Fixture;
+        let fixture = Fixture::build_for_tests()?;
+        let library = fixture.load()?;
+        fixture.configure_memory(&library, 0, 1 << 30)?;
+        let path = fixture.directory().join("gpu-embedding.bin");
+        std::fs::write(&path, [])?;
+        let source = EmbedSource { path, offset: 0, vocab: 5, hidden: 3,
+            snapshot: Some(fixture.directory().join("missing-snapshot")),
+            tensor_name: "model.embed_tokens.weight".into() };
+        let ((embedding, ()), records) = crate::shared::experts::rtx::dense::recording(||
+            TokenEmbedding::load(&library, source, EmbedPlacement::Gpu, || Ok(())))?;
+        assert_eq!(records.operands.len(), 1);
+        assert!(records.host_operands.is_empty());
+        assert_eq!(embedding.device_bytes(), 30);
+        Ok(())
     }
 
     #[test]
