@@ -117,7 +117,11 @@ capture, or a failed capture whose target and all draft capture streams drained
 successfully, abandons the remaining points and restarts the full prompt uncached.
 If completion cannot be established on either side, the request fails fatally:
 its lease, source storage, draft slots and capture storage remain quarantined
-for shutdown, with no cold restart or recycling. Image prompts prepare all missing image features before staging,
+for shutdown, with no cold restart or recycling. Queued captures reserve their
+source owners before enqueue and drain their own target and draft capture lanes
+on failure; ordinary-stream completion alone cannot release them. Fatal capture
+errors stop the current prefill round and turn retirement before further serving
+or admission. Image prompts prepare all missing image features before staging,
 including cached images needed by that fallback, and move them across re-admission.
 Cancellation between stages releases the request through the ordinary queue path
 after the synchronous copies have drained. A failed drain follows the fatal
