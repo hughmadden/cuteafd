@@ -117,6 +117,8 @@ struct Fake {
     fail_drain_once: Cell<bool>,
     drain_after_restore: Cell<bool>,
     fail_mark_segments_once: Cell<bool>,
+    /// Fail one replica copy, optionally also its cleanup drain.
+    fail_replicas: Cell<Option<bool>>,
     record_format: Cell<&'static str>,
     drains: Cell<usize>,
     rule: ReuseRule,
@@ -139,7 +141,7 @@ impl Fake {
     fn new(pages: usize, rings: usize, slots: usize) -> Self {
         let bytes = (pages * ROWS + rings * RING + slots * WINDOW) * ROW;
         let mem = Rc::new(RefCell::new(StubCopyEngine::new(CopyModel::default(), bytes, 1 << 26)));
-        Self { mem, pages, rings, slots, writable_lag: 0, queue: RefCell::new(Vec::new()), fail_restore: Cell::new(false), fail_restore_once: Cell::new(false), fail_copy: Cell::new(false), fail_drain: Cell::new(false), fail_drain_once: Cell::new(false), drain_after_restore: Cell::new(false), fail_mark_segments_once: Cell::new(false), record_format: Cell::new("opaque_v1"), drains: Cell::new(0),
+        Self { mem, pages, rings, slots, writable_lag: 0, queue: RefCell::new(Vec::new()), fail_restore: Cell::new(false), fail_restore_once: Cell::new(false), fail_copy: Cell::new(false), fail_drain: Cell::new(false), fail_drain_once: Cell::new(false), drain_after_restore: Cell::new(false), fail_mark_segments_once: Cell::new(false), fail_replicas: Cell::new(None), record_format: Cell::new("opaque_v1"), drains: Cell::new(0),
             rule: ReuseRule::EXACT, markless: false, pooled: false, reserved: 0, draft: RefCell::new(None) }
     }
     /// Marks in pool pages: no arena slot exists (any use of one panics). `pages` pages hand
@@ -393,6 +395,20 @@ impl PrefixFamily for Fake {
     }
     fn mark_segments(&self, slot: MarkSlot) -> Vec<DeviceRange> {
         vec![DeviceRange { addr: self.slot_row(slot, 0).addr, bytes: WINDOW * ROW }]
+    }
+    fn page_replicas(&self, page: u32) -> Vec<(DeviceRange, DeviceRange)> {
+        if self.fail_replicas.get().is_some() {
+            let row = self.page_row(page, 0);
+            vec![(row, row)]
+        } else { Vec::new() }
+    }
+    fn copy_replicas(&self, copies: &[(DeviceRange, DeviceRange)]) -> Result<(), BoxError> {
+        for &(from, to) in copies { self.queue.borrow_mut().push(Op::Copy(from, to)); }
+        if let Some(fail_drain) = self.fail_replicas.take() {
+            self.fail_drain_once.set(fail_drain);
+            return Err("injected replica failure after enqueue".into());
+        }
+        Ok(())
     }
     fn host_tail(&self) -> Vec<DeviceRange> {
         if self.markless { vec![DeviceRange { addr: self.slot_row(MarkSlot(0), 0).addr, bytes: 1 }] } else { Vec::new() }

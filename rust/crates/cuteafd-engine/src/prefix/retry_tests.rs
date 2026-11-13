@@ -224,3 +224,41 @@ fn same_frontier_host_promotion_retires_device_owner_and_deferred_store() {
         assert_eq!((cache.pool().free(), cache.arena().in_use()), (64, 0));
     }
 }
+
+#[test]
+fn host_replica_failure_retries_only_after_successful_cleanup() {
+    for cleanup_fails in [false, true] {
+        let fake = Fake::new(64, 2, 8);
+        let mut cache = cache(&fake, 8, 1 << 20);
+        for len in [8, 12] {
+            let (_, _, p) = serve(&mut cache, &fake, 0, &seq(100, len), &[], len);
+            cache.release(&fake, &p.pages).unwrap();
+            fake.mem.borrow_mut().advance(10_000_000);
+            cache.tick();
+        }
+        cache.clear(&fake).unwrap();
+        fake.fail_replicas.set(Some(cleanup_fails));
+        let builds = Cell::new(0);
+        let admitted = cache.admit(&fake, &seq(100, 15), 16, false, |pages| {
+            builds.set(builds.get() + 1);
+            Placement { pages, ring: 1, len: 0, ring_from: 0 }
+        });
+        if cleanup_fails {
+            assert!(admitted.is_err());
+            assert_eq!(builds.get(), 0);
+            assert_eq!((cache.stats().quarantined, cache.arena().in_use()), (1, 1));
+            assert_eq!(cache.pool().free(), 61, "failed promotion's three pages remain owned");
+        } else {
+            let mut admitted = admitted.unwrap();
+            assert_eq!(admitted.resume, 8);
+            assert_eq!(builds.get(), 1);
+            fake.forward(&mut admitted.placement, &seq(100, 15)).unwrap();
+            cache.release(&fake, &admitted.placement.pages).unwrap();
+            assert_eq!(cache.stats().quarantined, 0);
+        }
+        assert_eq!((cache.stats().mark_restore_misses, cache.stats().restore_failures,
+            cache.stats().fork_no_room), (1, 1, 0));
+        cache.clear(&fake).unwrap();
+        assert_eq!((cache.pool().free(), cache.arena().in_use()), (64, 0));
+    }
+}
