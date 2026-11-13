@@ -171,3 +171,56 @@ fn failed_host_promotion_compares_host_ancestor_after_pending_device_publication
     cache.clear(&family).unwrap();
     assert_eq!((cache.pool().free(), cache.arena().in_use()), (96, 0));
 }
+
+#[test]
+fn same_frontier_host_promotion_retires_device_owner_and_deferred_store() {
+    use cuteafd_hostcache::config::StoreMode;
+    for evict_other_first in [false, true] {
+        let fake = Fake::new(64, 2, 8);
+        let host = HostConfig { bytes: 1 << 20, chunk_bytes: 1 << 16, min_tokens: 1,
+            store: StoreMode::OnEvict, ..HostConfig::default() };
+        let mut cache = PrefixCache::new(fake.layout(), config(2, 8), Some((host, Shared(fake.mem.clone())))).unwrap();
+        let saved = seq(100, 8);
+        let other = seq(900, 8);
+        let (_, _, p) = serve(&mut cache, &fake, 0, &saved, &[], 8);
+        cache.release(&fake, &p.pages).unwrap();
+        cache.clear(&fake).unwrap(); // older host snapshot at the same kind/frontier
+        for tokens in [&saved, &other] {
+            let mut p = cache.admit_cold(&fake, 8, 8,
+                |pages| Placement { pages, ring: 0, len: 0, ring_from: 0 }).unwrap().placement;
+            let logits = fake.forward(&mut p, tokens).unwrap();
+            cache.capture(&fake, SnapshotKind::Prompt, tokens, &p, After::from_logits(&logits, true)).unwrap();
+            cache.release(&fake, &p.pages).unwrap();
+        }
+        fake.fail_restore_once.set(true);
+        let admitted = cache.admit(&fake, &saved, 8, false,
+            |pages| Placement { pages, ring: 1, len: 0, ring_from: 0 }).unwrap();
+        assert_eq!(admitted.resume, 8);
+        assert!(admitted.source.unwrap().host);
+        cache.release(&fake, &admitted.placement.pages).unwrap();
+        let stats = cache.stats();
+        assert_eq!((stats.promotions, stats.entries_prompt, stats.evictions), (1, 2, 2));
+        assert_eq!(stats.host.unwrap().stores_completed, 2, "retirement completes and replaces the selected host key");
+        assert_eq!(stats.pages_retained, 4, "exactly two owners, with no hidden old fork");
+        assert_eq!(64 - cache.pool().free(), 4);
+        // Select which owner becomes oldest, then insert a third key into the two-entry bank.
+        if !evict_other_first {
+            let admitted = cache.admit(&fake, &other, 8, false,
+                |pages| Placement { pages, ring: 1, len: 0, ring_from: 0 }).unwrap();
+            cache.release(&fake, &admitted.placement.pages).unwrap();
+        }
+        let (_, _, p) = serve(&mut cache, &fake, 0, &seq(500, 8), &[], 8);
+        cache.release(&fake, &p.pages).unwrap();
+        let survivor = if evict_other_first { &saved } else { &other };
+        assert_eq!(cache.peek(survivor, false), 8);
+        let admitted = cache.admit(&fake, survivor, 8, false,
+            |pages| Placement { pages, ring: 1, len: 0, ring_from: 0 }).unwrap();
+        assert_eq!(admitted.resume, 8);
+        assert_eq!(cache.stats().promotions, 1, "the survivor remains device-indexed; no second full promotion");
+        cache.release(&fake, &admitted.placement.pages).unwrap();
+        assert_eq!(cache.stats().entries_prompt, 2);
+        assert_eq!(64 - cache.pool().free(), 4);
+        cache.clear(&fake).unwrap();
+        assert_eq!((cache.pool().free(), cache.arena().in_use()), (64, 0));
+    }
+}

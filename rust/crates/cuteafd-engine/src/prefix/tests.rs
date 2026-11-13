@@ -111,6 +111,7 @@ struct Fake {
     queue: RefCell<Vec<Op>>,
     writable_lag: usize,
     fail_restore: Cell<bool>,
+    fail_restore_once: Cell<bool>,
     fail_copy: Cell<bool>,
     fail_drain: Cell<bool>,
     fail_drain_once: Cell<bool>,
@@ -138,7 +139,7 @@ impl Fake {
     fn new(pages: usize, rings: usize, slots: usize) -> Self {
         let bytes = (pages * ROWS + rings * RING + slots * WINDOW) * ROW;
         let mem = Rc::new(RefCell::new(StubCopyEngine::new(CopyModel::default(), bytes, 1 << 26)));
-        Self { mem, pages, rings, slots, writable_lag: 0, queue: RefCell::new(Vec::new()), fail_restore: Cell::new(false), fail_copy: Cell::new(false), fail_drain: Cell::new(false), fail_drain_once: Cell::new(false), drain_after_restore: Cell::new(false), fail_mark_segments_once: Cell::new(false), record_format: Cell::new("opaque_v1"), drains: Cell::new(0),
+        Self { mem, pages, rings, slots, writable_lag: 0, queue: RefCell::new(Vec::new()), fail_restore: Cell::new(false), fail_restore_once: Cell::new(false), fail_copy: Cell::new(false), fail_drain: Cell::new(false), fail_drain_once: Cell::new(false), drain_after_restore: Cell::new(false), fail_mark_segments_once: Cell::new(false), record_format: Cell::new("opaque_v1"), drains: Cell::new(0),
             rule: ReuseRule::EXACT, markless: false, pooled: false, reserved: 0, draft: RefCell::new(None) }
     }
     /// Marks in pool pages: no arena slot exists (any use of one panics). `pages` pages hand
@@ -343,7 +344,7 @@ impl PrefixFamily for Fake {
     fn restore_pages(&self, pages: &[u32], p: &mut Placement, len: usize) -> Result<(), BoxError> {
         assert!(self.pooled, "pool-page restore of an arena family");
         if self.drain_after_restore.replace(false) { self.fail_drain_once.set(true); }
-        if self.fail_restore.get() {
+        if self.fail_restore_once.replace(false) || self.fail_restore.get() {
             return Err("injected restore failure".into());
         }
         for (i, r) in (len.saturating_sub(WINDOW)..len).enumerate() {
@@ -358,7 +359,7 @@ impl PrefixFamily for Fake {
     }
     fn restore(&self, mark: Option<MarkSlot>, p: &mut Placement, len: usize) -> Result<(), BoxError> {
         if self.drain_after_restore.replace(false) { self.fail_drain_once.set(true); }
-        if self.fail_restore.get() {
+        if self.fail_restore_once.replace(false) || self.fail_restore.get() {
             return Err("injected restore failure".into());
         }
         let Some(slot) = mark else {

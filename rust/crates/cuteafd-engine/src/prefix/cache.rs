@@ -1551,7 +1551,11 @@ impl<E: CopyEngine, M: Clone + Default> PrefixCache<E, M> {
             }
         }
         let entry = self.entries.remove(&id).expect("checked before release barrier");
-        self.retained.bank_mut(entry.kind).remove_exact(&entry.tokens);
+        let bank = self.retained.bank_mut(entry.kind);
+        if bank.peek_reusable(&entry.tokens).is_some_and(|(_, frontier, &owner)|
+            frontier == entry.len() && owner == id) {
+            bank.remove_exact(&entry.tokens);
+        }
         self.stats.evictions += 1;
         self.release(family, &entry.pages)?;
         self.release_draft(family, entry.draft.as_ref())?;
@@ -1713,6 +1717,18 @@ impl<E: CopyEngine, M: Clone + Default> PrefixCache<E, M> {
             return Ok(None);
         }
         self.reap_marks(family)?;
+        // A rejected device restore may still own this exact radix key. Retire
+        // it before allocating the promoted owner, just as capture publication does.
+        let old = self.entries.iter().find_map(|(&id, entry)|
+            (entry.kind == hit.kind && entry.tokens == snapshot_tokens).then_some(id));
+        if let Some(old) = old {
+            self.evict(family, old)?;
+            // Finishing a deferred store can replace the selected host key. Let
+            // admission select its replacement with fresh payload and mark metadata.
+            if self.host.as_ref().is_none_or(|host| host.payload(hit.key).is_none()) {
+                return Ok(None);
+            }
+        }
         let slot = if self.arena_marks() {
             loop {
                 match self.arena.take() {
