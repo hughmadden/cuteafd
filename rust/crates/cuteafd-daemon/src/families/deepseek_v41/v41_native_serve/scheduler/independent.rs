@@ -739,6 +739,7 @@ mod tests {
         let result = runtime.block_on(retire_completed(&RefCell::new(active.as_mut_slice()), [0, 1], 0, 1, |request| {
             calls += 1;
             let error = cuteafd_engine::prefix::PrefixError::CaptureUndrained {
+                ticket: None,
                 capture: "injected queued retention".into(), source: "draft lane pending".into(),
             };
             std::future::ready((request, Err(error.into())))
@@ -759,6 +760,7 @@ mod tests {
                 completed.set(completed.get() + 1);
                 if lane == fatal_lane {
                     Err(cuteafd_engine::prefix::PrefixError::CaptureUndrained {
+                        ticket: None,
                         capture: "injected lane capture".into(), source: "capture lane pending".into(),
                     }.into())
                 } else { Err(anyhow::anyhow!("ordinary peer round error")) }

@@ -48,9 +48,12 @@ pub enum PrefixError {
         #[source]
         source: BoxError,
     },
-    /// Capture storage is quarantined; the caller must retain its source placement too.
+    /// Capture storage is quarantined; retain the queued owner's source placement
+    /// (or the caller's placement when no ticket was returned).
     #[error("capture failed ({capture}); completion could not be established: {source}")]
     CaptureUndrained {
+        /// The queued owner, which may differ from the caller waiting for mark storage.
+        ticket: Option<CaptureTicket>,
         capture: String,
         #[source]
         source: BoxError,
@@ -850,7 +853,7 @@ impl<E: CopyEngine, M: Clone + Default> PrefixCache<E, M> {
             Err(cleanup) => {
                 self.quarantine.push(Quarantined { _pages: entry.pages, _mark: entry.mark, _draft: entry.draft });
                 self.stats.quarantined += 1;
-                PrefixError::CaptureUndrained { capture: source.to_string(), source: Box::new(cleanup) }
+                PrefixError::CaptureUndrained { ticket: None, capture: source.to_string(), source: Box::new(cleanup) }
             }
         }
     }
@@ -859,7 +862,7 @@ impl<E: CopyEngine, M: Clone + Default> PrefixCache<E, M> {
     /// dropped because its bank no longer wants it), `Ok(false)` while copies are in flight.
     pub fn poll_capture<F: PrefixFamily<M>>(&mut self, family: &F, ticket: CaptureTicket) -> Result<bool, PrefixError> {
         if self.undrained_captures.contains(&ticket) {
-            return Err(PrefixError::CaptureUndrained { capture: "queued capture remains quarantined".into(),
+            return Err(PrefixError::CaptureUndrained { ticket: Some(ticket), capture: "queued capture remains quarantined".into(),
                 source: "capture lane completion was not established".into() });
         }
         if let Some(index) = self.completed_captures.iter().position(|&t| t == ticket) {
@@ -892,7 +895,7 @@ impl<E: CopyEngine, M: Clone + Default> PrefixCache<E, M> {
     /// copies drained, and is quarantined (never handed out again) otherwise.
     pub fn abort_capture<F: PrefixFamily<M>>(&mut self, family: &F, ticket: CaptureTicket) -> Result<(), PrefixError> {
         if self.undrained_captures.contains(&ticket) {
-            return Err(PrefixError::CaptureUndrained { capture: "queued capture remains quarantined".into(),
+            return Err(PrefixError::CaptureUndrained { ticket: Some(ticket), capture: "queued capture remains quarantined".into(),
                 source: "capture lane completion was not established".into() });
         }
         self.completed_captures.retain(|&done| done != ticket);
@@ -907,12 +910,16 @@ impl<E: CopyEngine, M: Clone + Default> PrefixCache<E, M> {
             }
             Err(error) => {
                 tracing::error!(target: "cuteafd::prefix", %error, "queued capture did not drain; quarantining its storage");
-                self.quarantine.push(Quarantined { _pages: entry.pages, _mark: entry.mark, _draft: entry.draft });
-                self.stats.quarantined += 1;
-                self.undrained_captures.push(ticket);
-                Err(PrefixError::CaptureUndrained { capture: "queued capture abort".into(), source: error })
+                Err(self.quarantine_capture(ticket, entry, "queued capture abort", error))
             }
         }
+    }
+
+    fn quarantine_capture(&mut self, ticket: CaptureTicket, entry: Entry<M>, capture: &str, source: BoxError) -> PrefixError {
+        self.quarantine.push(Quarantined { _pages: entry.pages, _mark: entry.mark, _draft: entry.draft });
+        self.stats.quarantined += 1;
+        self.undrained_captures.push(ticket);
+        PrefixError::CaptureUndrained { ticket: Some(ticket), capture: capture.into(), source }
     }
 
     /// Validate a capture and take its storage: bank room, a mark, the forked pages (the tail
@@ -1270,7 +1277,12 @@ impl<E: CopyEngine, M: Clone + Default> PrefixCache<E, M> {
             } else if !self.pending.is_empty() {
                 waited = true;
                 let ticket = self.pending[0].ticket;
-                family.wait_capture(ticket).map_err(|source| PrefixError::Family { what: "capture wait", source })?;
+                if let Err(source) = family.wait_capture(ticket) {
+                    // The failed lane belongs to this pending ticket, not the request
+                    // asking for a new mark. Do not retry or downgrade its completion.
+                    let PendingCapture { entry, .. } = self.pending.remove(0);
+                    return Err(self.quarantine_capture(ticket, entry, "queued capture wait", source));
+                }
                 let PendingCapture { kind, entry, .. } = self.pending.remove(0);
                 if let Some(old) = self.retained.bank_mut(kind).remove_exact(&entry.tokens) { self.evict(family, old)?; }
                 self.publish(family, kind, entry)?;

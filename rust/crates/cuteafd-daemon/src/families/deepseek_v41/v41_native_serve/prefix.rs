@@ -204,21 +204,24 @@ impl<'r, 'a, 'w, C: DraftChain<'a>> V41Prefix<'r, 'a, 'w, C> {
         self
     }
     fn capture_result<T>(&self, result: std::result::Result<T, cuteafd_engine::prefix::PrefixError>,
-        lease: CacheLease, draft_id: Option<u64>) -> Result<T> {
+        lease: CacheLease, draft_id: Option<u64>, pending: &mut [Option<PendingRetain>; 2]) -> Result<T> {
         use cuteafd_engine::prefix::PrefixError;
         let result = match result {
             Err(error @ PrefixError::CaptureUndrained { .. }) => Err(error),
             Err(error) => match self.drain_failed_capture() {
                 Ok(()) => Err(error),
-                Err(source) => Err(PrefixError::CaptureUndrained { capture: error.to_string(), source }),
+                Err(source) => Err(PrefixError::CaptureUndrained { ticket: None, capture: error.to_string(), source }),
             },
             done => done,
         };
-        if matches!(&result, Err(PrefixError::CaptureUndrained { .. })) {
+        if let Some((lease, draft_id)) = result.as_ref().err()
+            .and_then(|error| undrained_owner(error, pending, lease, draft_id)) {
             self.requests.borrow_mut().quarantine_capture(lease);
             if let (Some(id), Some(draft)) = (draft_id, self.draft.borrow_mut().as_deref_mut()) {
                 draft.quarantine_capture(id);
             }
+        }
+        if matches!(&result, Err(PrefixError::CaptureUndrained { .. })) {
             // Failed native completion cannot authorize allocator reuse during shutdown.
             if !self.arena.quarantined.replace(true) {
                 for owner in self.arena.owners() { std::mem::forget(owner); }
@@ -426,11 +429,27 @@ impl PendingRetain {
     fn check(&self) -> Result<()> {
         if self.undrained {
             return Err(cuteafd_engine::prefix::PrefixError::CaptureUndrained {
+                ticket: Some(self.ticket),
                 capture: "queued retention remains quarantined".into(),
                 source: "capture lane completion was not established".into(),
             }.into());
         }
         Ok(())
+    }
+}
+
+/// Resolve fatal queued ownership before quarantining native sources. A pressure
+/// waiter has not started its own capture and must never stand in for this owner.
+fn undrained_owner(error: &cuteafd_engine::prefix::PrefixError, pending: &mut [Option<PendingRetain>; 2],
+    lease: CacheLease, draft_id: Option<u64>) -> Option<(CacheLease, Option<u64>)> {
+    match error {
+        cuteafd_engine::prefix::PrefixError::CaptureUndrained { ticket: Some(ticket), .. } => {
+            let owner = pending.iter_mut().flatten().find(|owner| owner.ticket == *ticket)?;
+            owner.undrained = true;
+            Some((owner.lease, owner.draft_id))
+        }
+        cuteafd_engine::prefix::PrefixError::CaptureUndrained { ticket: None, .. } => Some((lease, draft_id)),
+        _ => None,
     }
 }
 
@@ -580,7 +599,7 @@ impl<'a> V41Cache<'a> {
         let after = After::from_logits(&next.logits()?, true);
         let family = V41Prefix::new(requests, draft, &self.arenas);
         let result = self.cache.capture_media_entry(&family, kind, &keys[..end], media, &placement, after);
-        family.capture_result(result, lease, draft_id)
+        family.capture_result(result, lease, draft_id, &mut self.pending)
     }
     /// [`V41Cache::retain`] with its copies queued on capture lane `lane`; poll it with
     /// [`V41Cache::poll_retain`]. `Ok(false)` when nothing was queued.
@@ -598,7 +617,7 @@ impl<'a> V41Cache<'a> {
         let family = V41Prefix::new(requests, draft, &self.arenas);
         family.on_lane(lane);
         let result = self.cache.queue_capture(&family, kind, &keys[..end], media, &placement, after);
-        match family.capture_result(result, lease, draft_id)? {
+        match family.capture_result(result, lease, draft_id, &mut self.pending)? {
             Captured::Queued(ticket) => {
                 self.pending[lane] = Some(PendingRetain { ticket, lease, draft_id, undrained: false });
                 Ok(true)
@@ -612,7 +631,7 @@ impl<'a> V41Cache<'a> {
         pending.check()?;
         let family = V41Prefix::new(requests, draft, &self.arenas);
         let result = self.cache.poll_capture(&family, pending.ticket);
-        let result = family.capture_result(result, pending.lease, pending.draft_id);
+        let result = family.capture_result(result, pending.lease, pending.draft_id, &mut self.pending);
         if result.as_ref().err().is_some_and(capture_undrained) {
             self.pending[lane].as_mut().unwrap().undrained = true;
         }
@@ -625,7 +644,7 @@ impl<'a> V41Cache<'a> {
         pending.check()?;
         let family = V41Prefix::new(requests, draft, &self.arenas);
         let result = self.cache.abort_capture(&family, pending.ticket);
-        let result = family.capture_result(result, pending.lease, pending.draft_id);
+        let result = family.capture_result(result, pending.lease, pending.draft_id, &mut self.pending);
         if result.as_ref().err().is_some_and(capture_undrained) {
             self.pending[lane].as_mut().unwrap().undrained = true;
         }
@@ -671,6 +690,32 @@ mod tests {
     use super::*;
 
     use cuteafd_engine::prefix::{RestoreCandidate, RestoreFidelity};
+
+    #[test]
+    fn pressure_wait_fatal_marks_the_owning_retention_instead_of_the_waiter() {
+        let owner = CacheLease::unbound_for_test(0);
+        let waiter = CacheLease::unbound_for_test(1);
+        let ticket = CaptureTicket(0);
+        let mut pending = [Some(PendingRetain { ticket, lease: owner, draft_id: Some(41), undrained: false }), None];
+        let error = cuteafd_engine::prefix::PrefixError::CaptureUndrained {
+            ticket: Some(ticket), capture: "queued capture wait".into(), source: "target or draft lane pending".into(),
+        };
+        let quarantined = undrained_owner(&error, &mut pending, waiter, Some(42)).unwrap();
+        assert_eq!(quarantined, (owner, Some(41)), "native quarantine receives A, never waiting B");
+        assert!(capture_undrained(&anyhow::Error::new(error)));
+        let sticky = pending[0].unwrap().check().unwrap_err();
+        assert!(capture_undrained(&sticky));
+        assert!(matches!(sticky.downcast_ref::<cuteafd_engine::prefix::PrefixError>(),
+            Some(cuteafd_engine::prefix::PrefixError::CaptureUndrained { ticket: Some(t), .. }) if *t == ticket));
+        assert!(pending[1].is_none());
+        let ordinary = cuteafd_engine::prefix::PrefixError::Family { what: "capture", source: "safely drained".into() };
+        assert!(undrained_owner(&ordinary, &mut pending, waiter, Some(42)).is_none());
+        // Even an unknown queued ticket must never be reassigned to the waiter.
+        let unknown = cuteafd_engine::prefix::PrefixError::CaptureUndrained {
+            ticket: Some(CaptureTicket(9)), capture: "unknown owner".into(), source: "pending".into(),
+        };
+        assert!(undrained_owner(&unknown, &mut pending, waiter, Some(42)).is_none());
+    }
 
     #[test]
     fn capture_cleanup_attempts_both_streams_and_requires_both_completions() {

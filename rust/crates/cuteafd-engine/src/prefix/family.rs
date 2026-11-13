@@ -370,6 +370,8 @@ pub trait PrefixFamily<M: Clone + Default = ()> {
     }
     /// Wait for queued copies under staging-ring pressure, preserving their captured bytes.
     /// The default drain-and-forget operation is also used by cancellation.
+    /// Failure leaves completion unproven: retain source reservations. The cache
+    /// quarantines this ticket's destinations and reports its owning ticket as fatal.
     fn wait_capture(&self, ticket: CaptureTicket) -> Result<(), BoxError> {
         self.abort_capture(ticket)
     }

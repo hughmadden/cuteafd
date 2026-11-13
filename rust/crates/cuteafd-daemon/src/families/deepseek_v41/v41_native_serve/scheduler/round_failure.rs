@@ -344,6 +344,7 @@ pub(super) mod tests {
                 self.calls += 1;
                 let error = if self.fatal {
                     cuteafd_engine::prefix::PrefixError::CaptureUndrained {
+                        ticket: None,
                         capture: "injected turn capture".into(), source: "lane pending".into(),
                     }.into()
                 } else { anyhow::anyhow!("safely drained turn capture failed") };

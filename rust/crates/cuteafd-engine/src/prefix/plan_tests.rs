@@ -103,7 +103,8 @@ impl PrefixFamily<LagMeta> for Lagged {
         if self.fail_poll.get() { return Err("injected lane query failure".into()); }
         Ok(!self.queued.borrow().iter().any(|&(t, ..)| t == ticket))
     }
-    fn wait_capture(&self, _: CaptureTicket) -> Result<(), BoxError> {
+    fn wait_capture(&self, ticket: CaptureTicket) -> Result<(), BoxError> {
+        if self.lane_failures.get().is_some() { return self.abort_capture(ticket); }
         if self.stuck.get() { return Err("queued copies did not drain".into()); }
         self.land();
         Ok(())
@@ -484,6 +485,59 @@ fn queued_capture_failures_drain_actual_lanes_or_keep_quarantined_owners() {
                 cache.abort_capture(&family, CaptureTicket(0)).unwrap();
                 assert_eq!(cache.arena().free(), marks, "safe abort returns its mark exactly once");
             }
+        }
+    }
+}
+
+#[test]
+fn mark_pressure_wait_quarantines_the_queued_owner_and_safe_wait_proceeds() {
+    for failures in [[false, false], [true, false], [false, true], [true, true]] {
+        let family = Lagged::new(64, 2, 1);
+        let mut cache = lag_cache(&family, 4, 1 << 20);
+        let first = seq(100, 13);
+        let second = seq(500, 13);
+        let mut placements = Vec::new();
+        for (ring, tokens) in [&first, &second].into_iter().enumerate() {
+            let mut p = cache.admit_cold(&family, tokens.len(), 16,
+                |pages| Placement { pages, ring, len: 0, ring_from: 0 }).unwrap().placement;
+            family.fake.forward(&mut p, tokens).unwrap();
+            placements.push(p);
+        }
+        family.lane_failures.set(Some(failures));
+        let Captured::Queued(owner) = cache.queue_capture(&family, SnapshotKind::Turn, &first, &[],
+            &placements[0], After::default()).unwrap() else { panic!("owner queued") };
+        let free = cache.pool().free();
+        // Ordinary streams complete successfully; only the queued owner's actual
+        // lanes determine whether waiting for the sole mark can proceed.
+        family.drain().unwrap();
+        let outcome = cache.queue_capture(&family, SnapshotKind::Turn, &second, &[], &placements[1], After::default());
+        if failures.into_iter().any(|fail| fail) {
+            assert!(matches!(outcome, Err(PrefixError::CaptureUndrained { ticket: Some(ticket), .. }) if ticket == owner));
+            assert_eq!(family.next.get(), 1, "the waiting request never starts a capture");
+            assert_eq!((cache.pool().free(), cache.arena().free(), cache.stats().quarantined), (free, 0, 1));
+            assert_eq!(cache.pool().refs(placements[0].pages[0]), 2, "owner source retained");
+            assert_eq!(cache.pool().refs(placements[1].pages[0]), 1, "waiter is not the capture owner");
+            assert_eq!(cache.stats().captures_turn, 0, "no failed mark published");
+            for lane in 0..2 {
+                assert_eq!(family.lane_owned[lane].get(), failures[lane]);
+                assert_eq!(family.lane_drains[lane].get(), 1);
+            }
+            for repeated in [cache.poll_capture(&family, owner).map(|_| ()), cache.abort_capture(&family, owner)] {
+                assert!(matches!(repeated, Err(PrefixError::CaptureUndrained { ticket: Some(ticket), .. }) if ticket == owner));
+            }
+            assert_eq!(cache.stats().quarantined, 1, "sticky failure does not quarantine twice");
+            assert!(family.lane_drains.iter().all(|count| count.get() == 1), "no cleanup retry hides the fatal");
+            family.lane_failures.set(Some([false, false]));
+            family.abort_capture(owner).unwrap(); // explicit abstract shutdown completion
+            assert!(family.lane_owned.iter().all(|owner| !owner.get()));
+            assert_eq!(cache.arena().free(), 0, "quarantined mark never returns to serving");
+        } else {
+            let Captured::Queued(waiter) = outcome.unwrap() else { panic!("safe wait permits the next capture") };
+            assert!(cache.poll_capture(&family, owner).unwrap(), "pressure wait completed the owner");
+            cache.abort_capture(&family, waiter).unwrap();
+            for p in &placements { cache.release(&family, &p.pages).unwrap(); }
+            cache.clear(&family).unwrap();
+            assert_eq!((cache.pool().free(), cache.arena().free()), (64, 1));
         }
     }
 }

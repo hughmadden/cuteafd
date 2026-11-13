@@ -123,6 +123,7 @@ mod tests {
         fn run(&mut self, request: &mut Prompt, cursor: &mut Cursor) -> Result<Option<usize>> {
             if self.fatal_on == Some(request.id) {
                 return Err(cuteafd_engine::prefix::PrefixError::CaptureUndrained {
+                    ticket: None,
                     capture: "injected capture failure".into(), source: "capture lane pending".into(),
                 }.into());
             }
@@ -293,6 +294,7 @@ mod tests {
                     );
                     if let Err(source) = drained {
                         return Err(cuteafd_engine::prefix::PrefixError::CaptureUndrained {
+                            ticket: None,
                             capture: "injected queued copy failure".into(), source }.into());
                     }
                 }
