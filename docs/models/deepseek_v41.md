@@ -103,7 +103,8 @@ Each point ends a complete prefill stage: encoder units and their lookahead
 stop at B, then the normal final decoder replay commits the complete frontier.
 Synchronous retention captures an ordinary full target/dSpark mark. The drained
 request and draft slots are then re-admitted through normal prefix restoration
-for the next stage. The same exact restore rule applies: fewer than 128 suffix
+of that concrete captured entry for the next stage; a same-end peer snapshot
+cannot replace it. External selection and Prompt/Turn tie rules are unchanged. The same exact restore rule applies: fewer than 128 suffix
 tokens use full-state continuation, while 128 or more use encoder continuation
 and a final decoder replay. There is no encoder-phase capture or new mark kind.
 The prompt-end snapshot remains unchanged.
@@ -111,22 +112,32 @@ The prompt-end snapshot remains unchanged.
 Staged prompts run individually through the shared prefill queue, including
 with decode sharing. Sampling and output occur only at the final prompt end;
 intermediate logits do not consume RNG or advance a grammar. Cold/scoring probes,
-disabled caches and launches without mark slots skip staging. A failed or skipped
-boundary capture abandons the remaining points and restarts the full prompt
-uncached. Image prompts prepare all missing image features before staging,
+disabled caches and launches without mark slots skip staging. A skipped boundary
+capture, or a failed capture whose target and all draft capture streams drained
+successfully, abandons the remaining points and restarts the full prompt uncached.
+If completion cannot be established on either side, the request fails fatally:
+its lease, source storage, draft slots and capture storage remain quarantined
+for shutdown, with no cold restart or recycling. Image prompts prepare all missing image features before staging,
 including cached images needed by that fallback, and move them across re-admission.
 Cancellation between stages releases the request through the ordinary queue path
-after the synchronous copies have drained.
+after the synchronous copies have drained. A failed drain follows the fatal
+quarantine path even if the client has disconnected.
 
 `/v1/stats.prefix_points` reports planned/captured points, skipped minimum,
 media, resume, eligibility and storage cases, rounded media points, capture
-failures and stage/cold restarts. Existing `prefix` fidelity counters also include
+failures and stage/cold restarts. Planning counters come from the executable
+planner pass: floor filtering precedes the boundary count and cap, while periodic
+media rounding follows the cap. Capped candidates do not count as media skips
+or rounded points. Existing `prefix` fidelity counters also include
 internal stage restores; `prefix_points.restarts` identifies that extra activity.
 Request cached-token usage still reports only the original admission's hit.
 The extra work per retained point includes a final replay, full mark capture,
 slot recycling and normal restore; with a short suffix the suffix also runs
 through all layers. Native initialized-state equality, cancellation and failure
-ordering, fidelity and replay throughput require GPU qualification.
+ordering, fidelity and replay throughput require GPU qualification. This includes
+initialized draft-ring bytes and ends at B and after restore (the target/Engram
+state hashes do not cover draft rings), same-end Prompt/Turn identity, and queued
+copy failures with successful and failed target/draft drains.
 
 ## Known limits
 
