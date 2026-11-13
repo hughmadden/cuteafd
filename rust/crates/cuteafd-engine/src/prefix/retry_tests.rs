@@ -10,6 +10,52 @@ impl Fake {
 }
 
 #[test]
+fn partial_host_promotion_drains_before_taking_entry_mark() {
+    for cleanup_fails in [false, true] {
+        let mut fake = Fake::new(64, 2, 8);
+        fake.rule = ReuseRule { align: 2, replay: Some(WINDOW) };
+        let mut cache = cache(&fake, 8, 1 << 20);
+        let saved = seq(100, 24);
+        let (_, _, p) = serve(&mut cache, &fake, 0, &saved, &[], 24);
+        cache.release(&fake, &p.pages).unwrap();
+        fake.mem.borrow_mut().advance(10_000_000);
+        cache.tick();
+        cache.clear(&fake).unwrap(); // The divergent request must promote from host.
+        assert_eq!((cache.pool().free(), cache.arena().in_use()), (64, 0));
+        *fake.bound_pages.borrow_mut() = Some(vec![Vec::new(); 2]);
+        let mut query = saved[..20].to_vec();
+        query.extend(seq(500, 4));
+        fake.drain_after_restore.set(cleanup_fails);
+        let builds = Cell::new(0);
+        let result = cache.admit(&fake, &query, 24, false, |pages| {
+            builds.set(builds.get() + 1);
+            Placement { pages, ring: 1, len: 0, ring_from: 0 }
+        });
+        assert_eq!(builds.get(), 1, "cleanup failure must abort without retrying");
+        assert_eq!(cache.stats().promotions, 1);
+        if cleanup_fails {
+            assert!(matches!(result, Err(PrefixError::Family { what: "drain", .. })));
+            assert_eq!(cache.arena().in_use(), 1, "the promoted entry still owns its mark");
+            assert_eq!((cache.stats().hits, cache.stats().partial_hits, cache.stats().host_hits), (0, 0, 0));
+        } else {
+            let mut admitted = result.unwrap();
+            assert_eq!(admitted.resume, 12, "aligned common 20 minus replay 8");
+            let source = admitted.source.unwrap();
+            assert!(source.host && source.partial);
+            assert_eq!(admitted.placement.ring_from, 12);
+            fake.forward(&mut admitted.placement, &query).unwrap();
+            assert_eq!(cache.arena().in_use(), 0);
+            assert_eq!((cache.stats().hits, cache.stats().partial_hits, cache.stats().host_hits), (1, 1, 1));
+        }
+        assert_eq!((cache.stats().quarantined, cache.stats().mark_restore_misses,
+            cache.stats().restore_failures, cache.stats().fork_no_room), (0, 0, 0, 0));
+        fake.external_release(&mut cache, 1).unwrap();
+        cache.clear(&fake).unwrap();
+        assert_eq!((cache.pool().free(), cache.arena().in_use()), (64, 0));
+    }
+}
+
+#[test]
 fn restore_drain_failure_leaves_bound_fork_to_caller_and_quarantines_only_temporary_mark() {
     for restore_fails in [false, true] {
         let fake = Fake::new(64, 2, 8);

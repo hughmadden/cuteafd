@@ -728,7 +728,10 @@ impl<E: CopyEngine, M: Clone + Default> PrefixCache<E, M> {
             self.discard_candidate(family, &mut placement, pages, temporary_mark)?;
             return Err(RestoreFailure::Candidate(PrefixError::Family { what, source }));
         }
-        if self.host.is_some() && (mark.is_some() || temporary_mark.is_some()) {
+        // A partial promotion also retires its entry mark below. Drain while the entry
+        // still owns it, so a failure leaves no taken mark outside the cleanup discipline.
+        let promoted_mark = promoted && self.entries[&hit.id].mark.is_some();
+        if self.host.is_some() && (mark.is_some() || temporary_mark.is_some() || promoted_mark) {
             if let Err(error) = self.drain(family) {
                 self.quarantine_temporary_mark(temporary_mark);
                 return Err(error.into());
