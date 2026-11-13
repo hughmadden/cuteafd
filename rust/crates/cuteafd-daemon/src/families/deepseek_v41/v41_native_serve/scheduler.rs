@@ -3340,6 +3340,11 @@ mod sampling_tests {
         // A configured bank keeps the **full** key set (the host keys stay null
         // here, because this fixture has no host cache attached either).
         let configured = serving_stats(&PrefixCache::configured(8), &waiter, &media, 0, &reserve, 0);
+        for key in ["exact_snapshot_restores", "exact_encoder_continuation_restores",
+            "approximate_replay_restores", "replayed_tokens", "exact_only_partial_misses"] {
+            assert_eq!(snapshot["prefix"][key], 0, "{key}: {snapshot}");
+            assert_eq!(configured["prefix"][key], 0, "{key}: {configured}");
+        }
         assert!(configured["prefix"]["promotions"].is_u64(), "{configured}");
         assert!(configured["host_cache"].is_null(), "{configured}");
         assert!(configured["host_cache_config"].is_null(), "{configured}");

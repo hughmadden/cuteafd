@@ -512,6 +512,36 @@ def test_v41_decode_share_key_reaches_only_the_coordinator_command(tmp_root, mon
         assert not any("decode-share" in arg or "DECODE_SHARE" in arg for arg in worker["argv"])
 
 
+@pytest.mark.parametrize("value", [None, "off", "on", "auto", "invalid"])
+def test_v41_prefix_partial_key_preserves_exact_only_policy(tmp_root, monkeypatch, value) -> None:
+    import v41_launch_capture as capture_module
+
+    original = capture_module.example_config
+
+    def with_key(name, directory):
+        config = original(name, directory)
+        if value is not None:
+            config.write_text(config.read_text() + f"PREFIX_PARTIAL={value}\n")
+        return config
+
+    monkeypatch.setattr(capture_module, "example_config", with_key)
+    if value not in (None, "off"):
+        message = "exact prefix frontiers only" if value == "on" else "PREFIX_PARTIAL must be on or off"
+        with pytest.raises(RuntimeError, match=message):
+            capture_module.capture(ROOT, "deepseek-v41-mxfp4-max")
+        return
+    result = capture_module.capture(ROOT, "deepseek-v41-mxfp4-max")
+    command = parse_run(result["containers"][0]["argv"])["command"]
+    if value is None:
+        assert "--prefix-partial" not in command
+    else:
+        assert command[command.index("--prefix-partial") + 1] == "off"
+        assert command.count("--prefix-partial") == 1
+    assert not any("prefix-partial" in arg for plan in result["plans"] for arg in plan)
+    for worker in result["containers"][1:]:
+        assert not any("prefix-partial" in arg or "PREFIX_PARTIAL" in arg for arg in worker["argv"])
+
+
 def test_v41_rejects_kv_cache_as_an_unused_key(tmp_root, monkeypatch) -> None:
     """V4.1 has no KV-precision flag. KV_CACHE is a hard error before any container."""
     import v41_launch_capture as capture_module
