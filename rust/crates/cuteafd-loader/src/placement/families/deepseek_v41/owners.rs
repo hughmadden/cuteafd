@@ -53,10 +53,18 @@ const _: () = assert!(cuteafd_core::V41_VERIFY_ROWS as u64 == DECODE_LANE_ROWS);
 /// 0..20 on GPU0, 20..40 on GPU1).
 fn v41_attention_gpu(layer: usize) -> usize { usize::from(layer >= 20) }
 
-/// Full-head sparse attention storage (64 heads) for units of `unit` rows.
-fn sparse64(unit: u64) -> u64 {
+/// Full-head sparse attention storage (64 heads) for units of `unit` rows
+/// (`SparseAttentionStorage::<64>::storage_bytes`): query and output planes,
+/// the split scratch of the `compressed` recipe's parts at the verify batch,
+/// batch descriptors, replay begins and metadata.
+pub fn sparse_attention_bytes(unit: u64, compressed: cuteafd_core::coordinator_programs::SparseAttentionBackend)
+    -> Result<u64> {
+    let plan = cuteafd_core::coordinator_programs::AttentionReductionPlan::new(cuteafd_core::V41_VERIFY_ROWS, None, None)?
+        .with_compressed(compressed);
     let batch = unit.min(cuteafd_core::V41_VERIFY_ROWS as u64);
-    2 * unit * 64 * 1024 + batch * 10 * 64 * 514 * 4 / 64 * 64 + batch * 120 + unit * 8 + unit * 80
+    let split = cuteafd_core::coordinator_programs::sparse_split_scratch_bytes(
+        usize::try_from(batch)?, plan.sparse_recipe(true).parts, 64) as u64;
+    Ok(2 * unit * 64 * 1024 + split + batch * 120 + unit * 8 + unit * 80)
 }
 
 /// Index selection's unit scratch (`IndexSelectionWave::sizes`).
@@ -262,13 +270,83 @@ pub fn draft_rows(concurrency: u64, width: u8) -> u64 {
 pub struct NativePrograms<'a> {
     manifest: &'a Value,
     sms: u32,
+    compressed: cuteafd_core::coordinator_programs::SparseAttentionBackend,
+    split_query: bool,
+    split_output: bool,
 }
 
 impl<'a> NativePrograms<'a> {
     pub fn new(manifest: &'a Value, sms: u32) -> Result<Self> {
         ensure!(sms > 0, "V4.1 native plans require physical SM count");
-        Ok(Self { manifest, sms })
+        Ok(Self { manifest, sms, compressed: cuteafd_core::coordinator_programs::SparseAttentionBackend::Bf16Aot,
+            split_query: false, split_output: false })
     }
+
+    /// The compressed sparse attention kernel the coordinator architecture
+    /// runs (`GpuArch::v41_compressed_attention`): the planner passes
+    /// `--coordinator-arch`, serve the measured device. BF16 AOT by default.
+    pub fn with_compressed_attention(self, compressed: cuteafd_core::coordinator_programs::SparseAttentionBackend) -> Self {
+        Self { compressed, ..self }
+    }
+
+    /// Match target lane allocation when q_b/o_b are loaded as TP2 shards.
+    /// The separate projection storages are charged by `projection_tp2_owners`.
+    pub fn with_projection_tp2(self, split_query: bool, split_output: bool) -> Self {
+        Self { split_query, split_output, ..self }
+    }
+
+    fn query_b_scratch(&self, rows: u64) -> Result<u64> {
+        if self.split_query { Ok(0) } else { self.scratch(rows, 1280, 32768) }
+    }
+
+    fn output_b_scratch(&self, rows: u64) -> Result<u64> {
+        if self.split_output { Ok(0) } else { self.scratch(rows, 8192, 5120) }
+    }
+
+    /// The fork's two attention owners per decode pass and per shared prefill
+    /// storage. Weight payload and packed scales belong to TargetLayout; only
+    /// temporary raw scales coexist with it during Load. Waves share storage.
+    pub fn projection_tp2_owners(&self, decode_rows: u64, capacity: u64, ranks: usize,
+        split_query: bool, split_output: bool) -> Result<Vec<super::admission::Owner>> {
+        use super::admission::Owner;
+        use crate::placement::planner::{Lifetime, Phase};
+        ensure!(matches!(ranks, 1 | 2) && (!(split_query || split_output) || ranks == 2),
+            "projection TP2 requires two target GPUs");
+        ensure!(self.split_query == split_query && self.split_output == split_output,
+            "projection TP2 owner flags differ from target programs");
+        ensure!((1..=4096).contains(&decode_rows) && (1..=4096).contains(&capacity),
+            "invalid projection TP2 row capacity");
+        let mut out = Vec::new();
+        let mut staging = 0;
+        for (enabled, name, k, n) in [(split_query, "query", 1280, 32768),
+            (split_output, "output", 8192, 5120)] {
+            if !enabled { continue; }
+            // Each rank retains scratch, alpha, BF16 input and FP16 half
+            // output; the gathered BF16 output lives on its attention owner.
+            let rank_storage = |rows| -> Result<u64> {
+                Ok(self.scratch(rows, k, n / 2)? + 16 + rows * k * 2 + rows * n)
+            };
+            let decode = 2 * (2 * rank_storage(decode_rows)? + decode_rows * n * 2);
+            let prefill = 2 * rank_storage(capacity)? + capacity * n * 2;
+            for gpu in 0..2 {
+                out.push(Owner::charged(gpu, Category::Workspace,
+                    format!("TP2 {name} projection decode"), decode));
+                out.push(Owner::charged(gpu, Category::Workspace,
+                    format!("TP2 {name} projection prefill"), prefill));
+            }
+            // Sequential matrix scale transforms reuse one raw-grid peak.
+            staging = staging.max(k * (n / 2) / 1024);
+        }
+        if staging > 0 {
+            for gpu in 0..2 {
+                out.push(Owner::charged(gpu, Category::Staging, "TP2 projection raw scales", staging)
+                    .with_lifetime(Lifetime { first: Phase::Load, last: Phase::Load }));
+            }
+        }
+        Ok(out)
+    }
+
+    pub fn compressed_attention(&self) -> cuteafd_core::coordinator_programs::SparseAttentionBackend { self.compressed }
 
     pub fn scratch(&self, rows: u64, k: u64, n: u64) -> Result<u64> {
         ProgramSet::v41_fp8(self.manifest, &[(k, n)], rows, self.sms)?.scratch
@@ -283,8 +361,10 @@ impl<'a> NativePrograms<'a> {
     pub fn modules(&self, decode_rows: u64, unit: u64, ranks: usize,
         draft_rows: Option<u64>) -> Result<Vec<ProgramSet>> {
         ensure!(matches!(ranks, 1 | 2), "invalid V4.1 module owners");
-        let target = [(5120, 1280), (1280, 32768), (32768, 8192),
-            (8192, 5120), (5120, 512), (1280, 4096)];
+        ensure!(!(self.split_query || self.split_output) || ranks == 2, "projection TP2 requires two target GPUs");
+        let mut target = vec![(5120, 1280), (32768, 8192), (5120, 512), (1280, 4096)];
+        target.push((1280, if self.split_query { 16384 } else { 32768 }));
+        target.push((8192, if self.split_output { 2560 } else { 5120 }));
         (0..ranks).map(|rank| {
             let mut selected = std::collections::BTreeSet::new();
             let mut add = |rows, matrices: &[(u64, u64)]| -> Result<()> {
@@ -309,7 +389,8 @@ impl<'a> NativePrograms<'a> {
             }
             if rank == ranks - 1 {
                 if let Some(rows) = draft_rows {
-                    add(rows, &target)?;
+                    add(rows, &[(5120, 1280), (1280, 32768), (32768, 8192),
+                        (8192, 5120), (5120, 512), (1280, 4096)])?;
                     add(rows, &[(15360, 5120), (5120, 2304), (2304, 5120)])?;
                 }
             }
@@ -391,10 +472,10 @@ impl<'a> NativePrograms<'a> {
                 rank as u8, Category::Workspace, format!("prefill slots {group}"), bytes, Basis::Formula));
             let placed = ranks == 2;
             // LaneStorage (WP7): HC boundaries, query, output, shared, sparse, router.
-            let query = 4 + u * 81160 + self.scratch(u, 5120, 1280)? + self.scratch(u, 1280, 32768)?;
-            let output = 4 + r * 92424 + self.scratch(u, 32768, 8192)? + self.scratch(u, 8192, 5120)?;
+            let query = 4 + u * 81160 + self.scratch(u, 5120, 1280)? + self.query_b_scratch(u)?;
+            let output = 4 + r * 92424 + self.scratch(u, 32768, 8192)? + self.output_b_scratch(u)?;
             let shared = if placed { 0 } else { self.shared_ffn(u)? + r * 20480 };
-            let sparse = sparse64(u);
+            let sparse = sparse_attention_bytes(u, self.compressed)?;
             add(&mut out, "lane", 2 * crate::serving_capacity::v41_workspace::hc(r as usize)?.bytes() as u64
                 + query + output + shared + sparse + r * 17105);
             // Cache producers: window storage and the source compressor storage(s).
@@ -464,6 +545,7 @@ impl<'a> NativePrograms<'a> {
     /// prefill slots' storage ([`Self::prefill_slots`]).
     pub fn target(&self, decode_rows: u64, reserve: u64, unit: u64, ranks: usize, slots: usize, concurrency: u64,
         head_mode: Fp8Head, window_batch: bool) -> Result<Vec<Demand>> {
+        ensure!(!(self.split_query || self.split_output) || ranks == 2, "projection TP2 requires two target GPUs");
         let mut out = self.decode_lanes(decode_rows, ranks, head_mode, window_batch)?;
         out.extend(self.prefill_slots(reserve, unit, ranks, slots, concurrency, head_mode, window_batch)?);
         Ok(out)
@@ -480,11 +562,10 @@ impl<'a> NativePrograms<'a> {
                 let add = |out: &mut Vec<Demand>, group: &str, bytes| out.push(Demand::new(
                     rank as u8, Category::Workspace, format!("lane {lane} {group}"), bytes, Basis::Formula));
                 let query = 4 + rows * (10240 + 2560 + 2560 + 65536 + 8 + 256)
-                    + self.scratch(rows, 5120, 1280)? + self.scratch(rows, 1280, 32768)?;
+                    + self.scratch(rows, 5120, 1280)? + self.query_b_scratch(rows)?;
                 let output = 4 + rows * (65536 + 16384 + 10240 + 8 + 256)
-                    + self.scratch(rows, 32768, 8192)? + self.scratch(rows, 8192, 5120)?;
-                let sparse = rows * (64 * 2048 + 88)
-                    + rows.min(cuteafd_core::V41_VERIFY_ROWS as u64) * (10 * 64 * 514 * 4 + 120);
+                    + self.scratch(rows, 32768, 8192)? + self.output_b_scratch(rows)?;
+                let sparse = sparse_attention_bytes(rows, self.compressed)?;
                 let shared = if ranks == 1 { self.shared_ffn(rows)? + rows * 20480 } else { 0 };
                 add(&mut out, "backbone", 2 * crate::serving_capacity::v41_workspace::hc(rows as usize)?.bytes() as u64
                     + query + output + sparse
@@ -634,7 +715,8 @@ mod tests {
     fn manifest() -> Value {
         let matrices = [(5120, 1280), (1280, 32768), (32768, 8192), (8192, 5120),
             (5120, 2304), (2304, 5120), (5120, 512), (1280, 4096),
-            (6144, 25600), (15360, 5120), (5120, 1152), (1152, 5120)];
+            (6144, 25600), (15360, 5120), (5120, 1152), (1152, 5120),
+            (1280, 16384), (8192, 2560)];
         let variants = matrices.into_iter().flat_map(|(k, n)| {
             [1, 16, 64, 80, 256, 1024, 4096].map(move |rows| json!({
                 "capacity": rows, "input_dim": k, "output_dim": n,
@@ -655,6 +737,63 @@ mod tests {
 
     fn owner(demands: &[Demand], rank: u8, group: &str) -> u64 {
         demands.iter().find(|d| d.gpu == rank && d.group == group).unwrap().bytes
+    }
+
+    #[test]
+    fn tp2_projection_owners_match_all_retained_storages_and_sequential_load_peak() -> Result<()> {
+        use crate::placement::planner::{Lifetime, Phase};
+        let manifest = manifest();
+        let programs = NativePrograms::new(&manifest, 128)?;
+        assert!(programs.projection_tp2_owners(64, 256, 2, false, false)?.is_empty());
+        assert!(programs.projection_tp2_owners(64, 256, 1, true, false).is_err());
+        for (query, output) in [(true, false), (false, true), (true, true)] {
+            let split = NativePrograms::new(&manifest, 128)?.with_projection_tp2(query, output);
+            let owners = split.projection_tp2_owners(64, 256, 2, query, output)?;
+            for gpu in 0..2 {
+                let workspace = owners.iter().filter(|o| o.location == crate::placement::planner::Location::coordinator(gpu)
+                    && o.category == Category::Workspace).map(|o| o.bytes).sum::<u64>();
+                // Independently enumerate actual Wave/Storage allocations:
+                // two passes, each with both attention owners; then two
+                // prefill storages shared over all prefill waves.
+                let mut expected = 0;
+                for (enabled, k, n) in [(query, 1280, 32768), (output, 8192, 5120)] {
+                    if !enabled { continue; }
+                    for (rows, passes) in [(64, 2), (256, 1)] {
+                        for owner in 0..2 {
+                            expected += passes * (programs.scratch(rows, k, n / 2)? + 16
+                                + rows * k * 2 + rows * n + if owner == gpu { rows * n * 2 } else { 0 });
+                        }
+                    }
+                }
+                assert_eq!(workspace, expected);
+                let stages = owners.iter().filter(|o| o.location == crate::placement::planner::Location::coordinator(gpu)
+                    && o.category == Category::Staging).collect::<Vec<_>>();
+                assert_eq!(stages.len(), 1);
+                assert_eq!(stages[0].bytes, 20480);
+                assert_eq!(stages[0].lifetime, Lifetime { first: Phase::Load, last: Phase::Load });
+                assert!(owners.iter().all(|o| o.resident == 0));
+            }
+            let baseline = programs.target(64, 512, 256, 2, 2, 1, Fp8Head::All, false)?;
+            let target = split.target(64, 512, 256, 2, 2, 1, Fp8Head::All, false)?;
+            for gpu in 0..2 {
+                let saved = |rows| -> Result<u64> { Ok(
+                    if query { programs.scratch(rows, 1280, 32768)? } else { 0 }
+                    + if output { programs.scratch(rows, 8192, 5120)? } else { 0 }) };
+                for lane in 0..2 {
+                    let group = format!("lane {lane} backbone");
+                    assert_eq!(owner(&baseline, gpu, &group) - owner(&target, gpu, &group), saved(64)?);
+                }
+                assert_eq!(owner(&baseline, gpu, "prefill slots lane")
+                    - owner(&target, gpu, "prefill slots lane"), saved(256)?);
+            }
+            let modules = split.modules(64, 256, 2, None)?;
+            assert_eq!(modules[0].names.iter().any(|n| n.contains("matrix_1280_16384_")), query);
+            assert_eq!(modules[0].names.iter().any(|n| n.contains("matrix_8192_2560_")), output);
+            let draft = split.modules(64, 256, 2, Some(80))?;
+            assert!(draft[1].names.iter().any(|n| n.contains("matrix_1280_32768_80")));
+            assert!(draft[1].names.iter().any(|n| n.contains("matrix_8192_5120_80")));
+        }
+        Ok(())
     }
 
     #[test]
@@ -971,6 +1110,44 @@ mod tests {
         let variant = duplicate["variants"][0].clone();
         duplicate["variants"].as_array_mut().unwrap().push(variant);
         assert!(programs.dspark(&duplicate, 256, 1, 5, 1, Fp8Head::Off).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn sm89_attention_charges_are_native_fp32_and_sm120_charges_are_unchanged() -> Result<()> {
+        use cuteafd_core::{coordinator_programs::SparseAttentionBackend, GpuArch};
+        // The sparse attention charge before the plan carried its backend.
+        let before = |u: u64| { let batch = u.min(64);
+            2 * u * 64 * 1024 + batch * 10 * 64 * 514 * 4 + batch * 120 + u * 8 + u * 80 };
+        for u in [1, 16, 63, 64, 65, 256, 1024, 2048, 2752, 4096] {
+            // SM89 reserves the native FP32 ten-part kernel's split scratch;
+            // SM120's BF16 AOT recipe keeps exactly the same extent.
+            let native = sparse_attention_bytes(u, GpuArch::Sm89.v41_compressed_attention())?;
+            let split = cuteafd_core::coordinator_programs::sparse_split_scratch_bytes(u.min(64) as usize, 10, 64);
+            assert_eq!(native, 2 * u * 64 * 1024 + split as u64 + u.min(64) * 120 + u * 88);
+            for arch in GpuArch::ALL {
+                assert_eq!(sparse_attention_bytes(u, arch.v41_compressed_attention())?, before(u));
+            }
+        }
+        let manifest = manifest();
+        for sms in [114, 188] {
+            let default = NativePrograms::new(&manifest, sms)?;
+            assert_eq!(default.compressed_attention(), SparseAttentionBackend::Bf16Aot);
+            let sm120 = NativePrograms::new(&manifest, sms)?
+                .with_compressed_attention(GpuArch::Sm120.v41_compressed_attention());
+            let sm89 = NativePrograms::new(&manifest, sms)?
+                .with_compressed_attention(GpuArch::Sm89.v41_compressed_attention());
+            assert_eq!(sm89.compressed_attention(), SparseAttentionBackend::NativeFp32);
+            for ranks in [1, 2] {
+                for (reserve, unit, slots) in [(8256, 2752, 3), (8192, 4096, 2), (8192, 2048, 4)] {
+                    let target = |programs: &NativePrograms| programs.target(DECODE_LANE_ROWS, reserve, unit,
+                        ranks, slots, 8, Fp8Head::All, ranks == 1);
+                    let baseline = target(&default)?;
+                    assert_eq!(target(&sm120)?, baseline);
+                    assert_eq!(target(&sm89)?, baseline);
+                }
+            }
+        }
         Ok(())
     }
 

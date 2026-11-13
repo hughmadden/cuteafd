@@ -47,6 +47,17 @@ There is no separate scale-only preload. `ENGRAM_WARM` warms the whole mapped ta
   FP4 source pages, a mark holding the window rings, odd compressor carry,
   Engram lookback and dSpark rings, snapshots at prompt end and turn end,
   shared `--prefix-cache-*`/`--host-cache-*` flags and pinned-host tier.
+  `PREFIX_PARTIAL=off` (CLI `--prefix-partial off`, environment
+  `CUTEAFD_PREFIX_PARTIAL=off`) preserves exact-only reuse; `on` is refused.
+  Exact ancestors with at least 128 new tokens use encoder continuation;
+  shorter suffixes restore the complete mark. Prefix stats distinguish
+  `exact_snapshot_restores`, `exact_encoder_continuation_restores`,
+  `approximate_replay_restores`, `replayed_tokens` and
+  `exact_only_partial_misses`. The last counter counts cold admissions with
+  useful rejected partial matches in either tier, excluding failed restores
+  and resource failures. Approximate replay and its replayed-token count stay
+  zero for V4.1. Existing `exact_hits` still means a whole-prompt hit with
+  retained logits, rather than all exact restores.
 - RTX/Spark layouts: the v2 native MXFP4 minimum is 1 RTX + 3 Sparks;
   the v2 NVFP4 cards use 4 Sparks. Current MXFP4 and NVFP4 support TP3 as a
   fit-minimum option (see the TP3 decision in `PLAN.md`). The current MXFP4
@@ -75,6 +86,85 @@ There is no separate scale-only preload. `ENGRAM_WARM` warms the whole mapped ta
 | Setting | Default | Scope |
 | --- | --- | --- |
 | `TP2_DSPARK_EXPERTS` | `on` with two RTX GPUs and dSpark; otherwise `off` | Splits dSpark routed experts across the RTX pair. `off` keeps them on the draft GPU. Explicit `on` requires V4.1, two RTX GPUs and dSpark. |
+
+### Exact message-boundary checkpoints
+
+V4.1 retains one exact message frontier by default, in addition to prompt-end
+and turn-end snapshots. `PREFIX_POINT_BOUNDARIES=0` (or
+`--prefix-point-boundaries 0`) disables boundary points. The shared
+`--prefix-points-per-request` cap defaults to four and `--prefix-point-gap`
+defaults to zero. Message boundaries come from the checkpoint's native
+`<｜System｜>`, `<｜User｜>` and `<｜Assistant｜>` added tokens; position `B`
+means the exclusive prefix `tokens[..B]`. The shared media-aware planner
+rounds points inside images to their start and applies the minimum and resume
+floor. No point is captured inside an image.
+
+Each point ends a complete prefill stage: encoder units and their lookahead
+stop at B, then the normal final decoder replay commits the complete frontier.
+Synchronous retention captures an ordinary full target/dSpark mark. The drained
+request and draft slots are then re-admitted through normal prefix restoration
+of that concrete captured entry for the next stage; a same-end peer snapshot
+cannot replace it. External selection and Prompt/Turn tie rules are unchanged. The same exact restore rule applies: fewer than 128 suffix
+tokens use full-state continuation, while 128 or more use encoder continuation
+and a final decoder replay. There is no encoder-phase capture or new mark kind.
+The prompt-end snapshot remains unchanged.
+
+Staged prompts run individually through the shared prefill queue, including
+with decode sharing. Sampling and output occur only at the final prompt end;
+intermediate logits do not consume RNG or advance a grammar. Cold/scoring probes,
+disabled caches and launches without mark slots skip staging. A skipped boundary
+capture, or a failed capture whose target and all draft capture streams drained
+successfully, abandons the remaining points and restarts the full prompt uncached.
+If completion cannot be established on either side, the request fails fatally:
+its lease, source storage, draft slots and capture storage remain quarantined
+for shutdown, with no cold restart or recycling. Queued captures reserve their
+source owners before enqueue and drain their own target and draft capture lanes
+on failure; ordinary-stream completion alone cannot release them. A failed wait
+for a peer's queued capture under mark pressure makes that owning ticket fatal
+and quarantines its source identity, rather than the waiting request's. Fatal
+capture errors stop the current prefill round and further admission. Independent
+lanes finish work already in flight, then check the shared stop flag between
+retirements and before selecting another decode round; they start no further
+retirement captures or decode rounds after observing that stop. Image prompts
+prepare all missing image features before staging,
+including cached images needed by that fallback, and move them across re-admission.
+Cancellation between stages releases the request through the ordinary queue path
+after the synchronous copies have drained. A failed drain follows the fatal
+quarantine path even if the client has disconnected.
+
+`/v1/stats.prefix_points` reports planned/captured points, skipped minimum,
+media, resume, eligibility and storage cases, rounded media points, capture
+failures and stage/cold restarts. Planning counters come from the executable
+planner pass: floor filtering precedes the boundary count and cap, while periodic
+media rounding follows the cap. Capped candidates do not count as media skips
+or rounded points. Existing `prefix` fidelity counters also include
+internal stage restores; `prefix_points.restarts` identifies that extra activity.
+Request cached-token usage still reports only the original admission's hit.
+The extra work per retained point includes a final replay, full mark capture,
+slot recycling and normal restore; with a short suffix the suffix also runs
+through all layers. Beyond the state comparisons below, cancellation and failure
+ordering, replay throughput and the following native checks still require GPU
+qualification: initialized draft-ring bytes and ends at B and after restore
+(the target/Engram state hashes do not cover draft rings), same-end Prompt/Turn identity, and queued
+copy failures with successful and failed target/draft drains, including mark-pressure
+waits and a peer suspended in retirement when the fatal stop is raised.
+
+#### Staged-prefill numerics
+
+At the generation-message start (`<｜Assistant｜>`, token index B), the boundary snapshot is an ordinary complete frontier for `tokens[..B]`, with no new mark kind.
+Stage 2 uses ordinary exact restoration: full-mark replay for suffixes below 128 tokens (including the 1–2-token boundary), or encoder continuation for 128 or more.
+
+Qualification on 2× RTX 4090 D + Sparks, `17137589f`:
+
+| Check | Measured result |
+| --- | --- |
+| Captured B versus cold whole-prompt `tokens[..B]` | Byte-identical state (same extent, byte count and SHA) for suffix lengths 0/1/2/37/127/128/129/300. |
+| Restore B and continue versus staged prefill | Same frontier states and extents in same-launch comparisons across suffixes 1/2/37/127/128/129/300. |
+| Drafts on versus off | Identical frontier states at suffix lengths 127 and 128. |
+| Golden `--resume-at` | Text and image restore/continuation cases pass byte-exactly. |
+
+Smoke `cache_exact` cold recomputation compares staged prefill against unstaged cold prefill (cold probes skip staging); restored prompt-end/turn-end rows are byte-identical. Of 24 turn-prompt cold-recompute rows compared, at least one differs. A one-row full-vocabulary continuation comparison gives KL = 2.9514e-4 with the same arg-max, without byte identity; the cold-versus-cold reference gives KL = 0.0 and byte-identical rows.
+This is the accepted chunk-size/prefill-versus-decode floating-point reordering class, at the same order of magnitude as the tool-call check's ~0.000-nat top-token differences. The repository rule permits logit/greedy differences from reordering, not cache-induced state changes; these cold-recompute differences are not a restored-bytes mismatch.
 
 ## Known limits
 

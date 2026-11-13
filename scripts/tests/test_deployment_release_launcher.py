@@ -220,7 +220,11 @@ def test_deployment_preserves_release_container_commands(
             if before["command"][before["command"].index("--rtx-gpus") + 1] == "2" and "--dspark" in before["command"]:
                 before["command"].insert(before["command"].index("--dspark") + 1, "--tp2-dspark-experts")
             position = before["command"].index("--mapped-scale-preload-gib") + 2
-            before["command"][position:position] = ["--expert-usage"]
+            # Complete message frontiers now default to one on V4.1.
+            boundaries = launch_config.get("PREFIX_POINT_BOUNDARIES", "1")
+            assert command.count("--prefix-point-boundaries") == 1
+            assert command[command.index("--prefix-point-boundaries") + 1] == boundaries
+            before["command"][position:position] = ["--prefix-point-boundaries", boundaries, "--expert-usage"]
 
         if old["host"] == "coordinator" and entry["family"] != "deepseek_v41":
             # Every family's coordinator now takes its GPUs as V4.1's always did: CDI by

@@ -75,7 +75,7 @@ impl BackboneRequest<'_> {
                 output_row_stride_bytes: self.output_row_bytes()?,
                 output_payload_bytes: partials.len() as u64,
                 status: ExpertProtocolV2Status::Ok,
-                flags: request.flags
+                flags: (request.flags & !super::V41_COORDINATOR_ROUTES_REQUEST_FLAG)
                     | EXPERT_PROTOCOL_V2_FLAG_RESPONSE_ROW_INDICES
                     | if end < self.rows() {
                         EXPERT_PROTOCOL_V2_FLAG_RESPONSE_MORE_CHUNKS

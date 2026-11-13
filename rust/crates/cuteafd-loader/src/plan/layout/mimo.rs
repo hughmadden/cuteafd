@@ -44,7 +44,7 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
         let cfg = MimoV2Config::from_hf(&checkpoint.config).ok();
         let base = cfg.as_ref().and_then(|cfg| cfg.program_family().ok()).unwrap_or("mimo");
         let families = std::iter::once(base.to_string()).chain((ranks == 2).then(|| format!("{base}2"))).collect::<Vec<_>>();
-        let mut runtime = runtime_item(manifest, &families, "*", ranks == 2, rank, total);
+        let mut runtime = runtime_item(manifest, &families, "*", ranks == 2, rank, options.coordinator_arch, total);
         if ranks == 1 && base == "mimof" {
             runtime.bytes = crate::placement::families::mimo_v2::admission::FLASH_MIN_BASELINE_BYTES;
             runtime.basis = Basis::Calibrated;
@@ -336,7 +336,7 @@ pub(super) fn profile(checkpoint: &super::super::Checkpoint, options: &LayoutOpt
                     if options.mimo_draft_bf16 { draft_representation::MimoDraftRepresentation::Bf16Only }
                         else { draft_representation::MimoDraftRepresentation::Fp8Only }, capacity, rank,
                     if options.tp2_dflash { 2 } else { 1 }, |shape| draft_scratch_bytes(shape, options.physical_sms.unwrap_or_else(||
-                        crate::placement::inventory::ArchContext::for_device("sm_120", options.rtx_bytes[0]).sms) as usize))?;
+                        crate::placement::inventory::ArchContext::for_device(options.coordinator_arch, options.rtx_bytes[0]).sms) as usize))?;
                 resident_weights = resident_weights.checked_add(costs.resident_weights)?;
                 additional.extend(costs.steady);
                 weight_arenas.push(costs.arena);
@@ -394,7 +394,7 @@ fn offline_draft_packing(checkpoint: &super::super::Checkpoint, options: &Layout
         if options.mimo_draft_bf16 { draft_representation::MimoDraftRepresentation::Bf16Only }
             else { draft_representation::MimoDraftRepresentation::Fp8Only }, capacity, 0,
         if options.tp2_dflash { 2 } else { 1 }, |shape| draft_scratch_bytes(shape, options.physical_sms.unwrap_or_else(||
-            crate::placement::inventory::ArchContext::for_device("sm_120", options.rtx_bytes[0]).sms) as usize))?.packing;
+            crate::placement::inventory::ArchContext::for_device(options.coordinator_arch, options.rtx_bytes[0]).sms) as usize))?.packing;
     Ok((0..ranks).map(|rank| if rank == 0 || options.tp2_dflash { packing.clone() } else { vec![] }).collect())
 }
 
@@ -957,7 +957,7 @@ mod tests {
             let baseline = baseline + 35_651_584;
             let opts = LayoutOptions { native_mtp_layers: 0, host_memory: Some((128 << 30, 128 << 30)), rtx_bytes: vec![total], concurrency: 4, ..Default::default() };
             let mut profile = profile(&checkpoint, &opts, 1, 2, 4096, 4, 1 << 20, None).unwrap();
-            let cublas = crate::placement::inventory::ArchContext::for_device("sm_120", total).cublas_bytes;
+            let cublas = crate::placement::inventory::ArchContext::for_device(cuteafd_core::GpuArch::Sm120, total).cublas_bytes;
             profile.steady.devices[0].reservations.push(cuteafd_core::serving_capacity::MemoryReservation {
                 name: "runtime.cublas_first_gemm".into(), bytes: cublas,
             });

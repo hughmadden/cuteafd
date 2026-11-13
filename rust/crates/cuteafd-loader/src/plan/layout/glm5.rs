@@ -29,7 +29,7 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
                 let plan = cuteafd_core::coordinator_programs::AttentionReductionPlan::new(
                     crate::placement::families::glm5::DECODE_ROWS as usize, drafts, options.glm5_attention_plan_rows)?;
                 let sms = options.physical_sms.unwrap_or_else(|| crate::placement::ArchContext::for_device(
-                    "sm_120", options.rtx_bytes[0]).sms) as usize;
+                    options.coordinator_arch, options.rtx_bytes[0]).sms) as usize;
                 manifest.as_ref().map(|manifest| crate::placement::families::glm5::manifest_context_for_cards(
                     &cfg, manifest, &[sms], plan)).transpose().map(Option::flatten)
             })();
@@ -424,7 +424,7 @@ fn production_serving(options: &LayoutOptions, checkpoint: &Checkpoint, cfg: &Gl
     use crate::families::glm5::draft_representation::{GlmDraftCapacity, GlmDraftRepresentation, serving_draft_context_slots};
     use crate::placement::planner::serving::{HostPrefixOwners, SelectorOwners, ServingOwners};
     let sms = options.physical_sms.unwrap_or_else(|| crate::placement::ArchContext::for_device(
-        "sm_120", options.rtx_bytes[0]).sms) as usize;
+        options.coordinator_arch, options.rtx_bytes[0]).sms) as usize;
     let concurrency = options.resolved_concurrency(cfg.family_id()) as usize;
     let sequences = options.glm_draft_sequences() as usize;
     let slots = serving_draft_context_slots(sequences, concurrency, options.draft_context_slots.map(|n| n as usize));
@@ -658,7 +658,7 @@ pub(crate) fn native_layout_with_metadata(checkpoint: &Checkpoint, options: &Lay
     }
     let context_programs = if attention == crate::placement::AttentionPlacement::Context {
         let sms = options.physical_sms.unwrap_or_else(|| crate::placement::ArchContext::for_device(
-            "sm_120", options.rtx_bytes[0]).sms) as usize;
+            options.coordinator_arch, options.rtx_bytes[0]).sms) as usize;
         Some(glm::manifest_context_for_cards(&cfg, &manifest, &[sms], plan)?
             .ok_or_else(|| crate::placement::PlacementError::MissingContextPrograms { family: cfg.family_id(),
                 programs: glm::context_program_list(&cfg) })?)
@@ -986,7 +986,7 @@ mod tests {
         let slots = cuteafd_core::prefix::mark_slots_with_host(on.resolved_concurrency("mistral_large4"),
             on.mimo_prefix_entries, mark, on.mimo_prefix_mark_bytes, false);
         assert_eq!(device, slots * mark);
-        assert!(device > host);
+        assert_eq!(device, host, "both tiers reserve the same budgeted draft mark arena");
 
     }
 

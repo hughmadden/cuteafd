@@ -189,7 +189,7 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
             programs.names.sort();
             programs.names.dedup();
             for rank in 0..gpus {
-                let arch = ArchContext::for_device("sm_120", opts.rtx_bytes[rank]);
+                let arch = ArchContext::for_device(opts.coordinator_arch, opts.rtx_bytes[rank]);
                 let code = crate::placement::inventory::loaded_code_allowance("kimik3", "exl3", gpus == 2,
                     rank as u8, arch, Some(&programs));
                 baseline[rank] = Baseline::Planned { context_bytes: arch.context_bytes, loaded_bytes: 0 };

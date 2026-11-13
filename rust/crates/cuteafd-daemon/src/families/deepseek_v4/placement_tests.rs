@@ -115,7 +115,7 @@ fn runtime_with_host(shared: &Shared, case: &Case<'_>, layout: &MemoryLayout, tp
     let mut manifest: serde_json::Value = serde_json::from_slice(&std::fs::read(case.manifest)?)?;
     // case.budget is plan_options' rtx_bytes[0], matching the planner's fallback.
     cuteafd_core::coordinator_programs::select_card_plans(&mut manifest, case.physical_sms.unwrap_or_else(||
-        cuteafd_loader::placement::ArchContext::for_device("sm_120", case.budget).sms))?;
+        cuteafd_loader::placement::ArchContext::for_device(cuteafd_core::GpuArch::Sm120, case.budget).sms))?;
     let catalog = shared.catalog(case.dspark)?;
     let cfg = cuteafd_loader::families::deepseek_v4::DeepseekV4Config::read(case.snapshot, 1)?;
     let family = if cfg.dim == 4096 { "dsv4f" } else { "dsv4p" };
@@ -747,7 +747,7 @@ struct FixtureGpu {
 impl FixtureGpu {
     fn context_bytes(&self) -> u64 {
         cuteafd_loader::placement::inventory::ArchContext::for_device(
-            "sm_120", self.total_bytes).context_bytes
+            cuteafd_core::GpuArch::Sm120, self.total_bytes).context_bytes
     }
     fn free_with_current_code(&self, code: u64) -> u64 {
         match (self.reserved_code_bytes, self.untracked_at_admission_bytes) {
@@ -838,7 +838,7 @@ fn planner_equals_runtime_deepseek_v4_measured() {
             let catalog = shared.input.expert_catalog().unwrap();
             let cfg = cuteafd_loader::families::deepseek_v4::DeepseekV4Config::read(&snapshot, 1).unwrap();
             let arch = cuteafd_loader::placement::inventory::ArchContext::for_device(
-                "sm_120", cuteafd_loader::placement::inventory::PRO_TOTAL_BYTES);
+                cuteafd_core::GpuArch::Sm120, cuteafd_loader::placement::inventory::PRO_TOTAL_BYTES);
             let family = if cfg.dim == 4096 { "dsv4f" } else { "dsv4p" };
             let code = (0..fixture.rtx).map(|rank| cuteafd_loader::placement::inventory::loaded_code_allowance(
                 family, cuteafd_loader::placement::families::deepseek_v4::code_experts(&catalog),
@@ -925,7 +925,7 @@ fn runtime_measured(shared: &Shared, case: &Case<'_>, fixture: &Fixture) -> anyh
     let mut manifest: serde_json::Value = serde_json::from_slice(&std::fs::read(case.manifest)?)?;
     // case.budget is plan_options' rtx_bytes[0], matching the planner's fallback.
     cuteafd_core::coordinator_programs::select_card_plans(&mut manifest, case.physical_sms.unwrap_or_else(||
-        cuteafd_loader::placement::ArchContext::for_device("sm_120", case.budget).sms))?;
+        cuteafd_loader::placement::ArchContext::for_device(cuteafd_core::GpuArch::Sm120, case.budget).sms))?;
     let catalog = shared.catalog(case.dspark)?;
     let cfg = cuteafd_loader::families::deepseek_v4::DeepseekV4Config::read(case.snapshot, 1)?;
     let family = if cfg.dim == 4096 { "dsv4f" } else { "dsv4p" };
@@ -939,7 +939,7 @@ fn runtime_measured(shared: &Shared, case: &Case<'_>, fixture: &Fixture) -> anyh
     let stages = (0..).take_while(|stage| catalog.tensors().iter()
         .any(|t| t.metadata.name.starts_with(&format!("mtp.{stage}.")))).count();
     let arch = cuteafd_loader::placement::inventory::ArchContext::for_device(
-        "sm_120", cuteafd_loader::placement::inventory::PRO_TOTAL_BYTES);
+        cuteafd_core::GpuArch::Sm120, cuteafd_loader::placement::inventory::PRO_TOTAL_BYTES);
     let code = (0..fixture.rtx).map(|rank| cuteafd_loader::placement::inventory::loaded_code_allowance(
         family, cuteafd_loader::placement::families::deepseek_v4::code_experts(&catalog),
         fixture.rtx == 2, rank as u8, arch, None).bytes).collect::<Vec<u64>>();

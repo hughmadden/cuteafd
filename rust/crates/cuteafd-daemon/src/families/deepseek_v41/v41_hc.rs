@@ -253,6 +253,8 @@ impl HcSublayer<'_, '_> {
             "mHC rows exceed capacity or the unit's window"
         );
         unsafe {
+            // The lagged begin produces the coefficients here; SM89's leaves
+            // its projection partials in the collapsed plane for enqueue_finish.
             if !self.kernel.try_begin(
                 self.window.apply(self.storage.residual.buffer, 40960),
                 self.weights.get(&self.names[0])?,
@@ -329,15 +331,33 @@ impl HcSublayer<'_, '_> {
         let rows = self.begun.take().context("mHC sublayer was not begun")?;
         let result = result.unwrap_or(self.window.apply(self.storage.sublayer.buffer, 10240));
         unsafe {
-            self.kernel.post(
-                result,
-                self.window.apply(self.storage.residual.buffer, 40960),
-                self.window.apply(self.storage.post.buffer, 16),
-                self.window.apply(self.storage.comb.buffer, 64),
-                self.window.apply(self.storage.output.buffer, 40960),
-                rows,
-                stream,
-            )?;
+            if self.kernel.defers_finish(rows) {
+                // SM89: the begin left the projection partials in the collapsed
+                // plane; next pre, post and comb come out of the finish here.
+                self.kernel.post_finish(
+                    result,
+                    self.window.apply(self.storage.residual.buffer, 40960),
+                    self.window.apply(self.storage.collapsed.buffer, 10240),
+                    self.weights.get(&self.names[1])?,
+                    self.weights.get(&self.names[2])?,
+                    self.window.apply(self.storage.next_pre.buffer, 16),
+                    self.window.apply(self.storage.post.buffer, 16),
+                    self.window.apply(self.storage.comb.buffer, 64),
+                    self.window.apply(self.storage.output.buffer, 40960),
+                    rows,
+                    stream,
+                )?;
+            } else {
+                self.kernel.post(
+                    result,
+                    self.window.apply(self.storage.residual.buffer, 40960),
+                    self.window.apply(self.storage.post.buffer, 16),
+                    self.window.apply(self.storage.comb.buffer, 64),
+                    self.window.apply(self.storage.output.buffer, 40960),
+                    rows,
+                    stream,
+                )?;
+            }
         }
         self.pending = Some(rows);
         Ok(())

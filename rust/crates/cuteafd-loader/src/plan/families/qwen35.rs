@@ -181,7 +181,7 @@ fn native_layout(cfg: &crate::families::qwen3_5::Qwen35Config, input: &crate::pl
     let capacity = options.rtx_bytes[0];
     // Physical card class fixes the CUDA context/module image and SM count;
     // `--gpu-memory-cap` only lowers the logical ceiling.
-    let physical = ArchContext::for_device("sm_120", capacity);
+    let physical = ArchContext::for_device(cuteafd_core::GpuArch::Sm120, capacity);
     let sms = options.physical_sms.unwrap_or(physical.sms);
     let drafter = options.dense_qwen_drafter_snapshot.as_ref().map(|snapshot| {
         ensure!(crate::formats::block_dspark::supports_sequences(slots), "dense dSpark sequence capacity exceeded");

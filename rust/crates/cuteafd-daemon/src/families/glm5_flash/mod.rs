@@ -1260,7 +1260,7 @@ mod draft_cli_tests {
         let mut cfg = GlmNextConfig::from_hf(&cuteafd_loader::plan::testing::glm5_flash_config(45))?;
         cfg.dense = (0..45).map(|layer| layer < 3).collect();
         // The small-budget NVFP4 placement retains one empty range per RTX GPU.
-        let mut placement = Placement {
+        let mut placement = Placement { expert_tier: None,
             pool_tokens: 1 << 20, pool_limits: PoolLimits(vec![]), attention_placement: AttentionPlacement::Heads,
             attention_by_kind: vec![], peer_row_bytes: 0, onboard_layers: 0, max_pool_tokens_no_onboard: None,
             layers: (0..45).map(|layer| LayerAssignment {
@@ -1997,12 +1997,12 @@ impl Opened {
             program_set.names.sort(); program_set.names.dedup();
         }
         let pending_code = inventory.gpus.iter().enumerate().map(|(rank, sample)| {
-            let arch = placement::ArchContext::for_device(&sample.arch, sample.total_bytes);
+            let arch = placement::ArchContext::for_device(sample.arch.parse()?, sample.total_bytes);
             let code = placement::inventory::loaded_code_allowance(
                 if core_charge.is_some() { "glmf-k6" } else { "glmf" }, code_package,
                 split, rank as u8, arch, Some(&program_set));
-            code.pending(sample.context_bytes, arch.context_bytes)
-        }).collect();
+            Ok(code.pending(sample.context_bytes, arch.context_bytes))
+        }).collect::<Result<Vec<_>>>()?;
         let headers = Checkpoint::coordinator_view(&self.view, false, false)?;
         let representation = GlmfRepresentation { kda_fp8: args.kda_fp8 != fp8::KdaFp8::Off,
             head: args.head_format, output_shard: args.kda_output_shard };

@@ -306,7 +306,7 @@ impl<'a> QwenSingle<'a> {
             by_kind.insert(if kind == Qwen4Attention::Full { AttentionClass::Gqa }
                 else { AttentionClass::Gdn }, AttentionPlacement::Heads);
         }
-        Ok(Placement { pool_tokens: solved.pool_tokens, pool_limits: PoolLimits(vec![]),
+        Ok(Placement { expert_tier: None, pool_tokens: solved.pool_tokens, pool_limits: PoolLimits(vec![]),
             attention_placement: AttentionPlacement::Heads,
             attention_by_kind: by_kind.into_iter().collect(),
             peer_row_bytes: 0, onboard_layers: 0, max_pool_tokens_no_onboard: None,
@@ -983,7 +983,7 @@ impl<'a> QwenDual<'a> {
             by_kind.insert(if kind == Qwen4Attention::Full { AttentionClass::Gqa }
                 else { AttentionClass::Gdn }, AttentionPlacement::Layers);
         }
-        Ok(Placement { pool_tokens: solved.pool_tokens, pool_limits: PoolLimits(vec![]),
+        Ok(Placement { expert_tier: None, pool_tokens: solved.pool_tokens, pool_limits: PoolLimits(vec![]),
             attention_placement: AttentionPlacement::Layers,
             attention_by_kind: by_kind.into_iter().collect(),
             peer_row_bytes: 0, onboard_layers: a.layers, max_pool_tokens_no_onboard: None,

@@ -171,12 +171,14 @@ pub(super) fn pack_grouped_scales<'a>(
         library,
         raw: library.cuda_stream_create()?,
     };
+    let grouped = library.v41_fp8_matrix_kernel(1, 32768, 8192)?;
     for stage in 0..3 {
         output.push(crate::families::deepseek_v41::weight_layout::allocation(library, Some(arena),
             &crate::families::deepseek_v41::weight_layout::packed_scale_name(
-                &format!("mtp.{stage}.attn.wo_a.weight")), 1048576)?);
+                &format!("mtp.{stage}.attn.wo_a.weight")),
+            grouped.info().packed_weight_scale_bytes as usize)?);
         unsafe {
-            crate::shared::experts::rtx::dense::v41_pack_scales(&library.v41_fp8_matrix_kernel(1, 32768, 8192)?,
+            crate::shared::experts::rtx::dense::v41_pack_scales(&grouped,
                 tensors.get(&format!("mtp.{stage}.attn.wo_a.scale"))?,
                 output.last().unwrap().buffer,
                 stream.raw,

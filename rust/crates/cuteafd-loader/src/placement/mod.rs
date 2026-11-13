@@ -18,6 +18,9 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 pub mod draft;
+pub mod expert_tier;
+pub mod route_trace;
+pub mod tier_cache;
 pub mod expert_usage;
 pub mod rtx_onboard;
 pub mod families;
@@ -42,6 +45,9 @@ pub use pool::{CoordinatorCard, PoolPolicy, AGENTIC_FLOOR_TOKENS};
 pub use residual::{validate_layer_pipeline_lanes, LAYER_PIPELINE_MAX_LANES, hop_buffer_bytes, plan_hops, residual_homes, Hop, HopKind, HopPoint, HopSpec, HopStorage, LayerExecutionPlan, LayerPlanError, ResidualHome, RoutedReplication, TerminalHome, Transition, HOP_SLOTS};
 pub use solve::{solve, solve_frozen, solve_with_marks, MarkSelection};
 pub use attention::{AttentionPlacement, ContextBuffers, ContextExchangeLayout, KvDemand, LayerOwnership, CONTEXT_EXCHANGES};
+pub use expert_tier::{ExpertActivation, ExpertRouteCensus, ExpertRouteProfile, ExpertTierPlacement, ExpertTierRequest,
+    ExpertTierSetting, ExpertTierShard, ExpertTierSize, ExpertTierSource, TierOrder, TierSlot, TierStepModel};
+pub use route_trace::{RouteTrace, RouteTraceLine, RouteTraceSession, RouteWindow};
 
 /// Weight residency is independent of future allocation bytes and CUDA baselines.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -98,6 +104,10 @@ pub struct PlacementRequest {
     pub tp2_workspace: [u64; 2],
     /// Which fixes the plan: the pool (`Auto`) or the RTX expert layers.
     pub onboard: Onboard,
+    /// A GPU expert tier ([`expert_tier`]): per-layer residency in place of
+    /// the whole-layer prefix (a whole layer is a tier layer at 100%). Its
+    /// size, not `onboard`, then fixes the plan.
+    pub expert_tier: Option<ExpertTierRequest>,
     /// GPUs (from GPU0) whose executors can hold whole routed layers.
     pub expert_gpus: usize,
     /// Compulsory routed prefix admitted before an automatic pool.
@@ -605,6 +615,9 @@ pub struct Placement {
     /// TP2 RTX expert halves (placement PR 4): one contiguous range of routed
     /// layers whose halves live on both GPUs, with each GPU's arena peak.
     pub tp2: Option<Tp2Range>,
+    /// The GPU expert tier, when the request asked for one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expert_tier: Option<ExpertTierPlacement>,
     /// Every item the solver charged, per GPU (fixed demands, KV records,
     /// expert arenas); the baseline's loaded bytes are not repeated here.
     pub items: Vec<Vec<Item>>,
@@ -653,6 +666,13 @@ impl Placement {
     }
 
     pub fn summary(&self) -> String {
+        match &self.expert_tier {
+            Some(tier) => format!("{}; {}", self.layer_summary(), tier.summary()),
+            None => self.layer_summary(),
+        }
+    }
+
+    fn layer_summary(&self) -> String {
         let attention = self.attention_summary();
         let counterfactual = self.max_pool_tokens_no_onboard
             .map(|maximum| format!(" (max_pool_tokens_no_onboard={maximum})")).unwrap_or_default();
@@ -739,6 +759,8 @@ pub enum PlacementError {
     Mandatory { gpu: u8, what: String },
     #[error("{requested} RTX expert layers do not fit beside the fixed demands (at most {placed})")]
     ExpertLayers { requested: usize, placed: usize },
+    #[error("{requested} GPU expert tier experts do not fit beside the fixed demands (at most {placed})")]
+    ExpertTier { requested: usize, placed: usize },
     #[error("KV pool of {pool} tokens is below the {floor}-token floor after {layers} RTX expert layers (short {short} tokens); {limits}")]
     BelowFloor { pool: u64, floor: u64, layers: usize, short: u64, limits: PoolLimits },
     #[error("Spark-free layout needs every routed layer on RTX: {placed} of {layers} fit")]

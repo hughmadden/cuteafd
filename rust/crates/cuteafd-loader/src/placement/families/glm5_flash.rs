@@ -617,12 +617,12 @@ pub(crate) mod tests {
     }
 
     pub(crate) fn inputs(cfg: &GlmNextConfig, ranks: usize, capacity: u64) -> GlmfInputs<'_> {
-        let context = ArchContext::coordinator(capacity, None).context_bytes;
+        let context = ArchContext::coordinator(cuteafd_core::GpuArch::Sm120, capacity, None).context_bytes;
         GlmfInputs { resident_weight_limit: None, spark_reply_format: cuteafd_core::SparkReplyFormat::Bf16, context: crate::placement::planner::Context::pinned(262_144),
             attention: Default::default(), cfg, layers: cfg.layers,
             gpus: (0..ranks).map(|rank| (capacity, Baseline::Planned {
                 context_bytes: context + inventory::loaded_code_allowance("glmf", "exl3", ranks == 2,
-                    rank as u8, ArchContext::for_device("sm_120", capacity), None).bytes,
+                    rank as u8, ArchContext::for_device(cuteafd_core::GpuArch::Sm120, capacity), None).bytes,
                 loaded_bytes: 0 })).collect(), pending_code: vec![0; ranks], local_tp2_exl3: false, headroom_bytes: 1 << 30,
             spark_ranks: 4, prefill_lanes: 2, prefill_rows: 4096, decode_rows: 64, partial_bytes: 2,
             max_context: 262_144, sequences: 8, speculation: true, state_slots: 8, mark_slots: 16, pool_marks: false,
@@ -1008,7 +1008,7 @@ pub(crate) mod tests {
         let programs = ProgramSet::from_names(&["glmf", "glmf2"], ["glmf_decode", "glmf2_decode"]);
         for rank in 0..2 {
             let code = inventory::loaded_code_allowance("glmf", "exl3-tp2-local", true, rank,
-                ArchContext::for_device("sm_120", inventory::PRO_TOTAL_BYTES), Some(&programs));
+                ArchContext::for_device(cuteafd_core::GpuArch::Sm120, inventory::PRO_TOTAL_BYTES), Some(&programs));
             assert_eq!(code.basis, Basis::Estimated);
             assert_eq!(code.bytes, programs.module_bytes());
             assert_eq!(code.pending(586_416_128 + 100, 586_416_128), code.bytes - 100);

@@ -20,7 +20,7 @@ impl CoordinatorCard {
     /// the architecture's default PRO class, and report that assumption.
     pub fn planned(logical_bytes: u64, physical_sms: Option<u32>) -> Self {
         let class = physical_sms.and_then(|sms| super::inventory::ARCH_CONTEXTS.iter()
-            .find(|class| class.arch == "sm_120" && class.sms == sms));
+            .find(|class| class.arch == cuteafd_core::GpuArch::Sm120 && class.sms == sms));
         let physical_bytes = class.map_or(super::inventory::PRO_TOTAL_BYTES, |class|
             if class.total_bytes == 0 { SMALL_CARD_BYTES } else { class.total_bytes });
         Self { physical_bytes, logical_bytes }

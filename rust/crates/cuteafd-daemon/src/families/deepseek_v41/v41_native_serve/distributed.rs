@@ -11,17 +11,21 @@ use crate::families::deepseek_v41::v41_target_pass::{DistributedTargetPass, Targ
 use std::rc::Rc;
 use crate::families::deepseek_v41::v41_projection_tp2::Kind;
 
+fn validate_expert_layers(layers: admission::LocalLayers,
+    tier: cuteafd_loader::placement::ExpertTierSetting) -> Result<()> {
+    // Admission resolves `all` against the inventory and validates exact pins.
+    // A tier can hold experts without pinning any complete layer.
+    if let admission::LocalLayers::Count(count) = layers {
+        let minimum = if tier.enabled() { 0 } else { 1 };
+        ensure!((minimum..=40).contains(&count), "dual RTX expert layers must be {minimum}..=40");
+    }
+    Ok(())
+}
+
 pub(super) fn worker(mut args: crate::cli::NativeServeArgs, mut receive: mpsc::Receiver<NativeRequest>,
     ready: &mut Option<oneshot::Sender<std::result::Result<(Option<std::sync::Arc<std::sync::atomic::AtomicBool>>, u32), anyhow::Error>>>,
     stats: std::sync::Arc<std::sync::Mutex<serde_json::Value>>) -> Result<()> {
-    // `all` becomes the expert inventory's exact count inside admission; this
-    // load-time floor only asserts that one routed layer stays resident.
-    match args.rtx_expert_layers {
-        admission::LocalLayers::Auto | admission::LocalLayers::All => {},
-        admission::LocalLayers::Count(count) => {
-            ensure!((1..=40).contains(&count), "dual RTX expert layers must be 1..=40");
-        }
-    };
+    validate_expert_layers(args.rtx_expert_layers, args.gpu_expert_tier)?;
     // AOT kernels keep their full scratch; row storage follows live capacity.
     let capacity = cuteafd_core::coordinator_programs::v41_live_rows(args.prefill_batch_tokens)
         .context("invalid V4.1 prefill batch")?;
@@ -40,6 +44,12 @@ pub(super) fn worker(mut args: crate::cli::NativeServeArgs, mut receive: mpsc::R
     memory_checkpoint("CUDA contexts and peer access")?;
     let catalog = cuteafd_loader::read_official_v41_catalog(&args.snapshot)?;
     cuteafd_bench::context::set_family(catalog.config().family_id());
+    let tier_ask = admission::TierAsk::of(&args, &catalog)?;
+    if tier_ask.is_some() {
+        ensure!(!args.peers.is_empty(), "--gpu-expert-tier needs Spark peers");
+        ensure!(catalog.nvfp4().is_none() && catalog.exl3().is_none() && catalog.fp8().is_none(),
+            "the GPU expert tier holds native MXFP4 expert halves");
+    }
 
     let map = CachePlacement::encoder_decoder();
     let started = Instant::now();
@@ -81,25 +91,27 @@ pub(super) fn worker(mut args: crate::cli::NativeServeArgs, mut receive: mpsc::R
     let (_, embedding_total) = devices[0].run(|| lib.cuda_memory_info())?;
     let embedding = super::admission::embedding_placement(args.embedding_placement, embedding_total);
     let target_arenas = crate::families::deepseek_v41::weight_layout::TargetArenas::new(&lib,
-        crate::families::deepseek_v41::weight_layout::target_layout(&catalog, Some(map),
+        crate::families::deepseek_v41::weight_layout::target_layout_for_arch(&catalog, Some(map),
             embedding == crate::shared::memory::EmbedPlacement::Gpu,
             crate::families::deepseek_v41::v41_tensors::fp8_head(),
-            args.tp2_query_projection, args.tp2_output_projection)?)?;
+            args.tp2_query_projection, args.tp2_output_projection, crate::shared::inventory::device_arch(&lib, 0)?)?)?;
     let recorder = crate::shared::experts::rtx::dense::Recorder::start(pushing)?;
-    let weights = BackboneLaneWeights::load_in(&lib, &catalog, 16 << 20, Some(map),
+    let mut weights = BackboneLaneWeights::load_in(&lib, &catalog, 16 << 20, Some(map),
         args.tp2_query_projection, args.tp2_output_projection, Some(&target_arenas))?;
+    // Each router counts on its attention GPU before any lane or graph exists.
+    let census = super::route_census(&lib, &args, &[0, 1], &mut weights)?;
     let query_shards=if args.tp2_query_projection {
         use crate::families::deepseek_v41::v41_projection_tp2::{Kind,Weights};
         Some([0usize,1].map(|rank| (0..40).map(|layer|
             Weights::load_in(devices[rank],&catalog,layer,Kind::QueryB,rank,
-                Weights::load_peak_device_bytes(Kind::QueryB),Some(target_arenas.get(rank as i32)?))).collect::<Result<Vec<_>>>())
+                Weights::load_peak_device_bytes(&lib, Kind::QueryB)?,Some(target_arenas.get(rank as i32)?))).collect::<Result<Vec<_>>>())
             .into_iter().collect::<Result<Vec<_>>>()?)
     } else { None };
     let output_shards=if args.tp2_output_projection {
         use crate::families::deepseek_v41::v41_projection_tp2::{Kind,Weights};
         Some([0usize,1].map(|rank| (0..40).map(|layer|
             Weights::load_in(devices[rank],&catalog,layer,Kind::OutputB,rank,
-                Weights::load_peak_device_bytes(Kind::OutputB),Some(target_arenas.get(rank as i32)?))).collect::<Result<Vec<_>>>())
+                Weights::load_peak_device_bytes(&lib, Kind::OutputB)?,Some(target_arenas.get(rank as i32)?))).collect::<Result<Vec<_>>>())
             .into_iter().collect::<Result<Vec<_>>>()?)
     } else { None };
     memory_checkpoint("attention mHC router weights")?;
@@ -247,11 +259,21 @@ pub(super) fn worker(mut args: crate::cli::NativeServeArgs, mut receive: mpsc::R
             Duration::from_secs(120),
         )
     };
-    let attention_plan = super::attention_plan(&args)?;
+    let attention_plan = super::attention_plan(&lib, 0, &args)?;
     let mut pass = make_pass(decode_rows).context("constructing first distributed decode lane")?;
     if args.tp2_attention { pass.enable_dual_attention()?; }
     let mut second = make_pass(decode_rows).context("constructing second distributed decode lane")?;
     if args.tp2_attention { second.enable_dual_attention()?; }
+    // Decode lanes only: prefill slots keep their copy-engine transfers.
+    let peer_push = crate::families::deepseek_v41::v41_peer_push::mode()?
+        == crate::families::deepseek_v41::v41_peer_push::Mode::Push;
+    tracing::info!(peer_push, "V4.1 dual decode transfers ({})", crate::families::deepseek_v41::v41_peer_push::MODE_ENV);
+    let busy_lanes = super::scheduler::busy_lanes::mode()?;
+    tracing::info!(?busy_lanes, "V4.1 busy decode lanes ({})", super::scheduler::busy_lanes::ENV);
+    if peer_push {
+        pass.enable_peer_push()?;
+        second.enable_peer_push()?;
+    }
     pass.install_expert_usage(usage.clone());
     second.install_expert_usage(usage.clone());
     memory_checkpoint("decode lanes")?;
@@ -368,6 +390,15 @@ pub(super) fn worker(mut args: crate::cli::NativeServeArgs, mut receive: mpsc::R
     let ffn_arenas = ffn_bytes(prefill_reserve as u32, capacity)? + 2 * ffn_bytes(decode_rows, decode_rows)?;
     admission::verify_expert_charges(&catalog, &args.native_lib, u32::try_from(lib.sm_count()?)?, 2, capacity,
         slots, prefill_reserve, ffn_arenas as u64)?;
+    // Each TP2 FFN's GPU expert tier (both decode lanes', the prefill
+    // slots') adds its slot tables and slots on both GPUs (the planner's
+    // `tier_lane_bytes`); its routed pair and result plane are the FFN's own,
+    // already in `ffn_arenas`.
+    let routed_shape = catalog.routed_experts();
+    let lane_bytes = |rows: u32| cuteafd_loader::placement::families::deepseek_v41::tier_lane_bytes(
+        routed_shape.layers as u64, routed_shape.experts as u64, u64::from(rows));
+    let tier_lanes = if tier_ask.is_some() { 2 * lane_bytes(decode_rows) + lane_bytes(capacity) } else { 0 };
+    let expert_workspace = ffn_arenas as u64 + tier_lanes;
     // Both Spark transport lanes live on GPU1 and reserve one wave each, sized
     // by the physical rank count.
     let spark_ranks = expert_world;
@@ -401,10 +432,36 @@ pub(super) fn worker(mut args: crate::cli::NativeServeArgs, mut receive: mpsc::R
     for slot in &mut slot_passes { slot.bind_execution_plan(&pool.placement)?; }
     let expert_layers=pool.placement.onboard_layers;
     cuteafd_bench::context::set_rtx_expert_layers(pool.placement.onboard_layers);
-    let admitted=pool.placement.tp2.context("dual RTX admission has no routed arena")?;
-    let rank_budgets=std::array::from_fn(|gpu| admitted.peak_bytes[gpu].saturating_sub(ffn_arenas as u64) as usize);
+    // The routed arena's peak less its workspace: whole TP2 layers', or the
+    // GPU expert tier's (its resident halves plus one expert's staging).
+    let peak_bytes: [u64; 2] = match (&tier_ask, &pool.placement.expert_tier) {
+        (None, _) => pool.placement.tp2.context("dual RTX admission has no routed arena")?.peak_bytes,
+        (Some(_), Some(tier)) => tier.peak_bytes.as_slice().try_into().context("a two-GPU expert tier")?,
+        (Some(_), None) => anyhow::bail!("dual RTX admission has no GPU expert tier"),
+    };
+    let rank_budgets=std::array::from_fn(|gpu| peak_bytes[gpu].saturating_sub(expert_workspace) as usize);
     tracing::info!(expert_layers,rank_peak_bytes=?rank_budgets,cache_bytes=?pool.cache_bytes,
         pool_tokens=pool.placement.pool_tokens,"shared dual RTX admission");
+    // The tier's halves load (or, pushing, record for the push group with
+    // the dense owners) before the push is planned; the push or the mount
+    // fill then delivers them with those owners.
+    let tier_loaded = match (&tier_ask, &pool.placement.expert_tier) {
+        (Some(_), Some(placed)) => {
+            use crate::families::deepseek_v41::v41_experts::tier;
+            let residency = std::sync::Arc::new(tier::TierResidency::new(routed_shape.experts, placed.resident.clone())?);
+            let charged = tier::resident_bytes(&lib, &catalog, residency.resident())?;
+            ensure!((0..2).all(|gpu| charged[gpu] as u64 == placed.resident_bytes[gpu]),
+                "GPU expert tier halves: planned {:?} B per GPU, the loader allocates {charged:?} B", placed.resident_bytes);
+            let recorder = crate::shared::experts::rtx::dense::Recorder::start(records.is_some())?;
+            let loaded = tier::load_halves(devices, &catalog, residency.resident(), rank_budgets);
+            if let (Some(records), Some(recorder)) = (records.as_mut(), recorder) { records.extend(recorder.finish()); }
+            tracing::info!(experts = residency.total(), layers = residency.resident_layers().len(),
+                resident_bytes = ?charged, pushing = records.is_some(), "GPU expert tier halves");
+            Some((residency, loaded?))
+        }
+        _ => None,
+    };
+    if tier_loaded.is_some() { memory_checkpoint("GPU expert tier halves")?; }
     let spark_plan = admission::plan_sparks(&args, &catalog, expert_layers, capacity)?;
     // Coordinator ranks join only a pushing group, planned before membership:
     // a planning error leaves them out (the Sparks still push).
@@ -429,6 +486,8 @@ pub(super) fn worker(mut args: crate::cli::NativeServeArgs, mut receive: mpsc::R
     for (rank, shard) in vocab.iter().enumerate() { devices[rank].run(|| shard.finish_push())?; }
     // Either the group committed or its records (vision included) filled through the mount.
     vision_push.commit()?;
+    // TP2 dSpark under push: its stages follow the backbone layers in the
+    // committed native arena; their views become the drafter's halves.
     let pushed = if let Some(prepared) = prepared_draft {
         let [left, right] = pushed.context("V4.1 TP2 dSpark requires committed push")?;
         let mut weights = [left.native()?, right.native()?];
@@ -437,8 +496,20 @@ pub(super) fn worker(mut args: crate::cli::NativeServeArgs, mut receive: mpsc::R
         draft_weights = Some(devices[1].own(|| prepared.into_inner().install(stages))?);
         Some(weights.map(crate::shared::experts::rtx::push::PushedExperts::Native))
     } else { pushed };
-    let routed = match pushed {
-        Some(pushed) if expert_layers > 0 => {
+    // The GPU expert tier's halves are the routed weights of a tier layout
+    // (no whole TP2 layer), delivered with the dense owners above.
+    let tier_halves = tier_loaded.map(|(residency, halves)|
+        crate::families::deepseek_v41::v41_experts::tier::TierHalves::new(residency, halves, capacity as usize))
+        .transpose()?;
+    if let Some(halves) = &tier_halves {
+        use crate::families::deepseek_v41::v41_experts::tier::TierLane;
+        let lanes = (2 * TierLane::table_bytes(&halves.residency, decode_rows)
+            + TierLane::table_bytes(&halves.residency, capacity)) as u64;
+        ensure!(lanes == tier_lanes, "GPU expert tier lanes: planned {tier_lanes} B per GPU, allocate {lanes} B");
+    }
+    let routed = match (&tier_halves, pushed) {
+        (Some(halves), _) => halves.weights.clone(),
+        (None, Some(pushed)) if expert_layers > 0 => {
             let [left, right] = pushed;
             tp2_ffn::pushed_routed_weights(devices, &catalog, expert_layers, capacity, rank_budgets,
                 [left.native()?, right.native()?])?
@@ -479,8 +550,11 @@ pub(super) fn worker(mut args: crate::cli::NativeServeArgs, mut receive: mpsc::R
     let timing = crate::families::deepseek_v41::v41_native_serve::protocol_v2_timing();
     // The prefill slots' TP2 FFN: one execution arena per GPU at the unit cap,
     // its planes at the reserve (WP7), every slot's wave on it.
-    let ffn_storage = tp2_ffn::Storage::new(routed.clone(), shared.clone(), expert_layers, prefill_reserve as u32,
-        capacity, [None, None])?;
+    let ffn_storage = match &tier_halves {
+        Some(halves) => tp2_ffn::Storage::tiered(halves, shared.clone(), prefill_reserve as u32, capacity)?,
+        None => tp2_ffn::Storage::new(routed.clone(), shared.clone(), expert_layers, prefill_reserve as u32,
+            capacity, [None, None])?,
+    };
     // Decode lanes own a link each at decode width; prefill slot 0 holds the
     // one prefill link (endpoint after the lanes'), every slot's units send on it.
     let mut decode_transport = |lane: usize| -> Result<_> {
@@ -489,8 +563,14 @@ pub(super) fn worker(mut args: crate::cli::NativeServeArgs, mut receive: mpsc::R
                 timing, world, u32::try_from(lane)?)?, wave_bytes),
             None => NativeTp4Wave::unlinked(&lib, decode_rows),
         })?;
-        transport.install_tp2(tp2_ffn::Wave::new(routed.clone(), shared.clone(), expert_layers, decode_rows,
-            [None, None])?)?;
+        let wave = match &tier_halves {
+            Some(halves) => tp2_ffn::Wave::tiered(halves, shared.clone(), decode_rows)?,
+            None => tp2_ffn::Wave::new(routed.clone(), shared.clone(), expert_layers, decode_rows, [None, None])?,
+        };
+        if peer_push { wave.enable_peer_push(decode_rows as usize)?; }
+        transport.install_tp2(wave)?;
+        // Before the link's first request (bootstrap below).
+        if tier_halves.is_some() { devices[1].run(|| transport.get_mut().enable_tier())?; }
         Ok(transport)
     };
     let [mut transport, mut second_transport] = lanes.try_map(|lane| decode_transport(lane.index()))?;
@@ -502,6 +582,9 @@ pub(super) fn worker(mut args: crate::cli::NativeServeArgs, mut receive: mpsc::R
             _ => devices[1].own(|| NativeTp4Wave::unlinked(&lib, capacity))?,
         };
         transport.install_tp2(tp2_ffn::Wave::on_storage(ffn_storage.clone()))?;
+        // Slot 0 holds the prefill link: its units leave the tier's experts
+        // to the slots' TP2 FFN (checked as a decode lane's), before bootstrap.
+        if slot == 0 && tier_halves.is_some() { devices[1].run(|| transport.get_mut().enable_tier())?; }
         Ok(transport)
     }).collect::<Result<Vec<_>>>()?;
     drop(ffn_storage);
@@ -614,7 +697,7 @@ pub(super) fn worker(mut args: crate::cli::NativeServeArgs, mut receive: mpsc::R
     crate::shared::memory_report::reconcile::capture("ready");
     let health = vision.health_handle();
     scheduler::serve(&lib, &args, &runtime, &mut receive, &mut pass, &mut second, &mut requests,
-        &mut transport, &mut second_transport, &mut prefill_slots, draft.as_mut().map(|d| d.get_mut()), &mut vision, stats, prefixes, || {
+        &mut transport, &mut second_transport, &mut prefill_slots, draft.as_mut().map(|d| d.get_mut()), &mut vision, stats, prefixes, census.as_ref(), || {
             ready.take().context("startup readiness missing")?
                 .send(Ok((health, args.max_context_tokens)))
                 .map_err(|_| anyhow::anyhow!("API startup cancelled"))
@@ -625,6 +708,22 @@ pub(super) fn worker(mut args: crate::cli::NativeServeArgs, mut receive: mpsc::R
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn whole_layer_pin_validation_allows_zero_only_with_a_tier() -> Result<()> {
+        use admission::LocalLayers::{All, Auto, Count};
+        use cuteafd_loader::placement::ExpertTierSetting::{Off, Auto as AutoTier, PerLayer};
+        for tier in [Off, AutoTier, PerLayer(6)] {
+            for layers in [Auto, All, Count(1), Count(40)] {
+                validate_expert_layers(layers, tier)?;
+            }
+            assert_eq!(validate_expert_layers(Count(0), tier).is_ok(), tier.enabled());
+            for count in [41, usize::MAX] {
+                assert!(validate_expert_layers(Count(count), tier).is_err());
+            }
+        }
+        Ok(())
+    }
+
     #[test]
     #[ignore = "requires CUTEAFD_NATIVE_LIB, CUTEAFD_SNAPSHOT, CUTEAFD_DUAL_PEERS, two GPUs and live Sparks"]
     fn distributed_worker_serves_text_requests() -> Result<()> {

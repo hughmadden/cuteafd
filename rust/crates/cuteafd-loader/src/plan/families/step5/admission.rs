@@ -481,7 +481,7 @@ pub fn forecast_mtp(checkpoint: &Checkpoint, inputs: &RuntimeInputs, depth: usiz
 }
 
 /// Includes native stage weights, private workspace, independent histories and
-/// the actual host-aware staging mark count before any live allocation.
+/// the actual budgeted device mark count before any live allocation.
 pub fn admit_mtp(checkpoint: &Checkpoint, inputs: &RuntimeInputs, depth: usize) -> Result<Admission> {
     let contract = super::coordinator::CoordinatorContract::from_checkpoint(checkpoint)?;
     admit_mtp_with_contract(checkpoint, inputs, depth, &contract)
@@ -958,7 +958,9 @@ mod tests {
             assert!(count(&candidate) < count(&base),
                 "{format:?}: predictor pressure must move CSA off the head GPU: {} vs {}",
                 count(&base), count(&candidate));
-            assert_eq!(candidate.marks, 2);
+            let mark_bytes = candidate.cache.ranks.iter().map(|r| r.bytes).sum::<u64>();
+            assert_eq!(candidate.marks as u64, cuteafd_core::prefix::mark_slots_for(
+                inputs.marks.lanes as u64, inputs.marks.entries as u64, mark_bytes, inputs.marks.budget_bytes));
             assert_eq!(candidate.cache.ranks[0].mtp_lengths.len(), 3);
             assert!(candidate.cache.ranks[1].mtp_lengths.is_empty());
             let expected = Step5CacheLayout::for_execution(&cfg, &candidate.ownership,
@@ -974,7 +976,8 @@ mod tests {
     }
 
     #[test]
-    fn host_retention_reserves_only_shared_staging_marks() -> Result<()> {
+    fn host_retention_reserves_budgeted_device_marks() -> Result<()> {
+        let (mut accepted, mut refused) = (0, 0);
         for ranks in [1, 2] {
             let mut inputs = inputs(ranks);
             inputs.context = EXTENT;
@@ -985,8 +988,27 @@ mod tests {
                 inputs.marks.entries = entries;
                 for budget in [0, 2 << 30, 32 << 30] {
                     inputs.marks.budget_bytes = budget;
-                    let admitted = run(&inputs)?;
-                    let slots = if entries == 0 { 0 } else { 2 };
+                    let admitted = match run(&inputs) {
+                        Ok(admitted) => { accepted += 1; admitted }
+                        Err(error) => {
+                            // A large retained arena may no longer leave room for the pinned
+                            // context. Host enablement must not hide that device allocation.
+                            assert_eq!(budget, 32 << 30, "ranks={ranks}, entries={entries}: {error:#}");
+                            assert!(entries > 0);
+                            inputs.marks.host = false;
+                            let device_error = run(&inputs).err().expect("the same device arena must also refuse");
+                            inputs.marks.host = true;
+                            for error in [error, device_error] {
+                                let message = format!("{error:#}");
+                                assert!(message.contains("selected context") && message.contains("cannot fit"), "{message}");
+                            }
+                            refused += 1;
+                            continue;
+                        }
+                    };
+                    let mark_bytes = admitted.cache.ranks.iter().map(|r| r.bytes).sum::<u64>();
+                    let slots = cuteafd_core::prefix::mark_slots_for(inputs.marks.lanes as u64,
+                        entries as u64, mark_bytes, budget) as usize;
                     assert_eq!(admitted.marks, slots);
                     for rank in 0..ranks {
                         assert_eq!(admitted.reservations[rank].marks as u64,
@@ -995,6 +1017,7 @@ mod tests {
                 }
             }
         }
+        assert!(accepted > 0 && refused > 0, "exercise both admitted and over-budget arenas");
         Ok(())
     }
 
@@ -1012,12 +1035,34 @@ mod tests {
             assert!(refusal.contains(message), "{refusal}");
         }
         inputs.marks.host = true;
-        // Host retention moves the marks off the device, but the full 1M
-        // context still does not fit in 50 GiB: the old planner silently
-        // clamped the pool below the request; the contract refuses instead.
+        // Host retention keeps the same budgeted device marks. The full
+        // context must refuse rather than silently clamp its pool.
         assert!(run(&inputs).is_err());
         inputs.inventory.gpus[0].baseline = Baseline::Measured { free_bytes: 96 << 30 };
-        run(&inputs)?;
+        assert!(run(&inputs).is_err());
+
+        // Price the pinned full-context pool with enough discovery capacity,
+        // then exercise its exact free-memory boundary with either tier.
+        let mut boundary = inputs.clone();
+        boundary.requested_pool = Some(EXTENT);
+        boundary.inventory.gpus[0].capacity_bytes += boundary.marks.budget_bytes;
+        boundary.inventory.gpus[0].baseline = Baseline::Measured {
+            free_bytes: boundary.inventory.gpus[0].capacity_bytes,
+        };
+        let admitted = run(&boundary)?;
+        let needed = admitted.solved.phases.iter().filter(|phase| phase.budget == "rtx0")
+            .map(|phase| phase.owned + phase.opaque).max().unwrap()
+            + boundary.inventory.gpus[0].reserve_bytes;
+        for host in [false, true] {
+            boundary.marks.host = host;
+            boundary.inventory.gpus[0].baseline = Baseline::Measured { free_bytes: needed };
+            let exact = run(&boundary)?;
+            assert_eq!(exact.placement.pool_tokens, EXTENT);
+            assert_eq!(exact.reservations, admitted.reservations);
+            assert_eq!(exact.host_cache_bytes, 0);
+            boundary.inventory.gpus[0].baseline = Baseline::Measured { free_bytes: needed - 1 };
+            assert!(run(&boundary).is_err());
+        }
         inputs.marks.host = false;
         inputs.context = FLOOR;
         inputs.serving_context = crate::placement::planner::Context::pinned(FLOOR);

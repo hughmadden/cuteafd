@@ -92,9 +92,9 @@ fn dump_max_group_plan_from_installed_headers() -> Result<()> {
     // Arm A's live pre-weight inventory: what startup measured before any
     // target weights were resident, so the solve reproduces its placement.
     let measured = vec![
-        super::startup::Measured { total_bytes: 101_973_491_712, free_bytes: 101_387_075_584,
+        super::startup::Measured { arch: cuteafd_core::GpuArch::Sm120, total_bytes: 101_973_491_712, free_bytes: 101_387_075_584,
             untracked_bytes: 586_416_128 },
-        super::startup::Measured { total_bytes: 101_970_345_984, free_bytes: 101_375_541_248,
+        super::startup::Measured { arch: cuteafd_core::GpuArch::Sm120, total_bytes: 101_970_345_984, free_bytes: 101_375_541_248,
             untracked_bytes: 594_804_736 },
     ];
     let (host_total, host_available) = cuteafd_loader::formats::mapped_preload::host_memory()?;

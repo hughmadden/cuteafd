@@ -845,6 +845,18 @@ pub fn solve(
     budgets: Vec<Budget>,
     recipe: &impl Recipe,
 ) -> Result<ResolvedPlan, Refusal> {
+    solve_with_growth(request, budgets, recipe, true, None).map(|(plan, _)| plan)
+}
+
+/// Ranked optional residency uses the same pool policy, phases and resource
+/// vectors, with pool growth delayed until its ordered prefix is fixed.
+pub(super) fn solve_with_growth(
+    request: Request,
+    budgets: Vec<Budget>,
+    recipe: &impl Recipe,
+    grow: bool,
+    frozen: Option<&[usize]>,
+) -> Result<(ResolvedPlan, Vec<usize>), Refusal> {
     let started = std::time::Instant::now();
     let mut contract = recipe.prepare(&request)?;
     contract.add_driver_page_tables();
@@ -935,6 +947,14 @@ pub fn solve(
             domain.retain(|&o| values[o] == shape);
         }
     }
+    if let Some(selected) = frozen {
+        if selected.len() != domains.len() {
+            return Err(Refusal::InvalidFact("ranked residency changed decision domains".into()));
+        }
+        for (domain, &option) in domains.iter_mut().zip(selected) {
+            domain.retain(|&candidate| candidate == option);
+        }
+    }
     if domains.iter().any(Vec::is_empty) {
         return Err(Refusal::PinConflict);
     }
@@ -1011,7 +1031,7 @@ pub fn solve(
         "priced propagated contract assignments");
     let (_, selected) = best.ok_or(search.last)?;
     // The layout is fixed; an automatic pool grows into what it leaves.
-    let pages = if matches!(request.pool, Pin::Auto) && ceiling > pages {
+    let pages = if grow && matches!(request.pool, Pin::Auto) && ceiling > pages {
         costs.limit(&budgets, &selected, pages, ceiling)?.unwrap_or(pages).max(pages)
     } else { pages };
     let decisions = contract.decisions(&selected)?;
@@ -1065,7 +1085,7 @@ pub fn solve(
             }
         }
     }
-    Ok(ResolvedPlan {
+    Ok((ResolvedPlan {
         pool_page_rows: page,
         encoder_diagnostics,
         request,
@@ -1076,5 +1096,5 @@ pub fn solve(
         budgets,
         facts,
         phases,
-    })
+    }, selected))
 }

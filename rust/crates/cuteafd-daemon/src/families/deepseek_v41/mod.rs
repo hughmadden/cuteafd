@@ -21,6 +21,7 @@ pub(crate) mod v41_index_selection;
 pub(crate) mod graph_policy;
 pub(crate) mod v41_native_serve;
 pub(crate) mod v41_golden;
+pub(crate) mod v41_peer_push;
 pub(crate) mod v41_projection_tp2;
 pub(crate) mod v41_requests;
 pub(crate) mod v41_shared_ffn;

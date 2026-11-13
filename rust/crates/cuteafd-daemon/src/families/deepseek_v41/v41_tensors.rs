@@ -1,7 +1,7 @@
 //! Official coordinator tensors retain their native checkpoint representations.
 use crate::shared::memory::Tag;
 use crate::shared::memory::{DeviceAllocation, HostAllocation, device::Device,
-    weight_arena::{DeviceWeightArena, weight_allocation}};
+    weight_arena::DeviceWeightArena};
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::{CuteafdDeviceBuffer, NativeLibrary};
 use cuteafd_loader::OfficialV41Catalog;
@@ -12,6 +12,26 @@ mod vocabulary_shard;
 pub(crate) use vocabulary_shard::VocabularyShard;
 #[cfg(test)]
 pub(crate) use vocabulary_shard::tests::packed_head_push_delivers_transient_source_before_arena_pack;
+
+/// Arena-backed operands take their exact named extent from admission. The
+/// library/header size remains authoritative for standalone conversions.
+pub(crate) fn allocation_bytes(
+    layout: Option<&cuteafd_loader::serving_capacity::WeightArenaLayout>,
+    name: &str, standalone_bytes: usize,
+) -> Result<usize> {
+    match layout {
+        Some(layout) => Ok(layout.view(name)
+            .with_context(|| format!("{} lacks weight {name}", layout.id()))?.bytes()),
+        None => Ok(standalone_bytes),
+    }
+}
+
+pub(crate) fn weight_allocation<'a>(device: Device<'a>, arena: Option<&DeviceWeightArena<'a>>,
+    name: &str, bytes: usize, standalone: ArenaTag<cuteafd_core::memory_layout::arena_class::Immutable>)
+    -> Result<crate::shared::memory::device::Allocation<'a>> {
+    let bytes = allocation_bytes(arena.map(DeviceWeightArena::layout), name, bytes)?;
+    crate::shared::memory::weight_arena::weight_allocation(device, arena, name, bytes, standalone)
+}
 
 pub(crate) fn allocation<'a>(library: &'a NativeLibrary,
     arena: Option<&DeviceWeightArena<'a>>, name: &str, bytes: usize) -> Result<DeviceAllocation<'a>> {
@@ -42,14 +62,7 @@ pub(crate) fn half(catalog: &OfficialV41Catalog, name: &str, axis: usize, rank: 
     let tensor = catalog.tensor(name)?;
     let shape = &tensor.metadata.shape;
     ensure!(shape.len() == 2 && axis < 2 && rank < 2 && shape[axis] % 2 == 0, "{name}: no TP2 half on axis {axis}");
-    let whole = rect(catalog, name, None)?;
-    Ok(if axis == 0 {
-        let half = shape[0] / 2;
-        whole.sub(rank * half..(rank + 1) * half)
-    } else {
-        let width = whole.row_bytes / 2;
-        crate::shared::experts::rtx::dense::Rect { cols: rank * width..(rank + 1) * width, ..whole }
-    })
+    rect(catalog, name, None)?.half(axis, rank)
 }
 
 pub(crate) struct NativeRtxTensors<'a> {

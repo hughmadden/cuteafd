@@ -15,6 +15,8 @@ mod roce;
 pub use roce::{SparkExpertPending, SparkExpertWave, SparkExperts, WaveReceipt};
 mod tcp;
 pub use tcp::{V41Tp4Pending, V41Tp4Tcp};
+mod coordinator_routes;
+pub use coordinator_routes::{CoordinatorRouteWord, V41_COORDINATOR_ROUTES_REQUEST_FLAG, V41_COORDINATOR_ROUTE_BIT, V41_UNASSIGNED_EXPERT_ID};
 mod topology;
 pub use topology::{SparkTopology, V41_ROUTED_EXPERTS};
 
@@ -114,6 +116,9 @@ fn validate_canonical_body(
                 .context("route count overflow")?,
         "native backbone needs top-k routes per token"
     );
+    if header.flags & V41_COORDINATOR_ROUTES_REQUEST_FLAG != 0 {
+        coordinator_routes::require_v41_geometry()?;
+    }
     for row_index in 0..header.row_count {
         let row = row_at(row_index as usize)?;
         ensure!(
@@ -127,7 +132,10 @@ fn validate_canonical_body(
         );
         let mut ids = [u32::MAX; 16];
         for slot in 0..topk {
-            let route = route_at(row_index as usize * topk + slot)?;
+            let mut route = route_at(row_index as usize * topk + slot)?;
+            if header.flags & V41_COORDINATOR_ROUTES_REQUEST_FLAG != 0 {
+                route.expert_id = CoordinatorRouteWord::decode(route.expert_id, true)?.expert_id as u32;
+            }
             ensure!(
                 route.row_index == row_index && route.expert_id < geometry.experts,
                 "invalid native expert route"
@@ -157,7 +165,7 @@ fn validate_canonical(
     ensure!(matches!(response, EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16
         | crate::EXPERT_PROTOCOL_V2_FLAG_PARTIAL_REPLIES),
         "native request requires exactly one compact BF16 or per-expert partial response agreement");
-    ensure!(header.flags & !(EXPERT_PROTOCOL_V2_FLAG_DEBUG_CHECKSUM | response | COMPRESSED_REPLY_FLAGS) == 0,
+    ensure!(header.flags & !(EXPERT_PROTOCOL_V2_FLAG_DEBUG_CHECKSUM | response | COMPRESSED_REPLY_FLAGS | V41_COORDINATOR_ROUTES_REQUEST_FLAG) == 0,
         "native complete batches cannot use legacy reduction/compression or stream flags");
     ensure!(cuteafd_core::expert_geometry().partial_replies()
         == (response == crate::EXPERT_PROTOCOL_V2_FLAG_PARTIAL_REPLIES),
@@ -241,8 +249,14 @@ impl<'a> BackboneRequest<'a> {
         );
         for index in 0..count {
             let route = self.view.route(index)?;
-            ids[index] = route.expert_id as i32;
-            weights[index] = route.gate_weight;
+            if self.view.header.flags & V41_COORDINATOR_ROUTES_REQUEST_FLAG != 0 {
+                let word = CoordinatorRouteWord::decode(route.expert_id, true)?;
+                ids[index] = if word.coordinator { V41_UNASSIGNED_EXPERT_ID } else { i32::from(word.expert_id) };
+                weights[index] = if word.coordinator { 0.0 } else { route.gate_weight };
+            } else {
+                ids[index] = route.expert_id as i32;
+                weights[index] = route.gate_weight;
+            }
         }
         Ok(())
     }
@@ -263,7 +277,7 @@ impl<'a> BackboneRequest<'a> {
             output_row_stride_bytes: if self.view.partial_replies() { 0 } else { self.output_row_bytes()? },
             output_payload_bytes: self.plane_bytes()? as u64,
             status: ExpertProtocolV2Status::Ok,
-            flags: header.flags,
+            flags: header.flags & !V41_COORDINATOR_ROUTES_REQUEST_FLAG,
             executor_id,
             pace: None,
         })

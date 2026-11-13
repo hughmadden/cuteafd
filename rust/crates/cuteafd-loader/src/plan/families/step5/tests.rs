@@ -141,7 +141,7 @@ fn full_context_mtp_forecast_charges_private_predictors_before_allocation() -> a
     let manifest: Value = serde_json::from_slice(&std::fs::read(&manifest_path)?)?;
     let programs = ProgramSet::from_manifest(&manifest, &["step5", "step52"]);
     let capacity = inventory::PRO_TOTAL_BYTES;
-    let arch = ArchContext::coordinator(capacity, None);
+    let arch = ArchContext::coordinator(cuteafd_core::GpuArch::Sm120, capacity, None);
     for kv_format in [crate::families::qwen4::Qwen4KvCache::Bf16,
         crate::families::qwen4::Qwen4KvCache::Fp8] {
         let inputs = RuntimeInputs { graph_layout: None, decode_graphs: false, bf16_target_head: crate::placement::planner::serving::BlasHead::TensorLt,
@@ -162,7 +162,9 @@ fn full_context_mtp_forecast_charges_private_predictors_before_allocation() -> a
             let admitted = admission::forecast_mtp(&cp, &inputs, depth)?;
             assert_eq!(admitted.cache.context, 1_048_576);
             assert_eq!(admitted.placement.pool_tokens, 1_048_576);
-            assert_eq!(admitted.marks, 2);
+            let mark_bytes = admitted.cache.ranks.iter().map(|r| r.bytes).sum::<u64>();
+            assert_eq!(admitted.marks as u64, cuteafd_core::prefix::mark_slots_for(
+                inputs.marks.lanes as u64, inputs.marks.entries as u64, mark_bytes, inputs.marks.budget_bytes));
             assert_eq!(admitted.cache.ranks[0].mtp_stage_hidden.len(), depth);
             assert!(admitted.cache.ranks[1].mtp_stage_hidden.is_empty());
             let planes = native::mtp_metadata_planes(inputs.unit_rows())?;

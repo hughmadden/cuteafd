@@ -767,7 +767,7 @@ impl MuseRecipe<'_> {
             || home.is_some_and(|gpu| usize::from(gpu) + 1 != self.gpus) {
             return Err(invalid("resolved draft home differs from the declared head"));
         }
-        let placement = Placement { pool_tokens: solved.pool_tokens, pool_limits: PoolLimits(vec![]),
+        let placement = Placement { expert_tier: None, pool_tokens: solved.pool_tokens, pool_limits: PoolLimits(vec![]),
             attention_placement: AttentionPlacement::Heads,
             attention_by_kind: vec![(AttentionClass::Gqa, AttentionPlacement::Heads),
                 (AttentionClass::Swa, AttentionPlacement::Heads)],

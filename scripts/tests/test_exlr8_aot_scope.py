@@ -167,7 +167,8 @@ def test_wip_artifacts_rejects_invalid_override(tmp_path):
 def test_spark_programs_manifest_is_installed_on_both_roles():
     build = (ROOT / 'scripts/build/build-wip-artifacts.sh').read_text()
     final = build[build.index('# Generic-family tables must come from this build'):]
-    condition = final[final.index('elif [['):final.index(']]; then')]
+    final = final[final.index('elif [[ ('):]
+    condition = final[:final.index(']]; then')]
     # EXLR8 on either role, and a Spark build whose expert scope has a partial-reply family.
     assert '|| "${CUTEAFD_WIP_EXLR8_AOT:-OFF}" == ON' in condition
     assert '$role" == expert' in condition and 'expert_families' in condition and 'v41_expert_aot' in condition
@@ -239,6 +240,15 @@ def test_spark_and_coordinator_program_geometry_by_scope(tmp_path):
     assert fields['GEOMETRY'] == 'glm,glm2,dense_trellis_k6,glm_stage,glm2_stage,expert_reply'
     fields, _ = _program_geometry(tmp_path, CUTEAFD_ENABLE_KIMIK3_AOT='ON', CUTEAFD_ENABLE_GLM_AOT='ON')
     assert fields['GEOMETRY'] == 'glm,glm2,kimik3,kimik31,dense_trellis_k6,kimi_split,glm_stage,glm2_stage,expert_reply'
+    # An sm_89 coordinator (V4.1) builds only the Spark reply reducers; table
+    # families, EXLR8 and partial replies stay SM120's.
+    fields, _ = _program_geometry(tmp_path, CUTEAFD_CUDA_ARCHITECTURES='89', CUTEAFD_ENABLE_V41_EXPERT_AOT='ON')
+    assert fields['GEOMETRY'] == 'expert_reply' and fields['ROLE'] == 'coordinator'
+    for flag in ('CUTEAFD_ENABLE_DSV4_AOT', 'CUTEAFD_ENABLE_GLM_AOT', 'CUTEAFD_ENABLE_EXLR8_AOT',
+                 'CUTEAFD_PARTIAL_REPLY_PROGRAMS'):
+        fields, error = _program_geometry(tmp_path, CUTEAFD_CUDA_ARCHITECTURES='89',
+                                          CUTEAFD_ENABLE_V41_EXPERT_AOT='ON', **{flag: 'ON'})
+        assert fields is None and 'an sm_89 coordinator only the Spark reply reducers' in ' '.join(error.split()), flag
 
 
 def test_exporter_forwards_role_to_the_fork_and_appends_last():
@@ -438,7 +448,7 @@ def _spark_table(tmp_path, expert_families, exlr8):
     gate = gate[:gate.index('\n')]
     switches = ['DSV4', 'GLM', 'MIMO', 'GLMF', 'QWEN4', 'QWEN_DENSE', 'STEP5', 'KIMIK3', 'MUSE']
     script = tmp_path / 'gate.cmake'
-    script.write_text(''.join(f'set(CUTEAFD_ENABLE_{name}_AOT OFF)\n' for name in switches)
+    script.write_text('cmake_minimum_required(VERSION 3.24)\n' + ''.join(f'set(CUTEAFD_ENABLE_{name}_AOT OFF)\n' for name in switches)
         + f'set(CUTEAFD_ENABLE_EXLR8_AOT {"ON" if exlr8 else "OFF"})\n'
         + f'set(CUTEAFD_EXPERT_FAMILIES "{";".join(expert_families)}")\n' + scan + '\n'
         + gate + '\n  message(STATUS "TABLE=ON PARTIAL=${CUTEAFD_PARTIAL_REPLY_PROGRAMS}")\nelse()\n'
@@ -449,7 +459,8 @@ def _spark_table(tmp_path, expert_families, exlr8):
     partial = 'PARTIAL=ON' in result.stdout + result.stderr
     build = (ROOT / 'scripts/build/build-wip-artifacts.sh').read_text()
     final = build[build.index('# Generic-family tables must come from this build'):]
-    condition = final[final.index('elif [[') + len('elif [['):final.index(']]; then')]
+    final = final[final.index('elif [[ ('): ]
+    condition = final[len('elif [['):final.index(']]; then')]
     env = {'PATH': '/usr/bin:/bin', 'role': 'expert', 'expert_families': ';'.join(expert_families),
            'CUTEAFD_WIP_EXLR8_AOT': 'ON' if exlr8 else 'OFF', 'v41_expert_aot': 'OFF'}
     shell = subprocess.run(['bash', '-c', f'if [[ {condition} ]]; then echo install; else echo none; fi'],

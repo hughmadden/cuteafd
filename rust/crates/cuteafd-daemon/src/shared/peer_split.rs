@@ -23,6 +23,8 @@ pub(crate) mod context;
 pub(crate) mod attention;
 pub(crate) mod hop;
 pub(crate) mod order;
+#[cfg(test)]
+mod push_cuda_tests;
 use cuteafd_ffi::peer_exchange::{PeerDiagnostic, PeerProgress};
 use cuteafd_ffi::NativeLibrary;
 use std::cell::{Cell, RefCell};
@@ -201,6 +203,9 @@ pub(crate) struct PeerExchange<'a> {
     library: &'a NativeLibrary,
     ranks: [RankDevice; 2],
     ends: [End<'a>; 2],
+    /// Publication flags besides [`DIRECT`]: one per receive slot, or the
+    /// count asked of [`Self::new_flags`] (which has no receive slots).
+    flags: usize,
     abort: Option<TerminalAbort<'a>>,
     decode_lane_bytes: usize,
     trace_name: Cell<&'static str>,
@@ -255,12 +260,35 @@ impl<'a> PeerExchange<'a> {
     }
 
     fn new_sized(library: &'a NativeLibrary, ranks: [RankDevice; 2], sizes: &[usize], decode_lane_bytes: usize) -> Result<Self> {
+        validate_slot_sizes(ranks.map(|rank| rank.device), sizes)?;
+        Self::with_ends(library, ranks, sizes, sizes.len(), decode_lane_bytes)
+    }
+
+    /// Device bytes [`Self::new_flags`] allocates on each GPU for `flags`
+    /// flags (without `CUTEAFD_PEER_WAIT_DIAGNOSTICS`).
+    pub fn flag_bytes(flags: usize) -> usize { ((flags + 1) * 16).max(256) }
+
+    /// Control words for `flags` publication flags (plus [`DIRECT`]) and no
+    /// receive slots: pushes land in the caller's own buffers
+    /// ([`Self::push_to_on`], [`Self::push_planes_on`]), and every operation
+    /// names its stream (the bound rank streams are null). Same preloads as
+    /// [`Self::new`]. Each flag direction must keep one sending and one
+    /// waiting stream (or streams ordered by events): sequences are per flag.
+    pub fn new_flags(library: &'a NativeLibrary, devices: [i32; 2], flags: usize, decode_lane_bytes: usize) -> Result<Self> {
+        ensure!(devices[0] != devices[1],
+            "peer flags need two different GPUs, got devices {} and {}", devices[0], devices[1]);
+        ensure!(flags > 0, "peer flags need at least one flag");
+        let ranks = devices.map(|device| RankDevice { device, stream: std::ptr::null_mut() });
+        Self::with_ends(library, ranks, &[], flags, decode_lane_bytes)
+    }
+
+    fn with_ends(library: &'a NativeLibrary, ranks: [RankDevice; 2], sizes: &[usize], flags: usize,
+        decode_lane_bytes: usize) -> Result<Self> {
         let _memory_scope = cuteafd_ffi::memory_ledger::scope("peer-split");
         validate_decode_extent(decode_lane_bytes)?;
-        let slots = sizes.len();
-        validate_slot_sizes(ranks.map(|rank| rank.device), sizes)?;
+        let slots = flags;
         let diagnostics = std::env::var("CUTEAFD_PEER_WAIT_DIAGNOSTICS").is_ok_and(|v| v == "1");
-        let storage = cuteafd_loader::serving_capacity::PeerStorageLayout::new(slots, *sizes.iter().max().context("empty peer slots")?, diagnostics)?;
+        let storage = cuteafd_loader::serving_capacity::PeerStorageLayout::new(slots, sizes.iter().copied().max().unwrap_or(1), diagnostics)?;
         let end = |rank: usize| -> Result<End<'a>> {
             on_device(library, ranks[rank].device, || {
                 library.cuda_enable_peer(ranks[1 - rank].device)?;
@@ -291,6 +319,7 @@ impl<'a> PeerExchange<'a> {
             library,
             ranks,
             ends: [end(0)?, end(1)?],
+            flags,
             abort: None,
             decode_lane_bytes,
             trace_name: Cell::new("unnamed"),
@@ -349,18 +378,18 @@ impl<'a> PeerExchange<'a> {
         if self.ends[0].progress.is_none() { return }
         for rank in 0..2 {
             let end = &self.ends[rank];
-            for flag in 0..=end.recv.len() {
+            for flag in 0..=self.flags {
                 let abort = self.abort.as_ref().map(|a| a.sides[rank].word.buffer.ptr);
                 tracing::info!(exchange = name, rank, device = self.ranks[rank].device,
                     stream = ?self.ranks[rank].stream, flag_index = flag,
-                    direct = flag == end.recv.len(), flag = ?end.flag(flag),
+                    direct = flag == self.flags, flag = ?end.flag(flag),
                     send_state = ?end.send_state(flag), receive_state = ?end.recv_state(flag),
                     abort = ?abort, "peer wait watchdog pointer map");
             }
         }
     }
 
-    fn diagnostic(&self, rank: usize, slot: usize, operation: &'static str) -> Option<PeerDiagnostic> {
+    fn diagnostic(&self, rank: usize, slot: usize, operation: &'static str, stream: *mut c_void) -> Option<PeerDiagnostic> {
         let local = self.ends[rank].progress.as_ref()?;
         let peer = self.ends[1 - rank].progress.as_ref()?;
         let issue = PEER_ISSUE.fetch_add(1, Ordering::Relaxed);
@@ -374,13 +403,13 @@ impl<'a> PeerExchange<'a> {
         // sequence. Never label this host ordinal as a publication sequence.
         tracing::info!(exchange = self.trace_name.get(), plane = ?self.ends[0].control.buffer.ptr,
             rank, slot, operation, issue, host_ordinal = ordinal, seq = "device-runtime",
-            stream = ?self.stream(rank), "peer host issue begin");
+            stream = ?stream, "peer host issue begin");
         Some(PeerDiagnostic {
             local: local.buffer.ptr.cast(), peer: peer.buffer.ptr.cast(),
             local_control: self.ends[rank].control.buffer.ptr.cast(),
             peer_control: self.ends[1 - rank].control.buffer.ptr.cast(),
-            issue, host_stream: self.stream(rank) as usize as u64,
-            rank: rank as u32, slot: slot as u32, slots: (self.ends[rank].recv.len() + 1) as u32,
+            issue, host_stream: stream as usize as u64,
+            rank: rank as u32, slot: slot as u32, slots: (self.flags + 1) as u32,
         })
     }
 
@@ -560,19 +589,27 @@ impl<'a> PeerExchange<'a> {
             .ptr)
     }
 
-    /// Bytes of each receive buffer.
+    /// Bytes of each receive buffer (0 for an exchange of flags only).
     pub fn slot_bytes(&self) -> usize {
-        self.ends[0].recv[0].buffer.bytes
+        self.ends[0].recv.first().map_or(0, |recv| recv.buffer.bytes)
     }
 
     /// Control index of `slot` ([`DIRECT`]: the one after the slots).
     fn flag_index(&self, slot: usize) -> Result<usize> {
-        let slots = self.ends[0].recv.len();
+        let slots = self.flags;
         if slot == DIRECT {
             return Ok(slots);
         }
         ensure!(slot < slots, "exchange slot {slot} of {slots}");
         Ok(slot)
+    }
+
+    /// The stream an operation of `rank` runs on: `stream` itself, which
+    /// must be live (an exchange of flags only binds no streams).
+    fn issuing(rank: usize, stream: *mut c_void) -> Result<*mut c_void> {
+        ensure!(rank < 2, "peer rank {rank}");
+        ensure!(!stream.is_null(), "peer operation of rank {rank} has no stream");
+        Ok(stream)
     }
 
     /// Queues on `from`'s stream: push `bytes` of `source` (rows final on that
@@ -601,11 +638,29 @@ impl<'a> PeerExchange<'a> {
         destination: *mut c_void,
         bytes: usize,
     ) -> Result<()> {
+        ensure!(from < 2, "peer push source rank {from}");
+        self.push_to_on(from, self.ranks[from].stream, slot, source, destination, bytes)
+    }
+
+    /// [`Self::push_to`] queued on `stream` (a stream of rank `from`'s GPU on
+    /// which `source` is final) instead of the rank's bound stream. Up to
+    /// `decode_lane_bytes` the SMs push; wider transfers copy by the sender's
+    /// copy engine and then publish a zero-byte push on the same stream.
+    pub fn push_to_on(
+        &self,
+        from: usize,
+        stream: *mut c_void,
+        slot: usize,
+        source: *const c_void,
+        destination: *mut c_void,
+        bytes: usize,
+    ) -> Result<()> {
         self.require_live()?;
+        let stream = Self::issuing(from, stream)?;
         let flag = self.flag_index(slot)?;
         tracing::trace!(from, flag, bytes, "peer push");
         let (mine, theirs) = (&self.ends[from], &self.ends[1 - from]);
-        let diagnostic = self.diagnostic(from, flag, "push");
+        let diagnostic = self.diagnostic(from, flag, "push", stream);
         // SAFETY: peer access is enabled both ways (new); the source rows are final on
         // this stream and untouched until later work on it; the destination is a live
         // buffer of the other GPU that it reads only after its matching wait.
@@ -615,13 +670,13 @@ impl<'a> PeerExchange<'a> {
             } else {
                 let buffer = |ptr, device_id| cuteafd_ffi::CuteafdDeviceBuffer { ptr, bytes, device_id, flags: 0 };
                 self.library.copy_d2d_async(buffer(destination, self.device(1 - from)),
-                    buffer(source.cast_mut(), self.device(from)), bytes, self.stream(from))?;
+                    buffer(source.cast_mut(), self.device(from)), bytes, stream)?;
                 // Publication follows the copy on the same issuing stream.
                 0
             };
             if let Some(d) = &diagnostic {
                 return self.library.peer_push_signal_diagnostic(destination, source, bytes,
-                    theirs.flag(flag), mine.send_state(flag), 0, self.stream(from), d);
+                    theirs.flag(flag), mine.send_state(flag), 0, stream, d);
             }
             self.library.peer_push_signal(
                 destination,
@@ -630,7 +685,7 @@ impl<'a> PeerExchange<'a> {
                 theirs.flag(flag),
                 mine.send_state(flag),
                 0,
-                self.ranks[from].stream,
+                stream,
             )
         });
         self.diagnostic_return(diagnostic, &result);
@@ -640,21 +695,62 @@ impl<'a> PeerExchange<'a> {
     /// Push strided planes on the source rank's stream, then publish one
     /// sequence. As with `push_to`, the caller orders destination reuse after
     /// its previous consumer, not merely after the previous publication.
+    /// Always an SM push, whatever the size (existing callers rely on it).
     pub fn push_planes(&self, from: usize, slot: usize, planes: &[cuteafd_ffi::peer_exchange::PeerPlane]) -> Result<()> {
-        self.require_live()?;
         ensure!(from < 2, "peer plane source rank {from}");
+        self.push_planes_with(from, self.ranks[from].stream, slot, planes, true)
+    }
+
+    /// [`Self::push_planes`] queued on `stream` (of rank `from`'s GPU), routed
+    /// by size like [`Self::push_to_on`]: planes totalling more than
+    /// `decode_lane_bytes` copy by the sender's copy engine, then one zero-byte
+    /// push publishes them.
+    pub fn push_planes_on(&self, from: usize, stream: *mut c_void, slot: usize,
+        planes: &[cuteafd_ffi::peer_exchange::PeerPlane]) -> Result<()> {
+        let bytes = planes.iter().try_fold(0u64, |sum, plane| plane.rows.checked_mul(plane.row_bytes)
+            .and_then(|bytes| sum.checked_add(bytes))).context("peer plane extent overflows")?;
+        let sm = crate::shared::memory::device::sm_peer_copy_for(true, usize::try_from(bytes)?, self.decode_lane_bytes);
+        self.push_planes_with(from, stream, slot, planes, sm)
+    }
+
+    fn push_planes_with(&self, from: usize, stream: *mut c_void, slot: usize,
+        planes: &[cuteafd_ffi::peer_exchange::PeerPlane], sm: bool) -> Result<()> {
+        self.require_live()?;
+        let stream = Self::issuing(from, stream)?;
         let flag = self.flag_index(slot)?;
         let (mine, theirs) = (&self.ends[from], &self.ends[1 - from]);
-        let diagnostic = self.diagnostic(from, flag, "push_planes");
+        let diagnostic = self.diagnostic(from, flag, "push_planes", stream);
+        // The copy engine moves contiguous planes from the sender's stream; a
+        // strided plane past the SM bound has no sender-side copy (the row
+        // copy is issued from the destination GPU), so it is refused.
+        ensure!(sm || planes.iter().all(|plane| plane.rows <= 1
+            || (plane.destination_pitch == plane.row_bytes && plane.source_pitch == plane.row_bytes)),
+            "strided peer planes past the {}-byte SM push bound", self.decode_lane_bytes);
         // SAFETY: callers keep every plane live and immutable through the
         // source stream's copy; the destination reads only after its wait.
         let result = self.on(from, || unsafe {
+            if !sm {
+                for plane in planes.iter().filter(|plane| plane.rows > 0) {
+                    let bytes = usize::try_from(plane.rows * plane.row_bytes)?;
+                    let buffer = |ptr: *mut c_void, device_id| cuteafd_ffi::CuteafdDeviceBuffer { ptr, bytes, device_id, flags: 0 };
+                    self.library.copy_d2d_async(buffer(plane.destination, self.device(1 - from)),
+                        buffer(plane.source.cast_mut(), self.device(from)), bytes, stream)?;
+                }
+                // Publication follows the copies on the same issuing stream.
+                let (source, destination) = (mine.control.buffer.ptr.cast_const(), theirs.control.buffer.ptr);
+                if let Some(d) = &diagnostic {
+                    return self.library.peer_push_signal_diagnostic(destination, source, 0,
+                        theirs.flag(flag), mine.send_state(flag), 0, stream, d);
+                }
+                return self.library.peer_push_signal(destination, source, 0,
+                    theirs.flag(flag), mine.send_state(flag), 0, stream);
+            }
             if let Some(d) = &diagnostic {
                 return self.library.peer_push_planes_diagnostic(planes,
-                    theirs.flag(flag), mine.send_state(flag), 0, self.stream(from), d);
+                    theirs.flag(flag), mine.send_state(flag), 0, stream, d);
             }
             self.library.peer_push_planes(planes,
-                Some((theirs.flag(flag), mine.send_state(flag))), 0, self.stream(from))
+                Some((theirs.flag(flag), mine.send_state(flag))), 0, stream)
         });
         self.diagnostic_return(diagnostic, &result);
         result
@@ -664,7 +760,13 @@ impl<'a> PeerExchange<'a> {
     /// acknowledgement orders the peer's next write after this rank's reader.
     pub fn signal(&self, from: usize, slot: usize) -> Result<()> {
         ensure!(from < 2, "peer signal source rank {from}");
-        self.push_to(from, slot, self.ends[from].control.buffer.ptr.cast_const(),
+        self.signal_on(from, self.ranks[from].stream, slot)
+    }
+
+    /// [`Self::signal`] queued on `stream` (of rank `from`'s GPU).
+    pub fn signal_on(&self, from: usize, stream: *mut c_void, slot: usize) -> Result<()> {
+        ensure!(from < 2, "peer signal source rank {from}");
+        self.push_to_on(from, stream, slot, self.ends[from].control.buffer.ptr.cast_const(),
             self.ends[1 - from].control.buffer.ptr, 0)
     }
 
@@ -688,11 +790,19 @@ impl<'a> PeerExchange<'a> {
 
     /// Queues on `at`'s stream: wait for the other GPU's next push on flag `slot`.
     pub fn wait(&self, at: usize, slot: usize) -> Result<()> {
+        ensure!(at < 2, "peer wait rank {at}");
+        self.wait_on(at, self.ranks[at].stream, slot)
+    }
+
+    /// [`Self::wait`] queued on `stream` (of rank `at`'s GPU): later work on
+    /// that stream sees the bytes of the matching push.
+    pub fn wait_on(&self, at: usize, stream: *mut c_void, slot: usize) -> Result<()> {
         self.require_live()?;
+        let stream = Self::issuing(at, stream)?;
         let flag = self.flag_index(slot)?;
         tracing::trace!(at, flag, "peer wait");
         let end = &self.ends[at];
-        let diagnostic = self.diagnostic(at, flag, "wait");
+        let diagnostic = self.diagnostic(at, flag, "wait", stream);
         // SAFETY: the flag and state are this GPU's control words; every wait is matched by a
         // push the host queues before it waits on either stream.
         let result = self.on(at, || unsafe {
@@ -700,24 +810,46 @@ impl<'a> PeerExchange<'a> {
                 let aborted = self.abort.as_ref().map_or(std::ptr::null(),
                     |a| a.sides[at].word.buffer.ptr.cast_const().cast());
                 return self.library.peer_wait_diagnostic(end.flag(flag), end.recv_state(flag),
-                    aborted, self.stream(at), d);
+                    aborted, stream, d);
             }
             match &self.abort {
                 Some(abort) => self.library.peer_wait_abortable(
                     end.flag(flag),
                     end.recv_state(flag),
                     abort.sides[at].word.buffer.ptr.cast(),
-                    self.ranks[at].stream,
+                    stream,
                 ),
                 None => self.library.peer_wait(
                     end.flag(flag),
                     end.recv_state(flag),
-                    self.ranks[at].stream,
+                    stream,
                 ),
             }
         });
         self.diagnostic_return(diagnostic, &result);
         result
+    }
+}
+
+/// One flag of a [`PeerExchange`] of flags between a transfer's two GPUs:
+/// rank 0 pushes, rank 1 waits ([`crate::shared::memory::device::PushRoute`]).
+pub(crate) struct FlagRoute<'a> {
+    exchange: PeerExchange<'a>,
+}
+
+impl<'a> FlagRoute<'a> {
+    /// `devices`: source then destination; SM pushes up to `decode_lane_bytes`.
+    pub fn new(library: &'a NativeLibrary, devices: [i32; 2], decode_lane_bytes: usize) -> Result<Self> {
+        Ok(Self { exchange: PeerExchange::new_flags(library, devices, 1, decode_lane_bytes)? })
+    }
+}
+
+impl crate::shared::memory::device::PushRoute for FlagRoute<'_> {
+    fn push(&self, stream: *mut c_void, source: *const c_void, destination: *mut c_void, bytes: usize) -> Result<()> {
+        self.exchange.push_to_on(0, stream, 0, source, destination, bytes)
+    }
+    fn wait(&self, stream: *mut c_void) -> Result<()> {
+        self.exchange.wait_on(1, stream, 0)
     }
 }
 
@@ -843,7 +975,10 @@ mod tests {
         assert!(push.contains("self.on(from, || unsafe"));
         assert!(push.contains("self.library.copy_d2d_async(buffer(destination, self.device(1 - from)),"));
         assert!(!push.contains("copy_peer_async"));
-        assert!(push.contains("buffer(source.cast_mut(), self.device(from)), bytes, self.stream(from))?"));
+        // The wide copy and its publication run on the sender's issuing stream.
+        assert!(push.contains("self.push_to_on(from, self.ranks[from].stream, slot, source, destination, bytes)"));
+        assert!(push.contains("let stream = Self::issuing(from, stream)?;"));
+        assert!(push.contains("buffer(source.cast_mut(), self.device(from)), bytes, stream)?"));
         assert!(push.find("copy_d2d_async").unwrap() < push.find("peer_push_signal(").unwrap());
     }
 

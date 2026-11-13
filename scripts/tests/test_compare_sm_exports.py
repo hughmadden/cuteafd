@@ -1376,6 +1376,81 @@ def test_default_source_root_resolves_worktree_alias_and_preserves_override(tmp_
     assert compare_sm.resolve_source_root(env={"CUTEAFD_SOURCE_ROOT": str(override)}) == override.resolve()
 
 
+def sm89_exports(tmp_path, kernels, headers=(b"same ABI\n", b"same ABI\n"), toolchain="4.6.2"):
+    """Two exports of one program on the SM89 target; kernels share a section name."""
+    left, right = exports(tmp_path, kernels=kernels)
+    for directory, header in zip((left, right), headers):
+        context = json.loads((directory / "comparison-context.json").read_text())
+        context.update(capability=[8, 9], toolchain={**context["toolchain"], "nvidia-cutlass-dsl": toolchain})
+        (directory / "comparison-context.json").write_text(json.dumps(context))
+        (directory / "test.h").write_bytes(header)
+    return left, right
+
+
+VARIATION = {"toolchain": {"nvidia-cutlass-dsl": "4.6.2"}, "programs": ["v41-fp8/test"]}
+
+
+def test_sm89_mode_exports_the_sm89_build_groups():
+    jobs = {name: (exporter, args) for name, exporter, args in compare_sm.jobs("all")}
+    assert set(compare_sm.SM89_GROUPS) <= set(jobs)
+    assert compare_sm.ARCHES["sm89"] == {"sms": (128, 114), "capability": [8, 9]}
+    # The SM120-only candidate groups are not part of an sm_89 build.
+    assert not {"v41-attention", "v41-attention-tp2"} & set(compare_sm.SM89_GROUPS)
+    assert not any(name.startswith("v41-nvfp4") for name in compare_sm.SM89_GROUPS)
+
+
+def test_sm89_recorded_variation_allows_device_code_only(tmp_path):
+    left, right = sm89_exports(tmp_path, kernels=(b"kern\x00first", b"kern\x00other"))
+    record, = compare_sm.compare(left, right, variation=VARIATION, group="v41-fp8")["programs"]
+    assert record["classification"] == "recorded-variation"
+    assert not record["cubins_identical"] and record["header_identical"]
+
+
+@pytest.mark.parametrize("change", ["unlisted", "header", "toolchain", "kernel-set"])
+def test_sm89_variation_fails_closed(tmp_path, change):
+    kernels = (b"kern\x00first", b"other\x00kern" if change == "kernel-set" else b"kern\x00other")
+    headers = (b"same ABI\n", b"changed ABI\n" if change == "header" else b"same ABI\n")
+    left, right = sm89_exports(tmp_path, kernels=kernels, headers=headers,
+                               toolchain="4.7.0" if change == "toolchain" else "4.6.2")
+    group = "v41-router" if change == "unlisted" else "v41-fp8"
+    record, = compare_sm.compare(left, right, variation=VARIATION, group=group)["programs"]
+    assert record["classification"] == "cubin-bytes"
+
+
+def test_unrecorded_device_code_variation_is_named_but_still_differs(tmp_path):
+    left, right = sm89_exports(tmp_path, kernels=(b"kern\x00first", b"kern\x00other"))
+    record, = compare_sm.compare(left, right, variation=VARIATION, group="v41-router")["programs"]
+    assert record["classification"] == "cubin-bytes" and record["variation_candidate"]
+    (tmp_path / "header").mkdir()
+    left, right = sm89_exports(tmp_path / "header", kernels=(b"kern\x00first", b"kern\x00other"),
+                               headers=(b"same ABI\n", b"changed ABI\n"))
+    record, = compare_sm.compare(left, right, variation=VARIATION, group="v41-router")["programs"]
+    assert record["classification"] == "cubin-bytes" and not record["variation_candidate"]
+
+
+def test_identical_sm89_exports_stay_identical_with_variation(tmp_path):
+    left, right = sm89_exports(tmp_path, kernels=(b"kern\x00same", b"kern\x00same"))
+    record, = compare_sm.compare(left, right, variation=VARIATION, group="v41-fp8")["programs"]
+    assert record["classification"] == "identical"
+
+
+def test_recorded_sm89_variation_names_sm89_groups():
+    record = compare_sm.read_variation(compare_sm.SM89_VARIATION)
+    assert record["toolchain"] == {"nvidia-cutlass-dsl": "4.6.2"}
+    assert all(name.split("/")[0] in compare_sm.SM89_GROUPS for name in record["programs"])
+
+
+@pytest.mark.parametrize("record", [
+    {"programs": ["v41-fp8/a"]},
+    {"toolchain": {"nvidia-cutlass-dsl": "4.6.2"}, "programs": []},
+    {"toolchain": {"nvidia-cutlass-dsl": "4.6.2"}, "programs": ["no-group"]},
+    {"toolchain": {"nvidia-cutlass-dsl": "4.6.2"}, "programs": ["v41-fp8/a", "v41-fp8/a"]},
+])
+def test_malformed_variation_is_refused(tmp_path, record):
+    path = tmp_path / "variation.json"
+    path.write_text(json.dumps(record))
+    with pytest.raises(ValueError, match="recorded variation"):
+        compare_sm.read_variation(path)
 def test_combined_exl3_reply_exports_cover_supported_geometries_without_sm_sizing():
     path = ROOT / "python/tools/aot/export_b12x_dsv4_aot.py"
     tree = ast.parse(path.read_text())
@@ -1432,14 +1507,16 @@ def test_combined_exl3_reply_export_operand_and_scalar_abi(monkeypatch):
 def test_combined_reply_reduce_export_has_runtime_geometry_and_no_scratch():
     source = (ROOT / "third_party/sparkinfer/b12x/moe/_shared/kernels/w4a16/expert_reply.py").read_text()
     tree = ast.parse(source)
-    function = next(node for node in tree.body if isinstance(node, ast.FunctionDef)
-                    and node.name == "compile_expert_reply_reduce_aot")
     record = lambda *args, **kwargs: SimpleNamespace(args=args, **kwargs)
     namespace = dict(compile_program=record, ExpertReplyReduce=lambda: "kernel",
+                     ExpertReplyReduceTier=lambda: "tier kernel",
                      Operand=record, Scalar=lambda name: name,
                      torch=SimpleNamespace(uint8="u8", bfloat16="bf16", uint32="u32"))
-    exec(compile(ast.Module(body=[function], type_ignores=[]), "reply_reduce_abi", "exec"), namespace)
-    program = namespace[function.name]()
+    names = ("compile_expert_reply_reduce_aot", "compile_expert_reply_reduce_tier_aot")
+    functions = [node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name in names]
+    assert sorted(function.name for function in functions) == sorted(names)
+    exec(compile(ast.Module(body=functions, type_ignores=[]), "reply_reduce_abi", "exec"), namespace)
+    program, tier = (namespace[name]() for name in names)
     assert program.name == "expert_reply_reduce" and program.key == ()
     assert [operand.args[0] for operand in program.operands] == [
         *(f"p{rank}" for rank in range(8)), "shared", "out", "mode"]
@@ -1447,9 +1524,26 @@ def test_combined_reply_reduce_export_has_runtime_geometry_and_no_scratch():
     assert program.geometry == dict(max_ranks=8, fp8_block=32, nvfp4_block=16,
                                     rank_rounding="bf16", accumulation="ordered_fp32")
     assert "scratch" not in vars(program)
+    # The GPU expert tier's variant: one more BF16 plane, after the ranks and
+    # before shared, with the reduce's scalars and no scratch.
+    assert tier.name == "expert_reply_reduce_tier" and tier.key == () and tier.args == ("tier kernel",)
+    assert [operand.args[0] for operand in tier.operands] == [
+        *(f"p{rank}" for rank in range(8)), "tier", "shared", "out", "mode"]
+    assert tier.operands[8].args[1:] == ("bf16", "[rows,width]")
+    assert tier.scalars == program.scalars
+    assert tier.geometry == dict(program.geometry, tier_plane="after_ranks")
+    assert "scratch" not in vars(tier)
     exporter = (ROOT / "python/tools/aot/export_b12x_dsv4_aot.py").read_text()
     assert 'work.append((name, "reduce", "expert_reply", {"max_rows": args.prefill_rows},' in exporter
     assert "compile_expert_reply_reduce_aot))" in exporter
+    # Coordinators (SM120, sm_89) add the tier variant last; an sm_89
+    # coordinator exports only the two reducers.
+    reply = exporter[exporter.index('if name == "expert_reply":'):]
+    reply = reply[:reply.index("continue")]
+    assert reply.index('"reduce"') < reply.index('"reduce_tier"')
+    assert 'if capability != (12, 1):' in reply and 'if capability != (8, 9):' in reply
+    assert 'an sm_89 coordinator exports only the expert_reply geometry' in exporter
+
 
 
 @pytest.mark.parametrize("mismatch", [False, "worker", "sources"])

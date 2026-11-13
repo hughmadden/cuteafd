@@ -2,19 +2,31 @@
 use super::resident::Fp8Head;
 use crate::{OfficialV41Catalog, SafetensorsTensorMetadata, serving_capacity::WeightArenaLayout};
 use anyhow::{ensure, Context, Result};
+use cuteafd_core::GpuArch;
 use std::collections::BTreeMap;
 
 pub struct TargetLayout { pub ranks: Vec<WeightArenaLayout> }
 impl TargetLayout {
     pub fn new(catalog: &OfficialV41Catalog, placement: Option<[usize; 40]>,
         gpu_embedding: bool, head: Fp8Head, split_query: bool, split_output: bool) -> Result<Self> {
-        Self::from_headers(catalog.tensors().iter().map(|tensor| &tensor.metadata),
-            placement, gpu_embedding, head, split_query, split_output)
+        Self::new_for_arch(catalog, placement, gpu_embedding, head, split_query, split_output, GpuArch::Sm120)
+    }
+
+    pub fn new_for_arch(catalog: &OfficialV41Catalog, placement: Option<[usize; 40]>,
+        gpu_embedding: bool, head: Fp8Head, split_query: bool, split_output: bool, arch: GpuArch) -> Result<Self> {
+        Self::from_headers_for_arch(catalog.tensors().iter().map(|tensor| &tensor.metadata),
+            placement, gpu_embedding, head, split_query, split_output, arch)
     }
 
     pub fn from_headers<'a>(tensors: impl IntoIterator<Item = &'a SafetensorsTensorMetadata>,
         placement: Option<[usize; 40]>, gpu_embedding: bool, head: Fp8Head,
         split_query: bool, split_output: bool) -> Result<Self> {
+        Self::from_headers_for_arch(tensors, placement, gpu_embedding, head, split_query, split_output, GpuArch::Sm120)
+    }
+
+    pub fn from_headers_for_arch<'a>(tensors: impl IntoIterator<Item = &'a SafetensorsTensorMetadata>,
+        placement: Option<[usize; 40]>, gpu_embedding: bool, head: Fp8Head,
+        split_query: bool, split_output: bool, arch: GpuArch) -> Result<Self> {
         let tensors: BTreeMap<_, _> = tensors.into_iter().map(|tensor| (tensor.name.as_str(), tensor)).collect();
         ensure!(placement.is_some() || !(split_query || split_output), "projection TP2 requires two target GPUs");
         ensure!(placement.as_ref().is_none_or(|map| map.iter().all(|&rank| rank < 2)), "invalid target weight placement");
@@ -62,7 +74,7 @@ impl TargetLayout {
                 insert(&mut requests[rank], name.clone(), bytes)?;
                 if name.ends_with(".weight") && tensor.dtype == cuteafd_core::DType::F8E4M3 {
                     // Grouped wo_a uses its stored group-local extent, not expanded geometry.
-                    insert(&mut requests[rank], packed_scale_name(&name), bytes / 32)?;
+                    insert(&mut requests[rank], packed_scale_name(&name), packed_scale_bytes(bytes, arch)?)?;
                 }
             }
             if placement.is_some() {
@@ -72,14 +84,14 @@ impl TargetLayout {
                         let shape = if stem == "w2" { [5120, 2304] } else { [2304, 5120] };
                         let bytes = fp8_half_bytes(&tensors, &name, shape)?;
                         insert(requests, name.clone(), bytes)?;
-                        insert(requests, packed_scale_name(&name), bytes / 32)?;
+                        insert(requests, packed_scale_name(&name), packed_scale_bytes(bytes, arch)?)?;
                     }
                     for (split, stem, shape) in [(split_query, "wq_b", [32768, 1280]), (split_output, "wo_b", [5120, 8192])] {
                         if split {
                             let name = format!("layers.{layer}.attn.{stem}.weight");
                             let bytes = fp8_half_bytes(&tensors, &name, shape)?;
                             insert(requests, name.clone(), bytes)?;
-                            insert(requests, packed_scale_name(&name), bytes / 32)?;
+                            insert(requests, packed_scale_name(&name), packed_scale_bytes(bytes, arch)?)?;
                         }
                     }
                 }
@@ -109,13 +121,22 @@ impl TargetLayout {
 
 /// Independently retired dense dSpark weights; routed experts have their own arena.
 pub fn draft_layout(catalog: &OfficialV41Catalog) -> Result<WeightArenaLayout> {
-    draft_layout_from_headers(catalog.tensors().iter().map(|tensor| &tensor.metadata))
+    draft_layout_for_arch(catalog, GpuArch::Sm120)
+}
+
+pub fn draft_layout_for_arch(catalog: &OfficialV41Catalog, arch: GpuArch) -> Result<WeightArenaLayout> {
+    draft_layout_from_headers_for_arch(catalog.tensors().iter().map(|tensor| &tensor.metadata), arch)
 }
 
 /// The one dSpark dense recipe the planner and the serving loader both charge:
 /// checkpoint headers only, so planning needs no catalog or payload read.
 pub fn draft_layout_from_headers<'a>(tensors: impl IntoIterator<Item = &'a SafetensorsTensorMetadata>)
     -> Result<WeightArenaLayout> {
+    draft_layout_from_headers_for_arch(tensors, GpuArch::Sm120)
+}
+
+pub fn draft_layout_from_headers_for_arch<'a>(tensors: impl IntoIterator<Item = &'a SafetensorsTensorMetadata>,
+    arch: GpuArch) -> Result<WeightArenaLayout> {
     let mut requests = BTreeMap::new();
     for meta in tensors {
         let name = &meta.name;
@@ -124,7 +145,7 @@ pub fn draft_layout_from_headers<'a>(tensors: impl IntoIterator<Item = &'a Safet
         insert(&mut requests, name.clone(), bytes)?;
         if name.ends_with(".weight") && meta.dtype == cuteafd_core::DType::F8E4M3
             && (!name.ends_with(".main_proj.weight") || name == "mtp.0.main_proj.weight") {
-            insert(&mut requests, packed_scale_name(name), bytes / 32)?;
+            insert(&mut requests, packed_scale_name(name), packed_scale_bytes(bytes, arch)?)?;
         }
     }
     WeightArenaLayout::new("v41/dspark/dense", requests)
@@ -154,6 +175,26 @@ pub fn vision_layout_from_headers<'a>(tensors: impl IntoIterator<Item = &'a Safe
         ensure!(tensor.dtype == cuteafd_core::DType::Bf16, "vision tensor must retain BF16: {name}");
         Ok((name, usize::try_from(tensor.byte_length)?))
     }).collect::<Result<Vec<_>>>()?)
+}
+
+/// Native matrix scale extent: SM89 packs the checkpoint's K32/N32 grid;
+/// Blackwell expands each grid element over 32 output rows.
+pub fn packed_scale_bytes(weight_bytes: usize, arch: GpuArch) -> Result<usize> {
+    let divisor = if arch == GpuArch::Sm89 { 1024 } else { 32 };
+    ensure!(weight_bytes > 0 && weight_bytes % divisor == 0, "invalid FP8 packed scale geometry");
+    Ok(weight_bytes / divisor)
+}
+
+/// Bind pre-weight facts to the coordinator's native matrix representation.
+/// Heads have their own format-specific recipes and are not matrix scale views.
+pub(crate) fn validate_packed_scales(layout: &WeightArenaLayout, arch: GpuArch) -> Result<()> {
+    for (name, scales) in layout.views() {
+        let Some(weight) = name.strip_suffix(".packed_scales") else { continue; };
+        let payload = layout.view(weight).with_context(|| format!("missing packed scale operand {weight}"))?;
+        ensure!(scales.bytes() == packed_scale_bytes(payload.bytes(), arch)?,
+            "packed scale arena differs from {arch} native matrix geometry: {name}");
+    }
+    Ok(())
 }
 
 fn fp8_half_bytes(tensors: &BTreeMap<&str, &SafetensorsTensorMetadata>, name: &str,
@@ -193,6 +234,66 @@ mod tests {
     use super::*;
     fn tensor(name: &str, dtype: cuteafd_core::DType, shape: &[usize], bytes: u64) -> SafetensorsTensorMetadata {
         SafetensorsTensorMetadata { name: name.into(), dtype, shape: shape.to_vec(), byte_offset: 0, byte_length: bytes }
+    }
+
+    fn official_dense_headers() -> Vec<SafetensorsTensorMetadata> {
+        let templates: Vec<serde_json::Value> = serde_json::from_str(include_str!(
+            "../../../families/deepseek_v41/official-v41-tensors.json")).unwrap();
+        let mut headers = Vec::new();
+        for template in templates {
+            let pattern = template["pattern"].as_str().unwrap();
+            if pattern.contains(".experts.") { continue; }
+            let mut names = vec![pattern.to_owned()];
+            for axis in template["axes"].as_array().unwrap() {
+                names = names.into_iter().flat_map(|name| axis.as_array().unwrap().iter()
+                    .map(move |i| name.replacen("{}", &i.to_string(), 1))).collect();
+            }
+            let (dtype, size) = match template["dtype"].as_str().unwrap() {
+                "BF16" => (cuteafd_core::DType::Bf16, 2),
+                "F32" => (cuteafd_core::DType::F32, 4),
+                "I8" => (cuteafd_core::DType::I8, 1),
+                "F8_E4M3" => (cuteafd_core::DType::F8E4M3, 1),
+                "F8_E8M0" => (cuteafd_core::DType::F8E8M0, 1),
+                other => panic!("unexpected official dtype {other}"),
+            };
+            let shape: Vec<usize> = template["shape"].as_array().unwrap().iter()
+                .map(|n| n.as_u64().unwrap() as usize).collect();
+            let bytes = shape.iter().product::<usize>() as u64 * size;
+            headers.extend(names.into_iter().map(|name| tensor(&name, dtype.clone(), &shape, bytes)));
+        }
+        headers
+    }
+
+    #[test]
+    fn target_and_draft_scale_views_match_each_architecture() -> Result<()> {
+        let headers = official_dense_headers();
+        for arch in [GpuArch::Sm89, GpuArch::Sm120] {
+            for split in [false, true] {
+                let target = TargetLayout::from_headers_for_arch(&headers, Some(std::array::from_fn(
+                    |layer| usize::from(layer >= 20))), false, Fp8Head::All, split, split, arch)?;
+                let draft = draft_layout_from_headers_for_arch(&headers, arch)?;
+                for arena in target.ranks.iter().chain([&draft]) {
+                    validate_packed_scales(arena, arch)?;
+                    let other = if arch == GpuArch::Sm89 { GpuArch::Sm120 } else { GpuArch::Sm89 };
+                    assert!(validate_packed_scales(arena, other).is_err());
+                    for (name, view) in arena.views() {
+                        if let Some(weight) = name.strip_suffix(".packed_scales") {
+                            let payload = arena.view(weight).unwrap().bytes();
+                            assert_eq!(view.bytes(), payload / if arch == GpuArch::Sm89 { 1024 } else { 32 },
+                                "{arch} {name}");
+                        }
+                    }
+                }
+                let shard = target.ranks[0].view("layers.0.ffn.shared_experts.w1.weight").unwrap();
+                assert_eq!(shard.bytes(), 1152 * 5120);
+                let query = target.ranks[0].view("layers.0.attn.wq_b.weight").unwrap();
+                assert_eq!(query.bytes(), (if split { 16384 } else { 32768 }) * 1280);
+                let output = target.ranks[0].view("layers.0.attn.wo_b.weight").unwrap();
+                assert_eq!(output.bytes(), (if split { 2560 } else { 5120 }) * 8192);
+            }
+        }
+        assert!(packed_scale_bytes(1025, GpuArch::Sm89).is_err());
+        Ok(())
     }
 
     #[test]

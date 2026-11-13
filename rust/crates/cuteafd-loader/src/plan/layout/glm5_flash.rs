@@ -113,7 +113,7 @@ fn layout_with_native(report: &mut PlanReport, model: &dyn super::super::FamilyM
         let attention_plan = cuteafd_core::coordinator_programs::AttentionReductionPlan::new(
             64, draft_config.as_ref().map(|(_, capacity, _)| capacity.block_rows / capacity.max_batch_sequences - 1),
             options.glm5_attention_plan_rows)?;
-        let sms = options.physical_sms.unwrap_or(placement::ArchContext::coordinator(options.rtx_bytes[0], None).sms);
+        let sms = options.physical_sms.unwrap_or(placement::ArchContext::coordinator(options.coordinator_arch, options.rtx_bytes[0], None).sms);
         let selected_manifest = manifest.map(|manifest| -> anyhow::Result<_> {
             let mut selected = manifest.clone();
             cuteafd_core::coordinator_programs::select_card_plans(&mut selected, sms)?;
@@ -253,7 +253,7 @@ fn layout_with_native(report: &mut PlanReport, model: &dyn super::super::FamilyM
             }
         }
         let draft_sms: Vec<_> = options.rtx_bytes[..ranks].iter().map(|&total|
-            options.physical_sms.unwrap_or(placement::ArchContext::coordinator(total, None).sms) as u64).collect();
+            options.physical_sms.unwrap_or(placement::ArchContext::coordinator(options.coordinator_arch, total, None).sms) as u64).collect();
         // Explicit fixture totals remain opaque: do not add inferred scratch on top.
         let mut draft_rows = None;
         let mut draft_tp2 = Vec::new();
@@ -332,19 +332,19 @@ fn layout_with_native(report: &mut PlanReport, model: &dyn super::super::FamilyM
             let runtime = if let (Some(charge), Some(manifest)) = (&native_charge, manifest) {
                 let mut set = placement::ProgramSet::from_manifest(manifest, &["glmf", "glmf2", "exlr8_glmf"]);
                 set.names.extend(charge.programs.iter().cloned()); set.names.sort(); set.names.dedup();
-                let arch = placement::ArchContext::coordinator(total, None);
+                let arch = placement::ArchContext::coordinator(options.coordinator_arch, total, None);
                 let allowance = placement::inventory::loaded_code_allowance("glmf", package,
                     ranks == 2, rank as u8, &arch, Some(&set));
                 Item::new(Category::Runtime, "context+modules", "", arch.context_bytes + allowance.bytes, allowance.basis)
             } else if let (Some(charge), Some(manifest)) = (&core_charge, manifest) {
                 let mut set = placement::ProgramSet::from_manifest(manifest, &["glmf", "glmf2"]);
                 set.names.extend(charge.programs.iter().cloned()); set.names.sort(); set.names.dedup();
-                let arch = placement::ArchContext::coordinator(total, None);
+                let arch = placement::ArchContext::coordinator(options.coordinator_arch, total, None);
                 let allowance = placement::inventory::loaded_code_allowance("glmf-k6", package,
                     ranks == 2, rank as u8, &arch, Some(&set));
                 Item::new(Category::Runtime, "context+modules", "", arch.context_bytes + allowance.bytes, allowance.basis)
-            } else { runtime_item(manifest, &program_families("glmf", ranks == 2), package, ranks == 2, rank, total) };
-            let context = placement::ArchContext::coordinator(total, None).context_bytes;
+            } else { runtime_item(manifest, &program_families("glmf", ranks == 2), package, ranks == 2, rank, options.coordinator_arch, total) };
+            let context = placement::ArchContext::coordinator(options.coordinator_arch, total, None).context_bytes;
             pending_code.push(runtime.bytes.saturating_sub(context));
             notes.push(format!("RTX{rank} selected-program code residency estimated (#1463); BLAS and mapped backings charged separately"));
             baselines.push((total, Baseline::Planned { context_bytes: context, loaded_bytes: 0 }));

@@ -29,7 +29,31 @@ pub(super) async fn drive_lanes<'s, F, G>(set: &'s LaneSet, epoch: impl Fn() -> 
     -> Result<()>
 where F: std::future::Future<Output = Result<()>>, G: std::future::Future<Output = Result<()>> {
     let control = LaneControl::start(epoch());
-    set.run(|lease| first(lease, control), |lease| second(lease, control)).await
+    // LaneSet normally keeps the first lane's error. Preserve a capture fatal
+    // from either lane even when its peer also reports an ordinary round error.
+    // Pin each native lane on the heap before adding async wrappers: carrying
+    // it by value through preserve/run/join multiplies the worker's stack frame.
+    let fatal = RefCell::new(None);
+    let result = set.run(
+        |lease| preserve_capture_failure(lease, Box::pin(first(lease, control)), &fatal),
+        |lease| preserve_capture_failure(lease, Box::pin(second(lease, control)), &fatal),
+    ).await;
+    fatal.into_inner().map_or(result, Err)
+}
+
+async fn preserve_capture_failure(lease: LaneLease<'_>,
+    future: impl std::future::Future<Output = Result<()>>,
+    fatal: &RefCell<Option<anyhow::Error>>) -> Result<()> {
+    match future.await {
+        Err(error) if super::super::prefix::capture_undrained(&error) => {
+            lease.stop();
+            fatal.borrow_mut().get_or_insert(error);
+            // Both lanes still finish through LaneSet. Its ordinary error
+            // preference cannot replace the typed fatal held by the caller.
+            Ok(())
+        }
+        result => result,
+    }
 }
 
 /// One lane's boundary bookkeeping: the call's start epoch, rounds issued and whether it retired
@@ -96,14 +120,21 @@ impl<'a, P: VerificationTarget<'a>, C: DraftChain<'a>> LaneCommit for Commit<'_,
     }
 }
 
-async fn retire_completed<M: round_failure::RoundMember, F: std::future::Future<Output = Result<()>>>(
+async fn retire_completed<M: round_failure::RoundMember, F: std::future::Future<Output = (M, Result<()>)>>(
     active: &RefCell<&mut [Option<M>]>, slots: impl IntoIterator<Item = usize>, lane: usize, round_id: u64,
+    lease: LaneLease<'_>,
     mut release: impl FnMut(M) -> F,
-) {
+) -> Result<bool> {
     for slot in slots {
+        if lease.stopping() { return Ok(false); }
         let request = active.borrow_mut()[slot].take().unwrap();
         let request_id = request.id();
-        if let Err(error) = release(request).await {
+        let (request, result) = release(request).await;
+        if let Err(error) = result {
+            if super::super::prefix::capture_undrained(&error) {
+                active.borrow_mut()[slot] = Some(request);
+                return Err(error);
+            }
             tracing::error!(lane, request_id, %error,
                 "independent lane request release failed; the serve loop continues");
         } else {
@@ -111,6 +142,9 @@ async fn retire_completed<M: round_failure::RoundMember, F: std::future::Future<
                 "independent lane request retired");
         }
     }
+    // Retirement may have yielded while the peer stopped the lane set. The
+    // caller must not select or issue a decode round after that suspension.
+    Ok(!lease.stopping())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -130,8 +164,8 @@ async fn lane<'a, P: VerificationTarget<'a>, C: DraftChain<'a>>(lease: LaneLease
                 entry.as_ref().filter(|r| retire_due(lane, r.lane(), r.finished, r.job.events.is_closed()))
                     .map(|_| slot)).collect();
             if !retired.is_empty() { control.retired(); }
-            retire_completed(active, retired, lane, round_id,
-                |request| retire(lane, request, requests, prefixes, draft)).await;
+            if !retire_completed(active, retired, lane, round_id, lease,
+                |request| retire(lane, request, requests, prefixes, draft)).await? { return Ok(()); }
             // Admission and prefill rounds run between lane sets: both lanes stop.
             let members: Vec<_> = {
                 let active = active.borrow();
@@ -247,9 +281,12 @@ async fn lane<'a, P: VerificationTarget<'a>, C: DraftChain<'a>>(lease: LaneLease
                 "independent verifier issued");
             let operation: Result<()> = async {
                 pass.set_capture(capture)?;
-                // Device-ordered passes only while the other lane is idle (two
-                // busy lanes interleave on host waits; see PLAN.md).
-                pass.set_device_order(!shared);
+                // Device-ordered passes while the other lane is idle; two busy
+                // lanes interleave on host waits, or on paced device-ordered
+                // passes (`CUTEAFD_V41_BUSY_LANES`; see PLAN.md).
+                let order = super::busy_lanes::mode()?.order(shared);
+                pass.set_device_order(order.device);
+                pass.set_pacing(order.paced);
                 // The peer lane's work would fill this lane's exchanges and evict an L2 prefetch.
                 pass.set_l2_prefetch(!shared);
                 let current = batch.as_mut().unwrap();
@@ -408,7 +445,8 @@ async fn lane<'a, P: VerificationTarget<'a>, C: DraftChain<'a>>(lease: LaneLease
 }
 
 async fn retire<'a, C: DraftChain<'a>>(lane: usize, mut request: Active<'a>, requests: &RefCell<&mut Requests<'a>>,
-    prefixes: &RefCell<&mut PrefixCache<'a>>, draft: &RefCell<Option<&mut DraftRuntime<'_, 'a, C>>>) -> Result<()> {
+    prefixes: &RefCell<&mut PrefixCache<'a>>, draft: &RefCell<Option<&mut DraftRuntime<'_, 'a, C>>>) -> (Active<'a>, Result<()>) {
+    let result = async {
     request.console_retire();
     let state = if !request.failed && requests.borrow().cache().request_id(request.lease).is_ok() {
         requests.borrow_mut().record_state(request.lease, &request.job.probe, "turn")
@@ -419,6 +457,7 @@ async fn retire<'a, C: DraftChain<'a>>(lane: usize, mut request: Active<'a>, req
     let cacheable = request.cacheable && prefixes.borrow().turn_bank_enabled()
         && requests.borrow().cache().request_id(request.lease).is_ok();
     if cacheable {
+        request.cacheable = false;
         let retained: Result<()> = async {
             let next = request.next_after_commit.as_ref().context("finished request has no retained logits")?;
             prefixes.borrow_mut().capture_session(request.job.usage.as_ref().map(|u| u.session_id().to_owned()));
@@ -442,11 +481,11 @@ async fn retire<'a, C: DraftChain<'a>>(lane: usize, mut request: Active<'a>, req
             Ok(())
         }.await;
         if let Err(error) = retained {
-            if let Err(cleanup) = prefixes.borrow_mut().abort_retain(lane, &mut requests.borrow_mut(),
-                draft.borrow_mut().as_deref_mut()) {
-                tracing::error!(%cleanup, "draining failed independent snapshot");
-            }
-            tracing::warn!(%error, "completed request prefix was not retained");
+            if super::super::prefix::capture_undrained(&error) { return Err(error); }
+            let cleanup = prefixes.borrow_mut().abort_retain(lane, &mut requests.borrow_mut(),
+                draft.borrow_mut().as_deref_mut());
+            round_failure::retained_turn(cleanup)?;
+            round_failure::retained_turn(Err(error))?;
         }
     }
     let target = requests.borrow_mut().release_if_present(request.lease);
@@ -458,6 +497,8 @@ async fn retire<'a, C: DraftChain<'a>>(lane: usize, mut request: Active<'a>, req
     let retired = target.and(speculative.map(|_| ())).and(state);
     requests.borrow_mut().mark_retired(retired.is_ok() && request.finished && !request.failed);
     retired
+    }.await;
+    (request, result)
 }
 
 /// Whether lane `lane` retires a request owned by `owner` at its boundary: a finished one, or one
@@ -497,6 +538,31 @@ pub(super) fn resume_due(rounds: u64, mut closed: impl Iterator<Item = bool>, ep
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn concrete_lane_driver_future_stays_bounded() {
+        use std::future::Future;
+        use crate::families::deepseek_v41::{v41_target_pass::{TargetPass, DistributedTargetPass},
+            v41_experts::dspark::{DsparkChain, DistributedDsparkChain}};
+        // Infer each production future's type without constructing GPU owners
+        // or polling native work. Tiny fake lanes miss this frame-size regression.
+        fn bytes<A, F: Future>(_: impl FnOnce(A) -> F) -> usize { std::mem::size_of::<F>() }
+        macro_rules! driver_bytes { ($target:ty, $chain:ty) => {
+            bytes(|(set, first, second, first_transport, second_transport, requests, active, draft, prefixes, receive, wake)|
+                super::drive_lanes(set, || 0,
+                    move |lease, control| super::lane::<$target, $chain>(
+                        lease, control, first, first_transport, requests, active, draft, prefixes, receive, wake),
+                    move |lease, control| super::lane::<$target, $chain>(
+                        lease, control, second, second_transport, requests, active, draft, prefixes, receive, wake)))
+        }; }
+        for (layout, bytes) in [
+            ("single", driver_bytes!(TargetPass<'_, '_>, DsparkChain<'_, '_>)),
+            ("distributed", driver_bytes!(DistributedTargetPass<'_, '_>, DistributedDsparkChain<'_, '_>)),
+        ] {
+            // Leave room on the default worker stack for nested poll frames,
+            // native calls and the synchronous scheduler's owners.
+            assert!(bytes <= 64 * 1024, "{layout} lane driver future occupies {bytes} bytes on the CUDA worker stack");
+        }
+    }
     use super::{boundary, drive_lanes, retire_completed, retire_due, round_failure, Boundary, LaneControl};
     use crate::shared::serve::lanes::{LaneLease, LaneSet};
     use super::admission::Wake;
@@ -682,11 +748,12 @@ mod tests {
         let mut active = [Some(first), Some(second), Some(peer)];
         let mut released = Vec::new();
         let runtime = tokio::runtime::Builder::new_current_thread().build().unwrap();
-        runtime.block_on(retire_completed(&RefCell::new(active.as_mut_slice()), [0, 1], 0, 1, |request| {
+        let set = LaneSet::default();
+        runtime.block_on(retire_completed(&RefCell::new(active.as_mut_slice()), [0, 1], 0, 1, set.lease(0), |request| {
             let id = request.id();
             released.push(id);
-            std::future::ready(if id == 1 { Err(anyhow::anyhow!("injected release failure")) } else { Ok(()) })
-        }));
+            std::future::ready((request, if id == 1 { Err(anyhow::anyhow!("injected release failure")) } else { Ok(()) }))
+        })).unwrap();
         assert_eq!(released, [1, 2], "cleanup continues after a per-request error");
         assert!(active[0].is_none() && active[1].is_none());
         assert!(!active[2].as_ref().unwrap().failed, "peer lane survives");
@@ -694,4 +761,111 @@ mod tests {
         assert!(second_output.try_recv().is_err());
         assert!(peer_output.try_recv().is_err());
     }
+    #[test]
+    fn undrained_lane_retirement_returns_owner_and_stops_before_peer_release() {
+        let (first, _, _) = round_failure::tests::active_fixture(1, 0);
+        let (second, _, _) = round_failure::tests::active_fixture(2, 0);
+        let mut active = [Some(first), Some(second)];
+        let mut calls = 0;
+        let runtime = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        let set = LaneSet::default();
+        let active = RefCell::new(active.as_mut_slice());
+        let result = runtime.block_on(retire_completed(&active, [0, 1], 0, 1, set.lease(0), |request| {
+            calls += 1;
+            let error = cuteafd_engine::prefix::PrefixError::CaptureUndrained {
+                ticket: None,
+                capture: "injected queued retention".into(), source: "draft lane pending".into(),
+            };
+            std::future::ready((request, Err(error.into())))
+        }));
+        assert!(super::super::super::prefix::capture_undrained(&result.unwrap_err()));
+        assert_eq!(calls, 1);
+        assert!(active.borrow().iter().all(Option::is_some), "both owners held for shutdown");
+    }
+
+    #[test]
+    fn suspended_peer_finishes_retirement_without_starting_another_capture_or_decode() {
+        use std::rc::Rc;
+        struct Owner { id: u64, drops: Rc<Cell<usize>> }
+        impl Drop for Owner { fn drop(&mut self) { self.drops.set(self.drops.get() + 1); } }
+        impl round_failure::RoundMember for Owner {
+            fn id(&self) -> u64 { self.id }
+            fn fail(&mut self, _: &str) { panic!("no round failure on completed peer"); }
+            fn is_done(&self) -> bool { true }
+        }
+        let runtime = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        // One case stops between retirements; the singleton case stops after
+        // the final awaited retirement, immediately before decode selection.
+        for retirements in [vec![0, 1], vec![0]] {
+            let drops = Rc::new(Cell::new(0));
+            let mut owners = [Some(Owner { id: 1, drops: drops.clone() }),
+                Some(Owner { id: 2, drops: drops.clone() }), Some(Owner { id: 3, drops: drops.clone() })];
+            let active = RefCell::new(owners.as_mut_slice());
+            let parked = Cell::new(false);
+            let issued = Cell::new(0);
+            let finished = Cell::new(0);
+            let decoded = Cell::new(0);
+            let fatals = Cell::new(0);
+            let set = LaneSet::default();
+            let result = runtime.block_on(drive_lanes(&set, || 0,
+                |_, _| async {
+                    while !parked.get() { tokio::task::yield_now().await; }
+                    fatals.set(fatals.get() + 1);
+                    Err(cuteafd_engine::prefix::PrefixError::CaptureUndrained {
+                        ticket: None, capture: "injected peer fatal".into(), source: "capture lane pending".into(),
+                    }.into())
+                },
+                |lease, _| {
+                    let (active, issued, parked, finished, decoded, drops) =
+                        (&active, &issued, &parked, &finished, &decoded, &drops);
+                    async move {
+                        if !retire_completed(active, retirements, 1, 0, lease, |request| {
+                            issued.set(issued.get() + 1);
+                            async move {
+                                parked.set(true);
+                                while !lease.stopping() { tokio::task::yield_now().await; }
+                                assert_eq!(drops.get(), 0, "the suspended retirement retains its owner");
+                                finished.set(finished.get() + 1);
+                                (request, Ok(()))
+                            }
+                        }).await? { return Ok(()); }
+                        decoded.set(decoded.get() + 1);
+                        Ok(())
+                    }
+                }));
+            assert!(super::super::super::prefix::capture_undrained(&result.unwrap_err()));
+            assert_eq!((fatals.get(), issued.get(), finished.get(), decoded.get()), (1, 1, 1, 0));
+            assert!(active.borrow()[0].is_none(), "in-flight retirement finishes and is accounted");
+            assert!(active.borrow()[1..].iter().all(Option::is_some), "unstarted owners remain for shutdown");
+            assert_eq!(drops.get(), 1);
+            drop(active);
+            drop(owners);
+            assert_eq!(drops.get(), 3, "each owner settles exactly once");
+        }
+    }
+
+    #[test]
+    fn capture_fatal_survives_a_simultaneous_peer_error_in_either_lane() {
+        use std::cell::Cell;
+        use crate::shared::serve::lanes::LaneSet;
+        let runtime = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        for fatal_lane in 0..2 {
+            let completed = Cell::new(0);
+            let outcome = |lane| {
+                completed.set(completed.get() + 1);
+                if lane == fatal_lane {
+                    Err(cuteafd_engine::prefix::PrefixError::CaptureUndrained {
+                        ticket: None,
+                        capture: "injected lane capture".into(), source: "capture lane pending".into(),
+                    }.into())
+                } else { Err(anyhow::anyhow!("ordinary peer round error")) }
+            };
+            let set = LaneSet::default();
+            let result = runtime.block_on(drive_lanes(&set, || 0,
+                |_, _| async { outcome(0) }, |_, _| async { outcome(1) }));
+            assert!(super::super::super::prefix::capture_undrained(&result.unwrap_err()));
+            assert_eq!(completed.get(), 2, "neither lane is cancelled mid-work");
+        }
+    }
+
 }

@@ -1171,7 +1171,7 @@ impl PreparedGlmf<'_> {
                 else if working.rtx_layers.contains(&layer) { if i.gpus.len() == 2 { ExpertHome::RtxTp2 } else { ExpertHome::RtxWhole { gpu: 0 } } }
                 else { ExpertHome::Spark } }).collect();
         let hop = hop_spec(i);
-        let mut placement = Placement { pool_tokens: solved.pool_tokens, pool_limits: PoolLimits(vec![]),
+        let mut placement = Placement { expert_tier: None, pool_tokens: solved.pool_tokens, pool_limits: PoolLimits(vec![]),
             attention_placement: i.attention.mode,
             attention_by_kind: vec![(AttentionClass::Dsa, i.attention.mode), (AttentionClass::Kda, AttentionPlacement::Heads)],
             peer_row_bytes: 0, onboard_layers: count, max_pool_tokens_no_onboard: None, layers,

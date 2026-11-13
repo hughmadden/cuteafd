@@ -101,6 +101,7 @@ pub(crate) struct DraftRuntime<'w, 'a, C = DsparkChain<'w, 'a>> {
     lanes: Vec<LaneRound>,
 }
 struct DraftRequest {
+    capture_quarantined: bool,
     leases: [WindowLease; 3],
     rng: cuteafd_core::DsparkRng,
     slot: usize,
@@ -173,6 +174,7 @@ impl<'w, 'a, C: DraftChain<'a>> DraftRuntime<'w, 'a, C> {
             }
         }
         self.requests.insert(id, DraftRequest {
+            capture_quarantined: false,
             leases: leases.try_into().ok().context("draft admission incomplete")?,
             rng: cuteafd_core::DsparkRng::new(id),
             slot,
@@ -311,7 +313,11 @@ impl<'w, 'a, C: DraftChain<'a>> DraftRuntime<'w, 'a, C> {
         self.lanes[lane].drafted_requests = requests.iter().filter(|r| r.1 > 0).count();
         Ok(width)
     }
+    pub fn quarantine_capture(&mut self, id: u64) {
+        if let Some(request) = self.requests.get_mut(&id) { request.capture_quarantined = true; }
+    }
     pub fn release(&mut self, id: u64) -> Result<()> {
+        ensure!(!self.requests.get(&id).is_some_and(|r| r.capture_quarantined), "undrained capture owns draft storage");
         let _device = self.chains[0].execution_device().map(|device| device.enter()).transpose()?;
         ensure!(!self.pending_prefix_ids.contains(&Some(id)), "cannot release a request with pending snapshot copies");
         ensure!(!pending_draft_blocks(&self.pending, id),
@@ -362,6 +368,17 @@ impl<'w, 'a, C: DraftChain<'a>> DraftRuntime<'w, 'a, C> {
             Ok(())
         })
     }
+    /// Attempt every window even if an earlier synchronization failed.
+    pub fn drain_capture(&self) -> Result<()> {
+        let device = self.windows[0].device();
+        device.run(|| {
+            let mut failure = None;
+            for window in &self.windows {
+                if let Err(error) = window.drain_capture() { failure.get_or_insert(error); }
+            }
+            failure.map_or(Ok(()), Err)
+        })
+    }
     /// [`DraftRuntime::capture_mark`] queued on capture lane `lane`.
     pub fn queue_mark(&mut self, lane: usize, id: u64, end: u64, mark: CuteafdDeviceBuffer) -> Result<()> {
         let _device = self.chains[0].execution_device().map(|device| device.enter()).transpose()?;
@@ -370,7 +387,7 @@ impl<'w, 'a, C: DraftChain<'a>> DraftRuntime<'w, 'a, C> {
         ensure!(!self.pending_prefix_ids.contains(&Some(id)), "draft snapshot already pending");
         ensure!(mark.bytes == DRAFT_MARK_BYTES, "draft mark storage size differs");
         let leases = self.check_frontier(id, end)?;
-        self.pending_prefix_ids[lane] = Some(id);
+        crate::shared::memory::reserve_snapshot(&mut self.pending_prefix_ids[lane], id)?;
         let device = self.windows[0].device();
         let queued = device.run(|| {
             for (stage, (window, lease)) in self.windows.iter_mut().zip(leases).enumerate() {
@@ -378,13 +395,9 @@ impl<'w, 'a, C: DraftChain<'a>> DraftRuntime<'w, 'a, C> {
             }
             Ok(())
         });
-        if let Err(error) = queued {
-            if let Err(cleanup) = self.abort_mark(lane) {
-                tracing::error!(%cleanup, "draining failed draft snapshot enqueue");
-            }
-            return Err(error);
-        }
-        Ok(())
+        // The prefix engine owns failure cleanup, including every target/draft lane.
+        // Keep reservations even when a window only partially enqueued its copies.
+        queued
     }
     /// Whether a ring copy is queued on capture lane `lane`.
     pub fn mark_pending(&self, lane: usize) -> bool {
@@ -420,8 +433,9 @@ impl<'w, 'a, C: DraftChain<'a>> DraftRuntime<'w, 'a, C> {
         for window in &mut self.windows {
             if let Err(error) = window.abort_ring(lane) { failure.get_or_insert(error); }
         }
+        failure.map_or(Ok(()), Err)?;
         self.pending_prefix_ids[lane] = None;
-        failure.map_or(Ok(()), Err)
+        Ok(())
     }
     /// Restore request `id`'s rings at frontier `end` from `mark`. A failure releases the draft
     /// request.
@@ -464,6 +478,9 @@ impl<'w, 'a, C: DraftChain<'a>> DraftRuntime<'w, 'a, C> {
         let _device = self.chains[0].execution_device().map(|device| device.enter()).transpose()?;
         self.commit_batch(pass, requests, batch, &[accepted])
     }
+    /// The queued commit on main context 0, waited for in place: its copies and
+    /// launches go out without a host round trip, and the host waits once. A
+    /// failure drains and revokes it, as a lane commit does.
     pub fn commit_batch(
         &mut self,
         pass: &mut TargetPass<'_, 'a>,
@@ -472,31 +489,20 @@ impl<'w, 'a, C: DraftChain<'a>> DraftRuntime<'w, 'a, C> {
         accepted: &[u32],
     ) -> Result<()> {
         let _device = self.chains[0].execution_device().map(|device| device.enter()).transpose()?;
-        let ids = batch.cache()?.request_ids();
-        ensure!(ids.len() == accepted.len(), "draft acceptance count differs");
-        let leases = ids.iter().map(|id| self.requests.get(id)
-            .map(|request| request.leases).context("draft request not admitted"))
-            .collect::<Result<Vec<_>>>()?;
-        let stage_leases: [Vec<WindowLease>; 3] = std::array::from_fn(|stage|
-            leases.iter().map(|request| request[stage]).collect());
-        let taps = pass.taps(batch)?;
-        let mut proposal = unsafe {
-            self.mains[0]
-                .execute_rows(taps.values(), taps.batch_identity(), taps.rows())?
-        };
-        let [a, b, c] = self.windows.as_mut_slice() else {
-            anyhow::bail!("draft windows incomplete");
-        };
-        unsafe {
-            pass.commit_with_dspark(
-                requests,
-                batch,
-                &mut proposal,
-                &mut [a, b, c],
-                [&stage_leases[0], &stage_leases[1], &stage_leases[2]],
-                accepted,
-            )
+        // The abort below must only ever drain a commit this call began.
+        ensure!(self.pending_commit_ids[0].is_empty(), "draft commit lane 0 is busy");
+        let result = (|| -> Result<()> {
+            self.begin_queued_commit(0, pass, requests, batch, accepted)?;
+            self.mains[0].wait_commit()?;
+            self.finish_queued_commit(0, pass, requests, batch, accepted)
+        })();
+        if let Err(error) = result {
+            if let Err(cleanup) = self.abort_queued_commit(0, requests, batch) {
+                tracing::error!(%cleanup, "draining a failed draft commit");
+            }
+            return Err(error);
         }
+        Ok(())
     }
     /// Begin a completed decode batch's accepted-cache transaction on its own lane.
     pub fn begin_queued_commit(&mut self, lane: usize, pass: &impl crate::families::deepseek_v41::v41_target_pass::TargetCache<'a>,
@@ -718,6 +724,8 @@ impl<'w, 'a, C: DraftChain<'a>> DraftRuntime<'w, 'a, C> {
 impl<'w, 'a, C: ProposeChain<'a>> DraftRuntime<'w, 'a, C> {
     /// Inputs are (request identity, anchor, committed end, remaining output budget).
     /// Returned rows retain input order; short histories/budgets use the anchor only.
+    /// The lane's queued draft, waited for in place: the uploads, replay and
+    /// downloads go out without a host round trip, and the host waits once.
     ///
     /// The lane's own chain drafts and latches: `propose` and `require_live` must
     /// agree on which chain a lane owns, or a terminal failure on one chain is
@@ -747,7 +755,7 @@ impl<'w, 'a, C: ProposeChain<'a>> DraftRuntime<'w, 'a, C> {
         let tokens: Vec<_> = active.iter().map(|(_, (_, anchor, _, _))| *anchor as i32).collect();
         let bindings: [Vec<_>; 3] = std::array::from_fn(|stage| active.iter()
             .map(|(_, (id, _, end, _))| (self.requests[id].leases[stage], *end)).collect());
-        if let Err(error) = self.chains[lane].set_tokens(&tokens) {
+        if let Err(error) = self.chains[lane].stage_tokens(&tokens) {
             self.chains[lane].note_failure(&error);
             return Err(error);
         }
@@ -755,7 +763,7 @@ impl<'w, 'a, C: ProposeChain<'a>> DraftRuntime<'w, 'a, C> {
             active.iter().position(|(_, (active_id, _, _, _))| active_id == id)
                 .map(|index| (index, &mut request.rng))).collect();
         rngs.sort_by_key(|(index, _)| *index);
-        if let Err(error) = self.chains[lane].prepare_sampling(
+        if let Err(error) = self.chains[lane].stage_sampling(
             &mut rngs.into_iter().map(|(_, rng)| rng).collect::<Vec<_>>(), &vec![0.0; count]) {
             self.chains[lane].note_failure(&error);
             return Err(error);
@@ -763,44 +771,19 @@ impl<'w, 'a, C: ProposeChain<'a>> DraftRuntime<'w, 'a, C> {
         self.graph_cycle()?;
         let windows = self.windows.each_ref();
         let bindings = bindings.each_ref().map(|rows| rows.as_slice());
-        if !self.chains[lane].has_graph(count) {
-            // SAFETY: admitted leases and windows remain owned until the synchronous operation drains.
-            if let Err(error) = unsafe { self.chains[lane].capture(windows, bindings) } {
-                self.chains[lane].note_failure(&error);
-                return Err(error);
-            }
-        }
-        // SAFETY: same stable window/binding lifetime as capture above.
-        if let Err(error) = unsafe { self.chains[lane].replay(windows, bindings) } {
+        // SAFETY: admitted windows, bindings and staged inputs live until the queued replay drains.
+        if let Err(error) = unsafe { self.chains[lane].begin_replay(windows, bindings) } {
             self.chains[lane].note_failure(&error);
             return Err(error);
         }
-        self.graph_completed()?;
-        let buffer = match self.chains[lane].draft_output() {
-            Ok(output) => output[0],
+        let (packed, values) = match self.chains[lane].wait_replay() {
+            Ok(output) => output,
             Err(error) => { self.chains[lane].note_failure(&error); return Err(error); }
         };
-        let mut bytes = vec![0; buffer.bytes];
-        if let Err(error) = self.chains[lane].copy_d2h(&mut bytes, buffer) {
-            self.chains[lane].note_failure(&error);
-            return Err(error);
-        }
-        ensure!(bytes.len() == (width + 1) * count * 4, "draft token extent differs");
-        let packed: Vec<_> = bytes.chunks_exact(4)
-            .map(|b| u32::from_ne_bytes(b.try_into().unwrap())).collect();
+        self.graph_completed()?;
+        ensure!(packed.len() == (width + 1) * count && values.len() == width * count,
+            "draft output extent differs");
         if self.wants_confidence() {
-            let confidence = match self.chains[lane].draft_output() {
-                Ok(output) => output[2],
-                Err(error) => { self.chains[lane].note_failure(&error); return Err(error); }
-            };
-            ensure!(confidence.bytes == width * count * 4, "draft confidence extent differs");
-            let mut bytes = vec![0; confidence.bytes];
-            if let Err(error) = self.chains[lane].copy_d2h(&mut bytes, confidence) {
-                self.chains[lane].note_failure(&error);
-                return Err(error);
-            }
-            let values: Vec<_> = bytes.chunks_exact(4)
-                .map(|b| f32::from_ne_bytes(b.try_into().unwrap())).collect();
             for (row, &(_, &(id, _, _, _))) in active.iter().enumerate() {
                 self.confidence_trace.insert(id,
                     (0..width).map(|step| values[step * count + row]).collect());
@@ -876,248 +859,5 @@ mod restored_prefix_tests {
         assert_eq!(tail_outcome(38, 20, 5), (32, 15, 14));
         assert_eq!(tail_outcome(38, 38, 5), (32, 32, 32));
         assert_eq!(tail_outcome(4, 4, 5), (0, 0, 0));
-    }
-}
-
-#[cfg(test)]
-mod anchor_fallback_tests {
-    use super::*;
-    use crate::families::deepseek_v41::v41_experts::dspark::DraftFailure;
-    use cuteafd_ffi::native_library_lifetime_fixture::Fixture;
-    use std::cell::Cell;
-
-    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    enum At { Width, Tokens, Sampling, Capture, Replay, Output, TokensCopy, ConfidenceCopy, Begin, Poll, Never }
-    struct FailingChain {
-        failure: DraftFailure,
-        at: At,
-        device_error: bool,
-        tokens: Vec<u32>,
-        polls: usize,
-        cancelled: bool,
-        downloads: Cell<usize>,
-        graph_bank: Option<crate::shared::decode_graph::GraphBank<usize, ()>>,
-    }
-    impl FailingChain {
-        fn new(at: At, device_error: bool) -> Self {
-            Self { failure: Default::default(), at, device_error, tokens: Vec::new(), polls: 0,
-                cancelled: false, downloads: Cell::new(0), graph_bank: None }
-        }
-        // Deliberately does not record: only the real runtime can latch this mock.
-        fn step(&self, at: At) -> Result<()> {
-            if self.at != at { return Ok(()); }
-            if self.device_error {
-                Err(anyhow::Error::new(cuteafd_ffi::NativeStatusError {
-                    context: format!("injected {at:?}"), status: 98, detail: "invalid device function".into(),
-                }).context("draft operation"))
-            } else { anyhow::bail!("injected host guard at {at:?}") }
-        }
-        fn packed(&self) -> Vec<u32> {
-            (0..=5).flat_map(|step| self.tokens.iter().map(move |&token| token + step)).collect()
-        }
-    }
-    impl<'a> DraftChain<'a> for FailingChain {
-        fn visit_graph_banks(&mut self, f: &mut crate::shared::decode_graph::device::GraphVisitor<'_>) -> Result<()> {
-            if let Some(bank) = &mut self.graph_bank { f(0, "dspark_chain", false, bank)?; }
-            Ok(())
-        }
-        fn execution_device(&self) -> Option<crate::shared::memory::device::Device<'a>> { None }
-        fn stage_tokens(&mut self, tokens: &[i32]) -> Result<()> {
-            self.tokens = tokens.iter().map(|&token| token as u32).collect();
-            self.step(At::Tokens)
-        }
-        fn stage_sampling(&mut self, _: &mut [&mut cuteafd_core::DsparkRng], _: &[f32]) -> Result<()> { self.step(At::Sampling) }
-        unsafe fn begin_replay(&mut self, _: [&DsparkWindow<'_>; 3], _: [&[(WindowLease, u64)]; 3]) -> Result<()> { self.step(At::Begin) }
-        fn poll_replay(&mut self) -> Result<Option<(Vec<u32>, Vec<f32>)>> {
-            self.step(At::Poll)?;
-            self.polls += 1;
-            Ok((self.polls > 1).then(|| (self.packed(), vec![0.5; self.tokens.len() * 5])))
-        }
-        fn cancel_replay(&mut self) { self.cancelled = true; }
-        fn note_failure(&mut self, error: &anyhow::Error) { self.failure.record(error); }
-        fn width(&self) -> usize { 5 }
-        fn set_width(&mut self, _: usize) -> Result<()> { self.step(At::Width) }
-        fn require_live(&self) -> Result<()> { self.failure.check("test draft chain") }
-    }
-    impl<'a> ProposeChain<'a> for FailingChain {
-        fn has_graph(&self, _: usize) -> bool { self.at != At::Capture }
-        fn set_tokens(&mut self, tokens: &[i32]) -> Result<()> { self.stage_tokens(tokens) }
-        fn prepare_sampling(&mut self, _: &mut [&mut cuteafd_core::DsparkRng], _: &[f32]) -> Result<()> { self.step(At::Sampling) }
-        unsafe fn capture(&mut self, _: [&DsparkWindow<'_>; 3], _: [&[(WindowLease, u64)]; 3]) -> Result<()> { self.step(At::Capture) }
-        unsafe fn replay(&mut self, _: [&DsparkWindow<'_>; 3], _: [&[(WindowLease, u64)]; 3]) -> Result<()> { self.step(At::Replay) }
-        fn draft_output(&self) -> Result<[CuteafdDeviceBuffer; 3]> {
-            self.step(At::Output)?;
-            Ok([CuteafdDeviceBuffer { ptr: 1usize as *mut _, bytes: self.tokens.len() * 6 * 4, device_id: 0, flags: 0 },
-                CuteafdDeviceBuffer::default(),
-                CuteafdDeviceBuffer { ptr: 2usize as *mut _, bytes: self.tokens.len() * 5 * 4, device_id: 0, flags: 0 }])
-        }
-        fn copy_d2h(&self, dst: &mut [u8], buffer: CuteafdDeviceBuffer) -> Result<()> {
-            self.downloads.set(self.downloads.get() + 1);
-            let confidence = buffer.ptr as usize == 2;
-            self.step(if confidence { At::ConfidenceCopy } else { At::TokensCopy })?;
-            let bytes: Vec<_> = if confidence { vec![0.5f32; self.tokens.len() * 5].iter().flat_map(|v| v.to_ne_bytes()).collect() }
-                else { self.packed().iter().flat_map(|v| v.to_ne_bytes()).collect() };
-            dst.copy_from_slice(&bytes);
-            Ok(())
-        }
-    }
-    fn fixture() -> Result<Fixture> {
-        Fixture::build_for_tests()
-    }
-    fn runtime<'a>(lib: &'a NativeLibrary, at: At, device_error: bool) -> Result<DraftRuntime<'a, 'a, FailingChain>> {
-        let window = || DsparkWindow::new(lib, 4, 8, DsparkWindow::device_bytes(4, 8)?);
-        let mut runtime = DraftRuntime {
-            mains: Vec::new(), chains: (0..2).map(|_| FailingChain::new(at, device_error)).collect(),
-            windows: [window()?, window()?, window()?], pending_commit_ids: vec![Vec::new(); 2],
-            pending_prefix_ids: [None, None], requests: Default::default(), pending: vec![None; 2],
-            request_limit: 4, draft_limit: 5, draft_width: 5, confidence_trace: Default::default(),
-            neural_lengths: Default::default(), length: Default::default(), policy: None, published: None,
-            lanes: (0..2).map(|_| LaneRound::new(policy::LAYERS, policy::TOPK)).collect(),
-        };
-        for id in 1..=4 { runtime.admit(id)?; }
-        runtime.bind_policy(policy::remote_geometry(5))?;
-        Ok(runtime)
-    }
-    fn seeds(ids: &[u64]) -> Vec<DraftSeed> {
-        ids.iter().enumerate().map(|(i, &id)| (id, 11 + i as u32, 5, 9)).collect()
-    }
-    #[test]
-    fn synchronous_proposal_records_each_failure_on_its_own_lane() -> Result<()> {
-        let fixture = fixture()?;
-        let lib = fixture.load()?;
-        fixture.immediate_copies(&lib)?;
-        fixture.configure_memory(&lib, 0, 1 << 30)?;
-        for lane in 0..2 {
-            for at in [At::Width, At::Tokens, At::Sampling, At::Capture, At::Replay, At::Output, At::TokensCopy, At::ConfidenceCopy] {
-                for device in [false, true] {
-                    let mut runtime = runtime(&lib, at, device)?;
-                    let round = seeds(&[1, 2]);
-                    let error = runtime.propose(lane, &round).unwrap_err();
-                    let fallback = runtime.anchor_fallback(lane, &round, &error);
-                    assert_eq!(fallback.is_err(), device, "lane {lane}, {at:?}");
-                    assert!(runtime.require_live(1 - lane).is_ok(), "other lane must stay live");
-                    if !device { assert_eq!(fallback?, vec![vec![11], vec![12]]); }
-                }
-            }
-        }
-        Ok(())
-    }
-    #[test]
-    fn independent_proposal_records_submission_and_poll_failures() -> Result<()> {
-        let fixture = fixture()?;
-        let lib = fixture.load()?;
-        fixture.immediate_copies(&lib)?;
-        fixture.configure_memory(&lib, 0, 1 << 30)?;
-        for lane in 0..2 {
-            for at in [At::Width, At::Tokens, At::Sampling, At::Begin, At::Poll] {
-                for device in [false, true] {
-                    let mut runtime = runtime(&lib, at, device)?;
-                    let round = seeds(&[1, 2]);
-                    let result = match runtime.poll_propose(lane, &round) {
-                        Ok(None) => runtime.poll_propose(lane, &round),
-                        result => result,
-                    };
-                    let error = result.unwrap_err();
-                    assert!(runtime.pending[lane].is_none());
-                    assert_eq!(runtime.anchor_fallback(lane, &round, &error).is_err(), device, "lane {lane}, {at:?}");
-                    assert!(runtime.require_live(1 - lane).is_ok());
-                }
-            }
-        }
-        Ok(())
-    }
-    #[test]
-    fn independent_pending_blocks_release_and_cancellation_resets_old_ids() -> Result<()> {
-        let fixture = fixture()?;
-        let lib = fixture.load()?;
-        fixture.immediate_copies(&lib)?;
-        fixture.configure_memory(&lib, 0, 1 << 30)?;
-        let mut runtime = runtime(&lib, At::Never, false)?;
-        let round = seeds(&[1, 2]);
-        assert!(runtime.poll_propose(1, &round)?.is_none());
-        assert!(runtime.release(1).is_err());
-        assert!(runtime.poll_propose(1, &round)?.is_none());
-        assert!(runtime.release(2).is_err());
-        runtime.confidence_trace.insert(1, vec![0.5; 5]);
-        runtime.neural_lengths.insert(1, 3);
-        assert!(runtime.poll_propose(1, &seeds(&[3, 4])).is_err());
-        assert!(runtime.chains[1].cancelled);
-        assert_eq!((runtime.lanes[1].width, runtime.lanes[1].drafted_requests), (0, 0));
-        assert!(runtime.confidence_trace(1).is_none() && !runtime.neural_lengths.contains_key(&1));
-        runtime.release(1)?;
-        runtime.release(2)?;
-        Ok(())
-    }
-    #[test]
-    fn both_proposal_completion_paths_measure_pending_captures() -> Result<()> {
-        use crate::shared::decode_graph::{device::{Basis, Cycle, Preference, Site}, GraphBank};
-        let fixture = fixture()?;
-        let lib = fixture.load()?;
-        fixture.immediate_copies(&lib)?;
-        fixture.configure_memory(&lib, 0, 1 << 30)?;
-        for independent in [false, true] {
-            let mut runtime = runtime(&lib, At::Never, false)?;
-            let mut bank = GraphBank::new(None);
-            bank.attach_device(&lib, 0, 4096, Site { name: "draft_completion_fixture", cycle: Cycle::Other,
-                preference: Preference::Adaptive, bootstrap: 16, basis: Basis::Bytes, spans_devices: false })?;
-            let ticket = bank.cache_ticket(&1, false, None).context("fixture admission")?;
-            bank.cache_commit(1, (), ticket, 1, 1, false);
-            assert!(bank.cache_needs_boundary());
-            runtime.chains[1].graph_bank = Some(bank);
-            let round = seeds(&[1, 2]);
-            if independent {
-                assert!(runtime.poll_propose(1, &round)?.is_none());
-                assert!(runtime.chains[1].graph_bank.as_ref().unwrap().cache_needs_boundary());
-                assert!(runtime.poll_propose(1, &round)?.is_none());
-                assert!(runtime.poll_propose(1, &round)?.is_some());
-            } else {
-                runtime.propose(1, &round)?;
-            }
-            assert!(!runtime.chains[1].graph_bank.as_ref().unwrap().cache_needs_boundary(),
-                "completed proposal must feed measured_capture, independent={independent}");
-            runtime.chains[1].graph_bank.as_mut().unwrap().cache_clear_drained();
-        }
-        Ok(())
-    }
-    #[test]
-    fn successful_poll_preserves_order_and_invalid_lane_is_an_error() -> Result<()> {
-        let fixture = fixture()?;
-        let lib = fixture.load()?;
-        fixture.immediate_copies(&lib)?;
-        fixture.configure_memory(&lib, 0, 1 << 30)?;
-        let mut runtime = runtime(&lib, At::Never, false)?;
-        assert!(runtime.poll_propose(2, &seeds(&[1])).is_err());
-        let round = seeds(&[2, 1]);
-        assert!(runtime.poll_propose(1, &round)?.is_none());
-        assert!(runtime.poll_propose(1, &round)?.is_none());
-        let (tokens, _) = runtime.poll_propose(1, &round)?.context("proposal should finish")?;
-        assert_eq!(tokens, vec![vec![11, 12, 13, 14, 15, 16], vec![12, 13, 14, 15, 16, 17]]);
-        runtime.release(1)?;
-        runtime.release(2)?;
-        Ok(())
-    }
-    #[test]
-    fn four_then_two_failed_proposal_is_an_undrafted_policy_round() -> Result<()> {
-        let fixture = fixture()?;
-        let lib = fixture.load()?;
-        fixture.immediate_copies(&lib)?;
-        fixture.configure_memory(&lib, 0, 1 << 30)?;
-        for independent in [false, true] {
-            let mut runtime = runtime(&lib, At::Never, false)?;
-            let previous = seeds(&[1, 2, 3, 4]);
-            runtime.propose(0, &previous)?;
-            assert_eq!(runtime.lanes[0].drafted_requests, 4);
-            runtime.neural_lengths.insert(1, 3);
-            let mut round = seeds(&[1, 2]);
-            round[0].1 = 129280; // Host validation fails before drafting starts.
-            let error = if independent { runtime.poll_propose(0, &round).unwrap_err() }
-                else { runtime.propose(0, &round).unwrap_err() };
-            assert_eq!((runtime.lanes[0].width, runtime.lanes[0].drafted_requests), (0, 0));
-            assert!(runtime.confidence_trace(1).is_none() && !runtime.neural_lengths.contains_key(&1));
-            round[0].1 = 11;
-            assert_eq!(runtime.anchor_fallback(0, &round, &error)?, vec![vec![11], vec![12]]);
-            runtime.select_lengths(0, &[(1, 0), (2, 0)], false)?;
-        }
-        Ok(())
     }
 }

@@ -596,7 +596,7 @@ mod tests {
             "step52_swa_attention", "glm_hidden_norm"];
         let manifest = serde_json::json!({"programs": names.iter()
             .map(|name| serde_json::json!({"name": name})).collect::<Vec<_>>()});
-        let arch = ArchContext::for_device("sm_120", 96 << 30);
+        let arch = ArchContext::for_device(cuteafd_core::GpuArch::Sm120, 96 << 30);
         for split in [false, true] {
             let prefixes = program_prefixes(split);
             let offline = ProgramSet::from_manifest(&manifest, prefixes);

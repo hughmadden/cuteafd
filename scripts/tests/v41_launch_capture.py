@@ -329,7 +329,8 @@ def normalize(value: str, root: Path) -> str:
 
 
 def capture(launcher_root: Path, case: str, *, release_entry: dict | None = None,
-            launcher_source: Path | None = None, dry_run: bool = False, site_hub: bool = False) -> dict:
+            launcher_source: Path | None = None, dry_run: bool = False, site_hub: bool = False,
+            operator_env: dict | None = None) -> dict:
     """Run LAUNCHER_ROOT/run.sh for one case; return the recorded serving containers.
 
     A non-zero exit (unknown key, unused key, bad value) raises RuntimeError
@@ -431,7 +432,8 @@ def capture(launcher_root: Path, case: str, *, release_entry: dict | None = None
                "CUTEAFD_CDI_CHECK": "on", "CUTEAFD_CDI_SPECS": str(spec),
                "CUTEAFD_GPU_POWERD_DIR": str(powerd),
                "CUTEAFD_RELEASE_READY_TIMEOUT_SECONDS": "30", "TMPDIR": str(root),
-               "LANG": "C.UTF-8", "USER": "test-user" if release_entry else "tj", "LOGNAME": "test-user" if release_entry else "tj"}
+               "LANG": "C.UTF-8", "USER": "test-user" if release_entry else "tj", "LOGNAME": "test-user" if release_entry else "tj",
+               **(operator_env or {})}
         args = ["--config", str(config), "--dry-run" if dry_run else "--restart"]
         if case in KIT_CARDS:
             args += ["--wip", WIP_SLOT]

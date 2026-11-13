@@ -8,6 +8,7 @@ without a GPU so they can run before any export/build lease.
 from __future__ import annotations
 
 import ast
+import os
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -393,18 +394,22 @@ def test_decode_width_recipe_uses_wide_arithmetic_for_m1() -> None:
 
 
 
-def test_output_decode_recipe_uses_unsplit_m16_for_every_capacity() -> None:
+def test_output_decode_recipe_uses_unsplit_m16_for_every_capacity(monkeypatch) -> None:
     source = ROOT / "python/tools/aot/export_b12x_v41_fp8_aot.py"
     tree = ast.parse(source.read_text())
-    body = next(node.body for node in ast.walk(tree)
-                if isinstance(node, ast.If) and isinstance(node.test, ast.Name)
-                and node.test.id == "fixed_output")
-    recipe = compile(ast.Module(body=body, type_ignores=[]), str(source), "exec")
-    for capacity in (1, 16, 80):
-        namespace = {"capacity": capacity, "expected_m": capacity}
-        exec(recipe, namespace)
-        assert namespace["expected_m"] == 16
+    function = next(node for node in tree.body
+                    if isinstance(node, ast.FunctionDef) and node.name == "expected_rows")
+    namespace = {"os": os}
+    exec(compile(ast.Module(body=[function], type_ignores=[]), str(source), "exec"), namespace)
+    monkeypatch.delenv("CUTEAFD_EXPORT_NARROW_AOT", raising=False)
+    for name, n in (("o_b", 5120), ("o_b_tp2", 2560)):
+        for capacity in (1, 16, 80):
+            for sms in (114, 128, 170, 188):
+                assert namespace["expected_rows"](name, capacity, 8192, n, 1, sms) == 16
+    assert namespace["expected_rows"]("o_b", 256, 8192, 5120, 1, 188) == 256
+    assert namespace["expected_rows"]("q_a", 80, 5120, 1280, 1, 114) == 80
     text = source.read_text()
+    assert 'fixed_output = name in ("o_b", "o_b_tp2") and capacity <= 80' in text
     assert "if fixed_output and split_k != 1:" in text
     assert "'all_rows': fixed_output or capacity == 1" in text
 

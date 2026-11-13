@@ -939,7 +939,7 @@ mod tests {
         let library = unsafe { NativeLibrary::load(&args.native_lib)? };
         let programs = library.programs()?.with_manifest(&args.manifest)?;
         let capacity = placement::inventory::PRO_TOTAL_BYTES;
-        let arch = placement::inventory::ArchContext::coordinator(capacity, None);
+        let arch = placement::inventory::ArchContext::coordinator(cuteafd_core::GpuArch::Sm120, capacity, None);
         let selected = ProgramSet::from_names(&["step5", "step52"], programs.names());
         let mut inputs = RuntimeInputs { graph_layout: None, decode_graphs: false, bf16_target_head: crate::shared::target_head::TargetHead::configured().blas_head(true),
             host: Default::default(), resident_weight_limit: None, spark_reply_format: cuteafd_core::SparkReplyFormat::Bf16,

@@ -30,6 +30,8 @@ default-off performance lever adds its row here in the same PR (AGENTS.md).
 | `GLM5_FLASH_KDA_FP8` | GLM Flash | `GLM5_FLASH_KDA_FP8=row128` or `channel` (unset/auto = off) | Converts BF16 KDA projections outside a metadata-selected native stage to one resident E4M3 copy; MC-selected q/k/v/o already use block FP8 and need no extra key. Prior 1 RTX + 2 Sparks, with FP8 head and drafter: C4 code 113.8 to 131.8 tok/s; MC original unmeasured. | Prior top-1 89.1% to 85.7%; six-row verify/decode KL 0.0056 to 0.0121 nat. Does not change KV dtype. |
 | `GLM5_FLASH_FP8_PREFILL` | GLM Flash | Add `kda-in` / `kda-o` to the default `mla,ffn` list; requires FP8 KDA weights (MC view or explicit key) | Adds W8A8 KDA prefill passes over already-FP8 weights. Unmeasured. Default MLA/shared-FFN passes likewise apply only to vendor FP8 or metadata/explicitly converted weights; they are a no-op on BF16 original/MC original operands. | FP8 activation quantization; this setting never converts BF16 target weights. |
 | `SPARK_PREFILL_REPLY_FORMAT` | V4.1, V4, GLM 5.3 / ML4, GLM Flash, MiMo, Qwen4, Kimi K3, Step-5, Muse | `SPARK_PREFILL_REPLY_FORMAT=fp8` or `nvfp4` (unset = BF16; release builds only) | Spark expert partials return compressed instead of BF16: fewer exchange bytes per prefill wave. Unmeasured. | Reply values at FP8/NVFP4 precision instead of BF16. |
+| `GPU_EXPERT_TIER` | V4.1 | `GPU_EXPERT_TIER=auto` or count | Unmeasured; offloads frequent experts from Sparks to the coordinator pair. | Resident GPU weights and BF16 replies required; checkpoint numerics preserved. |
+| `SPARK_REPLY_FORMAT` | V4.1, V4, GLM 5.3 / ML4, GLM Flash, MiMo, Qwen4, Kimi K3, Step-5, Muse | `SPARK_REPLY_FORMAT=fp8` or `nvfp4` | Unmeasured; compresses both prefill and decode replies. | FP8/NVFP4 precision; GPU expert tiers require BF16. |
 | `SPARK_DECODE_REPLY_FORMAT` | V4.1, V4, GLM 5.3 / ML4, GLM Flash, MiMo, Qwen4, Kimi K3, Step-5, Muse | `SPARK_DECODE_REPLY_FORMAT=fp8` or `nvfp4` (unset = BF16; release builds only) | Spark expert partials return compressed instead of BF16: fewer exchange bytes per decode wave. Unmeasured. | Reply values at FP8/NVFP4 precision instead of BF16. |
 | `ENGRAM_WARM` | V4.1 | `ENGRAM_WARM=on` (unset = off) | After readiness, reads both Engram tables into page cache on a background thread so per-token table reads hit RAM on stores with slow random reads. Unmeasured. | Host page cache equal to the table bytes (about 203 GB for the official checkpoint), reclaimable; skipped when free memory is below the tables plus 16 GiB. |
 
@@ -158,6 +160,11 @@ support draft/MTP comparisons or `--save-logits`.
 | `ENGRAM_WARM` | `off` | `on`, `off` | V4.1 only: read both Engram tables into page cache after readiness. |
 | `CUDA_MODULE_LOADING` | CUDA default (`LAZY`) | `LAZY`, `EAGER` | V4.1 only; `EAGER` costs startup time and memory, avoids first-shape hangs. |
 | `SPARK_INTAKE` | `auto` | `auto`, `gpu`, `pinned`, `host` | How routed partials reach the coordinator GPU. |
+| `SPARK_STAGING` | `auto` | `auto`, `sm`, `copy-engine` | Request staging into the pinned send arena; auto uses the startup probe. |
+| `SPARK_LANDING` | engine `sm` | `auto`, `sm`, `copy-engine` | Reply landing path on the coordinator. |
+| `SPARK_REPLY_FORMAT` | unset (BF16 on SM89) | `bf16`, `fp8`, `nvfp4` | Supplies both phase reply formats; explicit phase keys override it. GPU expert tiers require BF16 replies. SM89 compression needs codec exports. |
+| `GPU_EXPERT_TIER` | `off` | `off`, `auto`, expert count | V4.1 ranked experts resident as TP2 halves on two coordinator GPUs; remaining experts run on Sparks. |
+| `GPU_EXPERT_TIER_PROFILE` | unset | readable JSON file | Per-layer route counts ranking the GPU expert tier; requires GPU_EXPERT_TIER. Mounted read-only for plan and serve. |
 | `SPARK_PREFILL_REPLY_FORMAT` | unset (BF16) | `bf16`, `fp8`, `nvfp4` | Spark prefill replies; FP8/NVFP4 exported only in release builds. |
 | `SPARK_DECODE_REPLY_FORMAT` | unset (BF16) | `bf16`, `fp8`, `nvfp4` | Same for decode replies. |
 | `MIMO_WEIGHT_POLICY` | `auto` | `auto`, `checkpoint` | MiMo weight precision policy. |
@@ -266,9 +273,9 @@ Each key is also a global `cuteafd` flag (`--gpu-memory-cap`, `--kv-max-tokens`,
 | `SWA_KV_CACHE` | `int8` | `bf16`, `int8`, `fp8` | MiMo sliding/MTP rings. |
 | `DRAFT_KV_CACHE` | `fp8` | `bf16`, `fp8` | Drafter ring storage (GLM 5.3, GLM Flash, MiMo, Muse). |
 | `PREFIX_CACHE_ENTRIES` | `auto` | `auto`, non-negative | Snapshot entries; auto derives from context × concurrency. |
-| `PREFIX_CACHE_MARK_MIB` | unset | MiB | Recurrent/ring state retained per mark. |
+| `PREFIX_CACHE_MARK_MIB` | unset | MiB | Device budget for recurrent/ring marks, with or without the host tier; includes capture/restore headroom. `on-evict` stores only under device entry/mark pressure. |
 | `PREFIX_PARTIAL` | `off` | `on`, `off` | MiMo approximate partial reuse; off keeps exact restores only. Every other family, V4.1 included, restores exact snapshot frontiers only and refuses `on`. |
-| `PREFIX_POINT_BOUNDARIES` | `1` | `0`, `1` | Dense Qwen: retain the exact frontier before the generation message. |
+| `PREFIX_POINT_BOUNDARIES` | `1` | non-negative integer (`0` disables) | Dense Qwen and V4.1: retain exact message frontiers before the generation message. V4.1 stages complete prefill and restores the boundary mark; `--prefix-points-per-request` caps points (default 4), and `--prefix-point-gap` adds periodic points (default 0). |
 | `GLM5_FLASH_PREFIX_MARKS` | unset | `arena`, `pool` | GLM Flash KDA state marks. |
 | `GLM5_FLASH_KDA_STATE` | `f32` | `f32`, `bf16` | GLM Flash KDA recurrent state. |
 | `GLM5_FLASH_INDEX_CACHE` | `auto` | `keys`, `compact` | GLM Flash index cache; auto picks compact on one GPU. |
@@ -403,7 +410,7 @@ Keys here that are optional and off by default are also listed under
 
 | Key | Default | Values | Notes |
 | --- | --- | --- | --- |
-| `PROFILE` | unset | comma list of `census`, `transport-timing`, `expert-timing`, `expert-routes`, `draft-timing`, `nsys`, `ncu` | Wraps the coordinator for one launch; nsys and ncu are exclusive. |
+| `PROFILE` | unset | comma list of `census`, `transport-timing`, `expert-timing`, `expert-routes`, `route-census`, `draft-timing`, `nsys`, `ncu` | Wraps the coordinator for one launch; nsys and ncu are exclusive. V4.1 route-census needs PROFILE_DIR and writes total and windowed route counts. |
 | `PROFILE_DIR` | unset | absolute dir | Report destination; also runner-owned for `wip-cards --probe memory` without a profiler. |
 | `PROFILE_NCU_KERNEL` | unset | kernel regex | Required by `PROFILE=ncu`; each match is replayed. |
 | `PROFILE_NCU_COUNT`, `PROFILE_NCU_SET`, `PROFILE_NCU_SKIP` | 1, `full`, 0 | 1–9999 / section set / integer | ncu replay count, section set, warm-up matches skipped. |
@@ -561,6 +568,11 @@ original core is already FP8, not an MC publication.
 | `ENGRAM_WARM` | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
 | `CUDA_MODULE_LOADING` | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
 | `SPARK_INTAKE` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | ✓ | ✓ | ✓ |
+| `SPARK_STAGING` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | ✓ | ✓ | ✓ |
+| `SPARK_LANDING` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | ✓ | ✓ | ✓ |
+| `SPARK_REPLY_FORMAT` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | ✓ | ✓ | ✓ |
+| `GPU_EXPERT_TIER` | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
+| `GPU_EXPERT_TIER_PROFILE` | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
 | `MIMO_WEIGHT_POLICY` | ✗ | ✗ | ✗ | ✗ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ |
 | `MIMO_HOST_CACHE` | ✗ | ✗ | ✗ | ✗ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ |
 | `MIMO_PREFIX_DRAFT` | ✗ | ✗ | ✗ | ✗ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ |
@@ -598,8 +610,8 @@ original core is already FP8, not an MC publication.
 | `DRAFT_KV_CACHE` | ✗ | ✗ | ✓ | ✓ | ✓ | ✗ | ✗ | ✗ | ✗ | ✓ |
 | `PREFIX_CACHE_ENTRIES` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | `PREFIX_CACHE_MARK_MIB` | ✗ | ✗ | ✗ | ✓ | ✓ | ✗ | ✓ | ✗ | ✗ | ✗ |
-| `PREFIX_PARTIAL` | ✗ | ✗ | ✗ | ✗ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ |
-| `PREFIX_POINT_BOUNDARIES` | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✓ | ✗ | ✗ | ✗ |
+| `PREFIX_PARTIAL` | ✓ | ✗ | ✗ | ✗ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ |
+| `PREFIX_POINT_BOUNDARIES` | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✓ | ✗ | ✗ | ✗ |
 | `GLM5_FLASH_PREFIX_MARKS` | ✗ | ✗ | ✗ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
 | `GLM5_FLASH_KDA_STATE` | ✗ | ✗ | ✗ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
 | `GLM5_FLASH_INDEX_CACHE` | ✗ | ✗ | ✗ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
@@ -720,3 +732,9 @@ original core is already FP8, not an MC publication.
 | `PROFILE_SPARK_NSYS_GPU_METRICS` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | ✓ | ✓ | ✓ |
 
 MiniMax is not a launch family yet; it gets a column here when it lands.
+
+SM89 coordinator development builds select `CUTEAFD_WIP_COORDINATOR_ARCH=89`;
+`CUTEAFD_WIP_HOST_ISA` selects host ISA variants. `CUTEAFD_WIP_SM89_REPLY_AOT=ON`
+opts into offline compressed-reply codec exports; it is OFF by default.
+`CUTEAFD_HOST_CACHE_STORE` is forwarded from the operator environment to the
+V4.1 coordinator unchanged.

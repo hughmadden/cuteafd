@@ -226,7 +226,8 @@ impl<'library> DsparkWeights<'library> {
                 .context("dSpark expert residency overflow")?;
             load_staging_bytes = load_staging_bytes.max(budget.device_staging_bytes);
         }
-        let padding = cuteafd_loader::placement::families::deepseek_v41::weight_layout::draft_layout(catalog)?.padding_bytes();
+        let padding = cuteafd_loader::placement::families::deepseek_v41::weight_layout::draft_layout_for_arch(catalog,
+            crate::shared::inventory::device_arch(library, library.cuda_get_device()?)?)?.padding_bytes();
         let auxiliary_resident_bytes = NativeRtxTensors::plan(catalog, &Self::auxiliary_names(catalog))?
             .checked_add(padding).context("dSpark arena padding overflow")?;
         let execution_bytes_per_wave = ExpertWeights::plan_execution(ExpertLayer::Dspark { stage: 0 }, library, capacity, capacity, false)?.total()?
@@ -274,7 +275,8 @@ impl<'library> DsparkWeights<'library> {
                 runtime as u64, Basis::Exact)],
             marks: 0, peer_half: 0, staging: [staging as u64, 0],
             loading_experts: [budget.expert_resident_bytes as u64, 0], loader_peak: [peak as u64, 0],
-            dense: Some(cuteafd_loader::placement::families::deepseek_v41::weight_layout::draft_layout(catalog)?) })
+            dense: Some(cuteafd_loader::placement::families::deepseek_v41::weight_layout::draft_layout_for_arch(catalog,
+                crate::shared::inventory::device_arch(library, library.cuda_get_device()?)?)?) })
     }
 
     /// Every owner the distributed (two-RTX) drafter retains, before any
@@ -339,7 +341,8 @@ impl<'library> DsparkWeights<'library> {
             resident: resident as u64, runtime: runtime.into_iter().filter(|d| d.bytes > 0).collect(),
             marks: mark_bytes as u64, peer_half: peer_half as u64, staging: staging.map(|b| b as u64),
             loading_experts: loading_experts.map(|b| b as u64), loader_peak: loader_peak.map(|b| b as u64),
-            dense: Some(cuteafd_loader::placement::families::deepseek_v41::weight_layout::draft_layout(catalog)?) })
+            dense: Some(cuteafd_loader::placement::families::deepseek_v41::weight_layout::draft_layout_for_arch(catalog,
+                crate::shared::inventory::device_arch(library, library.cuda_get_device()?)?)?) })
     }
 
     /// Exact single-coordinator serving owners, before reading any payload.
@@ -497,7 +500,8 @@ impl<'library> DsparkWeights<'library> {
         resident: usize) -> Result<PreparedDspark<'library>> {
         ensure!(budget.load_bound()? <= device_budget, "dSpark auxiliary preparation exceeds load admission");
         ensure!((1..=64 * 1024 * 1024).contains(&pinned_staging_bytes), "invalid dSpark auxiliary staging");
-        let layout = cuteafd_loader::placement::families::deepseek_v41::weight_layout::draft_layout(catalog)?;
+        let layout = cuteafd_loader::placement::families::deepseek_v41::weight_layout::draft_layout_for_arch(catalog,
+            crate::shared::inventory::device_arch(library, library.cuda_get_device()?)?)?;
         ensure!(layout.bytes() <= device_budget.checked_sub(resident).context("dSpark auxiliary budget underflow")?,
             "dSpark dense arena exceeds remaining admission");
         let arena = crate::shared::memory::weight_arena::DeviceWeightArena::new(
@@ -563,8 +567,9 @@ impl<'library> DsparkWeights<'library> {
 impl DsparkWeights<'_> {
     /// Frees the experts' raw scale images kept for recorded plane packs.
     pub(crate) fn release_raw_scales(&self) {
-        if let ExpertStages::Full(stages) = &self.experts {
-            for stage in stages { stage.release_raw_scales(); }
+        match &self.experts {
+            ExpertStages::Full(stages) => for stage in stages { stage.release_raw_scales(); },
+            ExpertStages::Tp2(ranks) => for rank in ranks { rank.release_raw_scales(); },
         }
     }
 }

@@ -263,19 +263,12 @@ fn expert_workspace(
     let role = if local { "rtx_backbone" } else { "rtx_tp2" };
     // A compiled capacity on one RTX (the caller covers live rows); TP2 rows.
     let capacity = rows;
+    let format = if catalog.nvfp4().is_some() { "nvfp4" } else { "mxfp4" };
+    let path = parent.join("V41_EXPERT_WORKSPACES").join(format!("{format}_{role}.json"));
+    let value: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).with_context(|| {
+        format!("missing exact workspace manifest {}", path.display())
+    })?)?;
     let (stored, routed) = {
-        let format = if catalog.nvfp4().is_some() {
-            "nvfp4"
-        } else {
-            "mxfp4"
-        };
-        let path = parent
-            .join("V41_EXPERT_WORKSPACES")
-            .join(format!("{format}_{role}.json"));
-        let value =
-            serde_json::from_slice(&std::fs::read(&path).with_context(|| {
-                format!("missing exact workspace manifest {}", path.display())
-            })?)?;
         let workspace = NativeWorkspace::from_manifest(
             &value,
             role,
@@ -326,7 +319,37 @@ fn expert_workspace(
             Ok(cost)
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
+    if let Some(storage) = value.get("expert_storage") {
+        for cost in &experts {
+            check_expert_storage(storage, cost, shape.experts as u64)
+                .with_context(|| path.display().to_string())?;
+        }
+    }
     Ok((experts, lane))
+}
+
+/// A package that declares its resident expert layout (`expert_storage`, as
+/// SM89 exports do) must store exactly the bytes the planner charges for this
+/// role: one TP2 half per expert on two RTX, one whole expert on one.
+fn check_expert_storage(storage: &serde_json::Value, cost: &ExpertCost, experts: u64) -> anyhow::Result<()> {
+    use anyhow::{ensure, Context};
+    let declared = storage["bytes_per_expert"].as_u64().context("expert_storage has no bytes_per_expert")?;
+    if let Some(planes) = storage.get("plane_bytes") {
+        let planes = planes.as_array().context("expert_storage plane_bytes is not a list")?.iter()
+            .map(|plane| plane.as_u64().context("expert_storage plane is not a byte count"))
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        ensure!(planes.iter().sum::<u64>() == declared,
+            "expert_storage planes {planes:?} do not sum to its {declared} B per expert");
+    }
+    let parts = if cost.tp2 { cost.half.to_vec() } else { vec![cost.whole] };
+    for part in parts {
+        ensure!(experts > 0 && part.resident == declared.checked_mul(experts).context("expert_storage overflow")?,
+            "the package stores {declared} B per expert ({}, {}) but the planner charges {} B: \
+             it does not load this expert layout",
+            storage["weight_layout"].as_str().unwrap_or("unnamed weights"),
+            storage["scale_layout"].as_str().unwrap_or("unnamed scales"), part.resident / experts.max(1));
+    }
+    Ok(())
 }
 
 pub fn owner_workspace(rows: u64, hidden: u64, topk: u64) -> anyhow::Result<u64> {
@@ -384,8 +407,74 @@ pub fn execution_hops(ranks: usize) -> HopSpec {
     }
 }
 
-/// All weights, lanes, graphs and prefix state are charged in the inventory's
-/// baseline. Pool units include private tails supplied by the caller as fixed.
+/// `--gpu-expert-tier` and `--gpu-expert-tier-profile` as `cuteafd plan
+/// --layout` and serving both read them: the one source of the tier V4.1
+/// asks the solver for, so a plan admits the resident set serving loads.
+#[derive(Debug, Clone, Default)]
+pub struct TierChoice {
+    pub setting: ExpertTierSetting,
+    pub profile: Option<std::path::PathBuf>,
+    /// What the slots are ranked by (serving: the default model).
+    pub model: TierStepModel,
+    /// The selected coordinator build exports `expert_reply_reduce_tier`.
+    /// Both plan and serving derive this from the same program manifest.
+    pub expert_reply_reduce_tier: bool,
+}
+
+/// The activations a tier's order comes from, and the profile they were
+/// read from (the plan's notes).
+#[derive(Debug, Clone)]
+pub struct TierInputs {
+    pub activation: ExpertActivation,
+    pub source: ExpertTierSource,
+    pub profile: Option<ExpertRouteProfile>,
+}
+
+impl TierChoice {
+    pub fn expert_reply_reduce_tier_available(manifest: &serde_json::Value) -> bool {
+        manifest["programs"].as_array().is_some_and(|programs| programs.iter()
+            .any(|program| program["name"].as_str() == Some("expert_reply_reduce_tier")))
+    }
+
+    /// The tier's expected activations over `routed` routed layers of
+    /// `experts` experts (`topk` per row): the profile at the step model's
+    /// verify width, else uniform popularity; `None` when the tier is off.
+    /// A profile without a tier is refused.
+    pub fn inputs(&self, routed: usize, experts: usize, topk: u32) -> anyhow::Result<Option<TierInputs>> {
+        match (&self.profile, self.setting.enabled()) {
+            (Some(_), false) => anyhow::bail!("--gpu-expert-tier-profile needs --gpu-expert-tier auto or N"),
+            (_, false) => Ok(None),
+            (None, true) => Ok(Some(TierInputs {
+                activation: ExpertActivation::uniform(routed, experts, self.model.active_experts),
+                source: ExpertTierSource::Uniform, profile: None })),
+            (Some(path), true) => {
+                let profile = ExpertRouteProfile::read(path)?;
+                let activation = ExpertActivation::from_profile(&profile, routed, experts, self.model.step_rows, topk,
+                    self.model.active_experts)?;
+                Ok(Some(TierInputs { activation, source: ExpertTierSource::Profile, profile: Some(profile) }))
+            }
+        }
+    }
+
+    /// Rank the slots once for phase-aware admission. Explicit whole layers
+    /// lead the order and are included in the tier's count, never a second arena.
+    pub fn request(&self, inputs: &TierInputs, routed: &[usize], experts: usize,
+        pinned: usize) -> anyhow::Result<ExpertTierRequest> {
+        anyhow::ensure!(pinned <= routed.len(), "--rtx-expert-layers {pinned} exceeds the {} routed layers", routed.len());
+        let size = self.setting.size(routed.len()).ok_or_else(|| anyhow::anyhow!("the GPU expert tier is off"))?;
+        let order = super::super::expert_tier::optimized_order(routed, &inputs.activation, &self.model, pinned);
+        Ok(ExpertTierRequest::new(size, experts, order, inputs.source))
+    }
+}
+
+/// Device bytes one lane's GPU expert tier adds on each GPU beyond the routed
+/// owner pair it runs on (the TP2 FFN's, sized like a whole layer's): the
+/// `slot_of` tables of `layers` backbone layers of `experts` experts, and the
+/// compact slots of `rows` rows of six routes.
+pub fn tier_lane_bytes(layers: u64, experts: u64, rows: u64) -> u64 {
+    layers * experts * 4 + rows * 6 * 4
+}
+
 /// What the V4.1 dSpark drafter retains, measured from its own plan before
 /// any payload is read. Runtime owners come from `owners::NativePrograms::dspark`
 /// (request lanes, main context, windows) on the default native BF16 path;
@@ -466,6 +555,7 @@ mod tests {
         let total = 96 << 30;
         let budgets = admission::live_budgets(&vec![(total, total, free); ranks], &vec![64 << 30; 4])?;
         let input = ProductionInput {
+            coordinator_arch: cuteafd_core::GpuArch::Sm120,
             blas: Vec::new(),
             expert_usage: false,
             config, gpus: ranks, context, maximum_pool_tokens: pool.unwrap_or(2 << 20),
@@ -488,6 +578,7 @@ mod tests {
         for ranks in [1, 2] {
             for enabled in [false, true] {
                 let prepared = ProductionInput {
+            coordinator_arch: cuteafd_core::GpuArch::Sm120,
                     blas: Vec::new(),
                     expert_usage: enabled, config: &config, gpus: ranks, context: 512,
                     maximum_pool_tokens: 4096, prefill: PrefillShape { rows: 128, waves: 1 },
@@ -550,6 +641,7 @@ mod tests {
         use crate::plan::encoder::{EncoderKind, EncoderPlacement};
         let config = config();
         let input = ProductionInput {
+            coordinator_arch: cuteafd_core::GpuArch::Sm120,
             blas: Vec::new(),
             expert_usage: false, config: &config, gpus: 2, context: 32768, maximum_pool_tokens: 32768,
             prefill: PrefillShape { rows: 128, waves: 1 }, concurrency: 1, retained_turns: 0,
@@ -598,6 +690,7 @@ mod tests {
                     kind, weights: payload, scratch: 333, reason: "arena proof".into(), shortfall: 0,
                 }).collect();
                 let mut prepared = ProductionInput {
+            coordinator_arch: cuteafd_core::GpuArch::Sm120,
                     blas: Vec::new(),
                     expert_usage: false, config: &config, gpus: ranks, context: 512, maximum_pool_tokens: 512,
                     prefill: PrefillShape { rows: 128, waves: 1 }, concurrency: 1, retained_turns: 0,
@@ -755,6 +848,7 @@ mod tests {
         let cards = vec![(96u64 << 30, 96u64 << 30, (64 << 20) + padding); 2];
         let budgets = admission::live_budgets(&cards, &vec![1 << 30; 4])?;
         let input = ProductionInput {
+            coordinator_arch: cuteafd_core::GpuArch::Sm120,
             blas: Vec::new(),
             expert_usage: false,
             config: &config, gpus: 2, context: 262_144, maximum_pool_tokens: 2 << 20,
@@ -851,5 +945,31 @@ mod tests {
         assert_eq!(phase(&d), [(1, 9 << 30), (0, (2 << 30) + (1 << 29))]);
         d.peer_half = 0;
         assert_eq!(d.load_phase(1).unwrap()[0].gpu, 0);
+    }
+}
+
+impl TierInputs {
+    /// Notes from the same immutable profile and model used for admission.
+    pub fn notes(&self, tier: &ExpertTierPlacement, model: &TierStepModel) -> Vec<String> {
+        let routed = tier.resident.iter().map(|ids| ids.as_slice()).collect::<Vec<_>>();
+        let mut notes = vec![format!("GPU expert tier resident experts per routed layer: {:?}",
+            routed.iter().map(|ids| ids.len()).collect::<Vec<_>>())];
+        let ms = |ns: f64| ns / 1e6;
+        let all_spark = model.step_ns(&self.activation, &[]);
+        let tiered = model.step_ns(&self.activation, &routed);
+        let experts = self.activation.layers.first().map_or(1, Vec::len).max(1);
+        let per_whole_layer = (all_spark - model.whole_step_ns(&self.activation)) / self.activation.layers.len().max(1) as f64;
+        let whole = per_whole_layer * tier.experts as f64 / experts as f64;
+        notes.push(format!("GPU expert tier predicted expert time per verify step: {:.2} -> {:.2} ms ({:.2} ms saved) \
+            at a {:.1}% byte hit rate; the same bytes as whole layers save {:.2} ms (step model: GPU {:.2} us per \
+            expert + {:.0} us, Spark {:.2} us per expert + {:.0} us, {} active experts per layer)",
+            ms(all_spark), ms(tiered), ms(all_spark - tiered), 100.0 * self.activation.hit_rate(&routed), ms(whole),
+            model.gpu_expert_ns as f64 / 1e3, model.gpu_fixed_ns as f64 / 1e3, model.spark_expert_ns as f64 / 1e3,
+            model.spark_fixed_ns as f64 / 1e3, model.active_experts));
+        if let Some(profile) = &self.profile {
+            notes.push(format!("GPU expert tier profile: route hit rate {:.1}% (one-row steps)",
+                100.0 * profile.route_share(&routed)));
+        }
+        notes
     }
 }

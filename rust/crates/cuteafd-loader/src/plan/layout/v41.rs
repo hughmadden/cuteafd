@@ -54,8 +54,9 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
     let directory = manifest.parent().context("V4.1 manifest has no parent")?;
     let fp8: serde_json::Value = serde_json::from_slice(&std::fs::read(directory.join("V41_FP8_AOT.json"))
         .context("missing V4.1 native FP8 allocation manifest")?)?;
-    let sms = options.physical_sms.unwrap_or_else(|| ArchContext::for_device("sm_120", options.rtx_bytes[0]).sms);
-    let programs = v41::owners::NativePrograms::new(&fp8, sms)?;
+    let sms = options.physical_sms.unwrap_or_else(|| ArchContext::for_device(options.coordinator_arch, options.rtx_bytes[0]).sms);
+    let attention = options.coordinator_arch.v41_compressed_attention();
+    let programs = v41::owners::NativePrograms::new(&fp8, sms)?.with_compressed_attention(attention);
     let mode = Fp8Head::configured();
     let window_batch = ranks == 1 && std::env::var("CUTEAFD_WINDOW_BATCH").map_or(true, |v| v != "0");
     // The prefill slots, one storage set over their units; two decode lanes
@@ -64,7 +65,7 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
     let span = slots as u64 * rows;
     let target = programs.target(v41::owners::DECODE_LANE_ROWS, span, rows, ranks, slots,
         shape.concurrency, mode, window_batch)?;
-    let weights = resident_weights(checkpoint, ranks, false)
+    let weights = resident_weights_for_arch(checkpoint, ranks, false, options.coordinator_arch)
         .context("unsupported V4.1 native backbone residency: check non-expert tensor formats and geometry")?;
     let mut devices = options.rtx_bytes.iter().enumerate().map(|(rank, &bytes)| DeviceLayout {
         kind: DeviceKind::Rtx, index: rank as u32, capacity_bytes: bytes, worker_budget_bytes: 0,
@@ -75,6 +76,14 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
         "Native module residency: selected V41_FP8_AOT projection exports, estimated separately from physical BLAS pools. The existing lazy graph reserve remains; diagnostic startup capture is uncharged and outside this inventory.".into(),
         "Spark host, wave residual and native runtime: Estimated pending qualified worker inventory; explicit rank I/O remains formula-derived.".into(),
         "Lazy graph/runtime growth is a typed post-ready reserve, not part of the ready residency claim.".into()];
+    if attention != cuteafd_core::coordinator_programs::SparseAttentionBackend::Bf16Aot {
+        notes.push(format!("compressed sparse attention: native FP32 ten-part kernel ({} exports no BF16 AOT \
+            attention); same split scratch as BF16 AOT", options.coordinator_arch));
+    }
+    let tier = v41::TierChoice { setting: options.expert_tier, profile: options.expert_tier_profile.clone(),
+        model: options.expert_tier_model,
+        expert_reply_reduce_tier: v41::TierChoice::expert_reply_reduce_tier_available(
+            &serde_json::from_slice(&std::fs::read(manifest)?)?) };
     if options.host_embedding || (options.rtx_bytes[0] <= 32 * GIB && !options.force_gpu_embedding) {
         place_host_embedding(report, checkpoint, &mut devices, &mut waste, &mut notes);
     }
@@ -83,10 +92,10 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
     // only while it stays on the GPU. Planned layouts use the default (unsplit)
     // query/output projections, the only configuration the planner models.
     let gpu_embedding = devices[0].items.iter().any(|item| item.category == Category::Embedding);
-    let target_layout = v41::weight_layout::TargetLayout::from_headers(
+    let target_layout = v41::weight_layout::TargetLayout::from_headers_for_arch(
         checkpoint.tensors.iter().map(|tensor| &tensor.meta),
         (ranks == 2).then(|| std::array::from_fn(|layer| usize::from(layer >= 20))),
-        gpu_embedding, mode, false, false)?;
+        gpu_embedding, mode, false, false, options.coordinator_arch)?;
     for device in &mut devices { device.items.retain(|item| !v41::owners::is_arena_weight(item)); }
     let mut fixed = v41::owners::target_arena_demands(&target_layout);
     fixed.extend(devices.iter().flat_map(|d| d.items.iter().map(|i|
@@ -111,13 +120,13 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
     let draft = if dspark {
         let manifest: serde_json::Value = serde_json::from_slice(&std::fs::read(directory.join("V41_EXPERT_AOT.json"))
             .context("missing V4.1 dSpark coordinator allocation manifest")?)?;
-        let resident = drafter_weights(checkpoint, ranks).context("unsupported V4.1 dSpark resident format")?;
+        let resident = drafter_weights_for_arch(checkpoint, ranks, options.coordinator_arch).context("unsupported V4.1 dSpark resident format")?;
         let bytes = resident.iter().flatten().try_fold(0u64, |sum, owner|
             sum.checked_add(owner.bytes).context("V4.1 draft weight budget overflow"))?;
         let staging = catalog.expert_staging(crate::V41ExpertSelection::Dspark { stage: 0, expert: 0 })?.staging_bytes() as u64;
         ensure!((1..=cuteafd_core::MAX_DSPARK_PROPOSALS as u8).contains(&options.v41_draft_width), "invalid V4.1 dSpark draft limit");
         let width = if options.v41_draft_width > 5 { 7 } else { 5 };
-        let dense = v41::weight_layout::draft_layout_from_headers(checkpoint.tensors.iter().map(|tensor| &tensor.meta))?;
+        let dense = v41::weight_layout::draft_layout_from_headers_for_arch(checkpoint.tensors.iter().map(|tensor| &tensor.meta), options.coordinator_arch)?;
         let mut draft = DraftInventory { resident: bytes, runtime: programs.dspark(&manifest, rows, shape.concurrency, width, ranks,
             mode)?, marks: marks * 3 * 128 * 528,
             staging: [staging, 0], loading_experts: [3 * native_expert_bytes(128, 5120, 2304), 0],
@@ -139,6 +148,8 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
             draft.staging = [staging, peer_staging];
             draft.loading_experts = [resident; 2];
             draft.loader_peak = [draft.resident.max(resident + staging), resident + peer_staging];
+            notes.push(format!("dSpark routed experts: TP2 halves, {} B on each GPU (whole on rtx{}: {} B)",
+                resident, ranks - 1, full));
         }
         Some(draft)
     } else { None };
@@ -165,7 +176,7 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
     let modules = programs.modules(v41::owners::DECODE_LANE_ROWS, rows, ranks, draft_rows)?;
     let mut cards = Vec::with_capacity(ranks);
     for (gpu, &total) in options.rtx_bytes.iter().enumerate() {
-        let arch = ArchContext::coordinator(total, None);
+        let arch = ArchContext::coordinator(options.coordinator_arch, total, None);
         let ceiling = total;
         devices[gpu].capacity_bytes = ceiling;
         devices[gpu].items.clear();
@@ -184,7 +195,7 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
     }
     let onboard = if spark_ranks == 0 { Onboard::Layers(40) }
         else { options.resolve_onboard(40).unwrap_or(Onboard::Auto) };
-    let onboard_minimum = usize::from(ranks == 2 && !matches!(onboard, Onboard::Layers(0)));
+    let onboard_minimum = usize::from(!tier.setting.enabled() && ranks == 2 && !matches!(onboard, Onboard::Layers(0)));
     // Encoders are enumerated against the pre-solve hardware; the shared solve
     // keeps the first candidate whose whole placement fits every phase.
     let towers = v41_towers(report);
@@ -227,6 +238,7 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
         options.weight_budget_bytes, options.spark_reply_formats);
     let media_cache_bytes = options.media_cache_bytes.unwrap_or(0);
     let mut prepared = ProductionInput {
+        coordinator_arch: options.coordinator_arch,
         blas: v41::owners::blas_owners(ranks,
             if mode.target() { crate::placement::planner::serving::BlasHead::Native }
             else { options.bf16_target_head }, dspark)?,
@@ -261,7 +273,7 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
         checkpoint.tensors.iter().map(|tensor| &tensor.meta))).transpose()?;
     prepared.recipe.media_cache_bytes = media_cache_bytes;
     let vision_extent = prepared.recipe.vision_arena.as_ref().map_or(0, |layout| layout.bytes() as u64);
-    let admitted = prepared.admit(request)?;
+    let admitted = prepared.admit_with_tier(request, &tier)?;
     report.host_ledger = Some(admitted.host_ledger(host_facts.prefix_bytes)?);
     let mut encoder = encoders[admitted.solved.decisions.encoder.context("missing admitted encoder")?].clone();
     if report.vision == crate::plan::MediaMode::Auto && vision_weights > 0
@@ -290,6 +302,7 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
     notes.push(format!("attention placement {}", placement.attention_placement));
     notes.push(format!("placement: {}", placement.summary()));
     notes.push(format!("{} routed backbone layers resident on RTX", placement.onboard_layers));
+    notes.extend(admitted.tier_notes);
     if working.spark_layers.is_empty() { sparks.clear(); }
     for rank in encoder.spark_ranks() {
         ensure_tower_spark(&mut sparks, rank, options);
@@ -403,6 +416,7 @@ mod tests {
             let cards = vec![(96 * gib, 96 * gib); 2];
             let budgets = admission::production_budgets(&cards, 0, None, 0, &[4 * gib; 4])?;
             let input = ProductionInput {
+            coordinator_arch: cuteafd_core::GpuArch::Sm120,
             blas: Vec::new(),
             expert_usage: false,
                 config: &config, gpus: 2, context: 512, maximum_pool_tokens: 512 * 64,
@@ -445,6 +459,7 @@ mod tests {
         let cards = vec![(96 * gib, 96 * gib); 2];
         let budgets = admission::production_budgets(&cards, 0, None, 0, &[4 * gib; 4])?;
         let input = ProductionInput {
+            coordinator_arch: cuteafd_core::GpuArch::Sm120,
             blas: Vec::new(),
             expert_usage: false,
             config: &config, gpus: 2, context: 512, maximum_pool_tokens: 512 * 64,

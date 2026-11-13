@@ -61,6 +61,27 @@ fn media_capture(
 }
 
 #[test]
+fn exact_only_partial_misses_require_matching_full_media_identities() {
+    let mut fake = Fake::new(64, 3, 8);
+    fake.refused_partial_rule = Some(ReuseRule { align: 2, replay: Some(WINDOW) });
+    let mut cache = cache(&fake, 4, 0);
+    let (a, b) = colliding_keys();
+    let saved = media_keys(a, 41);
+    let source = media_capture(&mut cache, &fake, &saved, saved.tokens(), 0);
+    cache.release(&fake, &source.pages).unwrap();
+    let mut native = seq(10, 33);
+    native.extend(seq(900, 6));
+    for (key, expected) in [(b, 0), (a, 1)] {
+        let next = MediaKeys::new(&native, 1000, &[media_span(key)]).unwrap();
+        let cold = cache.admit_media(&fake, next.tokens(), next.spans(), 48, false,
+            |pages| media_place(pages, 1)).unwrap();
+        assert_eq!(cold.resume, 0);
+        assert_eq!(cache.stats().exact_only_partial_misses, expected);
+        cache.release(&fake, &cold.placement.pages).unwrap();
+    }
+}
+
+#[test]
 fn media_repeat_next_turn_and_changed_image_restore_exactly() {
     let fake = Fake::new(64, 4, 8);
     let mut cache = cache(&fake, 4, 0);

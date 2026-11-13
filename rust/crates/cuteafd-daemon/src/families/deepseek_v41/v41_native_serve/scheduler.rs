@@ -3,6 +3,7 @@ use super::*;
 use crate::families::deepseek_v41::v41_target_pass::VerificationTarget;
 use crate::families::deepseek_v41::v41_target_head::TargetSamplingRowRequest;
 mod independent;
+pub(crate) mod busy_lanes;
 mod admission;
 mod queue;
 mod round_failure;
@@ -165,10 +166,10 @@ impl Active<'_> {
     }
 }
 
-fn retire_request<'a, C: DraftChain<'a>>(mut request: Active<'a>, requests: &mut Requests<'a>,
-    prefixes: &mut PrefixCache<'a>, mut draft: Option<&mut DraftRuntime<'_, 'a, C>>) -> Result<()> {
+fn retire_request<'a, C: DraftChain<'a>>(request: &mut Active<'a>, requests: &mut Requests<'a>,
+    prefixes: &mut PrefixCache<'a>, mut draft: Option<&mut DraftRuntime<'_, 'a, C>>, capture: bool) -> Result<()> {
     request.console_retire();
-    let state = if !request.failed && requests.cache().request_id(request.lease).is_ok() {
+    let state = if capture && !request.failed && requests.cache().request_id(request.lease).is_ok() {
         requests.record_state(request.lease, &request.job.probe, "turn")
     } else { Ok(()) };
     // Chunk-4b: retention is consulted **before** the retained frontier is
@@ -176,14 +177,15 @@ fn retire_request<'a, C: DraftChain<'a>>(mut request: Active<'a>, requests: &mut
     // `next_after_commit` first would turn a cache-disabled deployment into a
     // spurious "finished request has no retained logits" warning -- and the
     // scheduler correctly skipped that transfer.
-    if request.cacheable && prefixes.turn_bank_enabled()
+    if capture && request.cacheable && prefixes.turn_bank_enabled()
         && requests.cache().request_id(request.lease).is_ok() {
         prefixes.capture_session(request.job.usage.as_ref().map(|u| u.session_id().to_owned()));
         let id = draft_id(&draft, request.id());
+        request.cacheable = false; // Never retry a failed capture during terminal cleanup.
         let retained = request.next_after_commit.as_ref().context("finished request has no retained logits")
             .and_then(|next| prefixes.retain(requests, draft.as_deref_mut(), SnapshotKind::Turn,
                 &keyed(&request.image_keys, &request.tokens), request.image_keys.spans(), next, request.lease, id));
-        if let Err(error) = retained { tracing::warn!(%error, "completed request prefix was not retained"); }
+        round_failure::retained_turn(retained)?;
     }
     // Release both owners even if one cleanup reports an error.
     let target = requests.release_if_present(request.lease);
@@ -260,6 +262,7 @@ fn serving_stats<C: cuteafd_engine::media::EncoderClient>(prefixes: &PrefixCache
         // The engine's prefix counters: hits by kind, hit tokens, host promotions (host-tier
         // restores), captures, evictions and page/mark occupancy.
         "prefix": prefixes.serving_stats(),
+        "prefix_points": prefixes.points,
         "target_sampling": sampling_stats::snapshot(),
         "dspark_policy": super::speculative::policy_snapshot(),
         "admission": kv_waiter.stats(),
@@ -335,16 +338,23 @@ impl<'a, C: DraftChain<'a>> Ledger for V41Ledger<'_, 'a, '_, '_, '_, C> {
         }
     }
     fn end(&mut self, index: usize) {
+        if self.error.is_some() { return; }
         let slot = self.slots()[index];
-        let mut request = self.active[slot].take().unwrap();
+        let request = self.active[slot].as_mut().unwrap();
         request.stalled = false;
         let ended = request.end(InferenceFinishReason::Length)
-            .and_then(|()| retire_request(request, self.requests, self.prefixes, self.draft.as_deref_mut()));
-        if let Err(error) = ended { self.fail(error); }
+            .and_then(|()| retire_request(request, self.requests, self.prefixes, self.draft.as_deref_mut(), true));
+        if let Err(error) = ended {
+            let fatal = super::prefix::capture_undrained(&error);
+            self.fail(error);
+            if fatal { return; }
+        }
+        self.active[slot] = None;
         // Return the units to the pool now (the cache releases a retired request's units).
         if let Err(error) = self.prefixes.tick(self.requests, self.draft.as_deref_mut()) { self.fail(error); }
     }
     fn grow(&mut self, index: usize, pages: usize) -> bool {
+        if self.error.is_some() { return false; }
         let slot = self.slots()[index];
         let lease = self.active[slot].as_ref().unwrap().lease;
         match self.prefixes.extend(self.requests, self.draft.as_deref_mut(), lease, pages * UNIT_TOKENS) {
@@ -353,6 +363,7 @@ impl<'a, C: DraftChain<'a>> Ledger for V41Ledger<'_, 'a, '_, '_, '_, C> {
         }
     }
     fn set_stalled(&mut self, index: usize, stalled: bool) {
+        if self.error.is_some() { return; }
         let slot = self.slots()[index];
         self.active[slot].as_mut().unwrap().stalled = stalled;
     }
@@ -368,9 +379,10 @@ fn reserve_round<'a, C: DraftChain<'a>>(reserve: &mut KvReserve, requests: &mut 
     // A stalled request whose client left retires now (its units and draft slot return).
     for entry in active.iter_mut() {
         if entry.as_ref().is_some_and(|r| r.stalled && r.job.events.is_closed()) {
-            let mut request = entry.take().unwrap();
+            let request = entry.as_mut().unwrap();
             request.stalled = false;
-            retire_request(request, requests, prefixes, draft.as_deref_mut())?;
+            retire_request(request, requests, prefixes, draft.as_deref_mut(), true)?;
+            *entry = None;
         }
     }
     // Every retirement so far (this boundary's and the ones above) is free before planning.
@@ -566,7 +578,7 @@ pub(crate) fn exercise_packed_prefill<'w, 'a: 'w>(
             max_tokens: 1, sampling: Default::default(), stop_token_ids: Vec::new(), events, usage: None, probe: None };
         let images = super::prefix::media_keys(tokens, &[])?;
         let now = Instant::now();
-        admitted.push((admission::Prepared { job, prompt: tokens.to_vec(), images: Vec::new() },
+        admitted.push((admission::Prepared { job, prompt: tokens.to_vec(), images: Vec::new(), stages: Default::default() },
             id, lease, slot, images, (now, now)));
     }
     let members: Vec<PackMember<'_>> = admitted.iter().map(|(prepared, _, lease, ..)| (prepared, *lease, false)).collect();
@@ -623,6 +635,8 @@ pub(super) struct Waiting<'a> {
     /// Prompt rows its restored prefix covered, and that prefix's retained
     /// logits (a whole-prompt hit selects from them without a call).
     cached: usize,
+    /// Resume within the current complete-frontier stage; usage keeps the initial hit.
+    stage_cached: usize,
     hit_scores: Option<RetainedScores>,
     /// It carried images (their spans drop once their features are installed).
     images: bool,
@@ -661,15 +675,12 @@ impl<'w, 'a, P: ServingTarget<'w, 'a>> Round<'_, 'w, 'a, P> {
     fn release(&mut self, lease: CacheLease, id: u64) {
         round_failure::release_admission(&mut *self.requests, self.draft.as_deref_mut(), lease, id);
     }
-}
 
-impl<'w, 'a, P: ServingTarget<'w, 'a>> queue::Host<Waiting<'a>, super::prefill_target::V41Prefill<P::Suffix>>
-    for Round<'_, 'w, 'a, P> {
-    type Output = RetainedScores;
-    fn run(&mut self, waiting: &mut Waiting<'a>, cursor: &mut super::prefill_target::V41Prefill<P::Suffix>)
+    fn run_stage(&mut self, waiting: &mut Waiting<'a>, cursor: &mut super::prefill_target::V41Prefill<P::Suffix>)
         -> Result<Option<RetainedScores>> {
-        let Waiting { prepared, lease, cached, hit_scores, packed, .. } = waiting;
-        let (job, prompt, lease) = (&prepared.job, prepared.prompt.as_slice(), *lease);
+        let Waiting { prepared, lease, stage_cached: cached, hit_scores, packed, .. } = waiting;
+        let end = prepared.stages.end(prepared.prompt.len());
+        let (job, prompt, lease) = (&prepared.job, &prepared.prompt[..end], *lease);
         ensure!(!job.events.is_closed(), "client disconnected");
         let first_call = cursor.at_start();
         // A scoring probe scores before anything else (it never packs) and
@@ -702,6 +713,62 @@ impl<'w, 'a, P: ServingTarget<'w, 'a>> queue::Host<Waiting<'a>, super::prefill_t
             times: &mut *self.times, interleaved: true };
         queue::advance(&mut step, cursor, false)
     }
+}
+
+impl<'w, 'a, P: ServingTarget<'w, 'a>> queue::Host<Waiting<'a>, super::prefill_target::V41Prefill<P::Suffix>>
+    for Round<'_, 'w, 'a, P> {
+    type Output = RetainedScores;
+    fn run(&mut self, waiting: &mut Waiting<'a>, cursor: &mut super::prefill_target::V41Prefill<P::Suffix>)
+        -> Result<Option<RetainedScores>> {
+        loop {
+            let Some(scores) = self.run_stage(waiting, cursor)? else { return Ok(None); };
+            if !waiting.prepared.stages.has_points() { return Ok(Some(scores)); }
+            let end = waiting.prepared.stages.end(waiting.prepared.prompt.len());
+            self.requests.record_state(waiting.lease, &waiting.prepared.job.probe, "boundary")?;
+            self.prefixes.capture_session(waiting.prepared.job.usage.as_ref().map(|u| u.session_id().to_owned()));
+            // The driver's final replay and target/draft commits drained before
+            // it returned scores. Synchronous retention drains its mark copies.
+            let draft_request = draft_id(&self.draft, waiting.id);
+            let captured = self.prefixes.retain_frontier(self.requests, self.draft.as_deref_mut(), SnapshotKind::Prompt,
+                &waiting.image_keys.tokens()[..end], waiting.image_keys.spans(), &scores, waiting.lease, draft_request);
+            let has_free_mark = self.prefixes.engine().arena().free() > 0;
+            self.prefixes.points.capture(&captured, has_free_mark);
+            let snapshot = match captured {
+                Ok(done) => done,
+                Err(error) if super::prefix::capture_undrained(&error) => return Err(error),
+                Err(error) => { tracing::warn!(%error, "boundary capture failed; restarting prompt uncached"); None }
+            };
+            let captured = snapshot.is_some();
+            if !captured {
+                self.prefixes.points.skipped_after_capture_failure += waiting.prepared.stages.len().saturating_sub(1) as u64;
+            }
+            waiting.prepared.stages.completed(captured);
+            // No new work or release races a completed mark; a disconnected
+            // client leaves through the queue's ordinary release path.
+            ensure!(!waiting.prepared.job.events.is_closed(), "client disconnected");
+            let capacity = self.requests.units(waiting.lease)?.len() * UNIT_TOKENS;
+            waiting.lease = self.requests.restart(waiting.lease)?;
+            if let Some(draft) = self.draft.as_deref_mut() {
+                draft.release(waiting.id)?;
+                draft.admit(waiting.id)?;
+            }
+            let next = waiting.prepared.stages.end(waiting.prepared.prompt.len());
+            let media = cuteafd_engine::media::snapshot_media(next, waiting.image_keys.spans());
+            let draft_request = draft_id(&self.draft, waiting.id);
+            let restored = self.prefixes.admit(self.requests, self.draft.as_deref_mut(), waiting.lease,
+                draft_request, &waiting.image_keys.tokens()[..next],
+                &waiting.prepared.prompt[..next], &media, capacity, !captured, snapshot)?;
+            self.prefixes.points.restarts += 1;
+            self.prefixes.points.cold_restarts += u64::from(!captured || restored.cached == 0);
+            waiting.stage_cached = restored.cached;
+            waiting.hit_scores = restored.scores;
+            if self.requests.cache().stage(waiting.lease)? == crate::families::deepseek_v41::v41_backbone_cache::CacheStage::Full {
+                self.requests.record_state(waiting.lease, &waiting.prepared.job.probe, "boundary_restore")?;
+            }
+            *cursor = super::prefill_target::V41Prefill::new();
+            if !self.whole { return Ok(None); }
+        }
+    }
 
     fn admit(&mut self, slot: usize, waiting: Waiting<'a>, scores: RetainedScores) -> Result<()> {
         let Waiting { prepared, id, lease, image_keys, cached, images, mut ticket, mut constraint, decoder, reserve, .. } = waiting;
@@ -717,6 +784,7 @@ impl<'w, 'a, P: ServingTarget<'w, 'a>> queue::Host<Waiting<'a>, super::prefill_t
                 let draft_request = draft_id(&self.draft, id);
                 if let Err(error) = self.prefixes.retain(self.requests, self.draft.as_deref_mut(), SnapshotKind::Prompt,
                     image_keys.tokens(), image_keys.spans(), &scores, lease, draft_request) {
+                    if super::prefix::capture_undrained(&error) { return Err(error); }
                     tracing::warn!(%error, "prompt prefix was not retained");
                 }
             }
@@ -728,8 +796,8 @@ impl<'w, 'a, P: ServingTarget<'w, 'a>> queue::Host<Waiting<'a>, super::prefill_t
         let (anchor, next_after_commit) = match result {
             Ok(value) => value,
             Err(error) => return queue::Host::<_, super::prefill_target::V41Prefill<P::Suffix>>::fail(self,
-                Waiting { prepared: admission::Prepared { job, prompt, images: Vec::new() }, id, lease, image_keys,
-                    cached, hit_scores: None, images, ticket, constraint, decoder, packed: None, reserve }, error),
+                Waiting { prepared: admission::Prepared { job, prompt, images: Vec::new(), stages: Default::default() }, id, lease, image_keys,
+                    cached, stage_cached: cached, hit_scores: None, images, ticket, constraint, decoder, packed: None, reserve }, error),
         };
         // The lane it was announced on at admission (queued prompts count in `loads`).
         let lane = ticket.lane();
@@ -762,6 +830,9 @@ impl<'w, 'a, P: ServingTarget<'w, 'a>> queue::Host<Waiting<'a>, super::prefill_t
         let _ = events.send(Err(failure));
         if events.is_closed() { ticket.cancel() } else { ticket.fail(0) }
         tracing::warn!(%error, "native request admission failed");
+        // Undrained capture copies still own the source lease, draft rings and
+        // connections. Stop serving; leave them held for shutdown, without reset.
+        if super::prefix::capture_undrained(&error) { return Err(error); }
         self.release(lease, id);
         P::reset_connections(self.first_transport)?; P::reset_connections(self.second_transport)?;
         for (_, transport) in self.prefill.slots.iter_mut() { P::reset_connections(transport)?; }
@@ -786,7 +857,7 @@ fn pack_waiting<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, runtim
         && entry.request().is_some_and(|w| w.packed.is_none());
     let members: Vec<PackMember<'_>> = waiting.iter().filter(|entry| fresh(entry)).map(|entry| {
         let w = entry.request().expect("queued prompts hold their request");
-        (&w.prepared, w.lease, w.cached > 0 || w.images)
+        (&w.prepared, w.lease, w.cached > 0 || w.images || w.prepared.stages.has_points())
     }).collect();
     if members.len() < 2 { return Ok(()); }
     if !whole {
@@ -823,14 +894,18 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
     vision: &mut crate::families::deepseek_v41::v41_vision_encoder::Encoder,
     stats: std::sync::Arc<std::sync::Mutex<serde_json::Value>>,
     mut prefixes: PrefixCache<'a>,
+    census: Option<&crate::shared::route_census::RouteCensus<'a>>,
     ready: impl FnOnce() -> Result<()>,
 ) -> Result<()> {
+    // Serving starts with every lane idle: the routing census counts from here.
+    if let Some(census) = census { census.begin()?; }
     if args.prefill_packing == crate::shared::prefill_packing::PackingMode::Exact {
         let manifest = cuteafd_loader::placement::families::deepseek_v41::owners::native_manifest(
             &args.native_lib, "V41_FP8_AOT.json")?;
         ensure!(native_coordinator_exact_cap(&manifest)? == NATIVE_COORDINATOR_EXACT_CAP,
             "native coordinator exact cap differs from validated inventory");
     }
+    let markers = crate::shared::prefix::marker_ids(&args.snapshot, &super::prefix::points::MESSAGE_STARTS)?;
     let _capture_session = crate::shared::decode_graph::CaptureWatch::session();
     let _stall_watch = stall::spawn();
     let mut active: Vec<Option<Active<'a>>> = (0..args.concurrency).map(|_| None).collect();
@@ -889,10 +964,15 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
         // This point is reached only after both complete stacks have drained and
         // committed. No cache owner is migrated or retired inside a layer stack.
         stall::mark(stall::Phase::Retire, active.iter().flatten().count());
+        // Drained: the routing census reads its device counts here when a dump
+        // or a trace window is due; a window notes the requests in serving.
+        if let Some(census) = census {
+            census.tick(active.iter().flatten().map(|r| (r.id(), round_failure::RoundMember::is_done(r))));
+        }
         {
             let mut releaser = round_failure::RetireAdapter { requests: &mut *requests,
-                prefixes: &mut prefixes, draft: draft.as_deref_mut() };
-            let report = round_failure::retire_done(&mut active, &mut releaser);
+                prefixes: &mut prefixes, draft: draft.as_deref_mut(), capture: true };
+            let report = round_failure::retire_done(&mut active, &mut releaser)?;
             // Both retire paths still retire closed requests: the predicate now
             // lives in `round_failure::RoundMember::is_done`, so nothing done may
             // remain after the pass.
@@ -906,10 +986,9 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
         // Their units are free for admission and the reservation round only once reclaimed.
         prefixes.reclaim(requests, draft.as_deref_mut())?;
         let mut loads = crate::shared::serve::lanes::rebalance(&mut active,
+            prefills.iter().filter_map(|queued| queued.request()).map(|waiting| waiting.ticket.lane()),
             |entry| entry.as_ref().map(Active::lane),
             |entry, lane| entry.as_mut().unwrap().ticket.set_lane(lane));
-        // Queued prompts keep the lane they were announced on and decode there.
-        for waiting in prefills.iter().filter_map(|queued| queued.request()) { loads[waiting.ticket.lane()] += 1; }
         // Admit available work at a completed boundary (both lanes drained):
         // admitted prompts join the decode-share queue holding their slots.
         let mut intake = receive.len().max(1);
@@ -1035,7 +1114,7 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
             };
             let events = prepared.job.events.clone();
             let admitted = (|| -> Result<_> {
-                let admission::Prepared { job, prompt, images } = &mut prepared;
+                let admission::Prepared { job, prompt, images, stages } = &mut prepared;
                 if let Some(draft) = draft.as_deref_mut() { draft.admit(id)?; }
                 let image_keys = super::prefix::media_keys(prompt, images)?;
                 if !images.is_empty() {
@@ -1046,8 +1125,20 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
                 // allocated here and the best snapshot restored into them.
                 let cold = crate::shared::probe::cold(&job.probe);
                 let draft_id = draft_id(&draft, id);
-                let restored = prefixes.admit(requests, draft.as_deref_mut(), lease, draft_id, image_keys.tokens(),
-                    prompt, image_keys.spans(), rows, cold)?;
+                let resume = if cold { 0 } else {
+                    prefixes.engine().peek_media(image_keys.tokens(), image_keys.spans(), true)
+                };
+                let planned = super::prefix::points::Stages::plan(prompt, &markers, image_keys.spans(), resume,
+                    args.prefill_batch_tokens as usize, args.prefix.prefix_cache_min_tokens, args.prefix.points());
+                let eligible = prefixes.engine().enabled() && !cold && packing_probe_allowed(&job.probe);
+                let has_marks = prefixes.engine().arena().slots() > 0;
+                if prefixes.points.plan(&planned, eligible, has_marks) {
+                    *stages = planned;
+                }
+                let end = stages.end(prompt.len());
+                let stage_media = cuteafd_engine::media::snapshot_media(end, image_keys.spans());
+                let restored = prefixes.admit(requests, draft.as_deref_mut(), lease, draft_id, &image_keys.tokens()[..end],
+                    &prompt[..end], &stage_media, rows, cold, None)?;
                 job.prefix_cache_source.set(restored.cached, restored.source.as_ref().is_some_and(|source| source.host));
                 if let Some(probe) = job.probe.as_ref().filter(|probe| probe.spec.record_state) {
                     if let Some(source) = &restored.source {
@@ -1060,8 +1151,9 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
                 let hit = (restored.cached > 0).then_some((restored.cached, restored.scores));
                 let restore = (restore_started, Instant::now());
                 let resume = if images.is_empty() { prompt.len() } else {
-                    let source_end = requests.cache().committed_end(lease)? as usize;
-                    // Encode only when a span from the restored frontier on lacks features.
+                    let source_end = stages.image_prepare_from(requests.cache().committed_end(lease)? as usize);
+                    // Staged prompts also prepare cached images for a possible cold
+                    // restart after capture failure. Ordinary hits encode only the suffix.
                     if requests.images(lease)?.needed(source_end, prompt.len())?.is_empty() { prompt.len() } else { source_end }
                 };
                 Ok((image_keys, hit, restore, resume))
@@ -1109,7 +1201,7 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
             held_slots.insert(slot);
             // Its rows depend only on its tokens and restored frontier, both known
             // now: fetch them while it waits behind earlier members, packed or not.
-            start_admission_lookahead(requests, lease, &prepared.prompt, args);
+            start_admission_lookahead(requests, lease, &prepared.prompt[..prepared.stages.end(prepared.prompt.len())], args);
             admitted.push_back((prepared, id, lease, slot, image_keys, hit, restore));
         }
         prefix_waiters.extend(next_wave);
@@ -1117,7 +1209,7 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
         while let Some((prepared, id, lease, slot, image_keys, hit, restore)) = admitted.pop_front() {
             let lane = cuteafd_loader::plan::decode_lanes::assign(loads);
             let events = prepared.job.events.clone();
-            let admission::Prepared { job, prompt, images } = prepared;
+            let admission::Prepared { job, prompt, images, stages } = prepared;
             let mut ticket = console::Ticket::new(id, lane as u8, job.usage.clone());
             let (cached, hit_scores) = hit.map_or((0, None), |(end, scores)| (end, scores));
             let image_count = images.len();
@@ -1140,8 +1232,8 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
             match ready {
                 Ok((constraint, decoder, reserve)) => { loads[lane] += 1; prefills.push(queue::Queued { slot,
                     cursor: super::prefill_target::V41Prefill::new(),
-                    request: Some(Waiting { prepared: admission::Prepared { job, prompt, images: Vec::new() }, id, lease,
-                        image_keys, cached, hit_scores, images: image_count > 0, ticket, constraint, decoder,
+                    request: Some(Waiting { prepared: admission::Prepared { job, prompt, images: Vec::new(), stages }, id, lease,
+                        image_keys, cached, stage_cached: cached, hit_scores, images: image_count > 0, ticket, constraint, decoder,
                         packed: None, reserve }) }) }
                 Err(error) => {
                     let failure = error.downcast_ref::<cuteafd_api::openai::NativeFailure>()
@@ -1166,7 +1258,7 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
             let finished = prefills.round_with(&mut round,
                 |round, waiting| pack_waiting::<P>(round.lib, round.runtime, round.requests, round.prefill, waiting,
                     round.args, round.draft.as_deref_mut(), round.prefixes, round.whole),
-                |round, entry| queue::chunk(round, entry))?;
+                |round, entry| queue::chunk(round, entry), |_| true)?;
             for (_, result) in finished { result?; }
             prefills.settle(active.iter().any(Option::is_some));
         }
@@ -1241,6 +1333,7 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
                 host_ns=started.elapsed().as_nanos() as u64, success=result.is_ok(), "graph census decode step end");
         }
         if let Err(error) = result {
+            if super::prefix::capture_undrained(&error) { return Err(error); }
             tracing::error!(error=%format!("{error:#}"), "native decode round failed");
             stall::mark(stall::Phase::Failed, active.iter().flatten().count());
             // RV3-4: answer and mark the members before a reset `?` can leave `serve`.
@@ -1256,7 +1349,8 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
         let message = match &result { Ok(()) => "serve loop stopped".to_owned(),
             Err(error) => format!("serve loop stopped: {error:#}") };
         let mut releaser = round_failure::RetireAdapter { requests: &mut *requests,
-            prefixes: &mut prefixes, draft: draft.as_deref_mut() };
+            prefixes: &mut prefixes, draft: draft.as_deref_mut(),
+            capture: !result.as_ref().err().is_some_and(super::prefix::capture_undrained) };
         let report = round_failure::drain_on_exit(&mut active, &mut releaser, &message);
         if report.retired + report.errors > 0 {
             tracing::warn!(retired = report.retired, errors = report.errors, "serve loop stopped; drained active members");
@@ -1275,6 +1369,8 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
         waiting.ticket.fail(0);
         round_failure::release_admission(requests, draft.as_deref_mut(), waiting.lease, waiting.id);
     }
+    // Every lane stopped: the final routing census.
+    if let Some(census) = census { census.finish(); }
     result
 }
 
@@ -2840,7 +2936,12 @@ mod sampling_tests {
         // A prompt deferred behind a pending snapshot wakes the lanes (#976 review A2).
         assert!(serve.contains("host_pending: (!media.full() && !media.backlog.is_empty()) || !prefix_waiters.is_empty(),"));
         // Queued prompts decode on the lane they were announced on (review A4).
-        assert!(serve.contains("for waiting in prefills.iter().filter_map(|queued| queued.request()) { loads[waiting.ticket.lane()] += 1; }"));
+        let rebalance = serve.find("crate::shared::serve::lanes::rebalance(&mut active,").unwrap();
+        let intake = serve.find("let mut intake =").unwrap();
+        assert!(rebalance < intake && intake < round);
+        assert!(serve[rebalance..intake].contains(
+            "prefills.iter().filter_map(|queued| queued.request()).map(|waiting| waiting.ticket.lane()),"),
+            "fixed queued lanes must count before survivor migration and admission");
         assert!(serve.contains("Ok((constraint, decoder, reserve)) => { loads[lane] += 1; prefills.push("));
         assert!(serve[round..decode].contains("prefills.settle("));
         let admit = &source[source.find("    fn admit(&mut self, slot: usize, waiting: Waiting<'a>").unwrap()..];
@@ -2853,7 +2954,7 @@ mod sampling_tests {
         assert!(serve.contains("if let Some(started) = cycle { prefills.stepped("));
         assert_eq!(serve.matches("prefills.stepped(").count(), 1);
         // The previous whole-prompt prefill is the share-0 chunk.
-        let host = &source[source.find("    fn run(&mut self, waiting: &mut Waiting<'a>").unwrap()..];
+        let host = &source[source.find("    fn run_stage(&mut self, waiting: &mut Waiting<'a>").unwrap()..];
         let host = &host[..host.find("\n    }\n").unwrap()];
         assert!(host.contains("if self.whole ||") && host.contains("super::prefill(self.lib"), "{host}");
         assert!(host.contains("queue::advance(&mut step, cursor, false)"));
@@ -2867,6 +2968,29 @@ mod sampling_tests {
         assert!(serve.contains("+ prefills.len();"));
         assert!(serve.contains("media_slots: media.len() + prefills.len(),"));
         assert!(serve.contains("&& prefills.is_empty() { break; }"));
+    }
+
+    #[test]
+    fn staged_frontiers_publish_after_replay_and_restart_through_normal_admission() {
+        let source = include_str!("scheduler.rs");
+        let run = &source[source.find("    fn run(&mut self, waiting: &mut Waiting<'a>").unwrap()..];
+        let run = &run[..run.find("\n    }\n").unwrap()];
+        let completed = run.find("self.run_stage(waiting, cursor)?").unwrap();
+        let capture = run.find("self.prefixes.retain_frontier(").unwrap();
+        let cancel = run.find("ensure!(!waiting.prepared.job.events.is_closed()").unwrap();
+        let restart = run.find("self.requests.restart(waiting.lease)?").unwrap();
+        let restore = run.find("self.prefixes.admit(").unwrap();
+        assert!(completed < capture && capture < cancel && cancel < restart && restart < restore);
+        assert!(run.contains("draft.release(waiting.id)?") && run.contains("draft.admit(waiting.id)?"));
+        assert!(!run.contains(".sample("), "intermediate logits must not consume request RNG");
+        assert!(run.contains("waiting.prepared.stages.completed(captured)"));
+        assert!(run.contains("capacity, !captured, snapshot)?"), "capture failure must restart uncached");
+        let requests = include_str!("../v41_requests.rs");
+        let restart = &requests[requests.find("    pub fn restart(&mut self, lease:").unwrap()..];
+        let restart = &restart[..restart.find("\n    }\n").unwrap()];
+        assert!(restart.find("self.cache.ensure_releasable(lease)?").unwrap() < restart.find("self.release(lease)?").unwrap());
+        assert!(restart.find("std::mem::take(").unwrap() < restart.find("self.release(lease)?").unwrap());
+        assert!(restart.contains("self.attach_images(fresh, images)"));
     }
 
     /// The lanes stop at their first completed boundary past the debt: an independent
@@ -3340,6 +3464,11 @@ mod sampling_tests {
         // A configured bank keeps the **full** key set (the host keys stay null
         // here, because this fixture has no host cache attached either).
         let configured = serving_stats(&PrefixCache::configured(8), &waiter, &media, 0, &reserve, 0);
+        for key in ["exact_snapshot_restores", "exact_encoder_continuation_restores",
+            "approximate_replay_restores", "replayed_tokens", "exact_only_partial_misses"] {
+            assert_eq!(snapshot["prefix"][key], 0, "{key}: {snapshot}");
+            assert_eq!(configured["prefix"][key], 0, "{key}: {configured}");
+        }
         assert!(configured["prefix"]["promotions"].is_u64(), "{configured}");
         assert!(configured["host_cache"].is_null(), "{configured}");
         assert!(configured["host_cache_config"].is_null(), "{configured}");

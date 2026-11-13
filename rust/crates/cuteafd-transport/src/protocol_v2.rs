@@ -668,10 +668,30 @@ fn response_header_len_from_flags(flags: u32) -> usize {
     }
 }
 
+const _: () = assert!(crate::expert::V41_COORDINATOR_ROUTES_REQUEST_FLAG
+    & (EXPERT_PROTOCOL_V2_FLAG_DEBUG_CHECKSUM
+        | EXPERT_PROTOCOL_V2_FLAG_PRECOMPILE_WARMUP
+        | EXPERT_PROTOCOL_V2_FLAG_RESPONSE_ROW_INDICES
+        | EXPERT_PROTOCOL_V2_FLAG_RESPONSE_MORE_CHUNKS
+        | EXPERT_PROTOCOL_V2_FLAG_RESPONSE_FP8_E4M3_ROW_SCALED
+        | EXPERT_PROTOCOL_V2_FLAG_RESPONSE_NVFP4_E2M1_FP8_E4M3
+        | EXPERT_PROTOCOL_V2_FLAG_STREAM_PLAN
+        | EXPERT_PROTOCOL_V2_FLAG_STREAM_DATA
+        | EXPERT_PROTOCOL_V2_FLAG_STREAM_FINAL
+        | EXPERT_PROTOCOL_V2_FLAG_SPARK_REDUCTION
+        | EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16
+        | EXPERT_PROTOCOL_V2_FLAG_RESPONSE_ROW_CAPACITY_ERROR
+        | EXPERT_PROTOCOL_V2_FLAG_RESPONSE_UNIT_PACE
+        | EXPERT_PROTOCOL_V2_FLAG_SPARK_ROW_SHARDED_REDUCTION
+        | EXPERT_PROTOCOL_V2_FLAG_PARTIAL_REPLIES
+        | EXPERT_PROTOCOL_V2_FLAG_RESPONSE_FP8_E4M3_UE8M0_K32
+        | EXPERT_PROTOCOL_V2_SPARK_COLLECTIVE_PART_COUNT_MASK) == 0);
+
 fn validate_flags(flags: u32, label: &str) -> Result<()> {
     let allowed = match label {
         "request" => {
-            EXPERT_PROTOCOL_V2_FLAG_DEBUG_CHECKSUM
+            crate::expert::V41_COORDINATOR_ROUTES_REQUEST_FLAG
+                | EXPERT_PROTOCOL_V2_FLAG_DEBUG_CHECKSUM
                 | EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16
                 | EXPERT_PROTOCOL_V2_FLAG_RESPONSE_FP8_E4M3_UE8M0_K32
                 | EXPERT_PROTOCOL_V2_FLAG_PRECOMPILE_WARMUP
@@ -698,6 +718,15 @@ fn validate_flags(flags: u32, label: &str) -> Result<()> {
         }
         _ => EXPERT_PROTOCOL_V2_FLAG_DEBUG_CHECKSUM,
     };
+    if label == "request" && flags & crate::expert::V41_COORDINATOR_ROUTES_REQUEST_FLAG != 0 {
+        let native_allowed = crate::expert::V41_COORDINATOR_ROUTES_REQUEST_FLAG
+            | EXPERT_PROTOCOL_V2_FLAG_DEBUG_CHECKSUM | EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16
+            | EXPERT_PROTOCOL_V2_FLAG_RESPONSE_FP8_E4M3_UE8M0_K32
+            | EXPERT_PROTOCOL_V2_FLAG_RESPONSE_NVFP4_E2M1_FP8_E4M3;
+        if flags & !native_allowed != 0 || flags & EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16 == 0 {
+            bail!("coordinator routes require the native compact request contract");
+        }
+    }
     let unknown = flags & !allowed;
     if unknown != 0 {
         bail!("ExpertProtocolV2 {label} has unknown flags 0x{unknown:08x}");

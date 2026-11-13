@@ -48,6 +48,33 @@ def _prepend_source() -> None:
     sys.path[:] = [source, *retained_paths]
 
 
+def _use_offline_target(name: str) -> str | None:
+    """Compile this process's exports on b12x's offline ``name`` target.
+
+    CUTEAFD_EXPORT_OFFLINE_TARGET=sm89, which the native CMake sets for every
+    sm_89 build, describes the target from sm89_cards and hides CUDA before
+    anything initializes it: device queries answer from the description and
+    every execution-side CUDA call fails. Unset keeps the visible GPU.
+    """
+    if not name:
+        return None
+    if name != "sm89":
+        raise RuntimeError(f"CUTEAFD_EXPORT_OFFLINE_TARGET={name!r}: the offline export target is sm89")
+    torch = sys.modules.get("torch")
+    if torch is not None and torch.cuda.is_initialized():
+        raise RuntimeError(f"CUTEAFD_EXPORT_OFFLINE_TARGET={name}: CUDA was initialized "
+                           "before _pinned_sparkinfer; offline exports never initialize it")
+    import multiprocessing
+    import sm89_cards
+    from b12x._lib.compile_pool import _initialize_worker
+
+    _initialize_worker(0, sm89_cards.CAPABILITY, f"{name}-offline", f"{name}-offline",
+                       sm89_cards.WORKSPACE_SMS, sm89_cards.MAX_SHARED_MEMORY_PER_BLOCK,
+                       sm89_cards.MAX_SHARED_MEMORY_PER_SM, multiprocessing.Array("i", [0, 0]))
+    print(f"AOT export target: offline {name}, {sm89_cards.WORKSPACE_SMS} SMs, CUDA hidden",
+          file=sys.stderr, flush=True)
+    return name
+
 def _export_cache_paused():
     # The export cache records what an export reads (python/tools/lib/_export_cache.py).
     # Verification hashes the whole tree against the lock: that proves the tree
@@ -71,6 +98,8 @@ except Exception as exc:
         "standalone SparkInfer tools require the verified "
         f"{SOURCE} tree locked by {LOCK}: {exc}"
     ) from exc
+
+OFFLINE_TARGET = _use_offline_target(os.environ.get("CUTEAFD_EXPORT_OFFLINE_TARGET", ""))
 
 REVISION = str(LOCK_DATA["revision"])
 VERSION = str(
@@ -152,5 +181,7 @@ def export_target(properties) -> str:
 
 # Every exporter imports this module before first CUDA use. Admission holds a
 # host RAM/context reservation until exit, including sequential FP8 packages.
+# An offline target never creates a context, so it takes no admission.
 from _export_jobs import install_context_admission
-install_context_admission()
+if OFFLINE_TARGET is None:
+    install_context_admission()

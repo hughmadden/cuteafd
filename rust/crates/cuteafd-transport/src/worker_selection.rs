@@ -8,7 +8,8 @@ use std::{collections::BTreeMap, io::{BufRead, BufReader, Read, Write}, net::{So
 pub mod push;
 
 const CONTROL_LIMIT: usize = 64 * 1024;
-const VERSION: u32 = 8;
+// v9 admits coordinator-marked routes on the canonical Spark wire.
+const VERSION: u32 = 9;
 
 fn check_version(actual: u64, expected: u32) -> Result<()> {
     ensure!(actual == u64::from(expected),

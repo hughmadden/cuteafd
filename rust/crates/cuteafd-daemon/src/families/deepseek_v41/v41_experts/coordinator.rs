@@ -2,18 +2,47 @@
 use crate::shared::memory::Tag;
 use super::{DeviceAllocation, LoadStream};
 use anyhow::{ensure, Context, Result};
+use cuteafd_core::CoordinatorExpertResidency;
 use cuteafd_ffi::{CuteafdDeviceBuffer, NativeLibrary};
-use cuteafd_transport::expert::{SparkExperts, V41_PARTIAL_ROW_BYTES};
+use cuteafd_transport::{
+    expert::{SparkExperts, V41_PARTIAL_ROW_BYTES, V41_ROUTED_EXPERTS},
+    ExpertProtocolV2Request,
+};
 
-/// A Spark link with V4.1's request contract. Decode lanes each own one;
+/// For each route of `experts` (rows of six distinct ids) in `layer`, whether
+/// the resident set marks it for the coordinator (a probe request, encoded as the
+/// link's requests are).
+pub(crate) fn coordinator_routes(resident: &[CoordinatorExpertResidency], layer: u32, experts: &[u32])
+    -> Result<Vec<bool>> {
+    use cuteafd_transport::{ExpertProtocolV2RouteEntry, ExpertProtocolV2RowDescriptor, ExpertV2Dtype, ExpertV2SourceKind};
+    ensure!(!experts.is_empty() && experts.len() % 6 == 0, "a tier probe routes whole rows of six experts");
+    let rows = (experts.len() / 6) as u32;
+    let descriptors = (0..rows).map(|row| ExpertProtocolV2RowDescriptor { row_id: row.into(),
+        source_kind: ExpertV2SourceKind::Prefill, source_request_id: 1, token_position: row.into(),
+        route_offset: row * 6, route_count: 6 }).collect();
+    let routes = experts.iter().enumerate().map(|(index, &expert_id)| ExpertProtocolV2RouteEntry {
+        row_index: index as u32 / 6, expert_id, gate_weight: 1.0 / 6.0 }).collect();
+    let request = crate::families::deepseek_v41::v41_backbone_router::build_spark_request(
+        1, 0, layer, ExpertV2Dtype::Fp8E4m3Ue8m0K32, descriptors, routes,
+        vec![0; rows as usize * 5280].into(), Some(resident))?;
+    request.routes.iter().map(|route| Ok(cuteafd_transport::expert::CoordinatorRouteWord::decode(
+        route.expert_id, true)?.coordinator)).collect()
+}
+
+/// A Spark link with V4.1's canonical request contract and optional immutable
+/// per-layer resident sets shared with the exchange worker. Decode lanes each own one;
 /// prefill units share one link whose return slots hold the in-flight units
 /// (PLAN "Prefill contract": one transport, N waves).
 pub(crate) struct V41Link<'a> {
     link: crate::shared::spark_intake::SparkLink<'a>,
+    resident: Option<std::sync::Arc<Vec<CoordinatorExpertResidency>>>,
+    /// The GPU expert tier whose experts this link's requests leave to the
+    /// coordinator ([`Self::enable_tier`]).
+    tier: Option<std::sync::Arc<super::tier::TierResidency>>,
 }
 impl<'a> V41Link<'a> {
-    pub(crate) fn new(link: crate::shared::spark_intake::SparkLink<'a>) -> Self {
-        Self { link }
+    pub(crate) fn new(link: crate::shared::spark_intake::SparkLink<'a>) -> Result<Self> {
+        Ok(Self { link, resident: None, tier: None })
     }
     /// The one prefill link: `slots` return slots of `unit_rows` rows.
     pub(crate) fn prefill(library: &'a NativeLibrary, transport: SparkExperts, slots: usize, unit_rows: u32)
@@ -21,9 +50,9 @@ impl<'a> V41Link<'a> {
         let ranks = transport.world_size();
         library.v41_compact_reducer()?.require_rank_count(ranks as u32)?;
         let timing = crate::families::deepseek_v41::v41_native_serve::protocol_v2_timing();
-        Ok(Self::new(crate::shared::spark_intake::SparkLink::from_transport_waves(library, transport,
-            V41_PARTIAL_ROW_BYTES as usize, crate::shared::spark_intake::IntakePreference::Probed, slots, unit_rows,
-            timing)?))
+        Self::new(crate::shared::spark_intake::SparkLink::from_transport_waves(library, transport,
+            V41_PARTIAL_ROW_BYTES as usize, slots, unit_rows,
+            timing)?)
     }
     /// Device bytes of the prefill link's intake: every rank's partial-sum
     /// plane over its `reserve_rows` (slots x unit) rows.
@@ -32,6 +61,32 @@ impl<'a> V41Link<'a> {
         ensure!((1..=8).contains(&ranks) && reserve_rows > 0, "invalid V4.1 prefill link geometry");
         usize::try_from(cuteafd_loader::serving_capacity::prefill_return_bytes_with_format(
             1, reserve_rows as u64, ranks as u64, 5120, format)?).context("prefill link budget overflow")
+    }
+    /// Leave each layer's resident experts to the coordinator, before the first request.
+    pub(crate) fn enable_tier(&mut self, tier: std::sync::Arc<super::tier::TierResidency>) -> Result<()> {
+        ensure!(self.tier.is_none(), "the GPU expert tier is already enabled on this Spark link");
+        // The tier's result is one more plane in the link's reduce (eight at most).
+        ensure!(self.link.world_size() < crate::shared::spark_intake::MAX_INTAKE_RANKS,
+            "a {}-rank Spark link has no reduce plane left for the GPU expert tier", self.link.world_size());
+        ensure!(tier.experts() == V41_ROUTED_EXPERTS, "GPU expert tier must describe all 384 experts");
+        let resident = tier.resident().iter()
+            .map(|ids| CoordinatorExpertResidency::from_experts(ids))
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        self.resident = Some(std::sync::Arc::new(resident));
+        self.tier = Some(tier);
+        Ok(())
+    }
+    /// The GPU expert tier this link's requests leave to the coordinator.
+    pub(crate) fn tier(&self) -> Option<&std::sync::Arc<super::tier::TierResidency>> { self.tier.as_ref() }
+    /// For each route of `experts` (rows of six distinct ids) in `layer`,
+    /// whether this link's request marks it for the coordinator: the host
+    /// view of the GPU expert tier, through the link's immutable sets.
+    pub(crate) fn coordinator_routes(&self, layer: u32, experts: &[u32]) -> Result<Vec<bool>> {
+        coordinator_routes(self.resident.as_deref().context("the Spark link has no GPU expert tier")?, layer, experts)
+    }
+    /// Whether this link's requests leave experts of `layer` to the coordinator.
+    pub(crate) fn tier_holds(&self, layer: usize) -> bool {
+        self.tier.as_ref().is_some_and(|tier| !tier.ids(layer).is_empty())
     }
     pub(crate) fn link(&mut self) -> &mut crate::shared::spark_intake::SparkLink<'a> { &mut self.link }
     pub(crate) fn capacity(&self) -> u32 { self.link.capacity() }
@@ -43,6 +98,7 @@ impl<'a> V41Link<'a> {
             else { cuteafd_transport::ExpertV2Dtype::Fp8E4m3Ue8m0K32 };
         let mut shape = cuteafd_transport::SparkSessionShape::new(self.link.capacity(), 5120, 6, dtype)?;
         shape.flags |= cuteafd_transport::expert::EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16;
+        if self.resident.is_some() { shape.flags |= cuteafd_transport::expert::V41_COORDINATOR_ROUTES_REQUEST_FLAG; }
         self.link.bootstrap(&shape)
     }
 
@@ -78,6 +134,41 @@ impl<'a> NativeTp4Wave<'a> {
     pub fn install_tp2(&mut self, wave: super::tp2_ffn::Wave<'a>) -> Result<()> {
         ensure!(self.local.is_none() && self.tp2.is_none(), "local expert lane already installed");
         self.tp2 = Some(Box::new(wave));
+        Ok(())
+    }
+    /// Runs the GPU expert tier on this decode lane's Spark layers: its TP2
+    /// FFN (`tp2_ffn::Wave::tiered`) runs the tier's halves beside the Spark
+    /// wave, and its link's requests leave the same experts (one
+    /// `TierResidency`) to the coordinator. A lane's two views of the set can
+    /// then never disagree: the Sparks skip exactly the routes the GPUs run.
+    /// At rest, before the link's first request.
+    pub(crate) fn enable_tier(&mut self) -> Result<()> {
+        let tp2 = self.tp2.as_ref().context("the GPU expert tier runs on the lane's TP2 FFN (two RTX)")?;
+        let residency = tp2.tier().context("this lane's TP2 FFN runs no GPU expert tier")?.clone();
+        ensure!(self.link.is_some(), "the GPU expert tier runs on a decode lane with its own Spark link");
+        self.own_link()?.enable_tier(residency)?;
+        self.verify_tier()
+    }
+    /// The startup check ([`super::tier::check_views`]): for every layer, the
+    /// routes this lane's Spark requests leave to the coordinator are exactly
+    /// those both GPUs' slot tables run, each slot naming its route's expert.
+    /// Host marks come from the link's resident sets, device slots from each GPU's
+    /// uploaded tables through the slot kernel, as the serving path uses them.
+    fn verify_tier(&self) -> Result<()> {
+        let link = self.link.as_ref().context("the GPU expert tier runs on a decode lane with its own Spark link")?;
+        let tp2 = self.tp2.as_ref().context("the GPU expert tier runs on the lane's TP2 FFN")?;
+        let residency = link.tier().context("the Spark link has no GPU expert tier")?;
+        ensure!(tp2.tier().is_some_and(|tier| std::sync::Arc::ptr_eq(tier, residency)),
+            "the Spark link and the TP2 FFN hold different GPU expert tiers");
+        let probe = super::tier::probe_ids(residency.experts());
+        for layer in 0..residency.layers() {
+            let host = link.coordinator_routes(layer as u32, &probe)?;
+            for (gpu, slots) in tp2.probe_tier_slots(layer, &probe)?.iter().enumerate() {
+                super::tier::check_views(residency, layer, gpu as i32, &probe, &host, slots)?;
+            }
+        }
+        tracing::info!(layers = residency.resident_layers().len(), experts = residency.total(),
+            "GPU expert tier: Spark marking and both GPUs' slot tables agree on every layer");
         Ok(())
     }
     /// Selects a prefill slot's rows in its TP2 FFN's shared planes, at rest
@@ -184,7 +275,7 @@ impl<'a> NativeTp4Wave<'a> {
         reducer.require_rank_count(world_size as u32)?;
         let timing = crate::families::deepseek_v41::v41_native_serve::protocol_v2_timing();
         let link = V41Link::new(crate::shared::spark_intake::SparkLink::from_transport(library, transport,
-            V41_PARTIAL_ROW_BYTES as usize, crate::shared::spark_intake::IntakePreference::Probed, timing)?);
+            V41_PARTIAL_ROW_BYTES as usize, timing)?)?;
         let mut wave = Self::unlinked(library, capacity)?;
         wave.link = Some(link);
         Ok(wave)
@@ -244,10 +335,16 @@ impl<'a> NativeTp4Wave<'a> {
         rows: &[crate::families::deepseek_v41::v41_backbone_router::ExpertRow]) -> Result<NativePendingFfn<'w, 'a>> {
         self.ready_rows = None;
         let link = self.link.as_mut().context("prefill-only slot has no Spark link of its own")?;
+        // The Sparks skip this layer's tier experts exactly when the TP2 FFN
+        // runs them (one set: `enable_tier`).
+        let tiered = link.tier_holds(routed.layer);
+        ensure!(tiered == self.tp2.as_ref().is_some_and(|tp2| tp2.tier_holds(routed.layer)),
+            "layer {}: the Spark link and the TP2 FFN disagree on the GPU expert tier", routed.layer);
         let ticket = unsafe { send_on(self.library, &self.stream, link, routed, router_stream, placement, rows)? };
         Ok(NativePendingFfn { ticket: ticket.0, binding: ticket.1, layer: routed.layer, rows: routed.rows,
             library: self.library, stream: &self.stream, link: &mut link.link, output: self.output.buffer,
-            ready_rows: &mut self.ready_rows, tp2: self.tp2.as_deref_mut() })
+            ready_rows: &mut self.ready_rows, tp2: self.tp2.as_deref_mut(),
+            tier: tiered.then_some([routed.expert_input, routed.ids, routed.routing]) })
     }
     /// A prefill unit's wave on the shared prefill `link` (its return slots
     /// hold the in-flight units): the returned ticket owns nothing borrowed, so
@@ -261,9 +358,15 @@ impl<'a> NativeTp4Wave<'a> {
         router_stream: *mut std::ffi::c_void, placement: u64,
         rows: &[crate::families::deepseek_v41::v41_backbone_router::ExpertRow]) -> Result<NativeUnitFfn> {
         self.ready_rows = None;
+        // As a decode lane's: the Sparks skip the layer's tier experts
+        // exactly when the slots' TP2 FFN runs them.
+        let tiered = link.tier_holds(routed.layer);
+        ensure!(tiered == self.tp2.as_ref().is_some_and(|tp2| tp2.tier_holds(routed.layer)),
+            "layer {}: the prefill link and the TP2 FFN disagree on the GPU expert tier", routed.layer);
         let (ticket, binding) = unsafe { send_on(self.library, &self.stream, link, routed, router_stream, placement, rows)? };
         Ok(NativeUnitFfn { ticket, binding, layer: routed.layer, rows: routed.rows,
-            owner: self.output.buffer.ptr as usize })
+            owner: self.output.buffer.ptr as usize,
+            tier: tiered.then_some([routed.expert_input, routed.ids, routed.routing]) })
     }
     /// Lands a unit's wave from the shared prefill `link` (waves land in
     /// dispatch order: the executor's FIFO) and reduces it with its `shared`
@@ -273,34 +376,47 @@ impl<'a> NativeTp4Wave<'a> {
     /// `shared` holds the unit's completed shared contribution for exactly this
     /// wave's rows and stays unchanged until the reduce completes.
     pub(crate) async unsafe fn collect_unit<'w>(&'w mut self, link: &'w mut V41Link<'a>, unit: NativeUnitFfn,
-        shared: CuteafdDeviceBuffer, destination: i32) -> Result<NativeFfnOutput<'w>> {
+        shared: UnitShared, destination: i32) -> Result<NativeFfnOutput<'w>> {
         ensure!(unit.owner == self.output.buffer.ptr as usize, "prefill unit ticket belongs to another slot");
-        ensure!(shared.device_id == self.output.buffer.device_id && shared.bytes >= unit.rows as usize * 10240,
+        let rows = unit.rows as usize;
+        ensure!(shared.values.device_id == self.output.buffer.device_id && shared.values.bytes >= rows * 10240
+            && shared.tier.is_some() == unit.tier.is_some() && shared.tier.is_none_or(|tier|
+                tier.device_id == self.output.buffer.device_id && tier.bytes >= rows * 10240),
             "prefill unit shared contribution differs from its wave");
-        let mut values = shared;
-        values.bytes = unit.rows as usize * 10240;
+        let mut values = shared.values;
+        values.bytes = rows * 10240;
         let pending = NativePendingFfn { ticket: unit.ticket, binding: unit.binding, layer: unit.layer, rows: unit.rows,
             library: self.library, stream: &self.stream, link: &mut link.link, output: self.output.buffer,
-            ready_rows: &mut self.ready_rows, tp2: self.tp2.as_deref_mut() };
+            ready_rows: &mut self.ready_rows, tp2: self.tp2.as_deref_mut(), tier: unit.tier };
         let destination = Some(destination).filter(|&device| device != self.output.buffer.device_id);
         if destination.is_some() {
             let device = crate::shared::memory::device::Device { library: self.library, id: self.output.buffer.device_id };
-            device.future(unsafe { pending.finish_values(values, destination) }).await
+            device.future(unsafe { pending.finish_values(values, destination, shared.tier) }).await
         } else {
-            unsafe { pending.finish_values(values, None).await }
+            unsafe { pending.finish_values(values, None, shared.tier).await }
         }
     }
-    /// The TP2 shared contribution of a prefill unit, into this transport's
-    /// workspace (one transport per in-flight slot), on the reduce GPU.
+    /// The TP2 shared contribution of `unit` (a prefill unit's wave), and the
+    /// GPU expert tier's result when it holds experts of the layer, into this
+    /// slot's windows of the TP2 FFN's planes on the reduce GPU.
     /// # Safety
-    /// The unit's normalized input stays unchanged until it completes; the
-    /// returned values stay unchanged until the unit lands.
-    pub(crate) async unsafe fn unit_shared(&mut self,
-        input: &crate::families::deepseek_v41::v41_block::FfnInput<'_>) -> Result<CuteafdDeviceBuffer> {
-        ensure!(matches!(input.values.device_id, 0 | 1), "TP2 shared input device differs");
-        unsafe { self.tp2.as_mut().context("TP2 shared workspace missing")?
-            .execute_shared_on(input.layer, input.tokens.len() as u32, input.values,
-                self.output.buffer.device_id as usize).await }
+    /// The unit's normalized input and router outputs stay unchanged until it
+    /// completes; the returned values stay unchanged until the unit lands.
+    pub(crate) async unsafe fn unit_shared(&mut self, input: &crate::families::deepseek_v41::v41_block::FfnInput<'_>,
+        unit: &NativeUnitFfn) -> Result<UnitShared> {
+        ensure!(matches!(input.values.device_id, 0 | 1) && unit.layer == input.layer
+            && unit.rows as usize == input.tokens.len(), "TP2 shared input device or unit differs");
+        let destination = self.output.buffer.device_id as usize;
+        let tp2 = self.tp2.as_mut().context("TP2 shared workspace missing")?;
+        Ok(match unit.tier {
+            Some([wire, ids, routing]) => {
+                let (values, tier) = unsafe { tp2.execute_shared_and_tier_on(input.layer, unit.rows, input.values,
+                    wire, ids, routing, destination).await? };
+                UnitShared { values, tier: Some(tier) }
+            }
+            None => UnitShared { values: unsafe { tp2.execute_shared_on(input.layer, unit.rows, input.values,
+                destination).await? }, tier: None },
+        })
     }
     /// Borrowed device view; never free it or retain it across wave reuse/drop.
     pub fn output(&self) -> Result<CuteafdDeviceBuffer> {
@@ -328,7 +444,8 @@ unsafe fn send_on<'a>(library: &'a NativeLibrary, stream: &LoadStream<'a>, link:
     -> Result<(crate::shared::spark_waves::WaveTicket, crate::families::deepseek_v41::v41_attention_binding::QueryBinding)> {
     let capacity = link.link.capacity();
     ensure!(routed.rows > 0 && routed.rows <= capacity, "native dispatched FFN rows exceed capacity");
-    let (binding, build) = routed.request_builder(placement, rows)?;
+    let (binding, build) = routed.request_builder(placement, rows,
+        link.resident.clone())?;
     let (layout, sources) = routed.wave_sources()?;
     // Stage on this wave's own stream when the router shares its GPU: the
     // lane's owners (the router among them) then carry nothing past their
@@ -377,6 +494,18 @@ pub(crate) struct NativeUnitFfn {
     layer: usize,
     rows: u32,
     owner: usize,
+    /// The router's FP8-K32 wire, ids and gate weights when the GPU expert
+    /// tier holds experts of this layer (the request left them to the coordinator).
+    tier: Option<[CuteafdDeviceBuffer; 3]>,
+}
+
+/// A prefill unit's coordinator contributions on the reduce GPU, from its
+/// send ([`NativeTp4Wave::unit_shared`]) to its land: the TP2 shared values,
+/// and the GPU expert tier's result when the tier holds experts of the layer.
+#[derive(Clone, Copy)]
+pub(crate) struct UnitShared {
+    pub(crate) values: CuteafdDeviceBuffer,
+    pub(crate) tier: Option<CuteafdDeviceBuffer>,
 }
 
 /// A remote layer's wave on the exchange, borrowed until its reduction is
@@ -393,6 +522,9 @@ pub(crate) struct NativePendingFfn<'w, 'a> {
     output: CuteafdDeviceBuffer,
     ready_rows: &'w mut Option<u32>,
     tp2: Option<&'w mut super::tp2_ffn::Wave<'a>>,
+    /// The router's FP8-K32 wire, ids and gate weights when the GPU expert
+    /// tier holds experts of this layer (the request left them to the coordinator).
+    tier: Option<[CuteafdDeviceBuffer; 3]>,
 }
 impl<'w> NativePendingFfn<'w, '_> {
     /// # Safety
@@ -404,7 +536,8 @@ impl<'w> NativePendingFfn<'w, '_> {
         ensure!(self.binding == shared.binding()? && self.layer == shared.layer && self.rows == shared.rows
             && shared.values.bytes == self.rows as usize * 10240 && shared.values.device_id == self.output.device_id,
             "native TP shared contribution differs from routed request");
-        unsafe { self.finish_values(shared.values, None).await }
+        ensure!(self.tier.is_none(), "the GPU expert tier runs only beside TP2 shared halves");
+        unsafe { self.finish_values(shared.values, None, None).await }
     }
     /// Run shared TP2 after the Spark dispatch, reduce on the transport GPU, and
     /// return the result to the block's GPU. The pending owner retains every lane workspace.
@@ -415,19 +548,32 @@ impl<'w> NativePendingFfn<'w, '_> {
         ensure!(self.binding == input.binding() && self.layer == input.layer
             && self.rows as usize == input.tokens.len() && matches!(input.values.device_id, 0 | 1),
             "TP2 shared input/request/device differs");
-        let values = unsafe { self.tp2.as_mut().context("TP2 shared workspace missing")?
-            .execute_shared_on(input.layer, self.rows, input.values, self.output.device_id as usize).await? };
+        let tp2 = self.tp2.as_mut().context("TP2 shared workspace missing")?;
+        let (values, tier) = match self.tier {
+            // The tier's halves run beside the shared halves; its result
+            // joins the Spark reduce on the reduce's GPU.
+            Some([wire, ids, routing]) => {
+                let (values, tier) = unsafe { tp2.execute_shared_and_tier_on(input.layer, self.rows, input.values,
+                    wire, ids, routing, self.output.device_id as usize).await? };
+                (values, Some(tier))
+            }
+            None => (unsafe { tp2.execute_shared_on(input.layer, self.rows, input.values,
+                self.output.device_id as usize).await? }, None),
+        };
         let destination = input.values.device_id;
         if destination != self.output.device_id {
             let device = crate::shared::memory::device::Device { library: self.library, id: self.output.device_id };
-            device.future(unsafe { self.finish_values(values, Some(destination)) }).await
+            device.future(unsafe { self.finish_values(values, Some(destination), tier) }).await
         } else {
-            unsafe { self.finish_values(values, Some(destination)).await }
+            unsafe { self.finish_values(values, Some(destination), tier).await }
         }
     }
-    async unsafe fn finish_values(mut self, values: CuteafdDeviceBuffer, destination: Option<i32>) -> Result<NativeFfnOutput<'w>> {
+    async unsafe fn finish_values(mut self, values: CuteafdDeviceBuffer, destination: Option<i32>,
+        tier: Option<CuteafdDeviceBuffer>) -> Result<NativeFfnOutput<'w>> {
         ensure!(values.device_id == self.output.device_id && values.bytes == self.rows as usize * 10240,
             "shared reduction device/extent differs");
+        ensure!(tier.is_some() == self.tier.is_some() && tier.is_none_or(|tier| tier.device_id == self.output.device_id
+            && tier.bytes >= self.rows as usize * 10240), "GPU expert tier result device/extent differs");
         let timing = std::time::Instant::now();
         let rows = self.rows;
         let slot = self.ticket.slot();
@@ -436,8 +582,9 @@ impl<'w> NativePendingFfn<'w, '_> {
         // host waits for the reply here, where everything this layer can
         // issue (router, staging, shared FFN, L2 prefetch) is already queued,
         // and only then queues the landing and reduce, so no stream sits
-        // blocked on a device wait through the round trip. A device-ordered
-        // pass queues them at once (the device waits).
+        // blocked on a device wait through the round trip. A paced
+        // device-ordered pass (both dual lanes busy) collects the same way;
+        // any other device-ordered pass queues them at once (the device waits).
         //
         // Every wait here yields to the executor rather than blocking the
         // thread (#815): prefill polls its two encoder lanes on this thread,
@@ -446,7 +593,7 @@ impl<'w> NativePendingFfn<'w, '_> {
         // ever in flight and the Sparks idled half the time. A lone future
         // (decode) re-polls at once, so its wait is still a spin.
         let host_ordered = !crate::shared::memory::chain::deferred();
-        if host_ordered {
+        if host_ordered || crate::shared::memory::chain::paced() {
             // The shared host-wait pacing still applies (`--host-wait block`
             // sleeps past its spin window), between yields. Pinned ranks that
             // arrived are pulled meanwhile (#815) on the reduce stream (after
@@ -469,7 +616,10 @@ impl<'w> NativePendingFfn<'w, '_> {
         unsafe {
             crate::shared::memory::chain::join(self.library, self.stream.raw)?;
             exchange.land(self.ticket, self.stream.raw)?;
-            exchange.reduce(slot, values.ptr.cast(), self.output.ptr.cast(), rows as usize, self.stream.raw)?;
+            // The tier's result is the plane after the ranks': every route of
+            // the layer ran once, on a Spark or on the coordinator GPUs.
+            exchange.reduce_with(slot, tier.map(|tier| tier.ptr.cast_const().cast()), values.ptr.cast(),
+                self.output.ptr.cast(), rows as usize, self.stream.raw)?;
         }
         // Inside a chain this records the head; unchained (prefill) it yields
         // until the reduce completes instead of synchronizing the thread.
@@ -505,20 +655,72 @@ impl<'w> NativePendingFfn<'w, '_> {
 }
 
 #[cfg(test)]
-mod upload_tests {
+mod coordinator_route_tests {
     use super::*;
+    use cuteafd_transport::{expert::{BackboneRequest, CoordinatorRouteWord, V41_COORDINATOR_ROUTES_REQUEST_FLAG},
+        ExpertProtocolV2RouteEntry, ExpertProtocolV2RowDescriptor, ExpertV2Dtype, ExpertV2SourceKind};
+
+    fn router_request(layer: u32, rows: usize, residents: Option<&[CoordinatorExpertResidency]>)
+        -> Result<ExpertProtocolV2Request> {
+        crate::families::deepseek_v41::v41_backbone_router::build_spark_request(
+            31, 7, layer, ExpertV2Dtype::Bf16,
+            (0..rows).map(|r| ExpertProtocolV2RowDescriptor { row_id: r as u64,
+                source_kind: ExpertV2SourceKind::Decode, source_request_id: 31,
+                token_position: r as u64, route_offset: r as u32 * 6, route_count: 6 }).collect(),
+            (0..rows * 6).map(|i| ExpertProtocolV2RouteEntry { row_index: i as u32 / 6,
+                expert_id: (i % 384) as u32, gate_weight: (i % 6 + 1) as f32 / 21.0 }).collect(),
+            vec![0; rows * 10240].into(), residents)
+    }
 
     #[test]
-    fn tp_wave_budget_remains_tp4_upper_bound() -> Result<()> {
-        assert!(NativeTp4Wave::device_bytes(0).is_err());
-        assert!(NativeTp4Wave::device_bytes(4097).is_err());
-        for capacity in [1, 16, 80, 4096] {
-            let reserved = NativeTp4Wave::device_bytes(capacity)?;
-            assert_eq!(reserved as u64, 4 * cuteafd_core::serving_capacity::spark_intake_allocation_bytes(capacity as u64 * 10240)?
-                + capacity as u64 * 2 * 10240);
-            assert!(reserved >= capacity as usize * (2 * V41_PARTIAL_ROW_BYTES as usize + 2 * 10240));
+    fn router_residents_and_worker_unpack_agree_route_for_route() -> Result<()> {
+        let mut resident = vec![CoordinatorExpertResidency::empty(); 40];
+        resident[3] = CoordinatorExpertResidency::from_experts(&[0, 5, 63, 64, 127, 200, 383])?;
+        for rows in [1, 2, 64, 4096] {
+            let original = router_request(3, rows, None)?;
+            let request = router_request(3, rows, Some(&resident))?;
+            let frame = request.encode()?;
+            assert_eq!(frame.len(), original.encode()?.len());
+            let worker = BackboneRequest::parse(&frame, rows as u32)?;
+            let mut ids = vec![-1; rows * 6]; let mut weights = vec![-1.0; rows * 6];
+            worker.copy_routes_into(&mut ids, &mut weights)?;
+            for (i, route) in original.routes.iter().enumerate() {
+                let marked = resident[3].contains(route.expert_id as u16);
+                assert_eq!(CoordinatorRouteWord::decode(request.routes[i].expert_id, true)?.coordinator, marked);
+                assert_eq!(ids[i], if marked { 384 } else { route.expert_id as i32 });
+                assert_eq!(weights[i].to_bits(), if marked { 0.0f32.to_bits() } else { route.gate_weight.to_bits() });
+            }
         }
         Ok(())
     }
 
+    #[test]
+    fn tier_flag_is_link_wide_and_startup_probe_matches_router() -> Result<()> {
+        let resident = vec![CoordinatorExpertResidency::from_experts(&[0, 5])?];
+        for layer in [0, 1, 39] {
+            let request = router_request(layer, 1, Some(&resident))?;
+            assert_ne!(request.header.flags & V41_COORDINATOR_ROUTES_REQUEST_FLAG, 0);
+            let mask = coordinator_routes(&resident, layer, &[0, 1, 2, 3, 4, 5])?;
+            for (i, route) in request.routes.iter().enumerate() {
+                assert_eq!(mask[i], CoordinatorRouteWord::decode(route.expert_id, true)?.coordinator);
+            }
+        }
+        assert_eq!(router_request(0, 1, None)?.header.flags & V41_COORDINATOR_ROUTES_REQUEST_FLAG, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn marking_depends_only_on_layer_residency_and_expert() -> Result<()> {
+        let resident = vec![CoordinatorExpertResidency::from_experts(&[0, 5, 383])?];
+        for id in [1, 7, u64::MAX] {
+            let mut request = router_request(0, 64, None)?;
+            request.header.request_id = id;
+            request.with_coordinator_routes(&resident[0])?;
+            for route in &request.routes {
+                let word = CoordinatorRouteWord::decode(route.expert_id, true)?;
+                assert_eq!(word.coordinator, resident[0].contains(word.expert_id));
+            }
+        }
+        Ok(())
+    }
 }

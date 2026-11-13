@@ -26,7 +26,9 @@ pub use families::deepseek_v41::v41_grouped_output::{V41GroupedOutput, V41_GROUP
 pub use families::deepseek_v41::v41_attention_ops::V41AttentionOps;
 pub use families::deepseek_v41::v41_dspark_cache::{V41DsparkCache, V41KvWrite};
 pub use shared::v41_router::V41Router;
-pub use families::deepseek_v41::v41_hc::V41Hc;
+pub use shared::route_census::{route_histogram, RouteCensusInput, RouteCensusKernels, RouteCensusShape};
+pub use shared::tier_slots::{tier_slots, TierSlotKernel, TierSlotShape};
+pub use families::deepseek_v41::v41_hc::{HcBoundary, V41Hc, HC_BOUNDARY_SWITCH};
 pub use families::deepseek_v41::v41_dspark::{V41DraftStep, V41DsparkConfidence, V41VocabularyProjection};
 pub use families::deepseek_v41::v41_fp8::{V41Fp8Info, V41Fp8Kernel, V41SharedSwiGlu};
 pub use families::deepseek_v41::v41_fp8_plan::{V41Fp8Plan, V41Fp8PlanInfo};
@@ -3125,8 +3127,9 @@ impl NativeLibrary {
 
 
     /// Blocking default-stream upload for fresh storage or a destination whose
-    /// prior consumers have completed. This does not join nonblocking streams;
-    /// use `copy_h2d_ordered` for queued workspace reuse.
+    /// prior consumers have completed: it returns once the DMA has landed, so any
+    /// later reader sees the bytes. It does not join nonblocking streams; use
+    /// `copy_h2d_ordered` for queued workspace reuse.
     pub fn copy_h2d(&self, dst: CuteafdDeviceBuffer, src: &[u8]) -> Result<()> {
         if src.is_empty() {
             return Ok(());

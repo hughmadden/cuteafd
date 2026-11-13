@@ -103,7 +103,12 @@ pub fn packed_expert_bytes(package: &str, experts: u64, hidden: u64, intermediat
 /// Unsupported native format changes return None instead of an exact claim.
 pub fn resident_weights(checkpoint: &Checkpoint, ranks: usize, dspark: bool)
     -> Option<Vec<Vec<Item>>> {
-    resident_headers(&checkpoint.config, checkpoint.tensors.iter().map(|tensor| &tensor.meta), ranks, dspark)
+    resident_weights_for_arch(checkpoint, ranks, dspark, cuteafd_core::GpuArch::Sm120)
+}
+
+pub fn resident_weights_for_arch(checkpoint: &Checkpoint, ranks: usize, dspark: bool,
+    arch: cuteafd_core::GpuArch) -> Option<Vec<Vec<Item>>> {
+    resident_headers_for_arch(&checkpoint.config, checkpoint.tensors.iter().map(|tensor| &tensor.meta), ranks, dspark, arch)
 }
 
 /// The serving catalog and the offline checkpoint enumerate the same source
@@ -111,17 +116,28 @@ pub fn resident_weights(checkpoint: &Checkpoint, ranks: usize, dspark: bool)
 pub fn resident_headers<'a>(config: &serde_json::Value,
     tensors: impl IntoIterator<Item = &'a crate::SafetensorsTensorMetadata>,
     ranks: usize, dspark: bool) -> Option<Vec<Vec<Item>>> {
-    resident_inventory(config, tensors, ranks, dspark, true)
+    resident_headers_for_arch(config, tensors, ranks, dspark, cuteafd_core::GpuArch::Sm120)
+}
+
+pub fn resident_headers_for_arch<'a>(config: &serde_json::Value,
+    tensors: impl IntoIterator<Item = &'a crate::SafetensorsTensorMetadata>,
+    ranks: usize, dspark: bool, arch: cuteafd_core::GpuArch) -> Option<Vec<Vec<Item>>> {
+    resident_inventory(config, tensors, ranks, dspark, true, arch)
 }
 
 /// Only the drafter's own checkpoint allocations; borrowed target owners are excluded.
 pub fn drafter_weights(checkpoint: &Checkpoint, ranks: usize) -> Option<Vec<Vec<Item>>> {
-    resident_inventory(&checkpoint.config, checkpoint.tensors.iter().map(|tensor| &tensor.meta), ranks, true, false)
+    drafter_weights_for_arch(checkpoint, ranks, cuteafd_core::GpuArch::Sm120)
+}
+
+pub fn drafter_weights_for_arch(checkpoint: &Checkpoint, ranks: usize,
+    arch: cuteafd_core::GpuArch) -> Option<Vec<Vec<Item>>> {
+    resident_inventory(&checkpoint.config, checkpoint.tensors.iter().map(|tensor| &tensor.meta), ranks, true, false, arch)
 }
 
 fn resident_inventory<'a>(config: &serde_json::Value,
     tensors: impl IntoIterator<Item = &'a crate::SafetensorsTensorMetadata>,
-    ranks: usize, dspark: bool, target: bool) -> Option<Vec<Vec<Item>>> {
+    ranks: usize, dspark: bool, target: bool, arch: cuteafd_core::GpuArch) -> Option<Vec<Vec<Item>>> {
     let config = config.get("text_config").unwrap_or(config);
     let tensors = tensors.into_iter().collect::<Vec<_>>();
     if ![1, 2].contains(&ranks) || config["num_hidden_layers"].as_u64() != Some(40)
@@ -140,7 +156,7 @@ fn resident_inventory<'a>(config: &serde_json::Value,
     // The dense dSpark arena's inter-view alignment, from the same header
     // recipe the serving loader allocates; charged once beside its payload.
     let draft_padding = if dspark && tensors.iter().any(|t| t.name.starts_with("mtp.") && !t.name.contains(".ffn.experts.")) {
-        super::weight_layout::draft_layout_from_headers(tensors.iter().copied()).ok()?.padding_bytes() as u64
+        super::weight_layout::draft_layout_from_headers_for_arch(tensors.iter().copied(), arch).ok()?.padding_bytes() as u64
     } else { 0 };
     let head_mode = Fp8Head::configured();
     let mut totals: Vec<BTreeMap<(Category, String, String), u64>> = vec![BTreeMap::new(); ranks];
@@ -160,7 +176,7 @@ fn resident_inventory<'a>(config: &serde_json::Value,
             // every stage. Grouped wo_a uses its stored n*k/groups extent.
             if name.ends_with(".weight") && format.contains("e4m3")
                 && (!name.ends_with(".main_proj.weight") || name == "mtp.0.main_proj.weight") {
-                bytes += tensor.shape.iter().product::<usize>() as u64 / 32;
+                bytes += super::weight_layout::packed_scale_bytes(usize::try_from(tensor.byte_length).ok()?, arch).ok()? as u64;
             }
             add(decoder, Category::Drafter, "dspark-auxiliary", &format, bytes);
             continue;
@@ -194,7 +210,7 @@ fn resident_inventory<'a>(config: &serde_json::Value,
             else if rest.starts_with("attn.compressor.") { (Category::Weights, "compressor") }
             else { (Category::Weights, "attention") };
         if name.ends_with(".weight") && format.contains("e4m3") {
-            bytes += tensor.shape.iter().product::<usize>() as u64 / 32;
+            bytes += super::weight_layout::packed_scale_bytes(usize::try_from(tensor.byte_length).ok()?, arch).ok()? as u64;
         }
         if ranks == 2 && group == "shared_expert" {
             // Shared TP2 copies retain the packed scales only; checkpoint
@@ -334,6 +350,32 @@ mod tests {
             assert_eq!(layout.payload_bytes(), 3200 + 100 + 3200 + 20);
             assert!(owned[..ranks - 1].iter().all(Vec::is_empty));
             assert!(drafter_weights(&checkpoint(target.clone()), ranks).unwrap().iter().all(Vec::is_empty));
+        }
+    }
+
+    #[test]
+    fn architecture_selected_draft_inventory_equals_its_arena_and_target_scale_grid() {
+        use cuteafd_core::{DType, GpuArch};
+        let dense = vec![
+            tensor("mtp.0.main_proj.weight", DType::F8E4M3, &[32, 32], 1024),
+            tensor("mtp.1.main_proj.weight", DType::F8E4M3, &[32, 32], 1024),
+            tensor("mtp.0.attn.wq_a.weight", DType::F8E4M3, &[32, 64], 2048),
+            tensor("mtp.0.norm.weight", DType::Bf16, &[37], 74),
+        ];
+        let mut headers = dense.clone();
+        headers.push(tensor("layers.0.attn.wq_a.weight", DType::F8E4M3, &[32, 64], 2048));
+        let checkpoint = checkpoint(headers);
+        for arch in [GpuArch::Sm89, GpuArch::Sm120] {
+            let layout = super::super::weight_layout::draft_layout_from_headers_for_arch(
+                dense.iter().map(|t| &t.meta), arch).unwrap();
+            for ranks in [1, 2] {
+                let owned = drafter_weights_for_arch(&checkpoint, ranks, arch).unwrap();
+                assert_eq!(owned[ranks - 1].iter().map(|i| i.bytes).sum::<u64>(), layout.bytes() as u64);
+                assert!(owned[..ranks - 1].iter().all(Vec::is_empty));
+                let target = resident_weights_for_arch(&checkpoint, ranks, false, arch).unwrap();
+                assert_eq!(target[0].iter().map(|i| i.bytes).sum::<u64>(),
+                    2048 + if arch == GpuArch::Sm89 { 2 } else { 64 });
+            }
         }
     }
 

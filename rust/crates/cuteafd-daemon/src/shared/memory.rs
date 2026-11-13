@@ -15,7 +15,7 @@ use std::ffi::c_void;
 pub(crate) mod receipts;
 #[path = "memory/snapshot.rs"]
 mod snapshot;
-pub(crate) use snapshot::{SnapshotCopies, SnapshotPool, SnapshotStorage};
+pub(crate) use snapshot::{reserve_snapshot, SnapshotCopies, SnapshotPool, SnapshotStorage};
 #[path = "memory/download.rs"]
 mod download;
 pub(crate) use download::RowDownload;
@@ -23,6 +23,8 @@ pub(crate) use download::RowDownload;
 pub(crate) mod device;
 #[path = "memory/staging.rs"]
 pub(crate) mod staging;
+#[path = "memory/staging_check.rs"]
+pub(crate) mod staging_check;
 #[path = "memory/peer_publication.rs"]
 pub(crate) mod peer_publication;
 #[path = "memory/proposal_replica.rs"]

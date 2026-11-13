@@ -8,11 +8,9 @@ use std::path::PathBuf;
 
 use crate::cli::PlanArgs;
 
-/// The coordinator GPU cap: `--gpu-memory-cap`, else the RTX PRO 6000's
-/// CUDA-reported total (`placement::inventory::PRO_TOTAL_BYTES`), what the
-/// runtime's own sample sees.
+/// The coordinator GPU cap: `--gpu-memory-cap`, else the selected architecture's reference-card total.
 fn coordinator_bytes(args: &PlanArgs) -> u64 {
-    args.memory.policy().gpu_cap.unwrap_or(cuteafd_loader::placement::inventory::PRO_TOTAL_BYTES)
+    args.memory.policy().gpu_cap.unwrap_or(cuteafd_loader::placement::inventory::ArchContext::reference_total_bytes(args.coordinator_arch))
 }
 
 /// The planning options `args` name, validated before any checkpoint is read.
@@ -50,6 +48,7 @@ fn options(args: &PlanArgs) -> Result<PlanOptions, PlanError> {
                 },
                 media_cache_bytes: args.media_cache_bytes,
                 rtx_bytes: vec![coordinator_bytes(args); args.rtx],
+                coordinator_arch: args.coordinator_arch,
                 spark_allocation_budget_bytes: args.memory.spark_memory_cap,
                 pool_tokens: args.pool_tokens,
                 dense_qwen_kv: args.kv_format.map(|format| match format {
@@ -72,6 +71,8 @@ fn options(args: &PlanArgs) -> Result<PlanOptions, PlanError> {
                 host_embedding: args.embedding_placement == Some(crate::shared::token_io::EmbedPlacement::Host),
                 force_gpu_embedding: args.embedding_placement == Some(crate::shared::token_io::EmbedPlacement::Gpu),
                 onboard: args.rtx_expert_layers,
+                expert_tier: args.gpu_expert_tier,
+                expert_tier_profile: args.gpu_expert_tier_profile.clone(),
                 exchange_f32: args.exchange_f32,
                 context_tokens: args.context_tokens.unwrap_or(0),
                 prefill_rows: args.prefill_rows,
@@ -139,6 +140,38 @@ fn options(args: &PlanArgs) -> Result<PlanOptions, PlanError> {
     options.apply_spark_budget();
     options.validate()?;
     Ok(options)
+}
+
+/// The `--layout` options `args` resolve to, for CLI parsing tests.
+#[cfg(test)]
+pub(crate) fn layout_options_for_test(args: &PlanArgs) -> cuteafd_loader::plan::layout::LayoutOptions {
+    options(args).expect("valid plan options").layout.expect("--layout")
+}
+
+/// The report `run_plan` prints for a V4.1 checkpoint directory, without
+/// printing: the same options, speculator and V4.1 layout steps, in order,
+/// for tests that size runtime owners from the deployment plan.
+#[cfg(test)]
+pub(crate) fn v41_report_for_test(mut args: PlanArgs) -> Result<cuteafd_loader::plan::PlanReport> {
+    let snapshot = PathBuf::from(&args.model);
+    let view = args.attention.select(&snapshot)?;
+    let input = cuteafd_loader::plan::PlanInput::open_view(&view)?;
+    let family = cuteafd_loader::plan::family::detect(input.checkpoint()).map_or("", |family| family.id());
+    anyhow::ensure!(family == "deepseek_v41", "expected a DeepSeek V4.1 checkpoint, found {family:?}");
+    let cfg = launch_config(args.config.as_deref())?;
+    resolve_expert_usage(&mut args, &cfg)?;
+    resolve_context_tokens(&mut args, &cfg)?;
+    resolve_speculator(&mut args, &snapshot, family, &cfg)?;
+    let mut options = options(&args)?;
+    options.draft_ownership = Some(cuteafd_loader::plan::spec::DraftOwnership::selected(family, &args.speculator));
+    if let Some(layout) = &mut options.layout {
+        if !options.draft_ownership.unwrap().uses_checkpoint() { layout.native_mtp_layers = 0; }
+        v41_layout(layout, &args);
+        layout.v41_draft_width = v41_draft_limit(&args, &cfg)?;
+        layout.tp2_dspark_experts = tp2_dspark_experts(&args, family, &cfg)?;
+    }
+    options.vision = glm_flash_vision(&args, family, &snapshot);
+    Ok(input.plan_spark_count(&options, args.available_sparks, args.spark_ranks)?)
 }
 
 fn resolve_context_tokens(args: &mut PlanArgs, cfg: &std::collections::BTreeMap<String, String>) -> Result<()> {
@@ -1327,6 +1360,7 @@ mod tests {
 
     fn args(model: &std::path::Path, spark_ranks: usize, require_ready: bool) -> PlanArgs {
         PlanArgs {
+            coordinator_arch: cuteafd_core::GpuArch::Sm120,
             attention: Default::default(),
             draft_kv_cache: cuteafd_loader::families::qwen4::Qwen4KvCache::Bf16,
             expert_partial_bf16_max_rows: cuteafd_loader::families::muse_spark::replies::DEFAULT_BF16_MAX_ROWS,
@@ -1365,6 +1399,8 @@ mod tests {
             draft_head: crate::shared::speculation::dflash::DraftHead::Exact,
             drafter_gib: 0.0,
             rtx_expert_layers: None,
+            gpu_expert_tier: Default::default(),
+            gpu_expert_tier_profile: None,
             deprecated_peer_expert_ranges: false,
             exchange_f32: false,
             attention_placement: "auto".into(),
@@ -2328,16 +2364,17 @@ mod tests {
             let argv: Vec<&str> = argv.iter().map(String::as_str).collect();
             assert_eq!(planned(&argv), served(sequences, entries, mib.unwrap_or(2048)), "{argv:?}");
         }
-        // Host-on reserves a fixed staging working set even when mark lanes change.
-        let staging = cuteafd_core::prefix::HOST_MARK_STAGING_SLOTS;
+        // Host-on and host-off reserve the same budgeted device mark arena.
         assert_eq!(planned(&launcher(1, 0, None).iter().map(String::as_str).collect::<Vec<_>>()), (0, state(1)));
         assert_eq!(planned(&["--concurrency", "1", "--prefix-cache-entries", "0"]), (0, state(1)));
         for concurrency in [16, 64] {
             let args = launcher(concurrency, 20, None);
             assert_eq!(planned(&args.iter().map(String::as_str).collect::<Vec<_>>()),
-                (staging * mark, state(cuteafd_core::concurrency::state_slots(concurrency))));
+                (cuteafd_core::prefix::mark_slots_for(concurrency, 20, mark, 2048 << 20) * mark,
+                    state(cuteafd_core::concurrency::state_slots(concurrency))));
             assert_eq!(planned(&["--concurrency", &concurrency.to_string()]),
-                (staging * mark, state(cuteafd_core::concurrency::state_slots(concurrency))));
+                (cuteafd_core::prefix::mark_slots_for(concurrency, 20, mark, 2048 << 20) * mark,
+                    state(cuteafd_core::concurrency::state_slots(concurrency))));
         }
         let default_sequences = cuteafd_core::serving_capacity::LARGE_CARD_DEFAULT_CONCURRENCY;
         assert_eq!(planned(&[]), served(default_sequences, 20, 2048));

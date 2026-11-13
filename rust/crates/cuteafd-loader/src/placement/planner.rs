@@ -577,6 +577,8 @@ pub fn driver_page_table_bytes(mapped_bytes: u64) -> u64 {
 
 mod contract;
 mod search;
+mod residency;
+pub use residency::{ResidencyRange, solve_residency};
 mod granularity;
 pub use granularity::{AllocationGranularity, GranularityBacking, GranularityEvidence,
     ALLOCATION_GRANULARITY_GROUP, SM120_ALLOCATION_GRANULARITY_BYTES, SM120_SHARED_REQUEST_BYTES,

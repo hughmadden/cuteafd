@@ -76,7 +76,7 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
             return memory;
         }
     };
-    // GPU marks follow the shared prefix rule: host-tier retention keeps only staging slots.
+    // GPU marks follow the same budgeted device rule with or without host retention.
     let mark_slots = opts.prefix_slots.unwrap_or_else(|| cuteafd_core::prefix::mark_slots_with_host(slots,
         opts.mimo_prefix_entries, crate::placement::families::muse_spark::mark_bytes(cfg, 1),
         opts.mimo_prefix_mark_bytes, opts.host_cache_bytes != Some(0)));
@@ -103,7 +103,7 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
     let drafter = match opts.muse_drafter_snapshot.as_deref().map(|snapshot| -> anyhow::Result<_> {
         let config: serde_json::Value = serde_json::from_slice(&std::fs::read(snapshot.join("config.json"))?)?;
         let head = model.core.head_outputs(&cfg);
-        let sms = opts.physical_sms.unwrap_or(ArchContext::for_device("sm_120", cards[gpus - 1].physical_bytes).sms);
+        let sms = opts.physical_sms.unwrap_or(ArchContext::for_device(cuteafd_core::GpuArch::Sm120, cards[gpus - 1].physical_bytes).sms);
         let drafter = shared::drafter_inventory(cfg, &config, usize::try_from(slots)?,
             usize::try_from(slots)?, head, u64::from(sms), opts.draft_kv_cache)?;
         if opts.tp2_dflash { drafter.with_tp2(snapshot, &vec![u64::from(sms); gpus], opts.draft_kv_cache) }
@@ -160,7 +160,7 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
         .unwrap_or(crate::plan::DEFAULT_SPARK_BUDGET_BYTES).min(opts.spark_bytes);
     let mut budgets = cards.iter().enumerate().map(|(gpu, card)| shared::planned_budget(gpu as u8,
         card.physical_bytes, card.logical_bytes, crate::placement::reserve::gpu("muse_spark"),
-        ArchContext::for_device("sm_120", card.physical_bytes).context_bytes)).collect::<Vec<_>>();
+        ArchContext::for_device(cuteafd_core::GpuArch::Sm120, card.physical_bytes).context_bytes)).collect::<Vec<_>>();
     budgets.extend((0..ranks).map(|rank| shared::spark_budget(rank as u8, spark_budget_bytes)));
     let maximum_pool_tokens = crate::placement::CoordinatorCard::maximum_pool(&cards, context, opts.pool_tokens, shared::PAGE_ROWS);
     let (total, available) = match opts.host_memory.map(Ok).unwrap_or_else(crate::formats::mapped_preload::host_memory) {
@@ -300,7 +300,7 @@ fn planned_code(input: &crate::plan::PlanInput, opts: &crate::plan::layout::Layo
     (0..gpus).map(|rank| {
         let mut programs = programs.clone();
         projections[rank].include_native_programs(&mut programs);
-        let arch = ArchContext::for_device("sm_120", cards[rank].physical_bytes);
+        let arch = ArchContext::for_device(cuteafd_core::GpuArch::Sm120, cards[rank].physical_bytes);
         let code = crate::placement::inventory::loaded_code_allowance("muse", "exl3", gpus == 2, rank as u8,
             arch, Some(&programs));
         crate::placement::families::muse_spark::code_demand(rank, code.bytes)

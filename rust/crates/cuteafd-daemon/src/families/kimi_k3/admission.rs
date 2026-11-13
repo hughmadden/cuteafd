@@ -1136,7 +1136,7 @@ fn request<const RANKS: usize>(mut i: Inputs<'_, RANKS>) -> Result<PlacementRequ
     let mut pool = PoolPolicy::resolve(&i.gpus.map(|gpu| gpu.capacity_bytes), context as u64,
         i.requested_pool, MLA_PAGE_ROWS as u64).with_context(i.serving_context);
     pool.ceiling = pool.target.max(pool.requested.unwrap_or(0));
-    Ok(PlacementRequest {
+    Ok(PlacementRequest { expert_tier: None,
         resident_weight_limit: Some(i.resident_weight_limit), inventory: Inventory { gpus: i.gpus.to_vec(), spark_ranks: i.spark_ranks, peer_access: i.peer_access },
         attention_placement: i.attention, context_buffers: i.context.as_ref().map_or_else(ContextBuffers::default, |layout| layout.buffers()), layers_first_gpu: 0,
         pool, layers, pool_overhead: vec![0; RANKS], pool_bounded: i.pool_bounded, fixed, startup, movables,
@@ -2010,7 +2010,7 @@ pub(super) mod tests {
             cuteafd_core::SparkRings { max_frame_bytes: rings.max_frame_bytes, depth: rings.depth,
                 slot_bytes: rings.slot_bytes, alignment: rings.alignment }, spark_bytes,
             cuteafd_loader::families::kimi_k3::spark::reserve_bytes(6, waves as u64, unit as u64)?)?;
-        let arch = ArchContext::for_device("sm_120", capacity);
+        let arch = ArchContext::for_device(cuteafd_core::GpuArch::Sm120, capacity);
         let programs = ProgramSet::from_manifest(&manifest, &["kimik3"]);
         let code = cuteafd_loader::placement::inventory::loaded_code_allowance(
             "kimik3", "exl3", false, 0, arch, Some(&programs));
@@ -2206,7 +2206,8 @@ pub(super) mod tests {
                 budget_bytes: 512 << 20, host: host_cache_bytes != Some(0) };
             let mark_bytes = cfg.kda_layers() as u64 * (cfg.kda_state_bytes() + cfg.kda_conv_bytes());
             let marks = prefix_slots.unwrap_or_else(|| rule.slots(usize::try_from(mark_bytes).unwrap()) as u64);
-            assert_eq!(marks, if entries == 0 { 0 } else if rule.host { 2 } else { 1 });
+            assert_eq!(marks, prefix_slots.unwrap_or_else(|| cuteafd_core::prefix::mark_slots_for(
+                slots, entries as u64, mark_bytes, rule.budget_bytes)));
             let options = PlanOptions { attention_placement: Some(AttentionPlacement::Layers), placement: ExpertPlacement::Sparks { ranks: 6 },
                 layout: Some(LayoutOptions { host_memory: Some((128 << 30, 128 << 30)), rtx_bytes: vec![capacity; 2], prefill_rows: unit as u64, prefill_lanes: waves as u64,
                     concurrency: slots, state_slots: Some(slots), prefix_slots,
@@ -2232,7 +2233,7 @@ pub(super) mod tests {
                     slot_bytes: rings.slot_bytes, alignment: rings.alignment }, spark_bytes,
                 cuteafd_loader::families::kimi_k3::spark::reserve_bytes(6, waves as u64, unit as u64)?)?;
             let programs = ProgramSet::from_manifest(&manifest, &["kimik3"]);
-            let arch = ArchContext::for_device("sm_120", capacity);
+            let arch = ArchContext::for_device(cuteafd_core::GpuArch::Sm120, capacity);
             // The installed plan resolves the same pinned host retention this
             // case asks for; the runtime must be given that quota too, or its
             // coordinator ledger omits the retained prefix and its mapping.

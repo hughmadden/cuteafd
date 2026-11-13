@@ -353,6 +353,25 @@ impl<'a> OwnerReduce<'a> {
         })
     }
 
+    /// Device-ordered passes push the remote partial from its producer's
+    /// stream into this owner's staging ([`PeerTransfer::enable_push`]),
+    /// instead of pulling it behind a cross-device event. For a reduction
+    /// private to one decode lane only: the staging is rewritten every layer
+    /// with no slot or acknowledgement, because the next layer's partial
+    /// follows this reduce through that lane's flags (layers must not
+    /// pipeline; V4.1's `v41_peer_push::schedule_tests` check it).
+    pub(crate) fn enable_push(&mut self, decode_lane_bytes: usize) -> Result<()> {
+        let [source, destination] = self.transfer.devices();
+        self.transfer.enable_push(Box::new(crate::shared::peer_split::FlagRoute::new(source.library,
+            [source.id, destination.id], decode_lane_bytes)?));
+        Ok(())
+    }
+
+    /// Bytes per row of the widest partial this reduction moves (FP32 route planes).
+    pub(crate) fn partial_row_bytes(&self) -> usize {
+        self.geometry.hidden as usize * self.geometry.topk as usize * 4
+    }
+
     /// # Safety
     /// Both rank outputs are immutable, live and ordered on their producer
     /// streams through completion or cancellation drainage. Deferred callers
@@ -367,10 +386,37 @@ impl<'a> OwnerReduce<'a> {
         dtype: PartialDtype,
         layout: PartialLayout,
     ) -> Result<CuteafdDeviceBuffer> {
+        // SAFETY: forwarded from this function's contract.
+        unsafe { self.reduce_into(local, remote, local_producer, remote_producer, rows, dtype, layout, None).await }
+    }
+
+    /// [`Self::reduce`] into `into` (on this reduction's GPU, holding the
+    /// BF16 result's bytes) instead of its own output, when `Some`: a plane
+    /// of the caller's that outlives this reduction's next use.
+    ///
+    /// # Safety
+    /// As [`Self::reduce`]; no other work reads or writes `into` until the
+    /// reduction completes on its stream.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async unsafe fn reduce_into(
+        &mut self,
+        local: &Allocation<'a>,
+        remote: &Allocation<'a>,
+        local_producer: &Stream<'a>,
+        remote_producer: &Stream<'a>,
+        rows: u32,
+        dtype: PartialDtype,
+        layout: PartialLayout,
+        into: Option<CuteafdDeviceBuffer>,
+    ) -> Result<CuteafdDeviceBuffer> {
         ensure!(
             (1..=self.capacity).contains(&rows),
             "owner reduction exceeds capacity"
         );
+        let result_bytes = rows as usize * self.geometry.hidden as usize * 2;
+        let target = into.unwrap_or(self.output.buffer);
+        ensure!(target.device_id == self.output.device.id && !target.ptr.is_null() && target.bytes >= result_bytes,
+            "owner reduction target device/extent differs");
         let columns = match layout {
             PartialLayout::Tokens => 1,
             PartialLayout::Routes { topk } => {
@@ -407,6 +453,7 @@ impl<'a> OwnerReduce<'a> {
         let ready = &self.local_ready;
         let output = &self.output;
         let reducer = &self.reducer;
+        let result = target;
         let local_rank = self.local_rank;
         // SAFETY: the caller retains rank outputs; transfer retains the callback
         // and drains copy/reduction on any partial enqueue or cancellation.
@@ -428,12 +475,12 @@ impl<'a> OwnerReduce<'a> {
                             (peer, local.buffer)
                         };
                         if dtype == PartialDtype::Bf16 {
-                            reducer.reduce_bf16_routes(rank0, rank1, output.buffer, rows, stream)
+                            reducer.reduce_bf16_routes(rank0, rank1, result, rows, stream)
                         } else {
                             reducer.reduce(
                                 rank0,
                                 rank1,
-                                output.buffer,
+                                result,
                                 rows,
                                 layout == PartialLayout::Tokens,
                                 stream,
@@ -449,8 +496,8 @@ impl<'a> OwnerReduce<'a> {
                 copy_reduce_us=started.elapsed().as_micros() as u64-producer_us.unwrap(),
                 "TP2 routed completion");
         }
-        let mut output = self.output.buffer;
-        output.bytes = rows as usize * self.geometry.hidden as usize * 2;
+        let mut output = target;
+        output.bytes = result_bytes;
         Ok(output)
     }
 }

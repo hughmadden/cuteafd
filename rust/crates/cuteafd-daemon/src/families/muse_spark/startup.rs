@@ -26,6 +26,7 @@ pub(crate) fn preflight(manifest: &Path, gpus: usize) -> Result<serde_json::Valu
 /// Startup's measured view of each coordinator GPU, sampled before weights.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Measured {
+    pub arch: cuteafd_core::GpuArch,
     pub total_bytes: u64,
     pub free_bytes: u64,
     /// Code already resident at the sample (CUDA used minus tracked allocations).
@@ -73,7 +74,7 @@ pub(crate) fn admit(options: Options<'_>) -> Result<shared::AdmittedMuse> {
     for (rank, sample) in options.measured.iter().enumerate() {
         let mut programs = programs.clone();
         options.projections[rank].include_native_programs(&mut programs);
-        let arch = cuteafd_loader::placement::ArchContext::for_device("sm_120", sample.total_bytes);
+        let arch = cuteafd_loader::placement::ArchContext::for_device(sample.arch, sample.total_bytes);
         let code = cuteafd_loader::placement::inventory::loaded_code_allowance("muse", "exl3", gpus == 2,
             rank as u8, arch, Some(&programs));
         fixed.push(shared::code_demand(rank, code.pending(sample.untracked_bytes, arch.context_bytes))?);
@@ -215,12 +216,12 @@ mod tests {
             let cutoff = Cutoff::with_formats(cutoff_rows, DEFAULT_BF16_MAX_ROWS, opts.spark_reply_formats)?;
             let served_drafter = snapshot.as_ref().map(|d| -> Result<_> {
                 let config: serde_json::Value = serde_json::from_slice(&std::fs::read(d.path().join("config.json"))?)?;
-                let sms = cuteafd_loader::placement::ArchContext::for_device("sm_120", total).sms;
+                let sms = cuteafd_loader::placement::ArchContext::for_device(cuteafd_core::GpuArch::Sm120, total).sms;
                 let draft = shared::drafter_inventory(&cfg, &config, 16, 16, 202_112, u64::from(sms), draft_kv)?;
                 if tp2 { draft.with_tp2(d.path(), &[u64::from(sms); 2], draft_kv) }
                 else { Ok(draft) }
             }).transpose()?;
-            let arch = cuteafd_loader::placement::ArchContext::for_device("sm_120", total);
+            let arch = cuteafd_loader::placement::ArchContext::for_device(cuteafd_core::GpuArch::Sm120, total);
             let live = crate::commands::bench::assert_resolved_family_seam("muse_spark", &[], || {
                 crate::commands::bench::fixture_prefix().resolve_entries(16);
                 admit(Options { host: shared::HostInput { total: 256 << 30, available: 256 << 30,
@@ -229,7 +230,7 @@ mod tests {
                 manifest: &preflight(&path, gpus)?,
                 projections: cuteafd_loader::families::muse_spark::weight_layout::projections(&cfg, &core,
                     gpus, prefill.unit_rows as usize)?,
-                measured: vec![Measured { total_bytes: total, free_bytes: total - arch.context_bytes,
+                measured: vec![Measured { arch: cuteafd_core::GpuArch::Sm120, total_bytes: total, free_bytes: total - arch.context_bytes,
                     untracked_bytes: arch.context_bytes }; gpus],
                 full_prefill_logits: opts.full_prefill_logits,
                 headroom_bytes: cuteafd_loader::placement::reserve::gpu("muse_spark"), spark_ranks: sparks, prefill, slots: 16,
@@ -302,7 +303,7 @@ mod tests {
             let prefill = cuteafd_loader::serving_capacity::prefill_waves::prefill_shape(sparks, descriptor,
                 Default::default())?;
             assert_eq!((report.prefill_unit_rows, report.prefill_waves), (Some(prefill.unit_rows), Some(prefill.waves)));
-            let arch = cuteafd_loader::placement::ArchContext::for_device("sm_120", total);
+            let arch = cuteafd_loader::placement::ArchContext::for_device(cuteafd_core::GpuArch::Sm120, total);
             let inventory = preflight(&path, gpus)?;
             let live = admit(Options { host: shared::HostInput { total: 256 << 30, available: 256 << 30,
                 reserve: 8 << 30, prefix_bytes: Some(0), prefix_entries: opts.mimo_prefix_entries,
@@ -310,7 +311,7 @@ mod tests {
                 manifest: &inventory,
                 projections: cuteafd_loader::families::muse_spark::weight_layout::projections(&cfg, &core,
                     gpus, prefill.unit_rows as usize)?,
-                measured: vec![Measured { total_bytes: total, free_bytes: total - arch.context_bytes,
+                measured: vec![Measured { arch: cuteafd_core::GpuArch::Sm120, total_bytes: total, free_bytes: total - arch.context_bytes,
                     untracked_bytes: arch.context_bytes }; gpus],
                 full_prefill_logits: opts.full_prefill_logits,
                 headroom_bytes: cuteafd_loader::placement::reserve::gpu("muse_spark"), spark_ranks: sparks, prefill, slots: 16,
@@ -360,7 +361,7 @@ mod tests {
                     manifest: &inventory,
                 projections: cuteafd_loader::families::muse_spark::weight_layout::projections(&cfg, &core,
                     gpus, prefill.unit_rows as usize)?,
-                    measured: vec![Measured { total_bytes: total, free_bytes: total - arch.context_bytes,
+                    measured: vec![Measured { arch: cuteafd_core::GpuArch::Sm120, total_bytes: total, free_bytes: total - arch.context_bytes,
                         untracked_bytes: arch.context_bytes }; gpus],
                     full_prefill_logits: opts.full_prefill_logits,
                     headroom_bytes: cuteafd_loader::placement::reserve::gpu("muse_spark"), spark_ranks: sparks, prefill, slots: 16,
@@ -430,14 +431,14 @@ mod tests {
         let prefill = cuteafd_loader::serving_capacity::prefill_waves::prefill_shape(sparks,
             cuteafd_loader::plan::Family::prefill_limits(&cuteafd_loader::plan::families::muse_spark::MUSE_SPARK),
             Default::default())?;
-        let arch = cuteafd_loader::placement::ArchContext::for_device("sm_120", total);
+        let arch = cuteafd_loader::placement::ArchContext::for_device(cuteafd_core::GpuArch::Sm120, total);
         let built = admit(Options { host: shared::HostInput { total: 256 << 30, available: 256 << 30,
                 reserve: 8 << 30, prefix_bytes: Some(0), prefix_entries: opts.mimo_prefix_entries,
                 media_bytes: opts.media_cache_bytes, device_sampling: true }, cfg: &cfg, core: &core, catalog: input.expert_catalog()?,
             manifest: &preflight(&path, gpus)?,
                 projections: cuteafd_loader::families::muse_spark::weight_layout::projections(&cfg, &core,
                     gpus, prefill.unit_rows as usize)?,
-            measured: vec![Measured { total_bytes: total, free_bytes: total - arch.context_bytes,
+            measured: vec![Measured { arch: cuteafd_core::GpuArch::Sm120, total_bytes: total, free_bytes: total - arch.context_bytes,
                 untracked_bytes: arch.context_bytes }; gpus],
             full_prefill_logits: opts.full_prefill_logits,
             headroom_bytes: cuteafd_loader::placement::reserve::gpu("muse_spark"), spark_ranks: sparks, prefill, slots: 16,

@@ -202,6 +202,10 @@ impl<'w, 'a> DistributedTargetHead<'w, 'a> {
         Ok(())
     }
     pub fn device(&self) -> Device<'a> { self.normalize.device }
+    /// The chained greedy head pushes between its GPUs (A8, A9; `v41_peer_push`).
+    pub fn enable_peer_push(&mut self) -> Result<()> {
+        self.vocabulary.enable_push(crate::families::deepseek_v41::v41_peer_push::lane_bytes(self.capacity, 10240)?)
+    }
     /// Select every row of the completed (non-greedy) head pass on the device:
     /// assemble the two vocabulary halves into full rows on the head GPU and run
     /// the target sampler there, downloading only ids/scores/status.

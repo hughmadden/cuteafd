@@ -65,7 +65,7 @@ extern "C" int32_t cuteafd_dsv4_program_load(uint32_t index) {
   if (status != cudaSuccess) return status;
   status = cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device);
   if (status != cudaSuccess) return status;
-  if (major != 12 || minor != CUTEAFD_DSV4_CC_MINOR) return cudaErrorNoKernelImageForDevice;
+  if (major != CUTEAFD_DSV4_CC_MAJOR || minor != CUTEAFD_DSV4_CC_MINOR) return cudaErrorNoKernelImageForDevice;
   int sms = 0;
   if (program->minimum_sms || program->launch_sm188 || program->runtime_sms()) {
     status = cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device);

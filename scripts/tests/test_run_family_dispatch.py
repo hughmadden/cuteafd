@@ -715,6 +715,26 @@ def test_deployment_planned_permission_is_strict_and_wip_only(tmp_path, family, 
 
 
 @pytest.mark.parametrize("family", ["mimo_v2", "deepseek_v41"])
+@pytest.mark.parametrize("arch", ["sm_120", "sm_89"])
+def test_deployment_plan_names_a_non_default_coordinator_architecture(tmp_path, family, arch):
+    # An SM89 slot's programs are planned for 114 SMs: a plan without the
+    # architecture looks for SM120 programs and is not executable.
+    config = {"model_type": "deepseek_v41"} if family == "deepseek_v41" else {
+        "model_type": "mimo_v2_flash", "num_hidden_layers": 2, "moe_layer_freq": [0, 1]}
+    model = "deepseek-ai/DeepSeek-V4.1-Flash" if family == "deepseek_v41" else "XiaomiMiMo/MiMo-V2-Flash"
+    keys = ("MODEL_REVISION=\nRTX_EXPERT_LAYERS=0\nSPARK_COUNT=2\nSPARK_1_HOST=h1\nSPARK_1_LANE_A=10.0.0.2\n"
+            if family == "deepseek_v41" else "SPARK_COUNT=0\nEXPERT_BACKEND=local\n")
+    result = _family_launch_result(tmp_path, config, model, keys + "SPECULATOR=off\nVISION=off\nAUDIO=off\n",
+        cuda_arch=arch)
+    assert result.returncode == 0, result.stderr
+    plans = [line for line in result.stderr.splitlines() if " plan " in line and "--deployment" in line]
+    assert plans, result.stderr
+    for plan in plans:
+        assert ("--coordinator-arch sm_89" in plan) == (arch == "sm_89"), plan
+        assert "--coordinator-arch sm_120" not in plan
+
+
+@pytest.mark.parametrize("family", ["mimo_v2", "deepseek_v41"])
 @pytest.mark.parametrize("launch", [None, {"family": "wrong"}])
 def test_deployment_wip_still_requires_matching_launch_family(tmp_path, family, launch):
     config = {"model_type": "deepseek_v41"} if family == "deepseek_v41" else {
@@ -896,7 +916,7 @@ def _family_launch_result(tmp_path: Path, family_config: dict, model: str, keys:
                           busy_gpus: tuple[int, ...] = (), plan_rtx_bytes: int | None = None,
                           restart: bool = False, preferred_ranks: int | None = None,
                           gpu_free_mib: int = 97000, gpu_total_mib: int = 98304,
-                          cuda_total_bytes: int | None = None,
+                          cuda_total_bytes: int | None = None, cuda_arch: str = "sm_120",
                           container_pids: tuple[int, ...] = (),
                           gpu_allocations: tuple[tuple[int, int], ...] = (),
                           previous_peers: str | None = None, encoder_plan: dict | None = None,
@@ -923,7 +943,7 @@ def _family_launch_result(tmp_path: Path, family_config: dict, model: str, keys:
     copy_input(ROOT / "scripts" / "lib" / "release-common.sh", repo / "scripts" / "lib")
     from launcher_sandbox import stub_cuda_capacity
     stub_cuda_capacity(repo / "scripts/lib/release-common.sh",
-                       cuda_total_bytes if cuda_total_bytes is not None else gpu_total_mib * 2**20)
+                       cuda_total_bytes if cuda_total_bytes is not None else gpu_total_mib * 2**20, cuda_arch)
     copy_input(ROOT / "scripts" / "lib" / "cdi-gpus.sh", repo / "scripts" / "lib")
     copy_input(ROOT / "scripts" / "lib" / "coordinator-gpus.py", repo / "scripts" / "lib")
     # release-common.sh stages serving_capacity.rs through shared_inputs.

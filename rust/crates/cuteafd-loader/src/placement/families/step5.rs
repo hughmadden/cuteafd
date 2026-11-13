@@ -952,6 +952,7 @@ impl Step5Recipe<'_> {
         };
         let spec = self.inputs.hops();
         let placement = Placement {
+            expert_tier: None,
             pool_tokens: solved.pool_tokens,
             pool_limits: PoolLimits(vec![]),
             attention_placement: AttentionPlacement::Layers,

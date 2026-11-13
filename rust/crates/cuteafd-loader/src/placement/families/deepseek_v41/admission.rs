@@ -5,6 +5,7 @@
 //! changes an owner's charge or its activation; the executor consumes the
 //! admitted owners and never samples free memory again.
 use super::{DraftInventory, ExpertCost};
+mod tier;
 use crate::placement::{AttentionPlacement, Demand, FfnMode, ItemLifetime, LayerMode, MovableId,
     ResidentWeights, planner::*};
 use cuteafd_core::memory_layout::{Basis, Category, MemoryKind};
@@ -538,6 +539,9 @@ pub struct AdoptedPool {
 pub const BACKING_OWNER: &str = "SM120 allocation backing";
 pub const UNATTRIBUTED_OWNER: &str = "unattributed runtime, measured";
 
+// A forecast is headroom, not occupancy to subtract from a device sample.
+const PRE_POOL_FORECAST: &str = "V4.1 pre-pool occupancy forecast:";
+
 /// Adopt the pre-pool device measurement into a solved plan (#1634).
 ///
 /// The solve sizes the KV pool from a sample taken before the family loads its
@@ -570,6 +574,11 @@ pub fn adopt_measured(
     // Zero is a measurement too: an owner with no bytes is not a charge.
     for occupant in measured {
         let location = Location::coordinator(occupant.gpu);
+        // Replace this GPU's pre-load forecast, including a zero measurement.
+        // Keeping both would charge the same residual twice and could break
+        // an explicit pool after the tier had already loaded.
+        plan.facts.allowances.retain(|owner| owner.location != location
+            || !owner.source.starts_with(PRE_POOL_FORECAST));
         for (index, (group, bytes)) in [(BACKING_OWNER, occupant.backing),
             (UNATTRIBUTED_OWNER, occupant.unattributed)].into_iter().enumerate() {
             if bytes == 0 { continue; }
@@ -590,10 +599,19 @@ pub fn adopt_measured(
 fn refit_pool(plan: &mut ResolvedPlan, owners: &[Vec<Component>], tails: u64) -> Result<AdoptedPool, Refusal> {
     let page_rows = plan.pool_page_rows;
     let solved = plan.pool_tokens.div_ceil(page_rows);
+    // Optional tier residency is already fixed: a later measurement may
+    // consume KV slack, but cannot pay for those weights with its policy floor.
+    let tier_floor = if plan.facts.resident_weights.iter().any(|owner| owner.id.starts_with("v41.tier.")) {
+        let smallest = plan.budgets.iter().filter(|budget| budget.locations.iter()
+            .any(|location| matches!(location.device, Device::Coordinator(_))))
+            .map(|budget| budget.physical_bytes).min().unwrap_or(u64::MAX);
+        cuteafd_core::memory_policy::MemoryPolicy::current().kv(smallest, plan.request.context.maximum)
+            .map_err(|error| invalid(&error.to_string()))?.min.div_ceil(page_rows)
+    } else { 0 };
     let floor = if matches!(plan.request.pool, Pin::Exact(_)) {
         solved
     } else {
-        plan.request.context.required().div_ceil(page_rows).max(1)
+        plan.request.context.required().div_ceil(page_rows).max(tier_floor).max(1)
     }.min(solved);
     let (mut low, mut high) = (floor, solved);
     let mut best: Option<AdoptedPool> = None;
@@ -1118,6 +1136,7 @@ impl V41Recipe<'_> {
             None => Vec::new(),
         };
         let placement = Placement {
+            expert_tier: None,
             pool_tokens: solved.pool_tokens,
             pool_limits: PoolLimits(vec![]),
             attention_placement: attention,
@@ -1149,6 +1168,10 @@ impl V41Recipe<'_> {
 }
 
 pub struct ProductionInput<'a> {
+    /// Sampled coordinator architecture; callers select context, program and
+    /// packed-scale facts with it before prepare. Graph/BLAS calibration stays
+    /// the shared upstream inventory until an architecture is measured.
+    pub coordinator_arch: cuteafd_core::GpuArch,
     pub expert_usage: bool,
     pub config: &'a serde_json::Value,
     pub gpus: usize,
@@ -1191,6 +1214,9 @@ pub struct ProductionInput<'a> {
 }
 
 pub struct PreparedV41<'a> {
+    coordinator_arch: cuteafd_core::GpuArch,
+    experts: Vec<ExpertCost>,
+    workspace: u64,
     pub recipe: V41Recipe<'a>,
     budgets: Vec<Budget>,
     /// Compulsory local routed layers; a smaller solved prefix is refused.
@@ -1198,6 +1224,7 @@ pub struct PreparedV41<'a> {
 }
 
 pub struct AdmittedV41 {
+    pub tier_notes: Vec<String>,
     pub expert_usage: Option<cuteafd_core::expert_usage::Geometry>,
     pub placement: crate::placement::Placement,
     pub spark: crate::placement::SparkWorkingSet,
@@ -1235,6 +1262,13 @@ impl<'a> ProductionInput<'a> {
             }
             budget.baseline = Baseline::Forecast { occupied: 0, assumed: false,
                 source: "physical capacity; sampled V4.1 context and selected modules charged once in recipe".into() };
+        }
+        if !matches!(self.coordinator_arch, cuteafd_core::GpuArch::Sm89 | cuteafd_core::GpuArch::Sm120) {
+            return Err(invalid("unsupported coordinator architecture"));
+        }
+        for layout in self.weight_arenas.iter().chain(self.draft.as_ref().and_then(|draft| draft.dense.as_ref())) {
+            super::weight_layout::validate_packed_scales(layout, self.coordinator_arch)
+                .map_err(|error| invalid(&error.to_string()))?;
         }
         let routed = self.experts.len();
         if !(1..=2).contains(&self.gpus)
@@ -1408,7 +1442,7 @@ impl<'a> ProductionInput<'a> {
             });
         }
         let minimum = self.onboard_minimum;
-        Ok(PreparedV41 { recipe, budgets: self.budgets, minimum })
+        Ok(PreparedV41 { coordinator_arch: self.coordinator_arch, recipe, budgets: self.budgets, minimum, experts: self.experts, workspace: self.workspace })
     }
 }
 
@@ -1447,7 +1481,11 @@ pub fn draft_owners(draft: &DraftInventory, gpus: usize) -> Result<Vec<Owner>, R
 
 impl PreparedV41<'_> {
     pub fn admit(self, request: Request) -> Result<AdmittedV41, Refusal> {
-        let solved = crate::placement::planner::solve(request, self.budgets, &self.recipe)?;
+        let solved = crate::placement::planner::solve(request, self.budgets.clone(), &self.recipe)?;
+        self.finish(solved)
+    }
+
+    fn finish(&self, solved: ResolvedPlan) -> Result<AdmittedV41, Refusal> {
         let count = solved
             .decisions
             .onboard_layers
@@ -1459,7 +1497,7 @@ impl PreparedV41<'_> {
             return Err(invalid("mandatory V4.1 expert prefix does not fit"));
         }
         let (placement, spark) = self.recipe.execution(&solved)?;
-        Ok(AdmittedV41 { expert_usage: self.recipe.expert_usage, placement, spark, solved })
+        Ok(AdmittedV41 { tier_notes: Vec::new(), expert_usage: self.recipe.expert_usage.clone(), placement, spark, solved })
     }
 }
 
@@ -1882,7 +1920,7 @@ mod runtime_base_tests {
 
     #[test]
     fn ready_check_prices_every_other_ready_owner_before_measuring_the_base() {
-        let arch = crate::placement::ArchContext::coordinator(
+        let arch = crate::placement::ArchContext::coordinator(cuteafd_core::GpuArch::Sm120,
             crate::placement::inventory::PRO_TOTAL_BYTES, None);
         let mut allocations = vec![
             ready("v41.arena", 0, 6 << 30, Category::Weights, "weight arena"),
@@ -1950,7 +1988,7 @@ mod measured_adoption_tests {
 
     #[test]
     fn untracked_owners_are_every_ready_owner_the_ledger_cannot_see() {
-        let arch = crate::placement::ArchContext::coordinator(
+        let arch = crate::placement::ArchContext::coordinator(cuteafd_core::GpuArch::Sm120,
             crate::placement::inventory::PRO_TOTAL_BYTES, None);
         let mut facts = facts(vec![
             ready("v41.arena", 6 << 30, Category::Weights, "weight arena"),

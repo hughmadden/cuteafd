@@ -207,7 +207,8 @@ pub struct Programs<'a> {
     load: LoadFn,
     launch: LaunchFn,
     programs: HashMap<String, (u32, ProgramSpec)>,
-    card_specs: HashMap<String, [ProgramSpec; 2]>,
+    /// Per-card specs of programs exported with `card_plans`, keyed by SM count.
+    card_specs: HashMap<String, Vec<(u32, ProgramSpec)>>,
     capacities: ProgramCapacities,
     families: serde_json::Value,
 }
@@ -281,15 +282,16 @@ impl<'a> Programs<'a> {
                 spec.scratch = scratch.iter().filter_map(|(k, v)| Some((k.clone(), v.as_u64()?))).collect();
             }
             if let Some(plans) = entry["card_plans"].as_array() {
-                let mut specs = [spec.clone(), spec.clone()];
-                for (index, sms) in [170, 188].into_iter().enumerate() {
-                    let plan = plans.iter().find(|p| p["sm_count"].as_u64() == Some(sms))
-                        .context("validated card plan disappeared")?;
-                    specs[index].geometry = plan["geometry"].clone();
-                    specs[index].scratch = plan["scratch_bytes_at_capacity"].as_object().context("card scratch")?
+                let specs = plans.iter().map(|plan| {
+                    let sms = u32::try_from(plan["sm_count"].as_u64().context("card SM count")?)
+                        .context("card SM count exceeds u32")?;
+                    let mut card = spec.clone();
+                    card.geometry = plan["geometry"].clone();
+                    card.scratch = plan["scratch_bytes_at_capacity"].as_object().context("card scratch")?
                         .iter().map(|(k, v)| Ok((k.clone(), v.as_u64().context("card scratch bytes")?)))
                         .collect::<Result<_>>()?;
-                }
+                    Ok((sms, card))
+                }).collect::<Result<Vec<_>>>()?;
                 self.card_specs.insert(name.to_string(), specs);
             }
             if name.starts_with("glm_stage_") || name.starts_with("glm2_stage_") {
@@ -339,7 +341,7 @@ impl<'a> Programs<'a> {
             if keep(&spec.name) { select(spec)?; }
         }
         for (name, specs) in &mut self.card_specs {
-            if keep(name) { for spec in specs { select(spec)?; } }
+            if keep(name) { for (_, spec) in specs { select(spec)?; } }
         }
         Ok(self)
     }
@@ -389,7 +391,8 @@ impl<'a> Programs<'a> {
         if let Some(specs) = self.card_specs.get(name) {
             let sms = self.library.sm_count()?;
             ensure!(sms > 0, "runtime SM count must be positive");
-            return Ok(&specs[usize::from(sms >= 188)]);
+            return specs.iter().find(|(count, _)| usize::try_from(*count).ok() == Some(sms)).map(|(_, spec)| spec)
+                .with_context(|| format!("program {name} has no card plan for {sms} SMs"));
         }
         Ok(&self.programs.get(name).with_context(|| format!("no DeepSeek V4 program {name}"))?.1)
     }

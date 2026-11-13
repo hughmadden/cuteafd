@@ -167,7 +167,7 @@ def test_wip_forwards_both_switches_to_both_legs_and_the_build_key():
     expert = wip.split('build_command="docker exec', 1)[1].split('\n', 1)[0]
     for key in ('V41_AOT', 'VISION_ATTENTION_AOT'):
         assert f'CUTEAFD_WIP_{key}=' in coordinator and f'CUTEAFD_WIP_{key}=' in expert
-    assert 'VISION_ATTENTION_AOT V41_AOT CARGO_FEATURES; do' in wip
+    assert 'VISION_ATTENTION_AOT V41_AOT SM89_REPLY_AOT CARGO_FEATURES; do' in wip
 
 
 def native_key(source, tmp_path, *, families='', bf16='', tp_roles='', exl3='ON', nvfp4='ON'):

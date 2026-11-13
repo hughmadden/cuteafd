@@ -5,8 +5,8 @@ use crate::families::deepseek_v41::v41_target_head::{SampledTargetRows, TargetSa
 use crate::shared::memory::device::DeviceOwner;
 use std::cell::RefCell;
 
-/// Futures remain concrete: selecting a layout does not box lane work or add a
-/// common stream. Each implementation retains its own device/transport owners.
+/// Futures remain concrete; the scheduler heap-pins each lane before wrapping
+/// it. Each implementation retains its own streams and device/transport owners.
 pub(crate) trait VerificationTarget<'a>: TargetCache<'a> {
     type Transport;
     fn set_route_capture(&mut self, enabled: bool) -> Result<()>;
@@ -16,6 +16,8 @@ pub(crate) trait VerificationTarget<'a>: TargetCache<'a> {
     /// whose row count varies (route capture also enables it).
     /// Whether the next pass may run device-ordered (`CUTEAFD_V41_DEVICE`).
     fn set_device_order(&mut self, on: bool);
+    /// Whether the next device-ordered pass is paced (`CUTEAFD_V41_BUSY_LANES`).
+    fn set_pacing(&mut self, on: bool);
     /// Whether the next pass may prefetch into L2 during its Spark exchanges
     /// (`--l2-prefetch`; only while the other lane is idle).
     fn set_l2_prefetch(&mut self, on: bool);
@@ -76,6 +78,7 @@ pub(crate) trait VerificationTarget<'a>: TargetCache<'a> {
 impl<'a> VerificationTarget<'a> for TargetPass<'_, 'a> {
     type Transport = NativeTp4Wave<'a>;
     fn set_device_order(&mut self, on: bool) { TargetPass::set_device_order(self, on) }
+    fn set_pacing(&mut self, on: bool) { TargetPass::set_pacing(self, on) }
     fn set_l2_prefetch(&mut self, on: bool) { TargetPass::set_l2_prefetch(self, on) }
     const SUPPORTS_SAMPLED_TERMINAL: bool = true;
     fn set_route_capture(&mut self, enabled: bool) -> Result<()> {
@@ -127,6 +130,7 @@ impl<'a> VerificationTarget<'a> for TargetPass<'_, 'a> {
 impl<'a> VerificationTarget<'a> for DistributedTargetPass<'_, 'a> {
     type Transport = DeviceOwner<'a, NativeTp4Wave<'a>>;
     fn set_device_order(&mut self, on: bool) { DistributedTargetPass::set_device_order(self, on) }
+    fn set_pacing(&mut self, on: bool) { DistributedTargetPass::set_pacing(self, on) }
     fn set_l2_prefetch(&mut self, on: bool) { DistributedTargetPass::set_l2_prefetch(self, on) }
     const SUPPORTS_SAMPLED_TERMINAL: bool = true;
     async unsafe fn execute_shared_sampled(&mut self, requests: &RefCell<&mut Requests<'a>>,

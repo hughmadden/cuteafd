@@ -223,7 +223,7 @@ def test_expert_codec_scope_installs_nonempty_program_manifest(tmp_path, scope):
     script = (ROOT / 'scripts/build/build-wip-artifacts.sh').read_text()
     block = '# Generic-family tables' + script.split('# Generic-family tables', 1)[1].split(
         '# Publish this build', 1)[0]
-    env = dict(PATH=os.environ['PATH'], role='expert', expert_families=scope,
+    env = dict(PATH=os.environ['PATH'], cuda_arch='121', role='expert', expert_families=scope,
                build_dir=str(build), output_dir=str(output))
     for hit in ['0', '1']:
         result = subprocess.run(['bash', '-c', 'set -euo pipefail\n' + block],
@@ -254,7 +254,8 @@ def test_wip_programs_stage_current_table_or_empty_even_after_previous_opt_in(tm
     (output / 'V41_EXPERT_WORKSPACES').mkdir()
     (output / 'PROGRAMS.json').write_text('stale table')
     env = {key: value for key, value in os.environ.items() if not key.startswith('CUTEAFD_WIP_')}
-    env.update(role=role, build_dir=str(build), output_dir=str(output), v41_expert_aot='OFF')
+    env.update(role=role, cuda_arch='120' if role == 'coordinator' else '121',
+               build_dir=str(build), output_dir=str(output), v41_expert_aot='OFF')
     env[f'CUTEAFD_WIP_{family}_AOT'] = 'ON' if enabled else 'OFF'
     result = subprocess.run(['bash', '-c', 'set -euo pipefail\n' + block], env=env,
                             capture_output=True, text=True, timeout=10)

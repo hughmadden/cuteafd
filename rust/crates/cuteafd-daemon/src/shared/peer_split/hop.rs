@@ -36,6 +36,15 @@ pub(crate) struct DirectInputHop<'a> {
     /// Device-ordered passes: an SM copy on the
     /// destination GPU ordered by the stage chain, with no host wait.
     sm: Option<cuteafd_ffi::V41PeerCopy<'a>>,
+    /// Device-ordered passes push instead ([`Self::enable_push`]).
+    push: Option<HopPush<'a>>,
+}
+
+/// A direct-input hop's push route: a stream on the source GPU and one
+/// device flag (rank 0 the source, rank 1 the destination).
+struct HopPush<'a> {
+    sender: Stream<'a>,
+    flags: super::PeerExchange<'a>,
 }
 impl<'a> DirectInputHop<'a> {
     pub fn new(source: Device<'a>, destination: Device<'a>, spec: HopSpec) -> Result<Self> {
@@ -48,7 +57,24 @@ impl<'a> DirectInputHop<'a> {
             contract: spec,
             destination: Stream::new(destination)?,
             sm,
+            push: None,
         })
+    }
+
+    /// From now on a device-ordered copy is pushed by the source GPU (on a
+    /// stream of its own that joins the chain head) behind a device flag the
+    /// destination stream waits on: no cross-device event, no SM pull. SM
+    /// pushes up to `decode_lane_bytes`, the copy engine above. For a hop
+    /// private to one decode lane: it lands once per pass, and the pass's
+    /// drain orders the next landing after every reader.
+    pub fn enable_push(&mut self, decode_lane_bytes: usize) -> Result<()> {
+        let library = self.source.library;
+        self.push = Some(HopPush {
+            sender: Stream::new(self.source)?,
+            flags: super::PeerExchange::new_flags(library, [self.source.id, self.destination.device.id], 1,
+                decode_lane_bytes)?,
+        });
+        Ok(())
     }
     /// Admission checks the planned endpoints against the required geometry.
     pub fn bind(&mut self, hops: &[Hop], spec: HopSpec) -> Result<()> {
@@ -82,6 +108,24 @@ impl<'a> DirectInputHop<'a> {
         );
         validate_direct_input_extent(self.contract, sources.iter().map(|source| source.bytes))?;
         let device = self.destination.device;
+        if let Some(push) = self.push.as_ref().filter(|_| crate::shared::memory::chain::deferred()) {
+            // The source GPU pushes every plane after the chain head (its
+            // producers) and publishes one flag; the destination waits on it
+            // and adopts the head without a cross-device event. Push before
+            // wait, in one synchronous block.
+            let planes = sources.iter().zip(&destinations).map(|(source, destination)|
+                cuteafd_ffi::peer_exchange::PeerPlane { destination: destination.ptr, source: source.ptr.cast_const(),
+                    rows: 1, row_bytes: source.bytes as u64, destination_pitch: source.bytes as u64,
+                    source_pitch: source.bytes as u64 }).collect::<Vec<_>>();
+            let library = device.library;
+            let mark = self.source.run(|| unsafe {
+                crate::shared::memory::chain::join_for_push(library, push.sender.raw) })?;
+            push.flags.push_planes_on(0, push.sender.raw, 0, &planes)?;
+            return device.run(|| unsafe {
+                push.flags.wait_on(1, self.destination.raw, 0)?;
+                crate::shared::memory::chain::finish_after_flag(library, self.destination.raw, mark)
+            });
+        }
         if crate::shared::memory::chain::deferred() {
             // The copy follows the chain head (the producers on the source GPU)
             // on the device and becomes the new head: no host wait. Decode-width

@@ -218,6 +218,8 @@ Porting a family or changing shared serve, prefill, exchange or admission code: 
   `--groups` (e.g. a shared MMA helper change checks the families that call it). From a git worktree, run it in `scripts/build/cuteafd-dev.sh cpu`
   by the worktree's real path (`cd ~/Developer/cute-worktrees/cuteafd-<task> && CUTEAFD_SOURCE_ROOT=$PWD ...`),
   not `/workspace/cuteafd`: relative submodule gitfiles resolve only from the real path.
+  SM89 exporter changes add `--arch sm89` (offline SM89 target, 128 and 114 SMs); programs in
+  `scripts/build/sm89-export-variation.json` may differ in device code only, the toolchain's own run-to-run variation.
 - Kernel row curves: for new kernels/families/expert formats, duel winners or export/tiling/threshold changes,
   measure warmed time per routed row across the policy's live-row band (8192/k, k=2..4: 2048/2752/4096 plus real tails),
   using runtime-selected exports on SM120 and SM121 where the kernel runs, with fork bench `--capacity` and `--routes`.

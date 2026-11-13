@@ -20,3 +20,7 @@ add_custom_target(cuteafd_v41_router_export DEPENDS ${CUTEAFD_V41_ROUTER_OUTPUTS
 add_dependencies(cuteafd_v41_router_export cuteafd_verify_sparkinfer_source)
 set_source_files_properties(${CUTEAFD_V41_ROUTER_OBJECTS} PROPERTIES EXTERNAL_OBJECT TRUE GENERATED TRUE)
 list(APPEND CUTEAFD_NATIVE_SOURCES ${CUTEAFD_V41_ROUTER_OBJECTS} families/deepseek_v41/src/v41_router_scores.cc)
+# Router cubins are exported for the build's CUDA architecture; refuse other devices.
+string(REGEX MATCH "^[0-9]+" CUTEAFD_V41_ROUTER_CC "${CUTEAFD_CUDA_ARCHITECTURES}")
+set_property(SOURCE families/deepseek_v41/src/v41_router_scores.cc APPEND PROPERTY
+  COMPILE_DEFINITIONS "CUTEAFD_V41_ROUTER_CC=${CUTEAFD_V41_ROUTER_CC}")

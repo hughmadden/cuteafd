@@ -81,7 +81,7 @@ impl Census {
         }
         let verdict = witness_verdict(&self.samples);
         let planned_context_bytes = cuteafd_loader::placement::ArchContext::for_device(
-            "sm_121", self.samples.first().map_or(0, |s| s.system_total_bytes)).context_bytes;
+            cuteafd_core::GpuArch::Sm121, self.samples.first().map_or(0, |s| s.system_total_bytes)).context_bytes;
         tracing::info!(target: "cuteafd::spark_memory", %verdict, planned_context_bytes,
             "Spark dual-witness census qualification (quiet-host evidence required externally)");
         Ok(SparkRuntimeDetail { load_transient: vec![], allocations, process_samples: self.samples.clone(),

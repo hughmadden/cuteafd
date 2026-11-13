@@ -761,6 +761,7 @@ impl<'a> PreparedV4<'a> {
             .map(|gpu| solved.items(Location::coordinator(gpu as u8)))
             .collect::<Result<Vec<_>, _>>()?;
         let placement = Placement {
+            expert_tier: None,
             pool_tokens: solved.pool_tokens,
             pool_limits: PoolLimits(Vec::new()),
             attention_placement: self.attention,

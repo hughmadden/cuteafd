@@ -160,7 +160,7 @@ pub(super) fn layout(
             .iter()
             .enumerate()
             .map(|(rank, &capacity_bytes)| {
-                let arch = ArchContext::coordinator(capacity_bytes, None);
+                let arch = ArchContext::coordinator(opts.coordinator_arch, capacity_bytes, None);
                 let allowance = inventory::loaded_code_allowance(
                     "step5",
                     &package,
@@ -257,7 +257,7 @@ pub(super) fn layout(
             Category::Runtime,
             "CUDA pre-weight baseline",
             "sm_120",
-            ArchContext::coordinator(opts.rtx_bytes[rank], None).context_bytes,
+            ArchContext::coordinator(opts.coordinator_arch, opts.rtx_bytes[rank], None).context_bytes,
             Basis::Calibrated,
         ));
         items.extend(crate::placement::reserve::gpu_item("step5"));

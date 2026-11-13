@@ -10,6 +10,8 @@ pub(crate) mod scores;
 use scores::RetainedScores;
 pub(crate) mod prefix;
 pub(crate) mod admission;
+#[cfg(test)]
+mod creation_sweep;
 use crate::families::deepseek_v41::v41_backbone_execution::BackboneExecution;
 use crate::families::deepseek_v41::v41_backbone_execution::CacheProducerWeights;
 use crate::families::deepseek_v41::v41_backbone_lane::BackboneLane;
@@ -159,14 +161,6 @@ fn normalize_serving(args: &mut crate::cli::NativeServeArgs) -> Result<u8> {
     Ok(lanes)
 }
 
-fn attention_plan(args: &crate::cli::NativeServeArgs) -> Result<cuteafd_core::coordinator_programs::AttentionReductionPlan> {
-    let plan = cuteafd_core::coordinator_programs::AttentionReductionPlan::new(
-        cuteafd_core::V41_VERIFY_ROWS, args.dspark.then_some(args.draft_length.draft_length.unwrap_or(5).min(7)),
-        args.attention_plan_rows)?;
-    cuteafd_bench::context::set_resolved("attention-plan-rows", &plan.rows().to_string());
-    Ok(plan)
-}
-
 /// Validate and normalize the launch, then spawn the CUDA worker thread.
 /// With `http`, the API and live console load where `serve-native` always loaded them.
 fn start(mut args: crate::cli::NativeServeArgs, http: bool) -> Result<Started> {
@@ -215,6 +209,24 @@ fn start(mut args: crate::cli::NativeServeArgs, http: bool) -> Result<Started> {
         })?;
     Ok(Started { send, readiness, worker_thread, stats, http })
 }
+/// The attention reduction plan every lane installs. Its compressed kernel is
+/// the measured device's (`GpuArch::v41_compressed_attention`, the planner's
+/// rule): SM89 runs the native FP32 ten-part kernel. Installing the plan only
+/// checks that the library carries that kernel's symbols.
+pub(crate) fn attention_plan(lib: &NativeLibrary, device: i32, args: &crate::cli::NativeServeArgs)
+    -> Result<cuteafd_core::coordinator_programs::AttentionReductionPlan> {
+    attention_plan_for_arch(args, crate::shared::inventory::device_arch(lib, device)?)
+}
+
+pub(crate) fn attention_plan_for_arch(args: &crate::cli::NativeServeArgs, arch: cuteafd_core::GpuArch)
+    -> Result<cuteafd_core::coordinator_programs::AttentionReductionPlan> {
+    let plan = cuteafd_core::coordinator_programs::AttentionReductionPlan::new(
+        cuteafd_core::V41_VERIFY_ROWS, args.dspark.then_some(args.draft_length.draft_length.unwrap_or(5).min(7)),
+        args.attention_plan_rows)?.with_compressed(arch.v41_compressed_attention());
+    cuteafd_bench::context::set_resolved("attention-plan-rows", &plan.rows().to_string());
+    Ok(plan)
+}
+
 // Reserve a supported AOT capacity once; live prefill chunks retain the user's
 // requested size. All backbone/draft workspaces and transport share this bound.
 fn prefill_capacity(batch_tokens: u32) -> Result<u32> {
@@ -437,12 +449,13 @@ fn worker(
     })?;
     let embedding = admission::embedding_placement(args.embedding_placement, device_total);
     let target_arenas = super::weight_layout::TargetArenas::new(&lib,
-        super::weight_layout::target_layout(&catalog, None,
+        super::weight_layout::target_layout_for_arch(&catalog, None,
             embedding == crate::shared::memory::EmbedPlacement::Gpu,
-            super::v41_tensors::fp8_head(), false, false)?)?;
+            super::v41_tensors::fp8_head(), false, false, crate::shared::inventory::device_arch(&lib, lib.cuda_get_device()?)?)?)?;
     let arena = Some(target_arenas.get(lib.cuda_get_device()?)?);
     let recorder = dense::Recorder::start(push_policy == PushPolicy::Required)?;
-    let weights = BackboneLaneWeights::load_in(&lib, &catalog, 16 << 20, None, false, false, Some(&target_arenas))?;
+    let mut weights = BackboneLaneWeights::load_in(&lib, &catalog, 16 << 20, None, false, false, Some(&target_arenas))?;
+    let census = route_census(&lib, &args, &[lib.cuda_get_device()?], &mut weights)?;
     let producers = CacheProducerWeights::load_in(&lib, &catalog, 16 << 20, None, Some(&target_arenas))?;
     let index_weights = IndexLaneWeights::load_in(&lib, &catalog, 16 << 20, None, Some(&target_arenas))?;
     let table = NativeRtxTensors::load_embedding_in(&lib, &catalog, embedding, arena)?;
@@ -451,7 +464,7 @@ fn worker(
         start.elapsed().as_secs_f64()
     );
     admission::startup_phase(&lib, "v41/weights:backbone,cache-producers,index,embedding", device_total)?;
-    let attention_plan = attention_plan(&args)?;
+    let attention_plan = attention_plan(&lib, lib.cuda_get_device()?, &args)?;
     let pipeline = engram_pipeline(&lib, &catalog, &args, rows, slots, &pool)?;
     let engram_weights = [0, 1]
         .map(|i| EngramLayerWeights::load_in(&lib, &catalog, i, 256 * 1024 * 1024, 16 * 1024 * 1024, arena))
@@ -779,11 +792,25 @@ fn worker(
     crate::shared::memory_report::reconcile::capture("ready");
     let health = vision.health_handle();
     scheduler::serve(&lib, &args, &runtime, &mut receive, &mut pass, &mut second,
-        &mut requests, &mut transport, &mut second_transport, &mut prefill_slots, draft.as_mut(), &mut vision, stats, prefixes, || {
+        &mut requests, &mut transport, &mut second_transport, &mut prefill_slots, draft.as_mut(), &mut vision, stats, prefixes, census.as_ref(), || {
             ready.take().context("startup readiness missing")?
                 .send(Ok((health, args.max_context_tokens)))
                 .map_err(|_| anyhow::anyhow!("API startup cancelled"))
         })
+}
+
+/// `CUTEAFD_V41_ROUTE_CENSUS` (`shared::route_census`): the census of the
+/// routers on `gpus`, installed in every layer's router before any lane or
+/// graph exists. Its model id is `--model-id`, else the snapshot's hub id or
+/// directory name.
+fn route_census<'a>(lib: &'a NativeLibrary, args: &crate::cli::NativeServeArgs, gpus: &[i32],
+    weights: &mut BackboneLaneWeights<'a>) -> Result<Option<crate::shared::route_census::RouteCensus<'a>>> {
+    let model = args.model_id.clone().or_else(|| cuteafd_api::openai::snapshot_model_id(&args.snapshot))
+        .unwrap_or_else(|| args.snapshot.file_name().map_or_else(String::new, |name| name.to_string_lossy().into_owned()));
+    let census = crate::shared::route_census::RouteCensus::from_env(lib, gpus,
+        crate::families::deepseek_v41::v41_backbone_router::ROUTE_CENSUS_SHAPE, model)?;
+    if let Some(census) = &census { weights.install_route_census(census)?; }
+    Ok(census)
 }
 
 /// The HC-9 prefill pacing hold at a chunk boundary: bounded by the host cache's store

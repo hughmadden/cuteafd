@@ -4,6 +4,11 @@
 #include <cstdio>
 #include <mutex>
 #include "v41_fp8_variants.h"
+// Exported compute capability; SM120 bundles predate the macros.
+#ifndef CUTEAFD_V41_FP8_CC_MAJOR
+#define CUTEAFD_V41_FP8_CC_MAJOR 12
+#define CUTEAFD_V41_FP8_CC_MINOR 0
+#endif
 static_assert(sizeof(cuteafd_v41_fp8_info_t) == 56);
 namespace {
 using ModuleFn = void (*)(void**);
@@ -44,15 +49,21 @@ int device_slot(int device) {
   for (int slot=0; slot<2; ++slot) if (owner_device[slot] < 0) { owner_device[slot]=device; return slot; }
   return -1;
 }
-Variant* capacity(int rows, int k, int n, int slot=0, int sms=188) {
+// Card plans: the plan exported for exactly this SM count, else (SM120) the
+// 170/188 rule. SM89 bundles plan each supported card exactly, so another
+// SM89 card has no plan for those shapes and is refused.
+Variant* capacity(int rows, int k, int n, int slot, int sms) {
   auto* table = slot == 0 ? variants : peer_variants;
-  const uint32_t plan_sms = sms >= 188 ? 188 : 170;
+  const uint32_t rule_sms = sms >= 188 ? 188 : 170;
+  Variant* ruled = nullptr;
   for (size_t i=0; i<sizeof(variants)/sizeof(variants[0]); ++i) {
     auto& v=table[i];
-    if (int(v.info.capacity_rows)==rows && int(v.info.input_dim)==k && int(v.info.output_dim)==n &&
-        (!v.plan_sms || v.plan_sms == plan_sms)) return &v;
+    if (int(v.info.capacity_rows)!=rows || int(v.info.input_dim)!=k || int(v.info.output_dim)!=n)
+      continue;
+    if (!v.plan_sms || int(v.plan_sms) == sms) return &v;
+    if (v.plan_sms == rule_sms) ruled = &v;
   }
-  return nullptr;
+  return ruled;
 }
 Variant* handle(void* p) {
   for (auto& v : variants) if (&v == p) return &v;
@@ -80,10 +91,25 @@ bool span(const void* p, uint64_t bytes, uintptr_t& start, uintptr_t& end) {
 // Cubins require the exported architecture, not the export host's SM count.
 int reject_device(int device, int major, int minor, int sms) {
   std::fprintf(stderr,
-               "cuteafd: v41 fp8 AOT kernels were exported for compute 12.0 with %d SMs, but "
+               "cuteafd: v41 fp8 AOT kernels were exported for compute %d.%d with %d SMs, but "
                "device %d is compute %d.%d with %d SMs; rebuild the coordinator AOT export on "
                "the target GPU (cudaErrorInvalidDevice)\n",
+               int(CUTEAFD_V41_FP8_CC_MAJOR), int(CUTEAFD_V41_FP8_CC_MINOR),
                int(CUTEAFD_V41_FP8_SMS), device, major, minor, sms);
+  return int(cudaErrorInvalidDevice);
+}
+// A shape with exact card plans and none for this device's SM count.
+int reject_plan(int rows, int k, int n, int device, int sms) {
+  char plans[64] = "";
+  size_t used = 0;
+  for (auto& v : variants)
+    if (int(v.info.capacity_rows)==rows && int(v.info.input_dim)==k && int(v.info.output_dim)==n &&
+        used < sizeof(plans))
+      used += std::snprintf(plans + used, sizeof(plans) - used, " %u", v.plan_sms);
+  if (!used) return cudaErrorInvalidValue;
+  std::fprintf(stderr,
+               "cuteafd: v41 fp8 %dx%d m%d is planned for SM counts%s; device %d has %d SMs "
+               "(cudaErrorInvalidDevice)\n", k, n, rows, plans, device, sms);
   return int(cudaErrorInvalidDevice);
 }
 int device_matches(Variant* v) {
@@ -117,17 +143,18 @@ extern "C" int32_t cuteafd_v41_fp8_matrix_reduction_info(int32_t rows, int32_t k
 }
 extern "C" int32_t cuteafd_v41_fp8_matrix_initialize(int32_t rows, int32_t k, int32_t n, void** out) {
   if (!out) return cudaErrorInvalidValue; *out = nullptr;
-  auto* v = capacity(rows, k, n); if (!v) return cudaErrorInvalidValue;
   int device, major, minor, sms;
   auto status = cudaGetDevice(&device); if (status) return status;
   status = cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device); if (status) return status;
   status = cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device); if (status) return status;
   status = cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device); if (status) return status;
-  if (major != 12 || minor != 0 || sms <= 0) return reject_device(device, major, minor, sms);
+  if (major != CUTEAFD_V41_FP8_CC_MAJOR || minor != CUTEAFD_V41_FP8_CC_MINOR || sms <= 0)
+    return reject_device(device, major, minor, sms);
   std::lock_guard<std::mutex> lock(mutex);
+  if (!capacity(rows,k,n,0,sms)) return reject_plan(rows,k,n,device,sms);
   const int slot=device_slot(device);
   if (slot<0) return cudaErrorInvalidDevice;
-  v=capacity(rows,k,n,slot,sms);
+  auto* v=capacity(rows,k,n,slot,sms);
   if (!v) return cudaErrorInvalidValue;
   if (v->device >= 0) {
     if (v->device != device) return cudaErrorInvalidDevice;
@@ -143,11 +170,14 @@ extern "C" int32_t cuteafd_v41_fp8_matrix_initialize(int32_t rows, int32_t k, in
     }
     v->device_sms = sms;
     v->device = device;
-    if (sms != CUTEAFD_V41_FP8_SMS)
+    static bool told[2];
+    if (sms != CUTEAFD_V41_FP8_SMS && !told[slot]) {
+      told[slot] = true;
       std::fprintf(stderr,
-                   "cuteafd: v41 fp8 AOT exported on %d SMs; device %d has %d SMs; "
-                   "using the same kernels with quantization grid capped at %d CTAs\n",
+                   "cuteafd: v41 fp8 AOT grids are sized for %d SMs; device %d has %d SMs; "
+                   "quantization grids are capped at %d CTAs\n",
                    int(CUTEAFD_V41_FP8_SMS), device, sms, 4 * sms);
+    }
   }
   *out = v; return 0;
 }
@@ -221,7 +251,7 @@ extern "C" int32_t cuteafd_v41_hc_project_initialize() {
   auto status=cudaGetDevice(&device); if(status) return status;
   status=cudaDeviceGetAttribute(&major,cudaDevAttrComputeCapabilityMajor,device); if(status) return status;
   status=cudaDeviceGetAttribute(&minor,cudaDevAttrComputeCapabilityMinor,device); if(status) return status;
-  if(major!=12 || minor!=0) return cudaErrorInvalidDevice;
+  if(major!=CUTEAFD_V41_FP8_CC_MAJOR || minor!=CUTEAFD_V41_FP8_CC_MINOR) return cudaErrorInvalidDevice;
   std::lock_guard<std::mutex> lock(mutex);
   const int slot=device_slot(device);
   if(slot<0) return cudaErrorInvalidDevice;

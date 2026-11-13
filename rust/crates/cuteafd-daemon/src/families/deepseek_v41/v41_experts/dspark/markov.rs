@@ -6,6 +6,14 @@ use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::{CuteafdDeviceBuffer, V41VocabularyProjection};
 use std::ffi::c_void;
 
+/// Rows the Markov head always runs. cuBLAS keeps the 66 MB head in L2 for a
+/// two-row GEMM (24.9 us warm on an RTX 4090) but streams it from memory for
+/// the GEMV it picks at one row (75.9 us), five times per draft: a one-row
+/// draft runs as two, its second row the embedding buffer's padding (zero
+/// until a wider draft wrote it) and its logits never read. Row 0's logits
+/// are then the GEMM's, as in a two-request draft.
+const GEMM_ROWS: usize = 2;
+
 /// One sequential draft position's stable token, embedding and logits buffers.
 /// Returned views are valid until this owner is reused; preserve embeddings for
 /// the final confidence projection before advancing to the next draft position.
@@ -37,13 +45,16 @@ impl<'library> DsparkWeights<'library> {
         self.tensor("mtp.2.markov_head.head.weight")?;
         let workspace = DeviceAllocation::new(library, V41VocabularyProjection::WORKSPACE_BYTES, Tag::drafter_workspace("v41/draft-markov"))?;
         let kernel = unsafe { library.v41_dspark_markov(workspace.buffer)? };
+        let rows = capacity.max(GEMM_ROWS);
+        let embedding = DeviceAllocation::new(library, rows * 512, Tag::drafter_workspace("v41/draft-markov"))?;
+        library.cuda_zero_bytes(embedding.buffer, rows * 512)?;
         Ok(DsparkMarkov {
             kernel,
             _workspace: workspace,
             standalone: &self.standalone,
             tokens: DeviceAllocation::new(library, capacity * 4, Tag::drafter_workspace("v41/draft-markov"))?,
-            embedding: DeviceAllocation::new(library, capacity * 512, Tag::drafter_workspace("v41/draft-markov"))?,
-            logits: DeviceAllocation::new(library, capacity * 129280 * 4, Tag::drafter_workspace("v41/draft-markov"))?,
+            embedding,
+            logits: DeviceAllocation::new(library, rows * 129280 * 4, Tag::drafter_workspace("v41/draft-markov"))?,
             weights: self,
             graph: BindingGraphs::new(library, "dspark_markov")?,
             capacity,
@@ -57,7 +68,7 @@ impl DsparkMarkov<'_, '_> {
             (1..=cuteafd_core::V41_MAX_LANE_MEMBERS).contains(&capacity),
             "Markov request capacity exceeds native lane capacity"
         );
-        Ok(capacity * (4 + 512 + 129280 * 4) + V41VocabularyProjection::WORKSPACE_BYTES)
+        Ok(capacity * 4 + capacity.max(GEMM_ROWS) * (512 + 129280 * 4) + V41VocabularyProjection::WORKSPACE_BYTES)
     }
     /// Preceding token IDs [capacity], u32, each less than 129280. Never free or
     /// retain after drop; finish producer writes before execute/replay.
@@ -88,11 +99,12 @@ impl DsparkMarkov<'_, '_> {
             )?;
             // BF16 checkpoint weights and embeddings are exact FP32 values;
             // accumulate and expose FP32 logits without a BF16 output rounding.
+            // At least GEMM_ROWS rows: the head then stays in L2.
             self.kernel.launch(
                 self.embedding.buffer,
                 self.weights.tensor("mtp.2.markov_head.head.weight")?,
                 self.logits.buffer,
-                rows,
+                rows.max(GEMM_ROWS),
                 stream,
             )
         }

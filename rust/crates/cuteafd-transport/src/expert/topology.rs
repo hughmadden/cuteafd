@@ -5,10 +5,10 @@
 //! rank planes in rank order. There are no replicated expert groups, so the
 //! topology is just the rank count.
 //!
-//! The 12-byte route entry carries the expert id in bits `0..8`; bits `9..31`
-//! are reserved, free for future use, and rejected by the canonical parser
-//! through its `expert_id < experts` check. Request flag bit `18` is reserved
-//! and rejected by the protocol flag validator.
+//! The 12-byte route entry carries the expert id in bits `0..8`. V4.1
+//! coordinator-route requests may mark bit `12`; all remaining bits `9..31`
+//! stay reserved. Without that request flag every bit `9..31` is rejected.
+//! Request flag bit `18` stays reserved and rejected.
 //!
 //! Topology is bound into response identity: each rank count owns a disjoint
 //! executor-id namespace (see [`SparkTopology::executor_id`]), so a stale

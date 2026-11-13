@@ -76,6 +76,9 @@ pub enum Eviction {
 pub enum RestoreFidelity {
     /// Every byte the model reads is the snapshot's (AGENTS "Exact prefix-cache restores").
     Exact,
+    /// Encoder state and sources are restored exactly; a suffix covering the decoder window
+    /// reconstructs its state without reading any saved decoder rings.
+    ExactEncoderContinuation,
     /// Shared pages hold exact rows through `source_end`, but positional state restarts empty
     /// at `replay_start` and the replayed rows rebuild it approximately (a partial match).
     ApproximateReplay,
@@ -148,7 +151,7 @@ impl RestorePlan {
         self.lag.replay_start
     }
     pub fn exact(&self) -> bool {
-        self.fidelity == RestoreFidelity::Exact
+        matches!(self.fidelity, RestoreFidelity::Exact | RestoreFidelity::ExactEncoderContinuation)
     }
     /// The invariants every plan keeps: replay never starts past the shared source frontier,
     /// nor the source frontier past the snapshot or the prompt, and an exact plan resumes at the
@@ -312,6 +315,10 @@ pub trait PrefixFamily<M: Clone + Default = ()> {
     fn plan_restore(&self, hit: RestoreCandidate<'_>) -> RestorePlan {
         RestorePlan::under(self.layout().rule, hit)
     }
+    /// Optional diagnostic rule for counting cold admissions that exact-only reuse refused.
+    /// This never enables partial lookup or restore; it only describes useful partial matches
+    /// the family's exact policy rejects.
+    fn refused_partial_rule(&self) -> Option<ReuseRule> { None }
     /// Which snapshot page pressure evicts first.
     fn eviction(&self) -> Eviction {
         Eviction::LeastRecent
@@ -352,6 +359,10 @@ pub trait PrefixFamily<M: Clone + Default = ()> {
         let _ = (slot, placement, len, tail);
         Ok(None)
     }
+    /// Drain a failed capture, including a partial enqueue that never returned a ticket.
+    /// Queued families must include the actual capture lanes and retain their reservations
+    /// if completion cannot be established. Ordinary synchronous families use `drain`.
+    fn drain_failed_capture(&self) -> Result<(), BoxError> { self.drain() }
     /// Whether every copy of a queued capture has landed (target and drafter alike).
     fn capture_ready(&self, ticket: CaptureTicket) -> Result<bool, BoxError> {
         let _ = ticket;
@@ -359,6 +370,8 @@ pub trait PrefixFamily<M: Clone + Default = ()> {
     }
     /// Wait for queued copies under staging-ring pressure, preserving their captured bytes.
     /// The default drain-and-forget operation is also used by cancellation.
+    /// Failure leaves completion unproven: retain source reservations. The cache
+    /// quarantines this ticket's destinations and reports its owning ticket as fatal.
     fn wait_capture(&self, ticket: CaptureTicket) -> Result<(), BoxError> {
         self.abort_capture(ticket)
     }

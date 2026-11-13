@@ -42,6 +42,8 @@ pub(crate) struct SourceCache<'a> {
     page_table: DeviceAllocation<'a>,
     lengths: DeviceAllocation<'a>,
     staging: HostAllocation<'a>,
+    /// `CUTEAFD_V41_CHECK_STAGING`: the previous upload of `staging` ran.
+    staging_check: crate::shared::memory::staging_check::StagingCheck<'a>,
     stride: usize,
     /// Physical pages bound to each slot, in row order; rows below `rows` are initialized.
     pages: [Vec<u32>; cuteafd_core::V41_MAX_REQUESTS],
@@ -107,6 +109,7 @@ impl<'a> SourceCache<'a> {
             page_table: DeviceAllocation::new(library, slots * pages.min(4096) * 4, Tag::kv("v41/compressed-cache"))?,
             lengths,
             staging: HostAllocation::new(library, slots * 8, Tag::staging("v41/compressed-cache"))?,
+            staging_check: crate::shared::memory::staging_check::StagingCheck::new(library, "V4.1 compressor source lengths", 1),
             stride: pages.min(4096),
             packed: DeviceAllocation::new(library, pages * PAGE_ROWS * 64, Tag::kv("v41/compressed-cache"))?,
             scales: DeviceAllocation::new(library, pages * PAGE_ROWS * 4, Tag::kv("v41/compressed-cache"))?,
@@ -245,7 +248,11 @@ impl<'a> SourceCache<'a> {
     pub unsafe fn upload(&mut self, plan: &IndexPlan, stream: *mut c_void) -> Result<()> {
         self.validate_plan(plan)?;
         let (library, lengths) = (self.lengths.library, self.lengths.buffer);
-        unsafe { upload_lengths(library, lengths, plan, self.staging.bytes_mut(), stream) }
+        self.staging_check.before_write(0)?;
+        unsafe {
+            upload_lengths(library, lengths, plan, self.staging.bytes_mut(), stream)?;
+            self.staging_check.uploaded(0, stream)
+        }
     }
     /// # Safety
     /// Same publication ordering as upload. Staging belongs to the producer and

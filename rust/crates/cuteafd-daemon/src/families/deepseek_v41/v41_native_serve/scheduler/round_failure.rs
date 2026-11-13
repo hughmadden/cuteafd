@@ -16,8 +16,8 @@
 //!
 //! * [`fail_round`] marks every member failed and sends the error once.
 //! * [`retire_done`] takes every done member out and releases EACH one even if an
-//!   earlier release errors; it logs each error with the request id and never
-//!   returns early. A per-request failure must not end the engine (FX-F6).
+//!   earlier ordinary release errors. An undrained capture instead stops serving
+//!   immediately and keeps the member in its slot for shutdown.
 
 use super::super::prefix::V41Cache as PrefixCache;
 use super::super::speculative::{DraftChain, DraftRuntime};
@@ -37,7 +37,7 @@ pub(super) trait RoundMember {
 
 /// Releases a retired member's owners (console ticket, KV lease, draft slot).
 pub(super) trait Releaser<M> {
-    fn release(&mut self, member: M) -> anyhow::Result<()>;
+    fn release(&mut self, member: &mut M) -> anyhow::Result<()>;
 }
 
 /// What one [`retire_done`] pass did.
@@ -59,25 +59,36 @@ pub(super) fn fail_round<M: RoundMember>(active: &mut [Option<M>], error: &anyho
 }
 
 /// Take every done member out of the round and release it. A release error is
-/// logged with the request id and counted; it never stops the pass, so one bad
-/// release cannot strand the rest (today `retire_request(...)?` did).
+/// logged and counted so one ordinary release error cannot strand the rest.
+/// Undrained captures return immediately with the slot and remaining members held.
 pub(super) fn retire_done<M: RoundMember, R: Releaser<M>>(active: &mut [Option<M>],
-    releaser: &mut R) -> RetireReport {
+    releaser: &mut R) -> anyhow::Result<RetireReport> {
     let mut report = RetireReport::default();
     for entry in active.iter_mut() {
         if !entry.as_ref().is_some_and(RoundMember::is_done) { continue; }
         let id = entry.as_ref().unwrap().id();
-        let member = entry.take().unwrap();
-        match releaser.release(member) {
+        match releaser.release(entry.as_mut().unwrap()) {
             Ok(()) => report.retired += 1,
             Err(error) => {
+                if super::super::prefix::capture_undrained(&error) { return Err(error); }
                 report.errors += 1;
                 tracing::error!(request_id = id, %error,
                     "retired request was not fully released; the serve loop continues");
             }
         }
+        *entry = None;
     }
-    report
+    Ok(report)
+}
+
+/// Optional retention may fail safely. Unproven completion must leave the
+/// enclosing retirement before any ordinary release or admission can run.
+pub(super) fn retained_turn(result: anyhow::Result<()>) -> anyhow::Result<()> {
+    if let Err(error) = result {
+        if super::super::prefix::capture_undrained(&error) { return Err(error); }
+        tracing::warn!(%error, "completed request prefix was not retained");
+    }
+    Ok(())
 }
 
 /// RV3-4: the serve loop is exiting (a fatal `?` or the channel closed). Fail
@@ -89,7 +100,19 @@ pub(super) fn drain_on_exit<M: RoundMember, R: Releaser<M>>(active: &mut [Option
     for member in active.iter_mut().flatten() {
         if !member.is_done() { member.fail(message); }
     }
-    retire_done(active, releaser)
+    let mut report = RetireReport::default();
+    for entry in active {
+        match retire_done(std::slice::from_mut(entry), releaser) {
+            Ok(done) => { report.retired += done.retired; report.errors += done.errors; }
+            Err(error) => {
+                // Fatal storage stays occupied through shutdown. Other members
+                // still receive terminal handling; no serving or admission resumes.
+                report.errors += 1;
+                tracing::error!(%error, "retaining undrained capture owners at shutdown");
+            }
+        }
+    }
+    report
 }
 
 /// RV3-5: release both owners of an admission that never entered the round
@@ -138,17 +161,19 @@ impl RoundMember for Active<'_> {
 }
 
 /// The scheduler's [`Releaser`]: the only place the Retire loop calls
-/// `retire_request`. A release error is returned to [`retire_done`], which logs
-/// it and keeps going instead of propagating out of `serve`.
+/// `retire_request`. Ordinary release errors are logged by [`retire_done`];
+/// undrained captures propagate out of `serve` with their slot still occupied.
 pub(super) struct RetireAdapter<'r, 'p, 'd, 'w, 'a, C: DraftChain<'a>> {
     pub(super) requests: &'r mut Requests<'a>,
     pub(super) prefixes: &'p mut PrefixCache<'a>,
     pub(super) draft: Option<&'d mut DraftRuntime<'w, 'a, C>>,
+    /// Fatal capture shutdown performs cleanup only, without queuing new copies.
+    pub(super) capture: bool,
 }
 
 impl<'a, C: DraftChain<'a>> Releaser<Active<'a>> for RetireAdapter<'_, '_, '_, '_, 'a, C> {
-    fn release(&mut self, member: Active<'a>) -> anyhow::Result<()> {
-        retire_request(member, self.requests, self.prefixes, self.draft.as_deref_mut())
+    fn release(&mut self, member: &mut Active<'a>) -> anyhow::Result<()> {
+        retire_request(member, self.requests, self.prefixes, self.draft.as_deref_mut(), self.capture)
     }
 }
 
@@ -192,7 +217,7 @@ pub(super) mod tests {
     }
 
     impl Releaser<FakeMember> for FakeReleaser {
-        fn release(&mut self, member: FakeMember) -> anyhow::Result<()> {
+        fn release(&mut self, member: &mut FakeMember) -> anyhow::Result<()> {
             self.leases.remove(&member.id);
             if self.fail_on == Some(member.id) {
                 anyhow::bail!("release failed for request {}", member.id);
@@ -287,7 +312,7 @@ pub(super) mod tests {
             let (request, output, _) = active_fixture(id, 0);
             slots.insert(id as usize); kv.insert(id); draft.insert(id);
             let now = std::time::Instant::now();
-            pending.push_back((super::super::admission::Prepared { job: request.job, prompt: vec![0], images: vec![] },
+            pending.push_back((super::super::admission::Prepared { job: request.job, prompt: vec![0], images: vec![], stages: Default::default() },
                 id, request.lease, id as usize, request.image_keys, None, (now, now)));
             outputs.push(output);
         }
@@ -308,6 +333,52 @@ pub(super) mod tests {
         }
         assert!(outputs[0].try_recv().is_err(), "active owner is untouched by admission drain");
         drop(first);
+    }
+
+    #[test]
+    fn undrained_turn_retention_stops_retirement_with_slot_and_ticket_consistent() {
+        struct Retainer { fatal: bool, calls: usize, released: Vec<u64> }
+        impl Releaser<Active<'_>> for Retainer {
+            fn release(&mut self, member: &mut Active<'_>) -> anyhow::Result<()> {
+                member.console_retire();
+                self.calls += 1;
+                let error = if self.fatal {
+                    cuteafd_engine::prefix::PrefixError::CaptureUndrained {
+                        ticket: None,
+                        capture: "injected turn capture".into(), source: "lane pending".into(),
+                    }.into()
+                } else { anyhow::anyhow!("safely drained turn capture failed") };
+                retained_turn(Err(error))?;
+                self.released.push(member.id());
+                Ok(())
+            }
+        }
+        for fatal in [false, true] {
+            let (mut first, _, first_log) = active_fixture(1, 0);
+            let (mut second, _, second_log) = active_fixture(2, 0);
+            first.finished = true; second.finished = true;
+            let mut active = [Some(first), Some(second)];
+            let mut retainer = Retainer { fatal, calls: 0, released: Vec::new() };
+            let result = retire_done(&mut active, &mut retainer);
+            if fatal {
+                assert!(super::super::super::prefix::capture_undrained(&result.unwrap_err()));
+                assert_eq!(retainer.calls, 1, "fatal propagates once without further device work");
+                assert!(retainer.released.is_empty());
+                assert!(active.iter().all(Option::is_some), "occupied identities never appear vacant to admission");
+                active[0].as_mut().unwrap().console_retire();
+                assert!(first_log.records.lock().unwrap().is_empty(), "usage record flushes when its owner drops");
+                assert!(second_log.records.lock().unwrap().is_empty(), "second retirement not started");
+                drop(active);
+                let records = first_log.records.lock().unwrap().len();
+                assert_eq!(records, 1, "one terminal usage record after repeated retirement and shutdown");
+            } else {
+                assert_eq!(result.unwrap().retired, 2);
+                assert_eq!(retainer.released, [1, 2]);
+                assert!(active.iter().all(Option::is_none));
+                assert_eq!(first_log.records.lock().unwrap().len(), 1);
+                assert_eq!(second_log.records.lock().unwrap().len(), 1);
+            }
+        }
     }
 
     /// 48 members, one failed round: every member gets exactly one error event.
@@ -332,7 +403,7 @@ pub(super) mod tests {
         let mut active = round(48, 0, &errors);
         fail_round(&mut active, &fault("window batch shape differs"));
         let mut releaser = FakeReleaser { leases: leases(48), retired: 0, fail_on: None };
-        let report = retire_done(&mut active, &mut releaser);
+        let report = retire_done(&mut active, &mut releaser).unwrap();
         assert!(active.iter().all(Option::is_none), "every slot is released");
         assert_eq!(report, RetireReport { retired: 48, errors: 0 });
         assert_eq!(releaser.retired, 48);
@@ -346,7 +417,7 @@ pub(super) mod tests {
         let mut active = round(48, 0, &errors);
         fail_round(&mut active, &fault("invalid vocabulary projection rows"));
         let mut releaser = FakeReleaser { leases: leases(48), retired: 0, fail_on: Some(3) };
-        let report = retire_done(&mut active, &mut releaser);
+        let report = retire_done(&mut active, &mut releaser).unwrap();
         assert!(active.iter().all(Option::is_none), "the failing member still leaves its slot");
         assert_eq!(report, RetireReport { retired: 47, errors: 1 });
         assert_eq!(releaser.retired, 47);
@@ -362,7 +433,7 @@ pub(super) mod tests {
         fail_round(&mut active, &fault("window batch shape differs"));
         assert_eq!(errors.lock().unwrap().len(), 24, "closed clients get no error event");
         let mut releaser = FakeReleaser { leases: leases(48), retired: 0, fail_on: None };
-        let report = retire_done(&mut active, &mut releaser);
+        let report = retire_done(&mut active, &mut releaser).unwrap();
         assert!(active.iter().all(Option::is_none));
         assert_eq!(report, RetireReport { retired: 48, errors: 0 });
         assert!(releaser.leases.is_empty());

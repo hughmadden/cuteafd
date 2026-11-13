@@ -285,7 +285,7 @@ impl GlmRecipe<'_> {
                     context.candidate_row_bytes
                 } else { 0 })).ok_or(Refusal::Overflow("GLM context peer rows"))?;
         }
-        let placement = Placement { pool_tokens: solved.pool_tokens, pool_limits: PoolLimits(vec![]),
+        let placement = Placement { expert_tier: None, pool_tokens: solved.pool_tokens, pool_limits: PoolLimits(vec![]),
             attention_placement: attention, attention_by_kind: vec![(AttentionClass::Dsa, attention)],
             peer_row_bytes, onboard_layers: local.len(), max_pool_tokens_no_onboard: None,
             layers: assignments, movables: solved.decisions.draft_home

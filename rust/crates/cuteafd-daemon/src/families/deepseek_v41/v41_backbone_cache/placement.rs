@@ -55,6 +55,7 @@ mod tests {
         for ranks in [1, 2] {
             let prefill = PrefillShape { rows: 128, waves: 1 };
             let placement = ProductionInput {
+                coordinator_arch: cuteafd_core::GpuArch::Sm120,
             blas: Vec::new(),
             expert_usage: false,
                 config: &config, gpus: ranks, context: 4096, maximum_pool_tokens: 8192,

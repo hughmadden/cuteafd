@@ -320,9 +320,9 @@ fn v4_inputs(report: &PlanReport, input: &super::super::PlanInput, options: &Lay
     let mut gpus = Vec::with_capacity(devices.len());
     let mut pending_code = Vec::with_capacity(devices.len());
     for (rank, (device, &total)) in devices.iter().zip(&options.rtx_bytes).enumerate() {
-        let context = crate::placement::ArchContext::coordinator(total, None).context_bytes;
+        let context = crate::placement::ArchContext::coordinator(options.coordinator_arch, total, None).context_bytes;
         let runtime = runtime_item(shape.manifest.as_deref(), &program_families(id, split),
-            v4::code_experts(catalog), split, rank, total);
+            v4::code_experts(catalog), split, rank, options.coordinator_arch, total);
         pending_code.push(runtime.bytes.saturating_sub(context));
         gpus.push((total, Baseline::Planned { context_bytes: context, loaded_bytes: device.used_bytes() }));
     }

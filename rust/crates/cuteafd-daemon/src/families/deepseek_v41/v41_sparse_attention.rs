@@ -114,6 +114,9 @@ pub(crate) struct LocalSparseAttentionWave<'a,const HEADS:usize> {
     descriptor_staging: LayerStaging<'a>,
     staging: LayerStaging<'a>,
     replay_staging: LayerStaging<'a>,
+    /// `CUTEAFD_V41_CHECK_STAGING`: per layer, the descriptor, metadata and
+    /// replay-begin regions (layer, 40 + layer and 80 + layer).
+    staging_check: crate::shared::memory::staging_check::StagingCheck<'a>,
     capacity: usize,
     batch_rows: usize,
     attention_plan: Option<cuteafd_core::coordinator_programs::AttentionReductionPlan>,
@@ -186,6 +189,8 @@ impl<'a,const HEADS:usize> LocalSparseAttentionWave<'a,HEADS> {
             descriptor_staging: LayerStaging::new(library, V41SparseAttention::batch_descriptor_bytes(batch)?, 40, "v41/sparse-descriptors")?,
             staging: LayerStaging::new(library, capacity * 80, 40, "v41/sparse-attention")?,
             replay_staging: LayerStaging::new(library, capacity * 8, 40, "v41/sparse-replay")?,
+            staging_check: crate::shared::memory::staging_check::StagingCheck::new(library,
+                "V4.1 sparse attention metadata", 120),
             storage, window: crate::shared::memory::row_window::RowWindow::NONE,
             capacity, batch_rows: batch, attention_plan: None, decode: false,
             graphs: GraphBank::new(None), spans_devices: false, warmed_kernels: 0, cold: None,
@@ -759,10 +764,14 @@ impl<'a,const HEADS:usize> LocalSparseAttentionWave<'a,HEADS> {
             } else { self.storage.kernel.prepare_batch(self.storage.query.buffer, sink, self.storage.metadata.buffer,
                 selected, &bindings, self.storage.output.buffer, self.storage.descriptors.buffer,
                 self.storage.replay_begins.buffer, self.storage.split_scratch.buffer)? };
+            self.staging_check.before_write(layer % 40)?;
             let (host, bytes) = self.descriptor_staging.region(layer);
             bytes[..batch.bytes().len()].copy_from_slice(batch.bytes());
-            unsafe { self.storage.stream.library.copy_host_buffer_h2d_async(self.storage.descriptors.buffer,
-                host, batch.bytes().len(), self.storage.stream.raw)?; }
+            unsafe {
+                self.storage.stream.library.copy_host_buffer_h2d_async(self.storage.descriptors.buffer,
+                    host, batch.bytes().len(), self.storage.stream.raw)?;
+                self.staging_check.uploaded(layer % 40, self.storage.stream.raw)?;
+            }
             // The kernel reads current descriptors rather than capturing external
             // cache pointers or request row counts. Selection is lane-owned and
             // stable; still include its address to guard any future owner change.
@@ -770,6 +779,7 @@ impl<'a,const HEADS:usize> LocalSparseAttentionWave<'a,HEADS> {
                 selected.map_or(0, |buffer| buffer.ptr as usize), batch.backend_key()];
             Some(batch)
         } else { None };
+        self.staging_check.before_write(40 + layer % 40)?;
         let (host, bytes) = self.staging.region(layer);
         for (i, m) in metadata.into_iter().enumerate() {
             bytes[i * 8..i * 8 + 8].copy_from_slice(&m.to_ne_bytes());
@@ -778,9 +788,11 @@ impl<'a,const HEADS:usize> LocalSparseAttentionWave<'a,HEADS> {
             self.storage.stream.library.copy_host_buffer_h2d_async(
                 self.storage.metadata.buffer, host, rows * 80, self.storage.stream.raw,
             )?;
+            self.staging_check.uploaded(40 + layer % 40, self.storage.stream.raw)?;
         }
         if HEADS==32 || batch.is_some() || requests.iter().any(|r| r.window.cache.begin != 0) {
             let mut row = 0;
+            self.staging_check.before_write(80 + layer % 40)?;
             let (host, bytes) = self.replay_staging.region(layer);
             for request in requests {
                 for _ in request.positions {
@@ -793,6 +805,7 @@ impl<'a,const HEADS:usize> LocalSparseAttentionWave<'a,HEADS> {
                 self.storage.stream.library.copy_host_buffer_h2d_async(
                     self.storage.replay_begins.buffer, host, rows * 8, self.storage.stream.raw,
                 )?;
+                self.staging_check.uploaded(80 + layer % 40, self.storage.stream.raw)?;
             }
         }
         let queued = QueuedSparseAttention { values: slice(self.storage.output.buffer, 0, rows * (HEADS*1024)), layer, rows };
@@ -959,6 +972,23 @@ mod plan_installation_tests {
         assert!(validate_plan_installation(false, 1, false, 64, 64).is_err());
         assert!(validate_plan_installation(false, 0, true, 64, 64).is_err());
         assert!(validate_plan_installation(false, 0, false, 6, 64).is_err());
+    }
+
+    /// The planner charges each architecture's compressed recipe exactly what
+    /// the storage allocates: SM89's native FP32 ten-part kernel and SM120's
+    /// BF16 AOT read one split extent, so both charges equal the runtime's.
+    #[test]
+    fn planner_charges_every_compressed_backend_what_storage_allocates() -> anyhow::Result<()> {
+        use cuteafd_loader::placement::families::deepseek_v41::owners::sparse_attention_bytes;
+        for unit in [1usize, 16, 63, 64, 65, 256, 1024, 2048, 2752, 4096] {
+            let runtime = super::SparseAttentionStorage::<'_, 64>::storage_bytes(unit)?;
+            assert_eq!(runtime, super::SparseAttentionWave::device_bytes(unit)?);
+            for arch in cuteafd_core::GpuArch::ALL {
+                assert_eq!(sparse_attention_bytes(unit as u64, arch.v41_compressed_attention())?, runtime as u64,
+                    "{arch} unit {unit}");
+            }
+        }
+        Ok(())
     }
 }
 

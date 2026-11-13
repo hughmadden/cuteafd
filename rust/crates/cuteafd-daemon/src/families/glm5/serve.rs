@@ -1584,7 +1584,7 @@ mod draft_tests {
             // Removing the manifest after resolution proves sizing does not resolve it again.
             std::fs::remove_file(&manifest)?;
             size_draft_window_marks(&mut resolved, &args.prefix, args.max_sequences.unwrap())?;
-            assert!(resolved.args.draft_window_marks > 0);
+            assert_eq!(resolved.args.draft_window_marks, 42);
             census.push((resolved.args.max_context, resolved.args.draft_window_marks));
             resolved.args.split_device = Some(1);
             resolved.args.attention_placement = "heads".into();
@@ -1596,7 +1596,10 @@ mod draft_tests {
             rule.host = false;
             assert_eq!(resolved.args.draft_window_marks, rule.slots(
                 cuteafd_loader::placement::families::glm5::draft_window_mark_bytes(&layout)?));
-            assert!(resolved.args.draft_window_marks > census.last().unwrap().1);
+            assert_eq!(cuteafd_loader::placement::families::glm5::draft_window_mark_bytes(&layout)?, 4_156_432);
+            // Host retention keeps the same budgeted device marks. Disabling
+            // host copies for heads placement no longer grows a two-slot arena.
+            assert_eq!(resolved.args.draft_window_marks, census.last().unwrap().1);
 
             let pool_context = crate::shared::context::pool_context("glm5", resolved.context, 524_288);
             if context == 0 { assert_eq!(pool_context?, 524_288); }

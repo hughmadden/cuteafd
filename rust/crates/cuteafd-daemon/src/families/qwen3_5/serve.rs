@@ -893,7 +893,7 @@ mod tests {
                 pool: Pin::Exact(cfg.max_context as u64), onboard: Pin::Auto,
                 prefill: Pin::Exact(PrefillShape { rows: 4096, waves: 1 }), operation: Operation::Serving,
                 resident_weight_limit: None, spark_reply_formats: Default::default() },
-                qwen3_5::forecast_budgets(cuteafd_loader::placement::ArchContext::for_device("sm_120", 96 << 30),
+                qwen3_5::forecast_budgets(cuteafd_loader::placement::ArchContext::for_device(cuteafd_core::GpuArch::Sm120, 96 << 30),
                     96 << 30, 0, (128 << 30, 128 << 30))?,
                 DenseFacts { graph_variant: "fixture".into(), graphs_enabled: true, cfg: &cfg, weights: &weights, target_arena: &target_arena, buffers: &buffers, slots: 4,
                     record_bytes: 4096, drafter: None,

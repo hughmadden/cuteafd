@@ -11,9 +11,14 @@ pub(crate) use cuteafd_loader::placement::families::deepseek_v41::weight_layout:
 
 pub(crate) fn target_layout(catalog: &OfficialV41Catalog, placement: Option<CachePlacement>,
     gpu_embedding: bool, head: Fp8Head, split_query: bool, split_output: bool) -> Result<TargetLayout> {
+    target_layout_for_arch(catalog, placement, gpu_embedding, head, split_query, split_output, cuteafd_core::GpuArch::Sm120)
+}
+pub(crate) fn target_layout_for_arch(catalog: &OfficialV41Catalog, placement: Option<CachePlacement>,
+    gpu_embedding: bool, head: Fp8Head, split_query: bool, split_output: bool,
+    arch: cuteafd_core::GpuArch) -> Result<TargetLayout> {
     let placement = placement.map(|map| (0..40).map(|layer| map.attention(layer))
         .collect::<Result<Vec<_>>>().map(|map| map.try_into().expect("40 layers"))).transpose()?;
-    TargetLayout::new(catalog, placement, gpu_embedding, head, split_query, split_output)
+    TargetLayout::new_for_arch(catalog, placement, gpu_embedding, head, split_query, split_output, arch)
 }
 pub(crate) fn probe_weights(library: &cuteafd_ffi::NativeLibrary, devices: &[i32],
     stage: &str, visit: impl FnOnce(&mut crate::shared::memory::receipts::Inventory<'_>) -> Result<()>) -> Result<()> {
@@ -57,6 +62,10 @@ impl<'a> TargetArenas<'a> {
 }
 
 #[cfg(test)]
+#[path = "weight_layout/arena_extent_tests.rs"]
+mod arena_extent_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use cuteafd_loader::placement::families::deepseek_v41::weight_layout::head_requests;
@@ -92,7 +101,7 @@ mod tests {
         }
         // The planner's dense dSpark charge is the serving arena, padding
         // included, on the installed checkpoint (routed draft experts present).
-        let draft = cuteafd_loader::placement::families::deepseek_v41::weight_layout::draft_layout(&catalog)?;
+        let draft = cuteafd_loader::placement::families::deepseek_v41::weight_layout::draft_layout_for_arch(&catalog, cuteafd_core::GpuArch::Sm120)?;
         let config = serde_json::from_slice(&std::fs::read(catalog.snapshot().join("config.json"))?)?;
         for ranks in [1, 2] {
             let items = cuteafd_loader::placement::families::deepseek_v41::resident::resident_headers(&config,
@@ -124,6 +133,7 @@ mod tests {
             gpu: u8, draft: bool| -> Result<(u64, u64)> {
             let demand = owners::arena_demand(gpu, layout);
             let prepared = admission::ProductionInput {
+                coordinator_arch: cuteafd_core::GpuArch::Sm120,
                 blas: Vec::new(),
                 expert_usage: false, config: &config, gpus: ranks, context: 512, maximum_pool_tokens: 512,
                 prefill: PrefillShape { rows: 128, waves: 1 }, concurrency: 1, retained_turns: 0,
@@ -193,7 +203,7 @@ mod tests {
                 }
             }
         }
-        let draft = cuteafd_loader::placement::families::deepseek_v41::weight_layout::draft_layout(&catalog)?;
+        let draft = cuteafd_loader::placement::families::deepseek_v41::weight_layout::draft_layout_for_arch(&catalog, cuteafd_core::GpuArch::Sm120)?;
         for ranks in [1, 2] {
             let items = resident::resident_headers(&config, catalog.tensors().iter().map(|t| &t.metadata), ranks, true)
                 .ok_or_else(|| anyhow::anyhow!("unsupported draft residency"))?;

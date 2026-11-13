@@ -582,6 +582,7 @@ impl MimoRecipe<'_> {
         let items = (0..self.gpus).map(|rank| solved.items_at(Location::coordinator(rank as u8), Phase::Growth))
             .collect::<Result<Vec<_>, _>>()?;
         let placement = Placement {
+            expert_tier: None,
             pool_tokens: solved.pool_tokens,
             pool_limits: PoolLimits(vec![]),
             attention_placement: AttentionPlacement::Heads,

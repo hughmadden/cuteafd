@@ -3812,11 +3812,11 @@ fn glm5_flash_selected_working_set_drives_plan_request_and_runtime_buffers() {
             blas_head: crate::placement::planner::serving::BlasHead::TensorLt,
         resident_weight_limit: None, spark_reply_format: cuteafd_core::SparkReplyFormat::Bf16, context: crate::placement::planner::Context::pinned(opts.context_tokens), attention: Default::default(), cfg: &cfg, layers: cfg.layers, local_tp2_exl3: false,
             gpus: opts.rtx_bytes.iter().map(|&total| (total, Baseline::Planned {
-                context_bytes: placement::ArchContext::coordinator(total, None).context_bytes,
+                context_bytes: placement::ArchContext::coordinator(cuteafd_core::GpuArch::Sm120, total, None).context_bytes,
                 loaded_bytes: 0 })).collect(),
             pending_code: opts.rtx_bytes.iter().enumerate().map(|(rank, &total)|
                 placement::inventory::loaded_code_allowance("glmf", "fp8", true, rank as u8,
-                    placement::ArchContext::for_device("sm_120", total),
+                    placement::ArchContext::for_device(cuteafd_core::GpuArch::Sm120, total),
                     Some(&placement::ProgramSet::from_manifest(&manifest, &["glmf", "glmf2"]))).bytes).collect(),
             headroom_bytes: crate::placement::reserve::gpu("glm5_flash"),
             spark_ranks: peers, prefill_lanes: lanes, prefill_rows: 4096, decode_rows: 64, partial_bytes: 2,
@@ -4521,7 +4521,7 @@ fn glm5_flash_disabled_draft_omits_arenas_and_speculative_graphs() {
         let items = &layout.devices[0].items;
         assert!(!items.iter().any(|i| i.group == "workspace runtime overhead"));
         let context = items.iter().find(|i| i.group == "context+modules").unwrap().bytes;
-        assert_eq!(context, crate::placement::ArchContext::coordinator(crate::placement::inventory::PRO_TOTAL_BYTES,
+        assert_eq!(context, crate::placement::ArchContext::coordinator(cuteafd_core::GpuArch::Sm120, crate::placement::inventory::PRO_TOTAL_BYTES,
             None).context_bytes);
         let code = items.iter().find(|i| i.group.starts_with("selected-program loaded code estimate")).unwrap();
         assert_eq!(code.basis, cuteafd_core::memory_layout::Basis::Estimated);
@@ -5166,7 +5166,7 @@ fn v41_prefill_reserve_is_the_largest_that_fits_never_shrunk_for_kv() {
     let items = &compact.memory_layout.as_ref().unwrap().devices[0].items;
     let bytes = |prefix: &str| items.iter().filter(|item| item.group.starts_with(prefix))
         .map(|item| item.bytes).sum::<u64>();
-    let arch = crate::placement::ArchContext::coordinator(31 << 30, None);
+    let arch = crate::placement::ArchContext::coordinator(cuteafd_core::GpuArch::Sm120, 31 << 30, None);
     assert_eq!(bytes("CUDA context"), arch.context_bytes);
     let modules = bytes("V4.1 selected native modules");
     assert!(modules >= 34 << 20);
@@ -5240,6 +5240,264 @@ fn v41_two_rtx_prefill_runs_three_units_and_pins_still_override() {
         let report = plan_spark_count(dir.path(), &options, 6, Some(4)).unwrap();
         assert_eq!(report.mapped_placement.host_budget_bytes, shape.preload_budget(budget, 264));
         assert_eq!(report.mapped_placement.tables_preloaded(), all);
+    }
+}
+
+#[test]
+fn v41_two_4090d_with_four_sparks_plans_on_sm89() {
+    let dir = strict_v41_snapshot(false);
+    let options = PlanOptions { layout: Some(layout::LayoutOptions {
+        host_memory: Some((256 << 30, 256 << 30)), rtx_bytes: vec![50_950_569_984; 2],
+        coordinator_arch: cuteafd_core::GpuArch::Sm89, workspace_manifest: v41_workspace(dir.path()),
+        pool_tokens: Some(0), context_tokens: 1 << 20, ..Default::default() }), ..sparks(4) };
+    // Two 47.45 GiB SM89 cards hold the head split, the default pool and
+    // some TP2 routed layers; the SM89 context is charged, not SM120's.
+    let report = plan_spark_count(dir.path(), &options, 6, Some(4)).unwrap();
+    assert!(report.executable(), "{}", render(&report));
+    let placement = report.solver_placement.as_ref().expect("V4.1 solver placement");
+    assert_eq!(placement.pool_tokens, 2 << 20, "{}", render(&report));
+    assert!((1..40).contains(&placement.onboard_layers), "{}", render(&report));
+    let layout = report.memory_layout.as_ref().expect("V4.1 memory layout");
+    let rtx = layout.devices.iter().filter(|d| d.kind == cuteafd_core::memory_layout::DeviceKind::Rtx).collect::<Vec<_>>();
+    assert_eq!(rtx.len(), 2);
+    for device in rtx {
+        let context = device.items.iter().find(|i| i.group == "CUDA context").unwrap();
+        // Shared admission charges BLAS separately; the context still uses
+        // the measured SM89 class rather than the SM120 reference card.
+        assert_eq!((context.bytes, context.basis), (374_472_704, cuteafd_core::memory_layout::Basis::Calibrated));
+        assert!(device.items.iter().map(|i| i.bytes).sum::<u64>() <= device.capacity_bytes, "{}", render(&report));
+    }
+}
+
+#[test]
+fn v41_gpu_expert_tier_spreads_resident_experts_over_every_layer() {
+    // A 48 GB SM89 coordinator pair (47.45 GiB CUDA total each) at TP2
+    // halves in front of four Sparks at TP4 that keep every expert.
+    let dir = strict_v41_snapshot(false);
+    let card = crate::placement::ArchContext::reference_total_bytes(cuteafd_core::GpuArch::Sm89);
+    let pair = |tier: crate::placement::ExpertTierSetting, onboard: Option<crate::placement::OnboardSetting>,
+        profile: Option<std::path::PathBuf>| PlanOptions { layout: Some(layout::LayoutOptions {
+        host_memory: Some((256 << 30, 256 << 30)), rtx_bytes: vec![card, card],
+        coordinator_arch: cuteafd_core::GpuArch::Sm89,
+        workspace_manifest: v41_workspace(dir.path()), pool_tokens: Some(0), context_tokens: 1 << 20,
+        expert_tier: tier, expert_tier_profile: profile, onboard, ..Default::default() }), ..sparks(4) };
+    use crate::placement::{ExpertTierSetting, ExpertTierShard, ExpertTierSource, OnboardSetting};
+    let whole = plan_spark_count(dir.path(), &pair(ExpertTierSetting::Off, None, None), 6, Some(4)).unwrap();
+    assert!(whole.executable(), "{}", render(&whole));
+    let auto = plan_spark_count(dir.path(), &pair(ExpertTierSetting::Auto, None, None), 6, Some(4)).unwrap();
+    assert!(auto.executable(), "{}", render(&auto));
+    let placed = auto.solver_placement.as_ref().unwrap();
+    let tier = placed.expert_tier.as_ref().expect("GPU expert tier placement");
+    assert_eq!((tier.shard, tier.source, tier.routed_experts), (ExpertTierShard::Tp2, ExpertTierSource::Uniform, 40 * 384));
+    // Uniform: the same count in every layer to within one, ascending ids.
+    let counts = tier.per_layer().collect::<Vec<_>>();
+    assert_eq!(counts.len(), 40);
+    assert!(counts.iter().max().unwrap() - counts.iter().min().unwrap() <= 1, "{counts:?}");
+    assert!(tier.experts > 0 && counts.iter().sum::<usize>() == tier.experts);
+    // Exact resident bytes: one TP2 half of the MXFP4 expert with coded UE8M0
+    // scales is 9,131,264 bytes (checkpoint MXFP4: 9,400,320).
+    let half = crate::formats::scale_codes::expert_bytes(1, 5120, 1152).unwrap();
+    assert_eq!(half, 9_131_264);
+    let catalog = crate::read_official_v41_catalog(dir.path()).unwrap();
+    assert_eq!(crate::placement::families::deepseek_v41::expert_cost(&catalog, 7, 2, 1, 1152).unwrap().resident, 384 * half);
+    assert_eq!(tier.resident_bytes, vec![tier.experts as u64 * half; 2]);
+    // No whole layer moves; the Sparks keep all 40.
+    assert_eq!(placed.onboard_layers, 0);
+    assert!(placed.tp2.is_none());
+    // The same pool target as whole-layer onboarding, and at least the same
+    // expert bytes: the tier fills at expert, not layer, granularity.
+    let whole_placed = whole.solver_placement.as_ref().unwrap();
+    assert_eq!(placed.pool_tokens, whole_placed.pool_tokens);
+    let whole_bytes = whole_placed.tp2.map_or(0, |t| t.layers as u64 * 384 * half);
+    assert!(tier.resident_bytes[0] >= whole_bytes, "tier {} B vs {} whole layers", tier.resident_bytes[0],
+        whole_placed.onboard_layers);
+    let notes = &auto.memory_layout.as_ref().unwrap().notes;
+    assert!(notes.iter().any(|n| n.starts_with("placement: ") && n.contains("GPU expert tier (Uniform)")), "{notes:?}");
+    assert!(notes.iter().any(|n| n.starts_with("GPU expert tier resident experts per routed layer: [")), "{notes:?}");
+    let predicted = notes.iter().find(|n| n.starts_with("GPU expert tier predicted expert time per verify step: 21.76 -> "))
+        .unwrap_or_else(|| panic!("{notes:?}"));
+    let byte_hit = format!("at a {:.1}% byte hit rate", 100.0 * tier.experts as f64 / tier.routed_experts as f64);
+    assert!(predicted.contains(&byte_hit) && predicted.contains("the same bytes as whole layers save"), "{predicted}");
+    for device in auto.memory_layout.as_ref().unwrap().devices.iter().take(2) {
+        assert!(device.items.iter().any(|i| i.group.starts_with("GPU expert tier (")), "{:?}", device.items);
+    }
+
+    // N per layer: exact, and the pool is the output.
+    let fixed = plan_spark_count(dir.path(), &pair(ExpertTierSetting::PerLayer(16), None, None), 6, Some(4)).unwrap();
+    assert!(fixed.executable(), "{}", render(&fixed));
+    let fixed_tier = fixed.solver_placement.as_ref().unwrap().expert_tier.clone().unwrap();
+    assert_eq!(fixed_tier.per_layer().collect::<Vec<_>>(), vec![16; 40]);
+    assert!(fixed.solver_placement.as_ref().unwrap().pool_tokens >= placed.pool_tokens);
+
+    // A profile ranks the set: the most-routed experts first, in any layer.
+    let mut counts = vec![vec![1u64; 384]; 40];
+    for row in &mut counts { row[300..316].fill(50); }
+    let path = dir.path().join("routes.json");
+    std::fs::write(&path, serde_json::to_vec(&json!({"model": "fixture", "layers": counts})).unwrap()).unwrap();
+    let profiled = plan_spark_count(dir.path(), &pair(ExpertTierSetting::PerLayer(16), None, Some(path.clone())), 6, Some(4)).unwrap();
+    assert!(profiled.executable(), "{}", render(&profiled));
+    let profiled_tier = profiled.solver_placement.as_ref().unwrap().expert_tier.clone().unwrap();
+    assert_eq!(profiled_tier.source, ExpertTierSource::Profile);
+    assert!(profiled_tier.resident.iter().all(|ids| *ids == (300..316).collect::<Vec<u16>>()));
+    let notes = &profiled.memory_layout.as_ref().unwrap().notes;
+    assert!(notes.iter().any(|n| n.starts_with("GPU expert tier profile: route hit rate 68.5%")), "{notes:?}");
+
+    // --rtx-expert-layers pins whole layers inside the tier; the Sparks still
+    // hold every layer.
+    let both = plan_spark_count(dir.path(), &pair(ExpertTierSetting::Auto, Some(OnboardSetting::Layers(2)), None), 6, Some(4)).unwrap();
+    assert!(both.executable(), "{}", render(&both));
+    let pinned = both.solver_placement.as_ref().unwrap().expert_tier.clone().unwrap();
+    assert_eq!(pinned.whole_layers, 2);
+    assert_eq!(pinned.per_layer().take(2).collect::<Vec<_>>(), vec![384, 384]);
+    assert!(pinned.per_layer().skip(2).all(|n| n < 384));
+    assert_eq!(both.solver_placement.as_ref().unwrap().onboard_layers, 0);
+
+    // Refusals: without Sparks, a profile without the tier, a malformed profile.
+    let mut free = pair(ExpertTierSetting::Auto, None, None);
+    free.placement = ExpertPlacement::from_spark_ranks(0);
+    let alone = plan(dir.path(), &free).unwrap();
+    assert!(!alone.executable() && render(&alone).contains("Spark ranks"), "{}", render(&alone));
+    let orphan = plan_spark_count(dir.path(), &pair(ExpertTierSetting::Off, None, Some(path.clone())), 6, Some(4)).unwrap();
+    assert!(!orphan.executable(), "{}", render(&orphan));
+    std::fs::write(&path, br#"{"layers": [[1, 2]]}"#).unwrap();
+    let malformed = plan_spark_count(dir.path(), &pair(ExpertTierSetting::Auto, None, Some(path)), 6, Some(4)).unwrap();
+    assert!(!malformed.executable() && render(&malformed).contains("expert route profile"), "{}", render(&malformed));
+}
+
+#[test]
+fn v41_compressed_tier_capability_comes_from_selected_program_manifest() {
+    use crate::placement::ExpertTierSetting;
+    let dir = strict_v41_snapshot(false);
+    let card = crate::placement::ArchContext::reference_total_bytes(cuteafd_core::GpuArch::Sm89);
+    let mut options = PlanOptions { layout: Some(layout::LayoutOptions {
+        host_memory: Some((256 << 30, 256 << 30)), rtx_bytes: vec![card; 2],
+        coordinator_arch: cuteafd_core::GpuArch::Sm89,
+        workspace_manifest: v41_workspace(dir.path()), pool_tokens: Some(8192), context_tokens: 4096,
+        expert_tier: ExpertTierSetting::PerLayer(8), ..Default::default()
+    }), ..sparks(4) };
+    let baseline = plan_spark_count(dir.path(), &options, 6, Some(4)).unwrap();
+    assert!(baseline.executable(), "{}", render(&baseline));
+    options.layout.as_mut().unwrap().spark_reply_formats.decode = Some(cuteafd_core::SparkReplyFormat::Fp8);
+    let unavailable = plan_spark_count(dir.path(), &options, 6, Some(4)).unwrap();
+    assert!(!unavailable.executable(), "{}", render(&unavailable));
+    assert!(render(&unavailable).contains("expert_reply_reduce_tier"));
+    let path = v41_workspace(dir.path()).unwrap();
+    let mut manifest: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    manifest["programs"] = json!([{"name": "expert_reply_reduce_tier"}]);
+    std::fs::write(&path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+    let available = plan_spark_count(dir.path(), &options, 6, Some(4)).unwrap();
+    assert!(available.executable(), "{}", render(&available));
+    assert_eq!(baseline.solver_placement.unwrap().expert_tier, available.solver_placement.unwrap().expert_tier);
+}
+
+#[test]
+fn v41_declared_expert_storage_must_match_the_charged_halves() {
+    // SM89 packages declare their resident expert layout. The planner charges
+    // the coded-scale TP2 half (9,131,264 B) and refuses any other layout.
+    let dir = strict_v41_snapshot(false);
+    let card = crate::placement::ArchContext::reference_total_bytes(cuteafd_core::GpuArch::Sm89);
+    let options = PlanOptions { layout: Some(layout::LayoutOptions {
+        host_memory: Some((256 << 30, 256 << 30)), rtx_bytes: vec![card; 2],
+        coordinator_arch: cuteafd_core::GpuArch::Sm89, workspace_manifest: v41_workspace(dir.path()),
+        pool_tokens: Some(0), context_tokens: 1 << 20, ..Default::default() }), ..sparks(4) };
+    let path = dir.path().join("share/V41_EXPERT_WORKSPACES/mxfp4_rtx_tp2.json");
+    let base: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    let declare = |planes: [u64; 4], bytes: u64| {
+        let mut manifest = base.clone();
+        manifest["expert_storage"] = json!({"weight_layout": "e2m1_n256_k128_lane_major",
+            "scale_layout": "ue8m0_offset4_n256_k128", "plane_bytes": planes, "bytes_per_expert": bytes});
+        std::fs::write(&path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+        plan_spark_count(dir.path(), &options, 6, Some(4)).unwrap()
+    };
+    let charged = declare([5_898_240, 186_624, 2_949_120, 97_280], 9_131_264);
+    assert!(charged.executable(), "{}", render(&charged));
+    // The checkpoint's own MXFP4 half (9,400,320 B) is not a layout the planner loads.
+    let other = declare([5_898_240, 184_320, 2_949_120, 368_640], 9_400_320);
+    assert!(!other.executable() && render(&other).contains("does not load this expert layout"), "{}", render(&other));
+    let inconsistent = declare([1, 2, 3, 4], 9_131_264);
+    assert!(!inconsistent.executable() && render(&inconsistent).contains("do not sum"), "{}", render(&inconsistent));
+}
+
+#[test]
+fn v41_tp2_dspark_experts_move_half_the_draft_experts_to_gpu0() {
+    // Whole on GPU1, dSpark's 3 x 128 routed experts leave GPU0 with room the
+    // TP2 tier cannot use. As TP2 halves each GPU holds 3 x 128 x 9,131,264 B
+    // and the tier grows into the memory that moves.
+    let dir = strict_v41_snapshot(false);
+    let card = crate::placement::ArchContext::reference_total_bytes(cuteafd_core::GpuArch::Sm89);
+    let pair = |tp2: bool, cards: usize| PlanOptions { layout: Some(layout::LayoutOptions {
+        host_memory: Some((256 << 30, 256 << 30)), rtx_bytes: vec![card; cards],
+        coordinator_arch: cuteafd_core::GpuArch::Sm89, workspace_manifest: v41_workspace(dir.path()),
+        pool_tokens: Some(0), context_tokens: 1 << 20, expert_tier: crate::placement::ExpertTierSetting::Auto,
+        tp2_dspark_experts: tp2, ..Default::default() }), ..sparks(4) };
+    let whole = plan_spark_count(dir.path(), &pair(false, 2), 6, Some(4)).unwrap();
+    let split = plan_spark_count(dir.path(), &pair(true, 2), 6, Some(4)).unwrap();
+    assert!(whole.executable() && split.executable(), "{}", render(&split));
+    let bytes = |report: &PlanReport, gpu: usize, group: &str| report.memory_layout.as_ref().unwrap().devices[gpu]
+        .items.iter().filter(|i| i.group == group).map(|i| i.bytes).sum::<u64>();
+    let half = 3 * 128 * crate::formats::scale_codes::expert_bytes(1, 5120, 1152).unwrap();
+    let full = 3 * 128 * crate::formats::scale_codes::expert_bytes(1, 5120, 2304).unwrap();
+    assert_eq!(bytes(&whole, 1, "dSpark experts") - bytes(&split, 1, "dSpark experts"), full - half);
+    assert_eq!((bytes(&whole, 0, "dSpark TP2 expert half"), bytes(&split, 0, "dSpark TP2 expert half")), (0, half));
+    // GPU0's lanes gain the TP2 fork/join owners of every stage (exact, from
+    // the dSpark TP2 role's own workspace manifest).
+    assert!(bytes(&split, 0, "dSpark request lanes") > bytes(&whole, 0, "dSpark request lanes"));
+    let whole_tier = whole.solver_placement.as_ref().unwrap().expert_tier.as_ref().unwrap();
+    let split_tier = split.solver_placement.as_ref().unwrap().expert_tier.as_ref().unwrap();
+    let bytes_per_expert = whole_tier.resident_bytes[0] / whole_tier.experts as u64;
+    for tier in [whole_tier, split_tier] {
+        assert_eq!(tier.resident_bytes, vec![bytes_per_expert * tier.experts as u64; 2]);
+    }
+    // Recover the tier's physical budget from every solved phase, keeping
+    // marks, lanes and all other owners charged. The limiting GPU changes
+    // when the draft half moves; GPU1's freed weights alone overstate the gain.
+    let tier_budgets = |report: &PlanReport| {
+        let tier = report.solver_placement.as_ref().unwrap().expert_tier.as_ref().unwrap();
+        std::array::from_fn::<_, 2, _>(|gpu| {
+            let backing = crate::placement::planner::sm120_request_backing(tier.resident_bytes[gpu]).unwrap();
+            report.phase_ledger.as_ref().unwrap().phases.iter()
+                .filter(|phase| phase.budget == format!("rtx{gpu}"))
+                .map(|phase| phase.available - phase.owned - phase.opaque + backing)
+                .min().unwrap()
+        })
+    };
+    let before = tier_budgets(&whole);
+    let after = tier_budgets(&split);
+    assert!(before[1] < before[0] && after[0] < after[1]);
+    let freed_bytes = after[0] - before[1];
+    assert!(freed_bytes >= bytes_per_expert);
+    assert_eq!(split_tier.experts, whole_tier.experts + (freed_bytes / bytes_per_expert) as usize);
+    let notes = &split.memory_layout.as_ref().unwrap().notes;
+    assert!(notes.iter().any(|n| n.starts_with("dSpark routed experts: TP2 halves")), "{notes:?}");
+    // One RTX has no peer for the other half.
+    let single = plan_spark_count(dir.path(), &pair(true, 1), 6, Some(4)).unwrap();
+    assert!(!single.executable() && render(&single).contains("two RTX GPUs"), "{}", render(&single));
+}
+
+#[test]
+fn v41_omitted_pool_tokens_plan_like_automatic() {
+    // `--pool-tokens` documents "0 or omitted: automatic": an omitted pool must
+    // charge the same 97% admission ceiling and growth reserve as 0, not plan
+    // to the whole card.
+    let dir = strict_v41_snapshot(false);
+    for (rtx_bytes, arch) in [(vec![50_950_569_984; 2], cuteafd_core::GpuArch::Sm89),
+        (vec![96 << 30], cuteafd_core::GpuArch::Sm120)] {
+        let options = |pool_tokens| PlanOptions { layout: Some(layout::LayoutOptions {
+            host_memory: Some((256 << 30, 256 << 30)), rtx_bytes: rtx_bytes.clone(), coordinator_arch: arch,
+            workspace_manifest: v41_workspace(dir.path()), pool_tokens, context_tokens: 1 << 20,
+            ..Default::default() }), ..sparks(4) };
+        let omitted = plan_spark_count(dir.path(), &options(None), 6, Some(4)).unwrap();
+        let automatic = plan_spark_count(dir.path(), &options(Some(0)), 6, Some(4)).unwrap();
+        assert!(automatic.executable(), "{}", render(&automatic));
+        // The plan names SM89's compressed attention kernel; SM120's is the default.
+        let notes = &automatic.memory_layout.as_ref().unwrap().notes;
+        assert_eq!(notes.iter().any(|n| n == "compressed sparse attention: native FP32 ten-part kernel \
+            (sm_89 exports no BF16 AOT attention); same split scratch as BF16 AOT"), arch == cuteafd_core::GpuArch::Sm89,
+            "{notes:?}");
+        assert_eq!(render(&omitted), render(&automatic));
+        assert_eq!(omitted.memory_layout, automatic.memory_layout);
+        let pinned = plan_spark_count(dir.path(), &options(Some(1 << 20)), 6, Some(4)).unwrap();
+        assert_ne!(render(&pinned), render(&automatic), "a positive pool still pins it");
     }
 }
 
@@ -5943,13 +6201,13 @@ fn glm5_flash_layout_reserves_the_mark_arena_its_server_allocates() {
         assert_eq!(state, rank.fixed_state_bytes + rank.active_state_per_sequence_bytes * concurrency
             + rank.speculative_replay_bytes);
     }
-    // At the default 2M pool cap the released arena becomes reported free headroom.
+    // Host enablement keeps the arena and charges the pinned mapping separately.
     let mut capped = layout(96 << 30, 16);
     capped.layout.as_mut().unwrap().pool_tokens = Some(2_097_152);
     let legacy = plan(dir.path(), &capped).unwrap().memory_layout.unwrap();
     capped.layout.as_mut().unwrap().host_cache_bytes = None;
     let staged = plan(dir.path(), &capped).unwrap().memory_layout.unwrap();
-    let released = (14 - cuteafd_core::prefix::HOST_MARK_STAGING_SLOTS) * rank.retained_mark_bytes;
+    let released = 0;
     assert_eq!((legacy.pool_tokens, staged.pool_tokens), (2_097_152, 2_097_152));
     assert_eq!(marks(&legacy) - marks(&staged), released);
     let prefix_driver = |memory: &cuteafd_core::memory_layout::MemoryLayout| memory.devices[0].items.iter()
@@ -5960,7 +6218,7 @@ fn glm5_flash_layout_reserves_the_mark_arena_its_server_allocates() {
     assert_eq!(mapped_prefix, (32u64 << 30) / 512);
     assert_eq!(staged.devices[0].free_bytes() - legacy.devices[0].free_bytes(),
         released as i64 - mapped_prefix as i64);
-    assert_eq!(released, 1_771_438_080);
+    assert_eq!(marks(&staged), 14 * rank.retained_mark_bytes);
     // An explicit arena (0: none) is taken as given.
     let mut none = layout(96 << 30, 16);
     none.layout.as_mut().unwrap().prefix_slots = Some(0);

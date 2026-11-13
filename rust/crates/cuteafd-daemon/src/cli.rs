@@ -175,6 +175,9 @@ pub(crate) enum Commands {
     Plan(PlanArgs),
     /// Report RDMA ports, link and PCIe rates, subnets and the rail plan.
     Fabric(FabricArgs),
+    /// Replay a route census trace through the static GPU expert tier and
+    /// dynamic expert caches at the same number of resident experts.
+    TierCache(crate::commands::tier_cache::TierCacheArgs),
     /// Validate a built library's program table against its PROGRAMS.json (WIP/release seal).
     #[command(hide = true)]
     ProgramsCheck(crate::commands::programs_check::ProgramsCheckArgs),
@@ -459,6 +462,10 @@ pub(crate) struct PlanArgs {
     /// Attention placement: auto is the qualified family default (heads until decided).
     #[arg(long, default_value = "auto", value_parser = ["auto", "context", "layers", "heads"])]
     pub(crate) attention_placement: String,
+    /// Coordinator GPU architecture to plan for: sm_120 (RTX 5090 / RTX PRO 6000)
+    /// or sm_89 (RTX 4090 class). Selects the card class every coordinator plan charges.
+    #[arg(long, default_value = "sm_120")]
+    pub(crate) coordinator_arch: cuteafd_core::GpuArch,
     /// Explicit KV pool tokens for --layout (0 or omitted: automatic).
     #[arg(long)]
     pub(crate) pool_tokens: Option<u64>,
@@ -499,6 +506,18 @@ pub(crate) struct PlanArgs {
     /// layer count `N` (the KV pool is then the output).
     #[arg(long, value_parser = |text: &str| text.parse::<cuteafd_loader::placement::OnboardSetting>())]
     pub(crate) rtx_expert_layers: Option<cuteafd_loader::placement::OnboardSetting>,
+    /// V4.1 GPU expert tier for --layout: per-layer expert residency on the
+    /// coordinator GPUs, ranked by predicted step time, generalising
+    /// whole-layer onboarding (`--rtx-expert-layers N` then pins N whole
+    /// layers inside it). `off`, `auto` (pool first; the tier takes what is
+    /// left while it still helps) or `N` experts per routed layer on average
+    /// (the KV pool is then the output). The Sparks keep every expert.
+    #[arg(long, default_value = "off", value_parser = |text: &str| text.parse::<cuteafd_loader::placement::ExpertTierSetting>())]
+    pub(crate) gpu_expert_tier: cuteafd_loader::placement::ExpertTierSetting,
+    /// Per-layer expert route counts (JSON `{"layers": [[count; experts]; routed layers]}`) that
+    /// rank the GPU expert tier's resident set; uniform without one.
+    #[arg(long, requires = "gpu_expert_tier")]
+    pub(crate) gpu_expert_tier_profile: Option<PathBuf>,
     /// Removed whole-layer GPU1 placement flag.
     #[arg(long = "peer-expert-ranges", hide = true, value_parser = reject_peer_expert_ranges)]
     pub(crate) deprecated_peer_expert_ranges: bool,
@@ -804,6 +823,26 @@ pub(crate) struct TransportCapabilitiesArgs {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn v41_defaults_to_one_boundary_and_keeps_shared_point_overrides() {
+        use clap::Parser;
+        let base = ["cuteafd", "serve-native", "--snapshot", "/model", "--native-lib", "/native.so"];
+        for (flags, boundaries, gap, cap) in [
+            (vec![], 1, 0, 4),
+            (vec!["--prefix-point-boundaries", "0"], 0, 0, 4),
+            (vec!["--prefix-point-boundaries", "2", "--prefix-point-gap", "8192", "--prefix-points-per-request", "3"], 2, 8192, 3),
+        ] {
+            let super::Commands::ServeNative(args) = super::Cli::try_parse_from(base.into_iter().chain(flags)).unwrap().command
+                else { unreachable!() };
+            assert_eq!((args.prefix.prefix_point_boundaries, args.prefix.prefix_point_gap, args.prefix.prefix_points_per_request),
+                (boundaries, gap, cap));
+        }
+        let super::Commands::ServeDsv4(args) = super::Cli::try_parse_from(
+            ["cuteafd", "serve-dsv4", "--snapshot", "/model", "--native-lib", "/native.so"]).unwrap().command
+            else { unreachable!() };
+        assert_eq!(args.prefix.prefix_point_boundaries, 0);
+    }
+
+    #[test]
     fn memory_policy_flags_parse_sizes_and_reject_percentages() {
         use clap::Parser;
         let cli = super::Cli::try_parse_from(["cuteafd", "--gpu-memory-cap", "32GiB", "--spark-memory-cap", "100GiB",
@@ -916,6 +955,59 @@ mod tests {
         assert_eq!(args.landing_repeats, 3);
         for repeats in ["0", "6", "-1"] {
             assert!(super::Cli::try_parse_from(["cuteafd", "fabric", "--landing-repeats", repeats]).is_err());
+        }
+    }
+
+    #[test]
+    fn gpu_expert_tier_is_off_by_default_and_takes_auto_or_a_count() {
+        use clap::Parser;
+        use cuteafd_loader::placement::ExpertTierSetting;
+        for (flags, expected) in [(vec![], ExpertTierSetting::Off), (vec!["--gpu-expert-tier", "auto"], ExpertTierSetting::Auto),
+            (vec!["--gpu-expert-tier", "60"], ExpertTierSetting::PerLayer(60)), (vec!["--gpu-expert-tier", "off"], ExpertTierSetting::Off)] {
+            let super::Commands::Plan(args) = super::Cli::try_parse_from(
+                ["cuteafd", "plan", "/model", "--layout"].into_iter().chain(flags)).unwrap().command
+                else { panic!("expected plan"); };
+            assert_eq!(args.gpu_expert_tier, expected);
+            let options = crate::commands::plan::layout_options_for_test(&args);
+            assert_eq!(options.expert_tier, expected);
+        }
+        assert!(super::Cli::try_parse_from(["cuteafd", "plan", "/model", "--gpu-expert-tier", "most"]).is_err());
+        // A routing profile ranks a tier; alone it is refused.
+        assert!(super::Cli::try_parse_from(["cuteafd", "plan", "/model", "--gpu-expert-tier-profile", "r.json"]).is_err());
+        let super::Commands::Plan(args) = super::Cli::try_parse_from(["cuteafd", "plan", "/model", "--layout",
+            "--gpu-expert-tier", "auto", "--gpu-expert-tier-profile", "r.json"]).unwrap().command
+            else { panic!("expected plan"); };
+        assert_eq!(crate::commands::plan::layout_options_for_test(&args).expert_tier_profile,
+            Some(std::path::PathBuf::from("r.json")));
+    }
+
+    /// Serving takes the plan's tier spellings, off by default.
+    #[test]
+    fn serve_native_takes_the_plans_gpu_expert_tier_flags() {
+        use clap::Parser;
+        use cuteafd_loader::placement::ExpertTierSetting;
+        let base = ["cuteafd", "serve-native", "--snapshot", "/model", "--native-lib", "/lib.so"];
+        for (flags, expected) in [(vec![], ExpertTierSetting::Off), (vec!["--gpu-expert-tier", "auto"], ExpertTierSetting::Auto),
+            (vec!["--gpu-expert-tier", "24"], ExpertTierSetting::PerLayer(24))] {
+            let super::Commands::ServeNative(args) = super::Cli::try_parse_from(base.into_iter().chain(flags)).unwrap()
+                .command else { panic!("expected serve-native"); };
+            assert_eq!((args.gpu_expert_tier, args.gpu_expert_tier_profile), (expected, None));
+        }
+        assert!(super::Cli::try_parse_from(base.into_iter().chain(["--gpu-expert-tier-profile", "r.json"])).is_err());
+        let super::Commands::ServeNative(args) = super::Cli::try_parse_from(base.into_iter()
+            .chain(["--gpu-expert-tier", "auto", "--gpu-expert-tier-profile", "r.json"])).unwrap().command
+            else { panic!("expected serve-native"); };
+        assert_eq!(args.gpu_expert_tier_profile, Some(std::path::PathBuf::from("r.json")));
+    }
+
+    #[test]
+    fn tp2_dspark_experts_is_off_by_default_and_reaches_the_layout() {
+        use clap::Parser;
+        for (flags, expected) in [(vec![], false), (vec!["--tp2-dspark-experts"], true)] {
+            let super::Commands::Plan(args) = super::Cli::try_parse_from(
+                ["cuteafd", "plan", "/model", "--layout", "--rtx", "2"].into_iter().chain(flags)).unwrap().command
+                else { panic!("expected plan"); };
+            assert_eq!(crate::commands::plan::layout_options_for_test(&args).tp2_dspark_experts, expected);
         }
     }
 
@@ -1417,6 +1509,7 @@ mod tests {
 }
 
 #[derive(Debug, Args)]
+#[command(mut_arg("prefix_point_boundaries", |arg| arg.default_value("1")))]
 pub(crate) struct NativeServeArgs {
     /// Count executed backbone expert routes by phase (disable with =false).
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set, num_args = 0..=1,
@@ -1501,6 +1594,20 @@ pub(crate) struct NativeServeArgs {
     /// Complete bottom-up RTX routed layers: auto fills available memory, or 0..40.
     #[arg(long, default_value = "auto")]
     pub rtx_expert_layers: crate::shared::memory::budget::LocalLayers,
+    /// GPU expert tier on two RTX GPUs, admitted as `cuteafd plan --layout
+    /// --gpu-expert-tier` plans it: per routed layer a fixed set of experts
+    /// resident on both GPUs as TP2 halves, ranked by predicted step time,
+    /// in place of whole-layer onboarding (`--rtx-expert-layers N` then pins
+    /// N whole layers inside it). `off`, `auto` (pool first) or `N` experts
+    /// per routed layer (the KV pool is then the output). The Sparks keep
+    /// every expert and use the admitted Spark placement.
+    #[arg(long, default_value = "off", value_parser = |text: &str| text.parse::<cuteafd_loader::placement::ExpertTierSetting>())]
+    pub gpu_expert_tier: cuteafd_loader::placement::ExpertTierSetting,
+    /// Per-layer expert route counts ranking the tier (the format of `cuteafd
+    /// plan --gpu-expert-tier-profile`); uniform popularity without one.
+    #[arg(long, requires = "gpu_expert_tier")]
+    pub gpu_expert_tier_profile: Option<PathBuf>,
+
 
 
     /// Maximum active requests, shared by both execution lanes.

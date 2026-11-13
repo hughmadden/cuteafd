@@ -81,7 +81,7 @@ pub fn forecast_budgets(physical: &ArchContext, capacity: u64, module_bytes: u64
 /// A live sample fixes the physical witness; the logical cap keeps its ceiling.
 pub fn sampled_budgets(free: u64, total: u64, logical: Option<u64>, host: (u64, u64))
     -> Result<Vec<Budget>, Refusal> {
-    let physical = ArchContext::for_device("sm_120", total);
+    let physical = ArchContext::for_device(cuteafd_core::GpuArch::Sm120, total);
     let mut budgets = forecast_budgets(physical, logical.unwrap_or(total), 0, host)?;
     budgets[0].physical_bytes = total;
     budgets[0].baseline = Baseline::Sampled { free, phase: Phase::Load,

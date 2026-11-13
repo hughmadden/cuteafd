@@ -34,11 +34,17 @@ impl<'a> Weights<'a> {
         self.weight.inventory(inventory, &name)?;
         self.scales.inventory(inventory, &cuteafd_loader::placement::families::deepseek_v41::weight_layout::packed_scale_name(&name))
     }
-    pub fn device_bytes(kind: Kind) -> usize {
-        let (k,n)=kind.geometry(); k*(n/2) + k*(n/2)/32
+    /// A shard's resident bytes: its FP8 weight half and packed scales, at the
+    /// packed size the loaded library's export reports (SM120 expands the
+    /// scale grid; SM89 keeps it).
+    pub fn device_bytes(library: &cuteafd_ffi::NativeLibrary, kind: Kind) -> Result<usize> {
+        let (k,n)=kind.geometry();
+        let packed=library.v41_fp8_matrix_info(1,u32::try_from(k)?,u32::try_from(n/2)?)?.packed_weight_scale_bytes;
+        Ok(k*(n/2) + usize::try_from(packed)?)
     }
-    pub fn load_peak_device_bytes(kind: Kind) -> usize {
-        let (k,n)=kind.geometry(); Self::device_bytes(kind) + k*(n/2)/1024
+    /// The resident bytes plus the raw scale grid held until its pack runs.
+    pub fn load_peak_device_bytes(library: &cuteafd_ffi::NativeLibrary, kind: Kind) -> Result<usize> {
+        let (k,n)=kind.geometry(); Ok(Self::device_bytes(library,kind)? + k*(n/2)/1024)
     }
     #[cfg(test)]
     pub fn load(device: Device<'a>, catalog: &OfficialV41Catalog, layer: usize,
@@ -48,7 +54,7 @@ impl<'a> Weights<'a> {
     pub fn load_in(device: Device<'a>, catalog: &OfficialV41Catalog, layer: usize,
         kind: Kind, rank: usize, budget: usize,
         arena: Option<&crate::shared::memory::weight_arena::DeviceWeightArena<'a>>) -> Result<Self> {
-        ensure!(layer<40 && rank<2 && budget>=Self::load_peak_device_bytes(kind),
+        ensure!(layer<40 && rank<2 && budget>=Self::load_peak_device_bytes(device.library,kind)?,
             "invalid projection shard layer, rank or budget");
         let (k,n)=kind.geometry(); let n=n/2;
         let prefix=format!("layers.{layer}.attn.{}",kind.name());
@@ -57,9 +63,9 @@ impl<'a> Weights<'a> {
             && catalog.tensor(&scale_name)?.metadata.shape==[2*n/32,k/32],
             "projection checkpoint geometry differs");
         let stream=Stream::new(device)?;
-        let weight=crate::shared::memory::weight_arena::weight_allocation(device,arena,&weight_name,k*n, ArenaTag::weights("v41/target"))?;
-        let scales=crate::shared::memory::weight_arena::weight_allocation(device,arena,
-            &cuteafd_loader::placement::families::deepseek_v41::weight_layout::packed_scale_name(&weight_name),k*n/32, ArenaTag::weights("v41/target"))?;
+        let weight=crate::families::deepseek_v41::v41_tensors::weight_allocation(device,arena,&weight_name,k*n, ArenaTag::weights("v41/target"))?;
+        let scales=crate::families::deepseek_v41::v41_tensors::weight_allocation(device,arena,
+            &cuteafd_loader::placement::families::deepseek_v41::weight_layout::packed_scale_name(&weight_name),usize::try_from(device.run(|| device.library.v41_fp8_matrix_info(1,k as u32,n as u32))?.packed_weight_scale_bytes)?, ArenaTag::weights("v41/target"))?;
         let dense = crate::shared::experts::rtx::dense::DenseLoad::mount(device.library);
         Self::load_operands(&dense, device.id, super::v41_tensors::half(catalog, &weight_name, 0, rank)?,
             super::v41_tensors::half(catalog, &scale_name, 0, rank)?, k, n, weight.buffer, scales.buffer, stream.raw)?;
@@ -473,9 +479,9 @@ mod tests {
         for kind in [Kind::QueryB,Kind::OutputB] {
             let (k,n)=kind.geometry();let capacity=16;
             let weights=[(0..2).map(|i|Weights::load(devices[0],&catalog,[2,20][i],kind,0,
-                Weights::load_peak_device_bytes(kind))).collect::<Result<Vec<_>>>()?,
+                Weights::load_peak_device_bytes(&lib,kind)?)).collect::<Result<Vec<_>>>()?,
                 (0..2).map(|i|Weights::load(devices[1],&catalog,[2,20][i],kind,1,
-                Weights::load_peak_device_bytes(kind))).collect::<Result<Vec<_>>>()?];
+                Weights::load_peak_device_bytes(&lib,kind)?)).collect::<Result<Vec<_>>>()?];
             let banks=[weights[0].as_slice(),weights[1].as_slice()];
             assert!(Wave::new(banks,capacity,0,[0,0]).is_err());
             let mut lanes=[Wave::new(banks,capacity,0,Wave::device_bytes(&lib,kind,capacity,0)?)?,
@@ -582,8 +588,8 @@ mod shared_storage_tests {
         let catalog=cuteafd_loader::read_official_v41_catalog(std::path::Path::new(&std::env::var("CUTEAFD_SNAPSHOT")?))?;
         lib.cuda_set_device(0)?;
         let devices=[Device {library:&lib,id:0},Device {library:&lib,id:1}];
-        let weights=[vec![Weights::load(devices[0],&catalog,2,kind,0,Weights::load_peak_device_bytes(kind))?],
-            vec![Weights::load(devices[1],&catalog,2,kind,1,Weights::load_peak_device_bytes(kind))?]];
+        let weights=[vec![Weights::load(devices[0],&catalog,2,kind,0,Weights::load_peak_device_bytes(&lib,kind)?)?],
+            vec![Weights::load(devices[1],&catalog,2,kind,1,Weights::load_peak_device_bytes(&lib,kind)?)?]];
         let banks=[weights[0].as_slice(),weights[1].as_slice()];
         let (rows,unit)=(13u32,16u32);let (k,n)=kind.geometry();
         let inputs=[Allocation::new(devices[0],rows as usize*k*2, crate::shared::memory::TEST)?,Allocation::new(devices[0],rows as usize*k*2, crate::shared::memory::TEST)?];
@@ -638,5 +644,72 @@ mod shared_storage_tests {
     #[ignore = "requires projection AOT, snapshot and two GPUs"]
     fn tp2_projection_without_guard_clobbers_gated_peer_reader() -> Result<()> {
         for _ in 0..3 {for kind in [Kind::QueryB,Kind::OutputB] {run(kind,false)?;}} Ok(())
+    }
+}
+
+/// Test inspection of a loaded shard: its weight and packed scales, and its layer.
+#[cfg(test)]
+#[allow(dead_code)] // the coordinator push tests read them; other test crates do not
+impl<'a> Weights<'a> {
+    pub(crate) fn layer_index(&self) -> usize { self.layer }
+}
+
+#[cfg(test)]
+pub(crate) mod shard_tests {
+    use super::*;
+    use std::os::unix::fs::FileExt;
+
+    /// Layer `layer`'s `kind` checkpoint weight and scale names.
+    #[allow(dead_code)] // the coordinator push tests use it; other test crates do not
+    pub(crate) fn names(layer: usize, kind: Kind) -> [String; 2] {
+        ["weight", "scale"].map(|suffix| format!("layers.{layer}.attn.{}.{suffix}", kind.name()))
+    }
+
+    /// Finite E4M3 weights (|w| <= 0.9375) and UE8M0 scales of 2^-7..2^0 for
+    /// layer `layer`'s `kind` projection.
+    pub(crate) fn pattern(catalog: &OfficialV41Catalog, layer: usize, kind: Kind) -> Result<()> {
+        for (suffix, scale) in [("weight", false), ("scale", true)] {
+            let tensor = catalog.tensor(&format!("layers.{layer}.attn.{}.{suffix}", kind.name()))?;
+            let bytes = (0..tensor.metadata.byte_length as usize).map(|i| if scale { 120 + (i * 7 % 8) as u8 } else {
+                (0x30 + (i * 13 + i / 977 + layer) % 16) as u8 | if (i * 5 + layer) % 3 == 0 { 0x80 } else { 0 }
+            }).collect::<Vec<_>>();
+            std::fs::OpenOptions::new().write(true).open(catalog.snapshot().join(&tensor.shard))?
+                .write_all_at(&bytes, tensor.metadata.byte_offset)?;
+        }
+        Ok(())
+    }
+
+    /// Each shard's recorded halves (`Rect::half` rows of the weight and raw
+    /// scales) are exactly the bytes the shard loader's former private mount
+    /// read uploaded (`read_coordinator_tp2_into`), and the ranks' halves
+    /// tile each tensor.
+    #[test]
+    fn shard_halves_are_the_coordinator_tp2_rows() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let snapshot = root.path().canonicalize()?;
+        cuteafd_loader::plan::testing::write_v41_snapshot(&snapshot);
+        let catalog = cuteafd_loader::read_official_v41_role_catalog(&snapshot, "projections",
+            |name| name.contains(".attn.wq_b.") || name.contains(".attn.wo_b."))?;
+        for kind in [Kind::QueryB, Kind::OutputB] {
+            let (k, n) = kind.geometry();
+            for layer in [2usize, 39] {
+                pattern(&catalog, layer, kind)?;
+                for (suffix, bytes) in [("weight", k * n / 2), ("scale", k * n / 2048)] {
+                    let name = format!("layers.{layer}.attn.{}.{suffix}", kind.name());
+                    let mut whole = vec![0u8; 2 * bytes];
+                    crate::families::deepseek_v41::v41_tensors::rect(&catalog, &name, None)?.read(&mut whole)?;
+                    for rank in 0..2 {
+                        let rect = crate::families::deepseek_v41::v41_tensors::half(&catalog, &name, 0, rank)?;
+                        let mut recorded = vec![0u8; rect.bytes()];
+                        rect.read(&mut recorded)?;
+                        let mut read = vec![0u8; bytes];
+                        ensure!(catalog.read_coordinator_tp2_into(&name, 0, rank, &mut read, &mut [])? == bytes
+                            && recorded == read && recorded == whole[rank * bytes..(rank + 1) * bytes],
+                            "{name} rank {rank}: recorded half differs from the coordinator TP2 read");
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 }

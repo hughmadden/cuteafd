@@ -186,6 +186,13 @@ if [[ "${CUTEAFD_WIP_EXPORT_LOCKS:-on}" == on ]]; then
   # Rust takes no hardware mutex. Native misses queue only after the seed
   # lease and Cargo build slot have been released.
 fi
+# The coordinator's CUDA architecture: 120 (RTX 5090, RTX PRO 6000; default) or
+# 89 (RTX 4090 class), whose slot carries DeepSeek V4.1's SM89 exports. SM120
+# exports compile for the GPU they run on; SM89 exports compile on b12x's
+# offline SM89 target, on this host with no GPU.
+wip_coordinator_arch="${CUTEAFD_WIP_COORDINATOR_ARCH:-120}"
+[[ "$wip_coordinator_arch" == 120 || "$wip_coordinator_arch" == 89 ]] ||
+  release_die "CUTEAFD_WIP_COORDINATOR_ARCH must be 120 or 89"
 mapfile -t wip_hosts < <(release_spark_values HOST)
 # A coordinator-only clone of a config with no active Sparks (0-Spark cards)
 # also skips the Spark leg: nothing to clone, rebuild or reach.
@@ -217,6 +224,7 @@ if ((dry_run)); then
   echo "WIP dry-run passed; no container, image, SSH or build operation was performed."
   echo "  config: $RELEASE_CONFIG"
   echo "  slot: $slot (role $role)"
+  echo "  coordinator arch: sm_$wip_coordinator_arch"
   echo "  containers: $(release_wip_container coordinator), $(release_wip_container spark-expert)"
   echo "  WIP root: ${WIP_ROOT:-$HOME/.cache/cuteafd/builds/wip${WIP_INSTANCE:+-$WIP_INSTANCE}}"
   echo "  Spark leg: $( ((wip_spark_leg)) && echo on || echo off)"
@@ -862,7 +870,7 @@ if [[ "$source_revision" != *dirty* && "$source_revision" != unknown && -z "$fro
       printf 'spark-tp-roles %s\nbf16 %s\naudio %s\n' "$wip_spark_tp_roles" "$bf16_families" "$audio_aot"
       for key in EXL3_AOT NVFP4_AOT DSV4_MAX_CONTEXT DSV4_AOT GLM_AOT CONTEXT_SPLIT_AOT MIMO_AOT MIMO_GEOMETRIES \
         GLMF_AOT GLMF_WIDE_DECODE_ROWS QWEN4_AOT QWEN_DENSE_AOT STEP5_AOT KIMIK3_AOT ML4_AOT MINIMAX_AOT COORDINATOR_EXPERT_FAMILIES EXPERT_FAMILIES GENERIC_SPARK_COUNTS \
-        VISION_ATTENTION_AOT V41_AOT CARGO_FEATURES; do
+        VISION_ATTENTION_AOT V41_AOT SM89_REPLY_AOT CARGO_FEATURES; do
         [[ "$key" != KIMIK3_AOT || "${CUTEAFD_WIP_KIMIK3_AOT:-OFF}" != OFF ]] || continue
         [[ "$key" != ML4_AOT || "${CUTEAFD_WIP_ML4_AOT:-OFF}" != OFF ]] || continue
         local_name="CUTEAFD_WIP_$key"
@@ -872,9 +880,13 @@ if [[ "$source_revision" != *dirty* && "$source_revision" != unknown && -z "$fro
       [[ "${CUTEAFD_WIP_EXLR8_AOT:-OFF}" == OFF ]] || printf 'CUTEAFD_WIP_EXLR8_AOT=%s\nCUTEAFD_WIP_EXLR8_FAMILIES=%s\n' "$CUTEAFD_WIP_EXLR8_AOT" "$CUTEAFD_WIP_EXLR8_FAMILIES"
     } | sha256sum | awk '{print $1}'
   )"
-  # Each role's key adds the dev image that builds it.
-  wip_coordinator_key="$(printf '%s coordinator %s\n' "$wip_build_key" \
-    "$(docker image inspect -f '{{.Id}}' "$COORDINATOR_DOCKER_DEV")" | sha256sum | awk '{print $1}')"
+  # Each role's key adds the dev image that builds it, and the coordinator's a
+  # non-default architecture (keyed only then, so SM120 slots keep their keys):
+  # an sm_89 build never adopts an SM120 slot of the same commit, or the reverse.
+  wip_coordinator_key="$( {
+    printf '%s coordinator %s\n' "$wip_build_key" "$(docker image inspect -f '{{.Id}}' "$COORDINATOR_DOCKER_DEV")"
+    [[ "$wip_coordinator_arch" == 120 ]] || printf 'arch %s\n' "$wip_coordinator_arch"
+  } | sha256sum | awk '{print $1}')"
   if ((wip_spark_leg)); then
     wip_expert_key="$(printf '%s spark-expert %s\n' "$wip_build_key" \
       "$(ssh -o BatchMode=yes "$seed_host" "docker image inspect -f '{{.Id}}' '$SPARK_EXPERT_DOCKER_DEV'")" | sha256sum | awk '{print $1}')"
@@ -1199,6 +1211,7 @@ wip_seed_lock() {
 }
 # Try a configured remote exporter first, then queue one capped local turn.
 # Dispatch runs only after the Spark lease and Cargo build slot are released.
+# SM120 only: an sm_89 export needs no GPU and compiles here (build_coordinator).
 wip_coordinator_export_modes() {
   case "${CUTEAFD_WIP_COORDINATOR_EXPORT:-auto}" in
     auto) [[ -z "${CUTEAFD_EXPORT_HOST:-}" ]] || printf 'remote ' ; printf 'capped\n' ;;
@@ -1231,17 +1244,18 @@ wip_cached_exports() {
 # wip_remote_export: the native key's entry from CUTEAFD_EXPORT_HOST, through
 # sparknest, then restored here with REQUIRE_HIT (no GPU turn on raptor).
 wip_remote_export() {
-  local host="${CUTEAFD_EXPORT_HOST:-}" key env_file started=$SECONDS
+  local host="${CUTEAFD_EXPORT_HOST:-}" scope key env_file started=$SECONDS
   [[ -n "$host" ]] || return 75
-  read -r _ key <"$state_dir/output/coordinator/.native-cache-key" || return 75
+  read -r scope key <"$state_dir/output/coordinator/.native-cache-key" || return 75
   env_file="$(mktemp "${TMPDIR:-/tmp}/wip-export-env.XXXXXXXX")"
   printf '%s\n' "${coordinator_build[@]}" | grep -E '^CUTEAFD_[A-Z0-9_]+=' >"$env_file"
   printf 'CUTEAFD_WIP_EXPORT_LOCKS=off\n' >>"$env_file"
   echo "WIP coordinator export: remote on $host"
   local layers status=0
   layers="$(docker image inspect -f '{{json .RootFS.Layers}}' "$COORDINATOR_DOCKER_DEV" | sha256sum | awk '{print $1}')"
+  # The key's scope (coordinator-120 or coordinator-89) names the architecture.
   "$repo_root/scripts/build/export-remote.sh" "$host" "$staging_dir" "$key" "$env_file" \
-    "$COORDINATOR_DOCKER_DEV" "$layers" || status=$?
+    "$COORDINATOR_DOCKER_DEV" "$layers" "${scope#coordinator-}" || status=$?
   if ((status != 0)); then
     rm -f "$env_file"
     echo "WIP coordinator export: $host unavailable (export-remote exited $status); next mode" >&2
@@ -1276,9 +1290,11 @@ wip_capped_export_on() (
   read -r cap jobs used < <(python3 "$placement" admit --gpu "$gpu" --headroom-mib "${CUTEAFD_WIP_EXPORT_HEADROOM_MIB:-4096}") ||
     { echo "WIP coordinator export: gpu$CUTEAFD_EXPORT_GPU has no room for a capped export" >&2; return 75; }
   echo "WIP coordinator export: capped on gpu$CUTEAFD_EXPORT_GPU (${cap} MiB, ${jobs} jobs; ${used} MiB in use)"
-  # The coordinator build's environment (its -e pairs), in a one-off container
-  # on that GPU sharing the WIP container's /wip and cache mounts.
-  local -a build env_args=()
+  # The coordinator build's environment (its -e pairs) and command (after the WIP
+  # container's name: build-wip-artifacts.sh for the coordinator's architecture),
+  # run as the native phase in a one-off container on that GPU sharing the WIP
+  # container's /wip and cache mounts.
+  local -a build env_args=() command=()
   eval "build=($CUTEAFD_CAPPED_BUILD)"
   local i line
   # The WIP container's own cache plan (export cache, Triton/XDG/torch caches,
@@ -1291,6 +1307,10 @@ wip_capped_export_on() (
   for ((i = 2; i < ${#build[@]}; i++)); do
     [[ "${build[i]}" == -e ]] && env_args+=(-e "${build[i + 1]}")
   done
+  i=2
+  while [[ "${build[i]:-}" == -e ]]; do i=$((i + 2)); done
+  command=("${build[@]:i + 1}")
+  ((${#command[@]})) || return 75
   local id status=0 gpu_args name="${coordinator_container}-export-$$"
   cleanup_capped() {
     trap '' TERM HUP INT QUIT
@@ -1318,8 +1338,7 @@ wip_capped_export_on() (
     --volumes-from "$coordinator_container" --entrypoint sleep "$COORDINATOR_DOCKER_DEV" infinity)" || return 75
   # The watchdog counts only this container's processes (its cgroup carries the ID).
   python3 "$placement" watch --gpu "$gpu" --cap-mib "$cap" --cgroup "$id" -- \
-    docker exec "$id" timeout --kill-after=30 7200 /wip/source/scripts/build/build-wip-artifacts.sh \
-    /wip/source coordinator 120 /wip/build/coordinator /wip/output/coordinator native || status=$?
+    docker exec "$id" timeout --kill-after=30 7200 "${command[@]}" native || status=$?
   cleanup_capped
   trap - EXIT TERM INT HUP QUIT
   ((status == 0)) || return "$status"
@@ -1328,7 +1347,9 @@ wip_capped_export_on() (
 
 build_coordinator() {
   echo "== incrementally building coordinator slot $slot =="
-  local phase="${1:-all}"
+  # The coordinator's CUDA architecture (CUTEAFD_WIP_COORDINATOR_ARCH, validated
+  # at startup): its native phase exports for it, SM120 on a GPU, sm_89 offline.
+  local phase="${1:-all}" coordinator_arch="${wip_coordinator_arch:-120}"
   [[ "$phase" == native ]] || sync_local_source
   local image_id image_layers
   image_id="$(docker image inspect -f '{{.Id}}' "$COORDINATOR_DOCKER_DEV")"
@@ -1356,6 +1377,7 @@ build_coordinator() {
     -e CUTEAFD_WIP_EXPORT_LOCKS=off -e "CUTEAFD_EXPORT_JOBS=${CUTEAFD_EXPORT_JOBS:-}" -e "CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS:-}" -e "RUST_TEST_THREADS=${RUST_TEST_THREADS:-}" -e "CMAKE_BUILD_PARALLEL_LEVEL=${CMAKE_BUILD_PARALLEL_LEVEL:-}" \
     -e "CUTEAFD_WIP_EXL3_AOT=${CUTEAFD_WIP_EXL3_AOT:-ON}" \
     -e "CUTEAFD_WIP_VISION_ATTENTION_AOT=${CUTEAFD_WIP_VISION_ATTENTION_AOT:-OFF}" \
+    -e "CUTEAFD_WIP_SM89_REPLY_AOT=${CUTEAFD_WIP_SM89_REPLY_AOT:-OFF}" \
     -e "CUTEAFD_WIP_V41_AOT=${CUTEAFD_WIP_V41_AOT:-OFF}" \
     -e "CUTEAFD_WIP_NVFP4_AOT=${CUTEAFD_WIP_NVFP4_AOT:-ON}" \
     -e "CUTEAFD_WIP_AUDIO_AOT=$audio_aot" \
@@ -1380,12 +1402,12 @@ build_coordinator() {
     -e "CUTEAFD_WIP_FP8_MOE_BF16_FAMILIES=$bf16_families" \
     "$coordinator_container" \
     /wip/source/scripts/build/build-wip-artifacts.sh \
-    /wip/source coordinator 120 /wip/build/coordinator /wip/output/coordinator)
+    /wip/source coordinator "$coordinator_arch" /wip/build/coordinator /wip/output/coordinator)
   # Cargo first, holding no hardware; then the bounded native/AOT export.
   # A native-cache hit restores verified outputs without touching a GPU.
   # The raptor compile holds a build slot (scripts/build/build-slot.sh; slot 0 is
-  # build.lock) only while Cargo runs, when the caller asks (wip-cards does);
-  # the GPU export, reuse and staging hold none.
+  # build.lock) only while Cargo or an sm_89 native phase runs, when the caller
+  # asks (wip-cards does); the SM120 GPU export, reuse and staging hold none.
   local rust_status=0 attempt
   # One retry: a coordinator Rust exec has twice reported 127 although the phase
   # inside the container completed (open issue). The phase is idempotent and a
@@ -1414,6 +1436,19 @@ build_coordinator() {
     # The build re-verifies the entry; one that vanished fails rather than exporting unlocked.
     docker exec -e CUTEAFD_WIP_NATIVE_REQUIRE_HIT=1 "${coordinator_build[@]:2}" native ||
       release_die "coordinator WIP native restore failed"
+  elif [[ "$coordinator_arch" == 89 ]]; then
+    # sm_89 exports compile on b12x's offline SM89 target with CUDA hidden
+    # (native/CMakeLists.txt): a compile like Cargo's, in this WIP container,
+    # with no GPU lock, GPU turn or export host.
+    echo "WIP coordinator export: sm_89 compiles offline here, no GPU turn"
+    local native_status=0
+    if [[ "${CUTEAFD_WIP_BUILD_SLOT:-off}" == on ]]; then
+      "$repo_root/scripts/build/build-slot.sh" "${coordinator_build[@]}" native || native_status=$?
+    else
+      "${coordinator_build[@]}" native || native_status=$?
+    fi
+    ((native_status == 0)) || release_die "coordinator WIP native phase failed (exit $native_status)"
+
   elif wip_cached_exports docker exec -e CUTEAFD_EXPORT_CACHE_REQUIRE_HIT=1 "${coordinator_build[@]:2}" native; then
     echo "WIP coordinator export: every export restored from the export cache, no GPU turn"
   else

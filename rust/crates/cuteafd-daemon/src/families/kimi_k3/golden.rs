@@ -1463,7 +1463,7 @@ mod tests {
         let native_scratch = super::super::device::NativeScratch { kda: scratch("kimik3_kda_m")?,
             mla: [scratch("kimik3_mla_producer_")?, scratch("kimik3_dense_mla_")?, scratch("kimik3_mla_output_")?] };
         let rows = 4096;
-        let arch = cuteafd_loader::placement::ArchContext::for_device("sm_120", 96 << 30);
+        let arch = cuteafd_loader::placement::ArchContext::for_device(cuteafd_core::GpuArch::Sm120, 96 << 30);
         let names = programs.iter().filter_map(|p| p["name"].as_str()).collect::<Vec<_>>();
         let selected = cuteafd_loader::placement::ProgramSet::from_names(&["kimik3"], names);
         let mut fixed = exchange_demands(rows, false)?;
@@ -1533,7 +1533,7 @@ mod tests {
     #[test]
     fn selected_code_allowance_excludes_private_head_and_peer_storage() -> Result<()> {
         use cuteafd_loader::placement::{ArchContext, ProgramSet, inventory::loaded_code_allowance};
-        let arch = ArchContext::for_device("sm_120", 96 << 30);
+        let arch = ArchContext::for_device(cuteafd_core::GpuArch::Sm120, 96 << 30);
         let programs = ProgramSet::from_names(&["kimik3"], ["kimik3_kda_m64", "other_m64"]);
         for rank in 0..2 {
             let code = loaded_code_allowance("kimik3", "exl3", true, rank as u8, arch, Some(&programs));

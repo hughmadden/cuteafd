@@ -235,6 +235,10 @@ powerd_dir="${CUTEAFD_GPU_POWERD_DIR:-/run/gpu-powerd}"
 # The coordinator environment every family reads:
 # SPARK_INTAKE: how routed partials reach the coordinator GPU (auto, gpu, pinned
 # or host; see rust/crates/cuteafd-daemon/src/shared/spark_intake.rs).
+# SPARK_STAGING: how a wave's request reaches its pinned send arena: auto
+# (default: the copy engine from the size a startup probe measures, where this
+# GPU's stream waits hold copy-engine work), sm or copy-engine (A/B arms; see
+# StagingRoute in rust/crates/cuteafd-daemon/src/shared/spark_waves.rs).
 # CONSOLE_TEXT=on (default) lets the live console at / stream generated token text to
 # viewers holding the console unlock cookie; CONSOLE_TEXT=off disables it for everyone.
 # FP8_EXPERT_PREFILL: how FP8 expert packages run prefill row counts: auto
@@ -251,14 +255,20 @@ powerd_dir="${CUTEAFD_GPU_POWERD_DIR:-/run/gpu-powerd}"
 shared_coordinator_env_args() {
 intake="$(get SPARK_INTAKE auto)"
 case "$intake" in auto|gpu|pinned|host) ;; *) echo "SPARK_INTAKE must be auto, gpu, pinned or host" >&2; exit 2 ;; esac
+staging="$(get SPARK_STAGING auto)"
+case "$staging" in auto|sm|copy-engine) ;; *) echo "SPARK_STAGING must be auto, sm or copy-engine" >&2; exit 2 ;; esac
 console_text="$(get CONSOLE_TEXT on)"
 case "$console_text" in on|off) ;; *) echo "CONSOLE_TEXT must be on or off" >&2; exit 2 ;; esac
-spark_prefill_reply_format="$(get SPARK_PREFILL_REPLY_FORMAT "")"
-spark_decode_reply_format="$(get SPARK_DECODE_REPLY_FORMAT "")"
+spark_reply_format="$(get SPARK_REPLY_FORMAT "")"
+case "$spark_reply_format" in ""|bf16|fp8|nvfp4) ;; *) release_die "SPARK_REPLY_FORMAT must be bf16, fp8 or nvfp4" ;; esac
+spark_prefill_reply_format="$(get SPARK_PREFILL_REPLY_FORMAT "$spark_reply_format")"
+spark_decode_reply_format="$(get SPARK_DECODE_REPLY_FORMAT "$spark_reply_format")"
 for phase in prefill decode; do
   key="spark_${phase}_reply_format"
   case "${!key}" in ""|bf16|fp8|nvfp4) ;; *) release_die "SPARK_${phase^^}_REPLY_FORMAT must be bf16, fp8 or nvfp4" ;; esac
 done
+landing="$(get SPARK_LANDING "")"
+case "$landing" in ""|auto|sm|copy-engine) ;; *) release_die "SPARK_LANDING must be auto, sm or copy-engine" ;; esac
 fp8_prefill="$(get FP8_EXPERT_PREFILL auto)"
 case "$fp8_prefill" in auto|w8a8|w8a16) ;; *) echo "FP8_EXPERT_PREFILL must be auto, w8a8 or w8a16" >&2; exit 2 ;; esac
 attention_plan_rows="$(get ATTENTION_PLAN_ROWS auto)"
@@ -278,6 +288,8 @@ fi
 if [[ $attention_plan_rows != auto ]]; then
   shared_env_args+=(-e "CUTEAFD_ATTENTION_PLAN_ROWS=$attention_plan_rows")
 fi
+[[ $staging == auto ]] || shared_env_args+=(-e "CUTEAFD_SPARK_STAGING=$staging")
+[[ -z $landing ]] || shared_env_args+=(-e "CUTEAFD_SPARK_LANDING=$landing")
 if [[ -n "${CUTEAFD_PUSH_SOCKET:-}" ]]; then
   shared_env_args+=(-e "CUTEAFD_PUSH_SOCKET=$CUTEAFD_PUSH_SOCKET")
 fi
@@ -343,6 +355,16 @@ done
 #                     PROFILE_EXPERT_INPUT_SAMPLE (default 64, 0 = none) serving
 #                     layer-steps as PROFILE_DIR/expert-input-HOST-NNNNN.safetensors.
 #                     PROFILE_EXPERT_ROUTE_WEIGHTS=on adds each narrow wave's gate weights.
+#   route-census      CUTEAFD_V41_ROUTE_CENSUS (needs PROFILE_DIR; V4.1 coordinators): every
+#                     routed layer's router also counts its routes per expert on the GPU,
+#                     decode/verify and prefill apart, written every 1000 decode steps
+#                     (CUTEAFD_V41_ROUTE_CENSUS_STEPS in the launching environment sets
+#                     another interval) and at shutdown to
+#                     PROFILE_DIR/route-census-HOST.json, the file
+#                     `cuteafd plan --gpu-expert-tier-profile` reads. Beside it,
+#                     route-census-HOST.windows.jsonl gets the routes of every
+#                     window of 64 decode steps (CUTEAFD_V41_ROUTE_CENSUS_WINDOW,
+#                     0 = none) and of each request's end, with the requests seen.
 #   draft-timing      CUTEAFD_DRAFT_TIMING=1 (drafter device and host launch spans)
 #   nsys              the coordinator runs under `nsys profile` (cuda, nvtx, osrt, CUDA
 #                     graph nodes; no CPU sampling), collection paused until
@@ -598,11 +620,42 @@ v41_l2_prefetch="$(get L2_PREFETCH)"
 # a smaller cap that holds the scales (about 6 GiB) preloads those alone.
 v41_engram_warm="$(get ENGRAM_WARM off)"
 case "$v41_engram_warm" in on|off) ;; *) release_die "ENGRAM_WARM must be on or off" ;; esac
+v41_prefix_partial="$(get PREFIX_PARTIAL off)"
+case "$v41_prefix_partial" in
+  off) ;;
+  on) release_die "V4.1 restores exact prefix frontiers only (PREFIX_PARTIAL=off)" ;;
+  *) release_die "PREFIX_PARTIAL must be on or off" ;;
+esac
 case "$RTX_GPUS" in auto|1|2) ;; *) release_die "RTX_GPUS must be auto, 1, or 2" ;; esac
 [[ "$RTX_EXPERT_LAYERS" == auto || "$RTX_EXPERT_LAYERS" == all || "$RTX_EXPERT_LAYERS" =~ ^[0-9]+$ ]] ||
   release_die "DeepSeek V4.1 RTX_EXPERT_LAYERS must be auto, all or a non-negative layer count"
 # V4.1 has 40 routed-expert layers, so `all` is exactly 40 here.
 [[ "$RTX_EXPERT_LAYERS" != all ]] || RTX_EXPERT_LAYERS=40
+# GPU_EXPERT_TIER (off|auto|N; default off): per routed layer a fixed set of
+# experts resident on both RTX GPUs as TP2 halves beside the Sparks, which keep
+# every expert, in place of whole-layer onboarding (serve-native and plan
+# --gpu-expert-tier; RTX_EXPERT_LAYERS=N then pins N whole layers inside it).
+# It needs two RTX GPUs and Spark experts on the shared exchange.
+# GPU_EXPERT_TIER_PROFILE: per-layer route counts ranking the tier (uniform without).
+v41_gpu_expert_tier="$(get GPU_EXPERT_TIER off)"
+[[ "$v41_gpu_expert_tier" =~ ^(off|auto|[0-9]+)$ ]] ||
+  release_die "GPU_EXPERT_TIER must be off, auto or N experts per routed layer"
+[[ "$v41_gpu_expert_tier" != 0 ]] || v41_gpu_expert_tier=off
+v41_tier_profile="$(get GPU_EXPERT_TIER_PROFILE)"
+v41_tier_args=()
+v41_tier_mounts=()
+if [[ "$v41_gpu_expert_tier" != off ]]; then
+  [[ "$RTX_GPUS" != 1 ]] || release_die "GPU_EXPERT_TIER runs TP2 halves on two RTX GPUs, not RTX_GPUS=1"
+  v41_tier_args=(--gpu-expert-tier "$v41_gpu_expert_tier")
+fi
+if [[ -n "$v41_tier_profile" ]]; then
+  [[ "$v41_gpu_expert_tier" != off ]] || release_die "GPU_EXPERT_TIER_PROFILE ranks a GPU expert tier: set GPU_EXPERT_TIER"
+  [[ -f "$v41_tier_profile" && -r "$v41_tier_profile" ]] ||
+    release_die "GPU_EXPERT_TIER_PROFILE is not a readable file: $v41_tier_profile"
+  v41_tier_profile="$(readlink -f "$v41_tier_profile")"
+  v41_tier_mounts=(-v "$v41_tier_profile:/run/cuteafd/gpu-expert-tier-profile.json:ro")
+  v41_tier_args+=(--gpu-expert-tier-profile /run/cuteafd/gpu-expert-tier-profile.json)
+fi
 ((!RELEASE_CONCURRENCY_EXPLICIT)) || [[ "$CONCURRENCY" =~ ^([1-9]|[1-5][0-9]|6[0-4])$ ]] || release_die "CONCURRENCY must be in 1..64"
 [[ "$PREFIX_CACHE_ENTRIES" == auto || "$PREFIX_CACHE_ENTRIES" =~ ^[0-9]+$ ]] || release_die "PREFIX_CACHE_ENTRIES must be auto or non-negative"
 [[ "$MAX_CONTEXT_TOKENS" == auto ]] || { [[ "$MAX_CONTEXT_TOKENS" =~ ^[1-9][0-9]{0,6}$ ]] && ((MAX_CONTEXT_TOKENS <= 1048576)); } || release_die "MAX_CONTEXT_TOKENS must be auto or in 1..1048576"
@@ -610,6 +663,9 @@ case "$RTX_GPUS" in auto|1|2) ;; *) release_die "RTX_GPUS must be auto, 1, or 2"
 [[ "$PREFILL_BATCH_TOKENS" =~ ^[0-9]+$ ]] && ((PREFILL_BATCH_TOKENS >= 80 && PREFILL_BATCH_TOKENS <= 4096)) || release_die "PREFILL_BATCH_TOKENS must be in 80..4096"
 [[ -z "$KV_POOL_SIZE" || "$KV_POOL_SIZE" =~ ^[0-9]+([.][0-9]{1,6})?(B|MB|GB|MiB|GiB)?$ ]] || release_die "KV_POOL_SIZE has an invalid unit"
 ((restart == 0 || dry_run == 0)) || release_die "--restart and --dry-run are mutually exclusive"
+if ((SPARK_COUNT == 0)); then
+  [[ "$v41_gpu_expert_tier" == off ]] || release_die "GPU_EXPERT_TIER runs the other experts on Sparks; SPARK_COUNT=0 has none"
+fi
 
 # Resolve the one SSH option set used by every remote step below: preflight reads,
 # expert launch, readiness polling and the EXIT cleanup. Placed after argument,
@@ -721,13 +777,18 @@ mkdir -p "$count_config_dir"
 count_config="$count_config_dir/plan-$(printf '%s\n' "$count_config_text" | sha256sum | cut -c1-16).config"
 printf '%s\n' "$count_config_text" >"$count_config.tmp.$$" && mv "$count_config.tmp.$$" "$count_config"
 count_args+=(--config /run/cuteafd-plan.config)
+for phase in prefill decode; do
+  format="$(get "SPARK_${phase^^}_REPLY_FORMAT" "$(get SPARK_REPLY_FORMAT)")"
+  [[ -z "$format" ]] || count_args+=("--spark-${phase}-reply-format" "$format")
+done
 v41_decode_lanes="$(get DECODE_LANES)"
 [[ -z "$v41_decode_lanes" || "$v41_decode_lanes" =~ ^[12]$ ]] || release_die "DECODE_LANES must be 1 or 2"
 [[ -z "$v41_decode_lanes" ]] || count_args+=(--decode-lanes "$v41_decode_lanes")
 ((RELEASE_SPARK_COUNT_EXPLICIT == 0)) || count_args+=(--spark-ranks "$SPARK_COUNT")
 # Keep checkpoint paths unchanged inside the full namespace mount.
 count_mounts=(-e "HF_HOME=$container_hf_home" ${v41_fp8_head_args[@]+"${v41_fp8_head_args[@]}"} "${namespace_mount_args[@]}"
-  -v "$count_config:/run/cuteafd-plan.config:ro")
+  -v "$count_config:/run/cuteafd-plan.config:ro"
+  ${v41_tier_mounts[@]+"${v41_tier_mounts[@]}"})
 if [[ -n "$wip_layout" ]]; then
   count_mounts+=(-v "$wip_layout/bin:/opt/cuteafd/bin:ro" -v "$wip_layout/lib:/opt/cuteafd/lib:ro"
     -v "$wip_layout/share:/opt/cuteafd/share:ro" --entrypoint /opt/cuteafd/bin/cuteafd)
@@ -736,6 +797,7 @@ count_pool="${POOL_TOKENS:-auto}"; [[ "$count_pool" != auto ]] || count_pool=0
 count_command=()
 [[ -n "$wip_layout" ]] || count_command=(cuteafd)
 [[ "$RTX_EXPERT_LAYERS" == auto ]] || count_args+=(--rtx-expert-layers "$RTX_EXPERT_LAYERS")
+count_args+=(${v41_tier_args[@]+"${v41_tier_args[@]}"})
 count_args+=(--embedding-placement "$EMBEDDING")
 count_prefill=0
 ((RELEASE_PREFILL_EXPLICIT == 0)) || count_prefill="$PREFILL_BATCH_TOKENS"
@@ -755,11 +817,12 @@ done
 release_reject_unused_keys deepseek_v41 $(_v41_allowed_keys)
 readiness_args=(--require-ready)
 [[ -z "$wip_slot" ]] || readiness_args=()
+release_coordinator_arch_args "$gpu_uuid_csv" v41_arch_args
 # Plan and serve admit resident weights against the same resolved budget.
 v41_weight_budget_gib="$(release_gib "$profile_cap")"
 count_plan="$(docker run --rm --network none "${count_mounts[@]}" "$COORDINATOR_DOCKER_INFERENCE" \
   "${count_command[@]}" plan "$(readlink -f "$hf_home/$snapshot_rel")" --vision "$VISION" --audio off \
-  --deployment "${readiness_args[@]}" "${count_args[@]}" --rtx "$RELEASE_RTX_GPUS" \
+  --deployment "${readiness_args[@]}" "${count_args[@]}" ${v41_arch_args[@]+"${v41_arch_args[@]}"} --rtx "$RELEASE_RTX_GPUS" \
   "${plan_memory_args[@]}" --gpu-memory-cap "$profile_cap" --coordinator-weight-budget-gib "$v41_weight_budget_gib" \
   --pool-tokens "$count_pool" --prefill-rows "$count_prefill" --max-context-tokens "$MAX_CONTEXT_TOKENS" \
   --concurrency "$CONCURRENCY" --prefix-cache-entries "$PREFIX_CACHE_ENTRIES" --host-cache-bytes "$HOST_CACHE_BYTES")"
@@ -933,7 +996,7 @@ assert hashlib.sha256((root / "lib/libcuteafd_native.so").read_bytes()).hexdiges
 fi
 
 peers="$(jq -er '.peers | join(",")' <<<"$count_plan")"
-fingerprint="$(printf '%s\n' "$engine_commit" "$RELEASE_MODEL_ID" "$RELEASE_MODEL_REVISION" "$ADDR" "$RELEASE_RTX_GPUS" "$gpu_uuid_csv" "$gpu_pci_csv" "$CONCURRENCY" "${HTTP_QUEUE_DEPTH:-$CONCURRENCY}" "$HTTP_QUEUE_WAIT_MS" "$HOST_CACHE_BYTES" "$RTX_EXPERT_LAYERS" "${KV_POOL_SIZE}${POOL_TOKENS:+:planner=$POOL_TOKENS}" "$EMBEDDING" "$VISION" "$AUDIO" "memory=${memory_policy_args[*]}" "$PREFIX_CACHE_ENTRIES" "$MAX_CONTEXT_TOKENS" "$MAX_OUTPUT_TOKENS" "$PREFILL_BATCH_TOKENS" "prefill-waves=${V41_PREFILL_WAVES:-}" "prefill-reserve=${V41_PREFILL_RESERVE_ROWS:-}" "$SPECULATOR" "${DRAFT_SURVIVAL_LENGTHS:-off}"${DRAFT_POLICY:+ "draft-policy=$DRAFT_POLICY"}${DRAFT_ROW_COST:+ "draft-row-cost=$DRAFT_ROW_COST"} "${draft_length:-auto}" "$TP2_ATTENTION" "$TP2_QUERY_PROJECTION" "$TP2_OUTPUT_PROJECTION" "$TP2_DSPARK_EXPERTS" "${CUTEAFD_PROTOCOL_V2_VERBS_HOST_DEVICE_MAP:-}" "${CUTEAFD_PROTOCOL_V2_VERBS_HOST_EXECUTION_LANES:-}" "${v41_worker_budget:-}" "$SPARK_COUNT" "$(release_hosts_csv)" "$peers" "spark-tp=${spark_tp}" "v41-spark-tp-roles=${spark_tp_roles_required}" | sha256sum | awk '{print $1}')"
+fingerprint="$(printf '%s\n' "$engine_commit" "$RELEASE_MODEL_ID" "$RELEASE_MODEL_REVISION" "$ADDR" "$RELEASE_RTX_GPUS" "$gpu_uuid_csv" "$gpu_pci_csv" "$CONCURRENCY" "${HTTP_QUEUE_DEPTH:-$CONCURRENCY}" "$HTTP_QUEUE_WAIT_MS" "$HOST_CACHE_BYTES" "$RTX_EXPERT_LAYERS" "${KV_POOL_SIZE}${POOL_TOKENS:+:planner=$POOL_TOKENS}" "$EMBEDDING" "$VISION" "$AUDIO" "memory=${memory_policy_args[*]}" "$PREFIX_CACHE_ENTRIES" "$MAX_CONTEXT_TOKENS" "$MAX_OUTPUT_TOKENS" "$PREFILL_BATCH_TOKENS" "prefill-waves=${V41_PREFILL_WAVES:-}" "prefill-reserve=${V41_PREFILL_RESERVE_ROWS:-}" "$SPECULATOR" "${DRAFT_SURVIVAL_LENGTHS:-off}"${DRAFT_POLICY:+ "draft-policy=$DRAFT_POLICY"}${DRAFT_ROW_COST:+ "draft-row-cost=$DRAFT_ROW_COST"} "${draft_length:-auto}" "$TP2_ATTENTION" "$TP2_QUERY_PROJECTION" "$TP2_OUTPUT_PROJECTION" "$TP2_DSPARK_EXPERTS" "${CUTEAFD_PROTOCOL_V2_VERBS_HOST_DEVICE_MAP:-}" "${CUTEAFD_PROTOCOL_V2_VERBS_HOST_EXECUTION_LANES:-}" "${v41_worker_budget:-}" "$SPARK_COUNT" "$(release_hosts_csv)" "$peers" "spark-tp=${spark_tp}" "gpu-expert-tier=$v41_gpu_expert_tier:${v41_tier_profile:+$(sha256sum <"$v41_tier_profile" | awk '{print $1}')}" "v41-spark-tp-roles=${spark_tp_roles_required}" | sha256sum | awk '{print $1}')"
 spark_prefix="$RELEASE_SPARK_CONTAINER_PREFIX"
 # Launch features shared with every family, validated before a dry run returns
 # and before any service is stopped.
@@ -1001,8 +1064,11 @@ trap cleanup EXIT
 # default. Values were format-checked above by release_validate_verbs_device_map.
 rdma_env_args=("${bond_args[@]}")
 # Optional V4.1 coordinator switches from the operator's environment, forwarded only when set.
-# (CONSOLE_TEXT and THERMAL are configuration keys, as for every family.)
-for switch_name in CUTEAFD_STAGE_CHAIN CUTEAFD_WINDOW_BATCH CUTEAFD_V41_FP8_HEAD; do
+# (CONSOLE_TEXT and THERMAL are configuration keys, as for every family. CUDA reads
+# CUDA_DEVICE_MAX_CONNECTIONS once, when the coordinator first initializes it.)
+for switch_name in CUTEAFD_STAGE_CHAIN CUTEAFD_WINDOW_BATCH CUTEAFD_V41_FP8_HEAD CUTEAFD_V41_PEER_EXCHANGE \
+  CUTEAFD_V41_PUSH_MAX_BYTES CUTEAFD_V41_BUSY_LANES CUTEAFD_V41_CHECK_STAGING CUTEAFD_SPARK_LANDING \
+  CUTEAFD_V41_INDEX_TOPK CUDA_DEVICE_MAX_CONNECTIONS CUTEAFD_V41_HC_BOUNDARY CUTEAFD_HOST_CACHE_STORE; do
   # The V41_FP8_HEAD key (validated above) takes the place of its environment spelling.
   [[ "$switch_name" != CUTEAFD_V41_FP8_HEAD || ${#v41_fp8_head_args[@]} == 0 ]] || continue
   [[ -z "${!switch_name:-}" ]] || rdma_env_args+=(-e "$switch_name=${!switch_name}")
@@ -1062,6 +1128,8 @@ fi
 start_coordinator() {
 echo "== starting native RTX coordinator =="
 local -a args=(--vision "$VISION" --audio "$AUDIO" serve-native "${vision_args[@]}" --snapshot "$(readlink -f "$hf_home/$snapshot_rel")" --native-lib /opt/cuteafd/lib/libcuteafd_native.so --peers "$peers" --rtx-gpus "$RELEASE_RTX_GPUS" --embedding-placement "$EMBEDDING" --listen "$ADDR" --prefill-batch-tokens "$PREFILL_BATCH_TOKENS" --concurrency "$CONCURRENCY" --prefix-cache-entries "$PREFIX_CACHE_ENTRIES" --max-context-tokens "$MAX_CONTEXT_TOKENS" --max-output-tokens "$MAX_OUTPUT_TOKENS" --mapped-scale-preload-gib "$(get MAPPED_SCALE_PRELOAD_GIB 0)")
+[[ -z "$(get PREFIX_PARTIAL)" ]] || args+=(--prefix-partial "$v41_prefix_partial")
+args+=(--prefix-point-boundaries "$(get PREFIX_POINT_BOUNDARIES 1)")
 case "$(get EXPERT_USAGE on)" in
   on) args+=(--expert-usage) ;;
   off) args+=(--expert-usage=false) ;;
@@ -1086,6 +1154,7 @@ args+=("${memory_policy_args[@]}" --coordinator-weight-budget-gib "$v41_weight_b
 args+=("${api_args[@]}")
 args+=(--http-queue-depth "${HTTP_QUEUE_DEPTH:-$CONCURRENCY}" --http-queue-wait-ms "$HTTP_QUEUE_WAIT_MS")
 [[ "$RTX_EXPERT_LAYERS" == auto ]] || args+=(--rtx-expert-layers "$RTX_EXPERT_LAYERS")
+args+=(${v41_tier_args[@]+"${v41_tier_args[@]}"})
 [[ "$HOST_CACHE_BYTES" == 0 ]] || args+=(--host-cache-bytes "$HOST_CACHE_BYTES")
 [[ -z "$KV_POOL_SIZE" ]] || args+=(--kv-pool-size "$KV_POOL_SIZE")
 if [[ -n "${POOL_TOKENS:-}" ]]; then
@@ -1107,7 +1176,7 @@ docker run -d "${RELEASE_SERVING_ARGS[@]}" --name "$coordinator" --restart no "$
   -e "CUTEAFD_V41_IMAGE_ADMISSIONS=${CUTEAFD_V41_IMAGE_ADMISSIONS:-2}" \
   "${rdma_env_args[@]}" "${bench_nonce_env_args[@]}" "${trace_args[@]}" "${graph_census_args[@]}" ${profile_args[@]+"${profile_args[@]}"} \
   "${shared_env_args[@]}" "${thermal_args[@]}" "${probe_args[@]}" \
-  "${wip_mount_args[@]}" \
+  "${wip_mount_args[@]}" ${v41_tier_mounts[@]+"${v41_tier_mounts[@]}"} \
   "${api_mount_args[@]}" -e "CUTEAFD_IMAGE=$COORDINATOR_DOCKER_INFERENCE" -v "$bench_dir:/run/cuteafd/bench" -v "$fidelity_cache:/run/cuteafd/fidelity" -e CUTEAFD_FIDELITY_CACHE=/run/cuteafd/fidelity \
   ${profile_wrapper_args[@]+"${profile_wrapper_args[@]}"} \
   "${namespace_mount_args[@]}" "$COORDINATOR_DOCKER_INFERENCE" ${profile_wrapper[@]+"${profile_wrapper[@]}"} cuteafd "${args[@]}" >/dev/null
@@ -2430,8 +2499,8 @@ audio_encoder_hash=""
     [[ -z "$(get PREFILL_ROWS)" ]] || plan_draft_args+=(--prefill-rows "$(get PREFILL_ROWS)")
     [[ -z "$(get PREFILL_WAVES)" ]] || plan_draft_args+=(--prefill-waves "$(get PREFILL_WAVES)")
   fi
-  [[ -z "$(get SPARK_PREFILL_REPLY_FORMAT)" ]] || plan_draft_args+=(--spark-prefill-reply-format "$(get SPARK_PREFILL_REPLY_FORMAT)")
-  [[ -z "$(get SPARK_DECODE_REPLY_FORMAT)" ]] || plan_draft_args+=(--spark-decode-reply-format "$(get SPARK_DECODE_REPLY_FORMAT)")
+  [[ -z "$(get SPARK_PREFILL_REPLY_FORMAT "$(get SPARK_REPLY_FORMAT)")" ]] || plan_draft_args+=(--spark-prefill-reply-format "$(get SPARK_PREFILL_REPLY_FORMAT "$(get SPARK_REPLY_FORMAT)")")
+  [[ -z "$(get SPARK_DECODE_REPLY_FORMAT "$(get SPARK_REPLY_FORMAT)")" ]] || plan_draft_args+=(--spark-decode-reply-format "$(get SPARK_DECODE_REPLY_FORMAT "$(get SPARK_REPLY_FORMAT)")")
   if [[ "$family" == muse_spark ]]; then
     [[ -z "$(get PREFILL_ROWS)" ]] || plan_draft_args+=(--prefill-rows "$(get PREFILL_ROWS)")
     [[ -z "$(get PREFILL_WAVES)" ]] || plan_draft_args+=(--prefill-waves "$(get PREFILL_WAVES)")
@@ -2500,6 +2569,7 @@ audio_encoder_hash=""
   [[ -z "$(get KV_POOL_SIZE)" ]] || deployment_args+=(--kv-pool-size "$(get KV_POOL_SIZE)")
   readiness_args=(--require-ready)
   [[ -z "$wip_slot" ]] || readiness_args=()
+  release_coordinator_arch_args "$(IFS=,; printf '%s' "${coordinator_uuids[*]}")" plan_arch_args
   plan_config_mounts=()
   if [[ "$family" == deepseek_v4 ]]; then
     # Pass the resolved value, including explicit off, to default-on admission.
@@ -2512,6 +2582,10 @@ audio_encoder_hash=""
     plan_config="$plan_config_dir/plan-$(printf '%s\n' "$plan_config_text" | sha256sum | cut -c1-16).config"
     printf '%s\n' "$plan_config_text" >"$plan_config.tmp.$$" && mv "$plan_config.tmp.$$" "$plan_config"
     count_args+=(--config /run/cuteafd-plan.config)
+for phase in prefill decode; do
+  format="$(get "SPARK_${phase^^}_REPLY_FORMAT" "$(get SPARK_REPLY_FORMAT)")"
+  [[ -z "$format" ]] || count_args+=("--spark-${phase}-reply-format" "$format")
+done
     plan_config_mounts=(-v "$plan_config:/run/cuteafd-plan.config:ro")
   fi
   # Keep checkpoint paths unchanged inside the full namespace mount. The plan
@@ -2543,7 +2617,7 @@ audio_encoder_hash=""
   done
   plan_json="$(docker run --rm --network none ${plan_profile_env[@]+"${plan_profile_env[@]}"} "${lane_env_args[@]}" -e "HF_HOME=$container_hf_home" "${generic_worker_mounts[@]}" "${chat_template_mounts[@]}" "${wip_mount_args[@]}" "${plan_config_mounts[@]}" \
     "$coordinator_image" cuteafd plan "$snapshot" --attention-placement "$attention_placement" --vision "$vision" --audio "$audio" --deployment "${readiness_args[@]}" \
-    "${deployment_args[@]}" "${count_args[@]}" "${exlr8_plan_args[@]}" "${core_view_args[@]}" "${plan_memory_args[@]}" \
+    "${deployment_args[@]}" "${count_args[@]}" "${exlr8_plan_args[@]}" "${core_view_args[@]}" "${plan_memory_args[@]}" ${plan_arch_args[@]+"${plan_arch_args[@]}"} \
     --rtx "$plan_rtx" --gpu-memory-cap "$plan_cap" --coordinator-weight-budget-gib "$coordinator_weight_budget_gib" --pool-tokens "$plan_pool" --vision-replicas "$vision_replicas" "${plan_draft_args[@]}")"
   release_validate_deployment "$plan_json" "$checkpoint_family"
   RELEASE_RECLAIM_ARGS=()

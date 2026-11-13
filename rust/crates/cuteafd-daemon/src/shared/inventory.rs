@@ -142,11 +142,11 @@ mod phase_tests {
     fn unknown_package_live_reservation_uses_same_program_estimate_as_plan() {
         use cuteafd_loader::placement::{inventory::loaded_code_allowance, ArchContext, ProgramSet};
         let manifest = serde_json::json!({"programs":[{"name":"qwen4_decode"}]});
-        let arch = ArchContext::for_device("sm_120", 96 << 30);
+        let arch = ArchContext::for_device(cuteafd_core::GpuArch::Sm120, 96 << 30);
         let programs = ProgramSet::from_manifest(&manifest, &["qwen4"]);
         let allowance = loaded_code_allowance("qwen4", "unmeasured", false, 0, arch, Some(&programs));
         let planned = cuteafd_loader::plan::layout::runtime_item(Some(&manifest), &["qwen4".into()],
-            "unmeasured", false, 0, 96 << 30);
+            "unmeasured", false, 0, cuteafd_core::GpuArch::Sm120, 96 << 30);
         let pending = allowance.pending(arch.context_bytes, arch.context_bytes);
         assert!(pending > 0);
         assert_eq!(pending + arch.context_bytes, planned.bytes);
@@ -299,6 +299,14 @@ pub(crate) fn startup_probe(library: &NativeLibrary, devices: &[i32], stage: &st
     result
 }
 
+/// The architecture of `device`; unsupported devices fail here, before any
+/// planner number is derived from them.
+pub(crate) fn device_arch(library: &NativeLibrary, device: i32) -> Result<cuteafd_core::GpuArch> {
+    let info = library.cuda_device_info(device)?;
+    Ok(cuteafd_core::GpuArch::from_compute_capability(info.compute_capability_major,
+        info.compute_capability_minor)?)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
 struct StartupPhaseSample {
     total: u64,
@@ -428,8 +436,9 @@ pub(crate) fn pending_code(library: &NativeLibrary, device: i32, rank: usize, sp
     let ((free, total), info) = sample?;
     let tracked = cuteafd_ffi::memory_ledger::snapshot().total(cuteafd_ffi::memory_ledger::Space::Device, device);
     let untracked = (total.saturating_sub(free) as u64).saturating_sub(tracked as u64);
-    let arch = format!("sm_{}{}", info.compute_capability_major, info.compute_capability_minor);
-    let context = cuteafd_loader::placement::ArchContext::for_device(&arch, total as u64);
+    let arch = cuteafd_core::GpuArch::from_compute_capability(info.compute_capability_major,
+        info.compute_capability_minor)?;
+    let context = cuteafd_loader::placement::ArchContext::for_device(arch, total as u64);
     let code = cuteafd_loader::placement::inventory::loaded_code_allowance(program_family, experts,
         split, rank as u8, context, Some(programs));
     let pending = code.pending(untracked, context.context_bytes);

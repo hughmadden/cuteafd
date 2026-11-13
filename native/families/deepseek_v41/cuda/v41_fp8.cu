@@ -3,6 +3,7 @@
 #include <cuda_bf16.h>
 #include "cuteafd_v41_fp8.h"
 namespace {
+#ifndef CUTEAFD_V41_FP8_PLAIN_SCALES
 __global__ void pack_scales(const uint8_t* source, uint8_t* output, uint64_t bytes, uint32_t scale_k) {
   const uint64_t i = uint64_t(blockIdx.x) * blockDim.x + threadIdx.x;
   if (i >= bytes) return;
@@ -10,6 +11,7 @@ __global__ void pack_scales(const uint8_t* source, uint8_t* output, uint64_t byt
   const uint64_t tile = i / 512, nk = tile / (scale_k / 4), kk = tile % (scale_k / 4);
   output[i] = source[(nk * 4 + row4) * scale_k + kk * 4 + k4];
 }
+#endif
 __global__ void alpha_one(float* alpha) { *alpha = 1.0f; }
 __global__ void shared_swiglu(const __nv_bfloat16* gate, const __nv_bfloat16* up,
     __nv_bfloat16* output, uint64_t count) {
@@ -54,13 +56,23 @@ extern "C" int32_t cuteafd_v41_fp8_matrix_pack_scales(
   // WO-A has eight independent groups, each [1024,4096]. The checkpoint
   // stores groups consecutively, so ordinary packing applies to [8192,4096].
   if (k == 32768 && n == 8192) k = 4096;
+#ifdef CUTEAFD_V41_FP8_PLAIN_SCALES
+  // SM89 GEMMs read the checkpoint grid [N/32,K/32] (per group for WO-A).
+  const uint64_t src_bytes = uint64_t(k) * n / 1024, dst_bytes = src_bytes;
+#else
   const uint64_t src_bytes = uint64_t(k) * n / 1024, dst_bytes = src_bytes * 32;
+#endif
   auto a = reinterpret_cast<uintptr_t>(source), b = reinterpret_cast<uintptr_t>(destination);
   if (!a || !b || a > UINTPTR_MAX - src_bytes || b > UINTPTR_MAX - dst_bytes ||
       (a < b + dst_bytes && b < a + src_bytes)) return cudaErrorInvalidValue;
+#ifdef CUTEAFD_V41_FP8_PLAIN_SCALES
+  return cudaMemcpyAsync(destination, source, dst_bytes, cudaMemcpyDeviceToDevice,
+                         reinterpret_cast<cudaStream_t>(stream));
+#else
   pack_scales<<<(dst_bytes + 255) / 256, 256, 0, reinterpret_cast<cudaStream_t>(stream)>>>(
       source, destination, dst_bytes, k / 32);
   return cudaGetLastError();
+#endif
 }
 extern "C" int32_t cuteafd_v41_fp8_pack_scales(const uint8_t* source, uint8_t* destination, void* stream) {
   return cuteafd_v41_fp8_matrix_pack_scales(source, destination, 6144, 25600, stream);

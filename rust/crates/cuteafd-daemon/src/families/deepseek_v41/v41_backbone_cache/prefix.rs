@@ -85,7 +85,7 @@ impl<'a> BackboneCache<'a> {
     /// complete frontier is captured, after all producer/consumer streams drained.
     pub fn capture_mark(&mut self, lease: CacheLease, mark: CuteafdDeviceBuffer) -> Result<BackboneMark> {
         let stream = self.prefix_stream.raw;
-        let saved = self.copy_mark(lease, mark, stream)?;
+        let saved = self.copy_mark(lease, mark, stream, None)?;
         unsafe { self.prefix_stream.library.cuda_stream_synchronize(stream)?; }
         Ok(saved)
     }
@@ -99,14 +99,7 @@ impl<'a> BackboneCache<'a> {
         let copies = self.prefix_copies.get(lane).context("invalid snapshot lane")?;
         ensure!(copies.pending.is_none(), "backbone snapshot lane is occupied");
         let stream = copies.stream.raw;
-        // SAFETY: both streams and the event belong to this cache and are live.
-        unsafe {
-            self.prefix_stream.library.cuda_event_record(self.prefix_queued.0, self.prefix_stream.raw)?;
-            self.prefix_stream.library.cuda_stream_wait_event(stream, self.prefix_queued.0)?;
-        }
-        let saved = self.copy_mark(lease, mark, stream)?;
-        self.prefix_copies[lane].pending = Some(lease);
-        Ok(saved)
+        self.copy_mark(lease, mark, stream, Some(lane))
     }
     /// Whether lane `lane`'s queued mark copies landed; the lane frees once they have.
     pub fn mark_ready(&mut self, lane: usize) -> Result<bool> {
@@ -120,8 +113,8 @@ impl<'a> BackboneCache<'a> {
     pub fn abort_mark(&mut self, lane: usize) -> Result<()> {
         self.prefix_copies.get_mut(lane).context("invalid snapshot lane")?.abort()
     }
-    fn copy_mark(&mut self, lease: CacheLease, mark: CuteafdDeviceBuffer, stream: *mut std::ffi::c_void)
-        -> Result<BackboneMark> {
+    fn copy_mark(&mut self, lease: CacheLease, mark: CuteafdDeviceBuffer, stream: *mut std::ffi::c_void,
+        lane: Option<usize>) -> Result<BackboneMark> {
         let end = self.committed_end(lease)?;
         let request = self.request(lease)?;
         ensure!(
@@ -129,13 +122,24 @@ impl<'a> BackboneCache<'a> {
             "prefix retention requires a complete request frontier"
         );
         ensure!(mark.bytes == BackboneMark::BYTES, "backbone mark storage size differs");
+        let (windows, sources) = (request.windows, request.sources);
+        if let Some(lane) = lane {
+            // Validation above still rejects foreign readers and incomplete frontiers.
+            // From this point the lane owns its source before even ordering events enqueue.
+            crate::shared::memory::reserve_snapshot(&mut self.prefix_copies[lane].pending, lease)?;
+            // SAFETY: both streams and the event belong to this cache and are live.
+            unsafe {
+                self.prefix_stream.library.cuda_event_record(self.prefix_queued.0, self.prefix_stream.raw)?;
+                self.prefix_stream.library.cuda_stream_wait_event(stream, self.prefix_queued.0)?;
+            }
+        }
         let result = (|| -> Result<_> {
-            let windows = self.windows.iter().zip(request.windows).enumerate()
+            let windows = self.windows.iter().zip(windows).enumerate()
                 .map(|(i, (state, lease))| unsafe {
                     state.retain_prefix(lease, slice(mark, i * WINDOW_PREFIX_BYTES, WINDOW_PREFIX_BYTES), stream)
                 })
                 .collect::<Result<Vec<_>>>()?;
-            for (i, (state, lease)) in self.sources.iter().zip(request.sources).enumerate() {
+            for (i, (state, lease)) in self.sources.iter().zip(sources).enumerate() {
                 let saved = unsafe {
                     state.retain_prefix(lease,
                         slice(mark, 40 * WINDOW_PREFIX_BYTES + i * COMPRESSOR_PREFIX_BYTES, COMPRESSOR_PREFIX_BYTES),

@@ -60,8 +60,7 @@ pub(crate) fn library() -> Result<NativeLibrary> {
 /// head and dSpark recipes are the same constructors the serving loaders use.
 #[test]
 fn installed_full_v41_push_host_owners_are_admitted_exactly() -> Result<()> {
-    use crate::shared::{experts::{layer::{native_coded_scale_steps, native_weight_windows},
-        rtx::dense::{HostStaging, Operand, RankLayout, Rect}},
+    use crate::shared::{experts::{layer::native_expert_steps, rtx::dense::{HostStaging, Operand, RankLayout}},
         memory::{push_coordinator::CoordinatorExpertPlan, push_native::ScalePlan}};
     use cuteafd_ffi::push_ring::{DEFAULT_SLOTS, DEFAULT_SLOT_BYTES};
     use cuteafd_loader::{push_load::native::NativePlanes, V41ExpertSelection, V41TensorPlacement};
@@ -108,19 +107,8 @@ fn installed_full_v41_push_host_owners_are_admitted_exactly() -> Result<()> {
             assert!(steps.iter().all(|step| step.bytes() == 16 * 10240));
             if gpu == draft_gpu {
                 for stage in 0..shape.draft_stages { for expert in 0..shape.draft_experts {
-                    let selection = catalog.expert_staging(V41ExpertSelection::Dspark { stage, expert })?;
-                    let names = selection.tensor_names();
-                    for (slot, projection) in [(0, 0), (1, 1), (2, 2)] {
-                        let tensor = catalog.tensor(&names[slot])?;
-                        let rows = tensor.metadata.shape[0];
-                        let width = tensor.metadata.byte_length as usize / rows;
-                        let rect = Rect { name: names[slot].clone(), path: snapshot.join(&tensor.shard),
-                            base: tensor.metadata.byte_offset, row_bytes: width, rows: 0..rows, cols: 0..width };
-                        steps.extend(native_weight_windows(rect, device, shape.hidden, shape.intermediate as u32,
-                            projection, buffer(device, 2 * shape.hidden * shape.intermediate))?);
-                    }
-                    steps.extend(native_coded_scale_steps(&catalog, names, shape.intermediate, device,
-                        [buffer(device, 2 * shape.hidden * shape.intermediate); 2])?);
+                    steps.extend(native_expert_steps(&catalog, V41ExpertSelection::Dspark { stage, expert }, device,
+                        [buffer(device, 2 * shape.hidden * shape.intermediate); 4])?);
                 } }
             }
             let layout = RankLayout::new(operands, steps, device)?;
@@ -174,7 +162,8 @@ pub(crate) fn mount_two_gpu(library: &NativeLibrary, catalog: &cuteafd_loader::O
     let devices = [Device { library, id: 0 }, Device { library, id: 1 }];
     let map = CachePlacement::encoder_decoder();
     let arenas = super::weight_layout::TargetArenas::new(library,
-        super::weight_layout::target_layout(catalog, Some(map), true, super::v41_tensors::fp8_head(), false, false)?)?;
+        super::weight_layout::target_layout_for_arch(catalog, Some(map), true, super::v41_tensors::fp8_head(), false, false,
+            crate::shared::inventory::device_arch(library, 0)?)?)?;
     let weights = BackboneLaneWeights::load_in(library, catalog, 16 << 20, Some(map), false, false, Some(&arenas))?;
     collect(library, out, |f| weights.visit(f))?;
     drop(weights);
@@ -236,7 +225,8 @@ pub(crate) fn mount_one_gpu(library: &NativeLibrary, catalog: &cuteafd_loader::O
     let device = Device { library, id: 0 };
     device.run(|| {
         let arenas = super::weight_layout::TargetArenas::new(library,
-            super::weight_layout::target_layout(catalog, None, false, super::v41_tensors::fp8_head(), false, false)?)?;
+            super::weight_layout::target_layout_for_arch(catalog, None, false, super::v41_tensors::fp8_head(), false, false,
+                crate::shared::inventory::device_arch(library, 0)?)?)?;
         let arena = Some(arenas.get(device.id)?);
         let weights = BackboneLaneWeights::load_in(library, catalog, 16 << 20, None, false, false, Some(&arenas))?;
         collect(library, out, |f| weights.visit(&mut |n, b| f(format!("single.{n}"), b)))?;
@@ -377,7 +367,8 @@ fn pushed_coordinator_operands(real_push: bool) -> Result<()> {
     let socket_dir = tempfile::tempdir()?;
     let map = CachePlacement::encoder_decoder();
     let arenas = super::weight_layout::TargetArenas::new(&library,
-        super::weight_layout::target_layout(&catalog, Some(map), true, super::v41_tensors::fp8_head(), false, false)?)?;
+        super::weight_layout::target_layout_for_arch(&catalog, Some(map), true, super::v41_tensors::fp8_head(), false, false,
+            crate::shared::inventory::device_arch(&library, 0)?)?)?;
     // Bind the same final arena views as serving before recording delivery.
     let recorder = Recorder::start(true)?.context("recorder")?;
     let mut owners = Digests::new();
@@ -498,11 +489,12 @@ fn checkpoint_pushed_projection_operands_match_mount() -> Result<()> {
                 cuteafd_loader::placement::families::deepseek_v41::weight_layout::packed_scale_name(&weight)];
             let (k, n) = kind.geometry();
             let layout = cuteafd_loader::serving_capacity::WeightArenaLayout::new("projection/oracle",
-                [(names[0].clone(), k * n / 2), (names[1].clone(), k * n / 64)])?;
+                [(names[0].clone(), k * n / 2),
+                    (names[1].clone(), Weights::device_bytes(&library, kind)? - k * n / 2)])?;
             let arena = crate::shared::memory::weight_arena::DeviceWeightArena::new(device,
                 layout.clone(), ArenaTag::weights("v41/target"))?;
             let mounted = device.run(|| Weights::load_in(device, &catalog, 2, kind, rank,
-                Weights::load_peak_device_bytes(kind), Some(&arena)))?;
+                Weights::load_peak_device_bytes(&library, kind)?, Some(&arena)))?;
             let expected = { let [weight, scales] = mounted.buffers(); [digest(&library, weight)?, digest(&library, scales)?] };
             drop(mounted);
             drop(arena);
@@ -510,7 +502,7 @@ fn checkpoint_pushed_projection_operands_match_mount() -> Result<()> {
                 layout, ArenaTag::weights("v41/target"))?;
             let reads = crate::shared::memory::load_timing::Split::start();
             let (pushed, records) = dense::recording(|| device.run(|| Weights::load_in(device, &catalog,
-                2, kind, rank, Weights::load_peak_device_bytes(kind), Some(&arena))))?;
+                2, kind, rank, Weights::load_peak_device_bytes(&library, kind)?, Some(&arena))))?;
             crate::shared::experts::rtx::push::tests::receive_pushed(device, None, &root,
                 sockets.path(), &records, None, 0, rank)?;
             assert_eq!(reads.read_bytes(), 0, "projection receiver must not read the mount");

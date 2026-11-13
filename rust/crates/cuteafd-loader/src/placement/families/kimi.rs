@@ -447,6 +447,7 @@ impl KimiRecipe {
         let attention_by_kind = self.kind_order().into_iter()
             .map(|kind| (kind, self.placement)).collect();
         Ok(Placement {
+            expert_tier: None,
             pool_tokens: solved.pool_tokens,
             pool_limits: PoolLimits(vec![]),
             attention_placement: self.placement,

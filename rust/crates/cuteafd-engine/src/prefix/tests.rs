@@ -111,10 +111,15 @@ struct Fake {
     writable_lag: usize,
     fail_restore: Cell<bool>,
     fail_copy: Cell<bool>,
+    fail_capture_queued: Cell<bool>,
     fail_drain: Cell<bool>,
     record_format: Cell<&'static str>,
     drains: Cell<usize>,
     rule: ReuseRule,
+    /// Diagnostic-only partial rule; never changes this fake's lookup or restores.
+    refused_partial_rule: Option<ReuseRule>,
+    /// Model an exact encoder-continuation route for restore accounting tests.
+    encoder_window: Option<usize>,
     /// A pages-only family (GLM 5.3): no mark; restores resume at the snapshot's length and the
     /// host tier keeps a one-byte stand-in tail.
     markless: bool,
@@ -134,8 +139,9 @@ impl Fake {
     fn new(pages: usize, rings: usize, slots: usize) -> Self {
         let bytes = (pages * ROWS + rings * RING + slots * WINDOW) * ROW;
         let mem = Rc::new(RefCell::new(StubCopyEngine::new(CopyModel::default(), bytes, 1 << 26)));
-        Self { mem, pages, rings, slots, writable_lag: 0, queue: RefCell::new(Vec::new()), fail_restore: Cell::new(false), fail_copy: Cell::new(false), fail_drain: Cell::new(false), record_format: Cell::new("opaque_v1"), drains: Cell::new(0),
-            rule: ReuseRule::EXACT, markless: false, pooled: false, reserved: 0, draft: RefCell::new(None) }
+        Self { mem, pages, rings, slots, writable_lag: 0, queue: RefCell::new(Vec::new()), fail_restore: Cell::new(false), fail_copy: Cell::new(false), fail_capture_queued: Cell::new(false), fail_drain: Cell::new(false), record_format: Cell::new("opaque_v1"), drains: Cell::new(0),
+            rule: ReuseRule::EXACT, refused_partial_rule: None, encoder_window: None,
+            markless: false, pooled: false, reserved: 0, draft: RefCell::new(None) }
     }
     /// Marks in pool pages: no arena slot exists (any use of one panics). `pages` pages hand
     /// out, past the reserved page 0.
@@ -236,6 +242,15 @@ impl PrefixFamily for Fake {
     fn layout(&self) -> FamilyLayout {
         Fake::layout(self)
     }
+    fn refused_partial_rule(&self) -> Option<ReuseRule> { self.refused_partial_rule }
+    fn plan_restore(&self, hit: RestoreCandidate<'_>) -> RestorePlan {
+        let mut plan = RestorePlan::under(self.rule, hit);
+        if plan.exact() && self.encoder_window.is_some_and(|window|
+            hit.target_end.saturating_sub(hit.snapshot_end) >= window) {
+            plan.fidelity = RestoreFidelity::ExactEncoderContinuation;
+        }
+        plan
+    }
     fn discard(&self, placement: &mut Placement) -> Result<(), BoxError> {
         if let Some(draft) = self.draft.borrow_mut().as_mut() {
             if let Some(binding) = draft.bindings[placement.ring].take() { draft.pool.release(binding)?; }
@@ -327,6 +342,7 @@ impl PrefixFamily for Fake {
         for (i, r) in Fake::mark_window(p, len)?.enumerate() {
             self.queue.borrow_mut().push(Op::Copy(self.ring_row(p.ring, r), self.slot_row(slot, i)));
         }
+        if self.fail_capture_queued.get() { return Err("injected failure after capture enqueue".into()); }
         Ok(())
     }
     fn capture_pages(&self, pages: &[u32], p: &Placement, len: usize) -> Result<(), BoxError> {
@@ -493,6 +509,106 @@ fn serve(cache: &mut PrefixCache<Shared>, fake: &Fake, ring: usize, prompt: &[u3
 
 fn seq(base: u32, n: usize) -> Vec<u32> {
     (0..n as u32).map(|i| base + i).collect()
+}
+
+#[test]
+fn restore_fidelity_counts_successes_and_preserves_legacy_hit_counters() {
+    let mut fake = Fake::new(64, 3, 8);
+    fake.encoder_window = Some(WINDOW);
+    let mut cache = cache(&fake, 4, 0);
+    let prompt = seq(100, 21);
+    let (_, _, a) = serve(&mut cache, &fake, 0, &prompt, &[], 32);
+    cache.release(&fake, &a.pages).unwrap();
+    for suffix in [0, WINDOW - 1, WINDOW] {
+        let mut next = prompt.clone();
+        next.extend(seq(900, suffix));
+        let admitted = cache.admit(&fake, &next, 32, false,
+            |pages| Placement { pages, ring: 1, len: 0, ring_from: 0 }).unwrap();
+        assert_eq!(admitted.resume, prompt.len());
+        assert!(admitted.source.unwrap().plan.exact());
+        let mut restored = admitted.placement;
+        fake.forward(&mut restored, &next).unwrap();
+        cache.release(&fake, &restored.pages).unwrap();
+    }
+    let stats = cache.stats();
+    assert_eq!((stats.hits, stats.exact_hits, stats.partial_hits), (3, 1, 0));
+    assert_eq!((stats.exact_snapshot_restores, stats.exact_encoder_continuation_restores), (2, 1));
+    assert_eq!((stats.approximate_replay_restores, stats.replayed_tokens), (0, 0));
+    // A failed restore must never count as successful fidelity, even after it queued copies.
+    fake.fail_restore.set(true);
+    let cold = cache.admit(&fake, &prompt, 32, false,
+        |pages| Placement { pages, ring: 2, len: 0, ring_from: 0 }).unwrap();
+    assert_eq!(cold.resume, 0);
+    assert_eq!(cache.stats().exact_snapshot_restores, 2);
+    cache.release(&fake, &cold.placement.pages).unwrap();
+}
+
+#[test]
+fn exact_only_partial_misses_count_both_tiers_and_keep_exact_ancestors() {
+    for host_bytes in [0, 1 << 20] {
+        let mut fake = Fake::new(64, 3, 8);
+        fake.refused_partial_rule = Some(ReuseRule { align: 2, replay: Some(WINDOW) });
+        let mut cache = cache(&fake, 4, host_bytes);
+        let prompt = seq(100, 41);
+        let (_, _, a) = serve(&mut cache, &fake, 0, &prompt, &[], 48);
+        cache.release(&fake, &a.pages).unwrap();
+        fake.mem.borrow_mut().advance(10_000_000);
+        cache.tick();
+        if host_bytes > 0 {
+            // Leave the snapshot in RAM alone; the device has no retained match.
+            assert!(cache.make_room(&fake, 64, None).unwrap());
+            assert_eq!(cache.stats().entries_prompt, 0);
+        }
+        let mut branch = prompt[..33].to_vec();
+        branch.extend(seq(900, 6));
+        assert_eq!(cache.peek(&branch, false), 0);
+        assert_eq!(cache.stats().exact_only_partial_misses, 0, "peeks never count requests");
+        let cold = cache.admit(&fake, &branch, 48, false,
+            |pages| Placement { pages, ring: 1, len: 0, ring_from: 0 }).unwrap();
+        assert_eq!(cold.resume, 0);
+        assert_eq!(cache.stats().exact_only_partial_misses, 1);
+        cache.release(&fake, &cold.placement.pages).unwrap();
+        // A full prompt hit from either tier is still exact.
+        let full = cache.admit(&fake, &prompt, 48, false,
+            |pages| Placement { pages, ring: 1, len: 0, ring_from: 0 }).unwrap();
+        assert_eq!(full.resume, prompt.len());
+        assert_eq!(full.source.unwrap().host, host_bytes > 0);
+        cache.release(&fake, &full.placement.pages).unwrap();
+        // Retain an older complete ancestor. It wins over the rejected deeper partial match.
+        let (_, _, ancestor) = serve(&mut cache, &fake, 2, &prompt[..20], &[], 48);
+        cache.release(&fake, &ancestor.pages).unwrap();
+        let hit = cache.admit(&fake, &branch, 48, false,
+            |pages| Placement { pages, ring: 1, len: 0, ring_from: 0 }).unwrap();
+        assert_eq!(hit.resume, 20);
+        assert!(hit.source.unwrap().plan.exact());
+        assert_eq!(cache.stats().exact_only_partial_misses, 2, "only the ancestor's cold admission also missed");
+        cache.release(&fake, &hit.placement.pages).unwrap();
+        // Neither an unrelated miss nor a prefix shorter than the replay window is useful.
+        for next in [seq(5000, 12), prompt[..WINDOW].to_vec()] {
+            let cold = cache.admit(&fake, &next, 48, false,
+                |pages| Placement { pages, ring: 1, len: 0, ring_from: 0 }).unwrap();
+            assert_eq!(cold.resume, 0);
+            cache.release(&fake, &cold.placement.pages).unwrap();
+        }
+        assert_eq!(cache.stats().exact_only_partial_misses, 2);
+        cache.clear(&fake).unwrap();
+        assert_eq!(cache.pool().free(), 64);
+    }
+}
+
+#[test]
+fn exact_only_partial_misses_exclude_failed_cold_allocations() {
+    let mut fake = Fake::new(16, 2, 4);
+    fake.refused_partial_rule = Some(ReuseRule { align: 2, replay: Some(WINDOW) });
+    let mut cache = cache(&fake, 4, 0);
+    let prompt = seq(100, 41);
+    let (_, _, active) = serve(&mut cache, &fake, 0, &prompt, &[], 48);
+    let mut branch = prompt[..33].to_vec();
+    branch.extend(seq(900, 6));
+    assert!(cache.admit(&fake, &branch, 64, false,
+        |pages| Placement { pages, ring: 1, len: 0, ring_from: 0 }).is_err());
+    assert_eq!(cache.stats().exact_only_partial_misses, 0);
+    cache.release(&fake, &active.pages).unwrap();
 }
 
 #[test]
@@ -1823,4 +1939,86 @@ fn predictor_inclusive_host_pages_do_not_deduplicate_by_target_tokens() {
     assert_eq!(fake.mem.borrow().read_device(row(&restored.placement)), value(4, &[901]));
     cache.release(&fake, &restored.placement.pages).unwrap();
     cache.clear(&fake).unwrap();
+}
+
+#[test]
+fn synchronous_capture_failure_drains_or_quarantines_queued_storage() {
+    for failed_drain in [false, true] {
+        let fake = Fake::new(32, 4, 2);
+        let mut cache = cache(&fake, 4, 0);
+        let tokens = seq(100, 13);
+        let mut p = cache.admit_cold(&fake, tokens.len(), 20,
+            |pages| Placement { pages, ring: 0, len: 0, ring_from: 0 }).unwrap().placement;
+        fake.forward(&mut p, &tokens).unwrap();
+        let (free, marks) = (cache.pool().free(), cache.arena().free());
+        fake.fail_capture_queued.set(true);
+        fake.fail_drain.set(failed_drain);
+        let error = cache.capture(&fake, SnapshotKind::Prompt, &tokens, &p, After::default()).unwrap_err();
+        assert_eq!(matches!(error, PrefixError::CaptureUndrained { .. }), failed_drain);
+        assert_eq!(cache.stats().quarantined, u64::from(failed_drain));
+        assert_eq!(cache.arena().free(), marks - usize::from(failed_drain));
+        assert_eq!(cache.pool().free(), free - usize::from(failed_drain));
+        assert_eq!(fake.queue.borrow().is_empty(), !failed_drain);
+        assert_eq!(cache.peek(&tokens, false), 0, "failed capture must not be published");
+        if failed_drain {
+            assert_eq!(cache.pool().refs(p.pages[0]), 2, "quarantine keeps shared source references");
+            assert!(cache.release(&fake, &p.pages).is_err());
+            assert_eq!(cache.pool().free(), free - 1, "failed drain cannot return storage");
+        } else {
+            fake.fail_capture_queued.set(false);
+            cache.release(&fake, &p.pages).unwrap();
+            let cold = cache.admit_cold(&fake, tokens.len(), 20,
+                |pages| Placement { pages, ring: 1, len: 0, ring_from: 0 }).unwrap();
+            let mut p = cold.placement;
+            fake.forward(&mut p, &tokens).unwrap();
+            cache.release(&fake, &p.pages).unwrap();
+            assert_eq!(cache.pool().free(), cache.pool().capacity());
+        }
+    }
+}
+
+#[test]
+fn internal_capture_identity_beats_same_end_turn_and_deeper_peer() {
+    let fake = Fake::new(96, 6, 8);
+    let mut cache = cache(&fake, 8, 0);
+    let tokens = seq(100, 26);
+    let boundary = 13;
+    let mut own = None;
+    // The peer Turn is older, but wins the public same-end tie even though
+    // our Prompt is newer. Distinct ring bytes expose selection by end alone.
+    for (ring, end, kind, byte) in [(0, boundary, SnapshotKind::Turn, 0x11),
+        (1, boundary, SnapshotKind::Prompt, 0x22), (2, 21, SnapshotKind::Turn, 0x33)] {
+        let mut p = cache.admit_cold(&fake, end, end,
+            |pages| Placement { pages, ring, len: 0, ring_from: 0 }).unwrap().placement;
+        fake.forward(&mut p, &tokens[..end]).unwrap();
+        for row in end.saturating_sub(WINDOW)..end {
+            fake.mem.borrow_mut().write_device(fake.ring_row(ring, row), &[byte; ROW]);
+        }
+        let id = cache.capture_media_entry(&fake, kind, &tokens[..end], &[], &p,
+            After::from_logits(&[1.0, byte as f32], true)).unwrap().unwrap();
+        if byte == 0x22 { own = Some(id); }
+        cache.release(&fake, &p.pages).unwrap();
+    }
+    let own = own.unwrap();
+    let internal = cache.admit_native_entry(&fake, &tokens, &tokens, &[], 30, true, own,
+        |pages| Placement { pages, ring: 3, len: 0, ring_from: 0 }).unwrap();
+    assert_eq!(internal.resume, boundary);
+    assert_eq!(internal.source.unwrap().kind, SnapshotKind::Prompt);
+    fake.drain().unwrap();
+    assert_eq!(fake.mem.borrow().read_device(fake.ring_row(3, boundary - 1)), vec![0x22; ROW]);
+    cache.release(&fake, &internal.placement.pages).unwrap();
+    for (end, resume, byte) in [(boundary + 1, boundary, 0x11), (26, 21, 0x33)] {
+        let external = cache.admit(&fake, &tokens[..end], 30, true,
+            |pages| Placement { pages, ring: 4, len: 0, ring_from: 0 }).unwrap();
+        assert_eq!(external.resume, resume);
+        assert_eq!(external.source.unwrap().kind, SnapshotKind::Turn);
+        fake.drain().unwrap();
+        assert_eq!(fake.mem.borrow().read_device(fake.ring_row(4, resume - 1)), vec![byte; ROW]);
+        cache.release(&fake, &external.placement.pages).unwrap();
+    }
+    cache.clear(&fake).unwrap();
+    let missing = cache.admit_native_entry(&fake, &tokens, &tokens, &[], 30, true, own,
+        |pages| Placement { pages, ring: 5, len: 0, ring_from: 0 }).unwrap();
+    assert_eq!(missing.resume, 0, "an unavailable identity must fall back cold");
+    cache.release(&fake, &missing.placement.pages).unwrap();
 }

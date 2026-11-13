@@ -1101,7 +1101,7 @@ mod tests {
 
     fn placement(modes: &[LayerMode]) -> Placement {
         use cuteafd_loader::placement::{plan_hops, ExpertHome, HopSpec, LayerAssignment};
-        Placement {
+        Placement { expert_tier: None,
             pool_tokens: 0, pool_limits: cuteafd_loader::placement::PoolLimits(vec![]), attention_placement: cuteafd_loader::placement::AttentionPlacement::Layers,
             attention_by_kind: vec![], peer_row_bytes: 0, onboard_layers: 0, max_pool_tokens_no_onboard: None,
             layers: modes.iter().map(|&mode| LayerAssignment { mode, experts: ExpertHome::Dense }).collect(),
