@@ -117,10 +117,15 @@ mod tests {
     /// A prompt of `tokens`; `closed` once its client left.
     struct Prompt { id: usize, tokens: usize, closed: Rc<RefCell<BTreeSet<usize>>> }
     struct FakeHost { whole: bool, rows: usize, waves: usize, log: Rc<RefCell<Vec<(usize, Range<usize>)>>>,
-        leases: BTreeSet<usize>, admitted: Vec<(usize, usize)>, failed: Vec<usize>, sleep: Duration }
+        leases: BTreeSet<usize>, fatal_on: Option<usize>, admitted: Vec<(usize, usize)>, failed: Vec<usize>, sleep: Duration }
     impl Host<Prompt, Cursor> for FakeHost {
         type Output = usize;
         fn run(&mut self, request: &mut Prompt, cursor: &mut Cursor) -> Result<Option<usize>> {
+            if self.fatal_on == Some(request.id) {
+                return Err(cuteafd_engine::prefix::PrefixError::CaptureUndrained {
+                    capture: "injected capture failure".into(), source: "capture lane pending".into(),
+                }.into());
+            }
             anyhow::ensure!(!request.closed.borrow().contains(&request.id), "client disconnected");
             let mut driver = Driver { tokens: request.tokens, rows: self.rows, waves: self.waves, id: request.id,
                 log: self.log.clone(), sleep: self.sleep };
@@ -131,7 +136,11 @@ mod tests {
             self.admitted.push((slot, request.id));
             Ok(())
         }
-        fn fail(&mut self, request: Prompt, _: anyhow::Error) -> Result<()> {
+        fn fail(&mut self, request: Prompt, error: anyhow::Error) -> Result<()> {
+            if super::super::super::prefix::capture_undrained(&error) {
+                self.failed.push(request.id);
+                return Err(error);
+            }
             assert!(self.leases.remove(&request.id), "released twice");
             self.failed.push(request.id);
             Ok(())
@@ -140,7 +149,7 @@ mod tests {
     }
 
     fn host(share: f64, rows: usize, waves: usize) -> FakeHost {
-        FakeHost { whole: share == 0.0, rows, waves, log: Rc::default(), leases: BTreeSet::new(), admitted: Vec::new(),
+        FakeHost { whole: share == 0.0, rows, waves, log: Rc::default(), leases: BTreeSet::new(), fatal_on: None, admitted: Vec::new(),
             failed: Vec::new(), sleep: Duration::ZERO }
     }
     fn queue(host: &mut FakeHost, share: f64, prompts: &[usize], closed: &Rc<RefCell<BTreeSet<usize>>>)
@@ -358,6 +367,75 @@ mod tests {
             assert!(!host.active && entry.request.is_none());
             assert_eq!(host.log, [("complete_and_drain", 900), ("capture_and_drain", 900)],
                 "no cold admission or further work after either failed drain");
+        }
+    }
+
+    #[test]
+    fn round_with_stops_on_fatal_capture_and_preserves_unprocessed_owners() {
+        for fatal in [false, true] {
+            let (mut host, first) = staged(true, false);
+            host.target_drain_ok = !fatal;
+            let (_, second) = staged(true, true);
+            let mut queue = PrefillQueue::new(0.0);
+            queue.push(first);
+            queue.push(second);
+            let finished = queue.round_with(&mut host, |_, _| Ok(()),
+                |host, entry| chunk(host, entry), |_| true).unwrap();
+            if fatal {
+                assert_eq!(finished.len(), 1);
+                assert!(super::super::super::prefix::capture_undrained(finished[0].1.as_ref().unwrap_err()));
+                assert_eq!((host.failures, host.releases, host.samples), (1, 0, 0));
+                assert_eq!(queue.len(), 1);
+                let unprocessed = queue.iter().next().unwrap().request.as_ref().unwrap();
+                assert!(unprocessed.stages.has_points(), "second prompt was never run or restarted");
+                assert_eq!(host.log.len(), 2, "no device work for second prompt");
+                // Shutdown still owns the unprocessed request exactly once.
+                assert_eq!(queue.drain().filter(|entry| entry.request.is_some()).count(), 1);
+                assert!(queue.is_empty());
+            } else {
+                assert!(finished.iter().all(|(_, result)| result.is_ok()));
+                assert_eq!(finished.len(), 2);
+                assert!(queue.is_empty());
+                assert_eq!(host.samples, 2, "safely cleaned errors retain the continue path");
+            }
+        }
+    }
+
+    #[test]
+    fn fatal_round_keeps_later_cursor_suffix_and_leases_for_shutdown() {
+        for fatal in [false, true] {
+            let mut host = host(0.0, 2752, 3);
+            let closed = Rc::default();
+            let mut queue = queue(&mut host, 0.0, &[900, 900], &closed);
+            let suffix = Rc::new(());
+            queue.iter_mut().nth(1).unwrap().cursor.suffix = Some(suffix.clone());
+            if fatal { host.fatal_on = Some(0); }
+            else { closed.borrow_mut().insert(0); }
+            let finished = queue.round_with(&mut host, |_, _| Ok(()),
+                |host, entry| chunk(host, entry), |_| true).unwrap();
+            if fatal {
+                assert_eq!(finished.len(), 1);
+                assert!(super::super::super::prefix::capture_undrained(finished[0].1.as_ref().unwrap_err()));
+                assert_eq!(host.failed, [0]);
+                assert!(host.admitted.is_empty() && host.log.borrow().is_empty());
+                assert_eq!(host.leases, BTreeSet::from([0, 1]));
+                assert_eq!(Rc::strong_count(&suffix), 2);
+                let later = queue.iter().next().unwrap();
+                assert_eq!(later.slot, 11);
+                assert_eq!(later.request.as_ref().unwrap().id, 1);
+                assert_eq!(later.cursor.next, 0);
+                assert!(Rc::ptr_eq(later.cursor.suffix.as_ref().unwrap(), &suffix));
+                // Shutdown receives the same opaque cursor/lease owner, once.
+                drop(queue.drain().next().unwrap());
+                assert!(queue.is_empty());
+                assert_eq!(Rc::strong_count(&suffix), 1);
+            } else {
+                assert!(finished.iter().all(|(_, result)| result.is_ok()));
+                assert!(queue.is_empty());
+                assert_eq!(host.failed, [0]);
+                assert_eq!(host.admitted, [(11, 1)]);
+                assert_eq!(host.leases, BTreeSet::from([1]));
+            }
         }
     }
 

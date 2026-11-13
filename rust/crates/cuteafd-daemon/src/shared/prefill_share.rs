@@ -171,26 +171,29 @@ impl<P> PrefillQueue<P> {
     /// Returns the prompts that finished (`Ok`) or failed (`Err`); call
     /// [`Self::settle`] once the finished ones joined the running requests.
     pub fn round(&mut self, chunk: impl FnMut(&mut P) -> Result<Chunk>) -> Vec<(P, Result<()>)> {
-        self.round_since(Instant::now(), chunk)
+        self.round_since(Instant::now(), chunk, |_| false)
     }
 
     /// [`Self::round`] after `prepare` (e.g. a family's packed pass over the
     /// waiting prompts) inside the same timed window: its time counts toward
     /// the round, so the running requests are owed their share of it too.
     /// `context` is lent to both steps in turn. A `prepare` error ends the
-    /// round before any chunk runs.
+    /// round before any chunk runs. `stop_on_error` ends a round immediately on
+    /// a fatal chunk; unprocessed prompts and their storage stay in the queue.
     pub fn round_with<C>(&mut self, context: &mut C, prepare: impl FnOnce(&mut C, &mut Self) -> Result<()>,
-        mut chunk: impl FnMut(&mut C, &mut P) -> Result<Chunk>) -> Result<Vec<(P, Result<()>)>> {
+        mut chunk: impl FnMut(&mut C, &mut P) -> Result<Chunk>,
+        stop_on_error: impl Fn(&anyhow::Error) -> bool) -> Result<Vec<(P, Result<()>)>> {
         let started = Instant::now();
         prepare(context, self)?;
-        Ok(self.round_since(started, |prompt| chunk(context, prompt)))
+        Ok(self.round_since(started, |prompt| chunk(context, prompt), stop_on_error))
     }
 
-    fn round_since(&mut self, started: Instant, mut chunk: impl FnMut(&mut P) -> Result<Chunk>) -> Vec<(P, Result<()>)> {
+    fn round_since(&mut self, started: Instant, mut chunk: impl FnMut(&mut P) -> Result<Chunk>,
+        stop_on_error: impl Fn(&anyhow::Error) -> bool) -> Vec<(P, Result<()>)> {
         let whole = self.share == 0.0;
         let mut out = Vec::new();
         let mut ran = VecDeque::new();
-        while let Some(mut prompt) = self.waiting.pop_front() {
+        'prompts: while let Some(mut prompt) = self.waiting.pop_front() {
             if !whole && (!ran.is_empty() || !out.is_empty()) && started.elapsed().as_secs_f64() >= self.round_s {
                 self.waiting.push_front(prompt);
                 break;
@@ -200,7 +203,11 @@ impl<P> PrefillQueue<P> {
                     Ok(Chunk::Done) => out.push((prompt, Ok(()))),
                     Ok(Chunk::More) if whole => continue,
                     Ok(Chunk::More) => ran.push_back(prompt),
-                    Err(error) => out.push((prompt, Err(error))),
+                    Err(error) => {
+                        let stop = stop_on_error(&error);
+                        out.push((prompt, Err(error)));
+                        if stop { break 'prompts; }
+                    }
                 }
                 break;
             }
@@ -491,13 +498,13 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(20));
             log.push(queue.len());
             Ok(())
-        }, |log, p| { log.push(10 + p.id); p.left -= 1; Ok(if p.left == 0 { Chunk::Done } else { Chunk::More }) }).unwrap();
+        }, |log, p| { log.push(10 + p.id); p.left -= 1; Ok(if p.left == 0 { Chunk::Done } else { Chunk::More }) }, |_| false).unwrap();
         assert!(finished.is_empty());
         assert_eq!(log, [1, 10]);
         queue.settle(true);
         // Share 0.5 owes the round's time, preparation included.
         assert!(queue.decode_seconds() >= 0.02, "{}", queue.decode_seconds());
-        let failed = queue.round_with(&mut log, |_, _| anyhow::bail!("prepare failed"), |_, _| panic!("no chunk"));
+        let failed = queue.round_with(&mut log, |_, _| anyhow::bail!("prepare failed"), |_, _| panic!("no chunk"), |_| false);
         assert!(failed.is_err() && queue.len() == 1);
     }
 

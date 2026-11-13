@@ -166,10 +166,10 @@ impl Active<'_> {
     }
 }
 
-fn retire_request<'a, C: DraftChain<'a>>(mut request: Active<'a>, requests: &mut Requests<'a>,
-    prefixes: &mut PrefixCache<'a>, mut draft: Option<&mut DraftRuntime<'_, 'a, C>>) -> Result<()> {
+fn retire_request<'a, C: DraftChain<'a>>(request: &mut Active<'a>, requests: &mut Requests<'a>,
+    prefixes: &mut PrefixCache<'a>, mut draft: Option<&mut DraftRuntime<'_, 'a, C>>, capture: bool) -> Result<()> {
     request.console_retire();
-    let state = if !request.failed && requests.cache().request_id(request.lease).is_ok() {
+    let state = if capture && !request.failed && requests.cache().request_id(request.lease).is_ok() {
         requests.record_state(request.lease, &request.job.probe, "turn")
     } else { Ok(()) };
     // Chunk-4b: retention is consulted **before** the retained frontier is
@@ -177,14 +177,15 @@ fn retire_request<'a, C: DraftChain<'a>>(mut request: Active<'a>, requests: &mut
     // `next_after_commit` first would turn a cache-disabled deployment into a
     // spurious "finished request has no retained logits" warning -- and the
     // scheduler correctly skipped that transfer.
-    if request.cacheable && prefixes.turn_bank_enabled()
+    if capture && request.cacheable && prefixes.turn_bank_enabled()
         && requests.cache().request_id(request.lease).is_ok() {
         prefixes.capture_session(request.job.usage.as_ref().map(|u| u.session_id().to_owned()));
         let id = draft_id(&draft, request.id());
+        request.cacheable = false; // Never retry a failed capture during terminal cleanup.
         let retained = request.next_after_commit.as_ref().context("finished request has no retained logits")
             .and_then(|next| prefixes.retain(requests, draft.as_deref_mut(), SnapshotKind::Turn,
                 &keyed(&request.image_keys, &request.tokens), request.image_keys.spans(), next, request.lease, id));
-        if let Err(error) = retained { tracing::warn!(%error, "completed request prefix was not retained"); }
+        round_failure::retained_turn(retained)?;
     }
     // Release both owners even if one cleanup reports an error.
     let target = requests.release_if_present(request.lease);
@@ -337,16 +338,23 @@ impl<'a, C: DraftChain<'a>> Ledger for V41Ledger<'_, 'a, '_, '_, '_, C> {
         }
     }
     fn end(&mut self, index: usize) {
+        if self.error.is_some() { return; }
         let slot = self.slots()[index];
-        let mut request = self.active[slot].take().unwrap();
+        let request = self.active[slot].as_mut().unwrap();
         request.stalled = false;
         let ended = request.end(InferenceFinishReason::Length)
-            .and_then(|()| retire_request(request, self.requests, self.prefixes, self.draft.as_deref_mut()));
-        if let Err(error) = ended { self.fail(error); }
+            .and_then(|()| retire_request(request, self.requests, self.prefixes, self.draft.as_deref_mut(), true));
+        if let Err(error) = ended {
+            let fatal = super::prefix::capture_undrained(&error);
+            self.fail(error);
+            if fatal { return; }
+        }
+        self.active[slot] = None;
         // Return the units to the pool now (the cache releases a retired request's units).
         if let Err(error) = self.prefixes.tick(self.requests, self.draft.as_deref_mut()) { self.fail(error); }
     }
     fn grow(&mut self, index: usize, pages: usize) -> bool {
+        if self.error.is_some() { return false; }
         let slot = self.slots()[index];
         let lease = self.active[slot].as_ref().unwrap().lease;
         match self.prefixes.extend(self.requests, self.draft.as_deref_mut(), lease, pages * UNIT_TOKENS) {
@@ -355,6 +363,7 @@ impl<'a, C: DraftChain<'a>> Ledger for V41Ledger<'_, 'a, '_, '_, '_, C> {
         }
     }
     fn set_stalled(&mut self, index: usize, stalled: bool) {
+        if self.error.is_some() { return; }
         let slot = self.slots()[index];
         self.active[slot].as_mut().unwrap().stalled = stalled;
     }
@@ -370,9 +379,10 @@ fn reserve_round<'a, C: DraftChain<'a>>(reserve: &mut KvReserve, requests: &mut 
     // A stalled request whose client left retires now (its units and draft slot return).
     for entry in active.iter_mut() {
         if entry.as_ref().is_some_and(|r| r.stalled && r.job.events.is_closed()) {
-            let mut request = entry.take().unwrap();
+            let request = entry.as_mut().unwrap();
             request.stalled = false;
-            retire_request(request, requests, prefixes, draft.as_deref_mut())?;
+            retire_request(request, requests, prefixes, draft.as_deref_mut(), true)?;
+            *entry = None;
         }
     }
     // Every retirement so far (this boundary's and the ones above) is free before planning.
@@ -961,8 +971,8 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
         }
         {
             let mut releaser = round_failure::RetireAdapter { requests: &mut *requests,
-                prefixes: &mut prefixes, draft: draft.as_deref_mut() };
-            let report = round_failure::retire_done(&mut active, &mut releaser);
+                prefixes: &mut prefixes, draft: draft.as_deref_mut(), capture: true };
+            let report = round_failure::retire_done(&mut active, &mut releaser)?;
             // Both retire paths still retire closed requests: the predicate now
             // lives in `round_failure::RoundMember::is_done`, so nothing done may
             // remain after the pass.
@@ -1249,7 +1259,7 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
             let finished = prefills.round_with(&mut round,
                 |round, waiting| pack_waiting::<P>(round.lib, round.runtime, round.requests, round.prefill, waiting,
                     round.args, round.draft.as_deref_mut(), round.prefixes, round.whole),
-                |round, entry| queue::chunk(round, entry))?;
+                |round, entry| queue::chunk(round, entry), |_| true)?;
             for (_, result) in finished { result?; }
             prefills.settle(active.iter().any(Option::is_some));
         }
@@ -1324,6 +1334,7 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
                 host_ns=started.elapsed().as_nanos() as u64, success=result.is_ok(), "graph census decode step end");
         }
         if let Err(error) = result {
+            if super::prefix::capture_undrained(&error) { return Err(error); }
             tracing::error!(error=%format!("{error:#}"), "native decode round failed");
             stall::mark(stall::Phase::Failed, active.iter().flatten().count());
             // RV3-4: answer and mark the members before a reset `?` can leave `serve`.
@@ -1339,7 +1350,8 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
         let message = match &result { Ok(()) => "serve loop stopped".to_owned(),
             Err(error) => format!("serve loop stopped: {error:#}") };
         let mut releaser = round_failure::RetireAdapter { requests: &mut *requests,
-            prefixes: &mut prefixes, draft: draft.as_deref_mut() };
+            prefixes: &mut prefixes, draft: draft.as_deref_mut(),
+            capture: !result.as_ref().err().is_some_and(super::prefix::capture_undrained) };
         let report = round_failure::drain_on_exit(&mut active, &mut releaser, &message);
         if report.retired + report.errors > 0 {
             tracing::warn!(retired = report.retired, errors = report.errors, "serve loop stopped; drained active members");
