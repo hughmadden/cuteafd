@@ -390,9 +390,8 @@ mod tests {
                 }
             }
             let mark_bytes = live.cache.ranks.iter().map(|r| r.bytes).sum::<u64>();
-            let expected_slots = if entries == 0 { 0 } else if host != Some(0) { 2 } else {
-                cuteafd_core::prefix::mark_slots_for(16, entries, mark_bytes, opts.mimo_prefix_mark_bytes) as usize
-            };
+            let expected_slots = cuteafd_core::prefix::mark_slots_for(
+                16, entries, mark_bytes, opts.mimo_prefix_mark_bytes) as usize;
             assert_eq!(live.marks, expected_slots);
             // Offline context/code forecasts remain budget baselines; measured
             // occupancy is instead a named owner in live plans. All other owners

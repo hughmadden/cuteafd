@@ -245,13 +245,12 @@ pub fn mark_slots_for(lanes: u64, entries: u64, slot_bytes: u64, budget_bytes: u
     wanted.max(floor).min(budget_bytes / slot_bytes.max(1))
 }
 
-/// A fixed staging ring: two asynchronous captures, or a capture and a serialized restore.
-/// Full rings wait for the oldest write; host-off retains the legacy lane/retention rule.
+/// Pool-page marks use two staging captures (arena marks include this headroom in
+/// `mark_slots_for`, within the mark budget).
 pub const HOST_MARK_STAGING_SLOTS: u64 = 2;
 
-pub fn mark_slots_with_host(lanes: u64, entries: u64, slot_bytes: u64, budget_bytes: u64, host: bool) -> u64 {
-    if entries == 0 { 0 } else if host { HOST_MARK_STAGING_SLOTS }
-    else { mark_slots_for(lanes, entries, slot_bytes, budget_bytes) }
+pub fn mark_slots_with_host(lanes: u64, entries: u64, slot_bytes: u64, budget_bytes: u64, _host: bool) -> u64 {
+    mark_slots_for(lanes, entries, slot_bytes, budget_bytes)
 }
 
 /// How much computation a retained frontier saves for a query that shares `common` tokens with
@@ -925,13 +924,16 @@ mod staging_tests {
         }
     }
     #[test]
-    fn host_working_set_is_constant_and_host_off_is_legacy() {
+    fn host_and_device_retention_share_the_mark_budget() {
         for lanes in [1, 2, 8, 16, 128] {
             for entries in [0, 1, 20, 128] {
-                assert_eq!(mark_slots_with_host(lanes, entries, 428 << 20, 2 << 30, true),
-                    if entries == 0 { 0 } else { 2 });
-                assert_eq!(mark_slots_with_host(lanes, entries, 428 << 20, 2 << 30, false),
-                    mark_slots_for(lanes, entries, 428 << 20, 2 << 30));
+                for budget in [0, 1, 428 << 20, 2 << 30, u64::MAX] {
+                    for host in [false, true] {
+                        let slots = mark_slots_with_host(lanes, entries, 428 << 20, budget, host);
+                        assert_eq!(slots, mark_slots_for(lanes, entries, 428 << 20, budget));
+                        assert!(slots * (428 << 20) <= budget);
+                    }
+                }
             }
         }
     }

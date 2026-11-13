@@ -16,8 +16,8 @@
 //! state, 72.8 MiB with a BF16 one. A restore copies the mark back into the new
 //! sequence's own KDA slot and maps its pool pages; nothing else of the state is positional.
 //! `--prefix-marks` picks where marks live:
-//! - `arena` (default): two in-flight staging marks with the host tier enabled; without it,
-//!   the legacy lane/entry/budget rule retains positional marks on device;
+//! - `arena` (default): the lane/entry/budget rule retains positional marks on device,
+//!   with two capture/restore slots included whether or not the host tier is enabled;
 //! - `pool`: whole units of the KV pool (49 per mark at FP32 state and token keys), taken at
 //!   capture and evicted like any snapshot's rows. Each rank keeps its part of a mark in its own
 //!   copy of the mark's units, laid out buffer by buffer over the units ([`mark_runs`]), and a
@@ -1084,7 +1084,8 @@ mod tests {
                     .slots_on(&cfg, cfg.layers, index, state).unwrap();
                 assert_eq!(planned as u64, cuteafd_core::prefix::mark_slots_with_host(lanes as u64,
                     hosted.prefix_cache_entries as u64, bytes, (hosted.prefix_cache_mark_mib as u64) << 20, true));
-                assert_eq!(planned, 2);
+                assert_eq!(planned as u64, cuteafd_core::prefix::mark_slots_for(lanes as u64,
+                    hosted.mark_rule(lanes).entries as u64, bytes, (hosted.prefix_cache_mark_mib as u64) << 20));
             }
         }
         // Device-only arenas stay within the byte budget at every concurrency.
@@ -1228,7 +1229,8 @@ mod tests {
                                     for (rank, part) in geometry.ranks.iter().zip(&parts) {
                                         assert_eq!(planned as u64 * rank.retained_mark_bytes, (allocated * part) as u64);
                                     }
-                                    if host { assert_eq!(planned, if entries == 0 { 0 } else { 2 }); }
+                                    assert_eq!(planned as u64, cuteafd_core::prefix::mark_slots_for(
+                                        lanes as u64, entries as u64, mark as u64, mib << 20));
                                     binding += usize::from(!host && entries > 0 && planned < 2 * entries + 2
                                         && planned > 2 * lanes + 2);
                                 }

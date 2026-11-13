@@ -986,7 +986,7 @@ mod tests {
         let slots = cuteafd_core::prefix::mark_slots_with_host(on.resolved_concurrency("mistral_large4"),
             on.mimo_prefix_entries, mark, on.mimo_prefix_mark_bytes, false);
         assert_eq!(device, slots * mark);
-        assert!(device > host);
+        assert_eq!(device, host, "both tiers reserve the same budgeted draft mark arena");
 
     }
 

@@ -76,7 +76,7 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
             return memory;
         }
     };
-    // GPU marks follow the shared prefix rule: host-tier retention keeps only staging slots.
+    // GPU marks follow the same budgeted device rule with or without host retention.
     let mark_slots = opts.prefix_slots.unwrap_or_else(|| cuteafd_core::prefix::mark_slots_with_host(slots,
         opts.mimo_prefix_entries, crate::placement::families::muse_spark::mark_bytes(cfg, 1),
         opts.mimo_prefix_mark_bytes, opts.host_cache_bytes != Some(0)));

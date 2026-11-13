@@ -6178,13 +6178,13 @@ fn glm5_flash_layout_reserves_the_mark_arena_its_server_allocates() {
         assert_eq!(state, rank.fixed_state_bytes + rank.active_state_per_sequence_bytes * concurrency
             + rank.speculative_replay_bytes);
     }
-    // At the default 2M pool cap the released arena becomes reported free headroom.
+    // Host enablement keeps the arena and charges the pinned mapping separately.
     let mut capped = layout(96 << 30, 16);
     capped.layout.as_mut().unwrap().pool_tokens = Some(2_097_152);
     let legacy = plan(dir.path(), &capped).unwrap().memory_layout.unwrap();
     capped.layout.as_mut().unwrap().host_cache_bytes = None;
     let staged = plan(dir.path(), &capped).unwrap().memory_layout.unwrap();
-    let released = (14 - cuteafd_core::prefix::HOST_MARK_STAGING_SLOTS) * rank.retained_mark_bytes;
+    let released = 0;
     assert_eq!((legacy.pool_tokens, staged.pool_tokens), (2_097_152, 2_097_152));
     assert_eq!(marks(&legacy) - marks(&staged), released);
     let prefix_driver = |memory: &cuteafd_core::memory_layout::MemoryLayout| memory.devices[0].items.iter()
@@ -6195,7 +6195,7 @@ fn glm5_flash_layout_reserves_the_mark_arena_its_server_allocates() {
     assert_eq!(mapped_prefix, (32u64 << 30) / 512);
     assert_eq!(staged.devices[0].free_bytes() - legacy.devices[0].free_bytes(),
         released as i64 - mapped_prefix as i64);
-    assert_eq!(released, 1_771_438_080);
+    assert_eq!(marks(&staged), 14 * rank.retained_mark_bytes);
     // An explicit arena (0: none) is taken as given.
     let mut none = layout(96 << 30, 16);
     none.layout.as_mut().unwrap().prefix_slots = Some(0);
