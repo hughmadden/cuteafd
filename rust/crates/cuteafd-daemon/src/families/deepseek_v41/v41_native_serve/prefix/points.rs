@@ -1,5 +1,5 @@
 //! Complete-frontier stages; each end is an ordinary whole-prompt prefill.
-use cuteafd_engine::prefix::{plan_media_points, PointPolicy};
+use cuteafd_engine::prefix::{plan_media_diagnostics, PointPolicy};
 use cuteafd_core::MediaSpan;
 use std::collections::VecDeque;
 use serde::Serialize;
@@ -57,24 +57,15 @@ impl Stages {
         if policy.per_request == 0 || (policy.boundaries == 0 && policy.gap == 0) { return Self::default(); }
         let boundaries = crate::shared::prefix::boundaries(tokens, markers);
         // Reach zero: a complete mark cannot capture behind the committed frontier.
-        let plan = plan_media_points(resume, tokens.len(), chunk, &boundaries, 0, minimum, policy, media);
+        let (plan, diagnostics) = plan_media_diagnostics(resume, tokens.len(), chunk, &boundaries, 0, minimum, policy, media);
         let points: VecDeque<_> = plan.points.into_iter().map(|(_, p)| p).collect();
-        let mut planning = Stats::default();
-        // Diagnose candidates the shared planner filtered. The actual cuts above
-        // still come solely from its media-aware schedule, including gap/cap.
-        let candidates = cuteafd_engine::prefix::plan_points(0, tokens.len(), chunk, &boundaries, 0, 1, policy);
-        for (_, p) in candidates.points {
-            let rounded = cuteafd_engine::media::round_frontier(p, media);
-            if rounded != p {
-                planning.media_rounded += 1;
-                if rounded <= resume || rounded < minimum.max(1) {
-                    planning.skipped_inside_media_span += 1;
-                    continue;
-                }
-            }
-            if p <= resume { planning.skipped_at_or_before_resume += 1; }
-            else if p < minimum.max(1) { planning.skipped_below_minimum += 1; }
-        }
+        let planning = Stats {
+            skipped_below_minimum: diagnostics.skipped_below_minimum,
+            skipped_inside_media_span: diagnostics.skipped_inside_media_span,
+            skipped_at_or_before_resume: diagnostics.skipped_at_or_before_resume,
+            media_rounded: diagnostics.media_rounded,
+            ..Stats::default()
+        };
         Self { points, planning }
     }
     /// A failed mark or restore may need a cold restart. Materialize every
@@ -129,6 +120,28 @@ mod tests {
             PointPolicy { gap: 512, boundaries: 0, per_request: 2 });
         assert_eq!(stages.points.iter().copied().collect::<Vec<_>>(), [1536, 2048]);
     }
+    #[test]
+    fn resumed_periodic_media_and_cap_share_executable_diagnostics() {
+        let media = [MediaSpan { start: 1800, len: 100, key: cuteafd_core::ImageKey([1; 32]).into() }];
+        let stages = Stages::plan(&vec![1; 2049], &[], &media, 300, 256, 64,
+            PointPolicy { gap: 512, boundaries: 0, per_request: 2 });
+        assert_eq!(stages.points.iter().copied().collect::<Vec<_>>(), [1324, 1800]);
+        let mut stats = Stats::default();
+        assert!(stats.plan(&stages, true, true));
+        assert_eq!((stats.planned, stats.media_rounded, stats.skipped_below_minimum,
+            stats.skipped_inside_media_span, stats.skipped_at_or_before_resume), (2, 1, 0, 0, 0));
+        // The media candidate at 812 is capped before media rounding. It must
+        // contribute neither a rounded point nor a media skip.
+        let media = [MediaSpan { start: 800, len: 100, key: cuteafd_core::ImageKey([2; 32]).into() }];
+        let stages = Stages::plan(&vec![1; 2049], &[], &media, 300, 256, 64,
+            PointPolicy { gap: 512, boundaries: 0, per_request: 2 });
+        let mut stats = Stats::default();
+        stats.plan(&stages, true, true);
+        assert_eq!(stages.points.iter().copied().collect::<Vec<_>>(), [1324, 1836]);
+        assert_eq!((stats.planned, stats.media_rounded, stats.skipped_below_minimum,
+            stats.skipped_inside_media_span, stats.skipped_at_or_before_resume), (2, 0, 0, 0, 0));
+    }
+
     #[test]
     fn staged_images_prepare_cold_fallback_even_after_a_prefix_hit() {
         let mut tokens = vec![1; 1024]; tokens[900] = 7;
