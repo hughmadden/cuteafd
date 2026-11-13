@@ -28,6 +28,8 @@
 //! until the restore drains, and the engine drains before it releases or stores anything
 //! (`tests::prefix_stream_reads_only_committed_private_state` checks the argument's source;
 //! moving onto the shared copy stream is #1882).
+pub(crate) mod points;
+
 use super::*;
 use super::scores::RetainedScores;
 use crate::families::deepseek_v41::v41_backbone_cache::{BackboneMark, CacheLease, UNIT_BYTES, UNIT_TOKENS};
