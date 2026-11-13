@@ -5442,8 +5442,31 @@ fn v41_tp2_dspark_experts_move_half_the_draft_experts_to_gpu0() {
     // GPU0's lanes gain the TP2 fork/join owners of every stage (exact, from
     // the dSpark TP2 role's own workspace manifest).
     assert!(bytes(&split, 0, "dSpark request lanes") > bytes(&whole, 0, "dSpark request lanes"));
-    let tier = |report: &PlanReport| report.solver_placement.as_ref().unwrap().expert_tier.as_ref().unwrap().experts;
-    assert!(tier(&split) >= tier(&whole) + 200, "tier {} -> {}", tier(&whole), tier(&split));
+    let whole_tier = whole.solver_placement.as_ref().unwrap().expert_tier.as_ref().unwrap();
+    let split_tier = split.solver_placement.as_ref().unwrap().expert_tier.as_ref().unwrap();
+    let bytes_per_expert = whole_tier.resident_bytes[0] / whole_tier.experts as u64;
+    for tier in [whole_tier, split_tier] {
+        assert_eq!(tier.resident_bytes, vec![bytes_per_expert * tier.experts as u64; 2]);
+    }
+    // Recover the tier's physical budget from every solved phase, keeping
+    // marks, lanes and all other owners charged. The limiting GPU changes
+    // when the draft half moves; GPU1's freed weights alone overstate the gain.
+    let tier_budgets = |report: &PlanReport| {
+        let tier = report.solver_placement.as_ref().unwrap().expert_tier.as_ref().unwrap();
+        std::array::from_fn::<_, 2, _>(|gpu| {
+            let backing = crate::placement::planner::sm120_request_backing(tier.resident_bytes[gpu]).unwrap();
+            report.phase_ledger.as_ref().unwrap().phases.iter()
+                .filter(|phase| phase.budget == format!("rtx{gpu}"))
+                .map(|phase| phase.available - phase.owned - phase.opaque + backing)
+                .min().unwrap()
+        })
+    };
+    let before = tier_budgets(&whole);
+    let after = tier_budgets(&split);
+    assert!(before[1] < before[0] && after[0] < after[1]);
+    let freed_bytes = after[0] - before[1];
+    assert!(freed_bytes >= bytes_per_expert);
+    assert_eq!(split_tier.experts, whole_tier.experts + (freed_bytes / bytes_per_expert) as usize);
     let notes = &split.memory_layout.as_ref().unwrap().notes;
     assert!(notes.iter().any(|n| n.starts_with("dSpark routed experts: TP2 halves")), "{notes:?}");
     // One RTX has no peer for the other half.
