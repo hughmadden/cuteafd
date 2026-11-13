@@ -1035,12 +1035,34 @@ mod tests {
             assert!(refusal.contains(message), "{refusal}");
         }
         inputs.marks.host = true;
-        // Host retention moves the marks off the device, but the full 1M
-        // context still does not fit in 50 GiB: the old planner silently
-        // clamped the pool below the request; the contract refuses instead.
+        // Host retention keeps the same budgeted device marks. The full
+        // context must refuse rather than silently clamp its pool.
         assert!(run(&inputs).is_err());
         inputs.inventory.gpus[0].baseline = Baseline::Measured { free_bytes: 96 << 30 };
-        run(&inputs)?;
+        assert!(run(&inputs).is_err());
+
+        // Price the pinned full-context pool with enough discovery capacity,
+        // then exercise its exact free-memory boundary with either tier.
+        let mut boundary = inputs.clone();
+        boundary.requested_pool = Some(EXTENT);
+        boundary.inventory.gpus[0].capacity_bytes += boundary.marks.budget_bytes;
+        boundary.inventory.gpus[0].baseline = Baseline::Measured {
+            free_bytes: boundary.inventory.gpus[0].capacity_bytes,
+        };
+        let admitted = run(&boundary)?;
+        let needed = admitted.solved.phases.iter().filter(|phase| phase.budget == "rtx0")
+            .map(|phase| phase.owned + phase.opaque).max().unwrap()
+            + boundary.inventory.gpus[0].reserve_bytes;
+        for host in [false, true] {
+            boundary.marks.host = host;
+            boundary.inventory.gpus[0].baseline = Baseline::Measured { free_bytes: needed };
+            let exact = run(&boundary)?;
+            assert_eq!(exact.placement.pool_tokens, EXTENT);
+            assert_eq!(exact.reservations, admitted.reservations);
+            assert_eq!(exact.host_cache_bytes, 0);
+            boundary.inventory.gpus[0].baseline = Baseline::Measured { free_bytes: needed - 1 };
+            assert!(run(&boundary).is_err());
+        }
         inputs.marks.host = false;
         inputs.context = FLOOR;
         inputs.serving_context = crate::placement::planner::Context::pinned(FLOOR);
