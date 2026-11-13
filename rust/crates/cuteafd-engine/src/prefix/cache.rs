@@ -23,7 +23,7 @@ use super::chain::{content_id, page_chain_media};
 use crate::media::{round_frontier, snapshot_media, verify_media, MediaError, MediaSpan};
 use super::entry::{victim, After, Entry, EntryId, Mark};
 use super::family::{BoxError, CaptureTicket, Eviction, FamilyLayout, MarkStore, PageOwners, PrefixFamily, RestoreCandidate,
-    RestoreContext, RestorePlan};
+    RestoreContext, RestoreFidelity, RestorePlan};
 use super::marks::MarkArena;
 use super::pages::{Need, PoolExhausted, RefPagePool};
 use cuteafd_core::prefix::{Retention, SnapshotKind};
@@ -138,6 +138,16 @@ pub struct PrefixStats {
     pub exact_hits: u64,
     /// Hits on a partial match (replay window, approximate positional state).
     pub partial_hits: u64,
+    /// Successful restores of a complete snapshot's positional state (including ancestors).
+    pub exact_snapshot_restores: u64,
+    /// Successful exact encoder restores whose suffix rebuilds the decoder window.
+    pub exact_encoder_continuation_restores: u64,
+    /// Successful restores that reconstruct positional state from an empty replay window.
+    pub approximate_replay_restores: u64,
+    /// Common-prefix tokens prefilled again after approximate restores, including alignment.
+    pub replayed_tokens: u64,
+    /// Cold admissions with useful partial matches but no usable exact candidate in either tier.
+    pub exact_only_partial_misses: u64,
     pub hit_tokens: u64,
     pub promotions: u64,
     pub device_hits: u64,
@@ -379,6 +389,7 @@ impl<E: CopyEngine, M: Clone + Default> PrefixCache<E, M> {
         self.tick();
         self.reconcile_draft(family)?;
         let total = self.pool.pages_for(capacity.max(tokens.len()));
+        let mut refused_partial = false;
         if self.enabled() && !tokens.is_empty() {
             self.stats.lookups += 1;
             let mut promoted = false;
@@ -411,9 +422,28 @@ impl<E: CopyEngine, M: Clone + Default> PrefixCache<E, M> {
                     }
                     Err(error) => return Err(error),
                 }
+            } else if let Some(rule) = family.refused_partial_rule().filter(|_| !self.layout.rule.partial()) {
+                if self.peek_media(tokens, media, sampled) == 0 {
+                    refused_partial = self.has_partial_match(tokens, media, sampled, rule);
+                }
             }
         }
-        self.admit_cold(family, tokens.len(), capacity, build)
+        let admitted = self.admit_cold(family, tokens.len(), capacity, build)?;
+        self.stats.exact_only_partial_misses += u64::from(refused_partial);
+        Ok(admitted)
+    }
+
+    /// Only the miss path scans retained metadata; peeks and successful exact hits stay free
+    /// of diagnostic work. Media identity and boundaries obey the normal lookup rules.
+    fn has_partial_match(&self, tokens: &[u32], media: &[MediaSpan], sampled: bool,
+        rule: cuteafd_core::prefix::ReuseRule) -> bool {
+        let useful = |saved: &[u32], saved_media: &[MediaSpan], after: &After| {
+            let (resume, common, _) = media_resume(rule, tokens, media, saved, saved_media, after, sampled);
+            common < saved.len() && resume > 0
+        };
+        self.entries.values().any(|entry| useful(&entry.tokens, &entry.media, &entry.after))
+            || self.host.as_ref().is_some_and(|host| host.resident_payloads()
+                .any(|(meta, _, payload)| useful(&meta.tokens, &payload.media, &payload.after)))
     }
 
     /// Bypass prefix reuse after repeated peek/admission races. The caller has materialized
@@ -680,6 +710,14 @@ impl<E: CopyEngine, M: Clone + Default> PrefixCache<E, M> {
         self.stats.hit_tokens += resume as u64;
         self.stats.exact_hits += u64::from(after.is_some());
         self.stats.partial_hits += u64::from(!exact);
+        match plan.fidelity {
+            RestoreFidelity::Exact => self.stats.exact_snapshot_restores += 1,
+            RestoreFidelity::ExactEncoderContinuation => self.stats.exact_encoder_continuation_restores += 1,
+            RestoreFidelity::ApproximateReplay => {
+                self.stats.approximate_replay_restores += 1;
+                self.stats.replayed_tokens += (hit.common - resume) as u64;
+            }
+        }
         self.restored_session = session.clone();
         Ok(Some(Admitted {
             placement,

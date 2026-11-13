@@ -147,6 +147,8 @@ fn a_lagged_partial_restore_shares_pages_through_source_end_and_replays_from_rep
     assert!(source.partial);
     assert_eq!(source.plan.lag, LaggedState { source_end: 32, replay_start: 24 });
     assert_eq!(source.plan.fidelity, RestoreFidelity::ApproximateReplay);
+    assert_eq!((cache.stats().approximate_replay_restores, cache.stats().replayed_tokens), (1, WINDOW as u64 + 1));
+    assert_eq!(cache.stats().exact_snapshot_restores, 0);
     assert_eq!(admitted.resume, 24);
     // Pages through source_end are the snapshot's own (shared, not recomputed).
     assert_eq!(&admitted.placement.pages[..32 / ROWS], &a.pages[..32 / ROWS]);
@@ -157,6 +159,8 @@ fn a_lagged_partial_restore_shares_pages_through_source_end_and_replays_from_rep
     let (exact, _) = lag_serve(&mut cache, &family, 2, &prompt, 48);
     assert_eq!(exact.resume, prompt.len());
     assert_eq!(exact.source.unwrap().plan.fidelity, RestoreFidelity::Exact);
+    assert_eq!(cache.stats().exact_snapshot_restores, 1);
+    assert_eq!(cache.stats().approximate_replay_restores, 1);
     assert_eq!(family.restored.borrow().last().cloned().flatten(), Some(LagMeta { frontier: 41, tag: 41 }));
     for p in [a, b, exact.placement] { cache.release(&family, &p.pages).unwrap(); }
     cache.clear(&family).unwrap();
@@ -165,13 +169,13 @@ fn a_lagged_partial_restore_shares_pages_through_source_end_and_replays_from_rep
 
 #[test]
 fn a_plan_that_claims_exactness_for_a_partial_match_is_refused() {
-    struct Liar(Lagged);
+    struct Liar(Lagged, RestoreFidelity);
     impl PrefixFamily<LagMeta> for Liar {
         type Placement = Placement;
         fn layout(&self) -> FamilyLayout { self.0.layout() }
         fn plan_restore(&self, hit: RestoreCandidate<'_>) -> RestorePlan {
             RestorePlan { snapshot_end: hit.snapshot_end, target_end: hit.target_end,
-                lag: LaggedState { source_end: hit.common, replay_start: hit.common }, fidelity: RestoreFidelity::Exact }
+                lag: LaggedState { source_end: hit.common, replay_start: hit.common }, fidelity: self.1 }
         }
         fn pages<'p>(&self, p: &'p Placement) -> &'p [u32] { &p.pages }
         fn commit_point(&self, p: &Placement) -> usize { p.len }
@@ -184,23 +188,25 @@ fn a_plan_that_claims_exactness_for_a_partial_match_is_refused() {
         fn page_segments(&self, p: u32) -> Vec<DeviceRange> { self.0.page_segments(p) }
         fn mark_segments(&self, s: MarkSlot) -> Vec<DeviceRange> { self.0.mark_segments(s) }
     }
-    let family = Liar(Lagged::new(64, 4, 8));
-    let mut cache = PrefixCache::<Shared, LagMeta>::new(family.layout(), config(4, 8), None).unwrap();
-    let prompt = seq(100, 41);
-    let mut a = cache.admit(&family, &prompt, 48, false, |pages| Placement { pages, ring: 0, len: 0, ring_from: 0 })
-        .unwrap().placement;
-    let logits = family.0.fake.forward(&mut a, &prompt).unwrap();
-    cache.capture(&family, SnapshotKind::Prompt, &prompt, &a, After::from_logits(&logits, true)).unwrap();
-    let mut other = prompt[..33].to_vec();
-    other.extend(seq(900, 6));
-    let free = cache.pool().free();
-    let admitted = cache.admit(&family, &other, 48, false, |pages| Placement { pages, ring: 1, len: 0, ring_from: 0 })
-        .unwrap();
-    assert_eq!((admitted.resume, admitted.source.is_none()), (0, true), "refused plan falls back to cold");
-    assert_eq!(cache.stats().restore_failures, 1);
-    cache.release(&family, &admitted.placement.pages).unwrap();
-    assert_eq!(cache.pool().free(), free);
-    cache.release(&family, &a.pages).unwrap();
+    for fidelity in [RestoreFidelity::Exact, RestoreFidelity::ExactEncoderContinuation] {
+        let family = Liar(Lagged::new(64, 4, 8), fidelity);
+        let mut cache = PrefixCache::<Shared, LagMeta>::new(family.layout(), config(4, 8), None).unwrap();
+        let prompt = seq(100, 41);
+        let mut a = cache.admit(&family, &prompt, 48, false, |pages| Placement { pages, ring: 0, len: 0, ring_from: 0 })
+            .unwrap().placement;
+        let logits = family.0.fake.forward(&mut a, &prompt).unwrap();
+        cache.capture(&family, SnapshotKind::Prompt, &prompt, &a, After::from_logits(&logits, true)).unwrap();
+        let mut other = prompt[..33].to_vec();
+        other.extend(seq(900, 6));
+        let free = cache.pool().free();
+        let admitted = cache.admit(&family, &other, 48, false, |pages| Placement { pages, ring: 1, len: 0, ring_from: 0 })
+            .unwrap();
+        assert_eq!((admitted.resume, admitted.source.is_none()), (0, true), "refused plan falls back to cold");
+        assert_eq!(cache.stats().restore_failures, 1);
+        cache.release(&family, &admitted.placement.pages).unwrap();
+        assert_eq!(cache.pool().free(), free);
+        cache.release(&family, &a.pages).unwrap();
+    }
 }
 
 #[test]

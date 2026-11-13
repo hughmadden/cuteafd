@@ -47,6 +47,17 @@ There is no separate scale-only preload. `ENGRAM_WARM` warms the whole mapped ta
   FP4 source pages, a mark holding the window rings, odd compressor carry,
   Engram lookback and dSpark rings, snapshots at prompt end and turn end,
   shared `--prefix-cache-*`/`--host-cache-*` flags and pinned-host tier.
+  `PREFIX_PARTIAL=off` (CLI `--prefix-partial off`, environment
+  `CUTEAFD_PREFIX_PARTIAL=off`) preserves exact-only reuse; `on` is refused.
+  Exact ancestors with at least 128 new tokens use encoder continuation;
+  shorter suffixes restore the complete mark. Prefix stats distinguish
+  `exact_snapshot_restores`, `exact_encoder_continuation_restores`,
+  `approximate_replay_restores`, `replayed_tokens` and
+  `exact_only_partial_misses`. The last counter counts cold admissions with
+  useful rejected partial matches in either tier, excluding failed restores
+  and resource failures. Approximate replay and its replayed-token count stay
+  zero for V4.1. Existing `exact_hits` still means a whole-prompt hit with
+  retained logits, rather than all exact restores.
 - RTX/Spark layouts: the v2 native MXFP4 minimum is 1 RTX + 3 Sparks;
   the v2 NVFP4 cards use 4 Sparks. Current MXFP4 and NVFP4 support TP3 as a
   fit-minimum option (see the TP3 decision in `PLAN.md`). The current MXFP4
@@ -75,6 +86,62 @@ There is no separate scale-only preload. `ENGRAM_WARM` warms the whole mapped ta
 | Setting | Default | Scope |
 | --- | --- | --- |
 | `TP2_DSPARK_EXPERTS` | `on` with two RTX GPUs and dSpark; otherwise `off` | Splits dSpark routed experts across the RTX pair. `off` keeps them on the draft GPU. Explicit `on` requires V4.1, two RTX GPUs and dSpark. |
+
+### Exact message-boundary checkpoints: design, not enabled
+
+V4.1 currently retains complete prompt-end and turn-end marks. Its shared
+intermediate-point arguments are not wired into prefill. Keep boundary points
+off until the following implementation and native-state checks are complete;
+the intended qualified default is one boundary, with explicit zero disabling it.
+The partial-reuse default stays exact-only.
+
+Resolve the checkpoint's `<｜System｜>`, `<｜User｜>` and `<｜Assistant｜>` added tokens
+with the shared marker helpers. The [encoding fixtures](../../rust/crates/cuteafd-api/tests/fixtures/v41-encoding/)
+show these markers in rendered prompts;
+the last assistant marker starts the generation prompt. Use the shared
+media-aware point planner with reach zero, the requested last N boundaries and
+`prefix_points_per_request`. Points inside media round to its start or are
+skipped by the planner. A point must be an actual prefill call end.
+
+Split both `V41PrefillTimes::encoder_unit` and the `prompt_units` Engram lookahead
+plan at the same points, including under whole-prompt budgets. No unit may cross
+a point. Drain every slot's device chain and check transport health there before
+capturing. `encoder_units::commit_unit` advances host bookkeeping without a host
+drain; later units can already overwrite window rings, so inserting a capture
+in that hook does not establish an exact checkpoint. Preserve the existing
+complete-mark guard in `BackboneCache::copy_mark`.
+
+Add a separate encoder-only mark capability and serialized kind: 20 encoder
+window rings, all four source carries/frontiers (including the source at layer
+20), and the Engram lookback. Share source pages using the existing prefix
+engine. Require the encoder phase, empty publication, matching source/window
+frontiers and no pending request history. Finish or safely abort the mark's
+copies before resuming writers or releasing storage. An encoder-only mark must
+never be accepted by the full-mark restore entry point or supply prompt logits.
+
+Admit encoder-only marks solely through encoder continuation with at least 128
+new tokens. Use the shared compatible-metadata lookup for both tiers and peeks;
+shorter suffixes and exact-end matches fall back to an older complete mark or
+cold prefill. Rank valid candidates by tokens saved, preserving existing bank
+tie rules; a deeper valid exact candidate wins. Approximate replay is absent in
+the current V4.1 implementation.
+
+The encoder payload is `20 * 67,592 + 4 * 4,096 = 1,368,224` bytes, before host
+metadata. Initially reuse full mark slots: 2,720,064 target bytes, plus 202,752
+drafter bytes when configured (2,922,816 total). Arena reservation is unchanged;
+a separate smaller class would require per-entry mark geometry.
+Source units remain shared, with at most the existing 455,680-byte private tail
+unit per capture. Bound points with the existing per-request cap.
+
+Qualification is blocked in a CPU-only run: the existing `committed_bytes` and
+`qualify_encoder_continuation` helpers use real CUDA. The cache/request integration
+tests return early without their native-library environment variables; they do
+not provide a CPU fake of V4.1 production or publication ordering. Before enabling
+this path, reuse those helpers on native hardware to compare initialized encoder,
+source and Engram bytes with cold prefill at the same point, then continued final
+state. Cover even/odd carry, 127/128/129 suffixes, older-full-mark fallback in both
+tiers, media rounding, multiple waves, two devices and cancellation/copy failures
+with no queued work surviving publication or storage release.
 
 ## Known limits
 
