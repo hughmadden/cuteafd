@@ -120,9 +120,11 @@ impl<'a, P: VerificationTarget<'a>, C: DraftChain<'a>> LaneCommit for Commit<'_,
 
 async fn retire_completed<M: round_failure::RoundMember, F: std::future::Future<Output = (M, Result<()>)>>(
     active: &RefCell<&mut [Option<M>]>, slots: impl IntoIterator<Item = usize>, lane: usize, round_id: u64,
+    lease: LaneLease<'_>,
     mut release: impl FnMut(M) -> F,
-) -> Result<()> {
+) -> Result<bool> {
     for slot in slots {
+        if lease.stopping() { return Ok(false); }
         let request = active.borrow_mut()[slot].take().unwrap();
         let request_id = request.id();
         let (request, result) = release(request).await;
@@ -138,7 +140,9 @@ async fn retire_completed<M: round_failure::RoundMember, F: std::future::Future<
                 "independent lane request retired");
         }
     }
-    Ok(())
+    // Retirement may have yielded while the peer stopped the lane set. The
+    // caller must not select or issue a decode round after that suspension.
+    Ok(!lease.stopping())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -158,8 +162,8 @@ async fn lane<'a, P: VerificationTarget<'a>, C: DraftChain<'a>>(lease: LaneLease
                 entry.as_ref().filter(|r| retire_due(lane, r.lane(), r.finished, r.job.events.is_closed()))
                     .map(|_| slot)).collect();
             if !retired.is_empty() { control.retired(); }
-            retire_completed(active, retired, lane, round_id,
-                |request| retire(lane, request, requests, prefixes, draft)).await?;
+            if !retire_completed(active, retired, lane, round_id, lease,
+                |request| retire(lane, request, requests, prefixes, draft)).await? { return Ok(()); }
             // Admission and prefill rounds run between lane sets: both lanes stop.
             let members: Vec<_> = {
                 let active = active.borrow();
@@ -717,7 +721,8 @@ mod tests {
         let mut active = [Some(first), Some(second), Some(peer)];
         let mut released = Vec::new();
         let runtime = tokio::runtime::Builder::new_current_thread().build().unwrap();
-        runtime.block_on(retire_completed(&RefCell::new(active.as_mut_slice()), [0, 1], 0, 1, |request| {
+        let set = LaneSet::default();
+        runtime.block_on(retire_completed(&RefCell::new(active.as_mut_slice()), [0, 1], 0, 1, set.lease(0), |request| {
             let id = request.id();
             released.push(id);
             std::future::ready((request, if id == 1 { Err(anyhow::anyhow!("injected release failure")) } else { Ok(()) }))
@@ -736,7 +741,9 @@ mod tests {
         let mut active = [Some(first), Some(second)];
         let mut calls = 0;
         let runtime = tokio::runtime::Builder::new_current_thread().build().unwrap();
-        let result = runtime.block_on(retire_completed(&RefCell::new(active.as_mut_slice()), [0, 1], 0, 1, |request| {
+        let set = LaneSet::default();
+        let active = RefCell::new(active.as_mut_slice());
+        let result = runtime.block_on(retire_completed(&active, [0, 1], 0, 1, set.lease(0), |request| {
             calls += 1;
             let error = cuteafd_engine::prefix::PrefixError::CaptureUndrained {
                 ticket: None,
@@ -746,7 +753,68 @@ mod tests {
         }));
         assert!(super::super::super::prefix::capture_undrained(&result.unwrap_err()));
         assert_eq!(calls, 1);
-        assert!(active.iter().all(Option::is_some), "both owners held for shutdown");
+        assert!(active.borrow().iter().all(Option::is_some), "both owners held for shutdown");
+    }
+
+    #[test]
+    fn suspended_peer_finishes_retirement_without_starting_another_capture_or_decode() {
+        use std::rc::Rc;
+        struct Owner { id: u64, drops: Rc<Cell<usize>> }
+        impl Drop for Owner { fn drop(&mut self) { self.drops.set(self.drops.get() + 1); } }
+        impl round_failure::RoundMember for Owner {
+            fn id(&self) -> u64 { self.id }
+            fn fail(&mut self, _: &str) { panic!("no round failure on completed peer"); }
+            fn is_done(&self) -> bool { true }
+        }
+        let runtime = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        // One case stops between retirements; the singleton case stops after
+        // the final awaited retirement, immediately before decode selection.
+        for retirements in [vec![0, 1], vec![0]] {
+            let drops = Rc::new(Cell::new(0));
+            let mut owners = [Some(Owner { id: 1, drops: drops.clone() }),
+                Some(Owner { id: 2, drops: drops.clone() }), Some(Owner { id: 3, drops: drops.clone() })];
+            let active = RefCell::new(owners.as_mut_slice());
+            let parked = Cell::new(false);
+            let issued = Cell::new(0);
+            let finished = Cell::new(0);
+            let decoded = Cell::new(0);
+            let fatals = Cell::new(0);
+            let set = LaneSet::default();
+            let result = runtime.block_on(drive_lanes(&set, || 0,
+                |_, _| async {
+                    while !parked.get() { tokio::task::yield_now().await; }
+                    fatals.set(fatals.get() + 1);
+                    Err(cuteafd_engine::prefix::PrefixError::CaptureUndrained {
+                        ticket: None, capture: "injected peer fatal".into(), source: "capture lane pending".into(),
+                    }.into())
+                },
+                |lease, _| {
+                    let (active, issued, parked, finished, decoded, drops) =
+                        (&active, &issued, &parked, &finished, &decoded, &drops);
+                    async move {
+                        if !retire_completed(active, retirements, 1, 0, lease, |request| {
+                            issued.set(issued.get() + 1);
+                            async move {
+                                parked.set(true);
+                                while !lease.stopping() { tokio::task::yield_now().await; }
+                                assert_eq!(drops.get(), 0, "the suspended retirement retains its owner");
+                                finished.set(finished.get() + 1);
+                                (request, Ok(()))
+                            }
+                        }).await? { return Ok(()); }
+                        decoded.set(decoded.get() + 1);
+                        Ok(())
+                    }
+                }));
+            assert!(super::super::super::prefix::capture_undrained(&result.unwrap_err()));
+            assert_eq!((fatals.get(), issued.get(), finished.get(), decoded.get()), (1, 1, 1, 0));
+            assert!(active.borrow()[0].is_none(), "in-flight retirement finishes and is accounted");
+            assert!(active.borrow()[1..].iter().all(Option::is_some), "unstarted owners remain for shutdown");
+            assert_eq!(drops.get(), 1);
+            drop(active);
+            drop(owners);
+            assert_eq!(drops.get(), 3, "each owner settles exactly once");
+        }
     }
 
     #[test]
