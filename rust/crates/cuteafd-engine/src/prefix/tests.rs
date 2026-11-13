@@ -23,6 +23,7 @@ use super::cache::Captured;
 
 include!("media_tests.rs");
 include!("plan_tests.rs");
+include!("retry_tests.rs");
 
 const ROWS: usize = 4; // page rows
 const RING: usize = 16; // ring slots per sequence
@@ -110,8 +111,15 @@ struct Fake {
     queue: RefCell<Vec<Op>>,
     writable_lag: usize,
     fail_restore: Cell<bool>,
+    fail_restore_once: Cell<bool>,
     fail_copy: Cell<bool>,
     fail_drain: Cell<bool>,
+    fail_drain_once: Cell<bool>,
+    fail_discard_once: Cell<bool>,
+    drain_after_restore: Cell<bool>,
+    fail_mark_segments_once: Cell<bool>,
+    /// Fail one replica copy, optionally also its cleanup drain.
+    fail_replicas: Cell<Option<bool>>,
     record_format: Cell<&'static str>,
     drains: Cell<usize>,
     rule: ReuseRule,
@@ -123,6 +131,9 @@ struct Fake {
     /// Leading pool pages never handed out (a pooled fake reserves page 0, the stand-in).
     reserved: usize,
     draft: RefCell<Option<DraftFixture>>,
+    /// Optional request table: bound pages survive an admission error until caller reclaim.
+    bound_pages: RefCell<Option<Vec<Vec<u32>>>>,
+    draft_releases: Cell<usize>,
 }
 
 struct DraftFixture {
@@ -134,8 +145,9 @@ impl Fake {
     fn new(pages: usize, rings: usize, slots: usize) -> Self {
         let bytes = (pages * ROWS + rings * RING + slots * WINDOW) * ROW;
         let mem = Rc::new(RefCell::new(StubCopyEngine::new(CopyModel::default(), bytes, 1 << 26)));
-        Self { mem, pages, rings, slots, writable_lag: 0, queue: RefCell::new(Vec::new()), fail_restore: Cell::new(false), fail_copy: Cell::new(false), fail_drain: Cell::new(false), record_format: Cell::new("opaque_v1"), drains: Cell::new(0),
-            rule: ReuseRule::EXACT, markless: false, pooled: false, reserved: 0, draft: RefCell::new(None) }
+        Self { mem, pages, rings, slots, writable_lag: 0, queue: RefCell::new(Vec::new()), fail_restore: Cell::new(false), fail_restore_once: Cell::new(false), fail_copy: Cell::new(false), fail_drain: Cell::new(false), fail_drain_once: Cell::new(false), drain_after_restore: Cell::new(false), fail_mark_segments_once: Cell::new(false), fail_replicas: Cell::new(None), record_format: Cell::new("opaque_v1"), drains: Cell::new(0),
+            rule: ReuseRule::EXACT, markless: false, pooled: false, reserved: 0, draft: RefCell::new(None),
+            fail_discard_once: Cell::new(false), bound_pages: RefCell::new(None), draft_releases: Cell::new(0) }
     }
     /// Marks in pool pages: no arena slot exists (any use of one panics). `pages` pages hand
     /// out, past the reserved page 0.
@@ -227,6 +239,13 @@ impl Fake {
 
 impl PrefixFamily for Fake {
     type Placement = Placement;
+    fn bind(&self, placement: &mut Placement) -> Result<(), BoxError> {
+        if let Some(bound) = self.bound_pages.borrow_mut().as_mut() {
+            assert!(bound[placement.ring].is_empty());
+            bound[placement.ring] = placement.pages.clone();
+        }
+        Ok(())
+    }
     fn write_frontier(&self, len: usize) -> usize {
         len.saturating_sub(self.writable_lag)
     }
@@ -237,8 +256,15 @@ impl PrefixFamily for Fake {
         Fake::layout(self)
     }
     fn discard(&self, placement: &mut Placement) -> Result<(), BoxError> {
+        if self.fail_discard_once.replace(false) { return Err("injected discard failure".into()); }
+        if let Some(bound) = self.bound_pages.borrow_mut().as_mut() {
+            bound[placement.ring].clear();
+        }
         if let Some(draft) = self.draft.borrow_mut().as_mut() {
-            if let Some(binding) = draft.bindings[placement.ring].take() { draft.pool.release(binding)?; }
+            if let Some(binding) = draft.bindings[placement.ring].take() {
+                draft.pool.release(binding)?;
+                self.draft_releases.set(self.draft_releases.get() + 1);
+            }
         }
         Ok(())
     }
@@ -338,7 +364,8 @@ impl PrefixFamily for Fake {
     }
     fn restore_pages(&self, pages: &[u32], p: &mut Placement, len: usize) -> Result<(), BoxError> {
         assert!(self.pooled, "pool-page restore of an arena family");
-        if self.fail_restore.get() {
+        if self.drain_after_restore.replace(false) { self.fail_drain_once.set(true); }
+        if self.fail_restore_once.replace(false) || self.fail_restore.get() {
             return Err("injected restore failure".into());
         }
         for (i, r) in (len.saturating_sub(WINDOW)..len).enumerate() {
@@ -348,10 +375,12 @@ impl PrefixFamily for Fake {
         Ok(())
     }
     fn mark_page_segments(&self, pages: &[u32]) -> Result<Vec<DeviceRange>, BoxError> {
+        if self.fail_mark_segments_once.replace(false) { return Err("injected mark segments failure".into()); }
         Ok((0..WINDOW).map(|i| self.mark_row(pages, i)).collect())
     }
     fn restore(&self, mark: Option<MarkSlot>, p: &mut Placement, len: usize) -> Result<(), BoxError> {
-        if self.fail_restore.get() {
+        if self.drain_after_restore.replace(false) { self.fail_drain_once.set(true); }
+        if self.fail_restore_once.replace(false) || self.fail_restore.get() {
             return Err("injected restore failure".into());
         }
         let Some(slot) = mark else {
@@ -376,7 +405,7 @@ impl PrefixFamily for Fake {
     }
     fn drain(&self) -> Result<(), BoxError> {
         self.drains.set(self.drains.get() + 1);
-        if self.fail_drain.get() { return Err("injected drain failure".into()); }
+        if self.fail_drain_once.replace(false) || self.fail_drain.get() { return Err("injected drain failure".into()); }
         self.flush();
         Ok(())
     }
@@ -385,6 +414,20 @@ impl PrefixFamily for Fake {
     }
     fn mark_segments(&self, slot: MarkSlot) -> Vec<DeviceRange> {
         vec![DeviceRange { addr: self.slot_row(slot, 0).addr, bytes: WINDOW * ROW }]
+    }
+    fn page_replicas(&self, page: u32) -> Vec<(DeviceRange, DeviceRange)> {
+        if self.fail_replicas.get().is_some() {
+            let row = self.page_row(page, 0);
+            vec![(row, row)]
+        } else { Vec::new() }
+    }
+    fn copy_replicas(&self, copies: &[(DeviceRange, DeviceRange)]) -> Result<(), BoxError> {
+        for &(from, to) in copies { self.queue.borrow_mut().push(Op::Copy(from, to)); }
+        if let Some(fail_drain) = self.fail_replicas.take() {
+            self.fail_drain_once.set(fail_drain);
+            return Err("injected replica failure after enqueue".into());
+        }
+        Ok(())
     }
     fn host_tail(&self) -> Vec<DeviceRange> {
         if self.markless { vec![DeviceRange { addr: self.slot_row(MarkSlot(0), 0).addr, bytes: 1 }] } else { Vec::new() }
@@ -1823,4 +1866,159 @@ fn predictor_inclusive_host_pages_do_not_deduplicate_by_target_tokens() {
     assert_eq!(fake.mem.borrow().read_device(row(&restored.placement)), value(4, &[901]));
     cache.release(&fake, &restored.placement.pages).unwrap();
     cache.clear(&fake).unwrap();
+}
+
+#[test]
+fn on_evict_keeps_more_than_two_marks_until_device_pressure() {
+    use cuteafd_hostcache::config::StoreMode;
+    let slots = MarkArena::slots_for(1, 4, WINDOW * ROW, 1 << 20, true);
+    assert_eq!(slots, MarkArena::slots_for(1, 4, WINDOW * ROW, 1 << 20, false));
+    for pooled in [false, true] {
+        let fake = if pooled { Fake::pooled(64, 2) } else { Fake::new(64, 2, slots) };
+        let host = HostConfig { bytes: 1 << 20, chunk_bytes: 1 << 16, min_tokens: 1,
+            store: StoreMode::OnEvict, ..HostConfig::default() };
+        let mut cache = PrefixCache::new(fake.layout(), config(4, slots), Some((host, Shared(fake.mem.clone())))).unwrap();
+        for n in 0..4 {
+            let (_, _, p) = serve(&mut cache, &fake, 0, &seq(100 * n, 8), &[], 8);
+            cache.release(&fake, &p.pages).unwrap();
+            fake.mem.borrow_mut().advance(10_000_000);
+            cache.tick();
+            let stats = cache.stats();
+            assert_eq!(stats.marks_in_use, n as usize + 1);
+            let host = stats.host.unwrap();
+            // stores_issued includes deferred tickets; none has submitted mark or page copies.
+            assert_eq!(host.stores_issued, n as u64 + 1);
+            assert_eq!((host.stores_completed, host.pages_copied, host.copy_submissions), (0, 0, 0));
+        }
+        let (_, _, p) = serve(&mut cache, &fake, 0, &seq(999, 8), &[], 8);
+        cache.release(&fake, &p.pages).unwrap();
+        assert_eq!(cache.stats().evictions, 1);
+        assert_eq!(cache.stats().host.unwrap().stores_completed, 1);
+        cache.clear(&fake).unwrap();
+        assert_eq!((cache.pool().free(), cache.arena().in_use()), (64, 0));
+    }
+}
+
+#[test]
+fn on_evict_demotes_a_mark_only_when_its_budgeted_arena_fills() {
+    use cuteafd_hostcache::config::StoreMode;
+    let slots = MarkArena::slots_for(1, 8, WINDOW * ROW, 3 * WINDOW * ROW, true);
+    assert_eq!(slots, 3);
+    let fake = Fake::new(64, 2, slots);
+    let host = HostConfig { bytes: 1 << 20, chunk_bytes: 1 << 16, min_tokens: 1,
+        store: StoreMode::OnEvict, ..HostConfig::default() };
+    let mut cache = PrefixCache::new(fake.layout(), config(8, slots), Some((host, Shared(fake.mem.clone())))).unwrap();
+    for n in 0..4 {
+        let (_, _, p) = serve(&mut cache, &fake, 0, &seq(100 * n, 8), &[], 8);
+        cache.release(&fake, &p.pages).unwrap();
+        let stats = cache.stats();
+        assert_eq!(stats.entries_prompt, n as usize + 1);
+        assert_eq!(stats.evictions, 0);
+        assert_eq!(stats.host.unwrap().stores_completed, u64::from(n == 3));
+    }
+    assert_eq!(cache.arena().in_use(), 3);
+    let admitted = cache.admit(&fake, &seq(0, 9), 12, false,
+        |pages| Placement { pages, ring: 1, len: 0, ring_from: 0 }).unwrap();
+    assert_eq!(admitted.resume, 8);
+    assert!(admitted.source.unwrap().host);
+    let mut p = admitted.placement;
+    fake.forward(&mut p, &seq(0, 9)).unwrap();
+    cache.release(&fake, &p.pages).unwrap();
+    cache.clear(&fake).unwrap();
+    assert_eq!((cache.pool().free(), cache.arena().in_use()), (64, 0));
+}
+
+#[test]
+fn evicted_host_mark_retires_device_hit_and_restores_exact_ancestor() {
+    let fake = Fake::new(64, 2, 8);
+    // Five small chunks hold four KV pages and three marks. The next store
+    // shares its KV pages, so pressure needs exactly one additional mark slab.
+    let host = HostConfig { bytes: 320, chunk_bytes: 64, min_tokens: 1, ..HostConfig::default() };
+    let mut cache = PrefixCache::new(fake.layout(), config(8, 8), Some((host, Shared(fake.mem.clone())))).unwrap();
+    let ancestor = seq(100, 8);
+    let deepest = seq(100, 12);
+    for (kind, tokens) in [(SnapshotKind::Prompt, ancestor.clone()), (SnapshotKind::Turn, deepest.clone()),
+        (SnapshotKind::Prompt, seq(200, 4)), (SnapshotKind::Turn, ancestor.clone())] {
+        let mut p = cache.admit_cold(&fake, tokens.len(), tokens.len(),
+            |pages| Placement { pages, ring: 0, len: 0, ring_from: 0 }).unwrap().placement;
+        let logits = fake.forward(&mut p, &tokens).unwrap();
+        assert!(cache.capture(&fake, kind, &tokens, &p, After::from_logits(&logits, true)).unwrap());
+        fake.mem.borrow_mut().advance(10_000_000);
+        cache.tick();
+        cache.release(&fake, &p.pages).unwrap();
+    }
+    assert_eq!(cache.stats().host.unwrap().device_reference_evictions, 1);
+    let mut query = deepest; query.push(999);
+    assert_eq!(cache.peek(&query, false), ancestor.len(), "peek excludes the stale mark");
+    let admitted = cache.admit(&fake, &query, query.len(), false,
+        |pages| Placement { pages, ring: 1, len: 0, ring_from: 0 }).unwrap();
+    assert_eq!(admitted.resume, ancestor.len());
+    let mut p = admitted.placement;
+    fake.forward(&mut p, &query).unwrap();
+    cache.release(&fake, &p.pages).unwrap();
+    let stats = cache.stats();
+    assert_eq!((stats.mark_restore_misses, stats.fork_no_room), (1, 0));
+    assert_eq!(stats.pages - stats.pages_free, stats.pages_retained);
+    let json = serde_json::to_value(stats).unwrap();
+    assert_eq!(json["mark_restore_misses"], 1);
+    assert_eq!(json["host"]["device_reference_evictions"], 1);
+    cache.clear(&fake).unwrap();
+    assert_eq!((cache.pool().free(), cache.arena().in_use()), (64, 0));
+}
+
+#[test]
+fn failed_mark_restore_tries_device_or_host_ancestor_without_leaking_fork_pages() {
+    use cuteafd_hostcache::copy::CopyFault;
+    for host_only in [false, true] {
+        let fake = Fake::new(64, 2, 8);
+        let mut cache = cache(&fake, 8, 1 << 20);
+        for len in [8, 12] {
+            let (_, _, p) = serve(&mut cache, &fake, 0, &seq(100, len), &[], len);
+            cache.release(&fake, &p.pages).unwrap();
+            fake.mem.borrow_mut().advance(10_000_000);
+            cache.tick();
+        }
+        if host_only { cache.clear(&fake).unwrap(); }
+        let before = cache.pool().free();
+        fake.mem.borrow_mut().inject(CopyFault::IssueFails(Stream::Restore));
+        let query = seq(100, 15);
+        let admitted = cache.admit(&fake, &query, 16, false,
+            |pages| Placement { pages, ring: 1, len: 0, ring_from: 0 }).unwrap();
+        assert_eq!(admitted.resume, 8, "host_only={host_only}");
+        let mut p = admitted.placement;
+        fake.forward(&mut p, &query).unwrap();
+        cache.release(&fake, &p.pages).unwrap();
+        let stats = cache.stats();
+        assert_eq!((stats.mark_restore_misses, stats.restore_failures, stats.fork_no_room), (1, 1, 0));
+        if !host_only { assert_eq!(cache.pool().free(), before); }
+        assert_eq!(stats.pages - stats.pages_free, stats.pages_retained);
+        cache.clear(&fake).unwrap();
+        assert_eq!((cache.pool().free(), cache.arena().in_use()), (64, 0));
+    }
+}
+
+#[test]
+fn failed_only_mark_still_admits_cold_without_counting_fork_pressure() {
+    use cuteafd_hostcache::copy::CopyFault;
+    let fake = Fake::new(32, 2, 8);
+    let mut cache = cache(&fake, 8, 1 << 20);
+    let (_, _, p) = serve(&mut cache, &fake, 0, &seq(100, 12), &[], 12);
+    cache.release(&fake, &p.pages).unwrap();
+    fake.mem.borrow_mut().advance(10_000_000);
+    cache.tick();
+    let before = cache.pool().free();
+    fake.mem.borrow_mut().inject(CopyFault::IssueFails(Stream::Restore));
+    let query = seq(100, 15);
+    let admitted = cache.admit(&fake, &query, 16, false,
+        |pages| Placement { pages, ring: 1, len: 0, ring_from: 0 }).unwrap();
+    assert_eq!(admitted.resume, 0);
+    assert!(admitted.source.is_none());
+    let mut p = admitted.placement;
+    fake.forward(&mut p, &query).unwrap();
+    cache.release(&fake, &p.pages).unwrap();
+    assert_eq!(cache.pool().free(), before);
+    let stats = cache.stats();
+    assert_eq!((stats.lookups, stats.hits, stats.mark_restore_misses, stats.fork_no_room), (2, 0, 1, 0));
+    cache.clear(&fake).unwrap();
+    assert_eq!(cache.pool().free(), 32);
 }

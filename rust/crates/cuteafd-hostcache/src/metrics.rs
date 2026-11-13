@@ -65,6 +65,8 @@ pub struct Snapshot {
     /// nothing: the hook is a no-op and never executes.
     pub device_evictions: u64,
     pub host_evictions: u64,
+    /// Host snapshots removed while still referenced by a live device entry.
+    pub device_reference_evictions: u64,
     /// Host wall time selecting and releasing store-pressure victims.
     pub host_eviction_ns: u64,
     pub host_evicted_bytes: u64,
