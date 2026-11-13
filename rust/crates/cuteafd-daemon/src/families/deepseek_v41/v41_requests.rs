@@ -425,8 +425,8 @@ impl<'a> Requests<'a> {
         let request = self.request(lease)?;
         ensure!(request.prefill.is_none() && request.history.position() == self.cache.committed_end(lease)?,
             "request prefix has pending or inconsistent history");
+        crate::shared::memory::reserve_snapshot(&mut self.prefix_leases[lane], lease)?;
         let backbone = self.cache.queue_mark(lane, lease, mark)?;
-        self.prefix_leases[lane] = Some(lease);
         Ok(self.mark_of(self.request_identity(lease)?, backbone))
     }
     pub fn mark_ready(&mut self, lane: usize) -> Result<bool> {
@@ -436,9 +436,9 @@ impl<'a> Requests<'a> {
         Ok(ready)
     }
     pub fn abort_mark(&mut self, lane: usize) -> Result<()> {
-        let drained = self.cache.abort_mark(lane);
+        self.cache.abort_mark(lane)?;
         if let Some(lease) = self.prefix_leases.get_mut(lane) { *lease = None; }
-        drained
+        Ok(())
     }
     /// Restore an exact snapshot (`saved`, its bytes in `mark`) into a fresh request whose
     /// sources hold its rows. With `prompt_end`, the restored frontier continues the encoder

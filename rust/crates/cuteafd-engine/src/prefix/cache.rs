@@ -239,6 +239,7 @@ pub struct PrefixCache<E: CopyEngine, M = ()> {
     entries: BTreeMap<EntryId, Entry<M>>,
     pending: Vec<PendingCapture<M>>,
     completed_captures: Vec<CaptureTicket>,
+    undrained_captures: Vec<CaptureTicket>,
     quarantine: Vec<Quarantined>,
     pool: RefPagePool,
     arena: MarkArena,
@@ -288,6 +289,7 @@ impl<E: CopyEngine, M: Clone + Default> PrefixCache<E, M> {
             entries: BTreeMap::new(),
             pending: Vec::new(),
             completed_captures: Vec::new(),
+            undrained_captures: Vec::new(),
             quarantine: Vec::new(),
             pool: match layout.page_owners {
                 PageOwners::Uniform => RefPagePool::with_reserved(layout.pages, layout.page_rows, layout.mark_store.reserved()),
@@ -836,7 +838,7 @@ impl<E: CopyEngine, M: Clone + Default> PrefixCache<E, M> {
     /// A failed copy may already be queued. Retain every destination reference until
     /// the family proves all of its capture streams complete, including draft copies.
     fn failed_capture<F: PrefixFamily<M>>(&mut self, family: &F, entry: Entry<M>, source: BoxError) -> PrefixError {
-        let cleanup = family.drain().map_err(|source| PrefixError::Family { what: "capture drain", source })
+        let cleanup = family.drain_failed_capture().map_err(|source| PrefixError::Family { what: "capture drain", source })
             .and_then(|()| {
                 self.dirty = false;
                 self.release(family, &entry.pages)?;
@@ -856,6 +858,10 @@ impl<E: CopyEngine, M: Clone + Default> PrefixCache<E, M> {
     /// Publish a queued capture whose copies landed: `Ok(true)` once it is retained (or was
     /// dropped because its bank no longer wants it), `Ok(false)` while copies are in flight.
     pub fn poll_capture<F: PrefixFamily<M>>(&mut self, family: &F, ticket: CaptureTicket) -> Result<bool, PrefixError> {
+        if self.undrained_captures.contains(&ticket) {
+            return Err(PrefixError::CaptureUndrained { capture: "queued capture remains quarantined".into(),
+                source: "capture lane completion was not established".into() });
+        }
         if let Some(index) = self.completed_captures.iter().position(|&t| t == ticket) {
             self.completed_captures.swap_remove(index);
             return Ok(true);
@@ -885,6 +891,10 @@ impl<E: CopyEngine, M: Clone + Default> PrefixCache<E, M> {
     /// Abandon a queued capture: its storage returns to the cache once the family proved its
     /// copies drained, and is quarantined (never handed out again) otherwise.
     pub fn abort_capture<F: PrefixFamily<M>>(&mut self, family: &F, ticket: CaptureTicket) -> Result<(), PrefixError> {
+        if self.undrained_captures.contains(&ticket) {
+            return Err(PrefixError::CaptureUndrained { capture: "queued capture remains quarantined".into(),
+                source: "capture lane completion was not established".into() });
+        }
         self.completed_captures.retain(|&done| done != ticket);
         let Some(index) = self.pending.iter().position(|p| p.ticket == ticket) else { return Ok(()) };
         let PendingCapture { entry, .. } = self.pending.remove(index);
@@ -899,7 +909,8 @@ impl<E: CopyEngine, M: Clone + Default> PrefixCache<E, M> {
                 tracing::error!(target: "cuteafd::prefix", %error, "queued capture did not drain; quarantining its storage");
                 self.quarantine.push(Quarantined { _pages: entry.pages, _mark: entry.mark, _draft: entry.draft });
                 self.stats.quarantined += 1;
-                Ok(())
+                self.undrained_captures.push(ticket);
+                Err(PrefixError::CaptureUndrained { capture: "queued capture abort".into(), source: error })
             }
         }
     }

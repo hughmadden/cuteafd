@@ -359,6 +359,10 @@ pub trait PrefixFamily<M: Clone + Default = ()> {
         let _ = (slot, placement, len, tail);
         Ok(None)
     }
+    /// Drain a failed capture, including a partial enqueue that never returned a ticket.
+    /// Queued families must include the actual capture lanes and retain their reservations
+    /// if completion cannot be established. Ordinary synchronous families use `drain`.
+    fn drain_failed_capture(&self) -> Result<(), BoxError> { self.drain() }
     /// Whether every copy of a queued capture has landed (target and drafter alike).
     fn capture_ready(&self, ticket: CaptureTicket) -> Result<bool, BoxError> {
         let _ = ticket;

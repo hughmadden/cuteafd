@@ -33,9 +33,9 @@ impl<'a> DsparkWindow<'a> {
         let slot = self.validate(lease)?;
         let mut used = [false; cuteafd_core::V41_MAX_REQUESTS]; used[slot] = true;
         let reservation = self.access.reserve(used)?;
-        let end = self.copy_ring(lease, destination, stream)?;
-        self.prefix_copies[lane].pending = Some((lease, reservation));
-        Ok(end)
+        crate::shared::memory::reserve_snapshot(
+            &mut self.prefix_copies[lane].pending, (lease, reservation))?;
+        self.copy_ring(lease, destination, stream)
     }
     /// Whether lane `lane`'s queued ring copy landed; the lane and its reservation free once
     /// it has.

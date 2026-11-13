@@ -21,6 +21,12 @@ struct Lagged {
     next: Cell<u32>,
     /// Make `abort_capture` fail (copies that never drained).
     stuck: Cell<bool>,
+    fail_enqueue: Cell<bool>,
+    fail_poll: Cell<bool>,
+    lane_failures: Cell<Option<[bool; 2]>>,
+    lane_ops: [RefCell<Vec<Op>>; 2],
+    lane_owned: [Cell<bool>; 2],
+    lane_drains: [Cell<usize>; 2],
     restored: RefCell<Vec<Option<LagMeta>>>,
 }
 
@@ -29,7 +35,9 @@ impl Lagged {
         let mut fake = Fake::new(pages, rings, slots);
         fake.rule = ReuseRule { align: 2, replay: Some(WINDOW) };
         Self { fake, align: 2, replay: WINDOW, queued: RefCell::new(Vec::new()), next: Cell::new(0),
-            stuck: Cell::new(false), restored: RefCell::new(Vec::new()) }
+            stuck: Cell::new(false), fail_enqueue: Cell::new(false), fail_poll: Cell::new(false),
+            lane_failures: Cell::new(None), lane_ops: std::array::from_fn(|_| RefCell::new(Vec::new())),
+            lane_owned: std::array::from_fn(|_| Cell::new(false)), lane_drains: std::array::from_fn(|_| Cell::new(0)), restored: RefCell::new(Vec::new()) }
     }
     /// Run every queued mark copy (their stream drained).
     fn land(&self) {
@@ -77,9 +85,22 @@ impl PrefixFamily<LagMeta> for Lagged {
         let ticket = CaptureTicket(self.next.get());
         self.next.set(self.next.get() + 1);
         self.queued.borrow_mut().push((ticket, slot, p.ring, len));
+        if self.lane_failures.get().is_some() {
+            // Independent abstract target/draft lanes, each holding real stub
+            // copy operations. Ordinary drain cannot complete these operations.
+            for owner in &self.lane_owned { owner.set(true); }
+            let ordinary = std::mem::take(&mut *self.fake.queue.borrow_mut());
+            PrefixFamily::capture(&self.fake, slot, p, len)?;
+            let mut operations = std::mem::replace(&mut *self.fake.queue.borrow_mut(), ordinary);
+            let draft = operations.split_off(operations.len() / 2);
+            *self.lane_ops[0].borrow_mut() = operations;
+            *self.lane_ops[1].borrow_mut() = draft;
+            if self.fail_enqueue.get() { return Err("partial lane enqueue before ticket return".into()); }
+        }
         Ok(Some(ticket))
     }
     fn capture_ready(&self, ticket: CaptureTicket) -> Result<bool, BoxError> {
+        if self.fail_poll.get() { return Err("injected lane query failure".into()); }
         Ok(!self.queued.borrow().iter().any(|&(t, ..)| t == ticket))
     }
     fn wait_capture(&self, _: CaptureTicket) -> Result<(), BoxError> {
@@ -87,7 +108,25 @@ impl PrefixFamily<LagMeta> for Lagged {
         self.land();
         Ok(())
     }
+    fn drain_failed_capture(&self) -> Result<(), BoxError> {
+        let ordinary = self.drain();
+        let lanes = if self.next.get() == 0 { Ok(()) }
+            else { self.abort_capture(CaptureTicket(self.next.get() - 1)) };
+        ordinary.and(lanes)
+    }
     fn abort_capture(&self, ticket: CaptureTicket) -> Result<(), BoxError> {
+        if let Some(failures) = self.lane_failures.get() {
+            let mut failed = false;
+            for (lane, fail) in failures.into_iter().enumerate() {
+                self.lane_drains[lane].set(self.lane_drains[lane].get() + 1);
+                if fail { failed = true; continue; }
+                let operations = std::mem::take(&mut *self.lane_ops[lane].borrow_mut());
+                self.fake.queue.borrow_mut().extend(operations);
+                self.fake.flush();
+                self.lane_owned[lane].set(false);
+            }
+            if failed { return Err("capture lane did not drain".into()); }
+        }
         if self.stuck.get() { return Err("queued copies did not drain".into()); }
         self.queued.borrow_mut().retain(|&(t, ..)| t != ticket);
         Ok(())
@@ -288,7 +327,7 @@ fn aborted_captures_return_their_storage_and_undrained_ones_are_quarantined() {
     let Captured::Queued(ticket) = cache.queue_capture(&family, SnapshotKind::Turn, &prompt, &[], &p, After::default())
         .unwrap() else { panic!("queued") };
     let (free, marks) = (cache.pool().free(), cache.arena().in_use());
-    cache.abort_capture(&family, ticket).unwrap();
+    assert!(matches!(cache.abort_capture(&family, ticket), Err(PrefixError::CaptureUndrained { .. })));
     assert_eq!((cache.pool().free(), cache.arena().in_use(), cache.stats().quarantined), (free, marks, 1));
     assert!(cache.poll_capture(&family, ticket).is_err(), "a quarantined capture is gone");
     cache.release(&family, &p.pages).unwrap();
@@ -388,4 +427,63 @@ fn queued_captures_publish_oldest_under_two_slot_pressure_without_losing_tickets
         cache.release(&family, &p.pages).unwrap();
     }
     assert!(cache.stats().capture_stalls > 0);
+}
+
+#[test]
+fn queued_capture_failures_drain_actual_lanes_or_keep_quarantined_owners() {
+    for failures in [[false, false], [true, false], [false, true], [true, true]] {
+        for route in ["enqueue", "poll", "abort"] {
+            let family = Lagged::new(32, 2, 2);
+            let mut cache = lag_cache(&family, 4, 0);
+            let tokens = seq(10, 13);
+            let mut p = cache.admit_cold(&family, tokens.len(), 20,
+                |pages| Placement { pages, ring: 0, len: 0, ring_from: 0 }).unwrap().placement;
+            family.fake.forward(&mut p, &tokens).unwrap();
+            let (free, marks) = (cache.pool().free(), cache.arena().free());
+            family.lane_failures.set(Some(failures));
+            family.fail_enqueue.set(route == "enqueue");
+            family.fail_poll.set(route == "poll");
+            let queued = cache.queue_capture(&family, SnapshotKind::Turn, &tokens, &[], &p, After::default());
+            // Ordinary completion is independent of both capture lanes, even
+            // when neither lane's abort can establish completion.
+            family.fake.drain().unwrap();
+            let outcome = if route == "enqueue" { queued.map(|_| ()) }
+                else {
+                    let Captured::Queued(ticket) = queued.unwrap() else { panic!("not queued") };
+                    if route == "poll" { cache.poll_capture(&family, ticket).map(|_| ()) }
+                    else { cache.abort_capture(&family, ticket) }
+                };
+            let fatal = failures.into_iter().any(|fail| fail);
+            assert_eq!(matches!(outcome, Err(PrefixError::CaptureUndrained { .. })), fatal, "{route}");
+            assert_eq!(cache.stats().quarantined, u64::from(fatal));
+            assert_eq!(cache.pool().free(), free - usize::from(fatal));
+            assert_eq!(cache.arena().free(), marks - usize::from(fatal));
+            assert_eq!(cache.peek(&tokens, false), 0, "never publish a failed capture");
+            for lane in 0..2 {
+                assert_eq!(family.lane_owned[lane].get(), failures[lane]);
+                assert_eq!(family.lane_ops[lane].borrow().is_empty(), !failures[lane]);
+                assert_eq!(family.lane_drains[lane].get(), 1, "both lanes attempted exactly once");
+            }
+            assert!(family.fake.queue.borrow().is_empty(), "ordinary stream completed independently");
+            if fatal {
+                assert_eq!(cache.pool().refs(p.pages[0]), 2, "quarantine retains source references");
+                if route != "enqueue" {
+                    assert!(matches!(cache.abort_capture(&family, CaptureTicket(0)), Err(PrefixError::CaptureUndrained { .. })));
+                    assert!(matches!(cache.poll_capture(&family, CaptureTicket(0)), Err(PrefixError::CaptureUndrained { .. })));
+                    assert_eq!(cache.stats().quarantined, 1, "no double quarantine on terminal cleanup");
+                }
+                // Abstract shutdown completion is explicit; it does not return
+                // quarantined destinations to the serving pool or fake CUDA completion.
+                family.lane_failures.set(Some([false, false]));
+                family.abort_capture(CaptureTicket(0)).unwrap();
+                assert!(family.lane_owned.iter().all(|owner| !owner.get()));
+                assert_eq!(cache.arena().free(), marks - 1);
+            } else {
+                cache.release(&family, &p.pages).unwrap();
+                assert_eq!(cache.pool().free(), family.fake.pages);
+                cache.abort_capture(&family, CaptureTicket(0)).unwrap();
+                assert_eq!(cache.arena().free(), marks, "safe abort returns its mark exactly once");
+            }
+        }
+    }
 }

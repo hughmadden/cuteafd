@@ -387,7 +387,7 @@ impl<'w, 'a, C: DraftChain<'a>> DraftRuntime<'w, 'a, C> {
         ensure!(!self.pending_prefix_ids.contains(&Some(id)), "draft snapshot already pending");
         ensure!(mark.bytes == DRAFT_MARK_BYTES, "draft mark storage size differs");
         let leases = self.check_frontier(id, end)?;
-        self.pending_prefix_ids[lane] = Some(id);
+        crate::shared::memory::reserve_snapshot(&mut self.pending_prefix_ids[lane], id)?;
         let device = self.windows[0].device();
         let queued = device.run(|| {
             for (stage, (window, lease)) in self.windows.iter_mut().zip(leases).enumerate() {
@@ -395,13 +395,9 @@ impl<'w, 'a, C: DraftChain<'a>> DraftRuntime<'w, 'a, C> {
             }
             Ok(())
         });
-        if let Err(error) = queued {
-            if let Err(cleanup) = self.abort_mark(lane) {
-                tracing::error!(%cleanup, "draining failed draft snapshot enqueue");
-            }
-            return Err(error);
-        }
-        Ok(())
+        // The prefix engine owns failure cleanup, including every target/draft lane.
+        // Keep reservations even when a window only partially enqueued its copies.
+        queued
     }
     /// Whether a ring copy is queued on capture lane `lane`.
     pub fn mark_pending(&self, lane: usize) -> bool {
@@ -437,8 +433,9 @@ impl<'w, 'a, C: DraftChain<'a>> DraftRuntime<'w, 'a, C> {
         for window in &mut self.windows {
             if let Err(error) = window.abort_ring(lane) { failure.get_or_insert(error); }
         }
+        failure.map_or(Ok(()), Err)?;
         self.pending_prefix_ids[lane] = None;
-        failure.map_or(Ok(()), Err)
+        Ok(())
     }
     /// Restore request `id`'s rings at frontier `end` from `mark`. A failure releases the draft
     /// request.
