@@ -31,10 +31,12 @@ where F: std::future::Future<Output = Result<()>>, G: std::future::Future<Output
     let control = LaneControl::start(epoch());
     // LaneSet normally keeps the first lane's error. Preserve a capture fatal
     // from either lane even when its peer also reports an ordinary round error.
+    // Pin each native lane on the heap before adding async wrappers: carrying
+    // it by value through preserve/run/join multiplies the worker's stack frame.
     let fatal = RefCell::new(None);
     let result = set.run(
-        |lease| preserve_capture_failure(lease, first(lease, control), &fatal),
-        |lease| preserve_capture_failure(lease, second(lease, control), &fatal),
+        |lease| preserve_capture_failure(lease, Box::pin(first(lease, control)), &fatal),
+        |lease| preserve_capture_failure(lease, Box::pin(second(lease, control)), &fatal),
     ).await;
     fatal.into_inner().map_or(result, Err)
 }
@@ -536,6 +538,31 @@ pub(super) fn resume_due(rounds: u64, mut closed: impl Iterator<Item = bool>, ep
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn concrete_lane_driver_future_stays_bounded() {
+        use std::future::Future;
+        use crate::families::deepseek_v41::{v41_target_pass::{TargetPass, DistributedTargetPass},
+            v41_experts::dspark::{DsparkChain, DistributedDsparkChain}};
+        // Infer each production future's type without constructing GPU owners
+        // or polling native work. Tiny fake lanes miss this frame-size regression.
+        fn bytes<A, F: Future>(_: impl FnOnce(A) -> F) -> usize { std::mem::size_of::<F>() }
+        macro_rules! driver_bytes { ($target:ty, $chain:ty) => {
+            bytes(|(set, first, second, first_transport, second_transport, requests, active, draft, prefixes, receive, wake)|
+                super::drive_lanes(set, || 0,
+                    move |lease, control| super::lane::<$target, $chain>(
+                        lease, control, first, first_transport, requests, active, draft, prefixes, receive, wake),
+                    move |lease, control| super::lane::<$target, $chain>(
+                        lease, control, second, second_transport, requests, active, draft, prefixes, receive, wake)))
+        }; }
+        for (layout, bytes) in [
+            ("single", driver_bytes!(TargetPass<'_, '_>, DsparkChain<'_, '_>)),
+            ("distributed", driver_bytes!(DistributedTargetPass<'_, '_>, DistributedDsparkChain<'_, '_>)),
+        ] {
+            // Leave room on the default worker stack for nested poll frames,
+            // native calls and the synchronous scheduler's owners.
+            assert!(bytes <= 64 * 1024, "{layout} lane driver future occupies {bytes} bytes on the CUDA worker stack");
+        }
+    }
     use super::{boundary, drive_lanes, retire_completed, retire_due, round_failure, Boundary, LaneControl};
     use crate::shared::serve::lanes::{LaneLease, LaneSet};
     use super::admission::Wake;
