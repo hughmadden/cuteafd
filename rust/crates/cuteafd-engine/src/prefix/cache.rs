@@ -730,7 +730,7 @@ impl<E: CopyEngine, M: Clone + Default> PrefixCache<E, M> {
         }
         if self.host.is_some() && (mark.is_some() || temporary_mark.is_some()) {
             if let Err(error) = self.drain(family) {
-                self.quarantine_candidate(pages, temporary_mark, None, true);
+                self.quarantine_temporary_mark(temporary_mark);
                 return Err(error.into());
             }
         }
@@ -743,7 +743,6 @@ impl<E: CopyEngine, M: Clone + Default> PrefixCache<E, M> {
         if matches!(admitted, Err(PrefixError::DraftPages(_))) && draft.is_some() {
             // Retained history is optional; retry admission with a cold drafter.
             if let Err(error) = self.drain(family) {
-                self.quarantine_candidate(pages, None, None, true);
                 return Err(error.into());
             }
             self.dirty = true;
@@ -1471,15 +1470,23 @@ impl<E: CopyEngine, M: Clone + Default> PrefixCache<E, M> {
         self.give_back(family, mark)
     }
 
+    /// A failed cleanup leaves bound pages and the live draft binding with the caller.
+    /// Only the temporary H2D mark has no external owner to release it after admission fails.
+    fn quarantine_temporary_mark(&mut self, mark: Option<Mark>) {
+        if mark.is_some() {
+            self.quarantine_candidate(Vec::new(), mark, None, true);
+        }
+    }
+
     fn discard_candidate<F: PrefixFamily<M>>(&mut self, family: &F, placement: &mut F::Placement,
         pages: Vec<u32>, mark: Option<Mark>) -> Result<(), PrefixError> {
         if let Err(error) = self.drain(family) {
-            self.quarantine_candidate(pages, mark, None, true);
+            self.quarantine_temporary_mark(mark);
             return Err(error);
         }
         if let Err(source) = family.discard(placement) {
             // A failed reset may still own a binding; do not recycle its storage.
-            self.quarantine_candidate(pages, mark, None, false);
+            self.quarantine_temporary_mark(mark);
             return Err(PrefixError::Family { what: "discard restore", source });
         }
         self.release_candidate(family, pages, mark, None)

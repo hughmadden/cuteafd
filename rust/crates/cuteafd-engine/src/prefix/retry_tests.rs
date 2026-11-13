@@ -1,6 +1,16 @@
 // Failure interleavings use the same queued-copy family and accounting as normal prefix tests.
+impl Fake {
+    /// Mirror scheduler reclaim: a failed drain keeps the external request's owners intact.
+    fn external_release(&self, cache: &mut PrefixCache<Shared>, ring: usize) -> Result<(), PrefixError> {
+        let pages = self.bound_pages.borrow().as_ref().unwrap()[ring].clone();
+        cache.release(self, &pages)?;
+        self.discard(&mut Placement { pages, ring, len: 0, ring_from: 0 })
+            .map_err(|source| PrefixError::Family { what: "external release", source })
+    }
+}
+
 #[test]
-fn restore_drain_failure_quarantines_fork_and_temporary_mark_without_retry() {
+fn restore_drain_failure_leaves_bound_fork_to_caller_and_quarantines_only_temporary_mark() {
     for restore_fails in [false, true] {
         let fake = Fake::new(64, 2, 8);
         let mut cache = cache(&fake, 8, 1 << 20);
@@ -12,6 +22,7 @@ fn restore_drain_failure_quarantines_fork_and_temporary_mark_without_retry() {
         }
         let before = cache.pool().free();
         let builds = Cell::new(0);
+        *fake.bound_pages.borrow_mut() = Some(vec![Vec::new(); 2]);
         fake.fail_restore.set(restore_fails);
         fake.drain_after_restore.set(true);
         let query = seq(100, 15);
@@ -23,16 +34,101 @@ fn restore_drain_failure_quarantines_fork_and_temporary_mark_without_retry() {
         assert_eq!(builds.get(), 1, "failed cleanup must abort admission");
         assert_eq!((cache.stats().quarantined, cache.arena().in_use()), (1, 1));
         assert_eq!(cache.pool().free(), before - 1, "one fresh fork page remains owned");
+        assert_eq!(fake.bound_pages.borrow().as_ref().unwrap()[1].len(), 4);
         assert_eq!(cache.stats().fork_no_room, 0);
+        // Repeated caller cleanup failures retain both the binding and staging mark.
+        fake.fail_drain.set(true);
+        for _ in 0..2 {
+            assert!(fake.external_release(&mut cache, 1).is_err());
+            assert_eq!(cache.pool().free(), before - 1);
+            assert_eq!(cache.arena().in_use(), 1);
+            assert_eq!(fake.bound_pages.borrow().as_ref().unwrap()[1].len(), 4);
+        }
+        fake.fail_drain.set(false);
+        fake.external_release(&mut cache, 1).unwrap();
+        assert_eq!(cache.pool().free(), before, "caller reclaims the fork exactly once");
         fake.fail_restore.set(false);
         let mut p = cache.admit(&fake, &query, 16, false,
             |pages| Placement { pages, ring: 1, len: 0, ring_from: 0 }).unwrap().placement;
         assert_eq!(p.len, 12);
         fake.forward(&mut p, &query).unwrap();
-        cache.release(&fake, &p.pages).unwrap();
+        fake.external_release(&mut cache, 1).unwrap();
         cache.clear(&fake).unwrap();
         assert_eq!((cache.pool().free(), cache.arena().in_use()), (64, 0));
     }
+}
+
+#[test]
+fn failed_discard_keeps_bound_pages_with_caller() {
+    let fake = Fake::new(64, 2, 8);
+    let mut cache = cache(&fake, 8, 1 << 20);
+    let (_, _, p) = serve(&mut cache, &fake, 0, &seq(100, 12), &[], 12);
+    cache.release(&fake, &p.pages).unwrap();
+    fake.mem.borrow_mut().advance(10_000_000);
+    cache.tick();
+    *fake.bound_pages.borrow_mut() = Some(vec![Vec::new(); 2]);
+    fake.fail_restore_once.set(true);
+    fake.fail_discard_once.set(true);
+    let builds = Cell::new(0);
+    assert!(cache.admit(&fake, &seq(100, 15), 16, false, |pages| {
+        builds.set(builds.get() + 1);
+        Placement { pages, ring: 1, len: 0, ring_from: 0 }
+    }).is_err());
+    assert_eq!(builds.get(), 1);
+    assert_eq!(cache.pool().free(), 60);
+    assert_eq!((cache.stats().quarantined, cache.arena().in_use()), (1, 1));
+    fake.external_release(&mut cache, 1).unwrap();
+    cache.clear(&fake).unwrap();
+    assert_eq!((cache.pool().free(), cache.arena().in_use()), (64, 0));
+}
+
+#[test]
+fn restore_drain_failure_leaves_live_draft_binding_to_caller() {
+    let fake = Fake::new(80, 2, 8);
+    let draft_tokens = 2048;
+    let bytes = fake.draft_range(0).addr as usize + draft_tokens * ROW;
+    *fake.mem.borrow_mut() = StubCopyEngine::new(CopyModel::default(), bytes, 1 << 26);
+    *fake.draft.borrow_mut() = Some(DraftFixture {
+        pool: DraftPagePool::new(draft_tokens, 2, 4096, 23).unwrap(), bindings: vec![None; 2],
+    });
+    let host = HostConfig { bytes: 1 << 20, chunk_bytes: 1 << 16, min_tokens: 1, ..HostConfig::default() };
+    let mut cache = PrefixCache::new_with_draft_pages(fake.layout(), config(8, 8),
+        Some((host, Shared(fake.mem.clone()))), fake.draft_page_bytes()).unwrap();
+    let tokens = seq(100, 65);
+    let mut p = cache.admit_cold(&fake, 65, 65,
+        |pages| Placement { pages, ring: 0, len: 0, ring_from: 0 }).unwrap().placement;
+    let logits = fake.forward(&mut p, &tokens).unwrap();
+    {
+        let mut draft = fake.draft.borrow_mut();
+        let draft = draft.as_mut().unwrap();
+        let reservation = draft.pool.reserve(draft.bindings[0].unwrap(), 0, 65).unwrap();
+        draft.pool.commit(reservation, 65).unwrap();
+    }
+    cache.capture(&fake, SnapshotKind::Prompt, &tokens, &p, After::from_logits(&logits, true)).unwrap();
+    fake.mem.borrow_mut().advance(10_000_000);
+    cache.tick();
+    fake.discard(&mut p).unwrap();
+    cache.release(&fake, &p.pages).unwrap();
+    let releases = fake.draft_releases.get();
+    *fake.bound_pages.borrow_mut() = Some(vec![Vec::new(); 2]);
+    fake.drain_after_restore.set(true);
+    let builds = Cell::new(0);
+    assert!(cache.admit(&fake, &tokens, 68, false, |pages| {
+        builds.set(builds.get() + 1);
+        Placement { pages, ring: 1, len: 0, ring_from: 0 }
+    }).is_err());
+    assert_eq!(builds.get(), 1);
+    assert!(fake.draft.borrow().as_ref().unwrap().bindings[1].is_some());
+    assert_eq!(fake.draft_releases.get(), releases);
+    fake.external_release(&mut cache, 1).unwrap();
+    assert_eq!(fake.draft_releases.get(), releases + 1);
+    cache.clear(&fake).unwrap();
+    assert_eq!(fake.draft_releases.get(), releases + 1, "clear releases snapshot attachments only");
+    assert!(fake.draft.borrow().as_ref().unwrap().bindings.iter().all(Option::is_none));
+    let draft = fake.draft.borrow();
+    let pool = &draft.as_ref().unwrap().pool;
+    assert_eq!(pool.free(), pool.capacity());
+    assert_eq!((cache.pool().free(), cache.arena().in_use()), (80, 0));
 }
 
 #[test]
@@ -248,6 +344,12 @@ fn host_replica_failure_retries_only_after_successful_cleanup() {
             assert_eq!(builds.get(), 0);
             assert_eq!((cache.stats().quarantined, cache.arena().in_use()), (1, 1));
             assert_eq!(cache.pool().free(), 61, "failed promotion's three pages remain owned");
+            fake.fail_drain.set(true);
+            for _ in 0..2 {
+                assert!(cache.clear(&fake).is_err());
+                assert_eq!((cache.pool().free(), cache.arena().in_use()), (61, 1));
+            }
+            fake.fail_drain.set(false);
         } else {
             let mut admitted = admitted.unwrap();
             assert_eq!(admitted.resume, 8);

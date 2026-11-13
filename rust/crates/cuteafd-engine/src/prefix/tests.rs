@@ -115,6 +115,7 @@ struct Fake {
     fail_copy: Cell<bool>,
     fail_drain: Cell<bool>,
     fail_drain_once: Cell<bool>,
+    fail_discard_once: Cell<bool>,
     drain_after_restore: Cell<bool>,
     fail_mark_segments_once: Cell<bool>,
     /// Fail one replica copy, optionally also its cleanup drain.
@@ -130,6 +131,9 @@ struct Fake {
     /// Leading pool pages never handed out (a pooled fake reserves page 0, the stand-in).
     reserved: usize,
     draft: RefCell<Option<DraftFixture>>,
+    /// Optional request table: bound pages survive an admission error until caller reclaim.
+    bound_pages: RefCell<Option<Vec<Vec<u32>>>>,
+    draft_releases: Cell<usize>,
 }
 
 struct DraftFixture {
@@ -142,7 +146,8 @@ impl Fake {
         let bytes = (pages * ROWS + rings * RING + slots * WINDOW) * ROW;
         let mem = Rc::new(RefCell::new(StubCopyEngine::new(CopyModel::default(), bytes, 1 << 26)));
         Self { mem, pages, rings, slots, writable_lag: 0, queue: RefCell::new(Vec::new()), fail_restore: Cell::new(false), fail_restore_once: Cell::new(false), fail_copy: Cell::new(false), fail_drain: Cell::new(false), fail_drain_once: Cell::new(false), drain_after_restore: Cell::new(false), fail_mark_segments_once: Cell::new(false), fail_replicas: Cell::new(None), record_format: Cell::new("opaque_v1"), drains: Cell::new(0),
-            rule: ReuseRule::EXACT, markless: false, pooled: false, reserved: 0, draft: RefCell::new(None) }
+            rule: ReuseRule::EXACT, markless: false, pooled: false, reserved: 0, draft: RefCell::new(None),
+            fail_discard_once: Cell::new(false), bound_pages: RefCell::new(None), draft_releases: Cell::new(0) }
     }
     /// Marks in pool pages: no arena slot exists (any use of one panics). `pages` pages hand
     /// out, past the reserved page 0.
@@ -234,6 +239,13 @@ impl Fake {
 
 impl PrefixFamily for Fake {
     type Placement = Placement;
+    fn bind(&self, placement: &mut Placement) -> Result<(), BoxError> {
+        if let Some(bound) = self.bound_pages.borrow_mut().as_mut() {
+            assert!(bound[placement.ring].is_empty());
+            bound[placement.ring] = placement.pages.clone();
+        }
+        Ok(())
+    }
     fn write_frontier(&self, len: usize) -> usize {
         len.saturating_sub(self.writable_lag)
     }
@@ -244,8 +256,15 @@ impl PrefixFamily for Fake {
         Fake::layout(self)
     }
     fn discard(&self, placement: &mut Placement) -> Result<(), BoxError> {
+        if self.fail_discard_once.replace(false) { return Err("injected discard failure".into()); }
+        if let Some(bound) = self.bound_pages.borrow_mut().as_mut() {
+            bound[placement.ring].clear();
+        }
         if let Some(draft) = self.draft.borrow_mut().as_mut() {
-            if let Some(binding) = draft.bindings[placement.ring].take() { draft.pool.release(binding)?; }
+            if let Some(binding) = draft.bindings[placement.ring].take() {
+                draft.pool.release(binding)?;
+                self.draft_releases.set(self.draft_releases.get() + 1);
+            }
         }
         Ok(())
     }
