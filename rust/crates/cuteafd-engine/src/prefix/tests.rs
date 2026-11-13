@@ -23,6 +23,7 @@ use super::cache::Captured;
 
 include!("media_tests.rs");
 include!("plan_tests.rs");
+include!("retry_tests.rs");
 
 const ROWS: usize = 4; // page rows
 const RING: usize = 16; // ring slots per sequence
@@ -112,6 +113,9 @@ struct Fake {
     fail_restore: Cell<bool>,
     fail_copy: Cell<bool>,
     fail_drain: Cell<bool>,
+    fail_drain_once: Cell<bool>,
+    drain_after_restore: Cell<bool>,
+    fail_mark_segments_once: Cell<bool>,
     record_format: Cell<&'static str>,
     drains: Cell<usize>,
     rule: ReuseRule,
@@ -134,7 +138,7 @@ impl Fake {
     fn new(pages: usize, rings: usize, slots: usize) -> Self {
         let bytes = (pages * ROWS + rings * RING + slots * WINDOW) * ROW;
         let mem = Rc::new(RefCell::new(StubCopyEngine::new(CopyModel::default(), bytes, 1 << 26)));
-        Self { mem, pages, rings, slots, writable_lag: 0, queue: RefCell::new(Vec::new()), fail_restore: Cell::new(false), fail_copy: Cell::new(false), fail_drain: Cell::new(false), record_format: Cell::new("opaque_v1"), drains: Cell::new(0),
+        Self { mem, pages, rings, slots, writable_lag: 0, queue: RefCell::new(Vec::new()), fail_restore: Cell::new(false), fail_copy: Cell::new(false), fail_drain: Cell::new(false), fail_drain_once: Cell::new(false), drain_after_restore: Cell::new(false), fail_mark_segments_once: Cell::new(false), record_format: Cell::new("opaque_v1"), drains: Cell::new(0),
             rule: ReuseRule::EXACT, markless: false, pooled: false, reserved: 0, draft: RefCell::new(None) }
     }
     /// Marks in pool pages: no arena slot exists (any use of one panics). `pages` pages hand
@@ -338,6 +342,7 @@ impl PrefixFamily for Fake {
     }
     fn restore_pages(&self, pages: &[u32], p: &mut Placement, len: usize) -> Result<(), BoxError> {
         assert!(self.pooled, "pool-page restore of an arena family");
+        if self.drain_after_restore.replace(false) { self.fail_drain_once.set(true); }
         if self.fail_restore.get() {
             return Err("injected restore failure".into());
         }
@@ -348,9 +353,11 @@ impl PrefixFamily for Fake {
         Ok(())
     }
     fn mark_page_segments(&self, pages: &[u32]) -> Result<Vec<DeviceRange>, BoxError> {
+        if self.fail_mark_segments_once.replace(false) { return Err("injected mark segments failure".into()); }
         Ok((0..WINDOW).map(|i| self.mark_row(pages, i)).collect())
     }
     fn restore(&self, mark: Option<MarkSlot>, p: &mut Placement, len: usize) -> Result<(), BoxError> {
+        if self.drain_after_restore.replace(false) { self.fail_drain_once.set(true); }
         if self.fail_restore.get() {
             return Err("injected restore failure".into());
         }
@@ -376,7 +383,7 @@ impl PrefixFamily for Fake {
     }
     fn drain(&self) -> Result<(), BoxError> {
         self.drains.set(self.drains.get() + 1);
-        if self.fail_drain.get() { return Err("injected drain failure".into()); }
+        if self.fail_drain_once.replace(false) || self.fail_drain.get() { return Err("injected drain failure".into()); }
         self.flush();
         Ok(())
     }

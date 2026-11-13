@@ -60,6 +60,16 @@ pub enum PrefixError {
     Layout(&'static str),
 }
 
+/// Only failures whose candidate resources were released may try another snapshot.
+enum RestoreFailure {
+    Candidate(PrefixError),
+    Fatal(PrefixError),
+}
+
+impl From<PrefixError> for RestoreFailure {
+    fn from(error: PrefixError) -> Self { Self::Fatal(error) }
+}
+
 fn draft_exhaustion(mut error: &(dyn std::error::Error + 'static)) -> Option<PoolExhausted> {
     loop {
         if let Some(super::DraftPageError::Exhausted(pages)) = error.downcast_ref() { return Some(*pages); }
@@ -217,6 +227,8 @@ struct Quarantined {
     _pages: Vec<u32>,
     _mark: Option<Mark>,
     _draft: Option<super::DraftPageAttachment>,
+    /// Family-only cleanup can settle at shutdown; failed host barriers remain quarantined.
+    family_cleanup: bool,
 }
 
 pub struct PrefixCache<E: CopyEngine, M = ()> {
@@ -435,8 +447,8 @@ impl<E: CopyEngine, M: Clone + Default> PrefixCache<E, M> {
                 match self.restore_hit(family, &hit, tokens, &context, total, capacity.max(tokens.len()), promoted, &mut build) {
                     Ok(Some(admitted)) => return Ok(admitted),
                     Ok(None) => self.stats.fork_no_room += 1,
-                    Err(PrefixError::MarkUnavailable) => self.stats.mark_restore_misses += 1,
-                    Err(PrefixError::Family { what, source }) => {
+                    Err(RestoreFailure::Candidate(PrefixError::MarkUnavailable)) => self.stats.mark_restore_misses += 1,
+                    Err(RestoreFailure::Candidate(PrefixError::Family { what, source })) => {
                         tracing::warn!(target: "cuteafd::prefix", what, error = %source, "prefix restore abandoned; trying another candidate");
                         self.stats.restore_failures += 1;
                         if self.layout.mark_bytes > 0 && hit.common == hit.frontier
@@ -444,7 +456,7 @@ impl<E: CopyEngine, M: Clone + Default> PrefixCache<E, M> {
                             self.stats.mark_restore_misses += 1;
                         }
                     }
-                    Err(error) => return Err(error),
+                    Err(RestoreFailure::Candidate(error) | RestoreFailure::Fatal(error)) => return Err(error),
                 }
             }
         }
@@ -638,7 +650,7 @@ impl<E: CopyEngine, M: Clone + Default> PrefixCache<E, M> {
     #[allow(clippy::too_many_arguments)]
     fn restore_hit<F: PrefixFamily<M, Placement = P>, P>(&mut self, family: &F, hit: &Hit, tokens: &[u32],
         context: &RestoreContext<'_>, total: usize, draft_capacity: usize, promoted: bool, build: &mut impl FnMut(Vec<u32>) -> P)
-        -> Result<Option<Admitted<P>>, PrefixError> {
+        -> Result<Option<Admitted<P>>, RestoreFailure> {
         let saved_media = self.entries[&hit.id].media.clone();
         let plan = family.plan_restore(RestoreCandidate { common: hit.common, snapshot_end: hit.frontier,
             target_end: tokens.len(), resume: hit.resume, media: context.media, saved_media: &saved_media });
@@ -652,7 +664,7 @@ impl<E: CopyEngine, M: Clone + Default> PrefixCache<E, M> {
                 Err(PrefixError::Family { what: "plan", source: "restore plan crosses a media span or claims exactness \
                     for a partial match".into() })
             } else { Ok(()) });
-        checked?;
+        checked.map_err(RestoreFailure::Candidate)?;
         let (source_end, resume) = (plan.lag.source_end, plan.resume());
         if resume == 0 {
             return Ok(None);
@@ -663,13 +675,14 @@ impl<E: CopyEngine, M: Clone + Default> PrefixCache<E, M> {
             return Ok(None);
         }
         let entry = self.entries.get(&hit.id).expect("the hit is kept while making room");
-        let (fork_pages, copies) = self.pool.fork_writable(&entry.pages, source_end, total, writable)?;
+        let (fork_pages, copies) = self.pool.fork_writable(&entry.pages, source_end, total, writable)
+            .map_err(PrefixError::from)?;
         let exact = plan.exact();
         let (mut mark, meta) = if exact { (entry.mark.clone(), Some(entry.meta.clone())) } else { (None, None) };
         let host_mark = if exact && self.layout.mark_bytes > 0 && mark.is_none() { entry.host_mark } else { None };
         if exact && self.layout.mark_bytes > 0 && mark.is_none() && host_mark.is_none() {
-            self.release(family, &fork_pages)?;
-            return Err(PrefixError::MarkUnavailable);
+            self.release_candidate(family, fork_pages, None, None)?;
+            return Err(RestoreFailure::Candidate(PrefixError::MarkUnavailable));
         }
         let after = (resume == tokens.len()).then(|| entry.after.clone());
         let session = entry.session.clone();
@@ -680,11 +693,14 @@ impl<E: CopyEngine, M: Clone + Default> PrefixCache<E, M> {
         if let Some(key) = host_mark {
             mark = match self.restore_mark(family, key, hit.id) {
                 Ok(mark) => mark,
-                Err(error) => { self.release(family, &pages)?; return Err(error); }
+                Err(error) => {
+                    self.release_candidate(family, pages, None, None)?;
+                    return Err(error);
+                }
             };
             if mark.is_none() {
-                self.release(family, &pages)?;
-                return Err(PrefixError::MarkUnavailable);
+                self.release_candidate(family, pages, None, None)?;
+                return Err(RestoreFailure::Candidate(PrefixError::MarkUnavailable));
             }
         }
         let mut placement = build(fork_pages);
@@ -703,37 +719,39 @@ impl<E: CopyEngine, M: Clone + Default> PrefixCache<E, M> {
                         .map_err(|e| ("restore draft pages cold", e)),
                 result => result.map_err(|e| ("restore draft pages", e)),
             });
+        // Entry marks and draft attachments remain owned by the entry. Only an H2D
+        // staging mark belongs to this fork and must follow it through failed cleanup.
+        let mut temporary_mark = if temporary { mark.take() } else { None };
         if let Err((what, source)) = restored {
-            // Drain before the pages can be handed out again; the family resets what it bound.
-            self.drain(family)?;
-            if let Err(error) = family.discard(&mut placement) {
-                tracing::error!(target: "cuteafd::prefix", %error, "discarding a failed restore");
-            }
-            self.release(family, &pages)?;
-            if temporary { self.give_back(family, mark)?; }
-            return Err(PrefixError::Family { what, source });
+            self.discard_candidate(family, &mut placement, pages, temporary_mark)?;
+            return Err(RestoreFailure::Candidate(PrefixError::Family { what, source }));
         }
-        if self.host.is_some() && mark.is_some() { self.drain(family)?; }
-        if temporary { self.give_back(family, mark)?; }
+        if self.host.is_some() && (mark.is_some() || temporary_mark.is_some()) {
+            if let Err(error) = self.drain(family) {
+                self.quarantine_candidate(pages, temporary_mark, None, true);
+                return Err(error.into());
+            }
+        }
+        self.give_back(family, temporary_mark.take())?;
         if promoted {
             let mark = self.entries.get_mut(&hit.id).and_then(|e| e.mark.take());
             self.give_back(family, mark)?;
         }
         let mut admitted = self.admit_draft(family, &mut placement, draft_capacity);
         if matches!(admitted, Err(PrefixError::DraftPages(_))) && draft.is_some() {
-            // Retained history is optional; do not reject a target hit when a cold
-            // drafter's smaller live credit fits beside the other active requests.
-            self.drain(family)?;
-            family.restore_draft_pages(None, &mut placement, resume).map_err(|source|
-                PrefixError::Family { what: "drop unadmitted draft history", source })?;
-            admitted = self.admit_draft(family, &mut placement, draft_capacity);
+            // Retained history is optional; retry admission with a cold drafter.
+            if let Err(error) = self.drain(family) {
+                self.quarantine_candidate(pages, None, None, true);
+                return Err(error.into());
+            }
+            self.dirty = true;
+            admitted = family.restore_draft_pages(None, &mut placement, resume).map_err(|source|
+                PrefixError::Family { what: "drop unadmitted draft history", source })
+                .and_then(|()| self.admit_draft(family, &mut placement, draft_capacity));
         }
         if let Err(error) = admitted {
-            self.drain(family)?;
-            family.discard(&mut placement).map_err(|source|
-                PrefixError::Family { what: "discard draft admission", source })?;
-            self.release(family, &pages)?;
-            return Err(error);
+            self.discard_candidate(family, &mut placement, pages, None)?;
+            return Err(RestoreFailure::Candidate(error));
         }
         let host_hit = promoted || temporary;
         self.stats.host_hits += u64::from(host_hit);
@@ -835,7 +853,7 @@ impl<E: CopyEngine, M: Clone + Default> PrefixCache<E, M> {
                     }
                     Err(error) => {
                         tracing::error!(target: "cuteafd::prefix", %error, "capture enqueue failed and did not drain; quarantining");
-                        self.quarantine.push(Quarantined { _pages: entry.pages, _mark: entry.mark, _draft: entry.draft });
+                        self.quarantine.push(Quarantined { _pages: entry.pages, _mark: entry.mark, _draft: entry.draft, family_cleanup: false });
                         self.stats.quarantined += 1;
                     }
                 }
@@ -888,7 +906,7 @@ impl<E: CopyEngine, M: Clone + Default> PrefixCache<E, M> {
             }
             Err(error) => {
                 tracing::error!(target: "cuteafd::prefix", %error, "queued capture did not drain; quarantining its storage");
-                self.quarantine.push(Quarantined { _pages: entry.pages, _mark: entry.mark, _draft: entry.draft });
+                self.quarantine.push(Quarantined { _pages: entry.pages, _mark: entry.mark, _draft: entry.draft, family_cleanup: false });
                 self.stats.quarantined += 1;
                 Ok(())
             }
@@ -995,7 +1013,7 @@ impl<E: CopyEngine, M: Clone + Default> PrefixCache<E, M> {
         // Target and draft copies become lookup-visible as one retired transaction.
         if entry.draft.is_some() {
             if let Err(error) = self.drain(family) {
-                self.quarantine.push(Quarantined { _pages: entry.pages, _mark: entry.mark, _draft: entry.draft });
+                self.quarantine.push(Quarantined { _pages: entry.pages, _mark: entry.mark, _draft: entry.draft, family_cleanup: false });
                 self.stats.quarantined += 1;
                 return Err(error);
             }
@@ -1176,7 +1194,7 @@ impl<E: CopyEngine, M: Clone + Default> PrefixCache<E, M> {
             if let Err(source) = copies.into_iter().try_for_each(|copy| family.copy_rows(copy)).and_then(|()| family.drain()) {
                 // Draining also covers a family that failed after enqueueing.
                 if let Err(source) = family.drain() {
-                    self.quarantine.push(Quarantined { _pages: fork_pages, _mark: None, _draft: None });
+                    self.quarantine.push(Quarantined { _pages: fork_pages, _mark: None, _draft: None, family_cleanup: false });
                     self.stats.quarantined += 1;
                     return Err(PrefixError::Family { what: "fork step drain", source });
                 }
@@ -1298,7 +1316,7 @@ impl<E: CopyEngine, M: Clone + Default> PrefixCache<E, M> {
     }
 
     fn restore_mark<F: PrefixFamily<M>>(&mut self, family: &F, key: cuteafd_hostcache::snapshot::Key, keep: EntryId)
-        -> Result<Option<Mark>, PrefixError> {
+        -> Result<Option<Mark>, RestoreFailure> {
         if !self.host.as_ref().is_some_and(|h| h.payload(key).is_some()) { return Ok(None); }
         self.reap_marks(family)?;
         let mark = if self.arena_marks() {
@@ -1314,16 +1332,19 @@ impl<E: CopyEngine, M: Clone + Default> PrefixCache<E, M> {
         };
         let tail = match Self::mark_segments(family, mark.as_ref()) {
             Ok(tail) => tail,
-            Err(error) => { self.give_back(family, mark)?; return Err(error); }
+            Err(error) => {
+                self.release_candidate(family, Vec::new(), mark, None)?;
+                return Err(RestoreFailure::Candidate(error));
+            }
         };
         let result = self.host.as_mut().expect("host enabled").restore_mark(key, tail);
         if !matches!(result, RestoreOutcome::Done { .. }) {
             if let Err(error) = self.host.as_mut().unwrap().engine_mut().release_barrier(Stream::Restore) {
-                self.quarantine.push(Quarantined { _pages: Vec::new(), _mark: mark, _draft: None });
+                self.quarantine.push(Quarantined { _pages: Vec::new(), _mark: mark, _draft: None, family_cleanup: false });
                 self.stats.quarantined += 1;
-                return Err(PrefixError::Host(format!("mark restore barrier: {error:#}")));
+                return Err(PrefixError::Host(format!("mark restore barrier: {error:#}")).into());
             }
-            self.give_back(family, mark)?;
+            self.release_candidate(family, Vec::new(), mark, None)?;
             self.stats.restore_failures += 1;
             return Ok(None);
         }
@@ -1332,8 +1353,8 @@ impl<E: CopyEngine, M: Clone + Default> PrefixCache<E, M> {
             if !replicas.is_empty() {
                 self.dirty = true;
                 if let Err(source) = family.copy_replicas(&replicas) {
-                    self.give_back(family, mark)?;
-                    return Err(PrefixError::Family { what: "mark replicas", source });
+                    self.release_candidate(family, Vec::new(), mark, None)?;
+                    return Err(RestoreFailure::Candidate(PrefixError::Family { what: "mark replicas", source }));
                 }
             }
         }
@@ -1392,6 +1413,11 @@ impl<E: CopyEngine, M: Clone + Default> PrefixCache<E, M> {
         while let Some(id) = self.victim(None) {
             self.evict(family, id)?;
         }
+        while let Some(index) = self.quarantine.iter().position(|q| q.family_cleanup) {
+            self.drain(family)?;
+            let owned = self.quarantine.remove(index);
+            self.release_candidate(family, owned._pages, owned._mark, owned._draft)?;
+        }
         Ok(())
     }
 
@@ -1417,6 +1443,37 @@ impl<E: CopyEngine, M: Clone + Default> PrefixCache<E, M> {
             self.dirty = false;
         }
         Ok(())
+    }
+
+    fn quarantine_candidate(&mut self, pages: Vec<u32>, mark: Option<Mark>,
+        draft: Option<super::DraftPageAttachment>, family_cleanup: bool) {
+        self.quarantine.push(Quarantined { _pages: pages, _mark: mark, _draft: draft, family_cleanup });
+        self.stats.quarantined += 1;
+    }
+
+    fn release_candidate<F: PrefixFamily<M>>(&mut self, family: &F, pages: Vec<u32>,
+        mark: Option<Mark>, draft: Option<super::DraftPageAttachment>) -> Result<(), PrefixError> {
+        if let Err(error) = self.drain(family).and_then(|()| self.release_draft(family, draft.as_ref())) {
+            self.quarantine_candidate(pages, mark, draft, true);
+            return Err(error);
+        }
+        // The drain above settled every family reader. These releases cannot enqueue work.
+        self.release(family, &pages)?;
+        self.give_back(family, mark)
+    }
+
+    fn discard_candidate<F: PrefixFamily<M>>(&mut self, family: &F, placement: &mut F::Placement,
+        pages: Vec<u32>, mark: Option<Mark>) -> Result<(), PrefixError> {
+        if let Err(error) = self.drain(family) {
+            self.quarantine_candidate(pages, mark, None, true);
+            return Err(error);
+        }
+        if let Err(source) = family.discard(placement) {
+            // A failed reset may still own a binding; do not recycle its storage.
+            self.quarantine_candidate(pages, mark, None, false);
+            return Err(PrefixError::Family { what: "discard restore", source });
+        }
+        self.release_candidate(family, pages, mark, None)
     }
 
     /// The family places each page where the pool says it lives (parity pools: GPU `id & 1`).
@@ -1670,12 +1727,14 @@ impl<E: CopyEngine, M: Clone + Default> PrefixCache<E, M> {
             None => self.take_mark_pages()?,
         };
         // The restore stream writes these pages and the mark: nothing queued may still use them.
-        self.drain(family)?;
+        if let Err(error) = self.drain(family) {
+            self.quarantine_candidate(pages, mark, None, true);
+            return Err(error);
+        }
         if let Err(source) = self.check_owners(family, &pages) {
             tracing::warn!(target: "cuteafd::prefix", error = %source, "host restore abandoned; prefilling");
             self.stats.restore_failures += 1;
-            self.release(family, &pages)?;
-            self.give_back(family, mark)?;
+            self.release_candidate(family, pages, mark, None)?;
             return Ok(None);
         }
         let ids = self.identities(family, &snapshot_tokens, &saved_media, &pages);
@@ -1684,18 +1743,21 @@ impl<E: CopyEngine, M: Clone + Default> PrefixCache<E, M> {
         let tail = match Self::mark_segments(family, mark.as_ref()) {
             Ok(tail) => tail,
             Err(error) => {
-                self.release(family, &pages)?;
-                self.give_back(family, mark)?;
-                return Err(error);
+                tracing::warn!(target: "cuteafd::prefix", %error, "host mark preparation failed");
+                self.stats.restore_failures += 1;
+                self.stats.mark_restore_misses += u64::from(self.layout.mark_bytes > 0);
+                self.release_candidate(family, pages, mark, None)?;
+                return Ok(None);
             }
         };
         let draft = match saved_draft.as_ref().map(|saved| family.promote_draft_pages(saved)).transpose() {
             Ok(draft) => draft,
             Err(source) if draft_exhaustion(source.as_ref()).is_some() => None,
             Err(source) => {
-                self.release(family, &pages)?;
-                self.give_back(family, mark)?;
-                return Err(PrefixError::Family { what: "reserve host draft pages", source });
+                tracing::warn!(target: "cuteafd::prefix", error = %source, "host draft preparation failed");
+                self.stats.restore_failures += 1;
+                self.release_candidate(family, pages, mark, None)?;
+                return Ok(None);
             }
         };
         if let Some(draft) = &draft {
@@ -1728,16 +1790,14 @@ impl<E: CopyEngine, M: Clone + Default> PrefixCache<E, M> {
                 // host snapshot pinned, instead of handing live targets back.
                 let host = self.host.as_mut().expect("checked");
                 if let Err(error) = host.engine_mut().release_barrier(Stream::Restore) {
-                    self.quarantine.push(Quarantined { _pages: pages, _mark: mark, _draft: draft });
+                    self.quarantine.push(Quarantined { _pages: pages, _mark: mark, _draft: draft, family_cleanup: false });
                     self.stats.quarantined += 1;
                     return Err(PrefixError::Host(format!("host restore release barrier: {error:#}")));
                 }
                 tracing::warn!(target: "cuteafd::prefix", tokens = len, "host restore abandoned; prefilling");
                 self.stats.restore_failures += 1;
                 if self.layout.mark_bytes > 0 { self.stats.mark_restore_misses += 1; }
-                self.release(family, &pages)?;
-                self.release_draft(family, draft.as_ref())?;
-                self.give_back(family, mark)?;
+                self.release_candidate(family, pages, mark, draft)?;
                 return Ok(None);
             }
         }
@@ -1752,17 +1812,14 @@ impl<E: CopyEngine, M: Clone + Default> PrefixCache<E, M> {
                 tracing::warn!(target: "cuteafd::prefix", error = %source, tokens = len, "host restore replicas failed; prefilling");
                 self.stats.restore_failures += 1;
                 if self.layout.mark_bytes > 0 { self.stats.mark_restore_misses += 1; }
-                self.release(family, &pages)?;
-                self.release_draft(family, draft.as_ref())?;
-                self.give_back(family, mark)?;
+                self.release_candidate(family, pages, mark, draft)?;
                 return Ok(None);
             }
         }
         // Restore copies and any replicas must retire before either attachment becomes visible.
         if draft.is_some() {
             if let Err(error) = self.drain(family) {
-                self.quarantine.push(Quarantined { _pages: pages, _mark: mark, _draft: draft });
-                self.stats.quarantined += 1;
+                self.quarantine_candidate(pages, mark, draft, true);
                 return Err(error);
             }
         }
