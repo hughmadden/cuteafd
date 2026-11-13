@@ -11,17 +11,21 @@ use crate::families::deepseek_v41::v41_target_pass::{DistributedTargetPass, Targ
 use std::rc::Rc;
 use crate::families::deepseek_v41::v41_projection_tp2::Kind;
 
+fn validate_expert_layers(layers: admission::LocalLayers,
+    tier: cuteafd_loader::placement::ExpertTierSetting) -> Result<()> {
+    // Admission resolves `all` against the inventory and validates exact pins.
+    // A tier can hold experts without pinning any complete layer.
+    if let admission::LocalLayers::Count(count) = layers {
+        let minimum = if tier.enabled() { 0 } else { 1 };
+        ensure!((minimum..=40).contains(&count), "dual RTX expert layers must be {minimum}..=40");
+    }
+    Ok(())
+}
+
 pub(super) fn worker(mut args: crate::cli::NativeServeArgs, mut receive: mpsc::Receiver<NativeRequest>,
     ready: &mut Option<oneshot::Sender<std::result::Result<(Option<std::sync::Arc<std::sync::atomic::AtomicBool>>, u32), anyhow::Error>>>,
     stats: std::sync::Arc<std::sync::Mutex<serde_json::Value>>) -> Result<()> {
-    // `all` becomes the expert inventory's exact count inside admission; this
-    // load-time floor only asserts that one routed layer stays resident.
-    match args.rtx_expert_layers {
-        admission::LocalLayers::Auto | admission::LocalLayers::All => {},
-        admission::LocalLayers::Count(count) => {
-            ensure!((1..=40).contains(&count), "dual RTX expert layers must be 1..=40");
-        }
-    };
+    validate_expert_layers(args.rtx_expert_layers, args.gpu_expert_tier)?;
     // AOT kernels keep their full scratch; row storage follows live capacity.
     let capacity = cuteafd_core::coordinator_programs::v41_live_rows(args.prefill_batch_tokens)
         .context("invalid V4.1 prefill batch")?;
@@ -704,6 +708,22 @@ pub(super) fn worker(mut args: crate::cli::NativeServeArgs, mut receive: mpsc::R
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn whole_layer_pin_validation_allows_zero_only_with_a_tier() -> Result<()> {
+        use admission::LocalLayers::{All, Auto, Count};
+        use cuteafd_loader::placement::ExpertTierSetting::{Off, Auto as AutoTier, PerLayer};
+        for tier in [Off, AutoTier, PerLayer(6)] {
+            for layers in [Auto, All, Count(1), Count(40)] {
+                validate_expert_layers(layers, tier)?;
+            }
+            assert_eq!(validate_expert_layers(Count(0), tier).is_ok(), tier.enabled());
+            for count in [41, usize::MAX] {
+                assert!(validate_expert_layers(Count(count), tier).is_err());
+            }
+        }
+        Ok(())
+    }
+
     #[test]
     #[ignore = "requires CUTEAFD_NATIVE_LIB, CUTEAFD_SNAPSHOT, CUTEAFD_DUAL_PEERS, two GPUs and live Sparks"]
     fn distributed_worker_serves_text_requests() -> Result<()> {
