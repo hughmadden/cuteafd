@@ -271,7 +271,7 @@ fn native_layer3_same_quant() -> Result<()> {
         "up1".into(),
         "--layers".into(),
         "4".into(),
-        "--max-context".into(),
+        "--max-context-tokens".into(),
         "128".into(),
         "--pool-tokens".into(),
         "256".into(),
@@ -323,7 +323,7 @@ fn native_layer3_same_quant() -> Result<()> {
                     let name = if rows > 64 { "exlr8_a16_grouped" } else { "exlr8_a16_serving" };
                     ensure!(pair.group_rows(rows)? == cuteafd_ffi::exlr8::group_rows(engine.programs.spec(name)?)?,
                         "native TP2 serving grouping differs from the export ABI");
-                    engine.moe_front(w, &engine.weights.layers[3], rows)?;
+                    engine.moe_front(3, w, &engine.weights.layers[3], rows)?;
                     engine.shared_on(1, 3, w1, &engine.peer()?.layers[3], Scalar::I32(rows as i32), "m4096")?;
                     engine.tp2_pair(3, 0, w, w1, rows, "m4096")?;
                     engine.exchange()?.wait(0, slot(3, true, 0))?;
@@ -459,7 +459,7 @@ fn prefill_lanes_byte_exact(total: usize, chunk: usize, waves: usize) -> Result<
         "--device".into(), "0".into(),
         "--split-device".into(), "1".into(),
         "--attention-placement".into(), "context".into(),
-        "--max-context".into(), context.to_string().into(),
+        "--max-context-tokens".into(), context.to_string().into(),
         "--pool-tokens".into(), context.to_string().into(),
         "--prefill-rows".into(), chunk.to_string().into(),
         "--prefill-waves".into(), waves.to_string().into(),

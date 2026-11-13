@@ -1,9 +1,45 @@
 //! Native graph adapters. The containing wave owns stable workspace/buffers and
 //! drains them before insert/clear; GraphOwner retains weight references.
-use super::{GraphBank, GraphOwner};
+use super::{GraphBank, GraphOwner, GraphPolicy};
 use anyhow::{ensure, Result};
 use cuteafd_ffi::NativeLibrary;
 use std::ffi::c_void;
+use super::bank::CaptureTicket;
+use super::device::{Cycle, Estimate, Miss, ReleaseMeasurement, Site};
+
+// Explicit opt-in: unattached wrappers continue to use the legacy methods.
+macro_rules! cache_methods {
+    ($key:ty) => {
+        pub fn attach_device(&mut self, library: &NativeLibrary, device: i32, reserve: u64, site: Site) -> Result<()> {
+            self.bank.attach_device(library, device, reserve, site)
+        }
+        pub fn cache_cycle(&mut self, cycle: Cycle) { self.bank.cache_cycle(cycle); }
+        pub fn cache_needs_boundary(&self) -> bool { self.bank.cache_needs_boundary() }
+        pub fn cache_measured(&mut self, bytes: u64) { self.bank.cache_measured(bytes); }
+        pub fn cache_tick(&mut self) { self.bank.cache_tick(); }
+        /// # Safety
+        /// Captured storage is persistent and outlives all graph launches.
+        pub unsafe fn cache_evict_persistent(&mut self) {
+            // SAFETY: caller guarantees persistent backing for every captured pointer.
+            unsafe { self.bank.cache_evict_persistent(); }
+        }
+
+        pub fn cache_drain(&mut self, drain: impl FnOnce() -> Result<()>,
+            measure: impl FnOnce() -> Result<ReleaseMeasurement>) -> Result<()> {
+            self.bank.cache_drain(drain, measure)
+        }
+        pub fn cache_miss(&mut self, key: &$key, pinned: bool, estimate: Option<Estimate>) -> Miss {
+            self.bank.cache_miss(key, pinned, estimate)
+        }
+        pub fn cache_ticket(&mut self, key: &$key, pinned: bool, estimate: Option<Estimate>) -> Option<CaptureTicket> {
+            self.bank.cache_ticket(key, pinned, estimate)
+        }
+        pub fn cache_cancel(&mut self, id: u64) { self.bank.cache_cancel(id); }
+        pub fn cache_topology(&mut self, id: u64, nodes: u64, width: usize, spans: bool) {
+            self.bank.cache_topology(id, nodes, width, spans);
+        }
+    };
+}
 
 /// Large (above-decode) shapes a bank retains per layer: the full prefill chunk
 /// and the decoder replay. Other large shapes are executed eagerly upstream.
@@ -18,8 +54,32 @@ pub(crate) struct LayerGraphs<'w, 'a, W> {
 }
 
 impl<'w, 'a, W> LayerGraphs<'w, 'a, W> {
-    pub fn new(library: &'a NativeLibrary, decode_rows: u32) -> Self {
-        Self { library, bank: GraphBank::new(None), current: [None; 40], retain_small: false, decode_rows }
+    cache_methods!((usize, u32));
+
+    pub fn cached_launch(&mut self, layer: usize, weights: &W, rows: u32) -> Option<(*mut c_void, u32)> {
+        if !std::ptr::eq(self.bank.get(&(layer, rows))?.pins, weights) { return None; }
+        self.bank.cached_launch(&(layer, rows)).map(|owner| (owner.raw, rows))
+    }
+
+    /// # Safety
+    /// The executable has not launched; weights and containing workspace remain
+    /// pinned until every consumer drains. A ticket owns cancellation on error.
+    pub unsafe fn cache_insert(&mut self, layer: usize, weights: &'w W, rows: u32,
+        raw: *mut c_void, ticket: CaptureTicket, nodes: u64, width: usize, spans: bool) -> Result<()> {
+        ensure!(layer < 40 && (1..=4096).contains(&rows) && !raw.is_null(), "invalid layer graph binding");
+        ensure!(self.bank.get(&(layer, rows)).is_none(), "cached layer graph already present");
+        let device = self.library.cuda_get_device()?;
+        // SAFETY: caller retains weights and workspace through the consumer drain.
+        let owner = unsafe { GraphOwner::new(self.library, device, raw, weights)? };
+        self.bank.census_capture_device_key(std::any::type_name::<W>(), device, &(layer, rows), raw);
+        self.bank.cache_commit((layer, rows), owner, ticket, nodes, width, spans);
+        self.current[layer] = Some(rows);
+        Ok(())
+    }
+
+    pub fn new(library: &'a NativeLibrary, decode_rows: u32, family: &'static str) -> Self {
+        Self { library, bank: GraphBank::with_family(GraphPolicy::Budgeted { bytes: None }, family),
+            current: [None; 40], retain_small: false, decode_rows }
     }
     pub fn get(&self, layer: usize, weights: &W) -> Option<(*mut c_void, u32)> {
         self.get_shape(layer, weights, self.current.get(layer).copied().flatten()?)
@@ -29,11 +89,24 @@ impl<'w, 'a, W> LayerGraphs<'w, 'a, W> {
         std::ptr::eq(owner.pins, weights).then_some((owner.raw, rows))
     }
     pub fn enable_small_shapes(&mut self) { self.retain_small = true; }
+    pub fn declare_startup(&mut self, keys: &[(usize, u32)]) -> Result<()> {
+        ensure!(keys.iter().all(|&(layer, rows)| layer < 40 && (1..=self.decode_rows).contains(&rows)),
+            "startup layer graph key exceeds decode geometry");
+        self.bank.declare_startup(keys)?;
+        self.retain_small = true;
+        Ok(())
+    }
+    pub fn finish_startup(&mut self) -> Result<()> { self.bank.finish_startup() }
+    pub fn capture_allowed(&self, layer: usize, rows: u32) -> bool {
+        self.bank.capture_allowed(&(layer, rows))
+    }
     /// # Safety
     /// All launches using the containing wave's storage have drained. The caller
     /// retains that storage until clear. On failure caller still owns graph.
     pub unsafe fn insert(&mut self, layer: usize, weights: &'w W, rows: u32, graph: *mut c_void) -> Result<()> {
         ensure!(layer < 40 && (1..=4096).contains(&rows) && !graph.is_null(), "invalid layer graph binding");
+        ensure!(!self.bank.cache_attached(), "attached layer bank requires cache_insert");
+        ensure!(self.capture_allowed(layer, rows), "layer graph capture outside startup inventory or after seal");
         let different_owner = self.bank.count(|(l, _)| *l == layer) > 0
             && self.current[layer].and_then(|r| self.bank.get(&(layer, r)))
                 .is_some_and(|owner| !std::ptr::eq(owner.pins, weights));
@@ -53,6 +126,7 @@ impl<'w, 'a, W> LayerGraphs<'w, 'a, W> {
         let device = self.library.cuda_get_device()?;
         // SAFETY: the weight borrow pins its storage and the containing wave pins workspace.
         let owner = unsafe { GraphOwner::new(self.library, device, graph, weights)? };
+        self.bank.census_capture_device_key(std::any::type_name::<W>(), device, &(layer, rows), graph);
         self.bank.insert((layer, rows), owner, None);
         self.current[layer] = Some(rows);
         drop(self.bank.drain_retired(|| Ok(()))?);
@@ -66,7 +140,11 @@ impl<'w, 'a, W> LayerGraphs<'w, 'a, W> {
     /// Every launch of this layer's graph completed on every consumer stream.
     pub unsafe fn remove(&mut self, layer: usize) -> Result<()> {
         ensure!(layer < 40, "invalid layer graph index");
-        self.bank.retire_matching(|(l, _)| *l == layer);
+        if self.bank.cache_attached() {
+            self.bank.cache_remove_drained(|(l, _)| *l == layer);
+        } else {
+            self.bank.retire_matching(|(l, _)| *l == layer);
+        }
         self.current[layer] = None;
         drop(self.bank.drain_retired(|| Ok(()))?);
         Ok(())
@@ -74,7 +152,11 @@ impl<'w, 'a, W> LayerGraphs<'w, 'a, W> {
     /// # Safety
     /// Every queued use of this wave's captured pointers completed.
     pub unsafe fn clear(&mut self) -> Result<()> {
-        self.bank.retire_all();
+        if self.bank.cache_attached() {
+            self.bank.cache_clear_drained();
+        } else {
+            self.bank.retire_all();
+        }
         self.current = [None; 40];
         drop(self.bank.drain_retired(|| Ok(()))?);
         Ok(())
@@ -90,10 +172,39 @@ pub(crate) struct RowGraphs<'a> {
     site: &'static str,
 }
 impl<'a> RowGraphs<'a> {
-    pub fn new(library: &'a NativeLibrary, site: &'static str, decode_rows: usize) -> Self {
-        Self { library, bank: GraphBank::new(None), decode_rows, site }
+    cache_methods!(usize);
+
+    pub fn cached_launch(&mut self, rows: usize) -> Option<*mut c_void> {
+        self.bank.cached_launch(&rows).map(|owner| owner.raw)
+    }
+
+    /// # Safety
+    /// The executable has not launched; the containing wave pins its workspace
+    /// through the consumer drain. A ticket owns cancellation on every error.
+    pub unsafe fn cache_insert(&mut self, rows: usize, raw: *mut c_void,
+        ticket: CaptureTicket, nodes: u64, width: usize, spans: bool) -> Result<()> {
+        ensure!((1..=4096).contains(&rows) && !raw.is_null(), "invalid row graph binding");
+        ensure!(self.bank.get(&rows).is_none(), "cached row graph already present");
+        let device = self.library.cuda_get_device()?;
+        // SAFETY: caller retains all captured storage through the consumer drain.
+        let owner = unsafe { GraphOwner::new(self.library, device, raw, ())? };
+        self.bank.census_capture_device_key(self.site, device, &rows, raw);
+        self.bank.cache_commit(rows, owner, ticket, nodes, width, spans);
+        Ok(())
+    }
+
+    pub fn new(library: &'a NativeLibrary, site: &'static str, decode_rows: usize, family: &'static str) -> Self {
+        Self { library, bank: GraphBank::with_family(GraphPolicy::Budgeted { bytes: None }, family),
+            decode_rows, site }
     }
     pub fn get(&self, rows: usize) -> Option<*mut c_void> { self.bank.get(&rows).map(|owner| owner.raw) }
+    pub fn declare_startup(&mut self, rows: &[usize]) -> Result<()> {
+        ensure!(rows.iter().all(|r| (1..=self.decode_rows).contains(r)),
+            "startup row graph key exceeds decode geometry");
+        self.bank.declare_startup(rows)
+    }
+    pub fn finish_startup(&mut self) -> Result<()> { self.bank.finish_startup() }
+    pub fn capture_allowed(&self, rows: usize) -> bool { self.bank.capture_allowed(&rows) }
     /// # Safety
     /// All launches on this wave's storage drained. The wave retains weights,
     /// workspace, geometry and buffers until clear, then drops them afterward.
@@ -105,6 +216,8 @@ impl<'a> RowGraphs<'a> {
     }
     pub unsafe fn insert(&mut self, rows: usize, graph: *mut c_void) -> Result<()> {
         ensure!((1..=4096).contains(&rows) && !graph.is_null(), "invalid row graph binding");
+        ensure!(!self.bank.cache_attached(), "attached row bank requires cache_insert");
+        ensure!(self.capture_allowed(rows), "row graph capture outside startup inventory or after seal");
         let device = self.library.cuda_get_device()?;
         // SAFETY: the containing wave owns and pins every captured allocation.
         let owner = unsafe { GraphOwner::new(self.library, device, graph, ())? };
@@ -114,6 +227,7 @@ impl<'a> RowGraphs<'a> {
                 self.bank.retire_oldest(|&r| r > decode_rows && r != rows);
             }
         }
+        self.bank.census_capture_device_key(self.site, device, &rows, graph);
         self.bank.insert(rows, owner, None);
         drop(self.bank.drain_retired(|| Ok(()))?);
         tracing::debug!(target: "cuteafd::graph_capture", site = self.site, rows, device,
@@ -123,10 +237,156 @@ impl<'a> RowGraphs<'a> {
     /// # Safety
     /// Every queued use completed before releasing graph executables or storage.
     pub unsafe fn clear(&mut self) -> Result<()> {
-        self.bank.retire_all();
+        if self.bank.cache_attached() {
+            self.bank.cache_clear_drained();
+        } else {
+            self.bank.retire_all();
+        }
         drop(self.bank.drain_retired(|| Ok(()))?);
         Ok(())
     }
     #[cfg(test)]
     pub fn len(&self) -> usize { self.bank.len() }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unattached_wrappers_preserve_legacy_decisions_and_stats() -> Result<()> {
+        let fixture = cuteafd_ffi::native_library_lifetime_fixture::Fixture::build_for_tests()?;
+        let library = fixture.load()?;
+        let mut rows = RowGraphs::new(&library, "fixture", 64, "test");
+        let weights = ();
+        let mut layers = LayerGraphs::new(&library, 64, "test");
+        assert!(rows.capture_allowed(80) && layers.capture_allowed(0, 80));
+        assert!(!rows.bank.cache_attached() && !layers.bank.cache_attached());
+        // SAFETY: the fake DSO records no device work; these owners never launch.
+        unsafe {
+            for width in [1, 80, 96, 128] {
+                library.cuda_graph_begin_capture(std::ptr::null_mut())?;
+                let graph = library.cuda_graph_end_capture(std::ptr::null_mut())?;
+                rows.insert(width, graph)?;
+            }
+        }
+        assert!(rows.get(1).is_some() && rows.get(80).is_none());
+        assert!(rows.get(96).is_some() && rows.get(128).is_some());
+        assert_eq!(rows.bank.stats(), super::super::GraphStats { captures: 4, ..Default::default() });
+        assert_eq!(rows.bank.retired_len(), 0);
+        assert!(rows.would_retire(160));
+        layers.declare_startup(&[(0, 1)])?;
+        // SAFETY: fixture graph has no queued work and weights outlive the bank.
+        unsafe {
+            library.cuda_graph_begin_capture(std::ptr::null_mut())?;
+            layers.insert(0, &weights, 1, library.cuda_graph_end_capture(std::ptr::null_mut())?)?;
+        }
+        layers.finish_startup()?;
+        assert!(!layers.capture_allowed(0, 1) && !layers.capture_allowed(0, 6));
+        assert_eq!(layers.bank.stats(), super::super::GraphStats { captures: 1, ..Default::default() });
+        assert!(layers.get_shape(0, &weights, 1).is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn capture_ticket_cancels_and_commits_surviving_owner() -> Result<()> {
+        use super::super::device::{Basis, Preference};
+        let mut bank = GraphBank::<usize, ()>::new(None);
+        bank.attach_device_for_test(-8801, 64 << 20, Site { name: "ticket-fixture", cycle: Cycle::Other,
+            preference: Preference::Capture, bootstrap: 2 << 20, basis: Basis::Bytes, spans_devices: true })?;
+        let ticket = bank.cache_ticket(&1, false, None).expect("capture");
+        drop(ticket);
+        assert!(bank.cache_needs_boundary());
+        bank.cache_measured(2 << 20);
+        let ticket = bank.cache_ticket(&2, false, None).expect("capture");
+        bank.cache_commit(2, (), ticket, 12, 1, true);
+        bank.cache_measured(2 << 20);
+        assert_eq!(bank.cached_launch(&2), Some(&()));
+        Ok(())
+    }
+}
+
+impl<W> super::CacheAttached for LayerGraphs<'_, '_, W> {
+    cache_attached_methods!(bank);
+}
+impl super::CacheAttached for RowGraphs<'_> {
+    cache_attached_methods!(bank);
+}
+
+#[cfg(test)]
+mod visitor_tests {
+    use super::*;
+    use super::super::{BindingGraphs, CacheAttached};
+    #[test]
+    fn heterogeneous_control_attaches_one_device_pool() -> Result<()> {
+        use super::super::device::{Basis, Preference};
+        let fixture = cuteafd_ffi::native_library_lifetime_fixture::Fixture::build_for_tests()?;
+        let library = fixture.load()?;
+        let mut direct = GraphBank::<u8, ()>::new(None);
+        let mut layers = LayerGraphs::<'_, '_, ()>::new(&library, 64, "test");
+        let mut rows = RowGraphs::new(&library, "fixture", 64, "test");
+        let mut bindings = BindingGraphs::<u16>::new(&library, "fixture")?;
+        let banks: [&mut dyn CacheAttached; 4] = [&mut direct, &mut layers, &mut rows, &mut bindings];
+        for bank in banks {
+            bank.attach(&library, -8802, 64 << 20, Site { name: "visitor-fixture", cycle: Cycle::Other,
+                preference: Preference::Capture, bootstrap: 2 << 20, basis: Basis::Bytes,
+                spans_devices: false })?;
+            bank.cycle(Cycle::Verify);
+            assert!(!bank.needs_boundary());
+            bank.tick();
+            bank.drain(&mut || Ok(()), &mut || Ok(ReleaseMeasurement { released: 0 }))?;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod clear_tests {
+    use super::*;
+    use super::super::{BindingGraphs, CacheAttached};
+    #[test]
+    fn attached_wrapper_clear_releases_live_capacity_not_physical_charge() -> Result<()> {
+        use super::super::device::{self, Basis, Preference};
+        let fixture = cuteafd_ffi::native_library_lifetime_fixture::Fixture::build_for_tests()?;
+        let library = fixture.load()?;
+        let weights = ();
+        let mut rows = RowGraphs::new(&library, "clear-row", 64, "test");
+        let mut layers = LayerGraphs::new(&library, 64, "test");
+        let mut bindings = BindingGraphs::<usize>::new(&library, "clear-binding")?;
+        let site = Site { name: "clear-test", cycle: Cycle::Other, preference: Preference::Capture,
+            bootstrap: 2 << 20, basis: Basis::Bytes, spans_devices: false };
+        for bank in [&mut rows as &mut dyn CacheAttached, &mut layers, &mut bindings] {
+            bank.attach(&library, -8804, 64 << 20, site)?;
+        }
+        let capture = || -> Result<*mut c_void> {
+            // SAFETY: fixture records no device work or referenced allocations.
+            unsafe {
+                library.cuda_graph_begin_capture(std::ptr::null_mut())?;
+                library.cuda_graph_end_capture(std::ptr::null_mut())
+            }
+        };
+        let row_ticket = rows.cache_ticket(&1, false, None).unwrap();
+        let layer_ticket = layers.cache_ticket(&(0, 1), false, None).unwrap();
+        let binding_ticket = bindings.cache_ticket(&1, false, None).unwrap();
+        // SAFETY: fake executables never launch; all fixture storage outlives them.
+        unsafe {
+            rows.cache_insert(1, capture()?, row_ticket, 1, 1, false)?;
+            layers.cache_insert(0, &weights, 1, capture()?, layer_ticket, 1, 1, false)?;
+            bindings.cache_insert(1, capture()?, binding_ticket, 1, 1, false)?;
+        }
+        rows.cache_measured(6 << 20);
+        let snapshot = || device::snapshots().into_iter().find(|row| row.device == -8804).unwrap();
+        assert_eq!(snapshot().pools.live_execs, 3);
+        let charged = snapshot().charged;
+        // SAFETY: no fixture launch was submitted.
+        unsafe { rows.clear()?; layers.remove(0)?; bindings.clear()?; }
+        let after = snapshot();
+        assert_eq!(after.pools.live_execs, 0);
+        assert_eq!(after.pools.live_nodes, 0);
+        assert_eq!(after.charged, charged);
+        assert!(rows.cache_ticket(&1, false, None).is_some());
+        assert!(layers.cache_ticket(&(0, 1), false, None).is_some());
+        assert!(bindings.cache_ticket(&1, false, None).is_some());
+        Ok(())
+    }
 }

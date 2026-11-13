@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 from pathlib import Path
 import sys
 
@@ -13,9 +14,12 @@ import _pinned_sparkinfer
 def programs(hidden=6144, units=16, top_k=8, max_groups=512, role="all", experts=256,
              swiglu_limit=0):
     from b12x.integration.cuteafd.exlr8_glue import exlr8_export_programs
-    return exlr8_export_programs(role, hidden=hidden, units=units,
+    result = exlr8_export_programs(role, hidden=hidden, units=units,
                                   top_k=top_k, max_groups=max_groups, experts=experts,
                                   swiglu_limit=swiglu_limit)
+    if os.environ.get("CUTEAFD_BUILD_KIND", "development") != "release":
+        result = [item for item in result if item[0] != "a16_serving_core" and "reply" not in item[0]]
+    return result
 
 
 def main():

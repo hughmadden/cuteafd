@@ -118,14 +118,6 @@ pub fn spark_package_worlds(family: &str, format: &str) -> Vec<usize> {
     }).collect()
 }
 
-/// Wire topology qualification is format-independent; checkpoint admission still
-/// checks the selected family's recipe and native whole-K32 ownership.
-pub fn spark_ownership_topology(tp: usize, ep: usize) -> bool {
-    (ep == 1 && ["v41", "dsv4f", "dsv4p"].iter()
-        .any(|family| spark_package_worlds(family, "mxfp4").contains(&tp)))
-        || matches!((tp, ep), (2, 2) | (3, 2) | (2, 3))
-}
-
 /// Exact-even ownership stays contiguous; uneven units balance across layers
 /// (native K32) or experts and layers (H128).
 pub fn balanced_rule(unit_columns: usize, units: usize, world: usize) -> UnitRule {

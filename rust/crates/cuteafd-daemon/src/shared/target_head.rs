@@ -56,6 +56,20 @@ impl TargetHead {
         })
     }
 
+    pub fn blas_head(self, bf16: bool) -> cuteafd_loader::placement::planner::serving::BlasHead {
+        use cuteafd_loader::placement::planner::serving::BlasHead;
+        if !bf16 { BlasHead::Native } else {
+            match self { Self::Tensor => BlasHead::TensorLt, Self::Exact => BlasHead::Gemm }
+        }
+    }
+
+    pub fn native_mode(self) -> cuteafd_ffi::programs::HeadMode {
+        match self {
+            Self::Tensor => cuteafd_ffi::programs::HeadMode::TensorLt,
+            Self::Exact => cuteafd_ffi::programs::HeadMode::Gemm,
+        }
+    }
+
     /// Whether this setting takes tensor cores (every row count, or none).
     pub fn tensor_cores(self) -> bool {
         self == Self::Tensor
@@ -101,16 +115,21 @@ mod tests {
     }
 
     /// Every family's BF16 target logits take this route (GLM 5.3, GLM 5.3 Flash, MiMo, Qwen,
-    /// DeepSeek V4, V4.1 single-GPU and split vocabulary heads), and none launches its BF16 target
-    /// head on the pedantic GEMM directly.
+    /// DeepSeek V4 including its dSpark drafter, V4.1 single-GPU and split vocabulary heads), and
+    /// none launches its BF16 target head on the pedantic GEMM directly: the head handle is created
+    /// for the configured route, and the native entry points refuse a handle created for the other
+    /// one (V4's dSpark draft block failed at every row count until it took this route).
     #[test]
     fn every_family_target_head_takes_the_shared_route() {
         let sources = [
+            ("muse_spark/forward.rs", include_str!("../families/muse_spark/forward.rs"), "shared::target_head::launch("),
             ("glm5/engine.rs", include_str!("../families/glm5/engine.rs"), "shared::target_head::launch("),
             ("glm5_flash/engine.rs", include_str!("../families/glm5_flash/engine.rs"), "shared::target_head::launch("),
             ("mimo_v2/head.rs", include_str!("../families/mimo_v2/head.rs"), "shared::target_head::launch("),
             ("qwen4/engine.rs", include_str!("../families/qwen4/engine.rs"), "shared::target_head::launch("),
             ("deepseek_v4/engine.rs", include_str!("../families/deepseek_v4/engine.rs"), "shared::target_head::launch("),
+            ("deepseek_v4/engine/dspark.rs", include_str!("../families/deepseek_v4/engine/dspark.rs"),
+                "shared::target_head::launch("),
             ("deepseek_v41/v41_target_head.rs", include_str!("../families/deepseek_v41/v41_target_head.rs"),
                 "project_target_vocabulary("),
             ("deepseek_v41/v41_target_head/distributed.rs",
@@ -127,6 +146,8 @@ mod tests {
             ("glm5/engine.rs", include_str!("../families/glm5/engine.rs"), "super::launch_head(self.library"),
             ("qwen4/engine.rs", include_str!("../families/qwen4/engine.rs"), "w.head.launch(x.cast()"),
             ("deepseek_v4/engine.rs", include_str!("../families/deepseek_v4/engine.rs"), "?.launch(w.y.buffer"),
+            ("deepseek_v4/engine/dspark.rs", include_str!("../families/deepseek_v4/engine/dspark.rs"),
+                "?.launch(w.y.buffer"),
         ] {
             assert!(!source.contains(old), "{name} still launches its target head directly");
         }

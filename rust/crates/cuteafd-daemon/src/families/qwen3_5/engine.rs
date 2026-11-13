@@ -3,12 +3,14 @@
 use super::{block::{Blocks, Planes, Step}, programs::DensePrograms, weights::DenseWeights};
 use crate::shared::{memory::device::{Allocation, Device, Stream}, qwen::{GdnBank, GdnLayout, LayerStateMap},
     qwen::weights::WeightReader, target_head::TargetHead, token_io::{DeviceLogits, EmbedPlacement, EmbedSource, TokenEmbedding}};
+use crate::shared::memory::Tag;
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::{programs::{Programs, Scalar, VocabularyHead}, CuteafdDeviceBuffer, NativeLibrary};
 use cuteafd_loader::{families::{qwen::HybridAttention, qwen3_5::Qwen35Config}, plan::checkpoint::Checkpoint,
-    placement::{self, families::qwen3_5::{DenseInputs, NativeBuffers, NativeWeights}, Baseline, GpuBudget}};
+    placement::{families::qwen3_5::{self, DenseFacts, NativeBuffers, NativeWeights, ServingFacts},
+        planner::{Operation, Pin, PrefillShape, Request}}};
 
-const _: () = assert!(placement::families::qwen3_5::HEAD_WORKSPACE
+const _: () = assert!(qwen3_5::HEAD_WORKSPACE
     == cuteafd_ffi::programs::VOCABULARY_HEAD_WORKSPACE);
 
 const ROWS: usize = 4096;
@@ -19,16 +21,19 @@ const PREFIX: &str = "model.language_model.";
 mod verify;
 #[path = "rows.rs"]
 mod rows;
+#[path = "graphs.rs"]
+mod graphs;
 #[path = "mtp.rs"]
 pub(crate) mod mtp;
 #[path = "prefix.rs"]
 pub(crate) mod prefix;
 pub(crate) use verify::DenseMark;
-pub(crate) use placement::families::qwen3_5::DrafterBytes;
+pub(crate) use qwen3_5::DrafterBytes;
 
 pub(crate) struct DenseEngine<'a> {
     // Drain queued work before fields retaining buffers/weights begin dropping.
     stream: Stream<'a>,
+    graphs: graphs::Graphs<'a>,
     pub(crate) cfg: Qwen35Config,
     pub(crate) kv_format: cuteafd_loader::families::qwen4::Qwen4KvCache,
     programs: &'a Programs<'a>,
@@ -46,6 +51,7 @@ pub(crate) struct DenseEngine<'a> {
     head_rows: usize,
     _head_workspace: Allocation<'a>,
     pub(crate) pool_tokens: usize,
+    pub(crate) admitted_host_config: Option<cuteafd_hostcache::config::Config>,
     pub(crate) position: usize,
     slots: Vec<rows::Slot>,
     prefix_arena: Option<std::rc::Rc<Allocation<'a>>>,
@@ -83,7 +89,7 @@ mod hook_borrow_tests {
         // Startup compares independently loaded allocation owners to offline
         // native admission, including multislot marks and retained prefixes.
         let mut engine = DenseEngine::with_prefix(&library, &programs, &checkpoint, cfg, None, None, 4,
-            Some(crate::shared::prefix::MarkRule { lanes: 4, entries: 4, budget_bytes: 1 << 30, host: false }), std::env::var("CUTEAFD_DENSE_TEST_KV_CACHE").unwrap_or_else(|_| "bf16".into()).parse()?, false)?;
+            Some(crate::shared::prefix::MarkRule { lanes: 4, entries: 4, budget_bytes: 1 << 30, host: false }), std::env::var("CUTEAFD_DENSE_TEST_KV_CACHE").unwrap_or_else(|_| "bf16".into()).parse()?, false, None, true)?;
         assert!(engine.pool_tokens >= 262144);
         let tokens = (1..=9).collect::<Vec<_>>();
         engine.verify_check(&tokens)?;
@@ -130,14 +136,17 @@ impl<'a> DenseEngine<'a> {
 
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn with_prefix(library: &'a NativeLibrary, programs: &'a Programs<'a>, checkpoint: &'a Checkpoint,
-        cfg: Qwen35Config, requested_pool: Option<u64>, drafter: Option<DrafterBytes>, slots: usize,
-        prefix: Option<crate::shared::prefix::MarkRule>, kv_format: cuteafd_loader::families::qwen4::Qwen4KvCache, full_prefill_logits: bool) -> Result<Self> {
+        mut cfg: Qwen35Config, requested_pool: Option<u64>, drafter: Option<DrafterBytes>, slots: usize,
+        prefix: Option<crate::shared::prefix::MarkRule>, kv_format: cuteafd_loader::families::qwen4::Qwen4KvCache, full_prefill_logits: bool,
+        serving: Option<(&crate::shared::prefix::PrefixArgs, usize, bool, Option<u64>)>, verify_check: bool) -> Result<Self> {
         ensure!((1..=cuteafd_core::concurrency::state_slots(cuteafd_core::concurrency::MAX_CONCURRENCY) as usize).contains(&slots), "dense state storage must be in 1..=64 slots");
         let reader = WeightReader { library, checkpoint };
-        let format = super::weights::DenseFormat::detect(&reader)?;
+        let format = super::weights::DenseFormat::detect(checkpoint)?;
         let admitted = DensePrograms::new(&cfg, programs, kv_format, format)?;
         let weight_bytes = NativeWeights::native(checkpoint, &cfg, admitted.norm_dtype.clone())?;
+        let target_arena = super::weights::target_arena(checkpoint, &cfg, admitted.norm_dtype.clone(), format)?;
         programs.load_matching(|name| name.starts_with(&format!("{}_", admitted.prefix)))?;
+        crate::shared::inventory::preload_native_modules(library)?;
         let device = Device { library, id: library.cuda_get_device()? };
         let stream = Stream::new(device)?;
         let layout = GdnLayout::new(cfg.gdn)?;
@@ -149,43 +158,102 @@ impl<'a> DenseEngine<'a> {
         let buffers = NativeBuffers::new(&cfg, admitted.scratch_bytes, slots, prefix_marks, full_prefill_logits)?;
         ensure!(buffers.mark_bytes == mark_bytes && buffers.prefix == prefix_bytes,
             "dense native prefix admission differs from state layout");
-        let (layer_bytes, fixed) = weight_bytes.demands(&cfg, &buffers, slots);
         let sizes = buffers.planes;
         let logit_bytes = buffers.logits;
+        // The live sample fixes the physical witness; the typed admission then
+        // consumes it without re-solving for a smaller context or pool.
         let (free, total) = library.cuda_memory_info()?;
-        let placement = placement::families::qwen3_5::placement(DenseInputs { cfg: &cfg,
-            gpu: GpuBudget { capacity_bytes: total as u64, headroom_bytes: 1 << 30,
-                baseline: Baseline::Measured { free_bytes: free as u64 } }, layers: &layer_bytes,
-            fixed, drafter, requested_pool, max_context: cfg.max_context as u64,
-            record_bytes: kv_format.record_bytes(cfg.kv_heads, cfg.head_dim) as u64, pool_overhead: 0, pool_bounded: vec![] })?;
-        let pool_tokens = usize::try_from(placement.pool_tokens)?;
-        tracing::info!(pool_tokens, kv_format = %kv_format, slots, prefix_marks, full_prefill_logits, head_rows = buffers.head_rows, kv_bytes_per_token = cfg.full_kv_bytes_per_token(kv_format), layout = %placement.summary(), "dense Qwen admitted before weight/state allocation");
+        let host = cuteafd_loader::formats::mapped_preload::host_memory_before_process()?;
+        let budgets = qwen3_5::sampled_budgets(free as u64, total as u64, None, host)?;
+        let request = Request {
+            context: cuteafd_loader::placement::planner::Context::resolve(cfg.max_context as u64,
+                serving.map_or(Some(cfg.max_context as u64), |(_, _, _, context)| context)),
+            pool: requested_pool.filter(|&n| n > 0).map(Pin::Exact).unwrap_or(Pin::Auto),
+            onboard: Pin::Auto,
+            prefill: Pin::Exact(PrefillShape { rows: ROWS as u64, waves: 1 }),
+            operation: if full_prefill_logits { Operation::Scoring } else { Operation::Serving },
+            resident_weight_limit: Some(crate::shared::memory::budget::resident_weight_limit()),
+            spark_reply_formats: cuteafd_core::spark_reply::requested(),
+        };
+        let geometry = qwen3_5::host_prefix_geometry(&cfg,
+            kv_format.record_bytes(cfg.kv_heads, cfg.head_dim) as u64, mark_bytes as u64);
+        let host_config = serving.map(|(prefix, concurrency, _, _)| prefix.resolve_host_config(
+            cuteafd_engine::prefix::FamilyLayout { page_rows: 64, pages: cfg.max_context.div_ceil(64),
+                page_bytes: geometry.page_bytes as usize, mark_bytes, draft_bytes: 0,
+                rule: cuteafd_engine::prefix::ReuseRule::EXACT,
+                mark_store: cuteafd_engine::prefix::MarkStore::Arena, page_owners: Default::default() },
+            cfg.max_context, concurrency)).transpose()?.flatten();
+        let solve_started = std::time::Instant::now();
+        let graph_variant = cuteafd_loader::serving_capacity::qwen35_graphs::variant(&cfg, format.fp8(), kv_format);
+        let admitted_plan = qwen3_5::admit(request, budgets, DenseFacts { cfg: &cfg,
+            graph_variant: graph_variant.clone(), graphs_enabled: cuteafd_loader::serving_capacity::qwen35_graphs::enabled(), weights: &weight_bytes, target_arena: &target_arena, buffers: &buffers, slots,
+            record_bytes: kv_format.record_bytes(cfg.kv_heads, cfg.head_dim) as u64, drafter,
+            blas_head: crate::shared::target_head::TargetHead::configured().blas_head(true),
+            serving: serving.map(|(_, _, device_sampling, _)| ServingFacts { capacity: HEAD_ROWS as u32, device_sampling }),
+            host_prefix: cuteafd_loader::placement::planner::serving::HostPrefixOwners {
+                quota_bytes: host_config.as_ref().map_or(0, |config| config.bytes),
+                chunk_bytes: host_config.as_ref().map_or(0, |config| config.chunk_bytes) }, verify_check })?;
+        tracing::info!(solve_us = solve_started.elapsed().as_micros() as u64,
+            ledger = %serde_json::to_string(&cuteafd_loader::plan::SolvedPhaseLedger::from(&admitted_plan))?,
+            "dense Qwen admitted phase ledger");
+        cuteafd_loader::placement::reserve::log_plan(&admitted_plan, "qwen3_5");
+        cuteafd_ffi::memory_ledger::fault::set_inputs(serde_json::json!({
+            "memory_reconciliation_provenance": {
+                "schema_version": 1, "family": "qwen3_5",
+                "source_commit": env!("CUTEAFD_BUILD_COMMIT"),
+                "source_dirty": env!("CUTEAFD_BUILD_DIRTY"),
+                "toolchain": env!("CUTEAFD_BUILD_TOOLCHAIN"),
+                "layout": graph_variant, "devices": [{"device": device.id}],
+                "graph_basis": "uncalibrated bytes, single RTX"
+            }
+        }));
+        let graphs = graphs::Graphs::new(device, graph_variant)?;
+        let pool_tokens = usize::try_from(admitted_plan.pool_tokens)?;
+        tracing::info!(pool_tokens, kv_format = %kv_format, slots, prefix_marks, full_prefill_logits,
+            head_rows = buffers.head_rows, kv_bytes_per_token = cfg.full_kv_bytes_per_token(kv_format),
+            // Basis for the Ready reconciliation: everything already resident
+            // after modules, programs, the engine stream and before weights.
+            preweight_used = total.saturating_sub(free),
+            "dense Qwen admitted before weight/state allocation");
         let tensor = reader.tensor(&format!("{PREFIX}embed_tokens.weight"))?;
         let source = EmbedSource::new(&checkpoint.snapshot, &tensor.shard, &tensor.meta, cfg.hidden)?;
-        let (embedding, weights) = TokenEmbedding::load(library, source, EmbedPlacement::Gpu,
-            || reader.dense_native(&cfg, admitted.norm_dtype.clone(), format))?;
-        let mut allocated = sizes.into_iter().map(|bytes| Allocation::new(device, alloc_bytes(bytes)))
+        // One preplanned backing holds every target layer, the final norm, head and embedding.
+        let arena = super::weights::ScopeArena::new(device, target_arena,
+            cuteafd_core::memory_layout::ArenaTag::weights("qwen35/target"))?;
+        tracing::info!(arena = arena.layout().id(), bytes = arena.layout().bytes(),
+            views = arena.layout().views().len(), padding = arena.layout().padding_bytes(),
+            "dense Qwen target weight arena allocated");
+        let (embedding, weights) = crate::shared::experts::rtx::push::load_alone(
+            &checkpoint.snapshot, &[device], || TokenEmbedding::load_with(library, source, EmbedPlacement::Gpu,
+                || reader.dense_native(&cfg, admitted.norm_dtype.clone(), format,
+                    &mut |name: &str, bytes| arena.allocate(name, bytes)),
+                |name, bytes| arena.allocate(name, bytes)))?;
+        arena.complete()?;
+        drop(arena);
+        let mut allocated = sizes.into_iter().map(|bytes|
+            Allocation::new(device, alloc_bytes(bytes), Tag::workspace("qwen35/planes")))
             .collect::<Result<Vec<_>>>()?;
         let views: Vec<_> = allocated.iter().map(|allocation| allocation.buffer).collect();
         let planes = Planes { residual: views[0], norm: views[1], delta: views[2], query: views[3],
             gate: views[4], attention: views[5], scratch: views[6], slots: views[7], seq_first: views[8],
             rope_positions: views[9], kv_slots: views[10], positions: views[11], page_table: views[12] };
-        let ids = Allocation::new(device, buffers.ids)?;
-        let logits = Allocation::new(device, logit_bytes)?;
-        let head_workspace = Allocation::new(device, buffers.head)?;
+        let ids = Allocation::new(device, buffers.ids, Tag::workspace("qwen35/ids"))?;
+        let logits = Allocation::new(device, logit_bytes, Tag::workspace("qwen35/logits"))?;
+        let head_workspace = Allocation::new(device, buffers.head, Tag::workspace("qwen35/head-workspace"))?;
         // SAFETY: owned workspace is retained after the head and stream, including error cleanup.
         let head = unsafe { library.vocabulary_head_rows(head_workspace.buffer.ptr, cfg.hidden as u32,
-            buffers.head_rows as u32, cfg.vocab as u32)? };
+            buffers.head_rows as u32, cfg.vocab as u32, crate::shared::target_head::TargetHead::configured().native_mode())? };
         let commit = match admitted.prefix { "qwen35" => "qwen35_gdn_commit", "qwen38" => "qwen38_gdn_commit",
             _ => anyhow::bail!("unadmitted dense prefix") };
         let bank = GdnBank::new(library, programs, stream.raw, cfg.gdn, homes.gdn_layers[0], slots, commit)?;
         let kv: Vec<Option<std::rc::Rc<Allocation<'a>>>> = cfg.attention.iter().map(|&kind| -> Result<_> {
             if kind == HybridAttention::Gdn { return Ok(None); }
-            Ok(Some(std::rc::Rc::new(Allocation::new(device, pool_tokens * kv_format.record_bytes(cfg.kv_heads, cfg.head_dim))?)))
+            Ok(Some(std::rc::Rc::new(Allocation::new(device,
+                pool_tokens * kv_format.record_bytes(cfg.kv_heads, cfg.head_dim), Tag::kv("qwen35/kv"))?)))
         }).collect::<Result<_>>()?;
         let verification = verify::Verification::new(device, &cfg, slots)?;
         let prefix_arena = if prefix_bytes == 0 { None } else {
-            Some(std::rc::Rc::new(Allocation::new(device, prefix_bytes)?))
+            Some(std::rc::Rc::new(Allocation::new(device, prefix_bytes, Tag::prefix("qwen35/prefix"))?))
         };
         // Compare actual allocation owners, not a second evaluation of the
         // planner recipe. This gate also runs for every golden/serving startup.
@@ -200,17 +268,33 @@ impl<'a> DenseEngine<'a> {
             && verification.allocated_bytes() == buffers.verify
             && prefix_arena.as_ref().map_or(0, |a| a.buffer.bytes) == buffers.prefix,
             "dense native planner workspace/prefix differs from actual runtime allocations");
-        ensure!(bank.allocated_bytes() == [layer_bytes.iter().map(|layer| layer.state as usize).sum(),
-            layer_bytes.iter().map(|layer| layer.replay as usize).sum(), buffers.commit],
+        let gdn_layers = cfg.attention.iter().filter(|&&kind| kind == HybridAttention::Gdn).count();
+        ensure!(bank.allocated_bytes() == [buffers.state_per_layer.checked_mul(slots)
+            .and_then(|n| n.checked_mul(gdn_layers)).context("dense GDN state inventory overflow")?,
+            buffers.replay_per_layer.checked_mul(gdn_layers).context("dense GDN replay inventory overflow")?,
+            buffers.commit],
             "dense native planner recurrence/replay differs from actual runtime allocations");
         ensure!(kv.iter().flatten().map(|a| a.buffer.bytes).sum::<usize>()
             == pool_tokens * cfg.full_kv_bytes_per_token(kv_format),
             "dense native planner KV differs from actual runtime allocations");
         tracing::info!("dense native planner equals actual weight, KV, state, replay, workspace and prefix allocations");
-        Ok(Self { stream, cfg, kv_format, programs, admitted, embedding, weights, homes, bank, kv, planes,
+        cfg.max_context = usize::try_from(admitted_plan.served_context())?;
+        Ok(Self { stream, graphs, cfg, kv_format, programs, admitted, embedding, weights, homes, bank, kv, planes,
             _planes: std::mem::take(&mut allocated), ids, logits, head, head_rows: buffers.head_rows, _head_workspace: head_workspace,
-            pool_tokens, position: 0, slots: vec![rows::Slot { position: 0, pages: Vec::new() }; slots],
+            pool_tokens, admitted_host_config: host_config, position: 0, slots: vec![rows::Slot { position: 0, pages: Vec::new() }; slots],
             prefix_arena, prefix_marks, healthy: true, verification })
+    }
+
+    /// Retained target weight owners: one arena backing plus a view per tensor.
+    pub(crate) fn weight_receipts(&self, devices: cuteafd_loader::placement::planner::CoordinatorDevices<'_>)
+        -> Result<Vec<cuteafd_loader::placement::planner::Receipt>> {
+        let mut inventory = crate::shared::memory::receipts::Inventory::new(devices, "qwen3_5.target",
+            cuteafd_loader::placement::planner::Lifetime::RESIDENT,
+            cuteafd_core::memory_layout::Category::Weights, "dense weights");
+        self.weights.inventory(&mut inventory)?;
+        let mut receipts = inventory.receipts;
+        receipts.extend(self.embedding.allocation_receipts(devices, "qwen3_5.embedding")?);
+        Ok(receipts)
     }
 
     pub(crate) fn slot_count(&self) -> usize { self.slots.len() }
@@ -328,6 +412,7 @@ impl<'a> DenseEngine<'a> {
             "dense prefill outside admitted slot/row capacity");
         ensure!(logit_rows <= self.head_rows.min(tokens.len()), "dense prefill head rows outside admission");
         ensure!(self.healthy && self.verification.pending.is_none(), "dense prefill requires committed healthy state");
+        self.graphs.prefill();
         self.embedding.check(tokens)?;
         let state = &self.slots[slot];
         let end = state.position.checked_add(tokens.len()).context("dense prefill position overflow")?;
@@ -376,6 +461,29 @@ impl<'a> DenseEngine<'a> {
         Ok(output)
     }
 
+    /// Consume the terminal residual before MTP or the next serving call reuses it.
+    pub(crate) fn record_prefill_head(&mut self, rows: usize, logit_rows: usize,
+        scoring: crate::shared::probe::ScoringRows<'_>) -> Result<()> {
+        ensure!(logit_rows > 0 && logit_rows <= rows && rows <= ROWS, "dense scoring head extent");
+        self.healthy = false;
+        let norm = self.programs.program(&format!("{}_norm", self.admitted.prefix), &["x", "weight", "out"])?;
+        let hidden = self.planes.residual.ptr.cast::<u8>()
+            .wrapping_add((rows - logit_rows) * self.cfg.hidden * 2).cast();
+        // SAFETY: the complete prefill left these residual rows live; normalization
+        // and every bounded projection/copy share the target stream before reuse.
+        unsafe { norm.launch(&[hidden, self.weights.norm.buffer.ptr, self.planes.norm.ptr],
+            &[Scalar::I32(i32::try_from(logit_rows)?)], self.stream.raw)?; }
+        for span in crate::shared::probe::head_spans(logit_rows, HEAD_ROWS)? {
+            let hidden = CuteafdDeviceBuffer { ptr: self.planes.norm.ptr.cast::<u8>()
+                .wrapping_add(span.start * self.cfg.hidden * 2).cast(),
+                bytes: span.len() * self.cfg.hidden * 2, ..self.planes.norm };
+            let logits = self.target_head(hidden, self.logits.buffer, span.len())?;
+            scoring.record(self.stream.device.library, span.start, &logits)?;
+        }
+        self.healthy = true;
+        Ok(())
+    }
+
     /// Attention keeps each member's native row route and state; the dense FFN
     /// sees the adjacent packed rows once. Tables reuse the admitted singleton scratch.
     pub(crate) fn prefill_packed(&mut self, sequences: &[(usize, &[u32])],
@@ -383,6 +491,7 @@ impl<'a> DenseEngine<'a> {
         mut hook: impl FnMut(usize, CuteafdDeviceBuffer, usize) -> Result<()>)
         -> Result<Vec<crate::shared::prefill_packing::Segment>> {
         ensure!(self.healthy && self.verification.pending.is_none(), "dense packed prefill requires committed healthy state");
+        self.graphs.prefill();
         let chunks = sequences.iter().map(|&(slot, tokens)| {
             let state = self.slots.get(slot).context("dense packed slot outside admission")?;
             self.embedding.check(tokens)?;

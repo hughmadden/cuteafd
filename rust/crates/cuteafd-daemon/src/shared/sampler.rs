@@ -7,6 +7,7 @@ use crate::shared::memory::{DeviceAllocation, HostAllocation};
 use anyhow::{ensure, Result};
 use cuteafd_ffi::{CuteafdDeviceBuffer, CuteafdV41SamplerRow, NativeLibrary};
 use std::ffi::c_void;
+use crate::shared::memory::Tag;
 
 /// Chunk-6 radix histogram arena, allocated once now so a later chunk needs no
 /// new allocation. 2048 buckets per row (design §11.1).
@@ -376,6 +377,26 @@ pub(crate) fn mask_launch_arguments(mask_rows: usize, mask_device: CuteafdDevice
 }
 
 impl<'a> TargetSamplingWave<'a> {
+    pub(crate) fn allocation_receipts(&self, inventory: &mut crate::shared::memory::receipts::Inventory<'_>,
+        name: &str) -> Result<()> {
+        for (key, owner) in [
+            ("params", &self.param_device), ("masks", &self.mask_device), ("scratch", &self.scratch),
+            ("bitmap", &self.bitmap), ("histogram", &self.histogram), ("ids", &self.ids_device),
+            ("status", &self.status_device), ("detail", &self.detail_device), ("scores", &self.scores_device),
+            ("total", &self.total_device), ("nucleus", &self.nucleus_device),
+            ("rank_ids", &self.rank_order_ids), ("rank_scratch", &self.rank_order_scratch),
+            ("retained", &self.retained_count_device), ("passes", &self.pivot_passes_device),
+        ] { inventory.device(&format!("{name}.device.{key}"), owner.buffer)?; }
+        for (key, owner) in [
+            ("params", &self.param_pinned), ("masks", &self.mask_pinned), ("ids", &self.ids_pinned),
+            ("status", &self.status_pinned), ("detail", &self.detail_pinned), ("scores", &self.scores_pinned),
+            ("retained", &self.retained_count_staging),
+        ] { inventory.pinned(&format!("{name}.pinned.{key}"), owner.buffer)?; }
+        inventory.host(&format!("{name}.host.params"), &self.params)?;
+        inventory.host(&format!("{name}.host.status"), &self.last_status)?;
+        inventory.host(&format!("{name}.host.retained"), &self.last_retained)
+    }
+
     pub(crate) fn new(library: &'a NativeLibrary, capacity: usize, vocab: usize) -> Result<Self> {
         Self::allocate(library, SamplerStages::native(), capacity, vocab)
     }
@@ -416,38 +437,38 @@ impl<'a> TargetSamplingWave<'a> {
             mask_words: vocab.div_ceil(32),
             param_device: DeviceAllocation::new(
                 library,
-                capacity * cuteafd_ffi::CUTEAFD_V41_SAMPLER_PARAM_BYTES,
+                capacity * cuteafd_ffi::CUTEAFD_V41_SAMPLER_PARAM_BYTES, Tag::workspace("shared/sampler")
             )?,
             param_pinned: HostAllocation::new(
                 library,
-                capacity * cuteafd_ffi::CUTEAFD_V41_SAMPLER_PARAM_BYTES,
+                capacity * cuteafd_ffi::CUTEAFD_V41_SAMPLER_PARAM_BYTES, Tag::staging("shared/sampler")
             )?,
-            mask_device: DeviceAllocation::new(library, Self::mask_arena_bytes(capacity, vocab))?,
-            mask_pinned: HostAllocation::new(library, Self::mask_arena_bytes(capacity, vocab))?,
+            mask_device: DeviceAllocation::new(library, Self::mask_arena_bytes(capacity, vocab), Tag::workspace("shared/sampler"))?,
+            mask_pinned: HostAllocation::new(library, Self::mask_arena_bytes(capacity, vocab), Tag::staging("shared/sampler"))?,
             scratch: DeviceAllocation::new(
                 library,
-                capacity * cuteafd_ffi::CUTEAFD_V41_SAMPLER_SCRATCH_BYTES,
+                capacity * cuteafd_ffi::CUTEAFD_V41_SAMPLER_SCRATCH_BYTES, Tag::workspace("shared/sampler")
             )?,
-            bitmap: DeviceAllocation::new(library, Self::mask_arena_bytes(capacity, vocab))?,
+            bitmap: DeviceAllocation::new(library, Self::mask_arena_bytes(capacity, vocab), Tag::workspace("shared/sampler"))?,
             histogram: DeviceAllocation::new(
                 library,
-                capacity * SAMPLING_HISTOGRAM_BUCKETS * 4,
+                capacity * SAMPLING_HISTOGRAM_BUCKETS * 4, Tag::workspace("shared/sampler")
             )?,
-            ids_device: DeviceAllocation::new(library, capacity * 4)?,
-            status_device: DeviceAllocation::new(library, capacity * 4)?,
-            detail_device: DeviceAllocation::new(library, capacity * 4)?,
-            scores_device: DeviceAllocation::new(library, capacity * 4)?,
-            total_device: DeviceAllocation::new(library, capacity * 4)?,
-            nucleus_device: DeviceAllocation::new(library, capacity * 4)?,
-            rank_order_ids: DeviceAllocation::new(library, capacity * retained * 4)?,
-            rank_order_scratch: DeviceAllocation::new(library, capacity * retained * 8)?,
-            retained_count_device: DeviceAllocation::new(library, capacity * 4)?,
-            pivot_passes_device: DeviceAllocation::new(library, capacity * 4)?,
-            ids_pinned: HostAllocation::new(library, capacity * 4)?,
-            status_pinned: HostAllocation::new(library, capacity * 4)?,
-            detail_pinned: HostAllocation::new(library, capacity * 4)?,
-            scores_pinned: HostAllocation::new(library, capacity * 4)?,
-            retained_count_staging: HostAllocation::new(library, capacity * 4)?,
+            ids_device: DeviceAllocation::new(library, capacity * 4, Tag::workspace("shared/sampler"))?,
+            status_device: DeviceAllocation::new(library, capacity * 4, Tag::workspace("shared/sampler"))?,
+            detail_device: DeviceAllocation::new(library, capacity * 4, Tag::workspace("shared/sampler"))?,
+            scores_device: DeviceAllocation::new(library, capacity * 4, Tag::workspace("shared/sampler"))?,
+            total_device: DeviceAllocation::new(library, capacity * 4, Tag::workspace("shared/sampler"))?,
+            nucleus_device: DeviceAllocation::new(library, capacity * 4, Tag::workspace("shared/sampler"))?,
+            rank_order_ids: DeviceAllocation::new(library, capacity * retained * 4, Tag::workspace("shared/sampler"))?,
+            rank_order_scratch: DeviceAllocation::new(library, capacity * retained * 8, Tag::workspace("shared/sampler"))?,
+            retained_count_device: DeviceAllocation::new(library, capacity * 4, Tag::workspace("shared/sampler"))?,
+            pivot_passes_device: DeviceAllocation::new(library, capacity * 4, Tag::workspace("shared/sampler"))?,
+            ids_pinned: HostAllocation::new(library, capacity * 4, Tag::staging("shared/sampler"))?,
+            status_pinned: HostAllocation::new(library, capacity * 4, Tag::staging("shared/sampler"))?,
+            detail_pinned: HostAllocation::new(library, capacity * 4, Tag::staging("shared/sampler"))?,
+            scores_pinned: HostAllocation::new(library, capacity * 4, Tag::staging("shared/sampler"))?,
+            retained_count_staging: HostAllocation::new(library, capacity * 4, Tag::staging("shared/sampler"))?,
             params: Vec::new(),
             param_rows: 0,
             mask_rows: 0,

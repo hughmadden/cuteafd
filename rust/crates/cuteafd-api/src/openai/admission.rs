@@ -163,11 +163,12 @@ mod tests {
         for _ in 0..8 {
             pending.push(tokio::spawn({let a=admission.clone(); let tx=tx.clone(); async move {a.reserve(tx).await}}));
         }
-        // Bounded by time, not a yield count: under a loaded test host the
-        // eight spawned waiters can take longer than any fixed number of yields.
+        // Acquiring the last permit precedes publishing its peak. Wait for
+        // publication too, rather than racing the worker between those steps.
         tokio::time::timeout(Duration::from_secs(10), async {
-            while admission.waiters.available_permits() != 0 { tokio::task::yield_now().await; }
-        }).await.expect("all eight waiters hold a slot");
+            while admission.waiters_peak.load(Ordering::Relaxed) != 8 { tokio::task::yield_now().await; }
+        }).await.expect("all eight waiters publish their held slots");
+        assert_eq!(admission.waiters.available_permits(), 0);
         assert_eq!(admission.metrics()["http_queue_waiters_peak"], 8);
         for p in &pending { p.abort(); }
         for p in pending { let _ = p.await; }

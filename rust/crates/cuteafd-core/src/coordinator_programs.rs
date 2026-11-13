@@ -419,7 +419,7 @@ pub fn attention_plan_scratch(geometry: &serde_json::Value, plan: AttentionReduc
 }
 
 /// Narrow a parsed program's scratch using the immutable numerical recipe.
-pub fn select_attention_scratch(geometry: &serde_json::Value,
+pub fn select_core_view_scratch(geometry: &serde_json::Value,
     scratch: &mut std::collections::HashMap<String, u64>, plan: AttentionReductionPlan)
     -> Result<(), AttentionScratchError> {
     if let Some(bytes) = attention_plan_scratch(geometry, plan)? {
@@ -429,7 +429,7 @@ pub fn select_attention_scratch(geometry: &serde_json::Value,
 }
 
 /// Planner counterpart of runtime program selection; card plans must be selected first.
-pub fn select_attention_plans(manifest: &mut serde_json::Value, plan: AttentionReductionPlan,
+pub fn select_core_view_plans(manifest: &mut serde_json::Value, plan: AttentionReductionPlan,
     keep: impl Fn(&str) -> bool) -> Result<(), AttentionScratchError> {
     let Some(programs) = manifest["programs"].as_array_mut() else { return Ok(()) };
     for program in programs {
@@ -437,7 +437,7 @@ pub fn select_attention_plans(manifest: &mut serde_json::Value, plan: AttentionR
             || program["geometry"].get("attention_plan_scratch").is_none() { continue; }
         let mut scratch = serde_json::from_value(program["scratch_bytes_at_capacity"].clone())
             .map_err(|_| AttentionScratchError)?;
-        select_attention_scratch(&program["geometry"], &mut scratch, plan)?;
+        select_core_view_scratch(&program["geometry"], &mut scratch, plan)?;
         program["scratch_bytes_at_capacity"] = serde_json::to_value(scratch)
             .map_err(|_| AttentionScratchError)?;
     }
@@ -688,8 +688,8 @@ mod tests {
                 select_card_plans(&mut manifest, sms).unwrap();
                 let program = &manifest["programs"][0];
                 let mut runtime = serde_json::from_value(program["scratch_bytes_at_capacity"].clone()).unwrap();
-                select_attention_scratch(&program["geometry"], &mut runtime, plan).unwrap();
-                select_attention_plans(&mut manifest, plan, |name| name.starts_with("glm_")).unwrap();
+                select_core_view_scratch(&program["geometry"], &mut runtime, plan).unwrap();
+                select_core_view_plans(&mut manifest, plan, |name| name.starts_with("glm_")).unwrap();
                 assert_eq!(manifest["programs"][0]["scratch_bytes_at_capacity"], serde_json::to_value(runtime).unwrap());
                 assert_eq!(manifest["programs"][1]["scratch_bytes_at_capacity"]["scratch"], 99);
             }

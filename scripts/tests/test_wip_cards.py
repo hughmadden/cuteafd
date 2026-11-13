@@ -1,4 +1,5 @@
 import importlib.util
+from http.client import IncompleteRead
 import json
 import os
 import re
@@ -14,6 +15,7 @@ ROOT = Path(__file__).resolve().parents[2]
 SPEC = importlib.util.spec_from_file_location('wip_cards', ROOT / 'scripts/bench/wip-cards.py')
 cards = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(cards)
+OBSERVER_GPU_UUIDS = cards.observer_gpu_uuids
 
 
 @pytest.fixture(autouse=True)
@@ -28,6 +30,11 @@ def no_stop_handlers(monkeypatch, tmp_path):
     monkeypatch.delenv('CUTEAFD_HW_LOCKS_HELD', raising=False)
     monkeypatch.delenv('CUTEAFD_HW_GATE_TICKETS', raising=False)
     cards.bench_panels.cache_clear()
+    monkeypatch.setattr(cards, 'observer_gpu_uuids', lambda devices: ','.join(f'GPU-host-{device}' for device in devices))
+    monkeypatch.setattr(cards, 'preflight_deployment', lambda job, arm: {
+        'spark_roles': [dict(rank=i, experts=True, audio_encoder=bool((job.get('needs') or {}).get('audio')))
+                        for i in range(len(job['entry'].get('sparks', [])))],
+        'artifact_requirements': {'spark_packages': {}, 'spark_tp_role': (job.get('needs') or {}).get('tp_role')}})
     bin_dir = tmp_path / '.cuteafd-test-bin'
     bin_dir.mkdir(exist_ok=True)
     cuteafd_bin = bin_dir / 'cuteafd'
@@ -62,7 +69,7 @@ def test_console_observer_records_policy_stats(entry, tmp_path, monkeypatch):
     monkeypatch.setenv('CUTEAFD_SMOKE_URL', 'http://localhost:8500')
     calls = []
 
-    def http(url, path):
+    def http(url, path, **kwargs):
         calls.append(path)
         if path == '/v1/stats':
             stop.touch()
@@ -528,16 +535,32 @@ def test_requested_panels_preflight_and_report(entry, tmp_path):
 
 
 
+@pytest.mark.parametrize('status', ['fail', 'failed'])
+def test_failed_panel_fails_zero_exit_done_report(entry, tmp_path, status):
+    job = make({**entry, 'profile': 'panels:shared_prefix', 'baseline': False}, tmp_path)
+    report_dir = Path(job['state']) / 'reports' / 'one'
+    report_dir.mkdir(parents=True)
+    panel = {'id': 'shared_prefix', 'status': status, 'error': 'retained 32768 tokens C1: HTTP 400: empty assistant'}
+    report = {'status': 'done', 'panels': [panel]}
+    (report_dir / 'report.json').write_text(json.dumps(report))
+    row = cards.summarize_job(job, 0)
+    assert row['status'] == 'failed' and row['failure_kind'] == 'measurement'
+    assert row['error'] == 'panel shared_prefix: ' + panel['error']
+    panel.update(status='done', error=None)
+    (report_dir / 'report.json').write_text(json.dumps(report))
+    assert cards.summarize_job(job, 0)['status'] == 'pass'
+
+
 def test_summary_reads_c8_from_the_concurrency_sweep(entry, tmp_path):
     job = make(entry, tmp_path)
     report_dir = Path(job['state']) / 'reports' / 'one'
     report_dir.mkdir(parents=True)
-    card = {'decode': [{'content': 'code', 'tok_s': 48.0}], 'prefill': {'tok_s': 2700.0},
+    card = {'decode': [{'content': 'code', 'tok_s': 48.0}], 'prefill': {'tok_s': 2700.0}, 'prefill_tail': {'tok_s': 2500.0},
             'concurrency': [{'width': 4, 'aggregate_tok_s': 70.0}, {'width': 8, 'aggregate_tok_s': 90.5},
                             {'width': 16, 'aggregate_tok_s': 114.0}]}
     (report_dir / 'report.json').write_text(json.dumps({'baseline': {'card': card}}))
     row = cards.summarize_job(job, 0)
-    assert (row['C1'], row['C8'], row['8K']) == (48.0, 90.5, 2700.0)
+    assert (row['C1'], row['C8'], row['8K'], row['8K w/tail']) == (48.0, 90.5, 2700.0, 2500.0)
     card['concurrency'] = [{'width': 4, 'aggregate_tok_s': 70.0}]
     (report_dir / 'report.json').write_text(json.dumps({'baseline': {'card': card}}))
     assert cards.summarize_job(job, 0)['C8'] is None
@@ -561,7 +584,7 @@ def test_matched_seed_same_across_arms_new_per_pair(entry, tmp_path, monkeypatch
     jobs = json.loads((state / 'plan.json').read_text())['jobs']
     assert jobs[0]['nonce_seed'] == jobs[1]['nonce_seed']
     assert jobs[0]['nonce_seed'] != jobs[2]['nonce_seed']
-    assert all('observer' in job['entry'] for job in jobs)
+    assert all('console' not in job['probes'] and 'observer' not in job['entry'] for job in jobs)
 
 
 def test_matched_round_metrics_and_pair_hash_failure(tmp_path):
@@ -592,7 +615,7 @@ def test_matched_round_metrics_and_pair_hash_failure(tmp_path):
     assert all(row['status'] == 'pass' for row in rows)
 
 
-def test_matched_prefill_only_sweep_needs_no_decode_rounds(tmp_path):
+def test_matched_sweeps_verify_hashes_without_console_rounds(tmp_path):
     # #72: a prefill-only sweep (max_tokens 1) emits no decode rounds; its pairs
     # match by prompt token hash alone.
     def job(entry):
@@ -614,7 +637,11 @@ def test_matched_prefill_only_sweep_needs_no_decode_rounds(tmp_path):
     assert prefill['prompt_token_hashes'] == ['73b4ebf8f4958775'] and prefill['follow_up_prompts'] == 1
     assert prefill['arm_local_prompts'] == 1
     decode = cards.summarize_job(job(dict(name='d', profile='panels:', levels=[1, 16], set={}, sparks=[])), 0)
-    assert decode['status'] == 'failed' and 'per-request console rounds' in decode['error']
+    assert decode['status'] == 'pass' and decode['requests'] == []
+    missing_job = job(dict(name='missing', profile='panels:', levels=[1, 16], set={}, sparks=[]))
+    next((Path(missing_job['state']) / 'smoke' / 'logs').glob('*.coordinator.log')).write_text('')
+    missing = cards.summarize_job(missing_job, 0)
+    assert missing['status'] == 'failed' and 'no prompt token hashes' in missing['error']
     # Fidelity-only runs (no baseline) score through the probe endpoint and decode nothing either.
     def with_report(entry):
         made = job(entry)
@@ -623,9 +650,9 @@ def test_matched_prefill_only_sweep_needs_no_decode_rounds(tmp_path):
         return made
     fidelity = cards.summarize_job(with_report(dict(name='f', profile='panels:fidelity', baseline=False, set={}, sparks=[])), 0)
     assert 'per-request console rounds' not in (fidelity.get('error') or ''), fidelity.get('error')
-    # A fidelity panel beside the baseline still decodes, so it keeps the check.
+    # Decode and fidelity both match by admission hashes without a console.
     mixed = cards.summarize_job(with_report(dict(name='m', profile='panels:fidelity', set={}, sparks=[])), 0)
-    assert 'per-request console rounds' in (mixed.get('error') or '')
+    assert mixed['status'] == 'pass' and mixed['requests'] == []
 
 
 def _coordinator_log(deterministic, follow_up_tokens):
@@ -687,7 +714,8 @@ def test_cleanup_foreign_root_refused(tmp_path, monkeypatch):
     root.mkdir(parents=True)
     (root / 'foreign').write_text('keep')
     script = cards.cleanup_script(dict(instance='test', slot='s'), 'task')
-    result = subprocess.run([sys.executable, '-c', script], env={**os.environ, 'HOME': str(home)}, text=True, capture_output=True)
+    prefix = 'import subprocess\nsubprocess.check_output=lambda cmd,**kw: ""\n'
+    result = subprocess.run([sys.executable, '-c', prefix + script], env={**os.environ, 'HOME': str(home)}, text=True, capture_output=True)
     assert result.returncode and 'refusing unowned' in result.stderr
     assert (root / 'foreign').exists()
 
@@ -794,9 +822,12 @@ def _wip_function(name, end):
 def _trace_tools(tmp_path, extra=None):
     tools = tmp_path / 'tools'
     tools.mkdir()
+    # The export cache is cold: a native phase that requires every export to be
+    # cached fails as export-cache.py does (exit 3) and the caller takes its turn.
+    cold = 'case "$*" in *CUTEAFD_EXPORT_CACHE_REQUIRE_HIT=1*) exit 3;; esac\n'
     scripts = {
-        'ssh': '#!/bin/sh\nprintf "ssh %s\\n" "$*" >> "$TRACE"\nprintf "image-id\\n"\n',
-        'docker': '#!/bin/sh\nprintf "docker %s\\n" "$*" >> "$TRACE"\nprintf "image-id\\n"\n',
+        'ssh': '#!/bin/sh\nprintf "ssh %s\\n" "$*" >> "$TRACE"\n' + cold + 'printf "image-id\\n"\n',
+        'docker': '#!/bin/sh\nprintf "docker %s\\n" "$*" >> "$TRACE"\n' + cold + 'printf "image-id\\n"\n',
         'flock': '#!/bin/sh\nprintf "flock %s\\n" "$*" >> "$TRACE"\n',
         # hwlock stand-in: record the turn, then run the command it guards.
         'python3': '#!/bin/sh\nprintf "turn %s\\n" "$*" >> "$TRACE"\nwhile [ "$1" != -- ]; do shift; done; shift\nprintf "begin\\n" >> "$TRACE"\n"$@"\nrc=$?\nprintf "end\\n" >> "$TRACE"\nexit $rc\n',
@@ -861,8 +892,11 @@ CUTEAFD_WIP_COORDINATOR_EXPORT=auto
     lines = trace.read_text().splitlines()
     rust = next(i for i, line in enumerate(lines) if line.endswith('/wip/output/coordinator rust'))
     capped = lines.index('capped')
-    native = next(i for i, line in enumerate(lines) if line.endswith('/wip/output/coordinator native'))
-    assert rust < capped < native
+    # First every export is requested from the export cache (cold here), then the GPU turn.
+    cached = next(i for i, line in enumerate(lines) if 'CUTEAFD_EXPORT_CACHE_REQUIRE_HIT=1' in line)
+    native = next(i for i, line in enumerate(lines) if line.endswith('/wip/output/coordinator native')
+                  and 'CUTEAFD_EXPORT_CACHE_REQUIRE_HIT=1' not in line)
+    assert rust < cached < capped < native
     assert not any('hwlock.py --locks gpu1' in line for line in lines)
     assert all('CUTEAFD_WIP_EXPORT_LOCKS=off' in line for line in lines if 'build-wip-artifacts.sh' in line)
     wip = (ROOT / 'wip.sh').read_text()
@@ -900,7 +934,7 @@ def test_explicit_nonce_overrides_auto_and_inherited(entry, tmp_path, monkeypatc
     assert cards.main() == 0
     jobs = json.loads((state / 'plan.json').read_text())['jobs']
     assert all(job['nonce_seed'] == 'explicit seed' for job in jobs)
-    assert all('observer' in job['entry'] and 'console' in job['probes'] for job in jobs)
+    assert all('observer' not in job['entry'] and 'console' not in job['probes'] for job in jobs)
     for job in jobs:
         dest = Path(job['state'])
         report = dest / 'reports' / 'one' / 'report.json'
@@ -928,8 +962,8 @@ def test_arm_overrides_only_selected_arm_and_card(entry, tmp_path, monkeypatch, 
     state = tmp_path / 'state'
     monkeypatch.setattr(sys, 'argv', ['wip-cards', '--kit', str(kit), '--cards', 'v41-min', 'other',
         '--interleave', '--repeats', '1', '--arm', 'off=b:s', '--arm', 'on=c:s', '--state', str(state),
-        '--set', 'v41-min:GLM5_FLASH_PREFILL_BATCH=off',
-        '--arm-set', 'on:v41-min:GLM5_FLASH_PREFILL_BATCH=on',
+        '--set', 'v41-min:PREFILL_PACKING=exact',
+        '--arm-set', 'on:v41-min:PREFILL_PACKING=unrestricted',
         '--dry-run'])
     assert cards.main() == 0
     jobs = json.loads((state / 'plan.json').read_text())['jobs']
@@ -937,12 +971,12 @@ def test_arm_overrides_only_selected_arm_and_card(entry, tmp_path, monkeypatch, 
         settings = job['entry']['set']
         base = cards.config(Path(job['state']) / 'base.config')
         if job['card'] == 'other':
-            assert 'GLM5_FLASH_PREFILL_BATCH' not in settings
+            assert 'PREFILL_PACKING' not in settings
         else:
             enabled = job['arm'] == 'on'
-            assert settings['GLM5_FLASH_PREFILL_BATCH'] == ('on' if enabled else 'off')
-            assert base['GLM5_FLASH_PREFILL_BATCH'] == settings['GLM5_FLASH_PREFILL_BATCH']
-    assert '"GLM5_FLASH_PREFILL_BATCH": "on"' in capsys.readouterr().out
+            assert settings['PREFILL_PACKING'] == ('unrestricted' if enabled else 'exact')
+            assert base['PREFILL_PACKING'] == settings['PREFILL_PACKING']
+    assert '"PREFILL_PACKING": "unrestricted"' in capsys.readouterr().out
 
 
 def test_arm_config_edits_apply_after_generation(entry, tmp_path, monkeypatch):
@@ -1204,6 +1238,24 @@ def test_slot_check_reads_host_root_without_any_container(tmp_path, monkeypatch)
         cards.slot_check(arm, 'raptor')
 
 
+@pytest.mark.parametrize('pcm_audio', [False, True])
+def test_slot_check_attests_pcm_symbol_independently(tmp_path, monkeypatch, pcm_audio):
+    root = tmp_path / 'wip-inst'
+    _sealed_slot(root)
+    bin_dir = tmp_path / 'bin'
+    bin_dir.mkdir()
+    symbols = '0000 T cuteafd_audio_required\n'
+    if pcm_audio:
+        symbols += '0001 T cuteafd_pcm_required\n'
+    nm = bin_dir / 'nm'
+    nm.write_text('#!/bin/sh\ncat <<\'SYMBOLS\'\n' + symbols + 'SYMBOLS\n')
+    nm.chmod(0o755)
+    monkeypatch.setenv('PATH', f'{bin_dir}:{os.environ["PATH"]}')
+    meta = json.loads(cards.slot_check(dict(instance='inst', slot='s', root=str(root)), 'raptor'))
+    assert meta['contents']['audio'] is True
+    assert meta['contents']['pcm_audio'] is pcm_audio
+
+
 def _kit(tmp_path, *entries):
     kit = tmp_path / 'kit'
     kit.mkdir(exist_ok=True)
@@ -1319,6 +1371,46 @@ def test_nsys_profile_frames_the_sweep_with_a_window(entry, tmp_path):
     assert 'window' not in plain['entry']
 
 
+def test_census_final_sample_hook_composes_with_profiler(entry, tmp_path):
+    job = cards.generate({**entry, 'levels': [1]}, 'a', dict(instance='p', slot='s'),
+                         tmp_path, tmp_path / 'key', {'PROFILE': 'census,nsys'}, set(), None, 1)
+    close = job['entry']['window']['close']
+    assert '--census-final-sample' in ' '.join(close['argv'])
+    assert 'stop --session=cuteafd-profile' in ' '.join(close['argv'])
+    assert close['required']
+    plain = cards.generate({**entry, 'levels': [1]}, 'b', dict(instance='q', slot='s'),
+                           tmp_path, tmp_path / 'key', {'PROFILE': 'census'}, set(), None, 1)
+    assert '--census-final-sample' in plain['entry']['window']['close']['argv']
+
+
+def test_census_marker_uses_server_clock_and_is_idempotent(tmp_path, monkeypatch):
+    job = {'state': str(tmp_path), 'entry': {'name': 'test'}}
+    log = tmp_path / 'smoke/logs/test.coordinator.log'
+    log.parent.mkdir(parents=True)
+    log.write_text('2026-11-04T12:00:01.000000Z INFO cuteafd::thermal: current={"queried_s":1.0}\n')
+    monkeypatch.setenv('CUTEAFD_SMOKE_URL', 'http://localhost:8500')
+    monkeypatch.setattr(cards, 'http', lambda url, path: {'now_s': 32.0, 'current': {'queried_s': 31.0}})
+    monkeypatch.setattr(cards.time, 'time', lambda: pytest.fail('client clock must not timestamp census marker'))
+    cards.census_final_sample(job)
+    cards.merge_census_marker(job)
+    cards.merge_census_marker(job)
+    text = log.read_text()
+    assert text.count('final server thermal sample') == 1
+    assert '2026-11-04T12:00:32.000000Z INFO cuteafd::bench_census:' in text
+    log.write_text('no server clock anchors\n')
+    with pytest.raises(ValueError, match='clock anchors'):
+        cards.merge_census_marker(job)
+
+
+@pytest.mark.parametrize('now', [True, -1, float('nan'), float('inf'), '32'])
+def test_census_final_sample_rejects_invalid_clock(tmp_path, monkeypatch, now):
+    monkeypatch.setenv('CUTEAFD_SMOKE_URL', 'http://localhost:8500')
+    monkeypatch.setattr(cards, 'http', lambda url, path: {'now_s': now})
+    with pytest.raises(ValueError, match='server clock'):
+        cards.census_final_sample({'state': str(tmp_path)})
+    assert not (tmp_path / 'census-final-thermal.json').exists()
+
+
 def test_session_name_matches_the_launcher():
     text = (ROOT / 'scripts/lib/release-common.sh').read_text()
     assert f'RELEASE_NSYS_SESSION={cards.NSYS_SESSION}\n' in text
@@ -1406,6 +1498,61 @@ def test_build_config_is_staging_only_with_card_overrides_and_tagged_images(tmp_
                                       'tp_role': None, 'nvfp4': False}
 
 
+@pytest.mark.parametrize('audio,enabled', [(None, True), ('auto', True), ('on', True), ('off', False)])
+def test_muse_audio_scope_matches_card_request(tmp_path, audio, enabled):
+    cfg = tmp_path / 'muse.config'
+    cfg.write_text('FAMILY=muse_spark\nSPARK_COUNT=4\n')
+    card = dict(family='muse_spark', config=str(cfg), gpus=[0], sparks=['ostrich', 'dodo', 'emu', 'kiwi'],
+                set={} if audio is None else dict(AUDIO=audio))
+    scopes = cards.build_scopes([card])
+    assert (scopes.get('CUTEAFD_WIP_AUDIO_AOT') == 'ON') == enabled
+    assert cards.slot_needs(card)['audio'] == enabled
+
+
+@pytest.mark.parametrize('size,gpus,count', [('min', [0], 4), ('max', [0, 1], 6)])
+def test_gate_muse_cards_use_real_hosts_and_native_defaults(size, gpus, count):
+    kit = ROOT / 'scripts/bench/kits/gate'
+    card = cards.load_cards(kit, [f'muse-spark-exl3-{size}'])[0]
+    values = {**cards.config(card['config']), **card['set']}
+    hosts = ['ostrich', 'dodo', 'emu', 'kiwi', 'rhea', 'moa'][:count]
+    assert card['family'] == 'muse_spark' and card['gpus'] == gpus
+    assert card['sparks'] == hosts and values['SPARK_COUNT'] == str(count)
+    assert values['MODEL_ID'] == 'wrldsuksgo2mars/Muse-Spark-Open-EXL3-K4-Core-K6'
+    assert values['MODEL_REVISION'] == '89998fb177acd9a862ac8bd4fb79bfd50e940c97'
+    assert values['SPECULATOR'] == 'dflash2' and values['POOL_TOKENS'] == 'auto'
+    assert values['VISION'] == ('spark' if size == 'min' else 'auto')
+    assert values['AUDIO'] == 'auto'
+    if size == 'min':
+        context = int(values['MAX_CONTEXT_TOKENS'])
+        assert context > 262144 and context % 64 == 0
+    for rank, host in enumerate(hosts):
+        assert values[f'SPARK_{rank}_HOST'] == host
+        assert values[f'SPARK_{rank}_LANE_A'] == f'10.55.0.{rank + 1}'
+    entries = [entry for matrix in kit.glob('matrix-*.json')
+               for entry in json.loads(matrix.read_text())['entries']]
+    for key in ('ADDR', 'EXPERT_PORT'):
+        assert sum(entry.get('set', {}).get(key) == values[key] for entry in entries) == 1
+
+
+def test_gate_glm53_exlr8_min_uses_real_hosts_and_pool_first_defaults():
+    kit = ROOT / 'scripts/bench/kits/gate'
+    card = cards.load_cards(kit, ['glm53-exlr8-min'])[0]
+    values = {**cards.config(ROOT / card['config']), **card['set']}
+    assert card['family'] == 'glm5' and card['gpus'] == [0]
+    assert card['sparks'] == ['ostrich', 'dodo', 'emu', 'kiwi']
+    assert values['RTX_GPUS'] == '1' and values['COORDINATOR_GPUS'] == '0'
+    assert values['SPARK_COUNT'] == '4' and values['EXLR8_MANIFEST'] == 'up1'
+    assert values['MODEL_ID'] == 'kindlingai/glm-5.3-exlr8-k2-k3-k4'
+    assert values['POOL_TOKENS'] == 'auto' and 'RTX_EXPERT_LAYERS' not in values
+    for rank, host in enumerate(card['sparks']):
+        assert values[f'SPARK_{rank}_HOST'] == host
+        assert values[f'SPARK_{rank}_LANE_A'] == f'10.55.0.{rank + 1}'
+    entries = [entry for matrix in kit.glob('matrix-*.json')
+               for entry in json.loads(matrix.read_text())['entries']]
+    for key in ('ADDR', 'EXPERT_PORT'):
+        assert sum(entry.get('set', {}).get(key) == values[key] for entry in entries) == 1
+
+
 def test_gate_glm53_max_uses_current_k4_core_k6_checkpoint():
     card = cards.load_cards(ROOT / 'scripts/bench/kits/gate', ['glm53-exl3-max'])[0]
     values = {**cards.config(ROOT / card['config']), **card['set']}
@@ -1423,9 +1570,9 @@ def test_gate_v41_sim5090_matches_pinned_tp4_reproduction():
     assert values['MODEL_ID'] == 'deepseek-ai/DeepSeek-V4.1-Flash-1017'
     expected = {
         'RTX_GPUS': '1', 'COORDINATOR_GPUS': '0',
-        'COORDINATOR_GPU_BUDGET_GIB': '31.8', 'SPARK_INTAKE': 'pinned',
+        'GPU_MEMORY_CAP': '31.8GiB', 'SPARK_INTAKE': 'pinned',
         'MAX_CONTEXT_TOKENS': '1048576',
-        'SPECULATOR': 'dspark', 'SPARK_COUNT': '4', 'SPARK_TP': '4', 'SPARK_EP': '1',
+        'SPECULATOR': 'dspark', 'SPARK_COUNT': '4',
     }
     assert {key: values[key] for key in expected} == expected
     # The prefill reserve is the planner's (TJ 2026-10-27): no row pin.
@@ -1461,9 +1608,9 @@ def test_build_staging_follows_card_coordinator_gpu(tmp_path, monkeypatch):
         cards.build_arms({'base': 'HEAD'}, cards.arms_from(['base=x:a']), [card], tmp_path / 'bad', 'task', True)
 
 
-def _fake_slot(packages=(), audio=True):
+def _fake_slot(packages=(), audio=True, pcm_audio=True):
     return lambda arm, host: json.dumps(dict(slot=arm['slot'], seal_sha256='seal', artifact_manifest_sha256='art',
-                                             contents=dict(packages=list(packages), audio=audio)))
+                                             contents=dict(packages=list(packages), audio=audio, pcm_audio=pcm_audio)))
 
 
 def _run_main(monkeypatch, argv, slot=None, rc_for=lambda job: 0, results=None, smoke_envs=None):
@@ -1560,6 +1707,20 @@ def test_preflight_refuses_missing_packages_and_audio_before_any_launch(tmp_path
     rc, launched = _run_main(monkeypatch, argv + ['--resume'], slot=_fake_slot(
         packages=['fp8/fp8-mimof', 'exl3/exl3-glmf-k34', 'fp8/fp8-glmf'], audio=True))
     assert rc == 0 and sorted(launched) == ['glmf-exl3-max/c', 'mimo26-flash-max/c']
+
+
+@pytest.mark.parametrize('pcm_audio', [False, None])
+def test_muse_preflight_refuses_missing_pcm_before_any_launch(tmp_path, monkeypatch, pcm_audio):
+    argv = ['--kit', str(ROOT / 'scripts/bench/kits/gate'), '--cards', 'muse-spark-exl3-max',
+            '--matrix', '--arm', 'c=x:s', '--state', str(tmp_path / 'state')]
+    with pytest.raises(ValueError, match='cuteafd_pcm_required'):
+        _run_main(monkeypatch, argv, slot=_fake_slot(packages=['exl3/exl3-muse-k45'],
+                                                   audio=True, pcm_audio=pcm_audio))
+    assert not list((tmp_path / 'state').glob('*/exit'))
+    assert json.loads((tmp_path / 'state' / 'preflight.json').read_text())['status'] == 'failed'
+    rc, launched = _run_main(monkeypatch, argv + ['--resume'], slot=_fake_slot(
+        packages=['exl3/exl3-muse-k45'], audio=True, pcm_audio=True))
+    assert rc == 0 and launched == ['muse-spark-exl3-max/c']
 
 
 def test_preflight_only_and_grant_hook(tmp_path, monkeypatch, capsys):
@@ -1679,6 +1840,28 @@ def test_panels_alone_skip_the_baseline_and_prefill_lengths_reach_the_sweep(entr
         assert json.loads(next(state2.glob('*/matrix.json')).read_text())['entries'][0].get('baseline') is expected
 
 
+def test_prefill_idle_seconds_reaches_matrix_and_rejects_invalid(entry, tmp_path, monkeypatch):
+    kit = _kit(tmp_path, entry)
+    for value in ['0', '1.5']:
+        state = tmp_path / ('idle-' + value)
+        monkeypatch.setattr(sys, 'argv', ['wip-cards', '--kit', str(kit), '--cards', 'v41-min',
+            '--matrix', '--arm', 'a=b:s', '--state', str(state), '--panels', 'none',
+            '--prefill-lengths', '8310', '--prefill-idle-seconds', value, '--dry-run'])
+        assert cards.main() == 0
+        matrix = json.loads(next(state.glob('*/matrix.json')).read_text())
+        assert matrix['entries'][0]['prefill_idle_seconds'] == float(value)
+    for value in ['-1', 'nan', 'inf', '1e30']:
+        monkeypatch.setattr(sys, 'argv', ['wip-cards', '--kit', str(kit), '--cards', 'v41-min',
+            '--matrix', '--arm', 'a=b:s', '--state', str(tmp_path / 'invalid'),
+            '--prefill-lengths', '8310', '--prefill-idle-seconds', value, '--dry-run'])
+        with pytest.raises(SystemExit):
+            cards.main()
+    monkeypatch.setattr(sys, 'argv', ['wip-cards', '--kit', str(kit), '--cards', 'v41-min',
+        '--matrix', '--arm', 'a=b:s', '--prefill-idle-seconds', '1', '--dry-run'])
+    with pytest.raises(SystemExit):
+        cards.main()
+
+
 def test_readiness_only_row_needs_no_report(entry, tmp_path):
     job = make({**entry, 'profile': 'panels:', 'baseline': False}, tmp_path)
     row = cards.summarize_job(job, 0)
@@ -1691,9 +1874,11 @@ def test_prefill_sweep_rows(entry, tmp_path):
     job = make(entry, tmp_path)
     sweep = Path(job['state']) / 'reports' / 'sweep-only' / job['entry']['name'] / 'sweep.json'
     sweep.parent.mkdir(parents=True)
-    sweep.write_text(json.dumps({'points': [], 'prefill': [{'length': 8192, 'prompt_tokens': 8170, 'tok_s': 9000.0, 'ttft_s': 0.91}]}))
+    sweep.write_text(json.dumps({'points': [], 'prefill': [{'length': 8192, 'prompt_tokens': 8192, 'tok_s': 9000.0, 'ttft_s': 0.91},
+        {'length': 8296, 'label': '8K w/tail', 'prompt_tokens': 8296, 'tok_s': 8800.0, 'ttft_s': 0.94}]}))
     row = cards.summarize_job(job, 0)
     assert row['status'] == 'pass' and row['prefill 8192'] == 9000.0 and row['prefill 8192 TTFT s'] == 0.91
+    assert row['8K w/tail'] == 8800.0
 
 
 def test_build_scopes_are_per_card_zero_spark_and_family_counts():
@@ -1729,7 +1914,7 @@ def _slot_with_roles(roles, verified=True, nvfp4=(), error=None):
     ([], False, 'TP manifest hash mismatch', 'cannot attest Spark TP role tp3: TP manifest hash mismatch'),
 ])
 def test_preflight_validates_attested_spark_tp_roles_before_enqueue(tmp_path, monkeypatch, roles, verified, error, message):
-    """#98: the card-derived Spark TP (v41-flash-min: SPARK_TP=3) must be attested by
+    """#98: the card-derived Spark TP (v41-flash-min: three Sparks, TP3) must be attested by
     every rank's slot before enqueue, as the launcher refuses it at launch."""
     gate = ROOT / 'scripts/bench/kits/gate'
     argv = ['--kit', str(gate), '--cards', 'v41-flash-min', '--matrix', '--arm', 'c=x:s',
@@ -1766,12 +1951,11 @@ def test_attested_spark_tp_roles_are_checked_again_at_grant(tmp_path, monkeypatc
 
 @pytest.mark.parametrize('keys,role', [
     ({'SPARK_COUNT': '4'}, None),
-    ({'SPARK_COUNT': '3', 'SPARK_TP': '3', 'SPARK_EP': '1'}, 'tp3'),
-    ({'SPARK_COUNT': '6', 'SPARK_TP': '6', 'SPARK_EP': '1'}, 'tp6'),
-    ({'SPARK_COUNT': '4', 'SPARK_TP': '2', 'SPARK_EP': '2'}, 'tp2'),
-    ({'SPARK_COUNT': '4', 'SPARK_TP': '4', 'SPARK_EP': '1'}, None),
     # A native count other than 4 is TP=count at launch.
+    ({'SPARK_COUNT': '3'}, 'tp3'),
+    ({'SPARK_COUNT': '5'}, 'tp5'),
     ({'SPARK_COUNT': '6'}, 'tp6'),
+    ({'SPARK_COUNT': '8'}, 'tp8'),
     ({'SPARK_COUNT': '2', 'EXPERT_FORMAT': 'exl3'}, None),
     ({'SPARK_COUNT': '0'}, None),
 ])
@@ -1950,6 +2134,25 @@ def test_context_load_options_reach_matrix(entry, tmp_path, monkeypatch, capsys)
     assert e['context_lengths'] == [32768, 131072] and e['context_levels'] == [1, 8, 16]
     assert e['context_suffix'] == 512
     assert 'context_suffix=512' in capsys.readouterr().out
+
+
+def test_run_timeout_overrides_one_cards_sweep_limit(entry, tmp_path, monkeypatch):
+    kit = _kit(tmp_path, entry)
+    state = tmp_path / 'timeout-state'
+    monkeypatch.setattr(sys, 'argv', ['wip-cards', '--kit', str(kit), '--cards', 'v41-min', '--matrix', '--arm', 'a=b:s',
+        '--state', str(state), '--run-timeout', 'v41-min=3600', '--dry-run'])
+    assert cards.main() == 0
+    e = json.loads(next(state.glob('*/matrix.json')).read_text())['entries'][0]
+    assert e['run_timeout_s'] == 3600
+
+
+@pytest.mark.parametrize('value', ['v41-min=0', 'v41-min=-5', 'v41-min=oops', 'other-card=3600'])
+def test_run_timeout_rejects_bad_values_and_unselected_cards(entry, tmp_path, monkeypatch, value):
+    kit = _kit(tmp_path, entry)
+    monkeypatch.setattr(sys, 'argv', ['wip-cards', '--kit', str(kit), '--cards', 'v41-min', '--matrix', '--arm', 'a=b:s',
+        '--state', str(tmp_path / 'bad-timeout'), '--run-timeout', value, '--dry-run'])
+    with pytest.raises((SystemExit, ValueError)):
+        cards.main()
 
 
 @pytest.mark.parametrize('option,value', [('--context-lengths', '255'), ('--context-lengths', '1048577'),
@@ -2351,7 +2554,8 @@ def test_an_export_published_while_waiting_is_restored_not_rebuilt(tmp_path):
     # A build ahead of us in the seed's export queue exported this very key.
     lines, lease = _expert_leg(tmp_path, [False, True])
     assert (lease / 'export-request').exists() and (lease / 'export-done').exists()
-    native = [line for line in lines if line.endswith('/wip/output/expert native')]
+    native = [line for line in lines if line.endswith('/wip/output/expert native')
+              and 'CUTEAFD_EXPORT_CACHE_REQUIRE_HIT=1' not in line]
     assert len(native) == 1 and 'CUTEAFD_WIP_NATIVE_REQUIRE_HIT=1' in native[0]
 
 
@@ -2939,6 +3143,7 @@ def test_observer_slow_cleanup_exits_within_hook_wait_and_preserves_failures(ent
     assert cards.observer_teardown_budget(job) == pytest.approx(3.5)
     hook_wait_s = 0.5
     job['entry']['observer']['finish_timeout_s'] = hook_wait_s
+    job['entry']['sparks'] = []  # This test isolates coordinator sampler teardown.
     budget_s = cards.observer_teardown_budget(job)
     assert 0.1 <= budget_s < hook_wait_s
     stop = tmp_path / 'observer.stop'
@@ -2962,7 +3167,7 @@ def test_observer_slow_cleanup_exits_within_hook_wait_and_preserves_failures(ent
             killed.append(True)
 
     def fake_popen(cmd, **kwargs):
-        kwargs['stdout'].write('{"time":1.0,"devices":[{"gpu":0,"raw_bytes":1,"sampler_bytes":0,"corrected_bytes":1}]}\n')
+        kwargs['stdout'].write('{"time":1.0,"devices":[{"gpu":0,"raw_bytes":2,"sampler_bytes":1,"corrected_bytes":1}]}\n')
         kwargs['stdout'].flush()
         return SlowSampler(kwargs['stdout'])
 
@@ -2976,7 +3181,7 @@ def test_observer_slow_cleanup_exits_within_hook_wait_and_preserves_failures(ent
             time.sleep(0.01)
         time.sleep(2.0)
 
-    def http(url, path):
+    def http(url, path, **kwargs):
         if path == '/v1/stats':
             stop.touch()
             return {'dspark_policy': {}}
@@ -3002,3 +3207,729 @@ def test_observer_slow_cleanup_exits_within_hook_wait_and_preserves_failures(ent
     monkeypatch.setattr(cards.subprocess, 'Popen', lambda cmd, **kw: SlowSampler(kw['stdout']))
     with pytest.raises(ValueError, match='memory probe produced no samples'):
         cards.observe(job)
+
+
+@pytest.mark.parametrize('profile,policy,expected', [('', 'simple', 'off'),
+    ('', 'shared', 'on (perturbing)'), ('draft-timing', 'simple', 'on (perturbing)'),
+    ('transport-timing', 'simple', 'on (perturbing)'), ('census', 'simple', 'off')])
+def test_layer_timing_reported_in_result_and_summary(entry, tmp_path, profile, policy, expected):
+    job = cards.generate(entry, 'a', dict(instance='a', slot='s'), tmp_path, tmp_path / 'key',
+                         {'PROFILE': profile, 'DRAFT_POLICY': policy}, set(), None, 1)
+    job['entry'].update(profile='panels:', baseline=False)
+    row = cards.summarize_job(job, 0)
+    assert row['instrumentation']['per_layer_timing'] == expected
+    cards.write_summary(tmp_path, [row], {'a': {}})
+    assert f'| {expected} |' in (tmp_path / 'summary.md').read_text()
+    assert json.loads((tmp_path / 'summary.json').read_text())['rows'][0]['instrumentation']['per_layer_timing'] == expected
+
+
+def test_deployment_preflight_uses_the_same_launcher_admission(entry, tmp_path, monkeypatch):
+    job = make(entry, tmp_path)
+    arm = dict(instance="test-base", slot="s", repo=str(ROOT))
+    # Bypass only the autouse sandbox stub for this bounded command-contract test.
+    original = importlib.util.module_from_spec(SPEC)
+    SPEC.loader.exec_module(original)
+    calls = []
+    def launch(cmd, **kwargs):
+        calls.append((cmd, kwargs))
+        return SimpleNamespace(stdout='launcher summary\n{"spark_roles": []}\n')
+    monkeypatch.setattr(original, "run", launch)
+    assert original.preflight_deployment(job, arm) == {"spark_roles": []}
+    cmd, kwargs = calls[0]
+    assert cmd[:3] == [str(ROOT / "run.sh"), "--config", job["entry"]["config"]]
+    assert "--dry-run" in cmd and "--total-capacity" in cmd
+    assert "--restart" not in cmd and kwargs["timeout"] == 300
+    assert "--wip" in cmd and "SPARK_COUNT=3" in cmd
+    def refused(cmd, **kwargs):
+        raise subprocess.CalledProcessError(2, cmd, stderr="planner: does not fit")
+    monkeypatch.setattr(original, "run", refused)
+    with pytest.raises(ValueError, match="planner: does not fit"):
+        original.preflight_deployment(job, arm)
+
+
+@pytest.mark.parametrize("media_rank", [None, 2])
+def test_deployment_preflight_checks_only_assigned_spark_roles(entry, tmp_path, monkeypatch, media_rank):
+    job = make(entry, tmp_path)
+    job['needs'] = dict(coordinator=[], spark=['experts-not-needed'], audio=False, tp_role='tp3')
+    roles = [] if media_rank is None else [dict(rank=media_rank, experts=False, encoder={}, audio_encoder=None)]
+    monkeypatch.setattr(cards, 'preflight_deployment', lambda *args: dict(spark_roles=roles))
+    checked = []
+    def seal(arm, host):
+        checked.append(host)
+        return json.dumps(dict(slot='s', seal_sha256='seal', artifact_manifest_sha256='art', contents=dict(packages=[], tp_roles=[])))
+    monkeypatch.setattr(cards, 'slot_check', seal)
+    cards.preflight_job(job, dict(instance='test-base', slot='s'))
+    assert checked == ['raptor'] + ([] if media_rank is None else [job['entry']['sparks'][media_rank]])
+    seen = []
+    monkeypatch.setattr(cards, 'run', lambda cmd: seen.append(cmd) or SimpleNamespace(stdout=''))
+    cards.assert_absent(job)
+    assert len(seen) == len(checked)
+    assert all(host in str(seen) for host in checked if host != 'raptor')
+
+
+@pytest.mark.parametrize('tp', [5, 6])
+def test_ml4_preflight_requires_exact_rank_packages(entry, tmp_path, monkeypatch, tp):
+    card = {**entry, 'name': 'ml4-card', 'family': 'mistral_large4',
+            'sparks': list(cards.HOSTS[:tp]), 'set': {'SPARK_COUNT': str(tp)}}
+    job = make(card, tmp_path)
+    package = 'exl3/exl3-ml4-k45'
+    job['needs'] = dict(coordinator=[package], spark=[package], audio=False)
+    monkeypatch.setattr(cards, 'preflight_deployment', lambda job, arm: {
+        'spark_roles': [dict(rank=i, experts=True) for i in range(tp)], 'artifact_requirements': {}})
+    layouts = cards.exl3_spark_layouts('ml4:exl3-k45', tp)
+    variants = [f'{package}/{layout}' for layout in layouts]
+    def slot(arm, host):
+        return json.dumps(dict(slot='s', seal_sha256='f07142-seal', artifact_manifest_sha256='art',
+            contents=dict(packages=[package], spark_variants=variants, audio=False)))
+    monkeypatch.setattr(cards, 'slot_check', slot)
+    cards.preflight_job(job, dict(instance='test', slot='s'))
+    # A registered package and balanced aliases do not prove the compact export.
+    variants.remove(f'{package}/{layouts[-1]}')
+    variants.append(f'{package}/tp{tp}-rank{tp-1}/m1' if tp == 5 else f'{package}/tp5-rank0/m1')
+    with pytest.raises(ValueError) as error:
+        cards.preflight_job(job, dict(instance='test', slot='s'))
+    message = str(error.value)
+    assert all(text in message for text in ('ml4-card', 'mistral_large4', layouts[-1], 'f07142-seal'))
+
+
+def test_ml4_min_max_scope_union_includes_both_counts():
+    selected = cards.load_cards(ROOT / 'scripts/bench/kits/gate', ['ml4-exl3-min', 'ml4-exl3-max'])
+    scope = cards.build_scopes(selected)
+    assert set(scope['CUTEAFD_WIP_GENERIC_SPARK_COUNTS'].split(';')) == {'ml4=5', 'ml4=6'}
+    assert cards.exl3_spark_layouts('ml4:exl3-k45', 5) == [f'tp5-compact-rank{rank}/m1' for rank in range(5)]
+    assert cards.exl3_spark_layouts('ml4:exl3-k45', 6) == [f'tp6-rank{rank}/m1' for rank in range(6)]
+
+
+def test_scope_and_package_needs_share_global_arm_settings(entry, tmp_path):
+    entry.update(family='mistral_large4')
+    Path(entry['config']).write_text('SPARK_COUNT=4\nSPARK_TP=4\n')
+    variant = cards.resolved_card(entry, {'SPARK_COUNT': '5'}, {'SPARK_TP'})
+    assert variant['resolved_values']['SPARK_COUNT'] == '5'
+    assert 'SPARK_TP' not in variant['resolved_values']
+    assert cards.build_scopes([variant])['CUTEAFD_WIP_GENERIC_SPARK_COUNTS'] == 'ml4=5'
+    assert cards.slot_needs(variant)['spark'] == ['exl3/exl3-ml4-k45']
+    assert 'SPARK_TP' not in make(variant, tmp_path)['entry']['set']
+
+
+def test_shared_launcher_package_verifier_requires_every_rank(tmp_path):
+    spec = importlib.util.spec_from_file_location('spark_preflight', ROOT / 'scripts/launch/preflight-spark-packages.py')
+    verifier = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(verifier)
+    package = 'exl3/exl3-ml4-k45'
+    layouts = cards.exl3_spark_layouts('ml4:exl3-k45', 5)
+    for layout in layouts[:-1]:
+        directory = tmp_path / package / layout
+        directory.mkdir(parents=True)
+        (directory / 'libcuteafd_exl3.so').touch()
+    with pytest.raises(ValueError, match='tp5-compact-rank4/m1'):
+        verifier.verify(tmp_path, {package: layouts}, 'ml4 seal fixture')
+    directory = tmp_path / package / layouts[-1]
+    directory.mkdir(parents=True)
+    (directory / 'libcuteafd_exl3.so').touch()
+    verifier.verify(tmp_path, {package: layouts}, 'ml4 seal fixture')
+
+
+def test_spark_package_preflight_resolves_the_slot_on_the_sparks_own_home(tmp_path, monkeypatch, capsys):
+    """The launcher passes a ~-relative WIP slot root; the Spark expands it against its own HOME,
+    which need not be the coordinator's."""
+    spec = importlib.util.spec_from_file_location('spark_preflight', ROOT / 'scripts/launch/preflight-spark-packages.py')
+    verifier = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(verifier)
+    package, layout = 'exl3/exl3-glmf-k34', 'tp4-rank0/m1'
+    rel = '.cache/cuteafd/builds/wip-inst/slots/s/spark-expert/workspace/.cuteafd-wip'
+    directory = tmp_path / rel / package / layout
+    directory.mkdir(parents=True)
+    (directory / 'libcuteafd_exl3.so').touch()
+    monkeypatch.setenv('HOME', str(tmp_path))
+    argv = ['preflight', json.dumps({package: [layout]}), 'glmf fixture', '~/' + rel]
+    monkeypatch.setattr(sys, 'argv', argv)
+    assert verifier.main() == 0
+    monkeypatch.setenv('HOME', str(tmp_path / 'elsewhere'))
+    assert verifier.main() == 2
+    assert 'missing Spark package exl3/exl3-glmf-k34/tp4-rank0/m1' in capsys.readouterr().err
+    launcher = (ROOT / 'scripts/launch/run-family.sh').read_text()
+    assert 'slot_root="${WIP_ROOT:-~/.cache/cuteafd/builds/wip${WIP_INSTANCE:+-$WIP_INSTANCE}}/slots/' in launcher
+
+
+def test_seal_inventory_reads_libraries_not_registered_directories(tmp_path):
+    root = tmp_path / 'wip'
+    slot = _sealed_slot(root)
+    artifacts = slot / 'workspace/.cuteafd-wip'
+    good = artifacts / 'exl3/exl3-ml4-k45/tp5-compact-rank0/m1'
+    good.mkdir(parents=True)
+    (good / 'libcuteafd_exl3.so').touch()
+    (artifacts / 'exl3/exl3-ml4-k45/tp5-compact-rank1/m1').mkdir(parents=True)
+    meta = json.loads(cards.slot_check(dict(instance='inst', slot='s', root=str(root)), 'raptor'))
+    assert meta['contents']['spark_variants'] == ['exl3/exl3-ml4-k45/tp5-compact-rank0/m1']
+
+
+def test_global_count_override_builds_and_launches_same_topology(entry, tmp_path, monkeypatch):
+    entry['family'] = 'mistral_large4'
+    kit = _kit(tmp_path, entry)
+    state = tmp_path / 'state'
+    seen = []
+    monkeypatch.setattr(cards, 'build_arms', lambda builds, arms, selected, *args: seen.extend(selected))
+    monkeypatch.setattr(sys, 'argv', ['wip-cards', '--kit', str(kit), '--cards', entry['name'],
+        '--matrix', '--arm', 'c=test:s', '--arm-set', 'c:SPARK_COUNT=5', '--state', str(state), '--dry-run'])
+    assert cards.main() == 0
+    job = json.loads((state / 'plan.json').read_text())['jobs'][0]
+    assert job['entry']['set']['SPARK_COUNT'] == '5'
+    assert len(job['entry']['sparks']) == 5
+    assert cards.build_scopes(seen)['CUTEAFD_WIP_GENERIC_SPARK_COUNTS'] == 'ml4=5'
+
+
+def test_release_preflight_verifies_exact_packages_without_gpu(entry, tmp_path, monkeypatch):
+    job = make(entry, tmp_path)
+    package = 'exl3/exl3-ml4-k45'
+    monkeypatch.setattr(cards, 'preflight_deployment', lambda *args: {
+        'spark_roles': [dict(rank=0, experts=True)],
+        'artifact_requirements': {'spark_packages': {package: ['tp5-compact-rank4/m1']}}})
+    monkeypatch.setattr(cards, 'slot_check', lambda *args: json.dumps(dict(image='image:tag', image_id='digest', repo_digests=[])))
+    commands = []
+    def run(command, **kwargs):
+        commands.append(command)
+        assert '--gpus' not in str(command)
+        assert 'tp5-compact-rank4/m1' in str(command)
+        assert 'def verify(' in kwargs['input']
+        raise subprocess.CalledProcessError(2, command, stderr='missing Spark package tp5-compact-rank4/m1')
+    monkeypatch.setattr(cards, 'run', run)
+    with pytest.raises(ValueError, match='missing Spark package tp5-compact-rank4/m1'):
+        cards.preflight_job(job, dict(release='v4.1.2'))
+    assert len(commands) == 1
+
+
+@pytest.mark.parametrize('attested,refused', [([], True), (['tp3', 'tp6'], True), (['tp7'], False)])
+def test_unequal_v41_world_needs_its_own_attested_role(attested, refused):
+    """A V4.1 TP7 card (adjacent-width packages) is refused before enqueue unless
+    every rank's slot attests tp7 itself; another world's role never stands in."""
+    card = dict(name='v', family='deepseek_v41', config='', set={'SPARK_COUNT': '7'}, sparks=[])
+    assert cards.v41_tp_role(card, {'SPARK_COUNT': '7'})['tp_role'] == 'tp7'
+    problems = cards.tp_role_problems('kiwi', 's', 'tp7', False,
+        dict(tp_roles=dict(roles=attested, verified=True, nvfp4=[], error=None)))
+    assert bool(problems) == refused, problems
+    if refused:
+        assert 'not tp7' in problems[0] and 'CUTEAFD_WIP_SPARK_TP_ROLES=tp7' in problems[0]
+    # A slot with no role manifest at all is refused too (the #1105 shape).
+    missing = cards.tp_role_problems('kiwi', 's', 'tp7', False, dict(tp_roles=None))
+    assert missing and 'has no V41_EXPERT_TP_AOT.json' in missing[0]
+
+
+@pytest.mark.parametrize('phase,gauges,active,expected', [
+    ('starting', {}, None, 'loading'),
+    ('ready', {'prefilling_n': 1, 'active': 1}, None, 'prefill'),
+    ('ready', {'active': 2}, None, 'decode'),
+    ('ready', {}, {'panel': 'baseline'}, 'panel:baseline'),
+    ('ready', {}, None, 'ready-idle'),
+])
+def test_spark_memory_phase(monkeypatch, phase, gauges, active, expected):
+    def http(url, path, **kwargs):
+        assert kwargs['timeout'] == .5
+        return ({'starting': phase == 'starting', 'g': gauges} if path.endswith('snapshot')
+                else {'active': active})
+    monkeypatch.setattr(cards, 'http', http)
+    diagnostics = []
+    assert cards.spark_memory_phase('http://localhost', diagnostics) == expected
+    assert diagnostics
+    assert all(row['status'] == 'ok' and row['exception_type'] is None for row in diagnostics)
+    assert all(row['timeout_s'] == .5 and row['elapsed_s'] >= 0 for row in diagnostics)
+
+
+@pytest.mark.parametrize('endpoint', ['/v1/console/snapshot', '/v1/bench/status'])
+def test_spark_memory_phase_timeout_diagnostics(monkeypatch, endpoint):
+    calls = []
+    def http(url, path, **kwargs):
+        calls.append(path)
+        assert kwargs['timeout'] == .5
+        if path == endpoint:
+            raise TimeoutError('timed out')
+        return {'g': {}}
+    monkeypatch.setattr(cards, 'http', http)
+    ticks = iter([10., 10.5, 11., 11.5])
+    monkeypatch.setattr(cards.time, 'monotonic', lambda: next(ticks))
+    diagnostics = []
+    assert cards.spark_memory_phase('http://localhost', diagnostics) == 'unavailable'
+    assert calls[-1] == endpoint
+    request = next(row for row in diagnostics if row.get('endpoint') == endpoint)
+    assert request == dict(endpoint=endpoint, timeout_s=.5, elapsed_s=.5,
+                           status='unavailable', exception_type='TimeoutError', error='timed out')
+    assert diagnostics[-1]['source'] == 'phase-classification'
+
+
+@pytest.mark.parametrize('endpoint', ['/v1/console/snapshot', '/v1/bench/status'])
+@pytest.mark.parametrize('boundary', ['ready', 'post-sweep'])
+@pytest.mark.parametrize('error', [TimeoutError('timed out'), IncompleteRead(b'{', 20)])
+def test_spark_memory_boundary_preserves_ready_on_telemetry_failure(entry, tmp_path, monkeypatch, endpoint, boundary, error):
+    job = cards.generate(entry, 'probe', dict(instance='boundary', slot='s'), tmp_path,
+                         tmp_path / 'key', {}, {'memory'}, None, 1)
+    monkeypatch.setenv('CUTEAFD_SMOKE_URL', 'http://localhost')
+    def http(url, path, **kwargs):
+        assert kwargs['timeout'] == 3.
+        if path == endpoint:
+            raise error
+        return {'g': {}}
+    monkeypatch.setattr(cards, 'http', http)
+    sampled = []
+    def run(command, **kwargs):
+        rank = len(sampled)
+        host = job['entry']['sparks'][rank]
+        sampled.append(host)
+        return SimpleNamespace(stdout=json.dumps(dict(rank=rank, host=host, mem={'MemAvailable': 2**30})))
+    # A single worker makes the mocked sampling order deterministic.
+    from concurrent.futures import ThreadPoolExecutor
+    monkeypatch.setattr(cards.concurrent.futures, 'ThreadPoolExecutor', lambda **kwargs: ThreadPoolExecutor(max_workers=1))
+    monkeypatch.setattr(cards, 'run', run)
+    if boundary == 'ready':
+        cards.precheck(job)
+        assert json.loads((Path(job['state']) / 'precheck.json').read_text())['status'] == 'pass'
+    else:
+        cards.spark_memory_boundary(job, boundary)
+    assert sampled == job['entry']['sparks']
+    evidence = json.loads((Path(job['state']) / f'memory-phase-{boundary}.json').read_text())
+    assert evidence['ready'] is True and evidence['boundary'] == boundary
+    assert evidence['phase'] == 'unavailable'
+    assert any(row.get('endpoint') == endpoint and row['exception_type'] == type(error).__name__
+               for row in evidence['telemetry'])
+    for rank in range(len(sampled)):
+        row = json.loads((Path(job['state']) / f'memory-spark-rank{rank}-{boundary}.jsonl').read_text())
+        assert all(row[key] == value for key, value in evidence.items())
+        assert row['mem']['MemAvailable'] == 2**30
+
+
+@pytest.mark.parametrize('failure', ['sampling', 'identity', 'guard'])
+def test_spark_memory_boundary_real_failures_stay_hard(entry, tmp_path, monkeypatch, failure):
+    entry['sparks'] = ['ostrich']
+    job = cards.generate(entry, 'probe', dict(instance='boundary', slot='s'), tmp_path,
+                         tmp_path / 'key', {}, {'memory'}, None, 1)
+    job['memory_guard_bytes'] = 512 * 1024 * 1024
+    monkeypatch.setenv('CUTEAFD_SMOKE_URL', 'http://localhost')
+    def http(*args, **kwargs):
+        raise TimeoutError('timed out')
+    monkeypatch.setattr(cards, 'http', http)
+    stopped = []
+    monkeypatch.setattr(cards, 'stop_memory_worker', lambda job, host: stopped.append(host))
+    def run(command, **kwargs):
+        if failure == 'sampling':
+            raise subprocess.TimeoutExpired(command, 8)
+        return SimpleNamespace(stdout=json.dumps(dict(rank=0, host='foreign' if failure == 'identity' else 'ostrich',
+                                                      mem={'MemAvailable': 1})))
+    monkeypatch.setattr(cards, 'run', run)
+    with pytest.raises((subprocess.TimeoutExpired, ValueError, RuntimeError)):
+        cards.precheck(job)
+    assert json.loads((Path(job['state']) / 'precheck.json').read_text())['status'] == 'failed'
+    assert stopped == (['ostrich'] if failure == 'guard' else [])
+    assert json.loads((Path(job['state']) / 'memory-phase-ready.json').read_text())['ready'] is True
+
+
+def test_launch_and_preflight_refuse_unconfirmed_cleanup_marker(tmp_path):
+    home = tmp_path / 'home'
+    marker = home / '.cache/cuteafd/instances/failed/unconfirmed-containers.json'
+    marker.parent.mkdir(parents=True)
+    marker.write_text(json.dumps([dict(host='kiwi', container='cuteafd-spark-expert-kiwi-19441')]))
+    # The marker is checked before configs, checkpoints or Docker are touched,
+    # including the launcher's CPU-only dry-run used by card preflight.
+    for args in ([], ['--dry-run', '--total-capacity']):
+        result = subprocess.run(['bash', str(ROOT / 'scripts/launch/run-family.sh'), *args],
+                                env={**os.environ, 'HOME': str(home)}, capture_output=True, text=True, timeout=5)
+        assert result.returncode != 0
+        assert str(marker) in result.stderr and 'kiwi' in result.stderr
+        assert 'unconfirmed container teardown' in result.stderr
+
+
+def test_spark_memory_stream_has_bytes_no_cuda_and_stops_on_eof():
+    command = cards.spark_memory_command(2, 'emu', 5)
+    assert command[:2] == ['ssh', '-T'] and 'ConnectTimeout=5' in command
+    assert 'cuda' not in cards.SPARK_MEMORY_SAMPLER.lower()
+    child = subprocess.Popen([sys.executable, '-I', '-u', '-c', cards.SPARK_MEMORY_SAMPLER,
+                              '2', 'emu', '5'], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                             stderr=subprocess.PIPE, text=True)
+    try:
+        first = json.loads(child.stdout.readline())
+        assert first['rank'] == 2 and first['host'] == 'emu'
+        assert first['phase'] == 'loading'
+        assert set(first['mem']) == {'MemAvailable', 'MemFree', 'Cached', 'SReclaimable',
+            'AnonPages', 'PageTables', 'SecPageTables', 'Slab', 'VmallocUsed'}
+        assert first['mem']['MemAvailable'] > 0
+        assert all(value is None or value % 1024 == 0 for value in first['mem'].values())
+        child.stdin.write('{"phase":')
+        child.stdin.flush()
+        child.stdout.readline()  # Partial control frames cannot abort the sampler.
+        child.stdin.write('"decode"}\n')
+        child.stdin.flush()
+        for _ in range(10):
+            if json.loads(child.stdout.readline())['phase'] == 'decode':
+                break
+        else:
+            pytest.fail('phase update never reached sampler')
+        child.stdin.close()
+        assert child.wait(timeout=2) == 0, child.stderr.read()
+    finally:
+        if child.poll() is None:
+            child.kill()
+            child.wait(timeout=2)
+
+
+def test_spark_memory_report_rank_phase_minima(tmp_path):
+    records = [dict(time=i, rank=0, host='ostrich', phase=phase,
+                    mem={'MemAvailable': available, 'Cached': cached, 'SecPageTables': None})
+               for i, (phase, available, cached) in enumerate([
+                   ('loading', 3000, 100), ('decode', 2000, 50), ('decode', 2500, 200)])]
+    (tmp_path / 'memory-spark-rank0.jsonl').write_text(''.join(json.dumps(r) + '\n' for r in records))
+    rank = cards.spark_memory_report(tmp_path)['0']
+    assert rank['samples'] == 3 and rank['min_mem_available_bytes'] == 2000
+    assert rank['phases']['loading']['min_mem_available_bytes'] == 3000
+    assert rank['phases']['decode'] == dict(samples=2, min_mem_available_bytes=2000,
+                                          peak_bytes={'MemAvailable': 2500, 'Cached': 200})
+
+
+def test_spark_memory_guard_only_triggers_below_threshold(tmp_path, monkeypatch):
+    from io import StringIO
+    stopped = []
+    monkeypatch.setattr(cards, 'stop_memory_worker', lambda job, host: stopped.append(host))
+    threshold = 512 * 1024 * 1024
+    for margin, enabled, expected in [(threshold, threshold, False), (1, 0, False), (1, threshold, True)]:
+        sample = dict(rank=0, host='ostrich', phase='decode', mem={'MemAvailable': margin})
+        output, errors = StringIO(), []
+        child = SimpleNamespace(stdout=StringIO(json.dumps(sample) + '\n'))
+        cards.spark_memory_read(child, output, enabled, {}, 0, 'ostrich', errors)
+        assert bool(errors) == expected
+        assert bool(json.loads(output.getvalue()).get('guard')) == expected
+    assert stopped == ['ostrich']
+
+
+def test_spark_guard_checks_exact_owned_worker_mount(entry, tmp_path, monkeypatch):
+    import shlex
+    job = make(entry, tmp_path)
+    commands = []
+    monkeypatch.setattr(cards, 'run', lambda cmd, **kwargs: commands.append(cmd))
+    cards.stop_memory_worker(job, 'ostrich')
+    argv = shlex.split(commands[0][-1])
+    program, name, layout = argv[-3:]
+    assert name == 'cuteafd-spark-expert-ostrich-' + job['entry']['set']['EXPERT_PORT']
+    assert layout.endswith('/serve-' + job['entry']['set']['INSTANCE'] + '/bin')
+    real_run = subprocess.run
+    for owned in (False, True):
+        stopped = []
+        info = dict(Id='immutable-card-id', Mounts=[dict(Destination='/opt/cuteafd/bin',
+                    Source='/home/tj' + layout if owned else '/foreign/bin')])
+        def fake_run(cmd, **kwargs):
+            if cmd[1] == 'inspect':
+                return SimpleNamespace(returncode=0, stdout=json.dumps([info]))
+            stopped.append(cmd)
+        monkeypatch.setattr(subprocess, 'run', fake_run)
+        monkeypatch.setattr(sys, 'argv', ['guard', name, layout])
+        if owned:
+            exec(program, {})
+            assert stopped == [['docker', 'stop', '-t', '1', 'immutable-card-id']]
+        else:
+            with pytest.raises(RuntimeError, match='refusing foreign card worker'):
+                exec(program, {})
+            assert not stopped
+    monkeypatch.setattr(subprocess, 'run', real_run)
+
+
+@pytest.mark.parametrize('hosts', [[], ['moa', 'dodo']])
+def test_memory_observer_samples_selected_hosts_and_closes_streams(entry, tmp_path, monkeypatch, hosts):
+    import shlex
+    entry.update(sparks=hosts, set={'SPARK_COUNT': str(len(hosts))})
+    job = cards.generate(entry, 'candidate', dict(instance='streams-test', slot='s'),
+                         tmp_path, tmp_path / 'key', {}, {'memory'}, None, 1)
+    stop = tmp_path / 'observer.stop'
+    monkeypatch.setenv('CUTEAFD_SMOKE_STOP', str(stop))
+    monkeypatch.setenv('CUTEAFD_SMOKE_URL', 'http://localhost:8500')
+    real_popen = subprocess.Popen
+    selected, children = [], []
+
+    class Coordinator:
+        returncode = None
+        stderr = SimpleNamespace(read=lambda: '')
+        def poll(self):
+            return None
+        def wait(self, timeout=None):
+            self.returncode = 0
+            return 0
+
+    def popen(cmd, **kwargs):
+        if cmd[0] == 'docker':
+            kwargs['stdout'].write('{"devices":[{"gpu":0,"raw_bytes":3,"sampler_bytes":1,"corrected_bytes":2}]}\n')
+            kwargs['stdout'].flush()
+            if not hosts:
+                stop.touch()
+            return Coordinator()
+        assert cmd[0] == 'ssh' and cmd[-2] in hosts
+        args = shlex.split(cmd[-1])
+        selected.append((int(args[-3]), cmd[-2]))
+        child = real_popen([sys.executable, *args[1:]], **kwargs)
+        children.append(child)
+        return child
+
+    def phase(url, diagnostics):
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            if all((Path(job['state']) / f'memory-spark-rank{r}.jsonl').stat().st_size for r in range(len(hosts))):
+                stop.touch()
+                return 'ready-idle'
+            time.sleep(.01)
+        pytest.fail('selected Spark streams did not produce samples')
+
+    monkeypatch.setattr(cards.subprocess, 'Popen', popen)
+    monkeypatch.setattr(cards, 'run', lambda *args, **kwargs: None)
+    monkeypatch.setattr(cards, 'spark_memory_phase', phase)
+    cards.observe(job)
+    assert selected == list(enumerate(hosts))
+    assert all(child.returncode == 0 and child.stdin.closed for child in children)
+    summary = cards.spark_memory_report(Path(job['state']))
+    assert [summary[str(r)]['host'] for r in range(len(hosts))] == hosts
+    assert all(rank['samples'] > 0 and rank['min_mem_available_bytes'] > 0 for rank in summary.values())
+    assert cards.peaks(Path(job['state'])) == {'0': dict(raw_bytes=3, sampler_bytes=1, corrected_bytes=2)}
+
+
+def test_spark_memory_minima_are_in_text_summary(tmp_path):
+    row = dict(card='test', arm='probe', repeat=1, status='pass', simulated=False, spark_memory={
+        '2': dict(host='moa', samples=10, min_mem_available_bytes=2**30,
+                  phases={'decode': dict(samples=8, min_mem_available_bytes=2**30)})})
+    cards.write_summary(tmp_path, [row], {'probe': {}})
+    text = (tmp_path / 'summary.md').read_text()
+    assert 'Spark Host Memory' in text and 'moa' in text and 'decode' in text
+    assert '1073741824' in text
+
+
+@pytest.mark.parametrize('ending', ['lifetime', 'lost-heartbeat'])
+def test_spark_memory_sampler_bounds_remote_lifetime(ending):
+    lifetime = '.15' if ending == 'lifetime' else '30'
+    source = cards.SPARK_MEMORY_SAMPLER
+    if ending == 'lost-heartbeat':
+        # Exercise the watchdog path without waiting five seconds in the suite.
+        source = source.replace('began - heartbeat > 5', 'began - heartbeat > .15')
+    child = subprocess.Popen([sys.executable, '-I', '-u', '-c', source, '0', 'ostrich', lifetime],
+                             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    try:
+        assert child.wait(timeout=2) == 0, child.stderr.read()
+        assert json.loads(child.stdout.readline())['host'] == 'ostrich'
+    finally:
+        if child.poll() is None:
+            child.kill()
+            child.wait(timeout=2)
+        child.stdin.close()
+
+
+def test_spark_memory_unit_error_identifies_field():
+    from unittest.mock import patch
+    from pathlib import Path as HostPath
+    from io import StringIO
+    with patch.object(HostPath, 'read_text', return_value='MemAvailable: 123 MB\n'), \
+         patch.object(sys, 'argv', ['sampler', '0', 'ostrich', '1']):
+        # The control channel is idle; the fixture reaches meminfo validation.
+        with patch('select.select', return_value=([], [], [])):
+            with pytest.raises(RuntimeError, match='MemAvailable.*unit'):
+                exec(cards.SPARK_MEMORY_SAMPLER, {})
+
+
+def test_observer_telemetry_calls_have_short_timeouts(entry, tmp_path, monkeypatch):
+    job = cards.generate(entry, 'candidate', dict(instance='http-test', slot='s'),
+                         tmp_path, tmp_path / 'key', {}, {'console'}, None, 1, trace=True)
+    stop = tmp_path / 'observer.stop'
+    monkeypatch.setenv('CUTEAFD_SMOKE_STOP', str(stop))
+    monkeypatch.setenv('CUTEAFD_SMOKE_URL', 'http://localhost:8500')
+    calls = []
+    def http(url, path, **kwargs):
+        calls.append((path, kwargs.get('timeout')))
+        if path == '/v1/stats':
+            stop.touch()
+        return {'active': None}
+    monkeypatch.setattr(cards, 'http', http)
+    monkeypatch.setattr(cards, 'console_frames', lambda *args: None)
+    cards.observe(job)
+    assert calls == [('/v1/bench/status', .5), ('/v1/console/snapshot', .5), ('/v1/stats', .5)]
+
+
+def test_spark_memory_boundaries_are_wired_and_merged(entry, tmp_path, monkeypatch):
+    entry.update(levels=[1], window=dict(open=dict(argv=['true'], timeout_s=10),
+                                       close=dict(argv=['echo', 'existing'], timeout_s=12)))
+    job = cards.generate(entry, 'probe', dict(instance='boundary', slot='s'), tmp_path,
+                         tmp_path / 'key', {}, {'memory'}, None, 1)
+    assert '--precheck' in job['entry']['precheck']['argv']
+    close = job['entry']['window']['close']
+    assert 'existing' in str(close['argv']) and '--spark-memory-boundary' in str(close['argv'])
+    assert close['timeout_s'] == 32
+    monkeypatch.setenv('CUTEAFD_SMOKE_URL', 'http://localhost')
+    phases = iter(['loading', 'ready-idle'])
+    monkeypatch.setattr(cards, 'spark_memory_phase', lambda url, diagnostics, timeout: next(phases))
+    real_run = subprocess.run
+    commands = []
+    def run(command, **kwargs):
+        import shlex
+        commands.append(command)
+        args = shlex.split(command[-1])
+        return real_run([sys.executable, *args[1:]], capture_output=True, text=True,
+                        stdin=subprocess.DEVNULL, timeout=kwargs['timeout'], check=True)
+    monkeypatch.setattr(cards, 'run', run)
+    cards.precheck(job)
+    cards.spark_memory_boundary(job, 'post-sweep')
+    assert len(commands) == 6
+    report = cards.spark_memory_report(Path(job['state']))
+    assert len(report) == 3
+    for rank in report.values():
+        assert rank['samples'] == 2 and rank['phases']['ready-idle']['samples'] == 2
+    for boundary in ['ready', 'post-sweep']:
+        sample = json.loads((Path(job['state']) / f'memory-spark-rank0-{boundary}.jsonl').read_text())
+        assert sample['boundary'] == boundary and sample['phase'] == 'ready-idle'
+
+
+def test_spark_teardown_kills_all_before_reaping(entry, tmp_path, monkeypatch):
+    from io import StringIO
+    entry.update(sparks=['moa', 'dodo'], set={'SPARK_COUNT': '2'})
+    job = cards.generate(entry, 'probe', dict(instance='teardown', slot='s'), tmp_path,
+                         tmp_path / 'key', {}, {'memory'}, None, 1)
+    stop = tmp_path / 'observer.stop'
+    stop.touch()
+    monkeypatch.setenv('CUTEAFD_SMOKE_STOP', str(stop))
+    events = []
+    class Child:
+        def __init__(self, pid):
+            self.pid, self.returncode = pid, None
+            self.stdin = StringIO()
+            self.stdout = StringIO(json.dumps(dict(rank=pid, host=entry['sparks'][pid],
+                phase='loading', mem={'MemAvailable': 1024})) + '\n')
+        def poll(self):
+            return self.returncode
+        def kill(self):
+            events.append(('kill', self.pid))
+            self.returncode = -9
+        def wait(self, timeout):
+            if self.returncode is None:
+                raise subprocess.TimeoutExpired('ssh', timeout)
+            events.append(('reap', self.pid, timeout))
+            return self.returncode
+    children = []
+    class Coordinator:
+        def wait(self, timeout):
+            return 0
+    def popen(cmd, **kwargs):
+        if cmd[0] == 'docker':
+            kwargs['stdout'].write('{"devices":[]}\n')
+            kwargs['stdout'].flush()
+            return Coordinator()
+        child = Child(len(children))
+        children.append(child)
+        return child
+    monkeypatch.setattr(cards.subprocess, 'Popen', popen)
+    monkeypatch.setattr(cards, 'run', lambda *args, **kwargs: None)
+    cards.observe(job)
+    assert events[:2] == [('kill', 0), ('kill', 1)]
+    assert [e[:2] for e in events[2:]] == [('reap', 0), ('reap', 1)]
+    assert all(e[2] > 2 for e in events[2:])
+    assert all(child.stdin.closed for child in children)
+
+
+@pytest.mark.parametrize('devices', [[1], [1, 0]])
+def test_sampler_uses_host_uuids_before_cuda_in_cdi_filtered_container(monkeypatch, capsys, devices):
+    import ctypes
+    events = []
+    uuids = ','.join(f'GPU-host-{device}' for device in devices)
+    monkeypatch.setenv('CARD_GPUS', ','.join(map(str, devices)))
+    monkeypatch.setenv('CUDA_VISIBLE_DEVICES', ','.join(map(str, devices)))
+    monkeypatch.setenv('CARD_GPU_UUIDS', uuids)
+
+    def cuda_device(index):
+        # Numeric host ordinal 1 does not exist after CDI filters to one card.
+        assert os.environ['CUDA_VISIBLE_DEVICES'] == uuids
+        assert index < len(devices)
+        events.append(('cuda', index))
+        return 0
+
+    def memory(free, total):
+        free._obj.value, total._obj.value = 100, 200
+        return 0
+
+    def processes(handle, count, rows):
+        count._obj.value = 1
+        rows[0].pid, rows[0].usedGpuMemory = os.getpid(), 20
+        return 0
+
+    # No numeric-index NVML lookup exists in the filtered-container fixture.
+    nv = SimpleNamespace(nvmlInit_v2=lambda: 0, nvmlDeviceGetHandleByPciBusId_v2=lambda *args: 0,
+        nvmlDeviceGetComputeRunningProcesses_v3=processes)
+    cuda = SimpleNamespace(cudaSetDevice=cuda_device, cudaFree=lambda *args: 0,
+        cudaMemGetInfo=memory, cudaDeviceGetPCIBusId=lambda *args: 0)
+    monkeypatch.setattr(ctypes, 'CDLL', lambda name: nv if name == 'libnvidia-ml.so.1' else cuda)
+    monkeypatch.setattr(time, 'sleep', lambda _: (_ for _ in ()).throw(InterruptedError()))
+    with pytest.raises(InterruptedError):
+        exec(cards.CUDA_SAMPLER, {})
+    sample = json.loads(capsys.readouterr().out)
+    assert [row['gpu'] for row in sample['devices']] == devices
+    assert all(row['sampler_bytes'] == 20 for row in sample['devices'])
+    assert events[:len(devices)] == [('cuda', index) for index in range(len(devices))]
+
+
+def test_observer_uses_same_host_resolver_as_launcher(monkeypatch):
+    seen = []
+    def run(cmd, **kwargs):
+        seen.append(cmd)
+        assert cmd[-2:] == ['1,0', '2']
+        assert 'release_resolve_coordinator_gpus' in cmd[2]
+        assert cmd[4] == str(ROOT / 'scripts/lib/release-common.sh')
+        assert kwargs['timeout'] == 30
+        return SimpleNamespace(stdout='GPU-second\nGPU-first\n')
+    monkeypatch.setattr(cards, 'run', run)
+    assert OBSERVER_GPU_UUIDS([1, 0]) == 'GPU-second,GPU-first'
+    assert len(seen) == 1
+
+
+def test_observer_context_handoff_is_measured_atomic_and_logical(entry, tmp_path):
+    entry.update(gpus=[1, 0], sparks=[], set={'SPARK_COUNT': '0'})
+    job = cards.generate(entry, 'candidate', dict(instance='observer-context', slot='s'),
+                         tmp_path, tmp_path / 'key', {}, {'memory'}, None, 1)
+    dest = Path(job['state'])
+    handoff = Path(job['entry']['set']['PROFILE_DIR']) / 'observer-context.json'
+    assert json.loads(handoff.read_text()) == {'pending': True}
+    samples = dest / 'memory.jsonl'
+    samples.write_text('{')
+    assert not cards.publish_observer_context(job)
+    assert json.loads(handoff.read_text()) == {'pending': True}
+    samples.write_text(json.dumps({'devices': [dict(gpu=0, sampler_bytes=234), dict(gpu=1, sampler_bytes=123)]}) + '\n')
+    assert cards.publish_observer_context(job)
+    assert json.loads(handoff.read_text()) == {'0': 123, '1': 234}
+    assert not handoff.with_suffix('.tmp').exists()
+    samples.write_text('{"devices":[{"gpu":1,"sampler_bytes":0}]}\n')
+    with pytest.raises(ValueError, match='invalid measured observer'):
+        cards.publish_observer_context(job)
+
+
+def test_launcher_mounts_and_declares_observer_for_coordinator_only(tmp_path):
+    profile = tmp_path / 'profile'
+    profile.mkdir()
+    (profile / 'observer-context.json').write_text('{"pending":true}\n')
+    source = (ROOT / 'scripts/launch/run-family.sh').read_text()
+    block = 'shared_profile_args() {\n' + source.split('shared_profile_args() {\n', 1)[1].split('\n}\n', 1)[0] + '\n}\n'
+    shell = f'source {ROOT}/scripts/lib/release-common.sh\n' + '''
+get() { case "$1" in PROFILE_DIR) printf '%s' "$TEST_PROFILE_DIR";; esac; }
+''' + block + '\nshared_profile_args\nprintf "%s\\0" "${profile_args[@]}"'
+    result = subprocess.run(['bash', '-c', shell], env={**os.environ, 'TEST_PROFILE_DIR': str(profile)}, capture_output=True)
+    assert result.returncode == 0, result.stderr.decode()
+    args = result.stdout.decode().split('\0')
+    assert f'{profile}:{profile}' in args
+    assert f'CUTEAFD_OBSERVER_CONTEXT_FILE={profile}/observer-context.json' in args
+    # Spark launchers call only release_profile_docker_args, never shared_profile_args.
+    shell = f'source {ROOT}/scripts/lib/release-common.sh\nrelease_profile_docker_args "" "$TEST_PROFILE_DIR" rhea\nprintf "%s\\0" "${{RELEASE_PROFILE_ARGS[@]}}"'
+    result = subprocess.run(['bash', '-c', shell], env={**os.environ, 'TEST_PROFILE_DIR': str(profile)}, capture_output=True)
+    assert result.returncode == 0, result.stderr.decode()
+    assert b'CUTEAFD_OBSERVER_CONTEXT_FILE' not in result.stdout
+
+
+def test_failed_memory_only_resume_recreates_pending_before_preflight(entry, tmp_path, monkeypatch):
+    entry.update(sparks=[], set={'SPARK_COUNT': '0'})
+    kit = _kit(tmp_path, entry)
+    state = tmp_path / 'state'
+    argv = ['--kit', str(kit), '--cards', 'v41-min', '--matrix', '--arm', 'a=b:s',
+            '--state', str(state), '--probe', 'v41-min:memory']
+    rc, _ = _run_main(monkeypatch, argv, rc_for=lambda job: 1)
+    assert rc == 1
+    seen = []
+    def deployment(job, arm):
+        path = Path(job['entry']['set']['PROFILE_DIR']) / 'observer-context.json'
+        assert json.loads(path.read_text()) == {'pending': True}
+        seen.append(path)
+        return {'spark_roles': [], 'artifact_requirements': {}}
+    monkeypatch.setattr(cards, 'preflight_deployment', deployment)
+    rc, launched = _run_main(monkeypatch, argv + ['--resume'])
+    assert rc == 0 and launched == ['v41-min/a'] and seen

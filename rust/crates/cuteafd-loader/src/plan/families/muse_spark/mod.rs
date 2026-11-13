@@ -90,7 +90,8 @@ impl Model {
         for tensor in &checkpoint.tensors { headers.insert(tensor.meta.name.as_str(), &tensor.meta); }
         let mut complete = checkpoint.missing_shards.is_empty();
         for (name, expected) in &tensors {
-            if core.get_weight(name).is_some() { continue; }
+            if core.get_weight(name).is_some()
+                || core.native.contains_key(name.strip_suffix(".weight").unwrap_or(name)) { continue; }
             let Some(meta) = headers.get(name.as_str()) else {
                 ensure!(checkpoint.contains_tensor(name), "Muse Spark checkpoint lacks {name}");
                 complete = false;
@@ -235,6 +236,7 @@ impl Family for MuseSpark {
 }
 
 impl FamilyModel for Model {
+    fn contract_admission(&self) -> bool { true }
     fn spec(&self) -> &ModelSpec { &self.spec }
     fn native_serving_admission(&self) -> bool { true }
     fn cache_geometry(&self, options: crate::serving_capacity::CacheOptions)
@@ -258,12 +260,23 @@ impl FamilyModel for Model {
                 format!("{stem}: bundled Muse tower needs plain BF16 {shape:?}, found {}", super::describe(operand)));
         }
         if let Some(projection) = self.core.projections.get(stem) {
-            super::require(matches!(operand.encoding, format::Encoding::Exl3 { bits: 6 })
+            super::require(matches!(projection.bits, 6 | 8)
+                && operand.exl3_bits() == Some(projection.bits)
                 && operand.logical == [projection.stored_outputs, projection.shape[1]],
-                || format!("{stem}: expected header-native K6 {:?} (stored N {})", projection.shape, projection.stored_outputs))?;
+                || format!("{stem}: expected header-native K{} {:?} (stored N {}; supported widths K6/K8)",
+                    projection.bits, projection.shape, projection.stored_outputs))?;
             // Report the logical extent; the head's stored N128 padding stays the loader's.
             operand.logical = projection.shape.to_vec();
             return Ok(());
+        }
+        if let Some(projection) = self.core.native.get(stem) {
+            return super::require(operand.logical == projection.shape
+                && (operand.is_plain(&[format::Encoding::Bf16])
+                    || operand.is_fp8_block(128, &[format::ScaleEncoding::F32]))
+                && operand.input_scale.is_none() && operand.global_scale.is_none()
+                && operand.companions.is_empty(), ||
+                format!("{stem}: expected selected native BF16 or E4M3/F32 block128 {:?}, found {}",
+                    projection.shape, super::describe(operand)));
         }
         if role.component == Component::RoutedExpert && role.expert.is_some() {
             let expected = match super::leaf(stem) {
@@ -296,7 +309,7 @@ impl FamilyModel for Model {
             package: PACKAGE.into(),
             block: 128,
             spark_worlds: crate::plan::experts::spark_worlds(PACKAGE, self.cfg.moe_intermediate),
-            local: Err("Muse Spark routed experts (~400 GB at K4) cannot all be resident on the coordinators".into()),
+            local: Ok("Muse EXL3 RTX expert onboarding package".into()),
         })
     }
     fn placement(&self, input: &crate::plan::PlanInput, report: &mut crate::plan::PlanReport,

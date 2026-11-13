@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 
 mod ownership;
 pub mod programs;
+pub mod requests;
 pub mod scratch;
 pub use ownership::{DenseAxis, DenseExecution, DenseOwnership, DenseRole, DenseSelection, DenseTransform, VocabularyRole, KvBGeometry, KvBLayout};
 
@@ -197,6 +198,10 @@ pub struct DensePlan {
     pub tensors: Vec<DenseSlice>,
     /// Sum of exact native operand allocation requests (each at least 256 bytes).
     pub resident_bytes: usize,
+    /// Serialized native readers share one pinned batch per active rank load.
+    pub pinned_staging_bytes: usize,
+    /// Ordinary heap row cache, not registered or pinned storage.
+    pub cached_rows_bytes: usize,
     /// Loading-only peak: reusable pinned batch plus retained full-row cache.
     /// Never part of resident_bytes or steady-state device admission.
     pub read_staging_bytes: usize,
@@ -275,7 +280,7 @@ fn inventory_candidates(snapshot: &Path) -> Result<Vec<(PathBuf, Header)>> {
 pub(super) fn inventory_headers(snapshot: &Path) -> Result<Vec<(PathBuf, Header, bool)>> {
     use crate::plan::{checkpoint::Checkpoint, family, Component};
     // Construct only the configuration view: opening the checkpoint inventory here recurses.
-    let checkpoint = Checkpoint { snapshot: snapshot.into(), config: super::read_json(&snapshot.join("config.json"))?,
+    let checkpoint = Checkpoint { view: None, snapshot: snapshot.into(), config: super::read_json(&snapshot.join("config.json"))?,
         quantize_config: None, weight_map: Default::default(), tensors: vec![], missing_shards: vec![], shard_bytes: 0 };
     let family = family::detect(&checkpoint).context("unsupported EXLR8 dense family")?;
     let model = family.open(&checkpoint).map_err(anyhow::Error::new)?;
@@ -751,6 +756,23 @@ impl DenseRecord {
 }
 
 impl DensePlan {
+    /// The vocabulary reader streams one native unit, unlike Mount's component
+    /// windows. No row cache or minimum Mount allocation belongs to this bank.
+    pub fn unit_staging_bytes(&self) -> anyhow::Result<usize> {
+        self.tensors.iter().flat_map(|slice| &slice.units)
+            .try_fold(0usize, |peak, unit| Ok(peak.max(unit.staging_bytes()?)))
+    }
+
+    /// One Mount instance visits coordinator ranks serially and retains a single
+    /// reusable bank and row cache. Rank-local maxima do not coexist.
+    pub fn mount_staging_bytes(plans: &[&Self]) -> anyhow::Result<(usize, usize)> {
+        let world = plans.len();
+        ensure!((1..=2).contains(&world) && plans.iter().enumerate().all(|(rank, plan)|
+            plan.world == world && plan.rank == rank), "native Mount rank identity");
+        Ok((plans.iter().map(|plan| plan.pinned_staging_bytes).max().unwrap_or(0),
+            plans.iter().map(|plan| plan.cached_rows_bytes).max().unwrap_or(0)))
+    }
+
     /// Streaming owns one staging buffer; retained/pinned host storage is caller-owned.
     pub fn admit_host(&self, available: usize, reserved: usize) -> Result<usize> {
         (|| -> anyhow::Result<_> {
@@ -849,6 +871,8 @@ impl DensePlan {
                 world,
                 tensors,
                 resident_bytes,
+                pinned_staging_bytes,
+                cached_rows_bytes,
                 read_staging_bytes: sum([pinned_staging_bytes, cached_rows_bytes])?,
             })
         })()
@@ -1375,6 +1399,30 @@ mod tests {
         ] {
             assert_eq!(glm.ownership(&format!("model.layers.0.self_attn.{leaf}.weight")).unwrap().execution, expected);
         }
+        let root = tempfile::tempdir().unwrap();
+        // Each FFN rank retains two complete 128-channel native blocks.
+        write(root.path(), [1, 512, 256, 4, 1, 128, 0, 1], vec![
+            ("trellis", "U8", vec![4, 16384], vec![0; 4 * 16384]),
+            ("suh", "F16", vec![256], vec![17; 512]),
+            ("svh", "F16", vec![512], vec![23; 1024]),
+            ("checksum", "U64", vec![4], vec![0; 32]),
+        ]);
+        let mut attention = DenseRecord::inventory(root.path()).unwrap().remove(0);
+        attention.tensor = "model.layers.0.self_attn.q_b_proj.weight".into();
+        attention.ownership = glm.ownership(&attention.tensor).unwrap();
+        assert_eq!(attention.ownership.whole_mla, Some(0));
+        let mut ffn = attention.clone();
+        ffn.tensor = "model.layers.0.mlp.gate_proj.weight".into();
+        ffn.ownership = glm.ownership(&ffn.tensor).unwrap();
+        assert_eq!(ffn.ownership.whole_mla, None);
+        for rank in 0..2 {
+            let plan = DensePlan::for_rank_owned(&[attention.clone(), ffn.clone()], 2, rank,
+                &std::collections::BTreeMap::from([(0, 1)])).unwrap();
+            let query = plan.tensors.iter().find(|slice| slice.tensor == attention.tensor);
+            assert_eq!(query.is_some(), rank == 1);
+            if let Some(query) = query { assert_eq!(query.channels, 512); }
+            assert_eq!(plan.tensors.iter().find(|slice| slice.tensor == ffn.tensor).unwrap().channels, 256);
+        }
         let flash = ownership::DenseFamily::from_hf(&crate::plan::testing::glm5_flash_config(2)).unwrap();
         let root = tempfile::tempdir().unwrap();
         trellis(root.path(), 1, 128, 0);
@@ -1580,6 +1628,20 @@ mod tests {
         let checkpoint = crate::plan::exlr8::inventory(root.path(), config.clone(), |_| true).unwrap();
         assert_eq!(checkpoint.tensors.len(), 1);
         assert_eq!(checkpoint.tensors[0].meta.name, "model.visual.patch_embed.proj.weight");
+        let vision = crate::plan::exlr8::bundled_vision_component(&checkpoint).unwrap().unwrap();
+        assert_eq!(vision.component, crate::plan::Component::Vision);
+        assert_eq!((vision.tensors, vision.bytes), (1, 2));
+        assert_eq!(vision.formats.values().sum::<usize>(), 1);
+        let text_only = crate::plan::exlr8::inventory(root.path(), config.clone(), |_| false).unwrap();
+        assert!(crate::plan::exlr8::bundled_vision_component(&text_only).unwrap().is_none());
+        let duplicate = root.path().join("dense/vision-copy.safetensors");
+        std::fs::copy(&path, &duplicate).unwrap();
+        for selected in [false, true] {
+            let error = crate::plan::exlr8::inventory(root.path(), config.clone(), |_| selected)
+                .unwrap_err().to_string();
+            assert!(error.contains("duplicate tensor model.visual.patch_embed.proj.weight"), "{error}");
+        }
+        std::fs::remove_file(duplicate).unwrap();
         write(&["model.visual.patch_embed.proj.weight", "model.language_model.norm.weight"]);
         assert!(matches!(DenseRecord::inventory(root.path()), Err(DenseError::NativeMetadata { path: p, .. }) if p == path));
         assert!(crate::plan::exlr8::catalog_headers(root.path()).is_err());

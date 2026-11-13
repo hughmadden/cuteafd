@@ -11,7 +11,7 @@ fn failed_pack_and_failed_drain_retain_module_and_destinations() -> Result<()> {
     let library = fixture.load()?;
     fixture.stage(&library)?;
     fixture.configure_pack(&library, 1, 1)?;
-    let source = DeviceAllocation::new(&library, 16 * 128 * 2)?;
+    let source = DeviceAllocation::new(&library, 16 * 128 * 2, crate::shared::memory::TEST)?;
     let result = Fp8Weight::pack(
         &library,
         source.buffer.ptr,
@@ -37,7 +37,7 @@ fn successful_pack_then_quarantine_retains_module_and_destinations() -> Result<(
     let library = fixture.load()?;
     fixture.stage(&library)?;
     fixture.configure_pack(&library, 0, 1)?;
-    let source = DeviceAllocation::new(&library, 16 * 128 * 2)?;
+    let source = DeviceAllocation::new(&library, 16 * 128 * 2, crate::shared::memory::TEST)?;
     let packed = Fp8Weight::pack(
         &library,
         source.buffer.ptr,
@@ -66,7 +66,7 @@ fn successful_drain_preserves_cleanup_on_pack_success_and_error() -> Result<()> 
         let library = fixture.load()?;
         fixture.stage(&library)?;
         fixture.configure_pack(&library, pack_status, 0)?;
-        let source = DeviceAllocation::new(&library, 16 * 128 * 2)?;
+        let source = DeviceAllocation::new(&library, 16 * 128 * 2, crate::shared::memory::TEST)?;
         let result = Fp8Weight::pack(
             &library,
             source.buffer.ptr,

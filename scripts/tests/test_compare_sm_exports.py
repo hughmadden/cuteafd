@@ -63,10 +63,105 @@ def test_two_target_counts():
 
 def test_draft_bf16_group_matches_exported_shapes():
     exporter = compare_sm.load_file("test_draft_bf16_exporter", ROOT / "python/tools/aot/export_b12x_dsv4_aot.py")
+    assert exporter.flash_native_bf16_shapes() == {(1536,16384),(1536,8192),
+                                          (16384,4096),(8192,4096),(4096,4096),
+                                          (4096,1536),(4096,512),(4096,12288),(4096,6144),
+                                          (12288,4096),(6144,4096),(4096,2048),(4096,1024),
+                                          (2048,4096),(1024,4096)}
+    assert exporter.flash_native_bf16_shapes() <= exporter.draft_bf16_shapes().keys()
     expected = ",".join(f"k{k}_n{n}" for k, n in sorted(exporter.draft_bf16_shapes()))
     for scope in ("all", "suspects"):
         job, = (job for job in compare_sm.jobs(scope) if job[0] == "draft-bf16")
         assert job[1:] == ("export_b12x_dsv4_aot.py", ["--geometry", "qwen38", "--only", expected])
+
+
+def test_native_attention_groups_cover_checkpoint_shapes_and_f32_partials():
+    exporter = compare_sm.load_file("test_native_attention_exporter", ROOT / "python/tools/aot/export_b12x_dsv4_aot.py")
+    shapes = exporter.native_attention_shapes()
+    assert shapes == {
+        "glm": {(16384,2048),(8192,2048),(6144,16384),(6144,8192)},
+        "kimik3": {(18432,1536),(9216,1536),(7168,12288),(7168,6144)},
+        "step5": {(4096,12288),(4096,6144)},
+        "muse": {(8192,8192),(8192,4096)},
+        "ml4": {(8192,6144),(4096,6144),(6144,8192),(6144,4096),
+                (24576,6144),(12288,6144),(6144,6144),(3072,6144),
+                (6144,24576),(6144,12288),(6144,3072)},
+    }
+    assert exporter.native_attention_f32_shapes() == {(7168,6144),(4096,6144),(8192,4096),(6144,8192),(6144,4096),
+                                                        (6144,12288),(6144,3072)}
+    assert exporter.native_attention_bf16_f32_shapes() == {(7168,6144),(4096,6144),(8192,4096),(6144,8192)}
+    programs = exporter.native_attention_programs()
+    expected = {f"n{n}_k{k}_m{rows}{suffix}"
+                for n,k in set().union(*shapes.values()) for rows in (64,4096)
+                for suffix in (("", "_f32") if (n,k) in exporter.native_attention_f32_shapes() else ("",))}
+    assert len(programs) == len(expected) and {p[0] for p in programs} == expected
+    jobs = {job[0]: job[1:] for job in compare_sm.jobs("all")}
+    assert jobs["native-attention-fp8"] == ("export_b12x_dsv4_aot.py",
+        ["--geometry", "native_attention", "--only", ",".join(p[0] for p in programs)])
+    stems = {f"k{k}_n{n}" for family, family_shapes in shapes.items() if family != "ml4"
+             for n,k in family_shapes}
+    stems |= {"k6144_n512", "k6144_n576", "k8192_n512", "k8192_n1024", "k8192_n4096"}
+    assert exporter.native_attention_bf16_shapes() == {
+        (int(stem.split("_")[0][1:]), int(stem.split("_")[1][1:])) for stem in stems}
+    assert all("native-core" in exporter.draft_bf16_shapes()[shape]
+               for shape in ((8192,8192), (8192,1024), (8192,4096), (8192,512), (4096,8192)))
+    assert all("native-core" in exporter.draft_bf16_shapes()[(6144,n)] for n in (512,576))
+    stems |= {f"k{k}_n{n}_f32" for n,k in exporter.native_attention_bf16_f32_shapes()}
+    args = jobs["native-attention-bf16"][1]
+    assert args[:2] == ["--geometry", "muse"] and set(args[3].split(",")) == stems
+    source = (ROOT / "python/tools/aot/export_b12x_dsv4_aot.py").read_text()
+    assert "rows, Int32(64), Int64(scratch.toint()), stream" in source
+    assert "canonical_fp8_gemv64_w8a16" in source
+    oracle_source = (ROOT / "native/tests/draft_bf16_projection_selftest.py").read_text()
+    tree = ast.parse(oracle_source)
+    nodes = [node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "shapes"
+             or isinstance(node, ast.Assign) and any(isinstance(target, ast.Name) and target.id == "F32_SHAPES"
+                                                    for target in node.targets)]
+    namespace = {}
+    exec(compile(ast.Module(body=nodes, type_ignores=[]), "projection_oracle_inventory", "exec"), namespace)
+    native_bf16 = {(k,n) for family, family_shapes in shapes.items() if family != "ml4"
+                   for n,k in family_shapes}
+    native_bf16.update((6144, n) for n in (512, 576))
+    native_bf16.update((8192, n) for n in (512, 1024, 4096))
+    assert native_bf16 <= namespace["shapes"]().keys()
+    assert namespace["F32_SHAPES"] == {(k,n) for n,k in exporter.native_attention_bf16_f32_shapes()}
+
+
+@pytest.mark.parametrize("hidden,heads", [(6144, 128), (4096, 64)])
+def test_mimo_tp2_draft_exports_cover_local_projection_shapes(hidden, heads):
+    exporter = compare_sm.load_file("test_mimo_tp2_draft_exporter", ROOT / "python/tools/aot/export_b12x_dsv4_aot.py")
+    shapes = exporter.draft_bf16_shapes()
+    family = f"dflash-mimo-{'pro' if hidden == 6144 else 'flash'}-tp2"
+    expected = {(hidden * 5, hidden), (hidden, (heads // 2 + 8) * 128),
+                (hidden, 1024), (heads // 2 * 128, hidden),
+                (hidden, 16384), (8192, hidden)}
+    assert {shape for shape, families in shapes.items() if family in families} == expected
+
+
+def test_kimi_context_group_covers_both_tiles_formats_and_shared_primitives():
+    job, = (job for job in compare_sm.jobs("all") if job[0] == "context-split-kimik3")
+    stems = [f"mla_partial{cache}_h{begin}_t{tile}_m64"
+             for cache in ("", "_fp8") for begin in (0, 48) for tile in (8, 16)]
+    stems += ["paged_staging_gather", "paged_staging_gather_fp8", "lse_combine2"]
+    assert len(stems) == len(set(stems)) == 11
+    assert job == ("context-split-kimik3", "export_b12x_dsv4_aot.py",
+                   ["--geometry", "kimik3", "--context-split", "on", "--only", ",".join(stems)])
+
+
+def test_spark_routed_groups_cover_all_shipped_weight_geometries_with_valid_inputs():
+    groups = {name: args for name, _, args in compare_sm.jobs("all")}
+    for geometry in compare_sm.ROUTED_GEOMETRIES:
+        if geometry.startswith("glmfdense"):
+            assert not any(name.startswith(f"routed-{geometry}-spark-") for name in groups)
+            continue
+        bf16_only = geometry.endswith(("_bf16", "_nvfp4", "_nvfp4a4"))
+        for input_format in ("bf16", "wire"):
+            name = f"routed-{geometry}-spark-{input_format}"
+            assert (name in groups) == (input_format == "bf16" or not bf16_only)
+            if name in groups:
+                args = groups[name]
+                assert args[args.index("--role") + 1] == "spark"
+                assert args[args.index("--input") + 1] == input_format
 
 
 def test_pro_native_tp3_has_equal_k32_geometry_without_v41_identity():
@@ -177,10 +272,24 @@ def test_ml4_context_fc_has_a_scoped_cross_sm_gate():
                        ["--geometry", "ml4", "--only", "draft_context_fc"])
 
 
+def test_ml4_index_has_a_scoped_listed_cross_sm_gate():
+    for scope in ("suspects", "all"):
+        job = next(job for job in compare_sm.jobs(scope) if job[0] == "ml4-index")
+        assert job == ("ml4-index", "export_b12x_dsv4_aot.py",
+                       ["--geometry", "ml4", "--only",
+                        "index_post_m64,index_post_nope_m64,index_post_m4096,index_post_nope_m4096"])
+    result = subprocess.run([sys.executable, str(ROOT / "scripts/build/compare-sm-exports.py"), "--list"],
+                            check=True, capture_output=True, text=True)
+    assert result.stdout.splitlines().count("ml4-index") == 1
+
+
 def test_mla_draft_cross_sm_group_and_checkpoint_neutral_registry(monkeypatch):
     names = ["mla_draft_producer_m64", "mla_draft_producer_fp8_m64", "mla_draft_output_m64",
              "mla_draft_attention_full_m64", "mla_draft_attention_w4096_m64",
-             "mla_draft_attention_full_fp8_m64", "mla_draft_attention_w4096_fp8_m64"]
+             "mla_draft_attention_full_fp8_m64", "mla_draft_attention_w4096_fp8_m64",
+             "mla_draft_partial_full_m64", "mla_draft_partial_w4096_m64",
+             "mla_draft_partial_full_fp8_m64", "mla_draft_partial_w4096_fp8_m64",
+             "mla_draft_lse_combine2"]
     job = next(job for job in compare_sm.jobs("suspects") if job[0] == "mla-draft-h64")
     assert job == ("mla-draft-h64", "export_b12x_dsv4_aot.py",
                    ["--geometry", "kimik3", "--only", ",".join(names)])
@@ -194,9 +303,11 @@ def test_mla_draft_cross_sm_group_and_checkpoint_neutral_registry(monkeypatch):
         calls.append((g, kwargs))
         return kwargs
 
-    module = SimpleNamespace(kimi_mla=SimpleNamespace(
+    combine_calls = []
+    module = SimpleNamespace(context_split=SimpleNamespace(
+        compile_lse_combine2_aot=lambda **kwargs: combine_calls.append(kwargs)), kimi_mla=SimpleNamespace(
         MlaDraftGeometry=lambda **kwargs: kwargs,
-        **{f"compile_mla_draft_{op}_aot": compile_fake for op in ("producer", "output", "attention")}))
+        **{f"compile_mla_draft_{op}_aot": compile_fake for op in ("producer", "output", "attention", "partial")}))
     monkeypatch.setitem(sys.modules, "b12x.integration.cuteafd", module)
     ns = {}
     exec(compile(tree, str(source), "exec"), ns)
@@ -204,10 +315,12 @@ def test_mla_draft_cross_sm_group_and_checkpoint_neutral_registry(monkeypatch):
     assert {row[0] for row in programs} == set(names)
     for row in programs:
         row[-1]()
+    assert combine_calls == [{"heads": 64, "has_sink": False}]
     assert calls == [({"window_size": None, "kv_cache": "bf16"}, {"max_rows": 64})] + [
         (dict(window_size=window, kv_cache=cache), dict(max_rows=64, **extra))
         for cache in ("bf16", "fp8")
         for window, extra in ((None, {}), (None, {"max_context": 262144}),
+                              (None, {"max_context": 262144}), (4096, {"max_context": 262144}),
                               (4096, {"max_context": 262144}))]
 
 
@@ -672,7 +785,7 @@ def test_catalog_includes_all_geometries_and_fused_suspects():
     ml4_args = next(args for name, _, args in jobs if name == "exl3-ml4-k45")
     assert ml4_args[ml4_args.index("--bits") + 1] == "4,5"
     assert not {"exl3-qwen4-k345", "exl3-qwen4-k2345"} & set(names)
-    assert {f"context-split-{name}" for name in ("flash", "pro", "glm", "glmf")} <= set(names)
+    assert {f"context-split-{name}" for name in ("flash", "pro", "glm", "glmf", "kimik3")} <= set(names)
     assert {"v41-fp8", "v41-experts", "v41-index", "v41-router", "v41-attention"} <= set(names)
     assert {"suspect-flash-m1", "suspect-flash-m16", "suspect-glm-mla", "suspect-glmf-mla"} <= set(names)
     assert all("--only" in args for _, _, args in compare_sm.jobs("suspects"))
@@ -1101,7 +1214,8 @@ def test_spark_routed_groups_follow_shared_width_aliases_and_input_formats():
 def test_routed_export_only_requires_segment_api_for_row_addresses(tmp_path, monkeypatch, indirect):
     from contextlib import nullcontext
 
-    geometry = SimpleNamespace(weights="fp8")
+    geometry = SimpleNamespace(weights="fp8", hidden=4096, slice=2048, experts=256, top_k=8, intermediate=2048,
+        activation="silu_bf16_product", projection="bf16", swiglu_limit=0.0)
     calls = []
     program = SimpleNamespace(export_to_c=lambda *args: None)
 
@@ -1128,16 +1242,97 @@ def test_routed_export_only_requires_segment_api_for_row_addresses(tmp_path, mon
     ))
     monkeypatch.setitem(sys.modules, "b12x.integration.cuteafd.fp8_moe", module)
     monkeypatch.setitem(sys.modules, "package_fp8_moe_aot", SimpleNamespace(
+        __file__=str(tmp_path / "baseline-package.py"),
         layout_geometry=lambda base, layout: (1, base), POINTERS=11, SEGMENT_MAX_ROWS=16384,
+        ABI_VERSION=6, activation_params=lambda *args: (1.0, 0.0),
         input_kind=lambda role, weights, requested: requested or ("wire" if role == "spark" else "bf16"),
     ))
+    (tmp_path / "baseline-package.py").write_text("# baseline without core variants\n")
     args = ["--geometry", "mimo", "--capacities", "2752"]
     compare_sm.export_routed(args + (["--row-addresses"] if indirect else []), tmp_path)
     assert calls == [(geometry, "stream" if indirect else "auto", 16384 if indirect else 2752,
                       indirect, "auto")]
     records = json.loads((tmp_path / "routed.json").read_text())["programs"]
     assert len(records) == 1
+    assert json.loads((tmp_path / "routed.json").read_text())["layouts"]["tp1"] == {
+        "tp": 1, "hidden": 4096, "slice": 2048, "experts": 256, "top_k": 8,
+        "intermediate": 2048, "weights": "fp8", "input": "wire" if indirect else "bf16",
+        "abi_version": 6, "activation": "silu_bf16_product", "projection": "bf16",
+        "swiglu_limit": 0.0, "swiglu_alpha": 1.0, "swiglu_beta": 0.0}
     assert records[0]["scratch_bytes"] == (128 if indirect else 64)
+
+
+@pytest.mark.parametrize("role", ["spark", "coordinator"])
+@pytest.mark.parametrize("weights", ["nvfp4", "fp8", "mxfp4", "bf16"])
+@pytest.mark.parametrize("build_kind", ["development", "release"])
+def test_routed_core_policy_is_the_packages_source_policy(tmp_path, monkeypatch, role, weights, build_kind):
+    monkeypatch.setenv("CUTEAFD_BUILD_KIND", build_kind)
+    package = compare_sm.load_file("core_policy_package", ROOT / "python/tools/aot/package_fp8_moe_aot.py")
+    expected = (False, True) if build_kind == "release" and role == "spark" and weights != "nvfp4" else (False,)
+    assert package.core_variants(role, weights, build_kind) == expected
+    assert compare_sm.routed_core_variants(package, role, weights) == expected
+    source = Path(package.__file__).read_text()
+    assert 'for core in core_variants(args.role, g.weights, os.environ.get("CUTEAFD_BUILD_KIND", "development"))' in source
+    # A source comparison must follow a changed policy, not a cached candidate list.
+    path = tmp_path / "package.py"
+    path.write_text("def core_variants(role):\n    return (True,) if role == 'spark' else (False, True)\n")
+    assert compare_sm.routed_core_variants(SimpleNamespace(__file__=str(path)), role, weights) == (
+        (True,) if role == "spark" else (False, True))
+
+
+@pytest.mark.parametrize("wire", [False, True])
+@pytest.mark.parametrize("weights", ["nvfp4", "fp8", "mxfp4", "bf16"])
+@pytest.mark.parametrize("build_kind", ["development", "release"])
+def test_spark_routed_object_set_matches_production_including_core(tmp_path, monkeypatch, wire, weights, build_kind):
+    monkeypatch.setenv("CUTEAFD_BUILD_KIND", build_kind)
+    from contextlib import nullcontext
+    package = compare_sm.load_file("core_set_package", ROOT / "python/tools/aot/package_fp8_moe_aot.py")
+    geometry = SimpleNamespace(weights=weights, hidden=4096, slice=2048, experts=256, top_k=8, intermediate=2048,
+        activation="silu_bf16_product", projection="bf16", swiglu_limit=0.0)
+    calls = []
+    def compile_program(g, **kwargs):
+        calls.append(kwargs)
+        return SimpleNamespace(export_to_c=lambda *args: None)
+    forms = lambda g, rows, wire: ["w8a16"] if rows > 16 else []
+    module = SimpleNamespace(GEOMETRIES={"mimo": geometry}, compile_fp8_moe_aot=compile_program,
+        fp8_moe_scratch_bytes=lambda *args: 64, fp8_moe_segment_scratch_bytes=lambda *args: 128,
+        prefill_forms=forms)
+    monkeypatch.setitem(sys.modules, "b12x.integration.cuteafd", SimpleNamespace(
+        exportable_compilation=nullcontext, validate_exported_header=lambda *args: {"argument_count": 13}))
+    monkeypatch.setitem(sys.modules, "b12x.integration.cuteafd.fp8_moe", module)
+    monkeypatch.setattr(package, "layout_geometry", lambda base, layout: (1, base))
+    monkeypatch.setitem(sys.modules, "package_fp8_moe_aot", package)
+    args = ["--geometry", "mimo", "--role", "spark", "--input", "wire" if wire else "bf16",
+            "--capacities", "16,4096", "--layouts", "tp1"]
+    if wire and weights in ("nvfp4", "bf16"):
+        with pytest.raises(ValueError, match="requires BF16 input"):
+            compare_sm.export_routed(args, tmp_path)
+        assert not calls
+        return
+    compare_sm.export_routed(args, tmp_path)
+    # Evaluate the actual production forms/exports AST: adding a production
+    # recipe without carrying it into export_routed changes this expected set.
+    tree = ast.parse(Path(package.__file__).read_text())
+    build = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "build")
+    loop = next(n for n in ast.walk(build) if isinstance(n, ast.For)
+                and isinstance(n.target, ast.Name) and n.target.id == "layout"
+                and any(isinstance(statement, ast.Assign)
+                        and any(isinstance(target, ast.Name) and target.id == "forms"
+                                for target in statement.targets) for statement in n.body))
+    begin = next(i for i, n in enumerate(loop.body) if isinstance(n, ast.Assign)
+                 and any(isinstance(t, ast.Name) and t.id == "forms" for t in n.targets))
+    end = next(i for i, n in enumerate(loop.body) if isinstance(n, ast.For)
+               and isinstance(n.target, ast.Tuple) and len(n.target.elts) == 4)
+    env = {**vars(package), "capacities": [16, 4096], "prefill_forms": forms, "g": geometry, "wire": wire,
+           "args": SimpleNamespace(role="spark")}
+    exec(compile(ast.Module(body=loop.body[begin:end], type_ignores=[]), "production_recipes", "exec"), env)
+    expected = {(rows, form, segmented, core) for rows, form, segmented, core in env["exports"]}
+    actual = {(c["max_rows"], c["prefill"], c.get("row_addresses", False), c.get("core_only", False)) for c in calls}
+    assert actual == expected
+    assert any(core for _, _, _, core in actual) == (build_kind == "release" and weights != "nvfp4")
+    records = json.loads((tmp_path / "routed.json").read_text())["programs"]
+    assert len(records) == len(expected)
+    assert all(r["name"].endswith("_core") == r.get("core_only", False) for r in records)
 
 
 def test_default_source_root_resolves_worktree_alias_and_preserves_override(tmp_path, monkeypatch):
@@ -1272,7 +1467,7 @@ def test_combined_exl3_reply_exports_cover_supported_geometries_without_sm_sizin
     assert 'Scalar(n) for n in ("weight_num_experts", "route_num_experts", "active_m")' in source
     worker = (ROOT / "rust/crates/cuteafd-daemon/src/shared/experts/exl3/worker.rs").read_text()
     assert "(Some(output), None) if compressed" in worker
-    assert "self.reply_fused.launch(request, sources, inputs, output" in worker
+    assert 'self.reply_fused.as_ref().context("combined reply reached a partial-only worker")?.launch(request, sources, inputs, output' in worker
     assert "reply_codec" not in worker
 
 
@@ -1348,3 +1543,319 @@ def test_combined_reply_reduce_export_has_runtime_geometry_and_no_scratch():
     assert reply.index('"reduce"') < reply.index('"reduce_tier"')
     assert 'if capability != (12, 1):' in reply and 'if capability != (8, 9):' in reply
     assert 'an sm_89 coordinator exports only the expert_reply geometry' in exporter
+
+
+
+@pytest.mark.parametrize("mismatch", [False, "worker", "sources"])
+def test_v4_placement_publication_preserves_compiler_metadata_and_provenance(tmp_path, monkeypatch, mismatch):
+    """Eight views may share code, but never manufacture program/workspace data."""
+    class Filesystem:
+        @staticmethod
+        def check_path(path):
+            pass
+
+    real_load = compare_sm.load_file
+    monkeypatch.setattr(compare_sm, 'load_file', lambda name, path: Filesystem if name == 'cuteafd_build_filesystem' else real_load(name, path))
+    commands = []
+
+    def compile_export(command, **kwargs):
+        payload = json.loads(command[-1])
+        commands.append(payload)
+        output = Path(payload['output'])
+        lock = json.loads((ROOT / 'third_party/sparkinfer.lock.json').read_text())
+        (output / 'comparison-context.json').write_text(json.dumps({'cuda_initialized': False, 'args': payload['args'],
+            'sparkinfer_revision': 'wrong' if mismatch == 'worker' else lock['revision'],
+            'source_tree_sha256': lock['source_tree_sha256']}))
+        if payload['exporter'] == 'package_exl3_aot.py':
+            for tp in (1, 2):
+                for rows in compare_sm.EXL3_CAPACITIES.split(','):
+                    variant = output / f'rtx-tp{tp}/m{rows}'
+                    variant.mkdir(parents=True)
+                    (variant / 'v41_exl3.json').write_text(json.dumps({'scratch': int(rows), 'source': 'compiler'}))
+        else:
+            (output / 'dsv4_programs.json').write_text(json.dumps({'args': payload['args'], 'source': 'compiler'}))
+
+    monkeypatch.setattr(compare_sm.subprocess, 'run', compile_export)
+    monkeypatch.setattr(compare_sm.subprocess, 'check_output', lambda *a, **kw: 'a' * 40)
+    target = tmp_path / 'published'
+    if mismatch == 'sources':
+        real_sources = compare_sm.v4_placement_sources
+        captures = []
+        def changing_sources():
+            captures.append(True)
+            return real_sources() if len(captures) == 1 else {}
+        monkeypatch.setattr(compare_sm, 'v4_placement_sources', changing_sources)
+    if mismatch:
+        with pytest.raises(ValueError, match='worker provenance' if mismatch == 'worker' else 'sources changed'):
+            compare_sm.v4_placement_inputs(target, tmp_path / 'staging', 1, 1)
+        assert not (target / 'INPUTS.json').exists()
+        return
+    compare_sm.v4_placement_inputs(target, tmp_path / 'staging', 1, 1)
+    provenance = json.loads((target / 'INPUTS.json').read_text())
+    assert provenance['engine_commit'] == 'a' * 40
+    assert provenance['engine_sources_sha256'] == compare_sm.v4_placement_sources()
+    lock = json.loads((ROOT / 'third_party/sparkinfer.lock.json').read_text())
+    assert provenance['sparkinfer_revision'] == lock['revision']
+    assert provenance['source_tree_sha256'] == lock['source_tree_sha256']
+    assert len(commands) == 3
+    assert all(command['sms'] == 188 for command in commands)
+    assert len(list(target.glob('*/PROGRAMS.json'))) == 8
+    assert len(list(target.glob('pro-*/exl3/**/v41_exl3.json'))) == 64
+    assert len(list((target / '.workers').rglob('v41_exl3.json'))) == 16
+    for relative, checksum in provenance['files'].items():
+        assert compare_sm.sha((target / relative).read_bytes()) == checksum
+    for context in (131072, 1048576):
+        for model in ('flash', 'pro'):
+            for rtx in (1, 2):
+                manifest = json.loads((target / f'{model}-{rtx}-{context}/PROGRAMS.json').read_text())
+                assert manifest['source'] == 'compiler'
+                args = manifest['args']
+                assert args[args.index('--max-context') + 1] == str(context)
+    with pytest.raises(ValueError, match='not empty'):
+        compare_sm.v4_placement_inputs(target, tmp_path / 'staging2', 1, 1)
+
+
+@pytest.mark.parametrize("mismatch", [None, "worker", "sources"])
+def test_all_family_placement_publication_preserves_compiler_metadata(tmp_path, monkeypatch, mismatch):
+    publisher = compare_sm.load_file("test_placement_inputs", ROOT / "scripts/build/export-placement-inputs.py")
+    real_load = publisher.compare.load_file
+    filesystem = SimpleNamespace(check_path=lambda path: None)
+    monkeypatch.setattr(publisher.compare, 'load_file', lambda name, path:
+        filesystem if name == 'placement_filesystem' else real_load(name, path))
+    jobs = [("programs", "export_b12x_dsv4_aot.py", []),
+            ("exl3/exl3-glm-k45", "package_exl3_aot.py", []),
+            ("fp8/fp8-mimop", "package_fp8_moe_aot.py", []),
+            *[job for job in publisher.export_jobs() if job[0] in publisher.V41_MANIFESTS]]
+    monkeypatch.setattr(publisher, 'export_jobs', lambda: jobs)
+    calls = []
+
+    def compile_export(command, **kwargs):
+        payload = json.loads(command[-1])
+        calls.append(payload)
+        output = Path(payload['output'])
+        lock = json.loads((ROOT / 'third_party/sparkinfer.lock.json').read_text())
+        (output / 'comparison-context.json').write_text(json.dumps({
+            'cuda_initialized': mismatch == 'worker', 'sparkinfer_revision': lock['revision'],
+            'source_tree_sha256': lock['source_tree_sha256'], 'sms': 188, 'capability': [12, 0],
+            'exporter': payload['exporter'], 'args': payload['args'],
+            'exporter_sha256': publisher.compare.sha((ROOT / 'python/tools/aot' / payload['exporter']).read_bytes()),
+            'comparison_script_sha256': publisher.compare.sha((ROOT / 'scripts/build/compare-sm-exports.py').read_bytes()),
+            'export_sources_sha256': {str(path.relative_to(ROOT)): publisher.compare.sha(path.read_bytes())
+                for path in sorted((ROOT / 'python/tools/aot').glob('*.py'))}}))
+        if payload['exporter'] == 'package_exl3_aot.py':
+            directory = output / 'rtx-tp2/m2752'
+            directory.mkdir(parents=True)
+            (directory / 'v41_exl3.json').write_text('{"scratch":123,"compiler":true}')
+        elif payload['exporter'] == 'package_fp8_moe_aot.py':
+            (output / 'routed.json').write_text(json.dumps({'layouts': {'tp1': {'tp': 1, 'hidden': 4096, 'input': 'bf16'},
+                             'tp2': {'tp': 2, 'hidden': 4096, 'input': 'bf16'}}, 'programs': [
+                {'layout': 'tp1', 'capacity': 2752, 'scratch_bytes': 123},
+                {'layout': 'tp1', 'capacity': 2752, 'scratch_bytes': 456},
+                {'layout': 'tp2', 'capacity': 4096, 'scratch_bytes': 789}]}))
+        elif output.name in publisher.V41_MANIFESTS:
+            source, _ = publisher.V41_MANIFESTS[output.name]
+            (output / source).write_text('{"compiler":true,"scratch_bytes":123}')
+        else:
+            (output / 'dsv4_programs.json').write_text('{"compiler":true}')
+    monkeypatch.setattr(publisher.subprocess, 'run', compile_export)
+    monkeypatch.setattr(publisher.subprocess, 'check_output', lambda *a, **kw: 'a' * 40)
+    if mismatch == 'sources':
+        original = publisher.source_hashes
+        captures = []
+        def changed():
+            captures.append(True)
+            return original() if len(captures) == 1 else {}
+        monkeypatch.setattr(publisher, 'source_hashes', changed)
+    target, staging = tmp_path / 'published', tmp_path / 'staging'
+    if mismatch:
+        with pytest.raises(ValueError, match='provenance mismatch' if mismatch == 'worker' else 'sources changed'):
+            publisher.publish(target, staging, 1, 1)
+        assert not (target / 'INPUTS.json').exists()
+        return
+    publisher.publish(target, staging, 1, 1)
+    metadata = json.loads((target / 'INPUTS.json').read_text())
+    assert metadata['engine_commit'] == 'a' * 40
+    assert metadata['engine_sources_sha256'] == publisher.source_hashes()
+    assert len(calls) == len(metadata['exports']) == len(jobs)
+    for name, (source, installed) in publisher.V41_MANIFESTS.items():
+        assert (target / 'share' / installed).read_bytes() == (staging / name / source).read_bytes()
+        assert 'share/' + installed in metadata['files']
+    assert (target / 'share/PROGRAMS.json').read_bytes() == (staging / 'programs/dsv4_programs.json').read_bytes()
+    assert not (target / 'PROGRAMS.json').exists()
+    assert (target / 'share/exl3/exl3-glm-k45/rtx-tp2/m2752/v41_exl3.json').read_bytes() == b'{"scratch":123,"compiler":true}'
+    fp8 = json.loads((target / 'lib/fp8/fp8-mimop/manifest.json').read_text())
+    assert (target / 'lib/fp8/fp8-mimop/tp1').is_dir()
+    assert fp8['layouts']['tp1']['input'] == 'bf16'
+    assert fp8['layouts']['tp2']['tp'] == 2
+    assert fp8['layouts']['tp1']['capacities'] == [{'capacity': 2752, 'scratch_bytes': 456}]
+    assert fp8['layouts']['tp2']['capacities'] == [{'capacity': 4096, 'scratch_bytes': 789}]
+    for path, checksum in metadata['files'].items():
+        assert publisher.compare.sha((target / path).read_bytes()) == checksum
+    assert not list(target.rglob('*.o'))
+    with pytest.raises(ValueError, match='not empty'):
+        publisher.publish(target, tmp_path / 'other-staging', 1, 1)
+
+
+def test_v41_allocation_metadata_is_bound_to_publication_records(tmp_path):
+    publisher = compare_sm.load_file("test_v41_placement_records", ROOT / "scripts/build/export-placement-inputs.py")
+    for name, (source, _) in publisher.V41_MANIFESTS.items():
+        directory = tmp_path / name
+        directory.mkdir()
+        records = {"z.o": {"object_sha256": "z"}, "a.o": {"object_sha256": "a"}}
+        (directory / "program-records.json").write_text(json.dumps(records))
+        manifest = {"variants": [{"capacity": 4096, "scratch_bytes": 123}],
+                    "artifacts": {"a.o": "a"}, "physical_sms": 188, "sparkinfer_revision": "old"}
+        (directory / source).write_text(json.dumps(manifest))
+        jobs = [(name, "export.py", [])]
+        published = publisher.publication_records(tmp_path, jobs)
+        assert published[name + "/a.o"]["planner_metadata"] == {"variants": manifest["variants"]}
+        assert "planner_metadata" not in published[name + "/z.o"]
+        manifest["variants"][0]["scratch_bytes"] = 456
+        (directory / source).write_text(json.dumps(manifest))
+        changed = publisher.publication_records(tmp_path, jobs)
+        report = publisher.kernel_records.change_report(published, changed)
+        assert [entry["program"] for entry in report["changed"]] == [name + "/a.o"]
+
+
+def test_installed_placement_export_jobs_cover_live_native_families_and_packages():
+    publisher = compare_sm.load_file("test_placement_jobs", ROOT / "scripts/build/export-placement-inputs.py")
+    jobs = publisher.export_jobs()
+    names = {name for name, _, _ in jobs}
+    assert {'exl3/exl3-glm-k45', 'exl3/exl3-glmf-k34', 'exl3/exl3-kimik3-k23',
+            'exl3/exl3-step5-k46', 'exl3/exl3-muse-k45', 'exl3/exl3-ml4-k45',
+            'exl3/exl3-qwen4-k45', 'fp8/fp8-mimop', 'fp8/fp8-mimof'} <= names
+    assert set(publisher.V41_MANIFESTS) <= names
+    for name, exporter, extra in jobs:
+        if name.startswith(('fp8/', 'bf16/')):
+            assert extra[extra.index('--capacities') + 1] == publisher.fp8_capacities()
+        elif name.startswith('exl3/'):
+            expected = (compare_sm.EXL3_CAPACITIES_KIMIK3 if name == 'exl3/exl3-kimik3-k23'
+                        else compare_sm.EXL3_CAPACITIES)
+            assert extra[extra.index('--capacities') + 1] == expected
+        if name.startswith('v41-'):
+            assert extra[extra.index('--rows') + 1] == (
+                compare_sm.V41_PROJECTION_CAPACITIES if name == 'v41-fp8' else
+                compare_sm.V41_DRAFT_CAPACITIES if name in ('v41-experts', 'v41-dspark_tp2') else
+                compare_sm.V41_CAPACITIES)
+    assert not any('nvfp4' in name for name in names)
+    # Step-5 FP8 is retired for v5 (TJ 2026-10-31), so its packages are not exported.
+    assert not any(name.startswith('fp8/fp8-step5') for name in names)
+    args = jobs[0][2]
+    geometry = set(args[args.index('--geometry') + 1].split(','))
+    assert {'flash', 'pro', 'glm', 'glmf', 'muse', 'ml4', 'qwen35', 'qwen38',
+            'step5', 'kimik3', 'exlr8', 'exlr8_dense', 'dense_trellis_k6'} <= geometry
+    assert args[args.index('--exlr8-role') + 1] == 'coordinator'
+    assert len(names) == len(jobs)
+
+
+def test_native_placement_jobs_follow_fp8_recipe_not_exl3_policy(monkeypatch):
+    publisher = compare_sm.load_file('test_native_capacity_recipe', ROOT / 'scripts/build/export-placement-inputs.py')
+    capacities = publisher.fp8_capacities()
+    assert 1 <= len(capacities.split(',')) <= 6
+    assert capacities != compare_sm.EXL3_CAPACITIES
+    exl3_before = {name: extra[extra.index('--capacities') + 1]
+                   for name, _, extra in publisher.export_jobs() if name.startswith('exl3/')}
+    changed = '1,16,80,4096'
+    monkeypatch.setattr(publisher, 'fp8_capacities', lambda root: changed)
+    jobs = publisher.export_jobs()
+    native = [extra for name, _, extra in jobs if name.startswith(('fp8/', 'bf16/'))]
+    assert native
+    assert all(extra[extra.index('--capacities') + 1] == changed for extra in native)
+    assert {name: extra[extra.index('--capacities') + 1]
+            for name, _, extra in jobs if name.startswith('exl3/')} == exl3_before
+
+
+@pytest.mark.parametrize('recipe', [
+    '',
+    'set(CUTEAFD_FP8_MOE_CAPACITIES "1,16")\n' * 2,
+    'set(CUTEAFD_FP8_MOE_CAPACITIES "1,2,3,4,5,6,7")',
+    'set(CUTEAFD_FP8_MOE_CAPACITIES "0,16")',
+    'set(CUTEAFD_FP8_MOE_CAPACITIES "16,1")',
+    'set(CUTEAFD_FP8_MOE_CAPACITIES "1,1")',
+    'set(CUTEAFD_FP8_MOE_CAPACITIES "1,2147483648")',
+])
+def test_native_placement_rejects_invalid_capacity_recipe(tmp_path, recipe):
+    publisher = compare_sm.load_file('test_invalid_capacity_recipe', ROOT / 'scripts/build/export-placement-inputs.py')
+    path = tmp_path / publisher.FP8_CAPACITY_RECIPE
+    path.parent.mkdir(parents=True)
+    path.write_text(recipe)
+    with pytest.raises(ValueError):
+        publisher.fp8_capacities(tmp_path)
+    path.write_text('set(CUTEAFD_FP8_MOE_CAPACITIES "1,16,80,256,1024,4096") # native recipe\n')
+    assert publisher.fp8_capacities(tmp_path) == '1,16,80,256,1024,4096'
+
+
+def test_placement_fingerprints_only_live_config_contents(tmp_path, monkeypatch):
+    publisher = compare_sm.load_file('test_live_placement_hashes', ROOT / 'scripts/build/export-placement-inputs.py')
+    for relative in ('scripts/build/export-placement-inputs.py', 'scripts/build/release-scope.py',
+                     'scripts/build/kernel-records.py', 'scripts/lib/wip_aot_scopes.py', 'examples/configs/live.config',
+                     'examples/configs/retired.config', 'benchmarks/current-matrix.json',
+                     'native/cmake/shared/fp8_moe.cmake'):
+        path = tmp_path / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text('original')
+    matrix = tmp_path / 'benchmarks/current-matrix.json'
+    retired = [{'config': 'examples/configs/retired.config'}]
+    matrix.write_text(json.dumps({'retired': retired, 'cells': [{'report': 'old'}]}))
+    monkeypatch.setattr(publisher, 'ROOT', tmp_path)
+    monkeypatch.setattr(publisher.compare, 'v4_placement_sources', lambda: {})
+    before = publisher.source_hashes()
+    assert 'examples/configs/retired.config' not in before
+    (tmp_path / 'examples/configs/retired.config').write_text('retired edit')
+    matrix.write_text(json.dumps({'retired': retired, 'cells': [{'report': 'new'}]}))
+    assert publisher.source_hashes() == before
+    recipe = tmp_path / publisher.FP8_CAPACITY_RECIPE
+    recipe.write_text('changed capacities')
+    assert publisher.source_hashes() != before
+    recipe.write_text('original')
+    (tmp_path / 'examples/configs/live.config').write_text('MODEL_REVISION=changed')
+    assert publisher.source_hashes() != before
+    (tmp_path / 'examples/configs/live.config').write_text('original')
+    matrix.write_text(json.dumps({'retired': [], 'cells': []}))
+    assert publisher.source_hashes()['installed_live_configs'] != before['installed_live_configs']
+
+
+def test_placement_selection_ignores_card_publication_but_tracks_retirement(tmp_path):
+    publisher = compare_sm.load_file('test_live_placement_selection', ROOT / 'scripts/build/export-placement-inputs.py')
+    (tmp_path / 'examples/configs').mkdir(parents=True)
+    (tmp_path / 'benchmarks').mkdir()
+    (tmp_path / 'examples/configs/live.config').write_text('MODEL_ID=test/live\nMODEL_REVISION=pinned\n')
+    matrix = tmp_path / 'benchmarks/current-matrix.json'
+    matrix.write_text(json.dumps({'retired': [], 'cells': [{'report': 'old'}]}))
+    before = publisher.live_configs(tmp_path)
+    matrix.write_text(json.dumps({'retired': [], 'cells': [{'report': 'new', 'status': 'current'}]}))
+    assert publisher.live_configs(tmp_path) == before
+    matrix.write_text(json.dumps({'retired': [{'config': 'examples/configs/live.config'}], 'cells': []}))
+    assert publisher.live_configs(tmp_path) == []
+
+
+def test_placement_publication_rsync_host_syncs_directory_and_current_symlink(tmp_path, monkeypatch):
+    publisher = compare_sm.load_file('test_placement_rsync', ROOT / 'scripts/build/export-placement-inputs.py')
+    published = tmp_path / 'placement-inputs/37ae6dccee42f4c3ba637e95dc8232b5398be644'
+    published.mkdir(parents=True)
+    with pytest.raises(ValueError, match='missing published placement input'):
+        publisher.rsync_publication(published, ['maxq'], timeout=30)
+    (published / 'INPUTS.json').write_text('{}')
+    (published / 'share').mkdir()
+    (published / 'share/PROGRAMS.json').write_text('{}')
+    rsync_calls = []
+
+    def fake_run(cmd, **kwargs):
+        rsync_calls.append((cmd, kwargs))
+        if len(rsync_calls) == 2:
+            link = Path(cmd[3])
+            assert link.is_symlink() and link.readlink() == Path(published.name)
+
+    monkeypatch.setattr(publisher.subprocess, 'run', fake_run)
+    monkeypatch.setattr(publisher.sys, 'argv', [
+        'export-placement-inputs.py', '--output', str(published), '--rsync-host', 'maxq', '--timeout', '45'])
+    publisher.main()
+    assert len(rsync_calls) == 2
+    assert rsync_calls[0][0] == ['rsync', '-a', '--delete', '--mkpath', f'{published}/', f'maxq:{published}/']
+    assert rsync_calls[1][0][:3] == ['rsync', '-a', '--mkpath']
+    assert rsync_calls[1][0][4] == f'maxq:{published.parent}/'
+    assert all(call[1]['check'] is True and call[1]['timeout'] == 45 for call in rsync_calls)
+    monkeypatch.setattr(publisher.sys, 'argv', ['export-placement-inputs.py', '--output', str(published)])
+    with pytest.raises(SystemExit) as refused:
+        publisher.main()
+    assert refused.value.code == 2

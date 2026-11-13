@@ -1,15 +1,15 @@
 //! Per-device memory layout: what the placement planner predicts each
 //! coordinator GPU and Spark rank holds, by category, weight group and
 //! resident format. The same categories label the runtime allocation ledger
-//! (`cuteafd_ffi::memory_ledger` scopes), so a prediction can be checked
+//! (`cuteafd_ffi::memory_ledger` tags), so a prediction can be checked
 //! against what an engine actually allocated (`compare`).
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 const GIB: f64 = (1u64 << 30) as f64;
 
-/// What a block of memory is for. Ledger scopes map onto these by their first
-/// path segment (`weights/fp8-pack` -> `Weights`, see [`Category::of_scope`]).
+/// What a block of memory is for. Allocation tags map onto planner categories
+/// through [`MemoryKind::category`]; ledger scopes add context only.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Category {
@@ -58,48 +58,245 @@ impl Category {
         }
     }
 
-    /// The planner category of a runtime ledger scope.
-    pub fn of_scope(scope: &str) -> Self {
-        let root = scope.split('/').next().unwrap_or(scope);
-        match root {
-            "weights" => Self::Weights,
-            "embedding" => Self::Embedding,
-            "experts" | "local-experts" => Self::Experts,
-            "drafter" => Self::Drafter,
-            "kv" => Self::Kv,
-            "prefix" => Self::Prefix,
-            "workspace" | "sampler" | "spark-intake" | "probe" => Self::Workspace,
-            "transport" | "peer-split" => Self::Transport,
-            "staging" => Self::Staging,
-            "mapped-table" | "ple" => Self::Tables,
-            "v41" => Self::of_v41_stage(scope),
-            _ => Self::Runtime,
+
+}
+
+/// What one allocation we make holds. Closed: every device, pinned and
+/// host-registered allocation states one of these at construction ([`Tag`]),
+/// so the ledger never guesses a kind. CUDA context, modules and third-party
+/// workspaces (cuBLAS, graph executables) are a measured residual, never a kind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[repr(u32)]
+pub enum MemoryKind {
+    /// Target model weights: attention, dense/shared MLP, head, norms, router,
+    /// and everything else packed into the target arena (its globals, including
+    /// an embedding placed there, and generated constants such as RoPE tables).
+    Weights = 1,
+    /// A standalone token embedding backing (host-mapped or its own device copy).
+    Embedding = 2,
+    /// Routed experts resident on this device.
+    Experts = 3,
+    /// Drafter (DFlash, dSpark, MTP) weights, including the drafter's arena globals.
+    DrafterWeights = 4,
+    /// Lookup tables read per token outside the weight arenas (engram, PLE).
+    Tables = 5,
+    /// Target KV records, index keys, recurrent state: a pool sized before Ready.
+    Kv = 6,
+    /// Drafter KV and recurrent state.
+    DrafterKv = 7,
+    /// Prefix-cache marks and snapshot arenas.
+    Prefix = 8,
+    /// Step scratch: decode/prefill lanes, verify, sampler, intake planes.
+    Workspace = 9,
+    /// Drafter step scratch.
+    DrafterWorkspace = 10,
+    /// Exchange buffers: peer-split slots, RDMA rings, reply planes.
+    Transport = 11,
+    /// Upload/download staging (pinned sources, row slots, readback).
+    Staging = 12,
+}
+
+/// How a kind's bytes behave after they are filled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Behaviour {
+    /// Written once while loading, read-only after Ready.
+    Immutable,
+    /// A pool of fixed capacity whose pages are rewritten per request.
+    FixedPool,
+    /// Rewritten every step.
+    ReadWrite,
+}
+
+impl MemoryKind {
+    pub const ALL: [Self; 12] = [Self::Weights, Self::Embedding, Self::Experts, Self::DrafterWeights,
+        Self::Tables, Self::Kv, Self::DrafterKv, Self::Prefix, Self::Workspace, Self::DrafterWorkspace,
+        Self::Transport, Self::Staging];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Weights => "weights",
+            Self::Embedding => "embedding",
+            Self::Experts => "experts",
+            Self::DrafterWeights => "drafter_weights",
+            Self::Tables => "tables",
+            Self::Kv => "kv",
+            Self::DrafterKv => "drafter_kv",
+            Self::Prefix => "prefix",
+            Self::Workspace => "workspace",
+            Self::DrafterWorkspace => "drafter_workspace",
+            Self::Transport => "transport",
+            Self::Staging => "staging",
         }
     }
 
-    fn of_v41_stage(scope: &str) -> Self {
-        let stage = scope.trim_start_matches("v41/");
-        if stage.starts_with("weights") || stage.contains("weights") && !stage.contains("draft") {
-            if stage.contains("Engram") { Self::Tables } else { Self::Weights }
-        } else if stage.contains("draft") || stage.contains("drafter") {
-            Self::Drafter
-        } else if stage.starts_with("kv") || stage.contains("KV cache") {
-            Self::Kv
-        } else if stage.contains("prefix") || stage.contains("snapshot") {
-            Self::Prefix
-        } else if stage.contains("expert") {
-            Self::Experts
-        } else if stage.contains("transport") || stage.contains("TP2") {
-            Self::Transport
-        } else if stage.contains("engram") {
-            Self::Tables
-        } else if stage.contains("workspace") || stage.contains("lane") || stage.contains("vision") {
-            Self::Workspace
-        } else {
-            Self::Runtime
+    pub const fn behaviour(self) -> Behaviour {
+        match self {
+            Self::Weights | Self::Embedding | Self::Experts | Self::DrafterWeights | Self::Tables => Behaviour::Immutable,
+            Self::Kv | Self::DrafterKv | Self::Prefix => Behaviour::FixedPool,
+            Self::Workspace | Self::DrafterWorkspace | Self::Transport | Self::Staging => Behaviour::ReadWrite,
         }
     }
+
+    /// The planner category this kind rolls up into.
+    pub const fn category(self) -> Category {
+        match self {
+            Self::Weights => Category::Weights,
+            Self::Embedding => Category::Embedding,
+            Self::Experts => Category::Experts,
+            Self::DrafterWeights | Self::DrafterKv | Self::DrafterWorkspace => Category::Drafter,
+            Self::Tables => Category::Tables,
+            Self::Kv => Category::Kv,
+            Self::Prefix => Category::Prefix,
+            Self::Workspace => Category::Workspace,
+            Self::Transport => Category::Transport,
+            Self::Staging => Category::Staging,
+        }
+    }
+
+    /// The C ABI value (`CUTEAFD_MEMORY_KIND_*`); 0 is never a kind.
+    pub const fn as_raw(self) -> u32 { self as u32 }
+
+    pub const fn from_raw(raw: u32) -> Option<Self> {
+        if raw == 0 || raw as usize > Self::ALL.len() { None } else { Some(Self::ALL[raw as usize - 1]) }
+    }
 }
+
+impl std::fmt::Display for MemoryKind {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { formatter.write_str(self.label()) }
+}
+
+/// The metadata every allocation constructor requires: what the memory is and
+/// which component owns it. Owners are `family/component[/detail]` (`v41/lane`,
+/// `glm/prefill-slots`, `shared/sampler`), never a bare kind word; the kind is
+/// already the first field. Runtime names go through
+/// `cuteafd_ffi::memory_ledger::tag`, which interns them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+pub struct Tag {
+    pub kind: MemoryKind,
+    pub owner: &'static str,
+}
+
+impl Tag {
+    pub const fn new(kind: MemoryKind, owner: &'static str) -> Self {
+        assert!(!owner.is_empty(), "allocation owner must be named");
+        Self { kind, owner }
+    }
+}
+
+impl Tag {
+    pub const fn weights(owner: &'static str) -> Self { Self::new(MemoryKind::Weights, owner) }
+    pub const fn embedding(owner: &'static str) -> Self { Self::new(MemoryKind::Embedding, owner) }
+    pub const fn experts(owner: &'static str) -> Self { Self::new(MemoryKind::Experts, owner) }
+    pub const fn drafter_weights(owner: &'static str) -> Self { Self::new(MemoryKind::DrafterWeights, owner) }
+    pub const fn tables(owner: &'static str) -> Self { Self::new(MemoryKind::Tables, owner) }
+    pub const fn kv(owner: &'static str) -> Self { Self::new(MemoryKind::Kv, owner) }
+    pub const fn drafter_kv(owner: &'static str) -> Self { Self::new(MemoryKind::DrafterKv, owner) }
+    pub const fn prefix(owner: &'static str) -> Self { Self::new(MemoryKind::Prefix, owner) }
+    pub const fn workspace(owner: &'static str) -> Self { Self::new(MemoryKind::Workspace, owner) }
+    pub const fn drafter_workspace(owner: &'static str) -> Self { Self::new(MemoryKind::DrafterWorkspace, owner) }
+    pub const fn transport(owner: &'static str) -> Self { Self::new(MemoryKind::Transport, owner) }
+    pub const fn staging(owner: &'static str) -> Self { Self::new(MemoryKind::Staging, owner) }
+}
+
+impl std::fmt::Display for Tag {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}:{}", self.kind.label(), self.owner)
+    }
+}
+
+/// Behaviour classes as types, so an arena's class is fixed by its type and an
+/// [`ArenaTag`] of another class does not type-check:
+///
+/// ```compile_fail
+/// use cuteafd_core::memory_layout::{ArenaTag, arena_class::Immutable};
+/// let weights: ArenaTag<Immutable> = ArenaTag::kv("v41/kv"); // KV is a fixed pool
+/// ```
+///
+/// ```compile_fail
+/// use cuteafd_core::memory_layout::{ArenaTag, arena_class::ReadWrite};
+/// let scratch: ArenaTag<ReadWrite> = ArenaTag::weights("v41/target"); // weights are immutable
+/// ```
+///
+/// The same tags in their own class compile:
+///
+/// ```
+/// use cuteafd_core::memory_layout::{ArenaTag, arena_class::{FixedPool, Immutable, ReadWrite}};
+/// let weights: ArenaTag<Immutable> = ArenaTag::weights("v41/target");
+/// let kv: ArenaTag<FixedPool> = ArenaTag::kv("v41/kv");
+/// let scratch: ArenaTag<ReadWrite> = ArenaTag::workspace("v41/lane");
+/// # let _ = (weights, kv, scratch);
+/// ```
+pub mod arena_class {
+    use super::Behaviour;
+    mod sealed { pub trait Sealed {} }
+    /// One of [`Immutable`], [`FixedPool`] or [`ReadWrite`].
+    pub trait Class: sealed::Sealed + Copy + 'static { const BEHAVIOUR: Behaviour; }
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct Immutable;
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct FixedPool;
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct ReadWrite;
+    impl sealed::Sealed for Immutable {}
+    impl sealed::Sealed for FixedPool {}
+    impl sealed::Sealed for ReadWrite {}
+    impl Class for Immutable { const BEHAVIOUR: Behaviour = Behaviour::Immutable; }
+    impl Class for FixedPool { const BEHAVIOUR: Behaviour = Behaviour::FixedPool; }
+    impl Class for ReadWrite { const BEHAVIOUR: Behaviour = Behaviour::ReadWrite; }
+}
+
+/// One arena's single tag. Only kinds of the arena's class can be named, so
+/// one physical backing never mixes, say, weights and KV.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ArenaTag<C: arena_class::Class> {
+    tag: Tag,
+    class: std::marker::PhantomData<C>,
+}
+
+impl<C: arena_class::Class> ArenaTag<C> {
+    const fn of(kind: MemoryKind, owner: &'static str) -> Self {
+        Self { tag: Tag::new(kind, owner), class: std::marker::PhantomData }
+    }
+    /// A runtime-chosen tag, checked against the arena's class.
+    pub fn try_from_tag(tag: Tag) -> Result<Self, MemoryKindMismatch> {
+        if tag.kind.behaviour() == C::BEHAVIOUR { Ok(Self { tag, class: std::marker::PhantomData }) }
+        else { Err(MemoryKindMismatch { tag, expected: C::BEHAVIOUR }) }
+    }
+    pub const fn tag(self) -> Tag { self.tag }
+    pub const fn kind(self) -> MemoryKind { self.tag.kind }
+}
+
+impl ArenaTag<arena_class::Immutable> {
+    pub const fn weights(owner: &'static str) -> Self { Self::of(MemoryKind::Weights, owner) }
+    pub const fn embedding(owner: &'static str) -> Self { Self::of(MemoryKind::Embedding, owner) }
+    pub const fn experts(owner: &'static str) -> Self { Self::of(MemoryKind::Experts, owner) }
+    pub const fn drafter_weights(owner: &'static str) -> Self { Self::of(MemoryKind::DrafterWeights, owner) }
+    pub const fn tables(owner: &'static str) -> Self { Self::of(MemoryKind::Tables, owner) }
+}
+
+impl ArenaTag<arena_class::FixedPool> {
+    pub const fn kv(owner: &'static str) -> Self { Self::of(MemoryKind::Kv, owner) }
+    pub const fn drafter_kv(owner: &'static str) -> Self { Self::of(MemoryKind::DrafterKv, owner) }
+    pub const fn prefix(owner: &'static str) -> Self { Self::of(MemoryKind::Prefix, owner) }
+}
+
+impl ArenaTag<arena_class::ReadWrite> {
+    pub const fn workspace(owner: &'static str) -> Self { Self::of(MemoryKind::Workspace, owner) }
+    pub const fn drafter_workspace(owner: &'static str) -> Self { Self::of(MemoryKind::DrafterWorkspace, owner) }
+    pub const fn transport(owner: &'static str) -> Self { Self::of(MemoryKind::Transport, owner) }
+    pub const fn staging(owner: &'static str) -> Self { Self::of(MemoryKind::Staging, owner) }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MemoryKindMismatch { pub tag: Tag, pub expected: Behaviour }
+impl std::fmt::Display for MemoryKindMismatch {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{} is {:?}, not a {:?} arena kind", self.tag, self.tag.kind.behaviour(), self.expected)
+    }
+}
+impl std::error::Error for MemoryKindMismatch {}
 
 /// How an item's bytes were obtained.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -136,16 +333,133 @@ pub struct Item {
     pub lifetime: ItemLifetime,
 }
 
-/// Shared allowance for unclassified Spark runtime growth, not an exact owner.
-/// Source: V4.1 min/max seven-rank system/cgroup census at 0a6fc7b1;
-/// maximum measured residual 2,083,518,960 B plus margin, attribution pending #388.
-pub const SPARK_RUNTIME_RESIDUAL_BYTES: u64 = 5 * (1 << 29);
-pub const SPARK_RUNTIME_RESIDUAL_GROUP: &str = "Spark runtime residual";
-pub const SPARK_RUNTIME_RESIDUAL_SOURCE: &str = "V4.1 min/max seven-rank system/cgroup census at 0a6fc7b1; maximum measured residual 2,083,518,960 B plus margin; shared cross-family estimate, attribution pending #388";
+/// A worker-process census, separate from future arena and execution owners.
+#[derive(Debug, Clone, Copy)]
+pub struct SparkWorkerProcessResident {
+    pub arch: &'static str,
+    pub anonymous_pss_bytes: u64,
+    pub file_pss_bytes: u64,
+    pub context_phase_bytes: u64,
+    pub context_file_pss_growth_bytes: u64,
+    pub driver: &'static str,
+    pub source: &'static str,
+}
 
-pub fn spark_runtime_residual() -> Item {
-    Item::new(Category::Runtime, SPARK_RUNTIME_RESIDUAL_GROUP, "",
-        SPARK_RUNTIME_RESIDUAL_BYTES, Basis::Estimated).with_lifetime(ItemLifetime::ReadyResident)
+impl SparkWorkerProcessResident {
+    pub const fn bytes(self) -> u64 {
+        self.anonymous_pss_bytes + self.file_pss_bytes + self.context_phase_bytes
+            - self.context_file_pss_growth_bytes
+    }
+}
+
+/// Spark plans target GB10/SM121, independently of the coordinator/host arch.
+/// No x86 worker-process census has been established by this measurement.
+pub const SPARK_WORKER_PROCESS_RESIDENT: &[SparkWorkerProcessResident] = &[
+    SparkWorkerProcessResident { arch: "sm_121", anonymous_pss_bytes: 1_199_439_872,
+        file_pss_bytes: 221_833_216, context_phase_bytes: 230_191_104,
+        context_file_pss_growth_bytes: 54_857_728, driver: "580.178.04",
+        source: "moa actual Kimi TP6 worker 2026-11-07, serve_owners_before_endpoint_rings; context MemAvailable delta less overlapping file PSS growth; #1454" },
+];
+pub const SPARK_WORKER_PROCESS_RESIDENT_BYTES: u64 = SPARK_WORKER_PROCESS_RESIDENT[0].bytes();
+pub const SPARK_WORKER_PROCESS_RESIDENT_GROUP: &str = "Spark worker process resident";
+pub const SPARK_WORKER_PROCESS_RESIDENT_SOURCE: &str = SPARK_WORKER_PROCESS_RESIDENT[0].source;
+pub const DRIVER_PAGE_TABLES_GROUP: &str = "driver page tables";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DriverPageTableModel {
+    Sm120Portable,
+    Sm121Arena,
+}
+impl DriverPageTableModel {
+    pub fn quantum(self) -> u64 {
+        match self { Self::Sm120Portable => 512, Self::Sm121Arena => 4096 }
+    }
+
+    pub fn bytes_per_quantum(self) -> u64 {
+        match self { Self::Sm120Portable => 1, Self::Sm121Arena => 48 }
+    }
+
+    /// Round once per physical backing, not once per logical pool page or view.
+    pub fn bytes(self, backing_bytes: u64) -> u64 {
+        backing_bytes.div_ceil(self.quantum()) * self.bytes_per_quantum()
+    }
+
+    pub fn source(self) -> &'static str {
+        match self {
+            Self::Sm120Portable => "SM120 CUDA 13.2, RTX PRO 6000 both contexts, Portable|Mapped allocation and Portable registration 1/4/16/32 GiB, 2026-11-07: mapped bytes/512, zero intercept and residuals; cudaMalloc control zero",
+            Self::Sm121Arena => "moa ARM/SM121 driver 580.178.04 actual-worker 40.508/75.059/103.652-GiB arenas, 2026-11-07 #1454: zero-intercept VmallocUsed fit 10.052338 MiB/GiB and SecPageTables 1.949590 MiB/GiB, calibrated to 40+8 B/page; nvidia_pte_t 16 B/page and nv_dma pages[] 8 B/page source-known, remaining vmalloc 16 B/page unattributed; no fitted intercept or maximum envelope",
+        }
+    }
+}
+
+/// The live worker and offline receipt use the same SM121 arena calibration.
+pub fn spark_arena_driver_overhead_bytes(resident: u64) -> u64 {
+    DriverPageTableModel::Sm121Arena.bytes(resident)
+}
+
+pub fn calibrated_kimi_spark(selected: Option<(crate::ExpertGeometry, usize, u32)>) -> bool {
+    matches!(selected, Some((geometry, 6, compiled))
+        if geometry == crate::ExpertGeometry::KIMI_K3 && compiled <= 1024)
+}
+
+/// Coordinator ownership inside SPARK_MEMORY_CAP. SPARK_RESERVE replaces the
+/// process reserve, never arena metadata or actual staging/workspace owners.
+pub fn spark_runtime_reserve_bytes(resident: u64) -> Option<u64> {
+    crate::memory_policy::MemoryPolicy::current().spark_reserve
+        .unwrap_or(SPARK_WORKER_PROCESS_RESIDENT_BYTES)
+        .checked_add(spark_arena_driver_overhead_bytes(resident))
+}
+
+/// Future allocations only: the worker process/context already reduced the
+/// live MemAvailable sample. An explicit reserve remains future headroom.
+pub fn spark_worker_future_bytes(selected: Option<(crate::ExpertGeometry, usize, u32)>, resident: u64) -> Option<u64> {
+    crate::memory_policy::MemoryPolicy::current().spark_reserve.unwrap_or(0)
+        .checked_add(spark_arena_driver_overhead_bytes(resident))?
+        .checked_add(if calibrated_kimi_spark(selected) { 4096 } else { 0 })
+}
+
+pub fn spark_runtime_bytes(selected: Option<(crate::ExpertGeometry, usize, u32)>, resident: u64) -> Option<u64> {
+    spark_runtime_reserve_bytes(resident)?.checked_add(if calibrated_kimi_spark(selected) { 4096 } else { 0 })
+}
+
+pub fn spark_runtime_reserve_group() -> &'static str {
+    if crate::memory_policy::MemoryPolicy::current().spark_reserve.is_some() { "SPARK_RESERVE" }
+    else { SPARK_WORKER_PROCESS_RESIDENT_GROUP }
+}
+
+pub fn spark_worker_process_resident_item() -> Item {
+    Item::new(Category::Runtime, SPARK_WORKER_PROCESS_RESIDENT_GROUP, "",
+        SPARK_WORKER_PROCESS_RESIDENT_BYTES, Basis::Calibrated).with_lifetime(ItemLifetime::ReadyResident)
+}
+
+/// Rebuild shared reserves from payload bytes, never from a prior reserve.
+/// Exact I/O, workspace and upload owners are intentionally not removed.
+pub fn charge_spark_runtime(device: &mut DeviceLayout) -> Option<()> {
+    if device.kind != DeviceKind::Spark { return Some(()); }
+    let resident = device.items.iter().filter(|item| item.category == Category::Experts)
+        .try_fold(0u64, |sum, item| sum.checked_add(item.bytes))?;
+    let driver_present = device.items.iter().any(|item|
+        item.group == DRIVER_PAGE_TABLES_GROUP && !item.format.is_empty());
+    device.items.retain(|item| !matches!(item.group.as_str(), "Spark runtime residual" | "SPARK_RESERVE")
+        && item.group != SPARK_WORKER_PROCESS_RESIDENT_GROUP
+        && !(item.group == DRIVER_PAGE_TABLES_GROUP && item.format.is_empty()));
+    if resident == 0 {
+        device.items.retain(|item| item.group != DRIVER_PAGE_TABLES_GROUP);
+        return Some(());
+    }
+    if let Some(bytes) = crate::memory_policy::MemoryPolicy::current().spark_reserve {
+        device.items.push(Item::new(Category::Runtime, "SPARK_RESERVE", "", bytes, Basis::Formula));
+    } else {
+        device.items.push(spark_worker_process_resident_item());
+    }
+    // Typed receipts already price each physical backing. Legacy layout producers
+    // have one expert arena; do not replace typed rows with an aggregate reprice.
+    if !driver_present {
+        device.items.push(Item::new(Category::Runtime, DRIVER_PAGE_TABLES_GROUP, "",
+            spark_arena_driver_overhead_bytes(resident), Basis::Calibrated));
+    }
+    Some(())
 }
 
 impl Item {
@@ -360,6 +674,24 @@ mod tests {
     use super::*;
 
     #[test]
+    fn memory_kinds_round_trip_the_c_abi_and_keep_their_class() {
+        assert_eq!(MemoryKind::from_raw(0), None);
+        assert_eq!(MemoryKind::from_raw(MemoryKind::ALL.len() as u32 + 1), None);
+        for kind in MemoryKind::ALL {
+            assert_eq!(MemoryKind::from_raw(kind.as_raw()), Some(kind));
+            assert_eq!(serde_json::to_value(kind).unwrap(), kind.label());
+            assert_ne!(kind.category(), Category::Runtime);
+            let tag = Tag::new(kind, "test/owner");
+            let matches = |behaviour| kind.behaviour() == behaviour;
+            assert_eq!(ArenaTag::<arena_class::Immutable>::try_from_tag(tag).is_ok(), matches(Behaviour::Immutable));
+            assert_eq!(ArenaTag::<arena_class::FixedPool>::try_from_tag(tag).is_ok(), matches(Behaviour::FixedPool));
+            assert_eq!(ArenaTag::<arena_class::ReadWrite>::try_from_tag(tag).is_ok(), matches(Behaviour::ReadWrite));
+        }
+        assert_eq!(ArenaTag::weights("test/w").kind(), MemoryKind::Weights);
+        assert_eq!(ArenaTag::kv("test/kv").tag().to_string(), "kv:test/kv");
+    }
+
+    #[test]
     fn host_admission_charges_future_owners_but_not_resident_bytes_twice() {
         let resident = Item::new(Category::Transport, "transport/rdma-rings", "", 20, Basis::Exact);
         let future = Item::new(Category::Workspace, "scoring/full-logits", "", 10, Basis::Formula)
@@ -402,13 +734,87 @@ mod tests {
     }
 
     #[test]
-    fn spark_residual_is_estimated_ready_resident_with_census_provenance() {
-        let item = spark_runtime_residual();
-        assert_eq!(item.bytes, 2_684_354_560);
-        assert!(item.bytes > 2_083_518_960);
-        assert_eq!(item.basis, Basis::Estimated);
+    fn spark_arena_measured_terms_and_reserve_override_preserve_payload_owners() {
+        assert_eq!(spark_arena_driver_overhead_bytes(1 << 30), 12 << 20);
+        assert_eq!(spark_arena_driver_overhead_bytes(117_692_170_240), 1_379_205_120);
+        assert_eq!(spark_arena_driver_overhead_bytes(0), 0);
+        assert_eq!(spark_arena_driver_overhead_bytes(1), 48);
+        assert_eq!(spark_arena_driver_overhead_bytes(u64::MAX), 216_172_782_113_783_808);
+        let mut device = DeviceLayout { kind: DeviceKind::Spark, index: 0, capacity_bytes: 121 << 30,
+            worker_budget_bytes: 110 << 30, kv_tokens: 0, items: vec![
+                Item::new(Category::Experts, "arena", "", 64 << 30, Basis::Exact),
+                Item::new(Category::Transport, "ring", "", 128 << 20, Basis::Exact),
+                Item::new(Category::Staging, "upload", "", 4096, Basis::Exact)] };
+        charge_spark_runtime(&mut device).unwrap();
+        let first = device.clone();
+        charge_spark_runtime(&mut device).unwrap();
+        assert_eq!(device, first);
+        crate::memory_policy::MemoryPolicy { spark_reserve: Some(7), ..Default::default() }.scoped(|| {
+            charge_spark_runtime(&mut device).unwrap();
+            assert_eq!(spark_runtime_reserve_bytes(64 << 30), Some(7 + spark_arena_driver_overhead_bytes(64 << 30)));
+            assert_eq!(device.items.len(), 5);
+            assert_eq!(device.items.iter().find(|item| item.group == "ring").unwrap().bytes, 128 << 20);
+            assert_eq!(device.items.iter().find(|item| item.group == "upload").unwrap().bytes, 4096);
+            assert_eq!(device.items.iter().find(|item| item.group == "SPARK_RESERVE").unwrap().bytes, 7);
+        });
+    }
+
+    #[test]
+    fn spark_runtime_keeps_attributed_physical_driver_rows_without_aggregate_rounding() {
+        let mut device = DeviceLayout { kind: DeviceKind::Spark, index: 0, capacity_bytes: 121 << 30,
+            worker_budget_bytes: 110 << 30, kv_tokens: 0, items: vec![
+                Item::new(Category::Experts, "arenas", "", 2, Basis::Exact),
+                Item::new(Category::Runtime, DRIVER_PAGE_TABLES_GROUP, "backing a", 48, Basis::Calibrated),
+                Item::new(Category::Runtime, DRIVER_PAGE_TABLES_GROUP, "backing b", 48, Basis::Calibrated),
+            ] };
+        for _ in 0..2 {
+            charge_spark_runtime(&mut device).unwrap();
+            let rows: Vec<_> = device.items.iter().filter(|row| row.group == DRIVER_PAGE_TABLES_GROUP).collect();
+            assert_eq!(rows.len(), 2);
+            assert_eq!(rows.iter().map(|row| row.bytes).sum::<u64>(), 96);
+        }
+        device.items.retain(|row| row.category != Category::Experts);
+        charge_spark_runtime(&mut device).unwrap();
+        assert!(!device.items.iter().any(|row| row.group == DRIVER_PAGE_TABLES_GROUP));
+        for model in [DriverPageTableModel::Sm120Portable, DriverPageTableModel::Sm121Arena] {
+            assert_eq!(model.bytes(0), 0);
+            assert_eq!(model.bytes(1), model.bytes_per_quantum());
+            assert_eq!(model.bytes(model.quantum()), model.bytes_per_quantum());
+            assert_eq!(model.bytes(model.quantum() + 1), 2 * model.bytes_per_quantum());
+            assert!(model.source().contains("2026-11-07"));
+            let json = serde_json::to_value(model).unwrap();
+            assert_eq!(serde_json::from_value::<DriverPageTableModel>(json).unwrap(), model);
+        }
+    }
+
+    #[test]
+    fn spark_process_census_is_named_ready_resident_and_not_worker_future_headroom() {
+        let item = spark_worker_process_resident_item();
+        assert_eq!(item.bytes, 1_596_606_464);
+        assert_eq!(SPARK_WORKER_PROCESS_RESIDENT[0].arch, "sm_121");
+        assert_eq!(SPARK_WORKER_PROCESS_RESIDENT[0].bytes(), item.bytes);
+        assert_eq!(item.basis, Basis::Calibrated);
+        let selected = Some((crate::ExpertGeometry::KIMI_K3, 6, 1024));
+        let resident = 64 << 30;
+        assert_eq!(spark_runtime_bytes(selected, resident).unwrap()
+            - spark_worker_future_bytes(selected, resident).unwrap(), item.bytes);
+        for reserve in [0, 7] {
+            crate::memory_policy::MemoryPolicy { spark_reserve: Some(reserve), ..Default::default() }.scoped(|| {
+                assert_eq!(spark_worker_future_bytes(selected, resident),
+                    Some(spark_arena_driver_overhead_bytes(resident) + reserve + 4096));
+                assert_eq!(spark_runtime_bytes(selected, resident), spark_worker_future_bytes(selected, resident));
+                let mut device = DeviceLayout { kind: DeviceKind::Spark, index: 0, capacity_bytes: 121 << 30,
+                    worker_budget_bytes: 110 << 30, kv_tokens: 0, items: vec![
+                        Item::new(Category::Experts, "arena", "", resident, Basis::Exact)] };
+                charge_spark_runtime(&mut device).unwrap();
+                let driver = device.items.iter().find(|item| item.group == DRIVER_PAGE_TABLES_GROUP).unwrap();
+                assert_eq!(driver.bytes, spark_arena_driver_overhead_bytes(resident));
+                assert_eq!(driver.category, Category::Runtime);
+                assert!(!device.items.iter().any(|item| item.group == SPARK_WORKER_PROCESS_RESIDENT_GROUP));
+            });
+        }
         assert_eq!(item.lifetime, ItemLifetime::ReadyResident);
-        assert!(SPARK_RUNTIME_RESIDUAL_SOURCE.contains("0a6fc7b1"));
+        assert!(SPARK_WORKER_PROCESS_RESIDENT_SOURCE.contains("2026-11-07"));
         let encoded = serde_json::to_value(&item).unwrap();
         assert_eq!(encoded["lifetime"], "ready_resident");
         assert_eq!(serde_json::from_value::<Item>(encoded).unwrap(), item);
@@ -424,19 +830,6 @@ mod tests {
             assert_eq!(encoded["lifetime"], serde_json::to_value(lifetime).unwrap());
             assert_eq!(serde_json::from_value::<Item>(encoded).unwrap(), item);
         }
-    }
-
-    #[test]
-    fn scopes_map_onto_categories() {
-        assert_eq!(Category::of_scope("weights/dense-nvfp4"), Category::Weights);
-        assert_eq!(Category::of_scope("drafter/workspace"), Category::Drafter);
-        assert_eq!(Category::of_scope("transport/rdma-rings"), Category::Transport);
-        assert_eq!(Category::of_scope("peer-split"), Category::Transport);
-        assert_eq!(Category::of_scope("staging/sync-h2d"), Category::Staging);
-        assert_eq!(Category::of_scope("other"), Category::Runtime);
-        assert_eq!(Category::of_scope("v41/kv"), Category::Kv);
-        assert_eq!(Category::of_scope("v41/draft weights"), Category::Drafter);
-        assert_eq!(Category::of_scope("v41/allocated KV cache"), Category::Kv);
     }
 
     #[test]

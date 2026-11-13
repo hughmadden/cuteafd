@@ -17,6 +17,13 @@ P = 'CUTEAFD_RELEASE_'
 GLM_PROGRAMS = ['dense_trellis_k6', 'glm', 'glm2', 'glm2_stage', 'glm_stage']
 
 
+def test_default_matrix_cli_ignores_publisher_override(monkeypatch, capsys):
+    monkeypatch.setenv('CUTEAFD_RELEASE_MATRIX', '/not/the/shipping/matrix.json')
+    monkeypatch.setattr('sys.argv', ['release-scope.py', 'default-matrix'])
+    SCOPE.main()
+    assert capsys.readouterr().out.strip() == SCOPE.DEFAULT_MATRIX
+
+
 @pytest.fixture
 def matrix(tmp_path):
     (tmp_path / 'glm.config').write_text('FAMILY=glm5\nMODEL_ID=fixture/glm\nSPARK_COUNT=4\nRTX_GPUS=1\n')
@@ -24,7 +31,7 @@ def matrix(tmp_path):
     path = tmp_path / 'matrix.json'
     path.write_text(json.dumps(dict(defaults=dict(set=dict(AUDIO='off')), entries=[
         dict(name='glm-fp8', family='glm5', config='glm.config', sparks=['rank-a', 'rank-b'], gpus=[0, 1],
-             set=dict(SPARK_TP='2', RTX_GPUS='1')),
+             set=dict(SPARK_COUNT='2', RTX_GPUS='1')),
         dict(name='flash-nvfp4', family='glm5_flash', config='flash.config', sparks=[], gpus=[0]),
     ])))
     # The helper imports WIP derivation from the source repo, not a fixture repo.
@@ -37,6 +44,27 @@ def fixture_repo(matrix, monkeypatch):
     real = SCOPE.scopes_module(REPO)
     monkeypatch.setattr(SCOPE, 'scopes_module', lambda _: real)
     return repo, path
+
+
+@pytest.mark.parametrize('audio,enabled', [('auto', True), ('on', True), ('off', False)])
+def test_muse_release_audio_scope(fixture_repo, audio, enabled):
+    repo, path = fixture_repo
+    (repo / 'muse.config').write_text(f'FAMILY=muse_spark\nMODEL_ID=fixture/muse-exl3\nSPARK_COUNT=4\nAUDIO={audio}\n')
+    write_json(path, dict(entries=[dict(name='muse', family='muse_spark', config='muse.config')]))
+    derived, _ = SCOPE.derive(repo, path, 'muse', {})
+    assert derived[P + 'AUDIO_AOT'] == ('ON' if enabled else 'OFF')
+    assert SCOPE.requirements(repo, path, 'muse')[0]['audio'] == enabled
+
+
+@pytest.mark.parametrize('role', ['coordinator', 'expert'])
+def test_muse_release_inventory_requires_pcm_symbol(tmp_path, role):
+    root = tmp_path / role
+    write_json(root / 'share/PROGRAMS.json', dict(programs=[]))
+    wanted = [dict(name='muse', family='muse_spark', programs=[], experts=[], spark_experts=[],
+                   spark_count=4, context_split=False, audio=True)]
+    with pytest.raises(ValueError, match='cuteafd_pcm_required'):
+        SCOPE.check_inventory(root, role, wanted, symbols={'cuteafd_audio_required'})
+    SCOPE.check_inventory(root, role, wanted, symbols={'cuteafd_audio_required', 'cuteafd_pcm_required'})
 
 
 def test_union_equals_per_entry_derivation(fixture_repo):
@@ -57,7 +85,7 @@ def test_union_equals_per_entry_derivation(fixture_repo):
                 assert SCOPE.tokens(value) == expected
     assert SCOPE.PREVIOUS_RELEASE_FLOOR['GENERIC_SPARK_COUNTS'] <= SCOPE.tokens(union[P + 'GENERIC_SPARK_COUNTS'])
     assert SCOPE.PREVIOUS_RELEASE_FLOOR['EXPERT_FAMILIES'] <= SCOPE.tokens(union[P + 'EXPERT_FAMILIES'])
-    assert SCOPE.requirements(repo, path, 'glm-fp8')[0]['spark_count'] == 4
+    assert SCOPE.requirements(repo, path, 'glm-fp8')[0]['spark_count'] == 2  # set wins over config
     assert not SCOPE.requirements(repo, path, 'glm-fp8')[0]['dual']  # set wins over gpus
 
 
@@ -190,6 +218,43 @@ def test_glm_inventory_requires_full_static_namespaces(fixture_repo, tmp_path, d
         return
     with pytest.raises(ValueError, match=f'missing program families.*{missing}'):
         SCOPE.check_inventory(root, 'coordinator', wanted, symbols=set())
+
+
+@pytest.mark.parametrize('family,world', [
+    (family, world)
+    for family in ('dsv4f', 'dsv4p')
+    for world in SCOPE.spark_packages_module().package_worlds(family, 'mxfp4')
+])
+def test_native_spark_inventory_requires_every_width_artifact(tmp_path, family, world):
+    kind = 'spark' if world == 4 else f'spark_tp{world}'
+    artifacts = SCOPE.spark_packages_module().native_spark_artifacts(family)[world]
+    symbols = {artifact.prefix(family) + 'launch' for artifact in artifacts}
+    wanted = [dict(name=f'{family}-tp{world}', family='deepseek_v4', programs=[],
+                   experts=[], spark_experts=[f'{family}:{kind}'], spark_count=world,
+                   native_spark_symbols={f'{family}:{kind}': sorted(symbols)},
+                   context_split=False, audio=False)]
+    SCOPE.check_inventory(tmp_path, 'expert', wanted, symbols=symbols)
+    for symbol in symbols:
+        with pytest.raises(ValueError, match=f'missing native expert package.*{symbol}'):
+            SCOPE.check_inventory(tmp_path, 'expert', wanted, symbols=symbols - {symbol})
+
+
+@pytest.mark.parametrize('family', ['dsv4f', 'dsv4p'])
+def test_shipping_native_spark_scopes_pass_the_same_width_inventory(tmp_path, monkeypatch, family):
+    wanted = SCOPE.requirements(REPO, REPO / SCOPE.DEFAULT_MATRIX, 'all')
+    selected = []
+    for entry in wanted:
+        scopes = [item for item in entry['spark_experts'] if item.startswith(f'{family}:spark')]
+        if scopes:
+            selected.append({**entry, 'spark_experts': scopes, 'programs': [], 'audio': False})
+    assert selected
+    artifacts = SCOPE.spark_packages_module().native_spark_artifacts(family)
+    symbols = {artifact.prefix(family) + 'launch'
+               for entry in selected for artifact in artifacts[entry['spark_tp']]}
+    def no_checkout_policy():
+        raise AssertionError('remote inventory checks must use serialized requirements')
+    monkeypatch.setattr(SCOPE, 'spark_packages_module', no_checkout_policy)
+    SCOPE.check_inventory(tmp_path, 'expert', json.loads(json.dumps(selected)), symbols=symbols)
 
 
 def test_glm_context_program_must_not_be_satisfied_by_neutral_namespace(fixture_repo, tmp_path):
@@ -354,7 +419,7 @@ def write_floor_packages(root, role, packages):
         path = root / 'lib' / package
         files = {}
         for layout in layouts:
-            name = layout + '/libcuteafd_package.so'
+            name = layout + ('/m1' if package.startswith('exl3/') and role == 'expert' else '') + '/libcuteafd_package.so'
             file = path / name
             file.parent.mkdir(parents=True, exist_ok=True)
             file.write_bytes(b'fake package')
@@ -463,6 +528,52 @@ def test_kimi_release_derives_coordinator_programs(tmp_path, monkeypatch):
     assert SCOPE.requirements(tmp_path, matrix, 'kimi')[0]['programs'] == ['dense_trellis_k6', 'kimi_split', 'kimik3']
 
 
+@pytest.mark.parametrize('checkpoint,k31', [
+    ({'architectures': ['KimiK31ForConditionalGeneration']}, True),
+    ({'model_type': 'kimi_k31'}, True),
+    ({'text_config': {'dsa_config': {'dsa_layers': [4, 8]}}}, True),
+    ({'dsa_config': {'dsa_layers': [4, 8]}}, True),
+    ({'architectures': ['KimiK3ForConditionalGeneration']}, False),
+    ({}, False),
+])
+def test_kimi_program_sources_agree_with_checkpoint_metadata(tmp_path, monkeypatch, checkpoint, k31):
+    real = SCOPE.scopes_module(REPO)
+    monkeypatch.setattr(SCOPE, 'scopes_module', lambda _: real)
+    monkeypatch.setenv('HF_HOME', str(tmp_path / 'hf'))
+    # A misleading repository name must not select the K3.1 variant.
+    model = 'fixture/Kimi-K3.1-EXL3-K2'
+    config = tmp_path / 'hf/hub/models--fixture--Kimi-K3.1-EXL3-K2/snapshots/revision/config.json'
+    checkpoint = {'model_type': 'kimi_k3', **checkpoint}
+    if 'text_config' in checkpoint:
+        checkpoint['text_config'] = {'num_hidden_layers': 93, **checkpoint['text_config']}
+    else:
+        checkpoint['num_hidden_layers'] = 93
+    write_json(config, checkpoint)
+    (tmp_path / 'kimi.config').write_text(
+        f'FAMILY=kimi_k3\nMODEL_ID={model}\nMODEL_REVISION=revision\nSPARK_COUNT=0\nRTX_GPUS=2\n')
+    matrix = tmp_path / 'matrix.json'
+    write_json(matrix, dict(entries=[dict(name='kimi', family='kimi_k3', config='kimi.config')]))
+    wanted = {'kimik3', 'dense_trellis_k6', 'kimi_split'} | ({'kimik31'} if k31 else set())
+    assert set(SCOPE.requirements(tmp_path, matrix, 'kimi')[0]['programs']) == wanted
+
+    # CMake always ships both variants; placement inputs must inventory that union.
+    cmake = (REPO / 'native/cmake/shared/dsv4_programs.cmake').read_text()
+    block = cmake.split('if(CUTEAFD_ENABLE_KIMIK3_AOT)\n', 1)[1].split('\nif(CUTEAFD_ENABLE_MUSE_AOT)', 1)[0]
+    import re
+    geometries = re.findall(r'set\(CUTEAFD_PROGRAM_GEOMETRY "([^"]+)"\)', block)
+    shipped = {'kimik3', 'kimik31', 'dense_trellis_k6', 'kimi_split'}
+    assert len(geometries) == 2
+    for geometry in geometries:
+        assert set(geometry.removeprefix('${CUTEAFD_PROGRAM_GEOMETRY},').split(',')) == shipped
+    spec = importlib.util.spec_from_file_location('k31_placement_inputs', REPO / 'scripts/build/export-placement-inputs.py')
+    publisher = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(publisher)
+    monkeypatch.setattr(publisher, 'live_configs', lambda: [])
+    args = publisher.export_jobs()[0][2]
+    assert shipped <= set(args[args.index('--geometry') + 1].split(','))
+    assert wanted <= shipped
+
+
 def test_unrelated_release_keeps_kimi_disabled(tmp_path, monkeypatch):
     real = SCOPE.scopes_module(REPO)
     monkeypatch.setattr(SCOPE, 'scopes_module', lambda _: real)
@@ -517,3 +628,70 @@ def test_shared_input_staging_can_precede_explicit_copy(tmp_path):
     launcher_sandbox.copy_input(REPO / 'scripts/lib/checkpoint-family.py', path)
     assert path.read_bytes() == other.read_bytes() == (REPO / 'scripts/lib/checkpoint-family.py').read_bytes()
     assert path.stat().st_ino == other.stat().st_ino
+
+
+@pytest.mark.parametrize("matrix", ["release-smoke.example.json", "release-smoke-v4.json"])
+def test_release_matrix_showcases_both_compressed_v41_reply_formats(matrix):
+    document = json.loads((REPO / "scripts/bench" / matrix).read_text())
+    base = next(entry for entry in document["entries"] if entry["name"] == "v41-flash-max")
+    assert "SPARK_PREFILL_REPLY_FORMAT" not in base["set"]
+    assert "SPARK_DECODE_REPLY_FORMAT" not in base["set"]
+    assert not document["defaults"].get("run_args")
+    for codec in ("fp8", "nvfp4"):
+        entry = next(entry for entry in document["entries"] if entry["name"] == f"v41-flash-max-{codec}-reply")
+        assert entry["gpus"] == base["gpus"] and entry["sparks"] == base["sparks"]
+        assert not entry.get("run_args")
+        assert entry["set"]["SPARK_PREFILL_REPLY_FORMAT"] == codec
+        assert entry["set"]["SPARK_DECODE_REPLY_FORMAT"] == codec
+        def config_values(path):
+            return dict(line.split("=", 1) for line in path.read_text().splitlines()
+                        if line and not line.startswith("#"))
+
+        config = config_values(REPO / entry["config"])
+        baseline = config_values(REPO / base["config"])
+        assert config == {**baseline, "SPARK_PREFILL_REPLY_FORMAT": codec,
+                          "SPARK_DECODE_REPLY_FORMAT": codec}
+        assert config["COORDINATOR_DOCKER_INFERENCE"].startswith("ghcr.io/")
+        assert config["SPARK_EXPERT_DOCKER_INFERENCE"].startswith("ghcr.io/")
+
+
+def test_release_all_includes_ml4_min_compact_and_max():
+    matrix = REPO / SCOPE.DEFAULT_MATRIX
+    result, _ = SCOPE.derive(REPO, matrix, 'all', {})
+    assert result[P + 'ML4_AOT'] == 'ON'
+    assert 'ml4:exl3-k45' in result[P + 'EXPERT_FAMILIES'].split(';')
+    assert {'ml4=5', 'ml4=6'} <= set(result[P + 'GENERIC_SPARK_COUNTS'].split(';'))
+    wanted = SCOPE.requirements(REPO, matrix, 'mistral_large4')
+    assert {(entry['spark_tp'], entry['dual']) for entry in wanted} == {(5, False), (6, True)}
+    assert all('ml4' in entry['programs'] for entry in wanted)
+
+
+def test_release_ml4_compact_layouts_are_checked(tmp_path):
+    package = 'exl3/exl3-ml4-k45'
+    root = tmp_path / 'lib' / package
+    write_json(root / 'manifest.json', dict(schema='cuteafd.exl3-package.v1', role='spark',
+        variants=[dict(directory=f'tp5-rank{rank}/m1') for rank in range(5)], files={'dummy.so': {}}))
+    layouts = [layout.removesuffix('/m1') for layout in SCOPE.scopes_module(REPO).exl3_spark_layouts('ml4:exl3-k45', 5)]
+    with pytest.raises(ValueError, match='tp5-compact-rank0'):
+        SCOPE.check_package(tmp_path, package, layouts, 'expert')
+
+
+def test_stdin_ml4_inventory_uses_serialized_compact_layouts(tmp_path):
+    import subprocess
+    requirement = next(e for e in SCOPE.requirements(REPO, REPO / SCOPE.DEFAULT_MATRIX, 'mistral_large4')
+                       if e['spark_tp'] == 5)
+    assert requirement['spark_layouts']['ml4:exl3-k45'] == [f'tp5-compact-rank{r}' for r in range(5)]
+    library = tmp_path / 'lib/libcuteafd_native.so'
+    library.parent.mkdir()
+    subprocess.run(['cc', '-shared', '-x', 'c', '-', '-o', str(library)],
+                   input='void fixture(void) {}', text=True, check=True)
+    package = tmp_path / 'lib/exl3/exl3-ml4-k45'
+    write_json(package / 'manifest.json', dict(schema='cuteafd.exl3-package.v1', role='spark',
+        variants=[dict(directory=f'tp5-rank{r}/m1') for r in range(5)], files={}))
+    helper = REPO / 'scripts/build/release-scope.py'
+    result = subprocess.run(['python3', '-', 'check-files', '--role', 'expert', '--root', str(tmp_path),
+        '--requirements', json.dumps([requirement])], input=helper.read_text(), cwd='/',
+        text=True, capture_output=True)
+    assert result.returncode != 0
+    assert 'tp5-compact-rank0/m1' in result.stderr
+    assert '__file__' not in result.stderr and 'IndexError' not in result.stderr

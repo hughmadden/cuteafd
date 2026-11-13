@@ -33,13 +33,13 @@ int main() {
     check(cuteafd_cuda_set_device(source) == CUTEAFD_STATUS_OK);
     check(cuteafd_cuda_enable_peer(destination) == CUTEAFD_STATUS_OK);
     check(cuteafd_cuda_enable_peer(destination) == CUTEAFD_STATUS_OK);
-    check(cuteafd_alloc_device_buffer(bytes, &src) == CUTEAFD_STATUS_OK);
+    check(cuteafd_alloc_device_buffer(bytes, &src, CUTEAFD_MEMORY_KIND_WORKSPACE, "selftest") == CUTEAFD_STATUS_OK);
     check(src.device_id == source);
     check(cuteafd_cuda_stream_create(&producer) == CUTEAFD_STATUS_OK);
     check(cuteafd_cuda_event_create(&event) == CUTEAFD_STATUS_OK);
     check(cuteafd_cuda_set_device(destination) == CUTEAFD_STATUS_OK);
     check(cuteafd_cuda_enable_peer(source) == CUTEAFD_STATUS_OK);
-    check(cuteafd_alloc_device_buffer(bytes, &dst) == CUTEAFD_STATUS_OK);
+    check(cuteafd_alloc_device_buffer(bytes, &dst, CUTEAFD_MEMORY_KIND_WORKSPACE, "selftest") == CUTEAFD_STATUS_OK);
     check(dst.device_id == destination);
     check(cuteafd_cuda_stream_create(&consumer) == CUTEAFD_STATUS_OK);
     check(cuteafd_cuda_stream_create(&pending) == CUTEAFD_STATUS_OK);
@@ -73,7 +73,7 @@ int main() {
       for (auto value : host) check(value == pattern);
     }
     cuteafd_device_buffer_t local{};
-    check(cuteafd_alloc_device_buffer(bytes, &local) == CUTEAFD_STATUS_OK);
+    check(cuteafd_alloc_device_buffer(bytes, &local, CUTEAFD_MEMORY_KIND_WORKSPACE, "selftest") == CUTEAFD_STATUS_OK);
     std::vector<unsigned char> values(bytes);
     for (size_t i = 0; i < bytes; ++i) values[i] = (i * 17 + 11) % 251;
     check(cuteafd_copy_h2d(local, values.data(), bytes) == CUTEAFD_STATUS_OK);

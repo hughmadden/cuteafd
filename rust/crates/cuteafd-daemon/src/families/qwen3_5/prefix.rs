@@ -214,7 +214,9 @@ pub(crate) fn check_backend_frontiers(engine: &RefCell<DenseEngine<'_>>, tokens:
         }
         Ok(bytes)
     };
-    let decode = |placement: &mut Placement, inputs: &[u32]| -> Result<Vec<f32>> {
+    let mut selector = crate::shared::token_io::TokenSelector::new(library,
+        crate::shared::token_io::SelectPlacement::Device, engine.borrow().cfg.vocab, 1)?;
+    let mut decode = |placement: &mut Placement, inputs: &[u32]| -> Result<Vec<f32>> {
         if family.mtp.is_some() {
             use crate::shared::qwen::scheduler::{DraftSeq, DraftState, DraftTiming};
             let mut state = super::super::serve::DraftState::default();
@@ -222,7 +224,7 @@ pub(crate) fn check_backend_frontiers(engine: &RefCell<DenseEngine<'_>>, tokens:
             let mut previous = Vec::new();
             for depth in 1..=3 {
                 let proposed = backend.draft(&mut [DraftSeq { placement, seq: &mut state, depth }],
-                    &mut DraftTiming::default())?;
+                    &mut DraftTiming::default(), &mut selector)?;
                 ensure!(proposed.len() == 1 && proposed[0].len() == depth
                     && proposed[0].starts_with(&previous), "native serving recursive draft differs by depth");
                 previous = proposed[0].clone();

@@ -1,9 +1,11 @@
 //! Serialized native ViT/aligner owner. No request KV or text execution state.
+use crate::shared::memory::Tag;
 use crate::shared::memory::{DeviceAllocation, LoadStream};
 use crate::families::deepseek_v41::v41_tensors::NativeRtxTensors;
 use anyhow::{ensure, Result};
 use cuteafd_ffi::{CuteafdDeviceBuffer as Buffer, NativeLibrary, V41VisionOps};
 use cuteafd_loader::{OfficialV41Catalog, V41Image, V41ImageGrid};
+use cuteafd_core::memory_layout::ArenaTag;
 
 #[derive(Clone, Copy)]
 #[repr(usize)]
@@ -40,33 +42,7 @@ pub(crate) struct VisionRuntime<'a> {
 }
 impl<'a> VisionRuntime<'a> {
     pub(super) fn names() -> Vec<String> {
-        let mut names = vec![
-            "vision.patch_embed.proj.weight".into(),
-            "vision.patch_embed.proj.bias".into(),
-            "vision.norm.weight".into(),
-            "aligner.w1.weight".into(),
-            "aligner.w1.bias".into(),
-            "aligner.w2.weight".into(),
-            "aligner.w2.bias".into(),
-            "image_start".into(),
-            "image_end".into(),
-            "image_newline".into(),
-        ];
-        for layer in 0..32 {
-            for suffix in [
-                "norm1.weight",
-                "attn.wqkv.weight",
-                "attn.wqkv.bias",
-                "attn.wo.weight",
-                "attn.wo.bias",
-                "norm2.weight",
-                "mlp.w1.weight",
-                "mlp.w2.weight",
-            ] {
-                names.push(format!("vision.blocks.{layer}.{suffix}"));
-            }
-        }
-        names
+        cuteafd_loader::placement::families::deepseek_v41::weight_layout::vision_names()
     }
     fn buffer_sizes(capacity: usize) -> Result<Vec<usize>> {
         ensure!(
@@ -94,7 +70,7 @@ impl<'a> VisionRuntime<'a> {
             16 * 4,
         ])
     }
-    pub fn device_bytes(catalog: &OfficialV41Catalog, capacity: usize) -> Result<usize> {
+    pub fn weight_bytes(catalog: &OfficialV41Catalog) -> Result<usize> {
         let names = Self::names();
         for name in &names {
             ensure!(
@@ -102,7 +78,15 @@ impl<'a> VisionRuntime<'a> {
                 "vision tensor must retain BF16: {name}"
             );
         }
-        Ok(NativeRtxTensors::plan(catalog, &names)?
+        Ok(Self::weight_layout(catalog)?.bytes())
+    }
+    fn weight_layout(catalog: &OfficialV41Catalog) -> Result<cuteafd_loader::serving_capacity::WeightArenaLayout> {
+        // One header recipe for the tower's arena and for admission.
+        cuteafd_loader::placement::families::deepseek_v41::weight_layout::vision_layout_from_headers(
+            catalog.tensors().iter().map(|tensor| &tensor.metadata))
+    }
+    pub fn device_bytes(catalog: &OfficialV41Catalog, capacity: usize) -> Result<usize> {
+        Ok(Self::weight_bytes(catalog)?
             + Self::buffer_sizes(capacity)?.iter().sum::<usize>()
             + V41VisionOps::WORKSPACE_BYTES)
     }
@@ -117,18 +101,20 @@ impl<'a> VisionRuntime<'a> {
             "vision owner exceeds device budget"
         );
         let names = Self::names();
-        let weights = NativeRtxTensors::load(
-            lib,
-            catalog,
-            &names,
-            NativeRtxTensors::plan(catalog, &names)?,
-            16 << 20,
+        let layout = Self::weight_layout(catalog)?;
+        // VisionRuntime is constructed inside its owning encoder thread/device.
+        let arena = crate::shared::memory::weight_arena::DeviceWeightArena::new(
+            crate::shared::memory::device::Device { library: lib, id: lib.cuda_get_device()? }, layout, ArenaTag::weights("v41/vision"))?;
+        let weights = NativeRtxTensors::load_in(
+            lib, catalog, &names, NativeRtxTensors::plan(catalog, &names)?, 16 << 20, Some(&arena),
         )?;
-        let workspace = DeviceAllocation::new(lib, V41VisionOps::WORKSPACE_BYTES)?;
+        super::weight_layout::probe_weights(lib, &[lib.cuda_get_device()?], "v41/vision-weights-loaded",
+            |inventory| weights.inventory(inventory))?;
+        let workspace = DeviceAllocation::new(lib, V41VisionOps::WORKSPACE_BYTES, Tag::workspace("v41/vision"))?;
         let ops = unsafe { lib.v41_vision_ops(workspace.buffer)? };
         let buffers = Self::buffer_sizes(capacity)?
             .into_iter()
-            .map(|n| DeviceAllocation::new(lib, n))
+            .map(|n| DeviceAllocation::new(lib, n, Tag::workspace("v41/vision")))
             .collect::<Result<Vec<_>>>()?;
         let stream = LoadStream {
             library: lib,
@@ -413,3 +399,62 @@ impl<'a> VisionRuntime<'a> {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod push_tests {
+    use super::*;
+    use anyhow::Context;
+
+    /// The coordinator-local tower's serving constructor recorded (as its owner
+    /// thread does under push) and replayed through one committed coordinator
+    /// rank must land byte-identical owners to the mount, without a payload read.
+    #[test]
+    #[ignore = "requires CUTEAFD_PUSH_V41 (SparkNest V4.1 snapshot), CUTEAFD_NATIVE_LIB and an RTX GPU"]
+    fn installed_vision_tower_push_matches_mount_byte_for_byte() -> Result<()> {
+        use crate::shared::{experts::rtx::dense, memory::device::Device};
+        let Some(snapshot) = std::env::var_os("CUTEAFD_PUSH_V41").map(std::path::PathBuf::from) else { return Ok(()) };
+        // SAFETY: the slot's native library, loaded once for this test process.
+        let lib = unsafe { NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?)? };
+        lib.cuda_set_device(0)?;
+        let names: std::collections::HashSet<String> = VisionRuntime::names().into_iter().collect();
+        let catalog = cuteafd_loader::read_official_v41_role_catalog(&snapshot, "vision", |name| names.contains(name))?;
+        let (root, _) = cuteafd_loader::push_load::namespace(&snapshot).context("V4.1 outside SparkNest")?;
+        let capacity = 1024;
+        let bytes = VisionRuntime::device_bytes(&catalog, capacity)?;
+        let mounted = VisionRuntime::new(&lib, &catalog, capacity, bytes)?;
+        let (pushed, records) = dense::recording(|| VisionRuntime::new(&lib, &catalog, capacity, bytes))?;
+        anyhow::ensure!(records.steps.is_empty() && records.finishes.is_empty() && !records.operands.is_empty(),
+            "the tower records only direct BF16 operands");
+        let staging = dense::RankLayout::new(records.operands.clone(), Vec::new(), 0)?.host_staging;
+        anyhow::ensure!(staging.bytes()? == 0, "the tower adds no dense pinned staging");
+        // Through the same address-only hand-off the owner thread uses.
+        let sent = crate::shared::vision::push::Contribution::send_records(records.clone())?;
+        let (contribution, _owner) = crate::shared::vision::push::Contribution::recorded(sent, std::sync::mpsc::channel().0,
+            std::sync::mpsc::sync_channel(1).1, std::thread::spawn(|| ()))?;
+        let replayed = contribution.records();
+        anyhow::ensure!(replayed.operands.len() == records.operands.len(), "hand-off lost operands");
+        drop(contribution);
+        let sockets = tempfile::tempdir()?;
+        crate::shared::experts::rtx::push::tests::receive_pushed(Device { library: &lib, id: 0 }, None, &root,
+            sockets.path(), &replayed, None, 0, 0)?;
+        let digest = |runtime: &VisionRuntime<'_>| -> Result<Vec<(String, Vec<u8>)>> {
+            let mut out = Vec::new();
+            let mut error = None;
+            runtime.weights.visit("", &mut |name, buffer| {
+                let mut bytes = vec![0u8; buffer.bytes];
+                match lib.copy_d2h(&mut bytes, buffer) { Ok(()) => out.push((name, bytes)), Err(e) => error = Some(e) }
+            });
+            error.map_or(Ok(out), Err)
+        };
+        let (expected, actual) = (digest(&mounted)?, digest(&pushed)?);
+        anyhow::ensure!(expected.len() == actual.len() && expected.len() == names.len(), "tower owner inventories differ");
+        let mut identical = 0usize;
+        for ((name, mount), (other, push)) in expected.iter().zip(&actual) {
+            anyhow::ensure!(name == other && mount == push, "pushed {name} differs from the mount");
+            identical += mount.len();
+        }
+        eprintln!("V4.1 vision: {} operands, {} owners, {identical} B byte-identical; dense staging 0 B",
+            records.operands.len(), expected.len());
+        Ok(())
+    }
+}

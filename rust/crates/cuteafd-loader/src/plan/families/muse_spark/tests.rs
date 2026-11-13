@@ -12,6 +12,69 @@ fn snapshot(expert_layers: &[usize]) -> tempfile::TempDir {
 
 fn all_layers() -> Vec<usize> { (0..62).collect() }
 
+#[test]
+fn core_contract_follows_header_width_and_charges_native_payload() {
+    use super::Model;
+    use crate::families::muse_spark::weight_layout::{GlobalLayout, LayerLayout, projection_key};
+    use crate::plan::{family::FamilyModel, format::{Encoding, QuantOperand}};
+    let mut resident = Vec::new();
+    for bits in [6, 8] {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut tensors, mut projections) = testing::muse_spark_tensors(&[]);
+        for (name, _, shape) in &mut tensors {
+            if name.ends_with(".trellis") { shape[2] = 16 * bits; }
+        }
+        for (_, width, _, _) in &mut projections { *width = bits; }
+        let compact = testing::exl3_compact(bits);
+        testing::write_quantize_config(dir.path(), &testing::exl3_manifest(&compact, &projections));
+        testing::write_snapshot(dir.path(), &testing::muse_spark_config(), &tensors, None);
+        let checkpoint = Checkpoint::open(dir.path()).unwrap();
+        let mut model = Model::open(&checkpoint).unwrap();
+        assert_eq!(model.core.projections.len(), 373);
+        let operand = |width, logical: Vec<usize>| QuantOperand {
+            encoding: Encoding::Exl3 { bits: width }, container: "I16".into(), logical,
+            stored: vec![], scale: None, global_scale: None, input_scale: None, companions: vec![],
+        };
+        for (stem, projection) in &model.core.projections {
+            assert_eq!(projection.bits, bits, "{stem}");
+            let role = TensorRole::new(if stem == "lm_head" { Component::LmHead } else { Component::Attention });
+            let shape = vec![projection.stored_outputs, projection.shape[1]];
+            let mut op = operand(bits, shape.clone());
+            model.accepts(&role, stem, &mut op).unwrap();
+            assert_eq!(op.logical, projection.shape, "head padding is logical-only");
+            for unsupported in [4, 5, 7, if bits == 6 { 8 } else { 6 }] {
+                assert!(model.accepts(&role, stem, &mut operand(unsupported, shape.clone())).is_err(), "{stem} K{unsupported}");
+            }
+            let mut wrong_shape = shape;
+            wrong_shape[1] += 128;
+            assert!(model.accepts(&role, stem, &mut operand(bits, wrong_shape)).is_err(), "{stem}");
+        }
+        let global = GlobalLayout::new(&model.cfg, &model.core).unwrap();
+        let mut bytes = global.head_bytes();
+        for layer in 0..model.cfg.layers {
+            for layout in LayerLayout::ranks(&model.cfg, layer, 2, &model.core).unwrap() {
+                for projection in layout.core.values() {
+                    assert_eq!(projection_key(projection).4, bits);
+                    let [n, k] = projection.shape;
+                    assert_eq!(projection.bytes, n * k * bits / 8 + 2 * (n + k));
+                    bytes += projection.bytes;
+                }
+            }
+        }
+        resident.push(bytes);
+        model.core.projections.get_mut("lm_head").unwrap().bits = 4;
+        assert!(model.accepts(&TensorRole::new(Component::LmHead), "lm_head",
+            &mut operand(4, vec![202112, 8192])).is_err());
+    }
+    let payload_elements = 202112usize * 8192 + 62 * (2 * 8192 * 8192 + 2 * 1024 * 8192 + 2 * 4096 * 8192);
+    assert_eq!(resident[1] - resident[0], payload_elements / 4);
+}
+
+/// The min card's declared serving context (examples/configs/muse-spark-exl3-min.config):
+/// one RTX PRO 6000 cannot hold the checkpoint's compiled 1M pool together
+/// with DFlash2 and the onboarding needed to keep both bundled towers on Sparks.
+const MIN_CARD_CONTEXT: u64 = 634_304;
+
 fn with_layout(rtx: usize, ranks: usize) -> PlanOptions {
     PlanOptions { placement: ExpertPlacement::from_spark_ranks(ranks),
         layout: Some(layout::LayoutOptions { host_memory: Some((256 << 30, 256 << 30)),
@@ -25,6 +88,153 @@ fn with_package(rtx: usize, ranks: usize, dir: &std::path::Path) -> PlanOptions 
     let mut options = with_layout(rtx, ranks);
     options.layout.as_mut().unwrap().workspace_manifest = Some(testing::write_muse_exl3_capacities(dir));
     options
+}
+
+#[test]
+fn selected_head_views_charge_one_native_workspace_with_or_without_drafter() {
+    use crate::families::muse_spark::{core::CoreInventory, MuseSparkConfig};
+    use crate::placement::planner::serving::BlasHead;
+    let cfg = MuseSparkConfig::from_hf(&testing::muse_spark_config()).unwrap();
+    let drafter = tempfile::tempdir().unwrap();
+    std::fs::write(drafter.path().join("config.json"),
+        include_str!("../../../../../cuteafd-daemon/src/families/muse_spark/fixtures/drafters/nvidia.json")).unwrap();
+    for width in [None, Some(6), Some(8)] {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut tensors, _) = testing::muse_spark_tensors(&all_layers());
+        if let Some(bits) = width {
+            for (name, _, shape) in &mut tensors {
+                if name.starts_with("lm_head.") && name.ends_with(".trellis") { shape[2] = 16 * bits; }
+            }
+        } else {
+            tensors.retain(|(name, _, _)| !name.starts_with("lm_head."));
+            tensors.push(testing::t("lm_head.weight", "BF16", &[cfg.vocab_size, cfg.hidden]));
+        }
+        let mut config = testing::muse_spark_config();
+        if let Some(bits) = width { config["quantization_config"]["head_bits"] = serde_json::json!(bits); }
+        else { for key in ["head_bits", "lm_head"] { config["quantization_config"].as_object_mut().unwrap().remove(key); } }
+        for key in ["audio_config", "vision_config"] { config.as_object_mut().unwrap().remove(key); }
+        tensors.retain(|(name, _, _)| !name.starts_with("model.audio_tower.")
+            && !crate::media::muse_vision::is_tensor(name));
+        testing::write_snapshot(dir.path(), &config, &tensors, None);
+        let input = testing::BudgetedPlanInput::open(dir.path()).unwrap();
+        let inventory = CoreInventory::from_checkpoint(&cfg, input.checkpoint()).unwrap();
+        assert_eq!(inventory.head_outputs(&cfg), if width.is_none() { cfg.vocab_size } else { 202112 });
+        for backend in [BlasHead::TensorLt, BlasHead::Gemm] {
+            for draft in [false, true] {
+                let mut options = with_layout(2, 6);
+                let layout = options.layout.as_mut().unwrap();
+                layout.bf16_target_head = backend;
+                if draft { layout.muse_drafter_snapshot = Some(drafter.path().to_path_buf()); }
+                let report = input.plan(&options).unwrap();
+                assert!(report.fits, "{width:?} {backend:?} draft={draft}: {:?}", report.hints);
+                let placed = report.solver_placement.unwrap();
+                let workspace = |gpu: usize| placed.items[gpu].iter().filter(|item|
+                    item.group == "Muse native target/drafter head workspace").map(|item| item.bytes).sum::<u64>();
+                assert_eq!(workspace(0), 0);
+                assert_eq!(workspace(1), if width.is_none() { crate::serving_capacity::GLMF_HEAD_WORKSPACE } else { 0 });
+                let init = placed.items[1].iter().filter(|item|
+                    item.group.starts_with("BLAS device initialization")).map(|item| item.bytes).sum::<u64>();
+                assert_eq!(init, if width.is_none() { 2 << 20 } else { 0 });
+            }
+        }
+    }
+}
+
+#[test]
+fn graph_reserve_matches_the_chosen_onboarding_candidate() {
+    const CHILD: &str = "CUTEAFD_MUSE_GRAPH_RESERVE_TEST";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["graph_reserve_matches_the_chosen_onboarding_candidate", "--nocapture"])
+            .env(CHILD, "1").env("CUTEAFD_GPU_GRAPH_RESERVE", "gpu0=128MiB,gpu1=192MiB")
+            .env_remove("CUTEAFD_GPU_GRAPH_RESERVE_EXTRA").env_remove("CUTEAFD_GPU_GRAPH_RESERVE_EXTRA_CAP")
+            .output().unwrap();
+        assert!(output.status.success(), "{}\n{}", String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr));
+        return;
+    }
+    let dir = snapshot(&all_layers());
+    let input = testing::BudgetedPlanInput::open(dir.path()).unwrap();
+    let package = tempfile::tempdir().unwrap();
+    for gpus in [1, 2] {
+        for sparks in [4, 6] {
+            let report = input.plan(&with_package(gpus, sparks, package.path())).unwrap();
+            let placement = report.solver_placement.as_ref().unwrap_or_else(|| panic!("{:?}", report.hints));
+            assert!(report.fits);
+            assert_eq!(report.onboard_layers, Some(placement.onboard_layers));
+            for gpu in 0..gpus {
+                let policy = crate::serving_capacity::muse_graphs::policy(gpus, placement.onboard_layers, gpu).unwrap();
+                let breakdown = crate::placement::reserve::breakdown(format!("gpu{gpu}"),
+                    cuteafd_core::memory_policy::DeviceKind::Gpu, crate::placement::inventory::PRO_TOTAL_BYTES,
+                    0, &placement.items[gpu]);
+                let owners = breakdown.reserve.iter().filter(|owner| owner.name == "graph reserve").collect::<Vec<_>>();
+                assert_eq!(owners.len(), 1, "{gpus} RTX/{sparks} Sparks, onboard {}", placement.onboard_layers);
+                assert_eq!(owners[0].bytes, policy.bytes);
+                assert_eq!(policy.bytes, [128 << 20, 192 << 20][gpu]);
+            }
+        }
+    }
+}
+
+#[test]
+fn zero_spark_is_a_typed_planner_result_not_a_launcher_restriction() {
+    let dir = snapshot(&all_layers());
+    let input = testing::BudgetedPlanInput::open(dir.path()).unwrap();
+    let report = input.plan(&with_package(2, 0, dir.path())).unwrap();
+    assert!(!report.executable() && !report.wip_launchable());
+    assert!(report.solver_placement.is_none());
+    assert!(report.hints.iter().any(|hint| hint.what.contains("joint admission refused")), "{:?}", report.hints);
+}
+
+fn check_target_arena_admission(input: &testing::BudgetedPlanInput) {
+    use crate::families::muse_spark::{core::CoreInventory,
+        weight_layout::{coordinator_arena, GlobalLayout, LayerLayout}, MuseSparkConfig};
+    use cuteafd_core::memory_layout::DeviceKind;
+    let checkpoint = input.checkpoint();
+    let cfg = MuseSparkConfig::from_hf(&checkpoint.config).unwrap();
+    let core = CoreInventory::from_checkpoint(&cfg, checkpoint).unwrap();
+    let global = GlobalLayout::new(&cfg, &core).unwrap();
+    for gpus in [1, 2] {
+        let report = input.plan(&with_layout(gpus, 6)).unwrap();
+        let placement = report.solver_placement.as_ref().unwrap_or_else(|| panic!("{:?}", report.hints));
+        let layouts = (0..cfg.layers).map(|layer| LayerLayout::ranks(&cfg, layer, gpus, &core).unwrap())
+            .collect::<Vec<_>>();
+        let devices = report.memory_layout.as_ref().unwrap().devices.iter()
+            .filter(|device| device.kind == DeviceKind::Rtx).collect::<Vec<_>>();
+        assert_eq!(devices.len(), gpus);
+        for (gpu, device) in devices.iter().enumerate() {
+            let local = layouts.iter().map(|ranks| &ranks[gpu]).collect::<Vec<_>>();
+            let arena = coordinator_arena(gpu, gpus, &global, &local).unwrap();
+            let bytes = arena.bytes() as u64;
+            let tail = bytes.div_ceil(2 << 20) * (2 << 20) - bytes;
+            let roots = device.items.iter().filter(|item| item.group == "weight arena").collect::<Vec<_>>();
+            assert_eq!(roots.len(), 1, "one target root per physical GPU");
+            assert_eq!(roots[0].bytes, bytes);
+            assert_eq!(device.items.iter().filter(|item| item.group == "allocation granularity")
+                .map(|item| item.bytes).sum::<u64>(), tail);
+            assert!(!placement.items[gpu].iter().any(|item| matches!(item.group.as_str(),
+                "token embedding" | "lm head (K6)" | "final norm" |
+                "Muse native attention values and block scales") || item.group.starts_with("layer weights (")),
+                "the old immutable tensor charge must not survive beside its arena");
+        }
+    }
+}
+
+#[test]
+fn target_admission_replaces_tensor_charges_with_runtime_arenas() {
+    let dir = snapshot(&all_layers());
+    let input = testing::BudgetedPlanInput::open(dir.path()).unwrap();
+    check_target_arena_admission(&input);
+}
+
+#[test]
+#[ignore = "reads the installed Muse checkpoint headers"]
+fn installed_target_admission_matches_runtime_arenas() {
+    let hub = std::env::var_os("HF_HOME").map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from("/mnt/sparknest/hf-home"));
+    let snapshot = hub.join("hub/models--wrldsuksgo2mars--Muse-Spark-Open-EXL3-K4-Core-K6/snapshots/89998fb177acd9a862ac8bd4fb79bfd50e940c97");
+    let input = testing::BudgetedPlanInput::open(&snapshot).unwrap();
+    check_target_arena_admission(&input);
 }
 
 #[test]
@@ -227,6 +437,32 @@ fn layout_picks_its_spark_range_and_onboards_by_default() { plan_matrix(2); }
 #[test]
 fn layout_plans_every_spark_world_on_one_rtx() { plan_matrix(1); }
 
+/// Automatic context follows the admitted pool; an explicit 1M pin still
+/// reports the typed capacity shortfall on one RTX.
+#[test]
+fn automatic_context_fits_one_rtx_and_full_context_pin_reports_shortfall() {
+    let dir = snapshot(&all_layers());
+    let input = testing::BudgetedPlanInput::open(dir.path()).unwrap();
+    let package = tempfile::tempdir().unwrap();
+    let mut options = with_package(1, 4, package.path());
+    let report = input.plan(&options).unwrap();
+    assert!(report.fits && report.wip_launchable(), "{:?}", report.hints);
+    let pool = report.memory_layout.as_ref().unwrap().pool_tokens;
+    assert!((262144..1 << 20).contains(&pool));
+    assert_eq!(report.phase_ledger.as_ref().unwrap().served_context_tokens, pool);
+    options.layout.as_mut().unwrap().context_tokens = 1 << 20;
+    let report = input.plan(&options).unwrap();
+    assert!(!report.fits && !report.wip_launchable(), "{:?}", report.hints);
+    let hint = report.hints.iter().map(|hint| &hint.what).find(|what|
+        what.contains("selected context 1048576 cannot fit")).expect("the typed shortfall");
+    assert!(hint.contains("maximum feasible pool is"), "{hint}");
+    assert!(hint.contains("pass a lower explicit context"), "{hint}");
+    // The declared max card context (1M) still plans on the head-split pair.
+    let report = input.plan(&with_package(2, 6, package.path())).unwrap();
+    assert!(report.fits && report.wip_launchable(), "{:?}", report.hints);
+    assert!(report.memory_layout.as_ref().unwrap().pool_tokens >= 1 << 20);
+}
+
 /// The plan matrix (#923) of one coordinator column: every Spark world the
 /// shared range data gives the width; each packages (no 'no layout' hint),
 /// and the worlds at or above the minimum fit.
@@ -237,7 +473,9 @@ fn plan_matrix(column: usize) {
     assert_eq!(worlds, [2, 3, 4, 5, 6, 7, 8], "range data for muse:exl3-k45");
     let package = tempfile::tempdir().unwrap();
     for (rtx, ranks) in worlds.iter().map(|&ranks| (column, ranks)) {
-        let report = input.plan(&with_package(rtx, ranks, package.path())).unwrap();
+        let mut options = with_package(rtx, ranks, package.path());
+        if column == 1 { options.layout.as_mut().unwrap().context_tokens = MIN_CARD_CONTEXT; }
+        let report = input.plan(&options).unwrap();
         eprintln!("muse {rtx} RTX + {ranks} Sparks: fits {} onboard {:?} pool {:?} hints {:?}", report.fits,
             report.onboard_layers, report.memory_layout.as_ref().map(|m| m.pool_tokens),
             report.hints.iter().map(|h| &h.what).collect::<Vec<_>>());
@@ -264,15 +502,13 @@ fn plan_matrix(column: usize) {
             assert_eq!(prefix_bytes, marks * mark_bytes, "host-off marks obey the aggregate byte budget");
             assert!(memory.notes.iter().any(|note|
                 note.contains(&format!("host prefix tier off: retains {marks} exact prefix marks"))));
-            let record_bytes = (cfg.kv_record_bytes() * cfg.full_layers()) as u64 / rtx as u64;
-            let page_rows = crate::families::muse_spark::cache::PAGE_ROWS;
-            let pool_from_ledger = devices.iter().map(|device| {
-                let fixed: u64 = device.items.iter().filter(|item| item.group != "records").map(|item| item.bytes).sum();
-                let context = crate::placement::ArchContext::for_device(cuteafd_core::GpuArch::Sm120, device.capacity_bytes).context_bytes;
-                (device.capacity_bytes - context - fixed) / (record_bytes * page_rows) * page_rows
-            }).min().unwrap().min(cuteafd_core::serving_capacity::DEFAULT_GPU_KV_TOKENS);
-            assert_eq!(memory.pool_tokens, pool_from_ledger, "pool first, derived from the exact ledger");
-            if rtx == 2 { assert_eq!(memory.pool_tokens, 2 << 20); }
+            // The shared pool policy is the only pool rule: 2M on a 96 GiB
+            // card, never below the declared serving context, capped by what
+            // the admission actually fits.
+            assert!(memory.pool_tokens >= if rtx == 1 { MIN_CARD_CONTEXT } else { 1 << 20 });
+            assert!(memory.pool_tokens <= cuteafd_core::serving_capacity::DEFAULT_GPU_KV_TOKENS);
+            if rtx == 2 { assert_eq!(memory.pool_tokens, 2 << 20, "the pooled target, not a fit cap"); }
+            else { assert!(memory.pool_tokens < 1 << 20, "one RTX is fit-capped below the compiled context"); }
         }
         if (rtx, ranks) == (2, 6) {
             assert!(report.fits && report.placement_supported, "{:?}", report.hints);
@@ -280,16 +516,143 @@ fn plan_matrix(column: usize) {
             assert!(memory.pool_tokens >= 1 << 20, "pool {}", memory.pool_tokens);
             // Onboarding stays automatic; pool first decides the count.
             assert!(report.onboard_layers.is_some());
-            assert!(report.solver_placement.as_ref().unwrap().max_pool_tokens_no_onboard >= memory.pool_tokens);
         }
     }
     // The installed inventory supports the serving path at the qualified width.
-    let report = input.plan(&with_layout(column, 6)).unwrap();
+    let mut serving = with_layout(column, 6);
+    if column == 1 { serving.layout.as_mut().unwrap().context_tokens = MIN_CARD_CONTEXT; }
+    let report = input.plan(&serving).unwrap();
     assert_eq!(report.runtime, Some(RuntimeStatus::Serving));
     assert_eq!(report.spark_ranks, 6, "the serving plan preserves the requested Spark width");
     assert!(report.executable() && report.fits && report.placement_supported, "{:?}", report.hints);
     assert!(report.memory_layout.as_ref().unwrap().pool_tokens >= 256 << 10,
         "the executable layout must preserve the agentic context floor");
+}
+
+/// Zero and unset pool select one recipe (the same request, the same prefill
+/// shape), and a pool the checkpoint cannot hold is a typed refusal on both
+/// the direct and the count-admission edges, never a silently clamped plan.
+#[test]
+fn muse_auto_pool_and_count_admission_preserve_one_recipe() {
+    let dir = snapshot(&all_layers());
+    let input = testing::BudgetedPlanInput::open(dir.path()).unwrap();
+    let package = tempfile::tempdir().unwrap();
+    let options = with_package(2, 6, package.path());
+    let unset = input.plan(&options).unwrap();
+    let mut zero = options.clone();
+    zero.layout.as_mut().unwrap().pool_tokens = Some(0);
+    let automatic = input.plan(&zero).unwrap();
+    assert!(automatic.wip_launchable(), "{}", render(&automatic));
+    assert_eq!(automatic.memory_layout.as_ref().unwrap().pool_tokens,
+        unset.memory_layout.as_ref().unwrap().pool_tokens);
+    assert_eq!(automatic.prefill_unit_rows, unset.prefill_unit_rows);
+    zero.layout.as_mut().unwrap().pool_tokens = Some(64);
+    let direct = input.plan(&zero).unwrap();
+    let counted = input.plan_spark_count(&zero, 6, Some(6)).unwrap();
+    assert!(!counted.wip_launchable());
+    assert_eq!(direct.prefill_unit_rows, counted.prefill_unit_rows);
+    for hint in &direct.hints {
+        assert!(counted.hints.iter().any(|other| other.what == hint.what));
+    }
+    assert!(!counted.hints.iter().any(|hint| hint.what.contains("reserve does not fit")), "{:?}", counted.hints);
+}
+
+/// HOST and PINNED share one sampled contract, including lazy retention and
+/// Load-only push owners. A failed host contract is never retried generically.
+#[test]
+fn host_contract_admits_all_phases_and_preserves_host_refusal() {
+    use crate::placement::planner::{Location, Phase};
+    let dir = snapshot(&all_layers());
+    let input = testing::BudgetedPlanInput::open(dir.path()).unwrap();
+    let package = tempfile::tempdir().unwrap();
+    let mut options = with_package(2, 6, package.path());
+    options.layout.as_mut().unwrap().host_cache_bytes = Some((1 << 30) + 123);
+    let report = input.plan(&options).unwrap();
+    assert!(report.fits, "{:?}", report.hints);
+    assert_eq!(report.host_budget_bytes, (1 << 30) + 123);
+    let host = report.host_ledger.as_ref().unwrap();
+    let cfg = crate::families::muse_spark::MuseSparkConfig::from_hf(&input.checkpoint().config).unwrap();
+    let chunk = (256u64 << 20).max(crate::placement::families::muse_spark::mark_bytes(&cfg, 1));
+    assert_eq!(host.host_budget_bytes, ((1u64 << 30) + 123) / chunk * chunk,
+        "only whole retained chunks allocate");
+    for group in ["transport/rdma-rings", "transport/egress", "spark-intake", "token selector"] {
+        assert!(host.items.iter().any(|item| item.group == group), "missing {group}");
+    }
+    let ledger = report.phase_ledger.as_ref().unwrap();
+    let budget = ledger.budgets.iter().find(|budget| budget.id == "host").unwrap();
+    assert_eq!(budget.locations, [Location::HOST, Location::PINNED]);
+    let load = ledger.phases.iter().find(|row| row.budget == "host" && row.phase == Phase::Load).unwrap();
+    assert!(load.owned > 0 && load.opaque >= 4 << 30, "both estimated dense ranks are Load owners");
+    let ready = ledger.phases.iter().find(|row| row.budget == "host" && row.phase == Phase::Ready).unwrap();
+    assert_eq!(ready.owned + ready.opaque, host.deferred_bytes + host.host_budget_bytes);
+    assert_eq!(ready.opaque, 1536 << 20, "census-rounded ordinary host allowance");
+    use crate::placement::planner::{Allocation, Lifetime, PhaseOrder, driver_page_table_bytes};
+    use crate::placement::planner::serving::{ServingOwners, SelectorOwners, HostPrefixOwners};
+    use crate::families::muse_spark::{core::CoreInventory, weight_layout::{LayerLayout, native_mount_load}};
+    use cuteafd_core::memory_layout::Category;
+    let opts = options.layout.as_ref().unwrap();
+    let slots = opts.resolved_state_slots("muse_spark");
+    let prefill = crate::serving_capacity::prefill_waves::PrefillPlan {
+        unit_rows: report.prefill_unit_rows.unwrap(), waves: report.prefill_waves.unwrap(),
+        span_rows: report.prefill_span_rows.unwrap() };
+    let placement = report.solver_placement.as_ref().unwrap();
+    let mut pinned = ServingOwners {
+        selector: SelectorOwners { location: Location::coordinator(1),
+            capacity: crate::families::muse_spark::lane::HEAD_ROWS, vocab: cfg.vocab_size, device_sampling: true },
+        prefix: HostPrefixOwners { quota_bytes: host.host_budget_bytes, chunk_bytes: chunk },
+    }.allocations().unwrap().into_iter().filter(|owner| owner.location == Location::PINNED).collect::<Vec<_>>();
+    let cutoff = crate::families::muse_spark::replies::Cutoff::with_formats(opts.muse_partial_bf16_max_rows,
+        crate::families::muse_spark::replies::DEFAULT_BF16_MAX_ROWS, opts.spark_reply_formats).unwrap();
+    let transport = crate::placement::families::muse_spark::host_transport(&cfg, prefill, cutoff, slots as usize, 6).unwrap();
+    for (id, bytes) in [("rings", transport.rings), ("egress", transport.egress), ("intake", transport.intake)] {
+        pinned.push(Allocation::buffer(id, Location::PINNED, bytes, Lifetime::RESIDENT, Category::Staging, id));
+    }
+    let core = CoreInventory::from_checkpoint(&cfg, input.checkpoint()).unwrap();
+    let layouts = (0..cfg.layers).map(|layer| LayerLayout::ranks(&cfg, layer, 2, &core).unwrap()).collect::<Vec<_>>();
+    for gpu in 0..2 {
+        let mount = native_mount_load(layouts.iter().flat_map(|ranks| ranks[gpu].native.values())).unwrap();
+        pinned.extend(mount.allocations(&format!("muse.native.load.{gpu}")).into_iter()
+            .filter(|owner| owner.location == Location::PINNED));
+    }
+    let catalog = input.expert_catalog().unwrap();
+    let manifest = catalog.exl3().unwrap();
+    let validation = (0..2).map(|gpu| (0..placement.onboard_layers).map(|layer|
+        manifest.residency(crate::V41Exl3Layer::Backbone(layer), 2, gpu).unwrap().loads.iter()
+            .filter(|load| load.tensor.ends_with(".trellis")).count() as u64 * 4).sum()).collect();
+    // Dense staging is an estimated allowance, not a physical pinned root.
+    let push = crate::push_load::PushHostEnvelope::new(validation, vec![0; 2],
+        cuteafd_ffi::push_ring::DEFAULT_SLOTS as u64, cuteafd_ffi::push_ring::DEFAULT_SLOT_BYTES as u64).unwrap();
+    pinned.extend(push.allocations("muse.push").unwrap().into_iter().filter(|owner| owner.location == Location::PINNED));
+    for gpu in 0..2 {
+        let id = format!("rtx{gpu}");
+        let tails = placement.items[gpu].iter().filter(|item| item.group == "allocation granularity")
+            .map(|item| item.bytes).sum::<u64>();
+        for row in ledger.phases.iter().filter(|row| row.budget == id) {
+            let mappings = pinned.iter().filter(|owner| owner.lifetime.contains(row.phase, PhaseOrder::TARGET_THEN_DRAFT))
+                .map(|owner| driver_page_table_bytes(owner.bytes)).sum::<u64>();
+            // The retired opaque runtime constant is replaced by the measured
+            // driver stream slabs (`muse/driver-stream-slabs/gpuN`): the model
+            // stream, the push loader's copy streams and the transient rotary
+            // table builder, four live streams per 2 MiB slab (#1561).
+            let peak_live = 1 + crate::push_load::COPY_STREAMS as u64 + 1;
+            let slabs = crate::placement::planner::cuda_stream_slab_bytes(peak_live).unwrap();
+            assert_eq!(row.opaque, slabs + tails + mappings,
+                "driver stream slabs, target arena tail and physical pinned mappings at {:?}", row.phase);
+        }
+        let ready_mappings = pinned.iter().filter(|owner| owner.lifetime.contains(Phase::Ready, PhaseOrder::TARGET_THEN_DRAFT))
+            .map(|owner| driver_page_table_bytes(owner.bytes)).sum::<u64>();
+        assert_eq!(placement.items[gpu].iter().filter(|item|
+            item.group == cuteafd_core::memory_layout::DRIVER_PAGE_TABLES_GROUP).map(|item| item.bytes).sum::<u64>(), ready_mappings);
+    }
+    options.layout.as_mut().unwrap().host_memory = Some((256 << 30, 28 << 30));
+    let direct = input.plan(&options).unwrap();
+    let counted = input.plan_spark_count(&options, 6, Some(6)).unwrap();
+    assert!(!direct.fits && !counted.fits);
+    assert!(direct.hints.iter().any(|hint| hint.what.contains("host")));
+    for hint in &direct.hints {
+        assert!(counted.hints.iter().any(|other| other.what == hint.what));
+    }
+    assert!(!counted.hints.iter().any(|hint| hint.what.contains("reserve does not fit")));
 }
 
 /// Each Spark's rings carry the shared Muse endpoint: the worst partial reply
@@ -414,11 +777,14 @@ fn missing_package_is_harmless_only_when_memory_onboards_nothing() {
     let broken = tempfile::tempdir().unwrap();
     let manifest = broken.path().join("PROGRAMS.json");
     std::fs::write(&manifest, b"{}").unwrap();
-    // One RTX at the default automatic context: the pool takes the GPU (onboarding 0).
+    // One RTX at the min card's declared context: the pool takes the GPU (onboarding 0).
     let mut one = with_layout(1, 6);
+    one.layout.as_mut().unwrap().context_tokens = MIN_CARD_CONTEXT;
     one.layout.as_mut().unwrap().workspace_manifest = Some(manifest);
     let unpackaged = input.plan(&one).unwrap();
-    let bare = input.plan(&with_layout(1, 6)).unwrap();
+    let mut plain = with_layout(1, 6);
+    plain.layout.as_mut().unwrap().context_tokens = MIN_CARD_CONTEXT;
+    let bare = input.plan(&plain).unwrap();
     assert_eq!(bare.onboard_layers, Some(0), "{:?}", bare.hints);
     assert_eq!(unpackaged.onboard_layers, Some(0), "{:?}", unpackaged.hints);
     // It plans (the manifest only adds the image's loaded-code demand).
@@ -449,12 +815,25 @@ fn drafter_is_charged_on_the_head_gpu_and_must_match_the_target_head() {
     let sms = crate::placement::ArchContext::for_device(cuteafd_core::GpuArch::Sm120, crate::placement::inventory::PRO_TOTAL_BYTES).sms;
     let expected = crate::placement::families::muse_spark::drafter_inventory(&cfg, &config, 16, 16, 202_112,
         u64::from(sms), crate::families::qwen4::Qwen4KvCache::Fp8).unwrap();
-    assert_eq!(group(1), expected.owned + expected.scratch + expected.head_scratch + expected.runtime);
+    let nonweights = expected.owned - expected.weights.0 + expected.scratch + expected.head_scratch + expected.runtime;
+    assert_eq!(group(1), nonweights);
+    let arena = expected.arena(0, 1).unwrap();
+    let arena_bytes = arena.bytes() as u64;
+    let tail = arena_bytes.div_ceil(2 << 20) * (2 << 20) - arena_bytes;
+    let root_bytes = |placement: &crate::placement::Placement, gpu: usize|
+        placement.items[gpu].iter().filter(|item| item.group == "weight arena").map(|item| item.bytes).sum::<u64>();
+    let plain_placed = plain.solver_placement.as_ref().unwrap();
+    assert_eq!(root_bytes(placed, 0), root_bytes(plain_placed, 0));
+    assert_eq!(root_bytes(placed, 1) - root_bytes(plain_placed, 1), arena_bytes);
+    let tails = |placement: &crate::placement::Placement, gpu: usize|
+        placement.items[gpu].iter().filter(|item| item.group == "allocation granularity").map(|item| item.bytes).sum::<u64>();
+    assert_eq!(tails(placed, 1) - tails(plain_placed, 1), tail);
     assert_eq!(expected.runtime, (16 * 8 * 4 + 62 * 64 * 8 * 4) as u64, "draft ids + probe ring");
     assert_eq!(expected.head_scratch, (16 * 8 * (202_112 + 202_048) * 4) as u64);
     assert!(placed.pool_tokens <= plain.solver_placement.as_ref().unwrap().pool_tokens);
     // One RTX cannot reach the pool cap: the exact drafter charge must displace KV pages.
-    let single = with_layout(1, 6);
+    let mut single = with_layout(1, 6);
+    single.layout.as_mut().unwrap().context_tokens = MIN_CARD_CONTEXT;
     let mut single_draft = single.clone();
     single_draft.layout.as_mut().unwrap().muse_drafter_snapshot = Some(drafter.path().to_path_buf());
     let single_plain = input.plan(&single).unwrap();
@@ -463,12 +842,12 @@ fn drafter_is_charged_on_the_head_gpu_and_must_match_the_target_head() {
     let memory = single_plain.memory_layout.as_ref().unwrap();
     let device = memory.devices.iter().find(|device|
         device.kind == cuteafd_core::memory_layout::DeviceKind::Rtx).unwrap();
-    let charged = expected.owned + expected.scratch + expected.head_scratch + expected.runtime;
+    let charged = nonweights + arena_bytes + tail;
     let draft_device = single_drafted.memory_layout.as_ref().unwrap().devices.iter().find(|device|
         device.kind == cuteafd_core::memory_layout::DeviceKind::Rtx).unwrap();
-    assert_eq!(draft_device.items.iter().filter(|item| item.group == "Drafter").map(|item| item.bytes).sum::<u64>(), charged);
+    assert_eq!(draft_device.items.iter().filter(|item| item.group == "Drafter").map(|item| item.bytes).sum::<u64>(), nonweights);
     let fixed = |device: &cuteafd_core::memory_layout::DeviceLayout| device.items.iter()
-        .filter(|item| item.group != "records").map(|item| item.bytes).sum::<u64>();
+        .filter(|item| item.group != "full-layer KV (paged K+V records)").map(|item| item.bytes).sum::<u64>();
     assert_eq!(fixed(draft_device) - fixed(device), charged);
     let page_rows = crate::families::muse_spark::cache::PAGE_ROWS;
     let page_bytes = (cfg.kv_record_bytes() * cfg.full_layers()) as u64 * page_rows;
@@ -486,38 +865,44 @@ fn drafter_is_charged_on_the_head_gpu_and_must_match_the_target_head() {
     std::fs::write(drafter.path().join("config.json"), other.to_string()).unwrap();
     let refused = input.plan(&with_draft).unwrap();
     assert!(refused.hints.iter().any(|h| h.what.contains("softcap/output_multiplier differ")), "{:?}", refused.hints);
+    for window in [serde_json::json!(1024), serde_json::Value::Null] {
+        let mut other = config.clone();
+        other["sliding_window"] = window;
+        std::fs::write(drafter.path().join("config.json"), other.to_string()).unwrap();
+        let refused = input.plan(&with_draft).unwrap();
+        assert!(refused.hints.iter().any(|h| h.what.contains("ring holds 2048")), "{:?}", refused.hints);
+    }
 }
 
+/// An explicitly requested tower with no executable device is a first typed
+/// refusal that names the tower and the requested placement. Auto never lands
+/// here: its domain always closes with the Off option.
 #[test]
-fn media_auto_off_and_explicit_refusals_keep_named_diagnostics() {
-    use crate::plan::encoder::EncoderKind;
+fn explicit_unplaceable_tower_is_refused_by_name() {
     let dir = tempfile::tempdir().unwrap();
     testing::write_muse_media_snapshot(dir.path(), &all_layers());
     let input = testing::BudgetedPlanInput::open(dir.path()).unwrap();
-    let mut options = with_layout(1, 6);
-    // Text fits at a fixed small pool, but neither tower can occupy the absent
-    // second RTX or the deliberately tiny Spark allocation budget.
-    let layout = options.layout.as_mut().unwrap();
-    layout.context_tokens = 4096;
-    layout.pool_tokens = Some(4096);
-    layout.spark_bytes = 1;
-    layout.spark_allocation_budget_bytes = Some(1);
-    let auto = input.plan(&options).unwrap();
-    for (component, encoder) in [(Component::Vision, auto.encoder.as_ref()),
-        (Component::Audio, auto.audio_encoder.as_ref())] {
-        // If even the text pool is refused, both explicit ownership diagnostics
-        // must still survive. Auto fallback itself is covered below.
-        assert!(encoder.is_some(), "{component:?}: {:?}", auto.hints);
-    }
-    options.vision = MediaMode::Rtx(Some(8));
-    options.audio = MediaMode::Spark(Some(8));
-    let refused = input.plan(&options).unwrap();
-    assert!(!refused.fits && !refused.placement_supported);
-    for encoder in [refused.encoder.as_ref(), refused.audio_encoder.as_ref()] {
-        let encoder = encoder.expect("media refusal has an ownership diagnostic");
-        assert_eq!(encoder.kind, EncoderKind::Off);
-        assert!(encoder.reason.contains("refused"));
-    }
+    let case = |vision: MediaMode, audio: MediaMode| {
+        let mut options = with_layout(1, 6);
+        let layout = options.layout.as_mut().unwrap();
+        layout.context_tokens = 4096;
+        layout.pool_tokens = Some(4096);
+        options.vision = vision;
+        options.audio = audio;
+        input.plan(&options).unwrap()
+    };
+    // Eight vision replicas cannot exist on one RTX; a rank-8 audio copy cannot
+    // exist across six Sparks.
+    let refused = case(MediaMode::Rtx(Some(8)), MediaMode::Off);
+    assert!(!refused.fits && !refused.placement_supported, "{:?}", refused.hints);
+    assert!(refused.encoder.as_ref().unwrap().reason.contains("not admitted"));
+    assert!(refused.audio_encoder.as_ref().unwrap().reason.contains("not admitted"));
+    assert!(refused.hints.iter().any(|hint| hint.what
+        .contains("requested vision tower (Rtx(Some(8))) has no executable device")), "{:?}", refused.hints);
+    let refused = case(MediaMode::Off, MediaMode::Spark(Some(8)));
+    assert!(!refused.fits && !refused.placement_supported, "{:?}", refused.hints);
+    assert!(refused.hints.iter().any(|hint| hint.what
+        .contains("requested audio tower (Spark(Some(8))) has no executable device")), "{:?}", refused.hints);
 }
 
 #[test]
@@ -553,15 +938,8 @@ fn media_auto_off_disables_component_bytes() {
     assert!(off.fits, "{:?}", off.hints);
     assert_eq!(off.encoder.as_ref().unwrap().kind, crate::plan::encoder::EncoderKind::Off);
     assert_eq!(off.audio_encoder.as_ref().unwrap().kind, crate::plan::encoder::EncoderKind::Off);
-    assert!(off.encoder.as_ref().unwrap().shortfall > 0, "{:?}", off.encoder);
-    assert!(off.audio_encoder.as_ref().unwrap().shortfall > 0, "{:?}", off.audio_encoder);
     assert_eq!(off.memory_layout.as_ref().unwrap().pool_tokens, 4096);
     assert!(plan::render(&off).contains("Muse axial/window attention"));
-    options.vision = MediaMode::Rtx(Some(0));
-    options.audio = MediaMode::Off;
-    let refused = input.plan(&options).unwrap();
-    assert!(!refused.fits);
-    assert!(refused.encoder.as_ref().unwrap().shortfall > 0, "{:?}", refused.encoder);
     assert!(off.disabled_media_bytes > 0, "{:?}", off.hints);
     for component in [Component::Vision, Component::Audio] {
         let component = off.components.iter().find(|c| c.component == component).unwrap();
@@ -616,18 +994,18 @@ fn host_transport_uses_resolved_small_and_large_card_slots_only() {
     for (bytes, slots) in [(32 << 30, 8), (crate::placement::inventory::PRO_TOTAL_BYTES, 16)] {
         let mut options = with_layout(1, 6);
         options.layout.as_mut().unwrap().rtx_bytes = vec![bytes];
-        options.layout.as_mut().unwrap().context_tokens = 4096;
-        options.layout.as_mut().unwrap().pool_tokens = Some(4096);
+        options.layout.as_mut().unwrap().context_tokens = 1024;
+        options.layout.as_mut().unwrap().pool_tokens = Some(1024);
         let report = input.plan(&options).unwrap();
         let opts = options.layout.as_ref().unwrap();
         assert_eq!(opts.resolved_state_slots("muse_spark"), slots);
         let unit_rows = report.prefill_unit_rows.unwrap();
         let waves = report.prefill_waves.unwrap();
         let shape = crate::serving_capacity::prefill_waves::PrefillPlan { unit_rows, waves, span_rows: unit_rows * waves };
-        let cutoff = crate::families::muse_spark::replies::Cutoff::with_wide(opts.muse_partial_bf16_max_rows,
-            crate::families::muse_spark::replies::DEFAULT_BF16_MAX_ROWS, opts.resolved_spark_reply_format(true).into()).unwrap();
+        let cutoff = crate::families::muse_spark::replies::Cutoff::with_formats(opts.muse_partial_bf16_max_rows,
+            crate::families::muse_spark::replies::DEFAULT_BF16_MAX_ROWS, opts.spark_reply_formats).unwrap();
         let expected = crate::placement::families::muse_spark::host_transport(&cfg, shape, cutoff, slots as usize, 6).unwrap();
-        let host = report.host_ledger.as_ref().unwrap();
+        let host = report.host_ledger.as_ref().unwrap_or_else(|| panic!("{bytes} B card: {:?}", report.hints));
         for (name, bytes) in [("transport/rdma-rings", expected.rings), ("transport/egress", expected.egress),
             ("spark-intake", expected.intake)] {
             assert_eq!(host.items.iter().find(|item| item.group == name).unwrap().bytes, bytes, "{name}");

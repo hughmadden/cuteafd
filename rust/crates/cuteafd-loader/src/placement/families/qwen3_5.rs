@@ -1,10 +1,12 @@
-//! Dense hybrid Qwen admission. Every byte is future to the supplied baseline;
-//! the executor supplies native packed sizes and exported workspace costs.
+//! Dense hybrid Qwen admission. The executor supplies native packed sizes and
+//! exported workspace costs; `admission` declares them as shared-planner facts.
 use crate::families::{qwen::HybridAttention, qwen3_5::Qwen35Config};
 use crate::placement::*;
 use anyhow::{ensure, Result};
 use cuteafd_core::DType;
-use cuteafd_core::memory_layout::{Basis, Category};
+
+mod admission;
+pub use admission::{DenseFacts, ServingFacts, admit, forecast_budgets, sampled_budgets};
 
 pub const PAGE_ROWS: u64 = 64;
 const WHOLE: LayerMode = LayerMode::Whole { gpu: 0, ffn: FfnMode::Owner };
@@ -12,27 +14,47 @@ const WHOLE: LayerMode = LayerMode::Whole { gpu: 0, ffn: FfnMode::Owner };
 pub const SINGLE: ExecutorModes = ExecutorModes { family: "qwen3_5", modes: &[WHOLE],
     hops: false, attention: AttentionPlacement::Heads };
 
-#[derive(Debug, Clone, Copy)]
-pub struct LayerBytes {
-    pub weights: u64,
-    /// Active recurrence and convolution slots, excluding retained prefix marks.
-    pub state: u64,
-    pub replay: u64,
-    pub prefix: u64,
-}
-
 /// Drafter-owned allocations, excluding the target embedding and vocabulary head.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct DrafterBytes {
     pub owned: u64,
+    pub weights: ResidentWeights,
+    /// The independently retired runtime arena; payload stays separate for workspace subtraction.
+    pub weight_arena: Option<(&'static str, u64)>,
     pub scratch: u64,
-    /// Full-context draft K/V per target pool page, not per sequence/context.
-    pub pool_unit: u64,
+    /// Per target-pool-page bytes of every shared-pool KV backing, one entry per
+    /// cudaMalloc the drafter keeps: dSpark's two planes of every layer, or
+    /// native MTP's records and hidden sidecars.
+    pub pools: Vec<u64>,
+    /// Exact device requests behind the retained draft workspace (pool-independent).
+    pub workspace_requests: Vec<u64>,
+    /// The paged draft page table, its own device request.
+    pub page_table_bytes: u64,
+    /// The pinned D2H landing row retained by the draft workspace.
+    pub landing: u64,
+    /// Pinned ordered-H2D staging retained per drafter destination from its
+    /// first upload; sized to the destination's whole extent.
+    pub staging: Vec<(&'static str, u64)>,
+    /// All wanted checkpoint tensors coexist in the prefetch HashMap at DraftLoad.
+    pub host_prefetch: u64,
+    /// Block dSpark prepares a GEMM head; native MTP borrows the target projection.
+    pub gemm_head: bool,
 }
 
 impl DrafterBytes {
     /// Native MTP owns one dense block, bounded hidden/logit planes and pooled KV sidecars.
     pub fn native_mtp(checkpoint: &crate::plan::checkpoint::Checkpoint, cfg: &Qwen35Config) -> anyhow::Result<Self> {
+        use crate::families::qwen3_5::weight_layout::{mtp_arena, DenseFormat};
+        let format = if checkpoint.tensors.iter().any(|t|
+            t.meta.name == "mtp.layers.0.mlp.gate_proj.weight" && t.meta.dtype == DType::F8E4M3) {
+            DenseFormat::Fp8
+        } else { DenseFormat::Bf16 };
+        let arena = mtp_arena(checkpoint, cfg, format)?;
+        Ok(Self { weight_arena: Some(("qwen3_5/mtp/gpu0", arena.bytes() as u64)),
+            ..Self::native_mtp_payload(checkpoint, cfg)? })
+    }
+
+    pub(crate) fn native_mtp_payload(checkpoint: &crate::plan::checkpoint::Checkpoint, cfg: &Qwen35Config) -> anyhow::Result<Self> {
         use anyhow::Context;
         ensure!(cfg.mtp_layers == 1, "dense MTP requires one checkpoint-native layer");
         let tensor = |name: &str| checkpoint.tensors.iter().find(|t| t.meta.name == name)
@@ -69,107 +91,109 @@ impl DrafterBytes {
             ensure!(value.dtype == DType::Bf16 && value.shape == shape, "{full}: native MTP shape/dtype differs");
             owned += value.byte_length.max(256);
         }
-        owned += ((64 * 2 + 4096) * cfg.hidden * 2 + 64 * cfg.vocab * 4) as u64;
-        // The independent greedy selector owns one ID/status/log-probability row.
-        owned += 12;
+        let weights = ResidentWeights(owned);
+        // The MTP workspace is three device rows (concat, hidden, logits), and
+        // the independent greedy selector owns one ID/status/log-probability
+        // row; every one is its own cudaMalloc in `Mtp::load`.
+        let workspace_requests = vec![((64 * 2) * cfg.hidden * 2) as u64,
+            (4096 * cfg.hidden * 2) as u64, (64 * cfg.vocab * 4) as u64, 12];
+        owned += workspace_requests.iter().sum::<u64>();
         let record = crate::families::qwen4::Qwen4KvCache::Bf16.record_bytes(cfg.kv_heads, cfg.head_dim);
-        Ok(Self { owned, scratch: 0, pool_unit: (64 * record + cfg.hidden * 2) as u64 })
+        Ok(Self { owned, weights, weight_arena: None, scratch: 0,
+            pools: vec![(64 * record) as u64, (cfg.hidden * 2) as u64],
+            workspace_requests, page_table_bytes: 0, landing: 0, staging: vec![],
+            host_prefetch: 0, gemm_head: false })
     }
 
-    pub fn block_dspark(config: &serde_json::Value, slots: usize, sms: u64, context: usize)
+    pub fn block_dspark(snapshot: &std::path::Path, config: &serde_json::Value, slots: usize, sms: u64, context: usize)
         -> anyhow::Result<Self> {
         use crate::families::glm5::draft_representation::{block_dspark_paged_resident_bytes, GlmDraftRepresentation};
         use crate::families::qwen4::Qwen4KvCache;
-        let cfg = crate::formats::block_dspark::BlockDsparkConfig::from_json(config)?;
-        ensure!(cfg.window.is_none(), "dense dSpark requires full-context cache");
-        let layout = cfg.paged_cache_layout(slots, context, PAGE_ROWS as usize, Qwen4KvCache::Bf16)?;
-        let (owned, scratch) = block_dspark_paged_resident_bytes(config, slots, slots, sms,
+        let model = crate::formats::block_dspark::BlockDsparkConfig::from_json(config)?;
+        ensure!(model.window.is_none(), "dense dSpark requires full-context cache");
+        let layout = model.paged_cache_layout(slots, context, PAGE_ROWS as usize, Qwen4KvCache::Bf16)?;
+        let residency = block_dspark_paged_resident_bytes(config, slots, slots, sms,
             GlmDraftRepresentation::Bf16Only, 0, context, PAGE_ROWS as usize, Qwen4KvCache::Bf16)?;
-        Ok(Self { owned: owned.checked_sub(layout.full_bytes).ok_or_else(|| anyhow::anyhow!("draft inventory underflow"))?,
-            scratch, pool_unit: layout.full_bytes })
-    }
-
-    fn movable(self) -> Result<Movable, PlacementError> {
-        crate::placement::draft::DrafterDemand::local(MovableId::Drafter, vec![Bytes2 { resident: self.owned, staging: 0 },
-            Bytes2 { resident: self.scratch, staging: 0 }], 0).movable(1)
+        let host_prefetch = crate::read_safetensors_metadata(&snapshot.join("model.safetensors"))?.iter()
+            .filter(|tensor| tensor.name != "embed_tokens.weight" && tensor.name != "lm_head.weight")
+            .try_fold(0u64, |bytes, tensor| bytes.checked_add(tensor.byte_length))
+            .ok_or_else(|| anyhow::anyhow!("drafter prefetch bytes overflow"))?;
+        let arena = crate::serving_capacity::WeightArenaLayout::new("qwen3_5/dspark/gpu0",
+            crate::formats::block_dspark::block_dspark_arena_requests(snapshot, GlmDraftRepresentation::Bf16Only)?)?;
+        ensure!(arena.payload_bytes() as u64 == residency.weights.0, "dense dSpark arena differs from weight payload");
+        // Every retained device owner behind the shared inventory, in the order
+        // the live drafter allocates it. The sum is asserted against the shared
+        // residency formula so the plan and the executor cannot drift.
+        let requests = dspark_requests(&model, slots)?;
+        let workspace: u64 = requests.iter().try_fold(0u64, |sum, &bytes| sum.checked_add(bytes))
+            .ok_or_else(|| anyhow::anyhow!("draft workspace request overflow"))?;
+        let ring = layout.layer_bytes.first().copied().unwrap_or(0) as u64 / 2;
+        let pools = vec![ring; layout.layer_bytes.len().checked_mul(2)
+            .ok_or_else(|| anyhow::anyhow!("draft ring count overflow"))?];
+        ensure!(pools.iter().try_fold(0u64, |sum, &unit| sum.checked_add(unit)) == Some(layout.full_bytes),
+            "dense dSpark rings differ from the shared pool extent");
+        let rows = slots.checked_mul(model.block).ok_or_else(|| anyhow::anyhow!("draft row overflow"))? as u64;
+        let tables = layout.page_table_bytes.max(256);
+        let total = residency.owned.checked_sub(residency.weights.0)
+            .and_then(|bytes| bytes.checked_sub(layout.full_bytes))
+            .ok_or_else(|| anyhow::anyhow!("draft inventory underflow"))?;
+        ensure!(workspace.checked_add(tables) == Some(total),
+            "dense dSpark workspace differs from the shared residency inventory");
+        Ok(Self { owned: residency.owned.checked_sub(layout.full_bytes).ok_or_else(|| anyhow::anyhow!("draft inventory underflow"))?,
+            weights: residency.weights, weight_arena: Some(("qwen3_5/dspark/gpu0", arena.bytes() as u64)),
+            scratch: residency.scratch, pools,
+            workspace_requests: requests, page_table_bytes: tables, landing: rows * 8,
+            // The serving draft path uploads these destinations through
+            // copy_h2d_ordered, which sizes each retained pinned staging to
+            // dst.bytes on its first upload.
+            staging: vec![("draft.staging.page-table", tables), ("draft.staging.positions", rows * 8),
+                ("draft.staging.tables", 3 * slots as u64 * 4), ("draft.staging.anchors", slots as u64 * 4),
+                ("draft.staging.context-positions", 2048 * 8),
+                ("draft.staging.context-slots", 2048 * 4),
+                ("draft.staging.h", rows * model.hidden as u64 * 2),
+                ("draft.staging.taps", 2048 * model.taps.len() as u64 * model.hidden as u64 * 2)],
+            host_prefetch, gemm_head: true })
     }
 }
 
-pub struct DenseInputs<'a> {
-    pub cfg: &'a Qwen35Config,
-    pub gpu: GpuBudget,
-    pub layers: &'a [LayerBytes],
-    /// Embedding, head, native norm, workspaces, graphs and pending loaded code.
-    /// Callers retain the categories and names of their actual allocations.
-    pub fixed: Vec<Demand>,
-    pub drafter: Option<DrafterBytes>,
-    pub requested_pool: Option<u64>,
-    pub max_context: u64,
-    /// Checkpoint/export-native K|V record width (BF16 initially, native FP8 later).
-    pub record_bytes: u64,
-    pub pool_overhead: u64,
-    pub pool_bounded: Vec<BoundedDemand>,
-}
-
-pub fn request(mut inputs: DenseInputs<'_>) -> Result<PlacementRequest> {
-    ensure!(!inputs.cfg.attention.is_empty() && inputs.layers.len() == inputs.cfg.attention.len(),
-        "dense Qwen layer byte inventory differs from checkpoint");
-    ensure!(inputs.record_bytes > 0 && inputs.max_context > 0, "invalid dense Qwen cache geometry");
-    ensure!(inputs.fixed.iter().all(|item| item.gpu == 0)
-        && inputs.pool_bounded.iter().all(|item| item.gpu == 0),
-        "single-device dense Qwen demand names a peer");
-    if let Some(draft) = inputs.drafter.filter(|draft| draft.pool_unit > 0) {
-        inputs.pool_bounded.push(BoundedDemand { gpu: 0, category: Category::Drafter,
-            group: "full-context dSpark KV".into(), bytes_per_unit: draft.pool_unit,
-            offset_units: 0, cap_units: u64::MAX, basis: Basis::Exact });
+/// The retained draft workspace requests, exactly as `DsparkDrafter::load_paged_with`
+/// and `DsparkDrafter::workspace` allocate them. The paged page table is a
+/// separate owner and not part of this list.
+fn dspark_requests(model: &crate::formats::block_dspark::BlockDsparkConfig, slots: usize) -> anyhow::Result<Vec<u64>> {
+    const TAP_ROWS: u64 = 2048;
+    let (h, inter) = (model.hidden as u64, model.intermediate as u64);
+    let q = (model.heads * model.head_dim) as u64;
+    let kv = (model.kv_heads * model.head_dim) as u64;
+    let taps = model.taps.len() as u64;
+    let rows = (slots as u64).checked_mul(model.block as u64).ok_or_else(|| anyhow::anyhow!("draft row overflow"))?;
+    let sequences = slots as u64;
+    let overflow = || anyhow::anyhow!("draft workspace overflow");
+    let term = |a: u64, b: u64, c: u64| a.checked_mul(b).and_then(|n| n.checked_mul(c))
+        .map(|bytes| bytes.max(256)).ok_or_else(overflow);
+    let mut requests = vec![HEAD_WORKSPACE as u64];
+    // The TAP_ROWS context-update buffers allocated with the drafter.
+    for bytes in [term(TAP_ROWS, taps * h, 2)?, term(TAP_ROWS, h, 2)?, term(TAP_ROWS, h, 2)?,
+        term(TAP_ROWS, 2 * kv, 2)?, term(TAP_ROWS, 8, 1)?, term(TAP_ROWS, 4, 1)?] {
+        requests.push(bytes);
     }
-    let layers = inputs.cfg.attention.iter().zip(inputs.layers).map(|(&kind, bytes)| {
-        ensure!(bytes.weights > 0, "dense Qwen layer has no native weight admission");
-        let mut extra = Vec::new();
-        let kv = match kind {
-            HybridAttention::Gdn => {
-                ensure!(bytes.state > 0 && bytes.replay > 0, "dense GDN lacks exact state/replay admission");
-                for (category, group, value) in [(Category::Kv, "GDN state", bytes.state),
-                    (Category::Workspace, "GDN replay", bytes.replay),
-                    (Category::Prefix, "GDN exact marks", bytes.prefix)] {
-                    extra.push(LayerExtraDemand::new(category, group, value, LayerResidency::Owner, Basis::Exact));
-                }
-                0
-            }
-            HybridAttention::Full => {
-                ensure!(bytes.state == 0 && bytes.replay == 0 && bytes.prefix == 0,
-                    "full GQA must not carry fabricated recurrent state");
-                inputs.record_bytes.checked_mul(PAGE_ROWS).ok_or_else(|| anyhow::anyhow!("dense KV unit size overflow"))?
-            }
-        };
-        Ok(LayerDemand { kind: if kind == HybridAttention::Gdn { AttentionClass::Gdn } else { AttentionClass::Gqa },
-            weights: ModeBytes { whole: bytes.weights, ..Default::default() },
-            kv_unit: KvDemand { unit_bytes_whole: kv, ..Default::default() },
-            fixed_bytes: ModeBytes::default(), extra, context_indexer: false, colocate: None,
-            experts: None, modes: vec![WHOLE] })
-    }).collect::<Result<_>>()?;
-    Ok(PlacementRequest { expert_tier: None,
-        inventory: Inventory { gpus: vec![inputs.gpu], spark_ranks: 0, peer_access: false },
-        attention_placement: None, context_buffers: ContextBuffers::default(),
-        layers_first_gpu: 0,
-        pool: PoolPolicy::resolve(&[inputs.gpu.capacity_bytes], inputs.max_context,
-            inputs.requested_pool, PAGE_ROWS, true),
-        layers, pool_overhead: vec![inputs.pool_overhead], pool_bounded: inputs.pool_bounded,
-        fixed: inputs.fixed, startup: Vec::new(), movables: inputs.drafter.map(DrafterBytes::movable).transpose()?.into_iter().collect(),
-        expert_workspace: 0, tp2_workspace: [0; 2],
-        onboard: Onboard::Auto, expert_gpus: 0, minimum_expert_layers: 0,
-        policy: LayerPolicy { default: vec![WHOLE], ..Default::default() },
-        hops: HopSpec { storage: HopStorage::ReceiveSlots, row_bytes: inputs.cfg.hidden as u64 * 2,
-            rows: 0, lanes: 0, entry_gpu: 0, head_gpu: 0, terminal: TerminalHome::AttentionOwner },
-        executor: SINGLE,
-    })
+    // The `workspace()` allocation order, each owner `.max(256)`.
+    for bytes in [term(rows, h, 2)?, term(rows, h, 2)?, term(rows, q + 2 * kv, 2)?, term(rows, q, 2)?,
+        term(rows, kv, 2)?, term(rows, kv, 2)?, term(rows, q, 2)?, term(rows, h, 2)?, term(rows, 2 * inter, 2)?,
+        term(rows, inter, 2)?, term(rows, model.vocab as u64, 4)?, term(sequences, 4, 1)?, term(rows, 4, 1)?,
+        term(rows, 4, 1)?, term(rows, 4, 1)?, term(rows, 8, 1)?, term(sequences, 12, 1)?] {
+        requests.push(bytes);
+    }
+    requests.push(sequences.checked_mul(296 * 8).and_then(|n| n.checked_add(rows * 4))
+        .map(|bytes| bytes.max(256)).ok_or_else(overflow)?);
+    Ok(requests)
 }
 
-/// Native admission uses the same solver in offline planning and device startup.
-pub fn placement(inputs: DenseInputs<'_>) -> Result<Placement> {
-    let result = solve(&request(inputs)?)?;
-    SINGLE.check(&result)?;
-    Ok(result)
+/// Geometry shared by offline admission and the live exact-prefix adapter.
+pub fn host_prefix_geometry(cfg: &Qwen35Config, record_bytes: u64, mark_bytes: u64)
+    -> cuteafd_core::prefix::HostCacheGeometry {
+    let full = cfg.attention.iter().filter(|&&kind| kind == HybridAttention::Full).count() as u64;
+    cuteafd_core::prefix::HostCacheGeometry { unit_rows: PAGE_ROWS,
+        page_bytes: PAGE_ROWS * full * record_bytes, mark_bytes, draft_bytes: 0 }
 }
 
 pub const PREFILL_ROWS: usize = 4096;
@@ -177,7 +201,7 @@ pub const VERIFY_ROWS: usize = 64;
 pub const HEAD_WORKSPACE: usize = 4 << 20;
 
 /// Exact allocation recipe, excluding checkpoint weights and the KV pool.
-/// Dense execution currently launches directly; it captures no CUDA graphs.
+/// The separately admitted driver graph reserve is not a native allocation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NativeBuffers {
     pub planes: [usize; 13],
@@ -222,17 +246,6 @@ impl NativeBuffers {
             verify: [mark_bytes.checked_mul(slots).ok_or_else(|| anyhow::anyhow!("dense verify mark overflow"))?.max(256),
                 VERIFY_ROWS * cfg.vocab * 4, cfg.attention.len() * VERIFY_ROWS * cfg.hidden * 2],
             prefix: marks.checked_mul(mark_bytes).ok_or_else(|| anyhow::anyhow!("dense prefix overflow"))?, mark_bytes, marks })
-    }
-
-    pub fn fixed(&self) -> Vec<Demand> {
-        [(Category::Workspace, "native step planes and scratch", self.planes.iter().sum()),
-            (Category::Workspace, "vocabulary head workspace", self.head),
-            (Category::Workspace, "logits", self.logits), (Category::Workspace, "token ids", self.ids),
-            (Category::Workspace, "GDN commit table", self.commit),
-            (Category::Prefix, "exact retained prefix marks", self.prefix),
-            (Category::Workspace, "block verify marks, logits and taps", self.verify.iter().sum()),
-            (Category::Runtime, "head and runtime growth", 512 << 20)]
-            .into_iter().map(|(category, group, bytes)| Demand::new(0, category, group, bytes as u64, Basis::Exact)).collect()
     }
 }
 
@@ -311,17 +324,6 @@ impl NativeWeights {
         let embedding = bytes("model.language_model.embed_tokens.weight", false, false)?;
         Ok(Self { layers, norm: bytes("model.language_model.norm.weight", false, false)?.max(256),
             head: bytes(if cfg.tied_embeddings { "model.language_model.embed_tokens.weight" } else { "lm_head.weight" }, false, false)?.max(256), embedding })
-    }
-
-    pub fn demands(&self, cfg: &Qwen35Config, buffers: &NativeBuffers, slots: usize) -> (Vec<LayerBytes>, Vec<Demand>) {
-        let layers = cfg.attention.iter().zip(&self.layers).map(|(&kind, &weights)| LayerBytes { weights,
-            state: if kind == HybridAttention::Gdn { (buffers.state_per_layer * slots) as u64 } else { 0 },
-            replay: if kind == HybridAttention::Gdn { buffers.replay_per_layer as u64 } else { 0 }, prefix: 0 }).collect();
-        let mut fixed = buffers.fixed();
-        fixed.extend([(Category::Embedding, "token embedding", self.embedding),
-            (Category::Weights, "final norm", self.norm), (Category::Weights, "vocabulary head", self.head)]
-            .into_iter().map(|(category, group, bytes)| Demand::new(0, category, group, bytes, Basis::Exact)));
-        (layers, fixed)
     }
 }
 
@@ -527,19 +529,11 @@ mod tests {
             rms_norm_eps: 1e-6, max_context: 262144, mtp_layers: 0, tied_embeddings: false }
     }
 
-    fn inputs<'a>(cfg: &'a Qwen35Config, layers: &'a [LayerBytes], scratch: u64) -> DenseInputs<'a> {
-        DenseInputs { cfg, layers, gpu: GpuBudget { capacity_bytes: 96 << 30, headroom_bytes: 1 << 30,
-            baseline: Baseline::Measured { free_bytes: 14 << 30 } },
-            fixed: vec![Demand::new(0, Category::Workspace, "native AOT scratch", scratch, Basis::Exact)],
-            drafter: None, requested_pool: None, max_context: 262144, record_bytes: 4096,
-            pool_overhead: 4, pool_bounded: Vec::new() }
-    }
-
     #[test]
     fn native_fp8_header_inventory_charges_scales_and_keeps_bf16_gates() -> Result<()> {
         use crate::plan::checkpoint::{Checkpoint, CheckpointTensor};
         let cfg = cfg();
-        let mut checkpoint = Checkpoint { snapshot: Default::default(), config: serde_json::json!({}),
+        let mut checkpoint = Checkpoint { view: None, snapshot: Default::default(), config: serde_json::json!({}),
             quantize_config: None, weight_map: Default::default(), tensors: vec![], missing_shards: vec![], shard_bytes: 0 };
         let mut add = |name: String, dtype, shape: Vec<usize>, byte_length| checkpoint.tensors.push(CheckpointTensor {
             shard: "model.safetensors".into(), meta: crate::SafetensorsTensorMetadata {
@@ -613,83 +607,5 @@ mod tests {
             }
         }
         Ok(())
-    }
-
-    #[test]
-    fn native_scratch_and_exact_marks_are_charged_before_dense_pool() -> Result<()> {
-        let cfg = cfg();
-        let layers = [LayerBytes { weights: 1 << 30, state: 1 << 20, replay: 1 << 20, prefix: 2 << 20 },
-            LayerBytes { weights: 1 << 30, state: 0, replay: 0, prefix: 0 }];
-        let req = request(inputs(&cfg, &layers, 2 << 30))?;
-        assert!(req.layers.iter().all(|layer| layer.experts.is_none()));
-        assert_eq!(req.layers[0].kv_unit.unit_bytes_whole, 0);
-        assert_eq!(req.layers[1].kv_unit.unit_bytes_whole, 64 * 4096);
-        let base = solve(&req)?;
-        assert!(base.layers.iter().all(|layer| layer.experts == ExpertHome::Dense));
-        assert_eq!(base.pool_tokens, 2 << 20);
-        let constrained = solve(&request(inputs(&cfg, &layers, 5 << 30))?)?;
-        assert!(constrained.pool_tokens < base.pool_tokens && constrained.pool_tokens >= 262144);
-        assert!(constrained.items[0].iter().any(|item| item.group == "native AOT scratch" && item.bytes == 5 << 30));
-        let mut explicit = inputs(&cfg, &layers, 5 << 30);
-        explicit.requested_pool = Some(2 << 20);
-        assert!(solve(&request(explicit)?).is_err());
-        Ok(())
-    }
-
-    #[test]
-    fn drafter_owned_and_scratch_are_charged_once_before_pool_admission() -> Result<()> {
-        let cfg = cfg();
-        let layers = [LayerBytes { weights: 1 << 30, state: 1 << 20, replay: 1 << 20, prefix: 0 },
-            LayerBytes { weights: 1 << 30, state: 0, replay: 0, prefix: 0 }];
-        let base = solve(&request(inputs(&cfg, &layers, 2 << 30))?)?;
-        let mut with_draft = inputs(&cfg, &layers, 2 << 30);
-        with_draft.drafter = Some(DrafterBytes { owned: 3 << 30, scratch: 1 << 30, ..Default::default() });
-        let placement = solve(&request(with_draft)?)?;
-        assert_eq!(placement.movables, [(MovableId::Drafter, 0)]);
-        assert!(placement.pool_tokens < base.pool_tokens && placement.pool_tokens >= 262144);
-        let charged: u64 = placement.items[0].iter().filter(|item| item.category == Category::Drafter)
-            .map(|item| item.bytes).sum();
-        assert_eq!(charged, 4 << 30);
-        let mut explicit = inputs(&cfg, &layers, 2 << 30);
-        explicit.drafter = Some(DrafterBytes { owned: 3 << 30, scratch: 1 << 30, ..Default::default() });
-        explicit.requested_pool = Some(base.pool_tokens);
-        assert!(solve(&request(explicit)?).is_err());
-        let mut overflow = inputs(&cfg, &layers, 0);
-        overflow.drafter = Some(DrafterBytes { owned: u64::MAX, scratch: 1, ..Default::default() });
-        assert!(solve(&request(overflow)?).is_err());
-        Ok(())
-    }
-
-    #[test]
-    fn full_context_drafter_kv_tracks_aggregate_pool_pages() -> Result<()> {
-        let cfg = cfg();
-        let layers = [LayerBytes { weights: 1 << 30, state: 1 << 20, replay: 1 << 20, prefix: 0 },
-            LayerBytes { weights: 1 << 30, state: 0, replay: 0, prefix: 0 }];
-        for tokens in [262144, 524288] {
-            let mut input = inputs(&cfg, &layers, 0);
-            input.gpu.capacity_bytes = 32 << 30;
-            input.gpu.baseline = Baseline::Measured { free_bytes: 32 << 30 };
-            input.requested_pool = Some(tokens);
-            input.drafter = Some(DrafterBytes { owned: 1 << 30, scratch: 1 << 20, pool_unit: 64 * 20480 });
-            let req = request(input)?;
-            assert_eq!(req.pool_bounded.len(), 1);
-            assert_eq!(req.pool_bounded[0].bytes(tokens / PAGE_ROWS)?, tokens * 20480);
-            let placement = solve(&req)?;
-            assert_eq!(placement.pool_tokens, tokens);
-            let charged: u64 = placement.items[0].iter().filter(|item| item.category == Category::Drafter)
-                .map(|item| item.bytes).sum();
-            assert_eq!(charged, (1 << 30) + (1 << 20) + tokens * 20480);
-        }
-        Ok(())
-    }
-
-    #[test]
-    fn admission_rejects_missing_or_fabricated_layer_costs() {
-        let cfg = cfg();
-        assert!(request(inputs(&cfg, &[], 1)).is_err());
-        let layers = [LayerBytes { weights: 1, state: 1, replay: 0, prefix: 0 }; 2];
-        assert!(request(inputs(&cfg, &layers, 1)).is_err());
-        let layers = [LayerBytes { weights: 1, state: 1, replay: 1, prefix: 0 }; 2];
-        assert!(request(inputs(&cfg, &layers, 1)).is_err());
     }
 }

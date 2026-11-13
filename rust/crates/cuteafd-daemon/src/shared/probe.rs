@@ -13,6 +13,16 @@ pub(crate) mod features;
 
 pub(crate) type ProbeRef = Option<Arc<Probe>>;
 
+/// Activate each adapter only after its paired raw-row and ordinary-layout proof.
+/// Remove this temporary allowlist with the final FULL_PREFILL_LOGITS deletion.
+pub(crate) fn streamed_prefill_scoring(family: &str) -> bool {
+    matches!(family, "glm5_flash" | "qwen4" | "qwen3_5" | "mimo_v2" | "deepseek_v4" | "step5" | "muse_spark" | "glm5" | "mistral_large4")
+}
+
+pub(crate) fn prefill_scoring_admitted(family: &str, full_prefill_logits: bool) -> bool {
+    full_prefill_logits || streamed_prefill_scoring(family)
+}
+
 pub(crate) fn image_echo(job: &cuteafd_api::openai::NativeRequest, spans: &[cuteafd_core::MediaSpan]) -> Result<()> {
     if let Some(probe) = &job.probe {
         anyhow::ensure!(spans.len() == job.media.len(), "probe image count differs");
@@ -90,15 +100,48 @@ pub(crate) fn image_spans(spec: &cuteafd_api::openai::probe::ProbeSpec, tokens: 
     Ok(spans)
 }
 
-/// Adds cumulative capture counts and site deltas since the last stats publication.
+/// Preserve the joined scheduler boundary independently of HTTP stats sampling.
+pub(crate) fn first_request(once: &std::sync::Once, completed: u64, capture: impl FnOnce()) {
+    if completed > 0 { once.call_once(capture); }
+}
+
+#[cfg(test)]
+mod first_request_tests {
+    #[test]
+    fn reconciliation_fires_once_at_the_completed_request_boundary_not_on_fetch() {
+        let once = std::sync::Once::new();
+        let calls = std::cell::Cell::new(0);
+        for completed in [0, 0, 1, 1, 2, 5] {
+            super::first_request(&once, completed, || calls.set(calls.get() + 1));
+            assert_eq!(calls.get(), usize::from(completed > 0));
+        }
+        for source in [include_str!("../families/glm5/serve.rs"),
+            include_str!("../families/glm5_flash/serve.rs"), include_str!("qwen/scheduler.rs")] {
+            let publish = source.split_once("\nfn publish").unwrap().1.split_once("\n}\n").unwrap().0;
+            assert!(publish.contains("first_request(&FIRST, requests"));
+            assert!(!publish.contains("graph_capture_stats"));
+            assert!(source.contains("cache.tick();\n        publish(stats, requests"));
+        }
+    }
+}
+
+/// Request-time diagnostics, called by the HTTP blocking worker, never a scheduler.
+/// Adds cumulative capture counts and site deltas since the last stats fetch.
 /// Gate clients subtract the cumulative fields across their own warmed interval.
+/// Startup-miss variants are cumulative too: each distinct shape a sealed graph
+/// set lacked with its eager run count, so a client sees which one to add.
 pub(crate) fn graph_capture_stats(stats: &mut serde_json::Value) {
     static PREVIOUS: std::sync::Mutex<Vec<(String, u64)>> = std::sync::Mutex::new(Vec::new());
     let mut previous = PREVIOUS.lock().unwrap_or_else(|p| p.into_inner());
     let tables = cuteafd_loader::mapped_table_stats_with_intervals();
     if !tables.is_empty() { stats["mapped_tables"] = serde_json::json!(tables); }
+    stats["graph_cache"] = serde_json::json!(crate::shared::decode_graph::device::snapshots());
+    stats["memory_reconciliation"] = crate::shared::memory_report::reconcile::snapshot();
     let sites = cuteafd_ffi::graph_capture_sites();
     record_graph_captures(stats, cuteafd_ffi::graph_captures(), sites, &mut previous);
+    stats["graph_missing_variants"] = serde_json::json!(crate::shared::decode_graph::missing_variants()
+        .into_iter().map(|miss| serde_json::json!({
+            "family": miss.family, "shape": miss.shape, "runs": miss.runs })).collect::<Vec<_>>());
 }
 
 fn record_graph_captures(stats: &mut serde_json::Value, total: u64, sites: Vec<(String, u64)>,
@@ -112,6 +155,51 @@ fn record_graph_captures(stats: &mut serde_json::Value, total: u64, sites: Vec<(
     stats["graph_capture_sites"] = serde_json::json!(sites);
     stats["graph_capture_site_deltas"] = serde_json::json!(deltas);
     *previous = sites;
+}
+
+#[cfg(test)]
+mod graph_stats_tests {
+    use super::*;
+
+    #[test]
+    fn stats_publish_each_startup_miss_variant_with_its_runs() {
+        use crate::shared::decode_graph::{GraphBank, GraphPolicy};
+        let mut bank = GraphBank::<u32, ()>::with_family(GraphPolicy::FixedStartup, "probe-test-miss");
+        bank.warm(&[1], |_| Ok(((), None))).unwrap();
+        bank.enqueue(&9);
+        bank.enqueue(&9);
+        let mut stats = serde_json::json!({});
+        graph_capture_stats(&mut stats);
+        let variants = stats["graph_missing_variants"].as_array().expect("variant array");
+        let ours: Vec<_> = variants.iter().filter(|variant| variant["family"] == "probe-test-miss").collect();
+        assert_eq!(ours.len(), 1);
+        assert_eq!((ours[0]["shape"].as_str(), ours[0]["runs"].as_u64()), (Some("9"), Some(2)));
+        assert!(stats["graph_captures"].is_u64());
+    }
+
+    /// A bank miss and an owner that holds its own executable (Qwen4) report
+    /// through the same logger, so both land in one /v1/stats inventory and an
+    /// eager variant is described only on its first miss.
+    #[test]
+    fn stats_publish_qwen4_and_bank_misses_together() {
+        use crate::shared::decode_graph::{GraphBank, GraphPolicy};
+        let mut bank = GraphBank::<u32, ()>::with_family(GraphPolicy::FixedStartup, "probe-test-bank");
+        bank.warm(&[1], |_| Ok(((), None))).unwrap();
+        bank.enqueue(&9);
+        let shape = "rows=6 spec=false long=false pool_width=64 page_stride=8192 pool_stride=524288";
+        crate::shared::decode_graph::note_eager("qwen4", shape, || "segment=11 max_context=4096 slots=8 pages=4".into());
+        crate::shared::decode_graph::note_eager("qwen4", shape,
+            || panic!("only a variant's first miss describes its request"));
+        let mut stats = serde_json::json!({});
+        graph_capture_stats(&mut stats);
+        let variants = stats["graph_missing_variants"].as_array().expect("variant array");
+        let bank: Vec<_> = variants.iter().filter(|variant| variant["family"] == "probe-test-bank").collect();
+        assert_eq!(bank.len(), 1);
+        assert_eq!((bank[0]["shape"].as_str(), bank[0]["runs"].as_u64()), (Some("9"), Some(1)));
+        let qwen4: Vec<_> = variants.iter().filter(|variant| variant["family"] == "qwen4").collect();
+        assert_eq!(qwen4.len(), 1);
+        assert_eq!((qwen4[0]["shape"].as_str(), qwen4[0]["runs"].as_u64()), (Some(shape), Some(2)));
+    }
 }
 
 #[cfg(test)]
@@ -359,12 +447,34 @@ pub(crate) fn device_rows(library: &NativeLibrary, probe: &ProbeRef, logits: &De
     anyhow::ensure!(logits.vocab > 0 && logits.stride >= logits.vocab, "invalid scoring vocabulary/stride");
     anyhow::ensure!(first.checked_add(n).is_some_and(|end| end <= logits.rows),
         "scoring needs {n} logits rows at {first}, got {}", logits.rows);
-    let host = logits.to_host(library)?;
-    for j in 0..n {
-        let row = &host[(first + j) * logits.vocab..][..logits.vocab];
+    let selected = (0..n).filter(|&j| probe.wants(position + j)).collect::<Vec<_>>();
+    let spans = selected.iter().map(|&j| (first + j, 1)).collect::<Vec<_>>();
+    if spans.is_empty() { return Ok(()); }
+    let host = logits.download(library, &spans)?;
+    for (j, row) in selected.into_iter().zip(host.chunks_exact(logits.vocab)) {
         probe.row(position + j, row);
     }
     Ok(())
+}
+
+/// A selected-row consumer; device scratch may be reused as soon as `record` returns.
+#[derive(Clone, Copy)]
+pub(crate) struct ScoringRows<'p> {
+    pub probe: &'p ProbeRef,
+    pub position: usize,
+}
+
+impl ScoringRows<'_> {
+    pub(crate) fn record(self, library: &NativeLibrary, offset: usize, logits: &DeviceLogits) -> Result<()> {
+        let position = self.position.checked_add(offset).ok_or_else(|| anyhow::anyhow!("scoring position overflow"))?;
+        device_rows(library, self.probe, logits, 0, logits.rows, position)
+    }
+}
+
+/// Head tiles only: transformer calls and their causal/pipeline geometry stay unchanged.
+pub(crate) fn head_spans(rows: usize, capacity: usize) -> Result<impl Iterator<Item = std::ops::Range<usize>>> {
+    anyhow::ensure!(rows > 0 && capacity > 0, "scoring head rows/capacity must be positive");
+    Ok((0..rows).step_by(capacity).map(move |first| first..first.saturating_add(capacity).min(rows)))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -421,11 +531,14 @@ pub(crate) fn validate_scoring(probe: &ProbeRef, full_prefill_logits: bool) -> R
 pub(crate) enum ScoreLogits {
     Device(DeviceLogits),
     Host { values: Vec<f32>, vocab: usize },
+    /// A streaming head consumed its bounded spans before returning.
+    Recorded,
 }
 
 impl ScoreLogits {
     fn record(&self, library: &NativeLibrary, probe: &ProbeRef, n: usize, position: usize) -> Result<()> {
         match self {
+            Self::Recorded => Ok(()),
             Self::Device(logits) => {
                 anyhow::ensure!(logits.rows >= n, "scoring needs {n} rows, got {}", logits.rows);
                 device_rows(library, probe, logits, logits.rows - n, n, position)
@@ -488,7 +601,7 @@ fn score_plan(len: usize, from: usize, prefill_rows: usize, verify_capacity: usi
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn score<S>(library: &NativeLibrary, probe: &ProbeRef, tokens: &[u32], from: usize, prefill_rows: usize,
     verify_capacity: usize, requested_verify_rows: Option<usize>, full_prefill_logits: bool, state: &mut S,
-    mut prefill: impl FnMut(&mut S, &[u32], usize) -> Result<Option<ScoreLogits>>,
+    mut prefill: impl FnMut(&mut S, &[u32], usize, usize) -> Result<Option<ScoreLogits>>,
     mut verify: impl FnMut(&mut S, &[u32]) -> Result<DeviceLogits>) -> Result<usize> {
     let path = ScorePath::parse(probe.as_ref().and_then(|p| p.spec.score_path.as_deref()), ScorePath::Decode)?;
     let steps = score_plan(tokens.len(), from, prefill_rows, verify_capacity, requested_verify_rows, path,
@@ -498,7 +611,7 @@ pub(crate) fn score<S>(library: &NativeLibrary, probe: &ProbeRef, tokens: &[u32]
     for step in steps {
         let chunk = &tokens[step.tokens];
         let logits = match step.path {
-            ScorePath::Prefill => prefill(state, chunk, step.logit_rows)?,
+            ScorePath::Prefill => prefill(state, chunk, step.logit_rows, step.position)?,
             ScorePath::Decode => Some(ScoreLogits::Device(verify(state, chunk)?)),
         };
         if step.logit_rows > 0 {
@@ -519,6 +632,86 @@ pub(crate) fn score<S>(library: &NativeLibrary, probe: &ProbeRef, tokens: &[u32]
 mod tests {
     use super::*;
     use cuteafd_api::openai::probe::ProbeSpec;
+
+    #[test]
+    fn streamed_scoring_activation_requires_a_proven_family() {
+        for family in ["glm5_flash", "qwen4", "qwen3_5", "mimo_v2", "deepseek_v4", "step5", "muse_spark", "glm5", "mistral_large4"] {
+            assert!(streamed_prefill_scoring(family), "{family}");
+            assert!(prefill_scoring_admitted(family, false), "{family}");
+        }
+        for family in ["kimi_k3", "unknown"] {
+            assert!(!streamed_prefill_scoring(family), "{family}");
+            for legacy in [false, true] {
+                assert_eq!(prefill_scoring_admitted(family, legacy), legacy, "{family}");
+                for path in [ScorePath::Decode, ScorePath::Prefill] {
+                    let actual = score_plan(20, 4, 8, 8, None, path, prefill_scoring_admitted(family, legacy));
+                    let dev = score_plan(20, 4, 8, 8, None, path, legacy);
+                    match (actual, dev) {
+                        (Ok(actual), Ok(dev)) => assert_eq!(actual, dev, "{family}"),
+                        (Err(actual), Err(dev)) => assert_eq!(actual.to_string(), dev.to_string(), "{family}"),
+                        _ => panic!("{family} changed legacy scoring admission"),
+                    }
+                }
+            }
+            let probe = Some(Probe::new(ProbeSpec { score_from: Some(4), score_path: Some("prefill".into()),
+                ..ProbeSpec::default() }));
+            assert!(validate_scoring(&probe, prefill_scoring_admitted(family, false)).is_err());
+            assert!(validate_scoring(&probe, prefill_scoring_admitted(family, true)).is_ok());
+        }
+    }
+
+    #[test]
+    fn streamed_scoring_activation_gates_capability_validation_and_dispatch() {
+        let scheduler = include_str!("qwen/scheduler.rs").split_once("\npub(crate) fn schedule").unwrap().1;
+        assert!(scheduler.contains("probe::streamed_prefill_scoring(geometry.family) && engine.streamed_prefill_scoring()"));
+        assert!(scheduler.contains("if streamed_scoring {\n            cuteafd_bench::context::set_resolved"));
+        assert_eq!(scheduler.matches("geometry.full_prefill_logits || streamed_scoring").count(), 2);
+        let dispatch = scheduler.split_once("|placement, chunk, rows, position| {").unwrap().1
+            .split_once("|placement, chunk| engine.verify_device_ungraphed").unwrap().0;
+        assert!(dispatch.contains("if streamed_scoring {"));
+        assert!(dispatch.contains("engine.prefill_scoring("));
+        assert!(dispatch.contains("engine.prefill_device(placement, chunk, rows, cache.pool())"));
+        for (family, source) in [
+            ("glm5_flash", include_str!("../families/glm5_flash/serve.rs")),
+            ("mimo_v2", include_str!("../families/mimo_v2/serve.rs")),
+            ("deepseek_v4", include_str!("../families/deepseek_v4/serve.rs")),
+        ] {
+            assert!(source.contains(&format!("if probe::streamed_prefill_scoring(\"{family}\") {{")));
+            assert_eq!(source.matches(&format!("probe::prefill_scoring_admitted(\"{family}\", engine.full_prefill_logits")).count(), 2);
+            assert!(source.contains(&format!("&& probe::streamed_prefill_scoring(\"{family}\")")));
+        }
+        let glm = include_str!("../families/glm5/serve.rs");
+        assert!(glm.contains("if probe::streamed_prefill_scoring(engine.cfg.family_id()) {"));
+        assert_eq!(glm.matches("probe::prefill_scoring_admitted(engine.cfg.family_id(), engine.full_prefill_logits)").count(), 2);
+        assert!(glm.contains("&& probe::streamed_prefill_scoring(engine.cfg.family_id())"));
+        let kimi = include_str!("../families/kimi_k3/serve.rs");
+        assert!(kimi.contains("if crate::shared::probe::streamed_prefill_scoring(\"kimi_k3\") {"));
+    }
+
+    #[test]
+    fn head_tiles_cover_the_call_without_changing_its_prefill_steps() {
+        for capacity in [1, 48, 64] {
+            for rows in [1, 47, 48, 49, 64, 65, 512, 8256] {
+                let spans = head_spans(rows, capacity).unwrap().collect::<Vec<_>>();
+                assert!(spans.iter().all(|span| !span.is_empty() && span.len() <= capacity));
+                assert_eq!(spans.into_iter().flatten().collect::<Vec<_>>(), (0..rows).collect::<Vec<_>>());
+            }
+        }
+        assert!(head_spans(0, 64).is_err());
+        assert!(head_spans(64, 0).is_err());
+        let plan = score_plan(9000, 1, 8256, 64, None, ScorePath::Prefill, true).unwrap();
+        assert_eq!(plan.iter().map(|step| step.tokens.len()).collect::<Vec<_>>(), [1, 8256, 742]);
+    }
+
+    #[test]
+    fn kimi_streams_the_same_head_tiles_without_growing_output_owners() {
+        let source = include_str!("../families/kimi_k3/engine.rs");
+        assert!(source.contains("head_spans(logit_rows, 64)"));
+        assert!(source.contains("consume(first, describe(logits, rows))?"));
+        let backend = include_str!("../families/kimi_k3/backend.rs");
+        assert!(backend.contains("fn streamed_prefill_scoring(&self) -> bool { true }"));
+        assert!(backend.contains("self.geometry.full_prefill_logits || logit_rows <= 1"));
+    }
 
     #[test]
     fn scoring_path_parser_keeps_family_defaults_and_rejects_unknown_paths() {
@@ -571,6 +764,63 @@ mod tests {
         let continuation: Vec<_> = plan.iter().filter(|s| s.tokens.start >= 1).collect();
         assert_eq!(continuation.iter().map(|s| s.tokens.len()).collect::<Vec<_>>(), [256, 255]);
         assert_eq!(continuation.iter().map(|s| s.logit_rows).sum::<usize>(), 511);
+    }
+
+    #[test]
+    fn kimi_context_replays_mandatory_graphs_after_prefill_and_ungraphed_scoring() -> Result<()> {
+        use crate::families::kimi_k3::{context::split_bucket, graphs::{self, Key, Op}};
+        use cuteafd_loader::families::kimi_k3::{config::{KimiAttention, KimiK3Config}, context::DecodeBuckets};
+        let mut cfg = KimiK3Config::from_hf(&cuteafd_loader::plan::testing::kimi_k3_config())?;
+        cfg.layers = 1;
+        cfg.attention = vec![KimiAttention::Mla];
+        let decode = DecodeBuckets::from_manifest(&serde_json::json!({"programs":[{
+            "name":"dense_trellis_k6_trellis_mla_q_a_mcg",
+            "geometry":{"bits":6,"decode_route_thresholds":[8,16,32,48]}}]}))?;
+        let set = graphs::inventory_with_context(&cfg, 1, 2752, 16, 8, 2,
+            |_, _| true, |_| true, Some(&decode))?;
+        let keys = set.keys.iter().copied().collect::<std::collections::HashSet<_>>();
+        let replay = |rows, speculative, optional, history: usize| -> Result<()> {
+            let rows = decode.dispatch_rows(rows, speculative)?;
+            let op = Op::Context { layer: 0, speculative };
+            assert!(graphs::replay_allowed(op, optional, false)?);
+            assert!(graphs::replay_allowed(op, optional, true).is_err());
+            assert_eq!(graphs::replay_allowed(Op::Ffn(0), optional, false)?, optional);
+            for rank in 0..2 {
+                assert!(keys.contains(&Key { lane: 0, rank, rows, op }),
+                    "missing scoring/decode Context graph at history={history}, rows={rows}");
+                for sms in [170, 188] {
+                    let logical = (0..history.div_ceil(64) as u32).collect::<Vec<_>>();
+                    let pages = crate::shared::peer_split::context::local_pages(&logical, rank)?.len();
+                    assert!(crate::families::kimi_k3::context::SPLIT_BUCKETS
+                        .contains(&split_bucket(pages, rows, sms)?));
+                }
+            }
+            Ok(())
+        };
+        // Walk the actual card sequence: a wide prefill, then the 513-token
+        // teacher-forced probe, then ordinary and mixed speculative C1..C16.
+        for prompt in [8027, 8192, 65536] {
+            let units = crate::shared::prefill_pipeline::prefill_units(prompt, 2752, 3, 256)?;
+            assert_eq!(units.iter().map(|unit| unit.len()).sum::<usize>(), prompt);
+            for unit in units { if unit.len() <= 64 { replay(unit.len(), false, true, unit.end)?; } }
+            for requested in [None, Some(1), Some(8), Some(13), Some(64)] {
+                let steps = score_plan(513, 1, 2752 * 3, 64, requested, ScorePath::Decode, false)?;
+                for step in steps {
+                    if step.tokens.len() <= 64 {
+                        replay(step.tokens.len(), false, step.path == ScorePath::Prefill, step.tokens.end)?;
+                    }
+                }
+            }
+            for active in 1..=16 {
+                for optional in [false, true] {
+                    replay(active, false, optional, prompt + 1)?;
+                    for rows in active.max(2)..=(active * 8).min(64) {
+                        replay(rows, true, optional, prompt + 8)?;
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     #[test]

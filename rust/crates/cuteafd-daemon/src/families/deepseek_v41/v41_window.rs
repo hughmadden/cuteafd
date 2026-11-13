@@ -1,7 +1,7 @@
 //! Backbone FP8 window KV production, private proposals and accepted ring writes.
 use crate::shared::memory::{DeviceAllocation, HostAllocation, LoadStream};
 use crate::shared::memory::row_window::RowWindow;
-use crate::shared::decode_graph::{fatal_drain, GraphBank, GraphOwner};
+use crate::shared::decode_graph::{fatal_drain, GraphBank, GraphOwner, GraphPolicy};
 use crate::families::deepseek_v41::v41_tensors::NativeRtxTensors;
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::{CuteafdDeviceBuffer, NativeLibrary, V41AttentionOps, V41Fp8Plan, V41Kv};
@@ -11,6 +11,7 @@ use std::{
     marker::PhantomData,
     sync::atomic::{AtomicU64, Ordering},
 };
+use crate::shared::memory::Tag;
 static NEXT_OWNER: AtomicU64 = AtomicU64::new(1);
 mod prefix;
 pub(crate) mod replica;
@@ -89,9 +90,9 @@ impl<'a> WindowState<'a> {
             "window state exceeds budget"
         );
         let value = Self {
-            values: DeviceAllocation::attention_plane(library, slots * 128, 512, "window cache values")?,
-            scales: DeviceAllocation::attention_plane(library, slots * 128, 16, "window cache scales")?,
-            ends: DeviceAllocation::new(library, slots * 8)?,
+            values: DeviceAllocation::attention_plane(library, slots * 128, 512, "window cache values", Tag::kv("v41/window-cache"))?,
+            scales: DeviceAllocation::attention_plane(library, slots * 128, 16, "window cache scales", Tag::kv("v41/window-cache"))?,
+            ends: DeviceAllocation::new(library, slots * 8, Tag::kv("v41/window-cache"))?,
             slots: [Slot::default(); cuteafd_core::V41_MAX_REQUESTS],
             writing: Default::default(),
             slot_count: slots,
@@ -136,13 +137,6 @@ impl<'a> WindowState<'a> {
     /// Existing consumers must be drained; version advancement revokes proposals.
     pub fn begin_replay(&mut self, lease: WindowLease, position: u64) -> Result<()> {
         ensure!(self.layer >= 20, "invalid decoder replay layer");
-        self.begin_empty_at(lease, position)
-    }
-    pub fn begin_encoder_replay(&mut self, lease: WindowLease, position: u64) -> Result<()> {
-        ensure!(self.layer < 20, "invalid encoder replay layer");
-        self.begin_empty_at(lease, position)
-    }
-    fn begin_empty_at(&mut self, lease: WindowLease, position: u64) -> Result<()> {
         let slot = self.validate(lease)?;
         ensure!(position <= 1048576, "invalid window replay start");
         ensure!(
@@ -242,7 +236,11 @@ pub(crate) struct WindowWeights<'a> {
     scales: DeviceAllocation<'a>,
 }
 impl<'a> WindowWeights<'a> {
-    fn names(layer: usize) -> Result<[String; 3]> {
+    pub(crate) fn inventory(&self, inventory: &mut crate::shared::memory::receipts::Inventory<'_>) -> Result<()> {
+        self.tensors.inventory(inventory)?;
+        self.scales.inventory(inventory, &super::weight_layout::packed_scale_name(&self.names[0]))
+    }
+    pub(super) fn names(layer: usize) -> Result<[String; 3]> {
         ensure!(layer < 40, "invalid backbone window layer");
         Ok([
             format!("layers.{layer}.attn.wkv.weight"),
@@ -262,6 +260,7 @@ impl<'a> WindowWeights<'a> {
                 .v41_fp8_matrix_info(1, 5120, 512)?
                 .packed_weight_scale_bytes as usize)
     }
+    #[cfg(test)]
     pub fn load(
         library: &'a NativeLibrary,
         catalog: &OfficialV41Catalog,
@@ -269,14 +268,19 @@ impl<'a> WindowWeights<'a> {
         budget: usize,
         staging: usize,
     ) -> Result<Self> {
+        Self::load_in(library, catalog, layer, budget, staging, None)
+    }
+    pub fn load_in(library: &'a NativeLibrary, catalog: &OfficialV41Catalog, layer: usize,
+        budget: usize, staging: usize, arena: Option<&crate::shared::memory::weight_arena::DeviceWeightArena<'a>>) -> Result<Self> {
         ensure!(
             Self::device_bytes(library, catalog, layer)? <= budget,
             "window weights exceed budget"
         );
         let names = Self::names(layer)?;
-        let tensors = NativeRtxTensors::load(library, catalog, &names, budget, staging)?;
+        let tensors = NativeRtxTensors::load_in(library, catalog, &names, budget, staging, arena)?;
         let fp8 = library.v41_fp8_matrix_kernel(1, 5120, 512)?;
-        let scales = DeviceAllocation::new(library, fp8.info().packed_weight_scale_bytes as usize)?;
+        let scales = super::weight_layout::allocation(library, arena,
+            &super::weight_layout::packed_scale_name(&names[0]), fp8.info().packed_weight_scale_bytes as usize)?;
         let stream = LoadStream {
             library,
             raw: library.cuda_stream_create()?,
@@ -300,7 +304,7 @@ impl<'a> WindowWeights<'a> {
             "window wave exceeds budget"
         );
         let rows = capacity as usize;
-        self.on_storage(WindowStorage::new(self.library, rows, rows, &[self.layer], true)?)
+        self.on_storage(WindowStorage::new(self.library, rows, rows, &[self.layer])?)
     }
     /// This layer's wave on `storage` (same device): its proposal plane is the
     /// storage's plane for this layer, windowed by `select_window`.
@@ -309,10 +313,18 @@ impl<'a> WindowWeights<'a> {
             .context("window storage has no plane for this layer")?;
         ensure!(storage.input.buffer.device_id == self.tensors.get(&self.names[0])?.device_id,
             "window storage device differs");
-        let own = storage.stream.is_none() || private_stream_for_test();
         let unit = storage.unit;
+        let device = crate::shared::memory::device::Device {
+            library: self.library, id: storage.input.buffer.device_id,
+        };
+        let ordering = || -> Result<_> { Ok(crate::shared::memory::device::Event {
+            device, raw: device.run(|| self.library.cuda_event_create_ordering())?,
+        }) };
         Ok(WindowWave {
-            own_stream: own.then(|| -> Result<_> { Ok(LoadStream {
+            produced: ordering()?,
+            committed: ordering()?,
+            #[cfg(test)]
+            own_stream: PRIVATE_STREAM.with(|private| private.get()).then(|| -> Result<_> { Ok(LoadStream {
                 library: self.library, raw: self.library.cuda_stream_create()? }) }).transpose()?,
             storage,
             plane,
@@ -320,11 +332,11 @@ impl<'a> WindowWeights<'a> {
             norm: self.library.v41_attention_ops()?,
             kv: self.library.v41_kv()?,
             weights: self,
-            staging: HostAllocation::new(self.library, unit * 8)?,
-            commit_staging: HostAllocation::new(self.library, commit::staging_bytes(unit))?,
+            staging: HostAllocation::new(self.library, unit * 8, Tag::staging("v41/window-proposal"))?,
+            commit_staging: HostAllocation::new(self.library, commit::staging_bytes(unit), Tag::staging("v41/window-proposal"))?,
             capacity: unit,
             graph: None,
-            graphs: GraphBank::new(None),
+            graphs: GraphBank::with_family(GraphPolicy::Budgeted { bytes: None }, "deepseek_v41"),
             ready: None,
             pending_query: None,
             pending_commit: None,
@@ -338,12 +350,6 @@ thread_local! {
     /// Test-only negative control: waves built while set issue on their own
     /// stream instead of their storage's shared one.
     pub(crate) static PRIVATE_STREAM: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
-fn private_stream_for_test() -> bool {
-    #[cfg(test)]
-    { PRIVATE_STREAM.with(|private| private.get()) }
-    #[cfg(not(test))]
-    { false }
 }
 struct Prepared {
     snapshot: u64,
@@ -421,14 +427,16 @@ pub(crate) struct WindowPlanes<'a> {
 /// | `input`, `positions`, `frequencies`, `projected`, `normalized`, GEMM `scratch`/`alpha` | plain scratch at the unit cap | written and consumed by this producer's stream inside one hook; nothing else reads them (`WindowOutput` exposes them to tests only, valid until the next production) |
 /// | position `staging`, `commit_staging` | per slot (on the wave) | pinned and rewritten on the host for each unit (#815) |
 ///
-/// Plain scratch is ordered by one stream. Prefill slots on one GPU share a
-/// storage with a shared `stream`, so every unit's production on every layer
-/// issues in stream order. A pass's private storage (`stream` none) is shared
-/// only by that pass's layers, each wave on its own stream, ordered by the
-/// pass (layer L+1's producer follows layer L's attention on the chain or a
-/// host drain).
+/// Plain scratch is ordered by the storage's one persistent stream. Decode
+/// layers share it within a pass; prefill slots share it across their units.
+/// Each layer retains its own graph and proposal plane. The pass orders layer
+/// L+1's producer after layer L's attention on the chain or a host drain.
+/// A separate persistent commit stream stores each layer's proposal after its
+/// producer event; a completion event orders that layer's next plane reuse.
+/// Independent passes retain separate producer/commit stream pairs.
 pub(crate) struct WindowStorage<'a> {
-    stream: Option<LoadStream<'a>>,
+    stream: LoadStream<'a>,
+    commit_stream: LoadStream<'a>,
     fp8: V41Fp8Plan<'a>,
     scratch: DeviceAllocation<'a>,
     alpha: DeviceAllocation<'a>,
@@ -445,38 +453,47 @@ pub(crate) struct WindowStorage<'a> {
 impl<'a> WindowStorage<'a> {
     /// Plain scratch bytes for units of up to `unit` rows.
     pub fn scratch_bytes(library: &NativeLibrary, unit: u32) -> Result<usize> {
-        Ok(library.v41_fp8_matrix_plan_info(unit, 5120, 512)?.scratch_bytes as usize
-            + 4 + unit as usize * (10240 + 1024 + 1024 + 8 + 256))
+        let scratch = library.v41_fp8_matrix_plan_info(unit, 5120, 512)?.scratch_bytes as usize;
+        let layout = cuteafd_loader::serving_capacity::v41_workspace::window(unit as usize, unit as usize, &[0], scratch)?;
+        Ok(layout.view("layer0.values").context("window proposal boundary")?.offset())
     }
     /// One layer's planes over `rows` rows.
     pub fn plane_bytes(rows: usize) -> usize { rows * (512 + 16 + 8) }
     pub fn device_bytes(library: &NativeLibrary, rows: usize, unit: u32, layers: usize) -> Result<usize> {
         ensure!(unit >= 1 && unit as usize <= rows, "window unit {unit} outside {rows} rows");
-        Ok(Self::scratch_bytes(library, unit)? + layers * Self::plane_bytes(rows))
+        let scratch = library.v41_fp8_matrix_plan_info(unit, 5120, 512)?.scratch_bytes as usize;
+        Ok(cuteafd_loader::serving_capacity::v41_workspace::window(rows, unit as usize,
+            &(0..layers).collect::<Vec<_>>(), scratch)?.bytes())
     }
     /// Planes for `layers` over `rows` reserve rows, scratch for units of up to
-    /// `unit` rows. `shared_stream`: every wave on this storage issues on its
-    /// one stream (prefill slots); otherwise each wave owns its stream.
-    pub fn new(library: &'a NativeLibrary, rows: usize, unit: usize, layers: &[usize], shared_stream: bool)
+    /// `unit` rows. Every wave on this storage issues on its one stream.
+    pub fn new(library: &'a NativeLibrary, rows: usize, unit: usize, layers: &[usize])
         -> Result<std::rc::Rc<Self>> {
         ensure!(unit >= 1 && unit <= rows && rows <= crate::shared::memory::row_window::MAX_RESERVE_ROWS.max(4096)
             && layers.iter().all(|&l| l < 40), "invalid window storage of {rows} rows, {unit}-row units, layers {layers:?}");
         let fp8 = library.v41_fp8_matrix_plan(unit as u32, 5120, 512)?;
+        let arena = crate::shared::memory::weight_arena::workspace_arena(library,
+            cuteafd_loader::serving_capacity::v41_workspace::window(rows, unit, layers, fp8.info().scratch_bytes as usize)?,
+            cuteafd_core::memory_layout::ArenaTag::workspace("v41/window-proposal"))?;
+        let plane = |name: &str| -> Result<_> {
+            let bytes = arena.layout().view(name).context("window plane")?.bytes();
+            Ok(DeviceAllocation::from_allocation(arena.view(name, bytes)?))
+        };
         let value = Self {
-            stream: shared_stream.then(|| -> Result<_> { Ok(LoadStream { library, raw: library.cuda_stream_create()? }) })
-                .transpose()?,
-            scratch: DeviceAllocation::new(library, fp8.info().scratch_bytes as usize)?,
-            alpha: DeviceAllocation::new(library, 4)?,
-            input: DeviceAllocation::new(library, unit * 10240)?,
-            projected: DeviceAllocation::new(library, unit * 1024)?,
-            normalized: DeviceAllocation::new(library, unit * 1024)?,
-            positions: DeviceAllocation::new(library, unit * 8)?,
-            frequencies: DeviceAllocation::new(library, unit * 256)?,
+            stream: LoadStream { library, raw: library.cuda_stream_create()? },
+            commit_stream: LoadStream { library, raw: library.cuda_stream_create()? },
+            scratch: plane("scratch")?,
+            alpha: plane("alpha")?,
+            input: plane("input")?,
+            projected: plane("projected")?,
+            normalized: plane("normalized")?,
+            positions: plane("positions")?,
+            frequencies: plane("frequencies")?,
             planes: layers.iter().map(|&layer| Ok(WindowPlanes {
                 layer,
-                values: DeviceAllocation::attention_plane(library, rows, 512, "window proposal values")?,
-                scales: DeviceAllocation::attention_plane(library, rows, 16, "window proposal scales")?,
-                destinations: DeviceAllocation::new(library, rows * 8)?,
+                values: plane(&format!("layer{layer}.values"))?,
+                scales: plane(&format!("layer{layer}.scales"))?,
+                destinations: plane(&format!("layer{layer}.destinations"))?,
             })).collect::<Result<Vec<_>>>()?,
             fp8,
             rows,
@@ -492,10 +509,10 @@ impl<'a> WindowStorage<'a> {
 }
 impl Drop for WindowStorage<'_> {
     fn drop(&mut self) {
-        if let Some(stream) = &self.stream {
-            // SAFETY: owned stream; its queued work reads only this storage.
-            fatal_drain(unsafe { stream.library.cuda_stream_synchronize(stream.raw) }, "window storage");
-        }
+        // SAFETY: owned stream; its queued work reads only this storage.
+        fatal_drain(unsafe { self.stream.library.cuda_stream_synchronize(self.stream.raw) }, "window storage");
+        // SAFETY: the persistent commit stream reads this storage's proposal planes.
+        fatal_drain(unsafe { self.commit_stream.library.cuda_stream_synchronize(self.commit_stream.raw) }, "window commits");
     }
 }
 
@@ -506,7 +523,10 @@ thread_local! {
     pub(crate) static SHARED_COMMIT_STAGING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 pub(crate) struct WindowWave<'w, 'a> {
-    /// Set when the storage has no shared stream (or the negative control).
+    produced: crate::shared::memory::device::Event<'a>,
+    committed: crate::shared::memory::device::Event<'a>,
+    /// Negative control only: bypass the shared scratch ordering stream.
+    #[cfg(test)]
     own_stream: Option<LoadStream<'a>>,
     storage: std::rc::Rc<WindowStorage<'a>>,
     /// This layer's planes in `storage`.
@@ -537,7 +557,9 @@ pub(crate) struct WindowWave<'w, 'a> {
 }
 impl<'a> WindowWave<'_, 'a> {
     fn stream(&self) -> &LoadStream<'a> {
-        self.own_stream.as_ref().or(self.storage.stream.as_ref()).expect("window wave stream")
+        #[cfg(test)]
+        if let Some(stream) = &self.own_stream { return stream; }
+        &self.storage.stream
     }
 }
 impl WindowWave<'_, '_> {
@@ -567,7 +589,10 @@ impl WindowWave<'_, '_> {
         Ok(())
     }
     fn synchronize(&self) -> Result<()> {
-        unsafe { self.stream().library.cuda_stream_synchronize(self.stream().raw) }
+        // SAFETY: both streams and their referenced storage belong to this wave.
+        let produced = unsafe { self.stream().library.cuda_stream_synchronize(self.stream().raw) };
+        let committed = unsafe { self.stream().library.cuda_stream_synchronize(self.storage.commit_stream.raw) };
+        produced.and(committed)
     }
     fn prepare(&mut self, state: &WindowState<'_>, chunks: &[WindowChunk]) -> Result<Prepared> {
         ensure!(self.pending_query.is_none(), "cache query production pending");
@@ -613,6 +638,11 @@ impl WindowWave<'_, '_> {
         Ok(p)
     }
     fn upload(&mut self, p: &Prepared) -> Result<()> {
+        // Reuse of this layer's proposal plane follows its last off-stream store.
+        // Keep this after graph selection's at-rest check and outside capture.
+        // SAFETY: events/streams share a device and live through both drains;
+        // CUDA treats an event not yet recorded (the first production) as complete.
+        unsafe { self.stream().library.cuda_stream_wait_event(self.stream().raw, self.committed.raw)?; }
         let bytes = self.staging.bytes_mut();
         for (i, c) in p.chunks.iter().enumerate() {
             for j in 0..c.tokens as usize {
@@ -665,6 +695,39 @@ impl WindowWave<'_, '_> {
         }
         Ok(())
     }
+    pub(crate) fn capture_startup(&mut self, state: &WindowState<'_>, rows: &[usize]) -> Result<()> {
+        ensure!(self.ready.is_none() && self.pending_query.is_none() && self.pending_commit.is_none()
+            && !self.window.is_windowed() && state.layer == self.weights.layer,
+            "window startup requires an idle matching owner");
+        self.stream().require_complete()?;
+        let keys: Vec<_> = rows.iter().map(|&row| (row, state.owner)).collect();
+        let _ = keys;
+        for &row in rows {
+            ensure!(row > 0 && row <= self.capacity, "window startup row exceeds capacity");
+            let library = self.stream().library;
+            let stream = self.stream().raw;
+            // SAFETY: capture records the exact proposal operations on owned
+            // buffers; it neither executes them nor commits cache storage.
+            let Some(mut ticket) = self.graphs.cache_ticket(&(row, state.owner),
+                super::graph_policy::pinned_shape(self.storage.input.buffer.device_id, row as u32), None) else { continue };
+            unsafe { ticket.capture_result(library.cuda_graph_begin_capture(stream))?; }
+            let queued = unsafe { self.enqueue(row) };
+            let captured = unsafe { ticket.capture_result(library.cuda_graph_end_capture_topology(stream)) };
+            match (queued, captured) {
+                (Ok(()), Ok((graph, nodes, width, spans, _))) => self.insert_graph(row, state.owner, graph, ticket, nodes as u64, width, spans)?,
+                (Err(error), Ok((graph, ..))) => {
+                    unsafe { library.cuda_graph_exec_destroy(graph)?; }
+                    return Err(error);
+                }
+                (Ok(()), Err(error)) if cuteafd_ffi::is_small_graph(&error) => {},
+                (Err(error), Err(_)) | (Ok(()), Err(error)) => return Err(error),
+            }
+            crate::shared::decode_graph::device::observe_device(library, self.storage.input.buffer.device_id)?;
+        }
+
+        self.graph = None;
+        Ok(())
+    }
     /// # Safety
     /// Query and admitted state slots stay alive and immutable until poll_query
     /// completes or abort_query drains. Peer work may use only disjoint slots.
@@ -707,19 +770,23 @@ impl WindowWave<'_, '_> {
             ensure!(prepared.owner == state.owner, "queued cache owner differs");
             let chained = crate::shared::memory::chain::active();
             if !chained && !unsafe { self.stream().library.cuda_stream_query(self.stream().raw)? } { return Ok(false); }
-            if *capture {
-                unsafe { self.stream().library.cuda_graph_begin_capture(self.stream().raw)?; }
+            let ticket = if *capture { self.graphs.cache_ticket(&(prepared.rows, state.owner),
+                super::graph_policy::pinned_shape(self.storage.input.buffer.device_id, prepared.rows as u32), None) } else { None };
+            if let Some(mut ticket) = ticket {
+                unsafe { ticket.capture_result(self.stream().library.cuda_graph_begin_capture(self.stream().raw))?; }
                 let queued = unsafe { self.enqueue(prepared.rows) };
-                let captured = unsafe { self.stream().library.cuda_graph_end_capture(self.stream().raw) };
-                let graph = match (queued, captured) {
-                    (Ok(()), Ok(graph)) => graph,
-                    (Err(error), Ok(graph)) => {
+                let captured = unsafe { ticket.capture_result(self.stream().library.cuda_graph_end_capture_topology(self.stream().raw)) };
+                match (queued, captured) {
+                    (Ok(()), Ok((graph, nodes, width, spans, _))) => {
+                        self.insert_graph(prepared.rows, state.owner, graph, ticket, nodes as u64, width, spans)?;
+                    }
+                    (Err(error), Ok((graph, ..))) => {
                         unsafe { self.stream().library.cuda_graph_exec_destroy(graph)?; }
                         return Err(error);
                     }
+                    (Ok(()), Err(error)) if cuteafd_ffi::is_small_graph(&error) => {},
                     (Err(error), Err(_)) | (Ok(()), Err(error)) => return Err(error),
-                };
-                self.insert_graph(prepared.rows, state.owner, graph)?;
+                }
                 // Eager proposal is complete. Capture records future work without
                 // committing cache state; publish the existing result below.
             }
@@ -779,8 +846,9 @@ impl WindowWave<'_, '_> {
             self.select_graph(prepared.rows, state.owner, true)?;
             if self.graph.is_none() {
                 unsafe { self.capture(state, chunks)?; }
+            } else {
+                unsafe { self.replay(state, chunks)?; }
             }
-            unsafe { self.replay(state, chunks)?; }
             Ok(())
         })();
         if let Err(error) = executed {
@@ -805,7 +873,7 @@ impl WindowWave<'_, '_> {
         self.output(state)
     }
     /// # Safety
-    /// Same inputs as execute. Warmup is drained and unpublished after capture.
+    /// Same inputs as execute. The drained eager result stays published after capture.
     pub unsafe fn capture(
         &mut self,
         state: &WindowState<'_>,
@@ -816,24 +884,33 @@ impl WindowWave<'_, '_> {
         unsafe {
             self.execute(state, chunks)?;
         }
-        let p = self.prepare(state, chunks)?;
+        // Recording does not execute: retain the exact completed proposal,
+        // including when admission selects eager fallback.
+        let p = self.ready.take().context("window capture eager output missing")?;
+        let Some(mut ticket) = self.graphs.cache_ticket(&(p.rows, state.owner),
+            super::graph_policy::pinned_shape(self.storage.input.buffer.device_id, p.rows as u32), None) else {
+                self.ready = Some(p);
+                return Ok(());
+            };
         unsafe {
-            self.stream()
+            ticket.capture_result(self.stream()
                 .library
-                .cuda_graph_begin_capture(self.stream().raw)?;
+                .cuda_graph_begin_capture(self.stream().raw))?;
         }
         let launched = unsafe { self.enqueue(p.rows) };
-        let captured = unsafe { self.stream().library.cuda_graph_end_capture(self.stream().raw) };
+        let captured = unsafe { ticket.capture_result(self.stream().library.cuda_graph_end_capture_topology(self.stream().raw)) };
         match (launched, captured) {
-            (Ok(()), Ok(g)) => self.insert_graph(p.rows, state.owner, g)?,
-            (Err(e), Ok(g)) => {
+            (Ok(()), Ok((g, nodes, width, spans, _))) => self.insert_graph(p.rows, state.owner, g, ticket, nodes as u64, width, spans)?,
+            (Err(e), Ok((g, ..))) => {
                 unsafe {
                     self.stream().library.cuda_graph_exec_destroy(g)?;
                 }
                 return Err(e);
             }
+            (Ok(()), Err(error)) if cuteafd_ffi::is_small_graph(&error) => {},
             (Err(e), Err(_)) | (Ok(()), Err(e)) => return Err(e),
         }
+        self.ready = Some(p);
         Ok(())
     }
     /// # Safety
@@ -935,43 +1012,34 @@ impl WindowWave<'_, '_> {
     }
     /// Switch only after prior launches finish. Graphs bind the cache owner and
     /// lane workspace, while current request descriptors are uploaded on replay.
-    fn select_graph(&mut self, rows: usize, owner: u64, drain: bool) -> Result<()> {
-        if self.graph == Some((rows, owner)) { return Ok(()); }
+    fn select_graph(&mut self, rows: usize, owner: u64, _drain: bool) -> Result<()> {
         ensure!(self.pending_query.is_none() && self.pending_commit.is_none(),
             "cannot switch a pending cache producer graph");
-        if self.graph.is_some_and(|(_, o)| o != owner)
-            || self.graphs.count(|(_, o)| *o != owner) > 0 {
-            return self.clear_graph_inner(drain);
-        }
         self.ready = None;
-        if drain { self.synchronize()?; } else { self.stream().require_complete()?; }
-        self.graph = None;
-        if rows > 64 && self.graphs.count(|&(r, _)| r > 64 && r != rows) >= crate::shared::decode_graph::LARGE_SHAPES {
-            // Keep the full prefill chunk and decoder replay across decode rounds.
-            self.graphs.retire_oldest(|&(r, _)| r > 64 && r != rows);
-        }
-        drop(self.graphs.drain_retired(|| Ok(()))?);
-        self.graph = self.graphs.launch(&(rows, owner)).map(|_| (rows, owner));
-        if self.graph.is_none() {
-            tracing::debug!(target: "cuteafd::graph_capture", site="window", layer=self.weights.layer,
-                rows, owner, device=self.storage.input.buffer.device_id, bank=self as *const Self as usize,
-                retained=self.graphs.len(), "graph cache miss");
-        }
+        self.graph = self.graphs.cached_launch(&(rows, owner)).map(|_| (rows, owner));
         Ok(())
     }
     fn current_graph(&self) -> Option<(*mut c_void, usize, u64)> {
         let (rows, owner) = self.graph?;
         Some((self.graphs.get(&(rows, owner))?.raw, rows, owner))
     }
-    fn insert_graph(&mut self, rows: usize, owner: u64, raw: *mut c_void) -> Result<()> {
+    fn insert_graph(&mut self, rows: usize, owner: u64, raw: *mut c_void,
+        ticket: crate::shared::decode_graph::CaptureTicket, nodes: u64, width: usize, spans: bool) -> Result<()> {
         let device = self.storage.input.buffer.device_id;
         // SAFETY: the wave pins weights/workspace; Drop drains before releasing fields.
         let graph = unsafe { GraphOwner::new(self.stream().library, device, raw, ())? };
-        self.graphs.insert((rows, owner), graph, None);
+        crate::shared::decode_graph::census::capture_device_key("deepseek_v41", "window",
+            &self.graphs as *const _ as usize, device, None, &(rows, owner), raw);
+        self.graphs.cache_commit((rows, owner), graph, ticket, nodes, width, spans);
         self.graph = Some((rows, owner));
         tracing::debug!(target: "cuteafd::graph_capture", site="window", layer=self.weights.layer,
             rows, owner, device, bank=self as *const Self as usize, "window graph captured");
         Ok(())
+    }
+    pub(crate) fn visit_graph_banks(&mut self,
+        f: &mut dyn FnMut(i32, &'static str, bool, &mut dyn crate::shared::decode_graph::CacheAttached) -> Result<()>,
+    ) -> Result<()> {
+        f(self.storage.input.buffer.device_id, "window", false, &mut self.graphs)
     }
     pub fn clear_graph(&mut self) -> Result<()> {
         self.clear_graph_inner(true)
@@ -982,8 +1050,7 @@ impl WindowWave<'_, '_> {
         self.ready = None;
         if drain { self.synchronize()?; } else { self.stream().require_complete()?; }
         self.graph = None;
-        self.graphs.retire_all();
-        drop(self.graphs.drain_retired(|| Ok(()))?);
+        self.graphs.cache_clear_drained();
         Ok(())
     }
 }
@@ -1053,5 +1120,76 @@ impl WindowWeights<'_> {
     pub(crate) fn visit(&self, prefix: &str, f: &mut dyn FnMut(String, cuteafd_ffi::CuteafdDeviceBuffer)) {
         self.tensors.visit(prefix, f);
         f(format!("{prefix}packed_scale"), self.scales.buffer);
+    }
+}
+
+#[cfg(test)]
+mod cold_capture_tests {
+    use super::*;
+    use crate::shared::decode_graph::CacheAttached;
+    use crate::families::deepseek_v41::v41_attention_query::AttentionQueryWeights;
+    use crate::shared::decode_graph::device::{Basis, Cycle, Preference, Site};
+
+    #[test]
+    #[ignore = "requires V4.1 checkpoint, AOT native library and CUDA GPU"]
+    fn first_query_publishes_eager_result_with_admitted_or_denied_capture() -> Result<()> {
+        // SAFETY: checkpoint, library, inputs and request state outlive every wave.
+        let library = unsafe { NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?)? };
+        library.cuda_set_device(0)?;
+        let catalog = cuteafd_loader::read_official_v41_catalog(std::path::Path::new(
+            &std::env::var("CUTEAFD_SNAPSHOT")?))?;
+        let query_weights = AttentionQueryWeights::load(&library, &catalog, 2, usize::MAX, 1 << 20)?;
+        let weights = WindowWeights::load(&library, &catalog, 2, usize::MAX, 1 << 20)?;
+        let mut query = query_weights.wave(2, usize::MAX)?;
+        let input: Vec<_> = (0..2 * 5120).flat_map(|i| {
+            let value = ((i * 37 % 61) as f32 - 30.) / 32.;
+            ((value.to_bits() >> 16) as u16).to_ne_bytes()
+        }).collect();
+        for admitted in [true, false] {
+            let mut state = WindowState::new(&library, 2, 1, usize::MAX)?;
+            let lease = state.begin_request(0, 1)?;
+            let chunks = [WindowChunk { lease, position: 0, tokens: 2 }];
+            let mut wave = weights.wave(2, usize::MAX)?;
+            wave.graphs.attach(&library, 0, 256 << 20, Site {
+                name: if admitted { "Window.cold.admitted" } else { "Window.cold.denied" },
+                cycle: Cycle::Prefill, preference: Preference::Capture,
+                bootstrap: if admitted { 2 << 20 } else { 1 << 30 },
+                basis: Basis::Bytes, spans_devices: false,
+            })?;
+            // Startup recording must not publish or consume a request proposal.
+            wave.capture_startup(&state, &[1])?;
+            assert!(wave.ready.is_none());
+            // SAFETY: preparation stages finite matching hidden rows and positions.
+            let produced = unsafe { query.execute_tokens_prepared(&[0, 1], |stream, buffer| {
+                library.copy_h2d(buffer, &input)?;
+                unsafe { library.cuda_stream_synchronize(stream) }
+            })? };
+            // Obtain an eager reference from the identical normalized query input.
+            library.copy_d2d(wave.input(), produced.hidden, produced.hidden.bytes)?;
+            let expected = unsafe {
+                let output = wave.execute(&state, &chunks)?;
+                let mut bytes = vec![0; output.values.bytes];
+                library.copy_d2h(&mut bytes, output.values)?;
+                bytes
+            };
+            let eager_snapshot = wave.ready.as_ref().context("eager proposal missing")?.snapshot;
+            // First real query misses the startup row-1 key. Capture records,
+            // but must return the completed eager row-2 proposal without replay.
+            unsafe { wave.execute_query(&state, &chunks, &produced)?; }
+            let prepared = wave.ready.as_ref().context("first query output unpublished")?;
+            assert_eq!(prepared.snapshot, eager_snapshot + 2, "cold capture prepared more than its query and eager execution");
+            assert_eq!(prepared.rows, 2);
+            assert_eq!(wave.current_graph().is_some(), admitted);
+            let output = wave.output(&state)?;
+            let mut actual = vec![0; output.values.bytes];
+            library.copy_d2h(&mut actual, output.values)?;
+            assert_eq!(actual, expected, "cold result differs, admitted={admitted}");
+            // A subsequent real query exercises replay or repeated eager denial.
+            unsafe { wave.execute_query(&state, &chunks, &produced)?; }
+            let output = wave.output(&state)?;
+            library.copy_d2h(&mut actual, output.values)?;
+            assert_eq!(actual, expected, "next query differs, admitted={admitted}");
+        }
+        Ok(())
     }
 }

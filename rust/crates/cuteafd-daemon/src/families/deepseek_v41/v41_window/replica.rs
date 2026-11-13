@@ -2,6 +2,7 @@
 use super::*;
 use crate::shared::memory::device::{Allocation, Device};
 use cuteafd_ffi::V41PeerCopy;
+use crate::shared::memory::Tag;
 
 pub(super) struct WindowStateReplica<'a> {
     pub storage: std::rc::Rc<WindowReplica<'a>>,
@@ -67,11 +68,11 @@ impl<'a> WindowReplica<'a> {
         ensure!(state.slots.iter().all(|slot|slot.request.is_none()) && state.writing.get()==0,
             "window replica requires no live requests");
         device.run(||device.library.cuda_enable_peer(state.values.buffer.device_id))?;
-        let ends=Allocation::new(device,state.ends.buffer.bytes)?;
+        let ends=Allocation::new(device,state.ends.buffer.bytes,Tag::kv("v41/window-cache-replica"))?;
         device.run(||device.library.copy_h2d(ends.buffer,&vec![0;ends.buffer.bytes]))?;
         Ok(Self { copy:device.run(||device.library.v41_peer_copy())?,
-            values:Allocation::attention_plane(device,state.values.buffer.bytes/512,512,"peer window cache values")?,
-            scales:Allocation::attention_plane(device,state.scales.buffer.bytes/16,16,"peer window cache scales")?,ends,owner:state.owner })
+            values:Allocation::attention_plane(device,state.values.buffer.bytes/512,512,"peer window cache values", Tag::kv("v41/window-cache-replica"))?,
+            scales:Allocation::attention_plane(device,state.scales.buffer.bytes/16,16,"peer window cache scales", Tag::kv("v41/window-cache-replica"))?,ends,owner:state.owner })
     }
     /// # Safety
     /// The peer stream follows the source's accepted ring writes and end update.
@@ -209,7 +210,7 @@ mod tests {
                 }
                 drop(append);
                 assert!(unsafe { replica.copy_commit(&state,lease,402,producer.raw) }.is_err());
-                let storage=DeviceAllocation::new(&lib,WINDOW_PREFIX_BYTES)?;
+                let storage=DeviceAllocation::new(&lib,WINDOW_PREFIX_BYTES, crate::shared::memory::TEST)?;
                 let (begin,end)=unsafe { state.retain_prefix(lease,storage.buffer,producer.raw)? };
                 producer.drain()?;
                 for restore_device in [owner,peer] {
@@ -224,14 +225,10 @@ mod tests {
                 }
                 state.release(lease)?;
                 assert!(unsafe { replica.view(&state,lease) }.is_err());
-                let replay=state.begin_request(0,3)?;
-                check(&state,replay,&expected_values,&expected_scales)?;
-                state.begin_encoder_replay(replay,900)?;
-                let view=unsafe { replica.view(&state,replay)? };
-                assert_eq!((view.begin,view.end),(900,900));
-                check(&state,replay,&expected_values,&expected_scales)?;
+                let fresh=state.begin_request(0,3)?;
+                check(&state,fresh,&expected_values,&expected_scales)?;
                 let foreign=WindowState::new(&lib,1,2,WindowState::device_bytes(1,2)?)?;
-                assert!(unsafe { replica.view(&foreign,replay) }.is_err());
+                assert!(unsafe { replica.view(&foreign,fresh) }.is_err());
                 Ok(())
             })?;
         }

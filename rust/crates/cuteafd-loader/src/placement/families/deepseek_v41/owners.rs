@@ -113,15 +113,56 @@ pub fn transports_bytes(decode_rows: u64, rows: u64, ranks: usize, slots: usize,
     Ok(lanes + outputs + crate::serving_capacity::prefill_return_bytes_with_format(slots as u64, rows, ranks as u64, 5120, format)?)
 }
 
-/// Full vocabulary packing peak above the pre-weight sample: the resident
-/// weights (but the head being packed) and the packing staging. Every lane
-/// and slot owner, transport, draft, vision and mark allocates after it.
-pub fn vocabulary_load_phase(weights: &[Demand], target: &[Demand], packing: u64) -> Result<Demand> {
-    ensure!(weights.iter().chain(target).all(|d| d.gpu == 0),
-        "vocabulary startup phase requires the single-RTX owners");
-    let bytes = weights.iter().filter(|d| !matches!(d.group.as_str(), "lm_head" | "norm")).try_fold(packing, |sum, d|
-        sum.checked_add(d.bytes).context("V4.1 vocabulary phase overflow"))?;
+/// Single-RTX vocabulary packing peak above the pre-weight sample. The whole
+/// target arena (final head copy included) is allocated before any payload, so
+/// the peak is its extent B plus the head conversion's transient source, the
+/// same bound `TargetArenas::new` checks before allocating. Every lane and slot
+/// owner, transport, draft, vision and mark allocates after it.
+pub fn vocabulary_load_phase(arena: &crate::serving_capacity::WeightArenaLayout,
+    head: super::resident::Fp8Head) -> Result<Demand> {
+    let transient = super::weight_layout::TargetLayout::vocabulary_transient_bytes(head, 1)? as u64;
+    let bytes = (arena.bytes() as u64).checked_add(transient).context("V4.1 vocabulary phase overflow")?;
     Ok(Demand::new(0, Category::Staging, "vocabulary packing", bytes, Basis::Formula))
+}
+
+/// BF16 sources coexist with all push destinations and workspaces until the
+/// group commits. Charge them during Load, never as retained target weights.
+pub fn packed_head_load_owners(layouts: &[crate::serving_capacity::WeightArenaLayout])
+    -> Result<Vec<super::admission::Owner>> {
+    use crate::placement::planner::{Lifetime, Phase};
+    if !layouts.iter().any(|layout| layout.view("head.packed12").is_some()) { return Ok(Vec::new()); }
+    let heads = layouts.iter().filter(|layout| layout.view("head.packed12").is_some()).collect::<Vec<_>>();
+    let bytes = super::weight_layout::TargetLayout::vocabulary_transient_bytes(Fp8Head::Packed, heads.len())? as u64;
+    Ok(heads.iter().enumerate()
+        .map(|(rank, _)| super::admission::Owner::charged(rank as u8, Category::Staging,
+            "vocabulary BF16 push source", bytes)
+            .with_lifetime(Lifetime { first: Phase::Load, last: Phase::Load })).collect())
+}
+
+/// Retained device target weights as one demand per arena (extent B, resident
+/// B), replacing the per-tensor `resident_headers` device items. Load phases,
+/// the pre-draft sample and admission all see the arena exactly where the
+/// payload used to be; `ProductionInput::weight_arenas` carries the layouts.
+pub fn target_arena_demands(layout: &super::weight_layout::TargetLayout) -> Vec<Demand> {
+    layout.ranks.iter().enumerate().map(|(rank, arena)| arena_demand(rank as u8, arena)).collect()
+}
+
+/// One arena's placeholder demand (extent B, resident B): every load phase and
+/// sum sees it where the payload was. `ProductionInput` binds it by arena ID to
+/// its layout and charges the shared root, logical claim and tail.
+pub fn arena_demand(gpu: u8, arena: &crate::serving_capacity::WeightArenaLayout) -> Demand {
+    Demand::new(gpu, Category::Weights, format!("{WEIGHT_ARENA_PREFIX}{}", arena.id()),
+        arena.bytes() as u64, Basis::Exact)
+        .with_resident_weights(crate::placement::ResidentWeights(arena.bytes() as u64))
+}
+
+/// Arena demands are named `weight arena:<layout id>`.
+pub const WEIGHT_ARENA_PREFIX: &str = "weight arena:";
+
+/// The device weight items the arenas replace: everything `resident_headers`
+/// places on a coordinator GPU (a host-placed embedding stays a host owner).
+pub fn is_arena_weight(item: &cuteafd_core::memory_layout::Item) -> bool {
+    matches!(item.category, Category::Weights | Category::Embedding | Category::Tables)
 }
 
 /// Serving lanes allocated after the dual-RTX draft loader drains. Setup is
@@ -191,16 +232,54 @@ impl TargetOwners {
     }
 }
 
+/// All compressor/index plans borrow the serving thread's Lt pool. dSpark's
+/// Markov GEMM lives only beside the terminal; vocabulary plans join that pool.
+pub fn blas_owners(ranks: usize, head: crate::placement::planner::serving::BlasHead,
+    dspark: bool) -> Result<Vec<crate::placement::planner::serving::BlasOwners>> {
+    use crate::placement::planner::{Activation, Lifetime, Location, Phase, serving::BlasOwners};
+    ensure!(matches!(ranks, 1 | 2), "invalid V4.1 BLAS owners");
+    let mut owners = (0..ranks).map(|gpu| BlasOwners {
+        name: format!("V4.1 compressor, index and vocabulary owner{gpu}"),
+        process: "coordinator".into(), thread: "v41/blas/serve".into(),
+        location: Location::coordinator(gpu as u8), gemm: head.gemm(), lt: true,
+        lifetime: Lifetime::RESIDENT, activation: Activation::always(),
+    }).collect::<Vec<_>>();
+    if dspark {
+        owners.push(BlasOwners { name: "V4.1 dSpark Markov and terminal".into(),
+            process: "coordinator".into(), thread: "v41/blas/serve".into(),
+            location: Location::coordinator((ranks - 1) as u8), gemm: true, lt: false,
+            lifetime: Lifetime { first: Phase::DraftLoad, last: Phase::Growth },
+            activation: Activation::always() });
+    }
+    Ok(owners)
+}
+
+/// Draft-row bucket a concurrency and draft width resolve to: the smallest
+/// compiled draft shape the lanes' live rows fit. Offline layout and serving
+/// admission both select modules with it, so the predicted module set and the
+/// one the drafter loads are the same.
+pub fn draft_rows(concurrency: u64, width: u8) -> u64 {
+    let lanes = if concurrency == 1 { 1 } else { 2 };
+    let live = concurrency.div_ceil(lanes) * if width > 5 { 7u64 } else { 5u64 };
+    [16, 40, cuteafd_core::V41_DRAFT_LEGACY_ROWS as u64,
+        cuteafd_core::V41_DRAFT_WIDE_ROWS as u64].into_iter()
+        .find(|&rows| rows >= live)
+        .unwrap_or(cuteafd_core::V41_DRAFT_WIDE_ROWS as u64)
+}
+
 pub struct NativePrograms<'a> {
     manifest: &'a Value,
     sms: u32,
     compressed: cuteafd_core::coordinator_programs::SparseAttentionBackend,
+    split_query: bool,
+    split_output: bool,
 }
 
 impl<'a> NativePrograms<'a> {
     pub fn new(manifest: &'a Value, sms: u32) -> Result<Self> {
         ensure!(sms > 0, "V4.1 native plans require physical SM count");
-        Ok(Self { manifest, sms, compressed: cuteafd_core::coordinator_programs::SparseAttentionBackend::Bf16Aot })
+        Ok(Self { manifest, sms, compressed: cuteafd_core::coordinator_programs::SparseAttentionBackend::Bf16Aot,
+            split_query: false, split_output: false })
     }
 
     /// The compressed sparse attention kernel the coordinator architecture
@@ -208,6 +287,63 @@ impl<'a> NativePrograms<'a> {
     /// `--coordinator-arch`, serve the measured device. BF16 AOT by default.
     pub fn with_compressed_attention(self, compressed: cuteafd_core::coordinator_programs::SparseAttentionBackend) -> Self {
         Self { compressed, ..self }
+    }
+
+    /// Match target lane allocation when q_b/o_b are loaded as TP2 shards.
+    /// The separate projection storages are charged by `projection_tp2_owners`.
+    pub fn with_projection_tp2(self, split_query: bool, split_output: bool) -> Self {
+        Self { split_query, split_output, ..self }
+    }
+
+    fn query_b_scratch(&self, rows: u64) -> Result<u64> {
+        if self.split_query { Ok(0) } else { self.scratch(rows, 1280, 32768) }
+    }
+
+    fn output_b_scratch(&self, rows: u64) -> Result<u64> {
+        if self.split_output { Ok(0) } else { self.scratch(rows, 8192, 5120) }
+    }
+
+    /// The fork's two attention owners per decode pass and per shared prefill
+    /// storage. Weight payload and packed scales belong to TargetLayout; only
+    /// temporary raw scales coexist with it during Load. Waves share storage.
+    pub fn projection_tp2_owners(&self, decode_rows: u64, capacity: u64, ranks: usize,
+        split_query: bool, split_output: bool) -> Result<Vec<super::admission::Owner>> {
+        use super::admission::Owner;
+        use crate::placement::planner::{Lifetime, Phase};
+        ensure!(matches!(ranks, 1 | 2) && (!(split_query || split_output) || ranks == 2),
+            "projection TP2 requires two target GPUs");
+        ensure!(self.split_query == split_query && self.split_output == split_output,
+            "projection TP2 owner flags differ from target programs");
+        ensure!((1..=4096).contains(&decode_rows) && (1..=4096).contains(&capacity),
+            "invalid projection TP2 row capacity");
+        let mut out = Vec::new();
+        let mut staging = 0;
+        for (enabled, name, k, n) in [(split_query, "query", 1280, 32768),
+            (split_output, "output", 8192, 5120)] {
+            if !enabled { continue; }
+            // Each rank retains scratch, alpha, BF16 input and FP16 half
+            // output; the gathered BF16 output lives on its attention owner.
+            let rank_storage = |rows| -> Result<u64> {
+                Ok(self.scratch(rows, k, n / 2)? + 16 + rows * k * 2 + rows * n)
+            };
+            let decode = 2 * (2 * rank_storage(decode_rows)? + decode_rows * n * 2);
+            let prefill = 2 * rank_storage(capacity)? + capacity * n * 2;
+            for gpu in 0..2 {
+                out.push(Owner::charged(gpu, Category::Workspace,
+                    format!("TP2 {name} projection decode"), decode));
+                out.push(Owner::charged(gpu, Category::Workspace,
+                    format!("TP2 {name} projection prefill"), prefill));
+            }
+            // Sequential matrix scale transforms reuse one raw-grid peak.
+            staging = staging.max(k * (n / 2) / 1024);
+        }
+        if staging > 0 {
+            for gpu in 0..2 {
+                out.push(Owner::charged(gpu, Category::Staging, "TP2 projection raw scales", staging)
+                    .with_lifetime(Lifetime { first: Phase::Load, last: Phase::Load }));
+            }
+        }
+        Ok(out)
     }
 
     pub fn compressed_attention(&self) -> cuteafd_core::coordinator_programs::SparseAttentionBackend { self.compressed }
@@ -218,19 +354,70 @@ impl<'a> NativePrograms<'a> {
                 .context("V4.1 projection arena overflow"))
     }
 
+    /// Selected native projection modules, not the all-family PROGRAMS.json.
+    /// Each selected variant loads quantization and GEMM; grouped queries also
+    /// load their RoPE quantizer. The shared module formula includes fixed CUDA
+    /// kernels, but no BLAS residency or graph executables.
+    pub fn modules(&self, decode_rows: u64, unit: u64, ranks: usize,
+        draft_rows: Option<u64>) -> Result<Vec<ProgramSet>> {
+        ensure!(matches!(ranks, 1 | 2), "invalid V4.1 module owners");
+        ensure!(!(self.split_query || self.split_output) || ranks == 2, "projection TP2 requires two target GPUs");
+        let mut target = vec![(5120, 1280), (32768, 8192), (5120, 512), (1280, 4096)];
+        target.push((1280, if self.split_query { 16384 } else { 32768 }));
+        target.push((8192, if self.split_output { 2560 } else { 5120 }));
+        (0..ranks).map(|rank| {
+            let mut selected = std::collections::BTreeSet::new();
+            let mut add = |rows, matrices: &[(u64, u64)]| -> Result<()> {
+                let plans = ProgramSet::v41_fp8(self.manifest, matrices, rows, self.sms)?;
+                for label in plans.names {
+                    selected.insert(format!("{label}/quant"));
+                    selected.insert(format!("{label}/gemm"));
+                    let variant = self.manifest["variants"].as_array().context("missing native module variants")?.iter()
+                        .find(|variant| variant["label"].as_str() == Some(label.as_str()))
+                        .context("selected native module label disappeared")?;
+                    if variant["groups"].as_u64().unwrap_or(1) > 1 {
+                        selected.insert(format!("{label}/quant_rope"));
+                    }
+                }
+                Ok(())
+            };
+            for rows in [decode_rows, unit] {
+                add(rows, &target)?;
+                if rank == 0 { add(rows, &[(6144, 25600)])?; }
+                add(rows, if ranks == 1 { &[(5120, 2304), (2304, 5120)] }
+                    else { &[(5120, 1152), (1152, 5120)] })?;
+            }
+            if rank == ranks - 1 {
+                if let Some(rows) = draft_rows {
+                    add(rows, &[(5120, 1280), (1280, 32768), (32768, 8192),
+                        (8192, 5120), (5120, 512), (1280, 4096)])?;
+                    add(rows, &[(15360, 5120), (5120, 2304), (2304, 5120)])?;
+                }
+            }
+            Ok(ProgramSet { families: vec!["v41".into()],
+                names: selected.into_iter().collect(), scratch: Vec::new() })
+        }).collect()
+    }
+
     fn shared_ffn(&self, rows: u64) -> Result<u64> {
         Ok(self.scratch(rows, 5120, 2304)? + self.scratch(rows, 2304, 5120)?
             + rows * 2304 * 6 + 4)
     }
 
     fn projection(&self, rows: u64, k: u64, n: u64) -> Result<u64> {
-        Ok(self.scratch(rows, k, n)? + rows * (k + n) * 2 + 4)
+        Ok(crate::serving_capacity::v41_workspace::projection(rows as usize, k as usize, n as usize,
+            self.scratch(rows, k, n)? as usize, true)?.bytes() as u64)
+    }
+
+    fn external_projection(&self, rows: u64, k: u64, n: u64) -> Result<u64> {
+        Ok(crate::serving_capacity::v41_workspace::projection(rows as usize, k as usize, n as usize,
+            self.scratch(rows, k, n)? as usize, false)?.bytes() as u64)
     }
 
     fn main_context(&self, rows: u64) -> Result<u64> {
         Ok(self.projection(rows, 15360, 5120)? + 3 * cuteafd_core::V41_WRITE_DESCRIPTOR_BYTES as u64
             + rows * (10240 + 256 + 8 + 3 * 1024)
-            + 3 * (self.projection(rows, 5120, 512)? - rows * 10240))
+            + 3 * self.external_projection(rows, 5120, 512)?)
     }
 
     /// The vocabulary GEMVs' split-K over 128-wide K blocks (gemv_tiles.cuh).
@@ -254,9 +441,8 @@ impl<'a> NativePrograms<'a> {
 
     /// `cuteafd_packed_head_workspace`: the row-64 B fragments plus runtime-SM split-K.
     pub fn packed_vocabulary_scratch(&self, rows: u64, n: u64) -> Result<u64> {
-        let splits = self.vocabulary_splits(rows, n)?;
-        let align = |bytes: u64| bytes.div_ceil(256) * 256;
-        Ok(align(5120 * 64 * 2) + if splits > 1 { align(splits * rows.min(64) * n * 4) } else { 0 })
+        self.vocabulary_splits(rows, n)?;
+        Ok(cuteafd_core::packed_head::workspace_bytes(rows, 5120, n, u64::from(self.sms)))
     }
 
     /// Scratch of one projection through `mode`'s resident copy of the vocabulary.
@@ -286,15 +472,17 @@ impl<'a> NativePrograms<'a> {
                 rank as u8, Category::Workspace, format!("prefill slots {group}"), bytes, Basis::Formula));
             let placed = ranks == 2;
             // LaneStorage (WP7): HC boundaries, query, output, shared, sparse, router.
-            let query = 4 + u * 81160 + self.scratch(u, 5120, 1280)? + self.scratch(u, 1280, 32768)?;
-            let output = 4 + r * 92424 + self.scratch(u, 32768, 8192)? + self.scratch(u, 8192, 5120)?;
+            let query = 4 + u * 81160 + self.scratch(u, 5120, 1280)? + self.query_b_scratch(u)?;
+            let output = 4 + r * 92424 + self.scratch(u, 32768, 8192)? + self.output_b_scratch(u)?;
             let shared = if placed { 0 } else { self.shared_ffn(u)? + r * 20480 };
             let sparse = sparse_attention_bytes(u, self.compressed)?;
-            add(&mut out, "lane", 2 * r * 112752 + query + output + shared + sparse + r * 17105);
+            add(&mut out, "lane", 2 * crate::serving_capacity::v41_workspace::hc(r as usize)?.bytes() as u64
+                + query + output + shared + sparse + r * 17105);
             // Cache producers: window storage and the source compressor storage(s).
             let windows = if placed { (0..40).filter(|&l| v41_attention_gpu(l) == rank).count() as u64 } else { 40 };
             let window = if windows == 0 { 0 } else {
-                self.scratch(u, 5120, 512)? + 4 + u * (10240 + 1024 + 1024 + 8 + 256) + windows * r * (512 + 16 + 8)
+                crate::serving_capacity::v41_workspace::window(r as usize, u as usize,
+                    &(0..windows as usize).collect::<Vec<_>>(), self.scratch(u, 5120, 512)? as usize)?.bytes() as u64
             };
             let sources: Vec<u64> = [2u64, 8, 14, 20].into_iter()
                 .filter(|&l| !placed || v41_attention_gpu(l as usize) == rank).collect();
@@ -324,8 +512,8 @@ impl<'a> NativePrograms<'a> {
             let gates = [1usize, 14].iter().filter(|&&l| !placed || v41_attention_gpu(l) == rank).count() as u64;
             if gates > 0 {
                 add(&mut out, "engram rows", r * crate::ENGRAM_DEVICE_ROW_BYTES as u64);
-                add(&mut out, "engram gates", gates * (u * (40960 * 2 + 51200 + 24 * 512 + 1)
-                    + self.scratch(u, 6144, 25600)? + 4));
+                add(&mut out, "engram gates", gates * crate::serving_capacity::v41_workspace::engram(
+                    u as usize, self.scratch(u, 6144, 25600)? as usize)?.bytes() as u64);
             }
             if rank == ranks - 1 { add(&mut out, "target taps", r * 30720); }
             add(&mut out, "target heads", slots as u64 * self.head(ranks, rank, head_mode)?);
@@ -357,6 +545,7 @@ impl<'a> NativePrograms<'a> {
     /// prefill slots' storage ([`Self::prefill_slots`]).
     pub fn target(&self, decode_rows: u64, reserve: u64, unit: u64, ranks: usize, slots: usize, concurrency: u64,
         head_mode: Fp8Head, window_batch: bool) -> Result<Vec<Demand>> {
+        ensure!(!(self.split_query || self.split_output) || ranks == 2, "projection TP2 requires two target GPUs");
         let mut out = self.decode_lanes(decode_rows, ranks, head_mode, window_batch)?;
         out.extend(self.prefill_slots(reserve, unit, ranks, slots, concurrency, head_mode, window_batch)?);
         Ok(out)
@@ -373,22 +562,24 @@ impl<'a> NativePrograms<'a> {
                 let add = |out: &mut Vec<Demand>, group: &str, bytes| out.push(Demand::new(
                     rank as u8, Category::Workspace, format!("lane {lane} {group}"), bytes, Basis::Formula));
                 let query = 4 + rows * (10240 + 2560 + 2560 + 65536 + 8 + 256)
-                    + self.scratch(rows, 5120, 1280)? + self.scratch(rows, 1280, 32768)?;
+                    + self.scratch(rows, 5120, 1280)? + self.query_b_scratch(rows)?;
                 let output = 4 + rows * (65536 + 16384 + 10240 + 8 + 256)
-                    + self.scratch(rows, 32768, 8192)? + self.scratch(rows, 8192, 5120)?;
+                    + self.scratch(rows, 32768, 8192)? + self.output_b_scratch(rows)?;
                 let sparse = sparse_attention_bytes(rows, self.compressed)?;
                 let shared = if ranks == 1 { self.shared_ffn(rows)? + rows * 20480 } else { 0 };
-                add(&mut out, "backbone", 2 * rows * 112752 + query + output + sparse
+                add(&mut out, "backbone", 2 * crate::serving_capacity::v41_workspace::hc(rows as usize)?.bytes() as u64
+                    + query + output + sparse
                     + rows * (11825 + 5280) + shared);
                 // One shared window producer scratch per pass and GPU; each of
                 // the GPU's window layers keeps only its proposal and commit
                 // destinations until the accepted rows commit.
-                let window_scratch = self.scratch(rows, 5120, 512)? + 4 + rows * (10240 + 1024 + 1024 + 8 + 256);
-                let window_proposal = rows * (512 + 16 + 8);
+                let window = crate::serving_capacity::v41_workspace::window(rows as usize, rows as usize,
+                    &(0..if ranks == 1 { 40 } else { 20 }).collect::<Vec<_>>(),
+                    self.scratch(rows, 5120, 512)? as usize)?.bytes() as u64;
                 let compressor = |ratio2| BLAS + rows * if ratio2 {
                     10240 + 2048 + 2048 + 8 + 1024 + 264 + 512 + 68 + 8 + 288
                 } else { 10240 + 1024 + 1024 + 264 + 512 + 68 + 8 + 288 };
-                add(&mut out, "cache producers", window_scratch + window_proposal * if ranks == 1 { 40 } else { 20 }
+                add(&mut out, "cache producers", window
                     + if rank == 0 { 3 * compressor(true) } else { 0 }
                     + if rank == ranks - 1 { compressor(false) } else { 0 });
                 if window_batch {
@@ -408,8 +599,8 @@ impl<'a> NativePrograms<'a> {
                     // Keep it distinct from gate scratch so admission can assert
                     // k * unit_rows exactly, without charging the upload twice.
                     add(&mut out, "engram rows", rows * crate::ENGRAM_DEVICE_ROW_BYTES as u64);
-                    add(&mut out, "engram gates", 2 * (rows * (40960 * 2 + 51200 + 24 * 512 + 1)
-                        + self.scratch(rows, 6144, 25600)? + 4));
+                    add(&mut out, "engram gates", 2 * crate::serving_capacity::v41_workspace::engram(
+                        rows as usize, self.scratch(rows, 6144, 25600)? as usize)?.bytes() as u64);
                 }
                 if rank == ranks - 1 { add(&mut out, "target taps", index_rows * 30720); }
                 add(&mut out, "target head", self.head(ranks, rank, head_mode)?);
@@ -449,7 +640,8 @@ impl<'a> NativePrograms<'a> {
             + self.projection(capacity, 1280, 32768)?
             + self.projection(capacity, 5120, 512)?;
         let chain = 3 * (expert + self.shared_ffn(capacity)? + capacity * 128 * 4
-            + 2 * capacity * 112752 + attention) + members * 4;
+            + 2 * crate::serving_capacity::v41_workspace::hc(capacity as usize)?.bytes() as u64
+            + attention) + members * 4;
         let terminal = members * (width * VOCAB * 8 + (width + 2) * 4 + 16
             + width * 10240 + width * (40960 + 16)) + BLAS
             + members * (4 + 512 + VOCAB * 4) + BLAS
@@ -523,7 +715,8 @@ mod tests {
     fn manifest() -> Value {
         let matrices = [(5120, 1280), (1280, 32768), (32768, 8192), (8192, 5120),
             (5120, 2304), (2304, 5120), (5120, 512), (1280, 4096),
-            (6144, 25600), (15360, 5120)];
+            (6144, 25600), (15360, 5120), (5120, 1152), (1152, 5120),
+            (1280, 16384), (8192, 2560)];
         let variants = matrices.into_iter().flat_map(|(k, n)| {
             [1, 16, 64, 80, 256, 1024, 4096].map(move |rows| json!({
                 "capacity": rows, "input_dim": k, "output_dim": n,
@@ -547,6 +740,123 @@ mod tests {
     }
 
     #[test]
+    fn tp2_projection_owners_match_all_retained_storages_and_sequential_load_peak() -> Result<()> {
+        use crate::placement::planner::{Lifetime, Phase};
+        let manifest = manifest();
+        let programs = NativePrograms::new(&manifest, 128)?;
+        assert!(programs.projection_tp2_owners(64, 256, 2, false, false)?.is_empty());
+        assert!(programs.projection_tp2_owners(64, 256, 1, true, false).is_err());
+        for (query, output) in [(true, false), (false, true), (true, true)] {
+            let split = NativePrograms::new(&manifest, 128)?.with_projection_tp2(query, output);
+            let owners = split.projection_tp2_owners(64, 256, 2, query, output)?;
+            for gpu in 0..2 {
+                let workspace = owners.iter().filter(|o| o.location == crate::placement::planner::Location::coordinator(gpu)
+                    && o.category == Category::Workspace).map(|o| o.bytes).sum::<u64>();
+                // Independently enumerate actual Wave/Storage allocations:
+                // two passes, each with both attention owners; then two
+                // prefill storages shared over all prefill waves.
+                let mut expected = 0;
+                for (enabled, k, n) in [(query, 1280, 32768), (output, 8192, 5120)] {
+                    if !enabled { continue; }
+                    for (rows, passes) in [(64, 2), (256, 1)] {
+                        for owner in 0..2 {
+                            expected += passes * (programs.scratch(rows, k, n / 2)? + 16
+                                + rows * k * 2 + rows * n + if owner == gpu { rows * n * 2 } else { 0 });
+                        }
+                    }
+                }
+                assert_eq!(workspace, expected);
+                let stages = owners.iter().filter(|o| o.location == crate::placement::planner::Location::coordinator(gpu)
+                    && o.category == Category::Staging).collect::<Vec<_>>();
+                assert_eq!(stages.len(), 1);
+                assert_eq!(stages[0].bytes, 20480);
+                assert_eq!(stages[0].lifetime, Lifetime { first: Phase::Load, last: Phase::Load });
+                assert!(owners.iter().all(|o| o.resident == 0));
+            }
+            let baseline = programs.target(64, 512, 256, 2, 2, 1, Fp8Head::All, false)?;
+            let target = split.target(64, 512, 256, 2, 2, 1, Fp8Head::All, false)?;
+            for gpu in 0..2 {
+                let saved = |rows| -> Result<u64> { Ok(
+                    if query { programs.scratch(rows, 1280, 32768)? } else { 0 }
+                    + if output { programs.scratch(rows, 8192, 5120)? } else { 0 }) };
+                for lane in 0..2 {
+                    let group = format!("lane {lane} backbone");
+                    assert_eq!(owner(&baseline, gpu, &group) - owner(&target, gpu, &group), saved(64)?);
+                }
+                assert_eq!(owner(&baseline, gpu, "prefill slots lane")
+                    - owner(&target, gpu, "prefill slots lane"), saved(256)?);
+            }
+            let modules = split.modules(64, 256, 2, None)?;
+            assert_eq!(modules[0].names.iter().any(|n| n.contains("matrix_1280_16384_")), query);
+            assert_eq!(modules[0].names.iter().any(|n| n.contains("matrix_8192_2560_")), output);
+            let draft = split.modules(64, 256, 2, Some(80))?;
+            assert!(draft[1].names.iter().any(|n| n.contains("matrix_1280_32768_80")));
+            assert!(draft[1].names.iter().any(|n| n.contains("matrix_8192_5120_80")));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn selected_native_modules_follow_devices_capacities_and_draft_home() -> Result<()> {
+        let manifest = manifest();
+        let programs = NativePrograms::new(&manifest, 188)?;
+        let target = programs.modules(DECODE_LANE_ROWS, 256, 2, None)?;
+        assert!(target[0].names.iter().any(|name| name.contains("6144_25600")));
+        assert!(!target[1].names.iter().any(|name| name.contains("6144_25600")));
+        assert!(target.iter().all(|set| set.names.iter().any(|name| name.contains("5120_1152"))));
+        assert!(target.iter().all(|set| !set.names.iter().any(|name| name.contains("_4096/"))));
+        let draft = programs.modules(DECODE_LANE_ROWS, 256, 2, Some(80))?;
+        assert_eq!(target[0], draft[0]);
+        assert!(draft[1].names.iter().any(|name| name.contains("15360_5120")));
+        assert!(draft[1].names.len() > target[1].names.len());
+        for set in draft {
+            assert_eq!(set.names.len(), set.names.iter().collect::<std::collections::BTreeSet<_>>().len());
+            assert!(set.scratch.is_empty());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn blas_pools_follow_compressors_and_decoder_markov_not_lanes() -> Result<()> {
+        use crate::placement::planner::serving::BlasHead;
+        for ranks in [1, 2] {
+            for head in [BlasHead::Native, BlasHead::Gemm, BlasHead::TensorLt] {
+                let target = blas_owners(ranks, head, false)?;
+                assert_eq!(target.len(), ranks);
+                assert!(target.iter().all(|owner| owner.lt && owner.gemm == head.gemm()));
+                let draft = blas_owners(ranks, head, true)?;
+                assert_eq!(draft.len(), ranks + 1);
+                assert_eq!(draft.last().unwrap().location, crate::placement::planner::Location::coordinator((ranks - 1) as u8));
+                assert!(draft.last().unwrap().gemm);
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn packed_push_source_coexists_with_all_load_owners_on_each_gpu() -> Result<()> {
+        use crate::placement::planner::{Lifetime, Phase};
+        use crate::serving_capacity::WeightArenaLayout;
+        assert!(packed_head_load_owners(&[])?.is_empty());
+        for ranks in [1, 2] {
+            let layouts = (0..ranks).map(|rank| WeightArenaLayout::new(format!("v41/target/gpu{rank}"),
+                super::super::weight_layout::head_requests(129280 / ranks, Fp8Head::Packed)?))
+                .collect::<Result<Vec<_>>>()?;
+            let owners = packed_head_load_owners(&layouts)?;
+            assert_eq!(owners.len(), ranks);
+            for (rank, owner) in owners.iter().enumerate() {
+                assert_eq!(owner.location, crate::placement::planner::Location::coordinator(rank as u8));
+                assert_eq!(owner.bytes, (129280 / ranks * 10240) as u64);
+                assert_eq!(owner.resident, 0);
+                assert_eq!(owner.category, Category::Staging);
+                assert_eq!(owner.lifetime, Lifetime { first: Phase::Load, last: Phase::Load });
+                assert!(layouts[rank].view("head.bf16").is_none());
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
     fn vocabulary_phase_charges_only_the_resident_weights_before_any_lane() -> Result<()> {
         let demand = |group: &str, bytes| Demand::new(0, Category::Workspace, group, bytes, Basis::Formula);
         let weights = vec![demand("attention", 100), demand("engram-projections", 20),
@@ -554,12 +864,17 @@ mod tests {
         let target = vec![demand("lane 0 backbone", 40), demand("lane 0 engram", 30),
             demand("lane 0 window batch table", 5), demand("lane 0 target head", 60),
             demand("lane 0 target taps", 70), demand("lane 1 backbone", 80)];
-        // Lanes and slots allocate after the head is packed.
-        let phase = vocabulary_load_phase(&weights, &target, 400)?;
-        assert_eq!(phase.bytes, 400 + 100 + 20 + 50);
-        assert_eq!(phase.category, Category::Staging);
-        assert!(vocabulary_load_phase(&[demand("attention", u64::MAX)], &target, 400).is_err());
-        assert!(vocabulary_load_phase(&[demand("attention", 1).on(1)], &target, 400).is_err());
+        let _ = (&weights, &target);
+        // The whole target arena exists before the head converts; only the
+        // mode's transient source sits beside it. Lanes and slots come after.
+        let arena = crate::serving_capacity::WeightArenaLayout::new("v41/target/gpu0",
+            [("head.fp8.payload".to_string(), 3 << 20), ("norm.weight".to_string(), 10)])?;
+        for (head, transient) in [(Fp8Head::All, 16 * 10240), (Fp8Head::Off, 0), (Fp8Head::Draft, 0),
+            (Fp8Head::Packed, 129280 * 10240)] {
+            let phase = vocabulary_load_phase(&arena, head)?;
+            assert_eq!(phase.bytes, arena.bytes() as u64 + transient, "{head:?}");
+            assert_eq!(phase.category, Category::Staging);
+        }
         for ranks in 1..=cuteafd_core::MAX_SPARK_WORLD {
             assert_eq!(transport_bytes(1024, ranks)?, ranks as u64 * cuteafd_core::serving_capacity::spark_intake_allocation_bytes(1024 * 10240)?
                 + 2 * 1024 * 10240);
@@ -599,9 +914,11 @@ mod tests {
         let target = vec![demand(0, "lane 0 backbone", 40), demand(0, "lane 0 engram", 30),
             demand(0, "lane 0 window batch table", 5), demand(0, "lane 0 target head", 60),
             demand(0, "lane 0 target taps", 70), demand(0, "lane 1 backbone", 80)];
-        let vocabulary = vocabulary_load_phase(&weights, &target,
-            Fp8Head::All.load_bytes(1_323_827_200))?;
-        assert_eq!(vocabulary.bytes, 2_006_425_845 - 40 - 30 - 5);
+        let _ = (&weights, &target);
+        let arena = crate::serving_capacity::WeightArenaLayout::new("v41/target/gpu0",
+            [("weights".to_string(), 170), ("head.fp8.payload".to_string(), 682_598_400)])?;
+        let vocabulary = vocabulary_load_phase(&arena, Fp8Head::All)?;
+        assert_eq!(vocabulary.bytes, arena.bytes() as u64 + 16 * 10240);
         let draft = DraftInventory { resident: 600, loading_experts: [500, 0],
             staging: [200, 0], loader_peak: [600, 0], marks: 50,
             runtime: vec![demand(0, "draft runtime", 70)], ..Default::default() };
@@ -612,8 +929,7 @@ mod tests {
         assert_eq!(single.draft_load_phases(&draft)?[0].bytes, 682_599_765);
         assert_eq!(single.fixed.iter().map(|d| d.bytes).sum::<u64>(), 688_039_877);
         assert!(single.fixed.iter().all(|d| d.lifetime == ItemLifetime::ReadyResident));
-        let draft_owner = super::super::drafter(&draft, 1)?;
-        assert_eq!(draft_owner.conditional.iter().flat_map(|home| &home.demands).map(|d| d.bytes).sum::<u64>(), 720);
+        assert_eq!(super::super::admission::draft_owners(&draft, 1)?.iter().map(|o| o.bytes).sum::<u64>(), 720);
 
         let mut dual = TargetOwners::new(vec![demand(0, "weights", 100), demand(1, "weights", 200)],
             vec![demand(0, "target", 30), demand(1, "target", 40)], 2, 200, 2)?;

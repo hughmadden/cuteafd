@@ -3,7 +3,7 @@
 //! every active sequence. With a DFlash2 drafter (--draft), every step first
 //! drafts after each sequence's next token on the GPU and verifies as many
 //! drafts as the shared resource-priced draft policy (`cuteafd_core::
-//! draft_policy` through `draft_binding`) finds worthwhile under one row
+//! draft_policy` through `shared::draft::resource`) finds worthwhile under one row
 //! budget; a copy window anchored to its confident leading positions extends the
 //! drafter's confident horizon; copies never stand alone without a drafter.
 //!
@@ -24,6 +24,7 @@
 //! at its last chunk; a decode whose client left is not retained.
 //! `prompt_cache_hit_tokens` reports the restored rows; `/v1/stats` carries
 //! the cache's counters.
+use crate::shared::draft::resource;
 use super::engine::{GlmfEngine, GlmfPlacement, DECODE_ROWS, PAGE_ROWS, WIDE_DECODE_ROWS};
 use super::prefix::{GlmfPrefix, PrefixMarks};
 use super::packing;
@@ -70,16 +71,8 @@ pub(crate) struct ServeArgs {
     /// template's Low effort, think block open, a short plan as reasoning).
     #[arg(long, env = "CUTEAFD_GLM_THINKING_OFF", default_value = "empty")]
     pub thinking_off: GlmThinkingOff,
-    /// With --draft: verify exactly this many DFlash2 drafts per step
-    /// (within the rows) instead of the adaptive policy.
-    #[arg(long)]
-    pub draft_fixed: Option<usize>,
-    /// Prefill the prompts that wait together in one pass: each prompt's next chunk, up to the first
-    /// prefill lane's rows, every per-sequence program over its own rows and one Spark wave per MoE
-    /// layer for all of them. Off: one pass per prompt.
-    #[arg(long, env = "CUTEAFD_GLMF_PREFILL_BATCH", default_value_t = false, num_args = 0..=1,
-        default_missing_value = "true", action = clap::ArgAction::Set)]
-    pub prefill_batch: bool,
+    #[command(flatten)]
+    pub draft_length: crate::shared::draft::length::DraftLength,
     #[command(flatten)]
     pub decode_share: DecodeShareArgs,
     #[command(flatten)]
@@ -98,6 +91,9 @@ pub(crate) struct ServeArgs {
     /// Admitted resident Spark encoder endpoints, in replica order.
     #[arg(long)]
     pub vision_peers: Option<String>,
+    /// Physical Spark ranks from the solved media roles, in endpoint order.
+    #[arg(long, requires = "vision_peers")]
+    pub vision_peer_ranks: Option<String>,
     /// Shared planner admission hash (required with --vision-peers).
     #[arg(long, requires = "vision_peers")]
     pub encoder_plan_hash: Option<String>,
@@ -115,11 +111,10 @@ fn verify_room(verify_rows: usize, sequences: usize) -> usize {
     verify_rows.saturating_sub(sequences)
 }
 
-/// Fixed neural count and packed admission prefill.
+/// Shared neural length policy and packed admission prefill.
 #[derive(Debug, Clone, Copy)]
 struct Policy {
-    fixed: Option<usize>,
-    batch: bool,
+    length: crate::shared::draft::length::DraftLength,
 }
 
 pub(crate) fn model_id(snapshot: &std::path::Path) -> Option<String> {
@@ -140,24 +135,53 @@ pub(crate) fn auto_vision(mode: cuteafd_loader::plan::MediaMode, snapshot: &std:
     if mode != MediaMode::Auto || template_from.is_some() || super::media::vision_config(mode, snapshot)?.is_none() {
         return Ok((mode, None));
     }
-    Ok(match GlmEncoding::vision_template_gap(snapshot)? {
+    let view = cuteafd_loader::plan::checkpoint::CheckpointView::select(snapshot,
+        cuteafd_loader::plan::checkpoint::CoreView::Original)?;
+    auto_vision_view(mode, &view, template_from)
+}
+
+pub(crate) fn auto_vision_view(mode: cuteafd_loader::plan::MediaMode,
+    view: &cuteafd_loader::plan::checkpoint::CheckpointView, template_from: Option<&str>)
+    -> Result<(cuteafd_loader::plan::MediaMode, Option<String>)> {
+    use cuteafd_loader::plan::MediaMode;
+    if mode != MediaMode::Auto || template_from.is_some() || super::media::vision_config_view(mode, view)?.is_none() {
+        return Ok((mode, None));
+    }
+    Ok(match GlmEncoding::vision_template_gap_with_config(view.snapshot(), &view.config()?)? {
         Some(gap) => (MediaMode::Off, Some(format!("VISION=auto serves text only (vision off): {gap}; \
             set CHAT_TEMPLATE_FROM=<HF id or snapshot> to the vendor template to serve images"))),
         None => (mode, None),
     })
 }
 
+pub(super) fn resolve_serving_capacity(engine_args: &mut super::EngineArgs, max_sequences: usize) {
+    engine_args.slots = cuteafd_core::concurrency::state_slots(max_sequences as u64) as usize;
+    (engine_args.draft_context_slots, engine_args.draft_sequences) = draft_capacity(max_sequences,
+        engine_args.draft_sequences, engine_args.draft_context_slots);
+    cuteafd_bench::context::set_resolved("max-sequences", &max_sequences.to_string());
+    cuteafd_bench::context::set_resolved("draft-fp8", if engine_args.draft.is_some() {
+        if engine_args.draft_fp8 == Some(false) { "false" } else { "true" }
+    } else { "unused" });
+    cuteafd_bench::context::set_resolved("slots", &engine_args.slots.to_string());
+    cuteafd_bench::context::set_resolved("draft-sequences", &engine_args.draft_sequences.to_string());
+    cuteafd_bench::context::set_resolved("draft-context-slots", &engine_args.draft_context_slots.unwrap_or(0).to_string());
+}
+
 pub(crate) async fn run_serve(mut args: ServeArgs) -> Result<()> {
+    args.draft_length.report_inactive(args.engine.draft.is_some());
     let max_sequences = crate::shared::memory::budget::serving_concurrency(
         args.max_sequences, &args.engine.native_lib, args.engine.device)?;
     cuteafd_core::concurrency::validate("glm5_flash", max_sequences as u64)?;
     args.prefix.resolve_entries(max_sequences as usize);
     let api = args.api.load()?;
     let snapshot: PathBuf = args.engine.snapshot.clone();
-    let encoding = if super::media::vision_config(args.vision, &snapshot)?.is_none() {
-        GlmEncoding::from_snapshot(&snapshot)?
+    let selected_view = args.engine.attention.selected_view.clone().map(Ok)
+        .unwrap_or_else(|| args.engine.attention.select(&snapshot))?;
+    args.engine.attention.selected_view = Some(selected_view.clone());
+    let encoding = if super::media::vision_config_view(args.vision, &selected_view)?.is_none() {
+        GlmEncoding::from_snapshot_with_config(&snapshot, &selected_view.config()?)?
     } else {
-        GlmEncoding::from_snapshot_for_vision(&snapshot, args.chat_template_from.as_deref(), None)?
+        GlmEncoding::from_snapshot_for_vision_with_config(&snapshot, &selected_view.config()?, args.chat_template_from.as_deref(), None)?
     }.with_thinking_off(args.thinking_off);
     if let Some(provenance) = encoding.template_provenance() {
         tracing::info!(chat_template = %serde_json::to_string(provenance)?, "GLM Flash chat template selected");
@@ -170,26 +194,18 @@ pub(crate) async fn run_serve(mut args: ServeArgs) -> Result<()> {
     let stats = Arc::new(Mutex::new(serde_json::Value::Null));
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
     let mut engine_args = args.engine.clone();
-    engine_args.slots = cuteafd_core::concurrency::state_slots(max_sequences as u64) as usize;
-    (engine_args.draft_context_slots, engine_args.draft_sequences) = draft_capacity(max_sequences,
-        engine_args.draft_sequences, engine_args.draft_context_slots);
-    cuteafd_bench::context::set_resolved("max-sequences", &max_sequences.to_string());
-    cuteafd_bench::context::set_resolved("slots", &engine_args.slots.to_string());
-    cuteafd_bench::context::set_resolved("draft-sequences", &engine_args.draft_sequences.to_string());
-    if let Some(slots) = engine_args.draft_context_slots {
-        cuteafd_bench::context::set_resolved("draft-context-slots", &slots.to_string());
-    }
+    resolve_serving_capacity(&mut engine_args, max_sequences);
     let (worker_stats, max_sequences, decode_share) = (stats.clone(), max_sequences, args.decode_share);
-    let policy = Policy { fixed: args.draft_fixed, batch: args.prefill_batch };
+    let policy = Policy { length: args.draft_length };
     let prefix = args.prefix.clone();
-    let hub = console::hub(args.console.console_text, || console_layout(&args, &profile.id, max_sequences));
+    let layout = console_layout(&args, &profile.id, max_sequences, None);
     let vision = args.vision;
     let remote = super::media::RemoteVision::from_args(&args)?;
     let media_cache_bytes = args.media_cache_bytes;
     let worker = tokio::task::spawn_blocking(move ||
         serve_loop(engine_args, receive, ready_tx, worker_stats, max_sequences, policy, decode_share, prefix, vision,
-            media_cache_bytes, remote, args.loop_abort.config()));
-    let (max_context, media) = ready_rx.await.context("engine failed before it was ready")??;
+            media_cache_bytes, remote, layout, args.console.console_text, args.loop_abort.config()));
+    let (max_context, media, hub) = ready_rx.await.context("engine failed before it was ready")??;
     let limits = args.prefix.reserve.limits(max_context)?;
     if let Some((preparer, health)) = media {
         profile = profile.with_loaded_vision(preparer);
@@ -204,16 +220,17 @@ pub(crate) async fn run_serve(mut args: ServeArgs) -> Result<()> {
     // lazy graphs or loads more code.
     crate::shared::memory_report::log("ready");
     tracing::info!(listen = %args.listen, model = %profile.id, "GLM 5.3 Flash API is ready");
+    let mut worker = Some(worker);
     tokio::select! {
-        served = axum::serve(listener, api.app(router, hub)
-            .into_make_service_with_connect_info::<std::net::SocketAddr>()) => served?,
-        _ = crate::shared::api::watch_scheduler(worker) => unreachable!(),
+        served = crate::shared::api::serve_http(listener, api.app(router, hub), "glm5_flash") => served?,
+        _ = crate::shared::api::watch_scheduler(&mut worker) => unreachable!(),
     }
+    crate::shared::api::finish_scheduler(&mut worker, "glm5_flash").await?;
     Ok(())
 }
 
 /// What the live console shows for GLM 5.3 Flash.
-fn console_layout(args: &ServeArgs, model: &str, max_sequences: usize) -> Result<console::Layout> {
+fn console_layout(args: &ServeArgs, model: &str, max_sequences: usize, speculator: Option<console::Speculator>) -> console::Layout {
     use console::{Color::*, StepGroup};
     let mut layout = console::Layout::new("glm5_flash", model.into(), args.engine.snapshot.clone());
     let sparks = args.engine.peers.as_deref().map_or(0, |peers| peers.split(',').count());
@@ -221,15 +238,7 @@ fn console_layout(args: &ServeArgs, model: &str, max_sequences: usize) -> Result
         args.engine.local_experts);
     layout.split = args.engine.split_device.map(|_| "head split".into());
     layout.concurrency = max_sequences;
-    let policy = match args.draft_fixed {
-        Some(n) => format!("fixed {n}"),
-        None => "adaptive".to_string(),
-    };
-    let drafter = args.engine.draft.as_deref()
-        .map(|snapshot| super::dspark::is_dspark(snapshot).map(|dspark| if dspark { "dSpark" } else { "DFlash2" }))
-        .transpose()?;
-    layout.speculator = drafter.map(|name| console::Speculator { name: name.into(), positions: 8,
-        policy: policy + " · confident copy continuation" });
+    layout.speculator = speculator;
     layout.steps = vec![
         StepGroup::new("Decode step", "host clock", &[("round.cycle", "step", Target),
             ("draft", "block draft", Accepted), ("plan", "draft plan + copy windows", Ink),
@@ -242,16 +251,17 @@ fn console_layout(args: &ServeArgs, model: &str, max_sequences: usize) -> Result
         StepGroup::admission(false),
     ];
     layout.layers = Some(console::Layers::host_clock());
-    Ok(layout)
+    layout
 }
 
 type VisionReady = Option<(Arc<cuteafd_api::openai::media::MediaPreparer>, Option<Arc<std::sync::atomic::AtomicBool>>)>;
 
 #[allow(clippy::too_many_arguments)]
 fn serve_loop(mut args: super::EngineArgs, mut receive: mpsc::Receiver<NativeRequest>,
-    ready: tokio::sync::oneshot::Sender<Result<(usize, VisionReady)>>, stats: Arc<Mutex<serde_json::Value>>, max_sequences: usize,
+    ready: tokio::sync::oneshot::Sender<Result<(usize, VisionReady, Arc<cuteafd_api::openai::ConsoleHub>)>>, stats: Arc<Mutex<serde_json::Value>>, max_sequences: usize,
     policy: Policy, decode_share: DecodeShareArgs, prefix: PrefixArgs,
     vision: cuteafd_loader::plan::MediaMode, media_cache_bytes: Option<u64>, remote: Option<super::media::RemoteVision>,
+    mut layout: console::Layout, console_text: bool,
     loop_abort: crate::shared::loop_abort::LoopAbortConfig) -> Result<()> {
     args.serving_graph_policy = Some((max_sequences, args.draft.is_some()));
     let lanes = max_sequences;
@@ -261,6 +271,7 @@ fn serve_loop(mut args: super::EngineArgs, mut receive: mpsc::Receiver<NativeReq
         tracing::info!("GLM 5.3 Flash prefix cache off (no entries): no prefix marks, no reserved unit");
         args.prefix_marks = marks;
     }
+    cuteafd_bench::context::set_resolved("prefix-marks", match args.prefix_marks { PrefixMarks::Arena => "arena", PrefixMarks::Pool => "pool" });
     // Either KV admission reserves the mark arena `prefix_cache` will allocate (none: marks in pool units),
     // counted once the engine's layout is known (`with_engine`).
     args.mark_arena = match args.prefix_marks {
@@ -274,17 +285,38 @@ fn serve_loop(mut args: super::EngineArgs, mut receive: mpsc::Receiver<NativeReq
             return Ok(());
         }
     };
-    let (vision, prefix) = match super::media::ReadyVision::load(&args, &opened.library, vision, &prefix, media_cache_bytes, remote) {
-        Ok(vision) => vision,
+    args.serving_encoder = match super::media::ReadyVision::plan(&args, &opened.view, vision, remote.as_ref()) {
+        Ok(encoder) => encoder,
         Err(error) => { let _ = ready.send(Err(error)); return Ok(()); }
     };
-    let preparer = vision.as_ref().map(|vision| vision.preparer.clone());
-    let (encoder, bytes) = vision.map_or((super::media::Encoder::Off, 0), |vision|
-        (vision.encoder, vision.cache_bytes));
-    let health = encoder.health_handle();
-    let mut media = MediaAdmission::new(EmbeddingCache::new(bytes), encoder, 16);
+    let bytes = if args.serving_encoder.is_some() {
+        let (total, _) = cuteafd_loader::formats::mapped_preload::host_memory_before_process()?;
+        usize::try_from(media_cache_bytes.unwrap_or((8 << 30).min(total / 20)))?
+    } else { 0 };
+    args.serving_prefix = Some(prefix.clone());
+    args.serving_media_bytes = bytes as u64;
+    let prepared = std::cell::RefCell::new(None);
     let mut ready = Some(ready);
-    let result = opened.with_engine(&args, |engine| {
+    let result = opened.with_engine_media(&args, || {
+        let vision = super::media::ReadyVision::load(&args, &opened.view, &opened.library, vision, bytes, remote)?;
+        let records = vision.as_ref().map(|vision| vision.push.records()).unwrap_or_default();
+        *prepared.borrow_mut() = vision;
+        Ok(records)
+    }, |engine| {
+        let mut vision = prepared.borrow_mut().take();
+        let media_push = vision.as_mut().map(|vision| std::mem::take(&mut vision.push)).unwrap_or_default();
+        layout.speculator = engine.drafter.as_ref().map(|draft| console::Speculator {
+            name: if matches!(draft, super::dspark::Drafter::Dspark(_)) { "dSpark" } else { "DFlash2" }.into(),
+            positions: draft.drafts(), policy: policy.length.label(draft.drafts()) });
+        let mut hub = Some(console::hub(console_text, || Ok(layout)));
+        media_push.commit()?;
+        let preparer = vision.as_ref().map(|vision| vision.preparer.clone());
+        let encoder = vision.map_or(super::media::Encoder::Off, |vision| vision.encoder);
+        let health = encoder.health_handle();
+        let mut media = MediaAdmission::new(EmbeddingCache::new(bytes), encoder, 16);
+        if probe::streamed_prefill_scoring("glm5_flash") {
+            cuteafd_bench::context::set_resolved("prefill-scoring", "streamed");
+        }
         anyhow::ensure!(engine.weights.layers.len() == engine.cfg.layers, "serve-glmf needs every layer");
         anyhow::ensure!(engine.has_expert_homes(), "serve-glmf needs an admitted home for every routed layer");
         anyhow::ensure!(preparer.is_none() || media.encoder().available(), "vision encoder unavailable before readiness");
@@ -299,14 +331,13 @@ fn serve_loop(mut args: super::EngineArgs, mut receive: mpsc::Receiver<NativeReq
                 // every start-up allocation.
                 crate::shared::memory_report::log("glm5_flash ready");
                 if let Some(ready) = ready.take() {
-                    let _ = ready.send(Ok((engine.max_context, preparer.clone().map(|p| (p, health.clone())))));
+                    let _ = ready.send(Ok((engine.max_context, preparer.clone().map(|p| (p, health.clone())), hub.take().expect("console hub"))));
                 }
             })
     });
-    if let Some(ready) = ready.take() {
-        let _ = ready.send(result.as_ref().map(|_| (args.max_context, preparer.map(|p| (p, health)))).map_err(|e| anyhow::anyhow!("{e:#}")));
-    }
-    result
+    crate::shared::serve::forward_initialization(result, ready.is_some(), "GLM Flash initialization failed", |error| {
+        ready.take().expect("pending readiness").send(Err(error)).map_err(|result| match result { Err(error) => error, Ok(_) => unreachable!("sent an error") })
+    })
 }
 
 /// An admitted prompt waiting for its remaining prefill chunks.
@@ -341,7 +372,7 @@ struct Prefill<'a> {
     /// prompts by their rows, as their own passes' would compare).
     busy: f64,
     phases: [f64; 3],
-    /// Chunks prefilled in packed passes (`--prefill-batch`).
+    /// Chunks prefilled in packed passes (`--prefill-packing`).
     packed: usize,
     ticket: console::Ticket,
 }
@@ -385,18 +416,18 @@ struct Active<'a> {
 /// The shared draft policy and its per-round plumbing.
 struct SharedPolicy {
     policy: cuteafd_core::DraftPolicy,
-    prior: super::draft_binding::Prior,
+    prior: resource::Prior,
     observed: u64,
     skipped: u64,
     trace: bool,
-    decision: Option<super::draft_binding::DecisionTrace>,
+    decision: Option<resource::DecisionTrace>,
 }
 
 impl SharedPolicy {
     fn new(engine: &GlmfEngine<'_>, opened: &Opened, drafter: &super::dspark::Drafter<'_>,
-        ranks: Option<usize>) -> Result<Self> {
+        ranks: Option<usize>, length: crate::shared::draft::length::DraftLength) -> Result<Self> {
         let geometry = engine.draft_geometry(opened.experts.as_ref(), drafter.drafts(),
-            super::draft_binding::COPY_EXTENSION)?;
+            resource::COPY_EXTENSION)?;
         let layers = &geometry.layers;
         let slice = layers.iter().find(|layer| layer.class.is_some()).map(|layer| layer.slice_bytes);
         tracing::info!(layers = layers.len(), dense = layers.iter().filter(|l| l.class.is_none()).count(),
@@ -405,9 +436,10 @@ impl SharedPolicy {
             first_slice_bytes = slice, rows = geometry.max_requests, width = ?geometry.widths, ranks,
             installed_group_rows = ?layers.iter().map(|l| l.group_rows).collect::<Vec<_>>(),
             "GLM Flash shared draft policy geometry");
-        let mut policy = cuteafd_core::DraftPolicy::seeded(geometry, super::draft_binding::seed())?;
-        crate::shared::draft::apply_length_rule(&mut policy);
+        let policy = length.policy(geometry, resource::seed(), drafter.drafts())?;
         engine.arm_draft_probe(engine.decode_rows)?;
+        // Drafts through a launcher (the FP8 head, or the packed head's coarse plane, whose E4M3-like
+        // numerics have no prior of their own) take the FP8 head's selector prior.
         let fp8_head = matches!(engine.draft_head(), crate::shared::speculation::dflash::TargetHead::Launch(_));
         let trace = crate::shared::speculation_trace::Trace::open()?.is_some();
         Ok(Self { policy, prior: drafter.draft_prior(fp8_head)?, observed: 0, skipped: 0, trace, decision: None })
@@ -416,20 +448,20 @@ impl SharedPolicy {
     /// `p0` of the drafter's positions, then of an agreed copy's `extension`.
     fn prior(&self, history: &DraftHistory, draft: &Draft, extension: usize) -> Vec<f64> {
         let evidence = if draft.confidence.is_empty() {
-            super::draft_binding::DraftEvidence::Selector(&draft.features)
+            resource::DraftEvidence::Selector(&draft.features)
         } else {
-            super::draft_binding::DraftEvidence::Head(&draft.confidence)
+            resource::DraftEvidence::Head(&draft.confidence)
         };
-        let mut prior = super::draft_binding::prior(&self.prior, history, &evidence);
+        let mut prior = resource::prior(&self.prior, history, &evidence);
         // A short or invalid prior has no window for a copy to extend.
         if prior.len() == draft.tokens.len() {
-            prior.extend((0..extension).map(super::draft_binding::tail_prior));
+            prior.extend((0..extension).map(resource::tail_prior));
         }
         prior
     }
 
     /// The completed round, once the verify step's stream drained.
-    fn observe(&mut self, engine: &GlmfEngine<'_>, requests: &[super::draft_binding::Verified<'_>],
+    fn observe(&mut self, engine: &GlmfEngine<'_>, requests: &[resource::Verified<'_>],
         times: crate::shared::draft::clock::RoundTimes, width: usize, drafted_requests: usize, predicted: Option<f64>) {
         // The caller captured the round clock before diagnostics; evaluate
         // against the pre-observation policy without charging trace work to its fit.
@@ -443,7 +475,7 @@ impl SharedPolicy {
         } else { None };
         let policy = &mut self.policy;
         let outcome = engine.probe_finish(|routes, layer_us|
-            super::draft_binding::observe_drafted(policy, requests, routes, layer_us, times, width, predicted, Some(drafted_requests)));
+            resource::observe_drafted(policy, requests, routes, layer_us, times, width, predicted, Some(drafted_requests)));
         match outcome {
             Some(Ok(())) => self.observed += 1,
             Some(Err(error)) => {
@@ -473,7 +505,7 @@ impl SharedPolicy {
             if let Some((layers, mismatched)) = ring {
                 tracing::info!(layers, mismatched, "GLM Flash route ring check against staged Spark ids");
             }
-            super::draft_binding::publish(&self.policy, self.observed, self.skipped, ring);
+            resource::publish(&self.policy, self.observed, self.skipped, ring);
         }
     }
 }
@@ -704,7 +736,7 @@ mod media_tests {
 /// its marks in pool units or in the mark arena `arena`, sized by its rule over the engine's own
 /// marks: the `engine.mark_slots` the KV admission reserved ([`super::prefix::ArenaMarks::slots_on`]).
 fn prefix_cache<'e, 'a>(engine: &'e GlmfEngine<'a>, args: &PrefixArgs, (marks, arena): (PrefixMarks,
-    super::prefix::ArenaMarks), concurrency: usize) -> Result<(GlmfPrefix<'e, 'a>, PrefixCache<CudaCopyEngine<'a>>)> {
+    super::prefix::ArenaMarks), _concurrency: usize) -> Result<(GlmfPrefix<'e, 'a>, PrefixCache<CudaCopyEngine<'a>>)> {
     let args = &args.with_scoring(if engine.full_prefill_logits { engine.prefill_capacity() } else { 64 },
         engine.prefill_rows, engine.cfg.vocab_size)?;
     let entries = args.prefix_cache_entries;
@@ -712,7 +744,7 @@ fn prefix_cache<'e, 'a>(engine: &'e GlmfEngine<'a>, args: &PrefixArgs, (marks, a
     let family = GlmfPrefix::new(engine, marks, |mark| arena.slots(mark))?;
     anyhow::ensure!(family.slots() == engine.mark_slots, "the prefix mark arena holds {} marks of {} B, the KV \
         admission reserved {}", family.slots(), family.mark_bytes(), engine.mark_slots);
-    let host = args.host_config(family.layout(), engine.max_context, concurrency)?.map(|config|
+    let host = engine.admitted_host.clone().map(|config|
         CudaCopyEngine::registered_with_owners(engine.library, &family.buffers(), family.arena_owners())
             .map(|copy| (config, copy))).transpose()?;
     let host_bytes = host.as_ref().map_or(0, |(config, _)| config.bytes);
@@ -868,13 +900,20 @@ fn publish(stats: &Mutex<serde_json::Value>, requests: u64, generated: u64, acti
     ring_misses: u64, cache: &PrefixCache<CudaCopyEngine<'_>>, media: &MediaAdmission<super::media::Prompt, super::media::Encoder>,
     preparer: Option<&cuteafd_api::openai::media::MediaPreparer>, verify: &VerifyStats,
     memory_boundaries: &std::cell::RefCell<Vec<serde_json::Value>>, reserve: &Reserve, stalled: usize) {
+    // The second reconciliation stage: the Ready row is resident only, so this one
+    // records what the first served request added (lazy graphs, wider workspaces).
+    if requests > 0 {
+        static FIRST: std::sync::Once = std::sync::Once::new();
+        crate::shared::probe::first_request(&FIRST, requests, || crate::shared::memory_report::reconcile::capture("first_request"));
+    }
+    if active == 0 && prefilling == 0 { cache.refresh_serving_stats(); }
+    let prefix_stats = cache.serving_stats();
     if let Ok(mut stats) = stats.lock() {
         *stats = serde_json::json!({"requests": requests, "generated_tokens": generated, "active": active,
-            "prefilling": prefilling, "draft_ring_misses": ring_misses, "prefix_cache": cache.stats(),
+            "prefilling": prefilling, "draft_ring_misses": ring_misses, "prefix_cache": prefix_stats,
             "kv_reserve": reserve.snapshot(stalled),
-            "verify": verify.snapshot(), "draft_policy": super::draft_binding::snapshot(),
-            "media": media.stats(cache.stats().media_key_collisions, preparer.map_or(0, |p| p.memo_hits()))});
-        crate::shared::probe::graph_capture_stats(&mut stats);
+            "verify": verify.snapshot(), "draft_policy": resource::snapshot(),
+            "media": media.stats(prefix_stats.media_key_collisions, preparer.map_or(0, |p| p.memo_hits()))});
         // Idle checkpoints only: never sample the process ledger on the decode hot path.
         if active == 0 && prefilling == 0 {
             use cuteafd_ffi::memory_ledger::{snapshot, Space};
@@ -916,7 +955,7 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
     let mut grammars = crate::shared::constraints::Compiler::with_vocab(
         &opened.library, snapshot.join("tokenizer.json"), engine.cfg.vocab_size, engine.cfg.eos.clone());
     let tokenizer = cuteafd_loader::LoadedTokenizer::from_snapshot(snapshot)?;
-    let config: serde_json::Value = serde_json::from_slice(&std::fs::read(snapshot.join("config.json"))?)?;
+    let config = opened.view.config()?;
     let drafter = engine.drafter.as_ref();
     let mut free_slots: Vec<usize> = drafter.map_or(Vec::new(), |d| (0..d.slots()).rev().collect());
     // Admissions that found no drafter ring (must stay 0: one ring per sequence the scheduler holds).
@@ -925,10 +964,9 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
     // `--decode-rows 128`).
     let verify_rows = engine.verify_rows;
     // The resource-priced shared draft policy (v3 D2/D3) chooses DFlash2/dSpark verify lengths under
-    // the verify-row budget; a fixed count keeps its own.
+    // the verify-row budget; fixed mode bypasses prices in the same policy.
     let mut shared = match drafter {
-        Some(drafter) if policy.fixed.is_none() =>
-            Some(SharedPolicy::new(engine, opened, drafter, ranks)?),
+        Some(drafter) => Some(SharedPolicy::new(engine, opened, drafter, ranks, policy.length)?),
         _ => None,
     };
     let mut active: Vec<Active<'_>> = Vec::new();
@@ -979,7 +1017,7 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
                             }
                         };
 
-                        if let Err(error) = probe::validate_scoring(&job.probe, engine.full_prefill_logits) {
+                        if let Err(error) = probe::validate_scoring(&job.probe, probe::prefill_scoring_admitted("glm5_flash", engine.full_prefill_logits)) {
                             let _ = job.events.send(Err(NativeFailure::BadRequest(format!("scoring: {error:#}"))));
                             continue;
                         }
@@ -1000,7 +1038,7 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
                                 prompt.tokens.len(), engine.max_context))));
                             continue;
                         }
-                        if let Err(error) = super::media::probe_features(&prompt, &mut request_media, &mut media.cache, snapshot) {
+                        if let Err(error) = super::media::probe_features(&prompt, &mut request_media, &mut media.cache, &opened.view) {
                             if let Some(probe) = &prompt.job.probe { probe.fail(format!("reference features: {error:#}")); }
                             let _ = events.send(Err(NativeFailure::BadRequest(format!("reference features: {error:#}"))));
                             drop(request_media); media.cache.prune_reservations();
@@ -1055,8 +1093,7 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
                 continue;
             };
             // Disabled neural drafts need neither a ring slot nor context updates.
-            let slot = take_ring(&mut free_slots, drafter.is_some() && !probe::no_speculation(&ready.job().job.probe)
-                && policy.fixed != Some(0), &mut ring_misses);
+            let slot = take_ring(&mut free_slots, drafter.is_some() && !probe::no_speculation(&ready.job().job.probe), &mut ring_misses);
             cache.tick();
             let admit_started = Instant::now();
             // Lookup, fork of the retained pages and restore of the mark (byte-exact).
@@ -1105,9 +1142,12 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
                 // Teacher-forced scoring: every row's logits, no generation, nothing retained.
                 let mut placement = admitted.placement;
                 let scored = probe::score(&opened.library, &job.probe, &tokens, from, engine.prefill_capacity(),
-                    DECODE_ROWS, probe::verify_rows(&job.probe), engine.full_prefill_logits, &mut placement,
-                    |placement, chunk, rows| {
-                        if rows > 1 {
+                    DECODE_ROWS, probe::verify_rows(&job.probe), probe::prefill_scoring_admitted("glm5_flash", engine.full_prefill_logits), &mut placement,
+                    |placement, chunk, rows, position| {
+                        if rows > 1 && !engine.full_prefill_logits && probe::streamed_prefill_scoring("glm5_flash") {
+                            engine.prefill_streamed_scoring(placement, chunk, &request_media,
+                                probe::ScoringRows { probe: &job.probe, position })
+                        } else if rows > 1 {
                             engine.prefill_scoring_media(placement, chunk, &request_media)
                         } else {
                             Ok(engine.prefill_media_device(placement, chunk, &request_media)?.map(probe::ScoreLogits::Device))
@@ -1150,10 +1190,10 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
         if prefills.due(!active.is_empty()) {
             let caching = cache.enabled();
             // One chunk (a lane wave) of each waiting prompt (whole prompts with --decode-share 0); with
-            // --prefill-batch, adjacent prompts whose chunks fit one pass prefill together.
+            // --prefill-packing, adjacent prompts whose chunks fit one pass prefill together.
             let cx = PrefillCx { engine, library: &opened.library, family: &family, caching,
                 first_prefill_seen: &first_prefill_seen, memory_boundaries: &memory_boundaries };
-            let finished = if policy.batch && engine.packs_prefill() {
+            let finished = if engine.packs_prefill() {
                 let limits = engine.packed_limits();
                 prefills.round_packed(limits.rows, DECODE_ROWS,
                     |p| packs(p).then(|| chunk_end(p) - p.done), |group, next| packable(group, next, &limits),
@@ -1292,7 +1332,7 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
             continue;
         }
         let cycle = Instant::now();
-        let Some(finished) = runtime.block_on(lanes.run_one(|lease| decode_round(lease, engine, opened, policy.fixed,
+        let Some(finished) = runtime.block_on(lanes.run_one(|lease| decode_round(lease, engine, opened,
             verify_rows, &mut lane, &mut active, &mut shared, &mut selector, &family, &mut cache, &mut free_kda,
             &mut free_slots, &mut trace, cycle)))? else { continue };
         for index in (0..active.len()).rev() {
@@ -1311,7 +1351,6 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
             tracing::info!(tokens = request.generated, seconds, tok_s = request.generated as f64 / seconds,
                 active = active.len(), steps = steps_seen, all_steps = lane.steps, dflash, dflash_ok, draft_calls,
                 draft_s = lane.draft_s, verify_s = lane.verify_s, emit_s = lane.emit_s, gpu_wait_s = phases[0], experts_s = phases[1], head_s = phases[2],
-                graph_captures = graphs.stats.captures, graph_recaptures = graphs.stats.recaptures,
                 graph_held = graphs.held, graph_shapes = graphs.shapes, graph_bytes = graphs.bytes,
                 draft_ring_misses = ring_misses, "request complete");
             (lane.steps, lane.draft_s, lane.verify_s, lane.emit_s) = (0, 0.0, 0.0, 0.0);
@@ -1389,7 +1428,7 @@ impl LaneCommit for Commit<'_, '_, '_, '_> {
 /// One round of lane 0: draft, plan, verify, select, emit and commit. `None`
 /// when the step failed and its requests were released.
 #[allow(clippy::too_many_arguments)]
-async fn decode_round(lease: LaneLease<'_>, engine: &GlmfEngine<'_>, opened: &Opened, fixed: Option<usize>,
+async fn decode_round(lease: LaneLease<'_>, engine: &GlmfEngine<'_>, opened: &Opened,
     verify_rows: usize, lane: &mut DecodeLane, active: &mut Vec<Active<'_>>, shared: &mut Option<SharedPolicy>,
     selector: &mut TokenSelector<'_>, family: &GlmfPrefix<'_, '_>, cache: &mut PrefixCache<CudaCopyEngine<'_>>,
     free_kda: &mut Vec<i32>, free_slots: &mut Vec<usize>, trace: &mut Option<crate::shared::speculation_trace::Trace>,
@@ -1465,35 +1504,32 @@ async fn decode_round(lease: LaneLease<'_>, engine: &GlmfEngine<'_>, opened: &Op
         }).collect();
     let copies: Vec<_> = active.iter().zip(&drafted).zip(&limits).zip(&mut shared_priors)
         .map(|(((a, draft), &limit), prior)| match (&shared, draft) {
-            (Some(shared), Some(d)) if fixed.is_none() =>
-                super::draft_binding::copy_continuation(&shared.policy, active.len(), a.ticket.id(), &a.history,
+            (Some(shared), Some(d)) if !shared.policy.fixed() =>
+                resource::copy_continuation(&shared.policy, active.len(), a.ticket.id(), &a.history,
                     &d.tokens, prior, limit, a.job.sampling.is_greedy()),
             _ => None,
         }).collect();
     let mut predicted = None;
-    let mut planned = match (fixed, shared.as_mut()) {
+    let mut planned = match shared.as_mut() {
         // No draft pass ran: every sequence verifies its next token alone.
-        (None, Some(_)) if drafted_width == 0 => vec![0; active.len()],
-        (None, Some(shared)) => {
+        Some(_) if drafted_width == 0 => vec![0; active.len()],
+        Some(shared) => {
             let candidates: Vec<_> = active.iter().zip(&shared_priors).zip(&limits).zip(&drafted)
-                .map(|(((a, prior), &limit), draft)| super::draft_binding::Candidate { id: a.ticket.id(), prior,
+                .map(|(((a, prior), &limit), draft)| resource::Candidate { id: a.ticket.id(), prior,
                     limit, selector: draft.as_ref().is_some_and(|d| d.confidence.is_empty()), cold: a.drafts.cold() })
                 .collect();
-            let selection = super::draft_binding::select_drafted(&mut shared.policy, &candidates, drafted_width, verify_rows, drafted_requests);
+            let selection = resource::select_drafted(&mut shared.policy, &candidates, drafted_width, verify_rows, drafted_requests);
             if shared.trace {
-                shared.decision = Some(super::draft_binding::DecisionTrace::capture(&candidates,
+                shared.decision = Some(resource::DecisionTrace::capture(&candidates,
                     drafted_width, drafted_requests, verify_rows, &selection));
             }
             predicted = selection.predicted;
             selection.lengths
         }
-        // A fixed count within each sequence's room.
-        (Some(fixed), _) => drafted.iter().zip(&limits).map(|(draft, &limit)| draft.as_ref()
-            .map_or(0, |d| fixed.min(limit).min(d.tokens.len()))).collect(),
         // No neural drafter means no speculative proposal.
-        (None, None) => vec![0; active.len()],
+        None => vec![0; active.len()],
     };
-    if super::draft_binding::trim_budget_with_priors(&mut planned, verify_rows, &shared_priors,
+    if resource::trim_budget_with_priors(&mut planned, verify_rows, &shared_priors,
         |i| active[i].ticket.id()) { predicted = None; }
     // A history continuation never competes with or replaces the confident prefix.
     let sequences: Vec<Vec<u32>> = active.iter().enumerate().map(|(i, a)| {
@@ -1510,7 +1546,7 @@ async fn decode_round(lease: LaneLease<'_>, engine: &GlmfEngine<'_>, opened: &Op
     let copy_windows = trace.as_ref().map(|_| active.iter().zip(&drafted).map(|(a, d)| {
         let (start, suffix, tokens) = crate::shared::draft::copy::trace_window(&a.history,
             d.as_ref().map_or(0, |d| d.tokens.len()) + crate::shared::draft::copy::COPY_EXTENSION);
-        serde_json::json!({"start": start, "matched_suffix": suffix, "tokens": tokens})
+        crate::shared::speculation_trace::record! {start: start, matched_suffix: suffix, tokens: tokens.to_vec()}
     }).collect::<Vec<_>>());
     let mut poisoned: Vec<Option<String>> = vec![None; sequences.len()];
     let plan_us = console::us(plan_timer);
@@ -1620,7 +1656,7 @@ async fn decode_round(lease: LaneLease<'_>, engine: &GlmfEngine<'_>, opened: &Op
         let requests: Vec<_> = active.iter().enumerate().map(|(i, a)| {
             let (rows, accepted, censor) = verified[i];
             let draft = drafted[i].as_ref().filter(|_| rows > 1);
-            super::draft_binding::Verified { id: a.ticket.id(), rows, accepted: accepted.max(1),
+            resource::Verified { id: a.ticket.id(), rows, accepted: accepted.max(1),
                 source: if draft.is_some() { DraftSource::Neural }
                     else { DraftSource::Undrafted },
                 prior: draft.map(|_| shared_priors[i].as_slice()),
@@ -1631,21 +1667,21 @@ async fn decode_round(lease: LaneLease<'_>, engine: &GlmfEngine<'_>, opened: &Op
     }
     if let Some(trace) = trace.as_mut() {
         lane.trace_round += 1;
-        let line = serde_json::json!({
-            "round": lane.trace_round, "spec": spec,
-            "request_ids": active.iter().map(|a| a.ticket.id()).collect::<Vec<_>>(),
-            "starts": starts,
-            "prompt_ids": active.iter().zip(&starts).map(|(a, &start)|
+        let line = crate::shared::speculation_trace::record! {
+            round: lane.trace_round, spec: spec,
+            request_ids: active.iter().map(|a| a.ticket.id()).collect::<Vec<_>>(),
+            starts: starts.clone(),
+            prompt_ids: active.iter().zip(&starts).map(|(a, &start)|
                 (a.counts[0] == 1).then(|| a.history[..start].to_vec())).collect::<Vec<_>>(),
-            "lengths": sequences.iter().map(|s| s.len() - 1).collect::<Vec<_>>(),
-            "accepted": verified.iter().map(|v| v.1.saturating_sub(1)).collect::<Vec<_>>(),
-            "neural_tokens": drafted.iter().map(|d| d.as_ref().map(|d| &d.tokens)).collect::<Vec<_>>(),
-            "copy_windows": copy_windows,
-            "verify_tokens": sequences,
-            "committed_tokens": active.iter().zip(&before).map(|(a, &n)| &a.history[n..]).collect::<Vec<_>>(),
-            "finished": finished,
-        });
-        if let Err(error) = trace.write(&line) {
+            lengths: sequences.iter().map(|s| s.len() - 1).collect::<Vec<_>>(),
+            accepted: verified.iter().map(|v| v.1.saturating_sub(1)).collect::<Vec<_>>(),
+            neural_tokens: drafted.iter().map(|d| d.as_ref().map(|d| d.tokens.clone())).collect::<Vec<_>>(),
+            copy_windows: copy_windows,
+            verify_tokens: sequences.clone(),
+            committed_tokens: active.iter().zip(&before).map(|(a, &n)| a.history[n..].to_vec()).collect::<Vec<_>>(),
+            finished: finished.clone(),
+        };
+        if let Err(error) = trace.write(line) {
             tracing::warn!(%error, "GLM Flash speculation trace write failed");
         }
     }
@@ -1761,7 +1797,7 @@ fn capture_points<'a>(family: &GlmfPrefix<'_, 'a>, cache: &mut PrefixCache<CudaC
     }
 }
 
-/// Whether prompt `p`'s next chunk may run in a packed pass (`--prefill-batch`): still prefilling
+/// Whether prompt `p`'s next chunk may run in a packed pass (`--prefill-packing`): still prefilling
 /// with its client there, no media (its rows' embeddings are injected by its own pass), and not a
 /// cold probe's replayed decode step.
 fn packs(p: &Prefill<'_>) -> bool {
@@ -1775,7 +1811,7 @@ fn packs_chunk(client: bool, left: usize, retained: bool, media: bool, replay_de
     client && left > 0 && !retained && !media && !replay_decode
 }
 
-/// Whether prompt `next` may join `group` in one packed pass (`--prefill-batch`): every member
+/// Whether prompt `next` may join `group` in one packed pass (`--prefill-packing`): every member
 /// [`packs`], and every member's next chunk fits the pass.
 fn packable(group: &[Prefill<'_>], next: &Prefill<'_>, limits: &packing::Limits) -> bool {
     let chunk = |p: &Prefill<'_>| (p.placement.len, chunk_end(p) - p.done);
@@ -1788,7 +1824,7 @@ fn chunk_end(p: &Prefill<'_>) -> usize {
     p.plan.chunks.get(p.chunks).copied().unwrap_or(p.tokens.len())
 }
 
-/// The next chunk of every prompt of `group` in one packed pass (`--prefill-batch`,
+/// The next chunk of every prompt of `group` in one packed pass (`--prefill-packing`,
 /// `GlmfEngine::prefill_packed`): each prompt's first token, prompt row, drafter context and
 /// snapshot points as its own chunk takes them. A group that no longer packs (a client left, a
 /// prompt is done) goes through the one-prompt path, so cleanup stays per prompt.
@@ -1960,12 +1996,14 @@ mod serve_cli_tests {
     }
 
     #[test]
-    fn admission_defaults_to_one_prefill_pass_per_prompt() {
-        let defaults = parse(&[]).unwrap();
-        assert!(!defaults.prefill_batch);
-        assert!(parse(&["--prefill-batch", "true"]).unwrap().prefill_batch);
-        assert!(!parse(&["--prefill-batch", "false"]).unwrap().prefill_batch);
-        assert!(parse(&["--prefill-batch", "sometimes"]).is_err());
+    fn shared_packing_option_alone_controls_packed_admission() {
+        use crate::shared::prefill_packing::PackingMode;
+        assert_eq!(parse(&[]).unwrap().engine.prefill_packing.unwrap_or_default(), PackingMode::Unrestricted);
+        for (name, mode) in [("exact", PackingMode::Exact), ("unrestricted", PackingMode::Unrestricted)] {
+            assert_eq!(parse(&["--prefill-packing", name]).unwrap().engine.prefill_packing, Some(mode));
+        }
+        let source = include_str!("serve.rs");
+        assert!(source.contains("let finished = if engine.packs_prefill()"));
     }
 
 }

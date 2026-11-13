@@ -11,6 +11,41 @@ use sha2::{Digest, Sha256};
 use std::os::unix::fs::FileExt;
 
 #[test]
+fn query_head_vectors_plan_contiguous_push_slices_tp1_tp2_tp4() -> Result<()> {
+    use crate::shared::experts::rtx::dense::append;
+    use cuteafd_loader::push_load::builder::Builder;
+    let root = tempfile::tempdir()?;
+    let mut config = fixture::glm5_config();
+    config["n_routed_experts"] = serde_json::json!(1);
+    config["num_experts_per_tok"] = serde_json::json!(1);
+    let mut tensors = fixture::glm5_tensors(|name, n, k| fixture::fp8(name, n, k, None));
+    let names = ["model.layers.0.self_attn.query_scale_s", "model.layers.0.self_attn.query_scale_b"];
+    tensors.extend(names.iter().map(|name| fixture::t(*name, "BF16", &[64])));
+    fixture::write_snapshot(root.path(), &config, &tensors, None);
+    let catalog = cuteafd_loader::read_expert_catalog(root.path())?;
+    for name in names {
+        let tensor = catalog.tensor(name)?;
+        let expected: Vec<_> = (0..128).map(|i| i as u8).collect();
+        std::fs::File::options().write(true).open(root.path().join(&tensor.shard))?
+            .write_all_at(&expected, tensor.metadata.byte_offset)?;
+        for ranks in [1, 2, 4] {
+            let mut builder = Builder::new(root.path(), vec![128 / ranks as u64; ranks]);
+            for rank in 0..ranks {
+                let (land, bytes) = landing::col_share(&catalog, name, ranks, rank)?;
+                assert_eq!(bytes, 128 / ranks);
+                assert_eq!(land.rows, 0..1);
+                assert_eq!(land.cols, rank * bytes..(rank + 1) * bytes);
+                let (rect, _) = land.rect(&catalog)?;
+                append(&rect, &mut builder, rank as u32, 0)?;
+                assert_eq!(landing::read(&catalog, &[land], bytes)?, expected[rank * bytes..(rank + 1) * bytes]);
+            }
+            builder.finish()?;
+        }
+    }
+    Ok(())
+}
+
+#[test]
 fn tp2_peer_router_names_match_installed_checkpoint_headers() -> Result<()> {
     let home = std::env::var_os("HF_HOME").map(std::path::PathBuf::from)
         .unwrap_or_else(|| std::path::PathBuf::from(std::env::var_os("HOME").unwrap()).join(".cache/huggingface"));
@@ -55,7 +90,7 @@ fn attention_residency_does_not_depend_on_optional_operand_names() {
                 mlp_numerics: cuteafd_loader::plan::checkpoint::ModuleNumerics::CheckpointPrecision,
                 split: true, attention_split: owner.is_none(), attention_owner: owner,
                 attention_resident: resident, operands: HashMap::new(), native: HashMap::new(),
-                core: Default::default(), native_projections: HashMap::new(),
+                core: Default::default(), native_projections: HashMap::new(), attention_native: Default::default(),
             };
             assert_eq!(layer.holds_attention(), resident, "owner={owner:?}, rank={rank}");
             assert!(layer.range("q_a_norm").is_none());
@@ -142,6 +177,19 @@ fn digests(library: &NativeLibrary, layers: &[Vec<GlmLayer<'_>>], norm: &DeviceA
     Ok(out)
 }
 
+fn golden_arenas<'a>(library: &'a NativeLibrary, catalog: &OfficialV41Catalog,
+    cfg: &GlmDsaConfig) -> Result<std::rc::Rc<std::collections::BTreeMap<i32,
+        crate::shared::memory::weight_arena::DeviceWeightArena<'a>>>> {
+    use cuteafd_loader::placement::{families::glm5::weights::WeightInventory, planner::EmbeddingHome};
+    let checkpoint = cuteafd_loader::plan::Checkpoint::open(catalog.snapshot())?;
+    let layouts = WeightInventory::from_checkpoint(&checkpoint, 2, cfg.layers, None, false, false,
+        EmbeddingHome::Device(0))?.coordinator_arenas()?;
+    Ok(std::rc::Rc::new(layouts.into_iter().enumerate().map(|(rank, layout)| {
+        Ok((rank as i32, crate::shared::memory::weight_arena::DeviceWeightArena::new(
+            Device { library, id: rank as i32 }, layout, crate::shared::memory::TEST_ARENA)?))
+    }).collect::<Result<_>>()?))
+}
+
 /// Set CUTEAFD_WRITE_GLM5_OPERAND_GOLDEN=1 to regenerate (only from a loader
 /// already known to be correct).
 #[test]
@@ -160,7 +208,7 @@ fn head_split_operands_match_the_mount_golden() -> Result<()> {
     let cfg = GlmDsaConfig::read(root.path())?;
     let stream = std::ptr::null_mut();
     let loader = GlmLoader { library: &library, catalog: &catalog, stream, device: 0,
-        peers: vec![crate::shared::peer_split::RankDevice { device: 1, stream }], push: None };
+        peers: vec![crate::shared::peer_split::RankDevice { device: 1, stream }], arenas: Some(golden_arenas(&library, &catalog, &cfg)?), allocation_prefix: String::new(), push: None };
     let (model, shares) = loader.model(&cfg, cfg.layers, None, false)?;
     let layers: Vec<Vec<GlmLayer<'_>>> = std::iter::once(model.layers).chain(shares).collect();
     let actual = digests(&library, &layers, &model.norm, model.head.bf16()?)?;
@@ -196,18 +244,18 @@ fn pushed_head_split_operands_match_the_mount_golden() -> Result<()> {
     let stream = std::ptr::null_mut();
     let sink = std::rc::Rc::new(super::landing::PushSink::default());
     let loader = GlmLoader { library: &library, catalog: &catalog, stream, device: 0,
-        peers: vec![crate::shared::peer_split::RankDevice { device: 1, stream }], push: Some(sink.clone()) };
+        peers: vec![crate::shared::peer_split::RankDevice { device: 1, stream }], arenas: Some(golden_arenas(&library, &catalog, &cfg)?), allocation_prefix: String::new(), push: Some(sink.clone()) };
     let (model, shares) = loader.model(&cfg, cfg.layers, None, false)?;
     let (records, deferred) = sink.take();
     let (sparks, world) = (6usize, 8usize);
     for gpu in 0..2 {
         use crate::shared::experts::rtx::dense::{DenseArena, RankLayout};
         let device = crate::shared::memory::device::Device { library: &library, id: gpu };
-        let layout = RankLayout::new(records.clone(), Vec::new(), gpu)?;
+        let layout = RankLayout::new(records.operands.clone(), records.steps.clone(), gpu)?;
         let checked = layout.checked(root.path(), world, sparks + gpu as usize)?;
         let expected = crate::shared::memory::weight_arena::ExpectedCoverage::from_plan(&checked, (sparks + gpu as usize) as u32)?;
         device.run(|| -> Result<()> {
-            let ring = cuteafd_ffi::push_ring::RegisteredRing::new(&library, 8, cuteafd_ffi::push_ring::DEFAULT_SLOT_BYTES)?;
+            let ring = cuteafd_ffi::push_ring::RegisteredRing::new(&library, 8, cuteafd_ffi::push_ring::DEFAULT_SLOT_BYTES, crate::shared::memory::TEST)?;
             let fake = crate::shared::experts::rtx::dense::testing::FakeRank::new(&checked, root.path(), (sparks + gpu as usize) as u32, &ring)?;
             let arena = DenseArena::new(device, layout, expected)?;
             crate::shared::memory::push_consumer::consume(device, arena, ring, fake, 8)
@@ -266,7 +314,7 @@ fn exlr8_prefetch_enumerates_each_resident_encoding_in_read_order() {
                 .collect::<Vec<Range>>();
             // Reverse insertion cannot change read order, unlike HashMap iteration.
             let resident = components.iter().zip(&expected).rev().map(|(component, &range)|
-                (crate::shared::experts::exlr8::dense_weights::key("q_a", component), range)).collect::<HashMap<_, _>>();
+                (cuteafd_loader::plan::exlr8::dense::requests::key("q_a", component), range)).collect::<HashMap<_, _>>();
             let actual = native_projection_ranges("q_a", |key| resident.get(key).copied());
             assert_eq!(actual, expected);
             assert_eq!(crate::shared::l2_prefetch::prefix(&actual, 1 << 19),

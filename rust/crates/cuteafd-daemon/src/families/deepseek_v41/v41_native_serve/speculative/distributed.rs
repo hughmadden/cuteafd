@@ -5,6 +5,13 @@ use crate::shared::memory::device::{Device, DeviceOwner};
 use crate::families::deepseek_v41::v41_tensors::VocabularyShard;
 
 impl<'w, 'a> DraftRuntime<'w, 'a, DistributedDsparkChain<'w, 'a>> {
+    pub(crate) fn capture_startup(&mut self) -> Result<()> {
+        ensure!(self.requests.is_empty() && self.pending.iter().all(Option::is_none),
+            "draft startup requires no admitted requests");
+        let windows = self.windows.each_ref();
+        for chain in &mut self.chains { chain.capture_startup(windows)?; }
+        Ok(())
+    }
     /// The returned owner scopes destruction to GPU1. Synchronous runtime methods
     /// select their execution device internally and restore it before returning;
     /// no device scope survives a scheduler yield.
@@ -30,9 +37,9 @@ impl<'w, 'a> DraftRuntime<'w, 'a, DistributedDsparkChain<'w, 'a>> {
                 pending_commit_ids: vec![Vec::new(); lane_count], pending_prefix_ids: [None, None],
                 requests: Default::default(), pending: vec![None; lane_count],
                 request_limit: requests as usize, draft_limit: 5, draft_width: weights.draft_width(),
-                confidence_trace: Default::default(), neural_lengths: Default::default(), fixed: false, policy: None,
+                confidence_trace: Default::default(), neural_lengths: Default::default(), length: Default::default(), policy: None,
                 published: None,
-                lanes: std::array::from_fn(|_| LaneRound::new(policy::LAYERS, policy::TOPK)),
+                lanes: (0..lane_count).map(|_| LaneRound::new(policy::LAYERS, policy::TOPK)).collect(),
             })
         })
     }
@@ -76,6 +83,9 @@ mod tests {
         let mut actual = DraftRuntime::with_distributed_requests(devices, &weights, &embedding,
             [&shards[0], &shards[1]], 80, 16)?;
         let mut reference = devices[1].own(|| DraftRuntime::with_requests(&lib, &weights, &embedding, &full, 80, 16))?;
+        devices[1].run(|| actual.get_mut().capture_startup())?;
+        assert!(actual.requests.is_empty());
+        assert!(actual.pending.iter().all(Option::is_none));
         devices[1].run(|| {
             let geometry = policy::remote_geometry(5);
             actual.bind_policy(geometry.clone())?; reference.bind_policy(geometry)?;
@@ -118,7 +128,7 @@ mod tests {
             eprintln!("PASS distributed runtime requests_per_lane={count}: identical proposals/confidence and independent polling");
         }
         let saved = devices[1].run(|| crate::shared::memory::DeviceAllocation::new(&lib,
-            crate::families::deepseek_v41::v41_native_serve::speculative::DRAFT_MARK_BYTES))?;
+            crate::families::deepseek_v41::v41_native_serve::speculative::DRAFT_MARK_BYTES, crate::shared::memory::TEST))?;
         actual.queue_mark(0, 1000, 8, saved.buffer)?;
         while !actual.mark_ready(0)? { std::thread::yield_now(); }
         actual.release(1000)?;

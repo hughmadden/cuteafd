@@ -77,9 +77,34 @@ pub(crate) fn unit_check(engine: &GlmfEngine<'_>, tokens: &[u32]) -> Result<()> 
     println!("unit check: {n} tokens (same cuts {cuts:?}): logits {}, KDA state {}, paged units {} \
         (N1 {:.0} ms, N{depth} {:.0} ms)", verdict(logits), verdict(state), verdict(paged),
         1e3 * one_seconds, 1e3 * two_seconds);
+    check_identity(logits, state, paged, depth)?;
     allocator.release(two);
     allocator.release(one);
-    check_identity(logits, state, paged, depth)
+    boundary_check(engine, &mut allocator, &tokens[..n])
+}
+
+/// Reuse the same peer workspace across two calls, with no host reader between
+/// the candidate calls. The control explicitly drains both ranks at the boundary.
+fn boundary_check(engine: &GlmfEngine<'_>, allocator: &mut Allocator, tokens: &[u32]) -> Result<()> {
+    let (mut drained, mut queued) = (allocator.admit(tokens.len())?, allocator.admit(tokens.len())?);
+    let split = engine.prefill_rows.min(tokens.len() - 1);
+    engine.prefill_device(&mut drained, &tokens[..split])?.context("boundary control head")?;
+    engine.synchronize()?;
+    let expected = engine.prefill_device(&mut drained, &tokens[split..])?
+        .context("boundary control continuation head")?.to_host(engine.library)?;
+    engine.synchronize()?;
+    engine.prefill_device(&mut queued, &tokens[..split])?.context("boundary queued head")?;
+    let actual = engine.prefill_device(&mut queued, &tokens[split..])?
+        .context("boundary queued continuation head")?.to_host(engine.library)?;
+    let logits = expected.len() == actual.len()
+        && expected.iter().zip(&actual).all(|(a, b)| a.to_bits() == b.to_bits());
+    let state = engine.slot_state(drained.slot)? == engine.slot_state(queued.slot)?;
+    let paged = unit_bytes(engine, &drained)? == unit_bytes(engine, &queued)?;
+    println!("back-to-back prefill boundary: logits {logits}, KDA state {state}, paged units {paged}");
+    ensure!(logits && state && paged, "queued prefill boundary differs from explicitly drained control");
+    allocator.release(queued);
+    allocator.release(drained);
+    Ok(())
 }
 
 fn check_identity(logits: bool, state: bool, paged: bool, depth: usize) -> Result<()> {

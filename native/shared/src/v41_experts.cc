@@ -25,10 +25,10 @@
 /* A non-V4.1 routed-expert family (cmake/expert_families.cmake). */
 #include CUTEAFD_EXPERT_VARIANTS_HEADER
 #elif defined(CUTEAFD_V41_SPARK_TP2_EXPERTS)
-/* Replicated-group Spark TP2 shards (native FP8 K32 family, SM121). */
+/* Spark TP2 shards (native FP8 K32 family, SM121). */
 #include "v41_spark_tp2_expert_variants.h"
 #elif defined(CUTEAFD_V41_SPARK_TP3_EXPERTS)
-/* Replicated-group Spark TP3 shards (native FP8 K32 family, SM121). */
+/* Spark TP3 shards (native FP8 K32 family, SM121). */
 #include "v41_spark_tp3_expert_variants.h"
 #elif defined(CUTEAFD_V41_SPARK_TP6_EXPERTS)
 /* Pure TP6 Spark shards (native FP8 K32 family, SM121). */
@@ -309,7 +309,7 @@ extern "C" int32_t cuteafd_expert_launch(void* kernel, const cuteafd_expert_laun
 }
 
 // The FP8 row quantizer belongs to the native family only: W4A4 hidden rows
-// are BF16, and the replicated-group Spark TP2/TP3/TP6 families share the
+// are BF16, and the Spark TP2/TP3/TP6 families share the
 // canonical quantizer compiled by the primary native expert translation unit.
 // Every role that needs it defines these entry points in exactly one member.
 #if !defined(CUTEAFD_V41_LOCAL_EXPERTS) && !defined(CUTEAFD_V41_NVFP4_VARIANTS_HEADER) && \

@@ -144,9 +144,9 @@ fn native_host_embedding_exact_512() -> Result<()> {
             }
         }
         for width in [5, 7] {
-            let ids = DeviceAllocation::new(&lib, 16 * 4)?;
-            let residual = DeviceAllocation::new(&lib, 16 * width * 40960)?;
-            let pre = DeviceAllocation::new(&lib, 16 * width * 16)?;
+            let ids = DeviceAllocation::new(&lib, 16 * 4, crate::shared::memory::TEST)?;
+            let residual = DeviceAllocation::new(&lib, 16 * width * 40960, crate::shared::memory::TEST)?;
+            let pre = DeviceAllocation::new(&lib, 16 * width * 16, crate::shared::memory::TEST)?;
             lib.copy_h2d(ids.buffer, &tokens[..16].iter().flat_map(|t| t.to_ne_bytes()).collect::<Vec<_>>())?;
             let ops = lib.v41_attention_ops_width(width)?;
             // SAFETY: immutable table and owned disjoint buffers live through both drains.
@@ -156,7 +156,7 @@ fn native_host_embedding_exact_512() -> Result<()> {
             let graph = unsafe {
                 lib.cuda_graph_begin_capture(wave.storage.stream.raw)?;
                 ops.embed(table.get("embed.weight")?, ids.buffer, residual.buffer, pre.buffer, 16, wave.storage.stream.raw)?;
-                lib.cuda_graph_end_capture(wave.storage.stream.raw)?
+                lib.cuda_graph_end_capture_for_test(wave.storage.stream.raw)?
             };
             // SAFETY: captured graph references these live buffers; destroy follows a drain.
             unsafe { lib.cuda_graph_launch(graph, wave.storage.stream.raw)?; }

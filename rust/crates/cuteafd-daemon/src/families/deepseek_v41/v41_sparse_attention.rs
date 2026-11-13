@@ -3,6 +3,7 @@ use crate::families::deepseek_v41::v41_attention_binding::QueryBinding;
 use crate::families::deepseek_v41::v41_attention_query::AttentionQueryOutput;
 use crate::families::deepseek_v41::v41_compressor::IndexProposal;
 use crate::families::deepseek_v41::v41_index_selection::IndexSelectionOutput;
+use crate::shared::memory::Tag;
 use crate::shared::memory::{DeviceAllocation, HostAllocation, LayerStaging, LoadStream};
 use crate::families::deepseek_v41::v41_window::WindowProposal;
 use anyhow::{ensure, Context, Result};
@@ -10,7 +11,7 @@ use cuteafd_ffi::{
     CuteafdDeviceBuffer, NativeLibrary, V41SparseAttention, V41SparseBatch, V41SparseSource, V41SparseWindow, V41Kv, V41PeerCopy,
 };
 use std::{ffi::c_void, marker::PhantomData};
-use crate::shared::decode_graph::{GraphBank, GraphOwner};
+use crate::shared::decode_graph::{CaptureTicket, GraphBank, GraphOwner};
 pub(crate) mod dual;
 
 pub(crate) struct AttentionRequest<'a> {
@@ -90,9 +91,9 @@ impl<'a, const HEADS: usize> SparseAttentionStorage<'a, HEADS> {
         Ok(std::rc::Rc::new(Self {
             stream: LoadStream { library, raw: library.cuda_stream_create()? },
             kernel: if HEADS == 64 { library.v41_sparse_attention()? } else { library.v41_sparse_attention_heads32()? },
-            query: DeviceAllocation::new(library, query)?, output: DeviceAllocation::new(library, output)?,
-            split_scratch: DeviceAllocation::new(library, split)?, descriptors: DeviceAllocation::new(library, descriptors)?,
-            replay_begins: DeviceAllocation::new(library, replay)?, metadata: DeviceAllocation::new(library, metadata)?,
+            query: DeviceAllocation::new(library, query, Tag::workspace("v41/sparse-attention"))?, output: DeviceAllocation::new(library, output, Tag::workspace("v41/sparse-attention"))?,
+            split_scratch: DeviceAllocation::new(library, split, Tag::workspace("v41/sparse-attention"))?, descriptors: DeviceAllocation::new(library, descriptors, Tag::workspace("v41/sparse-attention"))?,
+            replay_begins: DeviceAllocation::new(library, replay, Tag::workspace("v41/sparse-attention"))?, metadata: DeviceAllocation::new(library, metadata, Tag::workspace("v41/sparse-attention"))?,
             guard: crate::shared::memory::row_window::ScratchGuard::new(library, readers)?, unit,
         }))
     }
@@ -124,10 +125,8 @@ pub(crate) struct LocalSparseAttentionWave<'a,const HEADS:usize> {
     // current descriptors are validated and uploaded before EVERY replay.
     // For other paths, complete external-pointer and launch-geometry fingerprints are checked
     // against live proposals before every replay. Inactive graphs never launch.
-    // Adaptive mode keeps at most batch_rows variants per layer, including prefill;
-    // request layouts can have many more combinations than total row counts.
     graphs: GraphBank<(usize, Vec<usize>), GraphOwner<'a, ()>>,
-    graph_limit: usize,
+    spans_devices: bool,
     warmed_kernels: u16,
     cold: Option<ColdSparse>,
 }
@@ -149,6 +148,7 @@ struct ColdSparse {
     fingerprint: Vec<usize>,
     needed: u16,
     tail_identity: Option<Vec<usize>>,
+    ticket: CaptureTicket,
 }
 fn validate_plan_installation(installed: bool, graph_count: usize, pending: bool,
     batch_rows: usize, capacity_rows: usize) -> Result<()> {
@@ -186,14 +186,14 @@ impl<'a,const HEADS:usize> LocalSparseAttentionWave<'a,HEADS> {
         let capacity = storage.unit;
         let batch = capacity.min(cuteafd_core::V41_VERIFY_ROWS);
         Ok(Self {
-            descriptor_staging: LayerStaging::new(library, V41SparseAttention::batch_descriptor_bytes(batch)?, 40)?,
-            staging: LayerStaging::new(library, capacity * 80, 40)?,
-            replay_staging: LayerStaging::new(library, capacity * 8, 40)?,
+            descriptor_staging: LayerStaging::new(library, V41SparseAttention::batch_descriptor_bytes(batch)?, 40, "v41/sparse-descriptors")?,
+            staging: LayerStaging::new(library, capacity * 80, 40, "v41/sparse-attention")?,
+            replay_staging: LayerStaging::new(library, capacity * 8, 40, "v41/sparse-replay")?,
             staging_check: crate::shared::memory::staging_check::StagingCheck::new(library,
                 "V4.1 sparse attention metadata", 120),
             storage, window: crate::shared::memory::row_window::RowWindow::NONE,
             capacity, batch_rows: batch, attention_plan: None, decode: false,
-            graphs: GraphBank::new(None), graph_limit: 1, warmed_kernels: 0, cold: None,
+            graphs: GraphBank::new(None), spans_devices: false, warmed_kernels: 0, cold: None,
         })
     }
     pub(crate) fn select_window(&mut self, window: crate::shared::memory::row_window::RowWindow) -> Result<()> {
@@ -230,10 +230,10 @@ impl<'a,const HEADS:usize> LocalSparseAttentionWave<'a,HEADS> {
         if rows <= self.batch_rows { return Ok(()); }
         ensure!(self.attention_plan.is_none(), "attention workspace is immutable after plan admission");
         let library = self.storage.stream.library;
-        let scratch = DeviceAllocation::new(library, V41SparseAttention::split_scratch_bytes(rows, 10)?/64*HEADS)?;
+        let scratch = DeviceAllocation::new(library, V41SparseAttention::split_scratch_bytes(rows, 10)?/64*HEADS, Tag::workspace("v41/sparse-attention"))?;
         let bytes = V41SparseAttention::batch_descriptor_bytes(rows)?;
-        let descriptors = DeviceAllocation::new(library, bytes)?;
-        let staging = LayerStaging::new(library, bytes, 40)?;
+        let descriptors = DeviceAllocation::new(library, bytes, Tag::workspace("v41/sparse-attention"))?;
+        let staging = LayerStaging::new(library, bytes, 40, "v41/sparse-decode-rows")?;
         let additional_device_bytes = scratch.buffer.bytes + descriptors.buffer.bytes
             - self.storage.split_scratch.buffer.bytes - self.storage.descriptors.buffer.bytes;
         let storage = std::rc::Rc::get_mut(&mut self.storage).context("cannot resize shared sparse storage")?;
@@ -241,12 +241,10 @@ impl<'a,const HEADS:usize> LocalSparseAttentionWave<'a,HEADS> {
         storage.descriptors = descriptors;
         self.descriptor_staging = staging;
         self.batch_rows = rows;
-        if self.graph_limit > 1 { self.graph_limit = rows; }
         tracing::info!(device=self.storage.query.buffer.device_id, rows, additional_device_bytes,
             "sparse decode batch reservation before KV sizing");
         Ok(())
     }
-    pub fn enable_small_graph_shapes(&mut self) { self.graph_limit = self.batch_rows; }
     pub fn input(&self) -> CuteafdDeviceBuffer {
         self.storage.query.buffer
     }
@@ -255,19 +253,94 @@ impl<'a,const HEADS:usize> LocalSparseAttentionWave<'a,HEADS> {
     }
     pub fn clear_graph(&mut self) -> Result<()> {
         self.drain_chain()?;
-        self.graphs.retire_all();
-        drop(self.graphs.drain_retired(|| Ok(()))?);
+        self.graphs.cache_clear_drained();
         Ok(())
     }
     fn graph_count(&self, layer: usize) -> usize { self.graphs.count(|(l, _)| *l == layer) }
-    fn insert_graph(&mut self, layer: usize, fingerprint: Vec<usize>, graph: *mut c_void) -> Result<()> {
-        let device = self.storage.stream.library.cuda_get_device()?;
+    pub(crate) fn startup_key(&self, layer: usize, rows: usize, sink: CuteafdDeviceBuffer,
+        selected: Option<CuteafdDeviceBuffer>, aligned: bool, tail: Option<&dyn AttentionGraphTail>) -> Result<(usize, Vec<usize>)> {
+        ensure!(layer < 40 && rows <= self.batch_rows && self.window.admits(rows),
+            "sparse startup shape exceeds owned storage");
+        let plan = self.attention_plan.context("sparse startup requires an admitted reduction plan")?;
+        let recipe = self.storage.kernel.startup_batch_recipe(plan, rows, layer >= 2, aligned)?;
+        ensure!(selected.is_some() == (layer >= 2), "sparse startup selection differs from layer");
+        for (buffer, bytes) in std::iter::once((sink, HEADS * 4))
+            .chain(selected.map(|buffer| (buffer, rows * 2048))) {
+            ensure!(!buffer.ptr.is_null() && buffer.bytes >= bytes
+                && buffer.device_id == self.storage.query.buffer.device_id,
+                "sparse startup binding device or capacity differs");
+        }
+        let mut fingerprint = vec![usize::MAX, layer, rows, sink.ptr as usize,
+            selected.map_or(0, |buffer| buffer.ptr as usize), recipe.backend_key()];
+        if let Some(tail) = tail {
+            fingerprint.push(usize::MAX - 1);
+            fingerprint.extend(tail.identity());
+        }
+        Ok((layer, fingerprint))
+    }
+
+    /// # Safety
+    /// Stable selection, sink, tail weights and tail buffers must outlive this
+    /// bank. The tail must already have capture-only host phase prepared; it must
+    /// not upload request data or publish/commit state. Restore that host phase
+    /// after this call, including errors. No recorded device work executes here.
+    pub(crate) unsafe fn capture_startup(&mut self, layer: usize, rows: usize,
+        sink: CuteafdDeviceBuffer, selected: Option<CuteafdDeviceBuffer>, aligned: bool,
+        mut tail: Option<&mut dyn AttentionGraphTail>) -> Result<()> {
+        ensure!(self.decode && !self.window.is_windowed() && self.cold.is_none(),
+            "sparse startup requires an idle full decode owner");
+        self.storage.stream.require_complete()?;
+        let key = self.startup_key(layer, rows, sink, selected, aligned,
+            tail.as_ref().map(|tail| &**tail as &dyn AttentionGraphTail))?;
+        if self.graphs.contains(&key) { return Ok(()); }
+        let Some(mut ticket) = self.graphs.cache_ticket(&key, super::graph_policy::pinned_shape(self.storage.query.buffer.device_id, rows as u32), None) else {
+            return Ok(());
+        };
+        let plan = self.attention_plan.context("sparse startup reduction plan absent")?;
+        let recipe = self.storage.kernel.startup_batch_recipe(plan, rows, layer >= 2, aligned)?;
+        // SAFETY: this owner is drained and the caller retains every bound plane.
+        unsafe { ticket.capture_result(self.storage.stream.library.cuda_graph_begin_capture(self.storage.stream.raw))?; }
+        let queued = (|| unsafe {
+            self.storage.kernel.record_startup_batch(&recipe, self.storage.query.buffer, sink,
+                self.storage.metadata.buffer, selected, self.storage.output.buffer, self.storage.descriptors.buffer,
+                self.storage.replay_begins.buffer, self.storage.split_scratch.buffer, self.storage.stream.raw)?;
+            if let Some(tail) = tail.as_deref_mut() {
+                tail.enqueue(&QueuedSparseAttention { values: slice(self.storage.output.buffer, 0, rows * HEADS * 1024),
+                    layer, rows }, self.storage.stream.raw)?;
+            }
+            Ok(())
+        })();
+        // End capture even if a tail failed, so the owner is not left capturing.
+        let captured = unsafe { ticket.capture_result(self.storage.stream.library.cuda_graph_end_capture_topology(self.storage.stream.raw)) };
+        match (queued, captured) {
+            (Ok(()), Ok((graph, nodes, width, spans, inspection))) => {
+                if let Some(error) = inspection { tracing::warn!(%error, "sparse graph topology inspection failed"); }
+                if let Err(error) = self.insert_graph(key, graph, ticket, nodes, width, spans) {
+                    unsafe { self.storage.stream.library.cuda_graph_exec_destroy(graph)?; }
+                    return Err(error);
+                }
+                Ok(())
+            }
+            (Err(error), Ok((graph, _, _, _, _))) => {
+                unsafe { self.storage.stream.library.cuda_graph_exec_destroy(graph)?; }
+                Err(error)
+            }
+            (Ok(()), Err(error)) if cuteafd_ffi::is_small_graph(&error) => Ok(()),
+            (Err(error), Err(_)) | (Ok(()), Err(error)) => Err(error),
+        }
+    }
+    fn insert_graph(&mut self, key: (usize, Vec<usize>), graph: *mut c_void,
+        ticket: CaptureTicket, nodes: usize, width: usize, spans: bool) -> Result<()> {
+        let device = self.storage.query.buffer.device_id;
         // SAFETY: the lane guard retains all captured cache/selection/tail storage.
         let owner = unsafe { GraphOwner::new(self.storage.stream.library, device, graph, ())? };
-        tracing::debug!(target: "cuteafd::graph_capture", site = "sparse_attention", device, layer,
-            bank = self as *const Self as usize, key = ?fingerprint, "native binding graph captured");
-        self.graphs.insert((layer, fingerprint), owner, None);
+        self.graphs.cache_commit(key, owner, ticket, nodes as u64, width, spans || self.spans_devices);
         Ok(())
+    }
+    pub(crate) fn visit_graph_banks(&mut self,
+        f: &mut dyn FnMut(i32, &'static str, bool, &mut dyn crate::shared::decode_graph::CacheAttached) -> Result<()>,
+    ) -> Result<()> {
+        f(self.storage.query.buffer.device_id, "sparse_attention", self.spans_devices, &mut self.graphs)
     }
     unsafe fn enqueue(
         &self,
@@ -419,32 +492,50 @@ impl<'a,const HEADS:usize> LocalSparseAttentionWave<'a,HEADS> {
     /// The caller retains the external inputs represented by the owned cold plan.
     /// Returned attention is queued, ready for consumers on chain_stream().
     pub async unsafe fn finish_prepare(&mut self, mut tail: Option<&mut dyn AttentionGraphTail>) -> Result<QueuedSparseAttention> {
-        let plan = self.cold.take().context("cold attention preparation absent")?;
+        let mut plan = self.cold.take().context("cold attention preparation absent")?;
         #[cfg(test)]
         eprintln!("queued sparse warmup layer={} rows={} batched={}", plan.layer, plan.rows, plan.batch.is_some());
         self.storage.stream.wait().await?;
         ensure!(plan.tail_identity == tail.as_ref().map(|t| t.identity()), "cold attention tail identity changed");
         if let Some(tail) = tail.as_deref_mut() { unsafe { tail.restore_warmup()?; } }
         self.warmed_kernels |= plan.needed;
-        let graph = unsafe { self.capture_plan(&plan, &mut tail)? };
-        self.insert_graph(plan.layer, plan.fingerprint, graph)?;
+        let graph = match unsafe { self.capture_plan(&mut plan, &mut tail) } {
+            Ok(graph) => graph,
+            Err(error) if cuteafd_ffi::is_small_graph(&error) => {
+                // SAFETY: the cold plan and tail retain the exact recorded backing.
+                unsafe {
+                    self.enqueue(plan.sink, &plan.launches, plan.selected, plan.batch.as_ref())?;
+                    if let Some(tail) = tail.as_deref_mut() { tail.enqueue(&QueuedSparseAttention {
+                        values: slice(self.storage.output.buffer, 0, plan.rows * (HEADS*1024)),
+                        layer: plan.layer, rows: plan.rows }, self.storage.stream.raw)?; }
+                }
+                return Ok(QueuedSparseAttention { values: slice(self.storage.output.buffer, 0, plan.rows * (HEADS*1024)),
+                    layer: plan.layer, rows: plan.rows });
+            }
+            Err(error) => return Err(error),
+        };
+        self.insert_graph((plan.layer, plan.fingerprint), graph.0, plan.ticket, graph.1, graph.2, graph.3)?;
+        let graph = graph.0;
         let launched = unsafe { self.storage.stream.library.cuda_graph_launch(graph, self.storage.stream.raw) };
         if let Err(error) = launched { self.synchronize()?; return Err(error); }
         Ok(QueuedSparseAttention { values: slice(self.storage.output.buffer, 0, plan.rows * (HEADS*1024)),
             layer: plan.layer, rows: plan.rows })
     }
-    unsafe fn capture_plan(&self, plan: &ColdSparse, tail: &mut Option<&mut dyn AttentionGraphTail>) -> Result<*mut c_void> {
-        unsafe { self.storage.stream.library.cuda_graph_begin_capture(self.storage.stream.raw)?; }
+    unsafe fn capture_plan(&self, plan: &mut ColdSparse, tail: &mut Option<&mut dyn AttentionGraphTail>) -> Result<(*mut c_void, usize, usize, bool)> {
+        unsafe { plan.ticket.capture_result(self.storage.stream.library.cuda_graph_begin_capture(self.storage.stream.raw))?; }
         let launched = (|| unsafe {
             self.enqueue(plan.sink, &plan.launches, plan.selected, plan.batch.as_ref())?;
             if let Some(tail) = tail.as_deref_mut() { tail.enqueue(&QueuedSparseAttention {
                 values: slice(self.storage.output.buffer, 0, plan.rows * (HEADS*1024)), layer: plan.layer, rows: plan.rows }, self.storage.stream.raw)?; }
             Ok(())
         })();
-        let captured = unsafe { self.storage.stream.library.cuda_graph_end_capture(self.storage.stream.raw) };
+        let captured = unsafe { plan.ticket.capture_result(self.storage.stream.library.cuda_graph_end_capture_topology(self.storage.stream.raw)) };
         match (launched, captured) {
-            (Ok(()), Ok(graph)) => Ok(graph),
-            (Err(error), Ok(graph)) => { unsafe { self.storage.stream.library.cuda_graph_exec_destroy(graph)?; } Err(error) }
+            (Ok(()), Ok((graph, nodes, width, spans, inspection))) => {
+                if let Some(error) = inspection { tracing::warn!(%error, "sparse graph topology inspection failed"); }
+                Ok((graph, nodes, width, spans))
+            },
+            (Err(error), Ok((graph, _, _, _, _))) => { unsafe { self.storage.stream.library.cuda_graph_exec_destroy(graph)?; } Err(error) }
             (Err(error), Err(_)) | (Ok(()), Err(error)) => Err(error),
         }
     }
@@ -724,7 +815,7 @@ impl<'a,const HEADS:usize> LocalSparseAttentionWave<'a,HEADS> {
             unsafe { tail.as_deref_mut().unwrap().prepare(self.storage.stream.raw)?; }
         }
         let key = (layer, fingerprint.clone());
-        let cached = if self.window.is_windowed() { None } else { self.graphs.get(&key).map(|owner| owner.raw) };
+        let cached = if self.window.is_windowed() { None } else { self.graphs.cached_launch(&key).map(|owner| owner.raw) };
         if crate::shared::decode_graph::census::eager("sparse") {
             // Retain every executable; only dispatch changes between census arms.
             unsafe {
@@ -737,12 +828,12 @@ impl<'a,const HEADS:usize> LocalSparseAttentionWave<'a,HEADS> {
             }
             return Ok(Some(queued));
         }
-        let fixed_limit = super::graph_policy::fixed_binding_limit();
-        if cached.is_none() && (self.window.is_windowed() || !super::graph_policy::captures_shape(rows as u32)
-            || fixed_limit.is_some_and(|limit| self.graph_count(layer) >= limit)
-            || exact_small_shape(batch.is_some(), rows, self.batch_rows)) {
-            // Exact fingerprints can include launch recipes beyond row count.
-            // Freeze the bounded bank rather than evicting and recapturing them.
+        let ticket = if cached.is_none() && !self.window.is_windowed()
+            && super::graph_policy::captures_shape(rows as u32)
+            && !exact_small_shape(batch.is_some(), rows, self.batch_rows) {
+            self.graphs.cache_ticket(&key, super::graph_policy::pinned_shape(self.storage.query.buffer.device_id, rows as u32), None)
+        } else { None };
+        if cached.is_none() && ticket.is_none() {
             tracing::debug!(target: "cuteafd::target_step", layer, rows,
                 retained=self.graph_count(layer), "V4.1 sparse attention eager binding");
             unsafe {
@@ -752,7 +843,6 @@ impl<'a,const HEADS:usize> LocalSparseAttentionWave<'a,HEADS> {
             return Ok(Some(queued));
         }
         let graph = if let Some(graph) = cached {
-            self.graphs.launch(&key);
             if let Some(tail) = tail.as_deref_mut() { unsafe { tail.replay_state()?; } }
             if crate::shared::decode_graph::census::enabled() {
                 unsafe {
@@ -764,28 +854,21 @@ impl<'a,const HEADS:usize> LocalSparseAttentionWave<'a,HEADS> {
             graph
         } else {
             tracing::debug!(target: "cuteafd::graph_capture", site="sparse_attention", layer, rows,
-                retained=self.graph_count(layer), limit=self.graph_limit, key=?fingerprint,
+                retained=self.graph_count(layer), key=?fingerprint,
                 "graph cache miss");
             tracing::debug!(target: "cuteafd::timing", layer, rows, batched = batch.is_some(), "sparse graph capture");
-            if !defer_warmup { self.synchronize()?; }
-            let limit = fixed_limit.unwrap_or_else(|| if batch.is_some() { self.batch_rows } else { self.graph_limit });
-            if self.graph_count(layer) >= limit {
-                self.graphs.retire_oldest(|(l, _)| *l == layer);
-                // Preserve ownership until a later stream drain, including deferred warmup.
-                let library = self.storage.stream.library; let stream = self.storage.stream.raw;
-                drop(self.graphs.drain_retired(|| unsafe { library.cuda_stream_synchronize(stream) })?);
-            }
             // Native dispatch has four row recipes per cache format: split,
             // unsplit single-group, two-group and four-group. Changing pointers
             // or launch dimensions does not require executing a warmed recipe
-            // again before capture. Keep the fixed-policy path unchanged.
+            // again before capture.
             let needed = if batch.is_some() { 1u16 << (8 + usize::from(selected.is_some())) } else { launches.iter().fold(0u16, |mask, launch| {
                 let recipe = if launch.rows <= 16 { 0 } else if launch.rows < 128 { 1 }
                     else if launch.rows < 256 { 2 } else { 3 };
                 mask | (1 << (recipe + 4 * usize::from(launch.source.is_some())))
             }) };
-            let needs_warmup = tail.is_some() || (batch.is_none() && self.graph_limit == 1) || self.warmed_kernels & needed != needed;
-            let plan = ColdSparse { layer, rows, sink, launches, selected, batch, fingerprint, needed, tail_identity };
+            let needs_warmup = tail.is_some() || self.warmed_kernels & needed != needed;
+            let mut plan = ColdSparse { layer, rows, sink, launches, selected, batch, fingerprint, needed, tail_identity,
+                ticket: ticket.expect("capture miss reserved a ticket") };
             if needs_warmup {
                 let launched = (|| unsafe {
                     self.enqueue(plan.sink, &plan.launches, plan.selected, plan.batch.as_ref())?;
@@ -802,10 +885,21 @@ impl<'a,const HEADS:usize> LocalSparseAttentionWave<'a,HEADS> {
                 self.warmed_kernels |= needed;
             }
             // Metadata uploads remain ordered on this stream; capture itself
-            // contains no await. Previous uses of an evicted graph are complete.
-            let graph = unsafe { self.capture_plan(&plan, &mut tail)? };
-            self.insert_graph(layer, plan.fingerprint, graph)?;
-            graph
+            // contains no await. Evictions are drained at the enclosing completed-step boundary.
+            let graph = match unsafe { self.capture_plan(&mut plan, &mut tail) } {
+                Ok(graph) => graph,
+                Err(error) if cuteafd_ffi::is_small_graph(&error) => {
+                    // SAFETY: same persistent plan and tail as the rejected recording.
+                    unsafe {
+                        self.enqueue(plan.sink, &plan.launches, plan.selected, plan.batch.as_ref())?;
+                        if let Some(tail) = tail.as_deref_mut() { tail.enqueue(&queued, self.storage.stream.raw)?; }
+                    }
+                    return Ok(Some(queued));
+                }
+                Err(error) => return Err(error),
+            };
+            self.insert_graph((layer, plan.fingerprint), graph.0, plan.ticket, graph.1, graph.2, graph.3)?;
+            graph.0
         };
         let launched = unsafe {
             self.storage.stream
@@ -938,9 +1032,9 @@ mod shared_storage_tests {
         let storage = SparseAttentionStorage::<HEADS>::new(&lib, 4, &[0,1])?;
         let mut slots = [LocalSparseAttentionWave::on_storage(storage.clone())?, LocalSparseAttentionWave::on_storage(storage.clone())?];
         for (i,slot) in slots.iter_mut().enumerate() { slot.select_window(crate::shared::memory::row_window::RowWindow::within(i*4..i*4+4,8)?)?; }
-        let scales=Allocation::new(device,128*16)?; let end=Allocation::new(device,8)?;
-        let sink=Allocation::new(device,HEADS*4)?;
-        let sources=[Allocation::new(device,128*512)?,Allocation::new(device,128*512)?];
+        let scales=Allocation::new(device,128*16, crate::shared::memory::TEST)?; let end=Allocation::new(device,8, crate::shared::memory::TEST)?;
+        let sink=Allocation::new(device,HEADS*4, crate::shared::memory::TEST)?;
+        let sources=[Allocation::new(device,128*512, crate::shared::memory::TEST)?,Allocation::new(device,128*512, crate::shared::memory::TEST)?];
         lib.copy_h2d(sources[0].buffer,&vec![0x38;128*512])?;
         lib.copy_h2d(sources[1].buffer,&vec![0x40;128*512])?;
         lib.copy_h2d(scales.buffer,&vec![127;128*16])?;lib.copy_h2d(end.buffer,&[0;8])?;
@@ -970,7 +1064,7 @@ mod shared_storage_tests {
             lib.cuda_stream_synchronize(private.stream.raw)?; }
         let mut want=vec![0;output_bytes];lib.copy_d2h(&mut want,private.output.buffer)?;
         for seed in 0..2 { enqueue(&slots[seed],seed)?; unsafe { lib.cuda_stream_synchronize(storage.stream.raw)?; } }
-        let reader=Stream::new(device)?;let saved=Allocation::new(device,output_bytes)?;
+        let reader=Stream::new(device)?;let saved=Allocation::new(device,output_bytes, crate::shared::memory::TEST)?;
         unsafe { lib.copy_d2d_async(saved.buffer,storage.output.buffer,output_bytes,reader.raw)?; }
         reader.drain()?;
         let chains=[StageChain::on_devices(&lib,&[0,1])?,StageChain::on_devices(&lib,&[0,1])?];
@@ -1008,4 +1102,50 @@ mod shared_storage_tests {
     #[test]
     #[ignore = "requires native sparse CUDA kernels"]
     fn sparse_without_guard_clobbers_gated_reader() -> Result<()> { for _ in 0..3 {run::<64>(false)?;} Ok(()) }
+}
+
+#[cfg(test)]
+mod bounded_cache_tests {
+    use super::*;
+    use crate::shared::decode_graph::device::{Basis, Cycle, Preference, Site};
+
+    fn site(spans_devices: bool) -> Site {
+        Site { name: "sparse_attention", cycle: Cycle::Wave,
+            preference: Preference::Capture, bootstrap: 100, basis: Basis::Bytes, spans_devices }
+    }
+
+    #[test]
+    fn sparse_full_reserve_miss_runs_eager_without_refusal() -> Result<()> {
+        let mut bank = GraphBank::<(usize, Vec<usize>), usize>::new(None);
+        bank.attach_device_for_test(-164_411, 200, site(false))?;
+        let hot = (0, vec![1]);
+        let cold = (0, vec![7]);
+        let ticket = bank.cache_ticket(&hot, true, None).expect("initial capture fits");
+        bank.cache_commit(hot.clone(), 17, ticket, 1, 1, false);
+        bank.cache_measured(200);
+        let mut eager = 0;
+        for _ in 0..3 {
+            assert!(bank.cached_launch(&cold).is_none());
+            assert!(bank.cache_ticket(&cold, false, None).is_none());
+            eager += 1;
+        }
+        assert_eq!(eager, 3);
+        assert_eq!(bank.cached_launch(&hot), Some(&17));
+        bank.cache_clear_drained();
+        Ok(())
+    }
+
+    #[test]
+    fn sparse_failed_capture_cancels_ticket() -> Result<()> {
+        let mut bank = GraphBank::<(usize, Vec<usize>), usize>::new(None);
+        bank.attach_device_for_test(-164_412, 200, site(true))?;
+        let key = (0, vec![7]);
+        let ticket = bank.cache_ticket(&key, false, None).expect("initial capture fits");
+        let capture = || -> Result<()> { let _ticket = ticket; anyhow::bail!("capture failed") };
+        assert!(capture().is_err());
+        bank.cache_measured(0);
+        assert!(bank.cached_launch(&key).is_none());
+        assert!(bank.cache_ticket(&key, false, None).is_some());
+        Ok(())
+    }
 }

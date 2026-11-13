@@ -122,6 +122,24 @@ fn native_dspark_high_concurrency_admits_and_matches_anchor_only_inventory() {
         "enable_confidence_head":true,"confidence_head_with_markov":true,
         "dflash_config":{"projector_type":"dspark","mask_token_id":63,"target_layer_ids":[0]}});
     std::fs::write(draft.path().join("config.json"), serde_json::to_vec(&config).unwrap()).unwrap();
+    let cfg = crate::formats::block_dspark::BlockDsparkConfig::from_json(&config).unwrap();
+    let tensors = std::cell::RefCell::new(Vec::new());
+    crate::formats::block_dspark::block_dspark_weight_recipe(&cfg,
+        |name, shape| { tensors.borrow_mut().push(t(name, "BF16", shape)); Ok::<_, ()>(()) },
+        |parts, cols| { for (name, rows) in parts { tensors.borrow_mut().push(t(*name, "BF16", &[*rows, cols])); } Ok(()) }).unwrap();
+    let tensors = tensors.into_inner();
+    crate::plan::testing::write_safetensors(&draft.path().join("model.safetensors"), &tensors);
+    use crate::placement::families::qwen3_5::DrafterBytes;
+    use crate::families::glm5::draft_representation::GlmDraftRepresentation;
+    let arena = crate::serving_capacity::WeightArenaLayout::new("qwen3_5/dspark/gpu0",
+        crate::formats::block_dspark::block_dspark_arena_requests(draft.path(), GlmDraftRepresentation::Bf16Only).unwrap()).unwrap();
+    let charge = DrafterBytes::block_dspark(draft.path(), &config, 17, 142, 262144).unwrap();
+    assert_eq!(charge.weight_arena, Some(("qwen3_5/dspark/gpu0", arena.bytes() as u64)));
+    assert_eq!(charge.weights.0, arena.payload_bytes() as u64);
+    let checkpoint = plan::Checkpoint::open(dir.path()).unwrap();
+    let target_cfg = Qwen35Config::from_hf(&checkpoint.config).unwrap();
+    let target = weight_layout::target_arena(&checkpoint, &target_cfg, cuteafd_core::DType::F32,
+        weight_layout::DenseFormat::Bf16).unwrap();
     for c in [17, 32, 33, 64] {
         let layout = options.layout.as_mut().unwrap();
         layout.concurrency = c;
@@ -134,13 +152,19 @@ fn native_dspark_high_concurrency_admits_and_matches_anchor_only_inventory() {
         let memory = report.memory_layout.unwrap();
         let supported = crate::formats::block_dspark::supports_sequences(c as usize);
         assert_eq!(memory.notes.iter().any(|note| note.contains("anchor-only")), !supported);
-        if !supported {
+        if supported {
+            assert_eq!(memory.devices[0].items.iter().filter(|item| item.group == "weight arena")
+                .map(|item| item.bytes).sum::<u64>(), (target.bytes() + arena.bytes()) as u64);
+        } else {
             options.layout.as_mut().unwrap().dense_qwen_drafter_snapshot = None;
             let plain = plan::plan(dir.path(), &options).unwrap().memory_layout.unwrap();
             assert_eq!(memory.devices, plain.devices);
             assert_eq!(memory.pool_tokens, plain.pool_tokens);
         }
     }
+    let missing = tensors.into_iter().filter(|(name, _, _)| name != "layers.0.self_attn.q_proj.weight").collect::<Vec<_>>();
+    crate::plan::testing::write_safetensors(&draft.path().join("model.safetensors"), &missing);
+    assert!(DrafterBytes::block_dspark(draft.path(), &config, 17, 142, 262144).is_err());
 }
 
 #[test]
@@ -157,9 +181,24 @@ fn native_planner_uses_export_contract_and_exact_dense_allocations() {
     let memory = report.memory_layout.unwrap();
     assert_eq!(memory.pool_tokens, 262144, "{:?}", report.hints);
     assert_eq!(memory.devices.len(), 1);
+    let checkpoint = plan::Checkpoint::open(dir.path()).unwrap();
+    let cfg = Qwen35Config::from_hf(&checkpoint.config).unwrap();
+    let arena = weight_layout::target_arena(&checkpoint, &cfg, cuteafd_core::DType::F32,
+        weight_layout::DenseFormat::Bf16).unwrap();
+    assert_eq!(memory.devices[0].items.iter().filter(|item| item.group == "weight arena")
+        .map(|item| item.bytes).sum::<u64>(), arena.bytes() as u64);
+    // The arena pays its own single tail; the view-less runtime owners pay one
+    // shared SM120 backing forecast beside it.
+    let tail = crate::placement::planner::allocation_granularity_forecast(&[arena.bytes() as u64]).unwrap();
+    let tails = memory.devices[0].items.iter()
+        .filter(|item| item.group == crate::placement::planner::ALLOCATION_GRANULARITY_GROUP)
+        .map(|item| (item.format.as_str(), item.bytes)).collect::<Vec<_>>();
+    assert_eq!(tails.iter().find(|(source, _)| *source == format!("{}.tail (SM120 direct cudaMalloc, \
+        driver/runtime13020 LAZY, #1454 2026-11-08, sizes-only forecast)", arena.id())).unwrap().1, tail);
+    assert!(tails.iter().any(|(source, _)| source.starts_with("dense.runtime.tail")));
     assert!(memory.devices[0].items.iter().any(|item| item.group == "exact retained prefix marks"
         && item.bytes == buffers.prefix as u64));
-    assert!(memory.notes.iter().any(|note| note.contains("no captured graphs")));
+    assert!(memory.notes.iter().any(|note| note.contains("bounded decode/verify graph reserve")));
     for ranks in 1..=8 {
         let spark_options = PlanOptions { placement: ExpertPlacement::Sparks { ranks }, ..options.clone() };
         let refused = plan::plan(dir.path(), &spark_options).unwrap();
@@ -182,6 +221,39 @@ fn native_planner_uses_export_contract_and_exact_dense_allocations() {
     assert!(!refused.fits && !refused.placement_supported && !refused.native_serving_admitted
         && !refused.wip_launchable());
     assert!(refused.hints.iter().any(|hint| hint.what.contains("pointer order")));
+}
+
+#[test]
+fn native_planner_enforces_independent_checkpoint_weight_and_storage_limits() {
+    use crate::placement::families::qwen3_5::NativeWeights;
+    use cuteafd_core::DType;
+    let (dir, mut options, _, _) = native_planner_fixture();
+    let checkpoint = plan::Checkpoint::open(dir.path()).unwrap();
+    let cfg = Qwen35Config::from_hf(&checkpoint.config).unwrap();
+    let owners = NativeWeights::native(&checkpoint, &cfg, DType::F32).unwrap();
+    let required = owners.layers.iter().sum::<u64>() + owners.embedding + owners.norm + owners.head;
+    assert!(required > 0);
+    options.coordinator_budget_bytes = required;
+    let accepted = plan::plan(dir.path(), &options).unwrap();
+    assert!(accepted.fits && accepted.native_serving_admitted, "{:?}", accepted.hints);
+    assert_eq!(accepted.memory_layout.as_ref().unwrap().pool_tokens, 262144);
+
+    options.coordinator_budget_bytes = required - 1;
+    let refused = plan::plan(dir.path(), &options).unwrap();
+    assert!(!refused.fits && !refused.native_serving_admitted);
+    let message = format!("rtx0 resident weights need {required} bytes, over the {} byte weight budget", required - 1);
+    assert!(refused.hints.iter().any(|hint| hint.what.contains(&message)), "{:?}", refused.hints);
+
+    // One byte short of the admitted owners must refuse rather than shrink the
+    // fixed context, now that no opaque growth allowance pads the ledger.
+    let accepted_bytes = accepted.memory_layout.as_ref().unwrap().devices[0].used_bytes();
+    assert!(accepted_bytes > (1 << 20));
+    options.coordinator_budget_bytes = required;
+    options.layout.as_mut().unwrap().rtx_bytes = vec![accepted_bytes - 1];
+    let refused = plan::plan(dir.path(), &options).unwrap();
+    assert!(!refused.fits && !refused.native_serving_admitted);
+    assert!(!refused.hints.iter().any(|hint| hint.what.contains("resident weights need")), "{:?}", refused.hints);
+    assert!(refused.hints.iter().any(|hint| hint.what.contains("native placement refused")), "{:?}", refused.hints);
 }
 
 #[test]
@@ -362,9 +434,7 @@ fn full_prefill_head_changes_only_the_admitted_logit_arena() {
             assert_eq!(wide.head_rows, PREFILL_ROWS);
             assert_eq!(narrow.logits, VERIFY_ROWS * cfg.vocab * 4);
             assert_eq!(wide.logits, PREFILL_ROWS * cfg.vocab * 4);
-            assert_eq!(wide.fixed().iter().map(|d| d.bytes).sum::<u64>()
-                - narrow.fixed().iter().map(|d| d.bytes).sum::<u64>(),
-                ((PREFILL_ROWS - VERIFY_ROWS) * cfg.vocab * 4) as u64);
+            assert_eq!(wide.logits - narrow.logits, (PREFILL_ROWS - VERIFY_ROWS) * cfg.vocab * 4);
             wide.logits = narrow.logits;
             wide.head_rows = narrow.head_rows;
             assert_eq!(wide, narrow, "full scoring must not change recurrence, replay or marks");
@@ -389,11 +459,33 @@ fn full_prefill_planner_equals_runtime_recipe_for_each_kv_format() {
             let memory = report.memory_layout.unwrap();
             assert_eq!(memory.pool_tokens, 262144);
             let device = &memory.devices[0];
-            for demand in buffers.fixed() {
-                let item = device.items.iter().find(|i| i.group == demand.group).unwrap();
-                assert_eq!(item.bytes, demand.bytes, "full={full}, kv={kv}, {}", demand.group);
+            // The admitted owner groups are the executor's actual allocations.
+            for (group, bytes) in [
+                ("native step planes and scratch", buffers.planes.iter().sum::<usize>()),
+                ("vocabulary head workspace", buffers.head),
+                ("logits", buffers.logits),
+                ("token ids", buffers.ids),
+                ("GDN commit table", buffers.commit),
+                ("exact retained prefix marks", buffers.prefix),
+                ("block verify marks, logits and taps", buffers.verify.iter().sum::<usize>()),
+            ] {
+                let bytes_by_group = device.items.iter().filter(|item| item.group == group)
+                    .map(|item| item.bytes).sum::<u64>();
+                assert_eq!(bytes_by_group, bytes as u64, "full={full}, kv={kv}, {group}");
             }
-            let bytes = device.used_bytes();
+            for (category, bytes) in [
+                (cuteafd_core::memory_layout::Category::Kv, buffers.verify[0]),
+                (cuteafd_core::memory_layout::Category::Workspace, buffers.verify[1..].iter().sum()),
+            ] {
+                let item = device.items.iter().find(|item| item.group == "block verify marks, logits and taps"
+                    && item.category == category).unwrap();
+                assert_eq!(item.bytes, bytes as u64, "full={full}, kv={kv}, {category:?}");
+            }
+            // Full scoring only grows the vocabulary head workspace; the SM120
+            // backing tails are a separate forecast that may re-round.
+            let bytes = device.items.iter()
+                .filter(|item| item.group != crate::placement::planner::ALLOCATION_GRANULARITY_GROUP)
+                .map(|item| item.bytes).sum::<u64>();
             if let Some(narrow_bytes) = previous {
                 assert_eq!(bytes - narrow_bytes, ((4096 - 64) * cfg.vocab * 4) as u64);
             }
@@ -495,4 +587,26 @@ fn native_compact_admission_keeps_fixed_slots_and_spends_half_the_pool_bytes() {
     let after = memories[1].get(&Category::Kv).copied().unwrap();
     // Fixture has one GQA layer; the actual 9B checkpoint has eight.
     assert_eq!(before - after, 2_097_152 * (4096 - 2080));
+}
+
+#[test]
+fn host_prefix_recipe_uses_the_live_geometry_and_explicit_quota() {
+    use crate::placement::{families::qwen3_5::host_prefix_geometry, planner::Phase};
+    let (dir, mut options, buffers, _) = native_planner_fixture();
+    let cfg = Qwen35Config::from_hf(&config(4096, 12288, 16, 32, 4)).unwrap();
+    let geometry = host_prefix_geometry(&cfg, 4096, buffers.mark_bytes as u64);
+    for quota in [Some(0), Some(1 << 30), None] {
+        let layout = options.layout.as_mut().unwrap();
+        layout.host_cache_bytes = quota;
+        let report = plan::plan(dir.path(), &options).unwrap();
+        assert!(report.fits, "{:?}", report.hints);
+        let expected = if quota == Some(0) { 0 } else {
+            geometry.resolve(quota, cfg.max_context as u64, 4, 128 << 30,
+                geometry.chunk_bytes()).unwrap()
+        };
+        assert_eq!(report.host_budget_bytes, expected);
+        let ledger = report.phase_ledger.unwrap();
+        let ready = ledger.phases.iter().find(|row| row.budget == "host" && row.phase == Phase::Ready).unwrap();
+        assert!(ready.owned >= expected);
+    }
 }

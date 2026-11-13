@@ -10,6 +10,7 @@
 //! up_proj; shared_expert_gate; 15 zero rows]`, PLE `w_kv = [key_proj;
 //! value_proj]` and FP32 `conv_w [10240, 4]`.
 use crate::shared::memory::device::{Allocation, Device};
+use cuteafd_loader::families::qwen4::weight_layout::rows_key;
 use anyhow::{ensure, Context, Result};
 use cuteafd_core::DType;
 use cuteafd_ffi::NativeLibrary;
@@ -19,6 +20,9 @@ use cuteafd_loader::families::qwen4::{Qwen4Attention, Qwen4Config};
 use std::collections::HashMap;
 use std::ffi::c_void;
 use crate::shared::qwen::weights::WeightReader;
+
+#[path = "weights_arena.rs"]
+pub(super) mod arena;
 
 pub(crate) const PREFIX: &str = "model.language_model.";
 /// Rows of the shared expert's packed gate/up/gate-logit operand.
@@ -128,6 +132,12 @@ pub(crate) struct Qwen4Weights<'a> {
 }
 
 impl Qwen4Weights<'_> {
+    pub fn bytes(&self) -> usize {
+        self.layers.iter().map(Qwen4Layer::bytes).sum::<usize>()
+            + self.mtp.as_ref().map_or(0, MtpWeights::bytes)
+            + self.mixer.iter().map(|a| a.buffer.bytes).sum::<usize>() + self.head.bytes()
+    }
+
     /// Every layer (target and MTP) with its projections in the representation
     /// `fp8` selects and no other, and the head likewise: device bytes of the
     /// selectable weights as loaded (projections, head).
@@ -181,6 +191,7 @@ pub(crate) struct Qwen4Loader<'a> {
     /// The coordinator's dense records: filled through the mount at once, or
     /// recorded for a push group (every transform runs on the GPU either way).
     pub dense: std::rc::Rc<crate::shared::experts::rtx::dense::DenseLoad<'a>>,
+    pub(super) arenas: Option<std::rc::Rc<arena::Arenas<'a>>>,
 }
 
 impl<'a> Qwen4Loader<'a> {
@@ -200,10 +211,6 @@ impl<'a> Qwen4Loader<'a> {
         self.reader().raw(name)
     }
 
-    fn upload(&self, bytes: &[u8]) -> Result<Allocation<'a>> {
-        self.reader().upload(bytes)
-    }
-
     /// Rows `rows` of a tensor (whole rows) as a landing rectangle.
     fn rect(&self, name: &str, rows: Option<std::ops::Range<usize>>) -> Result<crate::shared::experts::rtx::dense::Rect> {
         let tensor = self.tensor(name)?;
@@ -215,10 +222,10 @@ impl<'a> Qwen4Loader<'a> {
 
     /// An allocation of `size` bytes (zeroed with `zero`) whose `lands` fill
     /// its first `bytes` unchanged (class 2); sizes match the mount loader's.
-    fn landed(&self, lands: Vec<(crate::shared::experts::rtx::dense::Rect, usize)>, bytes: usize, size: usize,
+    fn landed(&self, name: &str, lands: Vec<(crate::shared::experts::rtx::dense::Rect, usize)>, bytes: usize, size: usize,
         zero: bool) -> Result<Allocation<'a>> {
         let device = self.device()?;
-        let allocation = Allocation::new(device, size)?;
+        let allocation = self.allocate(name, size)?;
         if zero { self.library.cuda_zero_bytes(allocation.buffer, allocation.buffer.bytes)?; }
         self.dense.operand(crate::shared::experts::rtx::dense::Operand { device: device.id, buffer: allocation.buffer,
             lands, bytes })?;
@@ -238,7 +245,7 @@ impl<'a> Qwen4Loader<'a> {
         let (lands, bytes) = self.row_lands(names, pad_rows)?;
         // As the reader: exactly the packed bytes, zeroed (padding rows stay zero).
         let data = lands.iter().map(|(r, _)| r.bytes()).sum();
-        self.landed(lands, data, bytes, true)
+        self.landed(&names.join("+"), lands, data, bytes, true)
     }
 
     fn row_lands(&self, names: &[String], pad_rows: usize)
@@ -266,7 +273,7 @@ impl<'a> Qwen4Loader<'a> {
         ensure!(tensor.meta.dtype == DType::Bf16, "{name}: expected BF16, found {:?}", tensor.meta.dtype);
         let rect = self.rect(name, None)?;
         let bytes = rect.bytes();
-        self.landed(vec![(rect, 0)], bytes, bytes.max(256), false)
+        self.landed(name, vec![(rect, 0)], bytes, resident::native_operand_bytes(bytes), false)
     }
 
     /// Native FP32 values land unchanged; BF16 values widen exactly on the GPU.
@@ -275,10 +282,10 @@ impl<'a> Qwen4Loader<'a> {
         let tensor = self.tensor(name)?;
         let rect = self.rect(name, None)?;
         match tensor.meta.dtype {
-            DType::F32 => { let bytes = rect.bytes(); self.landed(vec![(rect, 0)], bytes, bytes.max(256), false) }
+            DType::F32 => { let bytes = rect.bytes(); self.landed(name, vec![(rect, 0)], bytes, resident::native_operand_bytes(bytes), false) }
             DType::Bf16 => {
                 let width = rect.width();
-                let out = Allocation::new(self.device()?, (rect.bytes() * 2).max(256))?;
+                let out = self.allocate(name, resident::native_operand_bytes(rect.bytes() * 2))?;
                 for (parts, window) in crate::shared::experts::rtx::dense::windows(&[rect], 1)? {
                     let dst = cuteafd_ffi::CuteafdDeviceBuffer {
                         // SAFETY: these rows' FP32 values lie inside `out` (twice the BF16 bytes).
@@ -299,9 +306,8 @@ impl<'a> Qwen4Loader<'a> {
     fn block_fp8(&self, names: &[String], rows: usize, cols: usize) -> Result<(Allocation<'a>, Allocation<'a>)> {
         let (lands, bytes) = self.row_lands(names, 0)?;
         ensure!(bytes == resident::bf16_bytes(rows, cols), "{names:?}: BF16 [{rows}, {cols}] expected");
-        let device = self.device()?;
-        let q = Allocation::new(device, rows * cols)?;
-        let scale = Allocation::new(device, resident::fp8_block_scale_bytes(rows, cols))?;
+        let q = self.allocate(&format!("{}.fp8", names.join("+")), rows * cols)?;
+        let scale = self.allocate(&format!("{}.scales", names.join("+")), resident::fp8_block_scale_bytes(rows, cols))?;
         let rects: Vec<_> = lands.into_iter().map(|(rect, _)| rect).collect();
         let kb = cols.div_ceil(128);
         for (parts, window) in crate::shared::experts::rtx::dense::windows_with_tail(&rects, 128)? {
@@ -417,6 +423,10 @@ impl<'a> Qwen4Loader<'a> {
             "invalid Qwen weight placement");
         ensure!(ranks.iter().all(|(device, _)| std::ptr::eq(device.library, self.library)),
             "Qwen weight placement crosses native libraries");
+        if self.arenas.is_none() {
+            let loader = self.with_arenas(cfg, owners, ranks, mtp, fp8_head, false)?;
+            return loader.model_placed(cfg, owners, ranks, mtp, fp8_head);
+        }
         let _entry = ranks[0].0.enter()?;
         let tensor = self.tensor("lm_head.weight")?;
         ensure!(tensor.meta.dtype == DType::Bf16 && tensor.meta.shape == [cfg.vocab_size, cfg.hidden],
@@ -425,9 +435,8 @@ impl<'a> Qwen4Loader<'a> {
             // Per-row x 128-K E4M3 (Row128) quantized on the GPU from staged rows.
             let (rows, cols) = (cfg.vocab_size, cfg.hidden);
             ensure!(cols % 128 == 0, "the FP8 head needs whole 128-K scale blocks");
-            let device = self.device()?;
-            let values = Allocation::new(device, (rows * cols).max(256))?;
-            let scales = Allocation::new(device, (rows * (cols / 128) * 4).max(256))?;
+            let values = self.allocate("lm_head.weight.fp8", (rows * cols).max(256))?;
+            let scales = self.allocate("lm_head.weight.scales", (rows * (cols / 128) * 4).max(256))?;
             let whole = self.rect("lm_head.weight", None)?;
             for (parts, window) in crate::shared::experts::rtx::dense::windows(&[whole], 1)? {
                 let target = crate::shared::fp8_load_quant::Target {
@@ -452,7 +461,7 @@ impl<'a> Qwen4Loader<'a> {
             layers: owners.iter().enumerate().map(|(layer, &owner)| {
                 let (device, stream) = ranks[owner];
                 let loader = Qwen4Loader { library: self.library, checkpoint: self.checkpoint,
-                    fp8_decode: self.fp8_decode, fp8_scales: self.fp8_scales, stream, dense: self.dense.clone() };
+                    fp8_decode: self.fp8_decode, fp8_scales: self.fp8_scales, stream, dense: self.dense.clone(), arenas: self.arenas.clone() };
                 device.run(|| loader.layer(cfg, layer))
             }).collect::<Result<_>>()?,
             mixer: self.hc(&format!("{PREFIX}hyper_connection_mixer"), false)?,
@@ -481,7 +490,127 @@ mod coordinator_golden_tests;
 
 #[cfg(test)]
 mod tests {
-    use super::projection_residency;
+    use super::*;
+
+    #[test]
+    #[ignore = "requires an allocated CPU build slot and explicit NVMe fixture directory"]
+    fn gdn_small_owners_match_admission_and_replay_payloads() -> Result<()> {
+        use crate::shared::experts::rtx::dense::{self, DenseLoad};
+        use cuteafd_ffi::native_library_lifetime_fixture::Fixture;
+        use cuteafd_loader::plan::testing::{qwen4_config, t, write_snapshot};
+        use std::os::unix::fs::FileExt;
+        let fixture = Fixture::build()?;
+        let library = fixture.load()?;
+        fixture.immediate_copies(&library)?;
+        fixture.configure_memory(&library, 0, 1 << 30)?;
+        let mut config = qwen4_config(1);
+        config["text_config"]["hidden_size"] = 128.into();
+        let cfg = Qwen4Config::from_hf(&config)?;
+        let p = "model.language_model.layers.0";
+        let a = format!("{p}.linear_attn");
+        let mut tensors = vec![
+            t("lm_head.weight", "BF16", &[cfg.vocab_size, cfg.hidden]),
+            t(format!("{a}.in_proj_qkv.weight"), "BF16", &[cfg.gdn_conv_width(), cfg.hidden]),
+            t(format!("{a}.in_proj_z.weight"), "BF16", &[cfg.gdn_value_width(), cfg.hidden]),
+            t(format!("{a}.in_proj_b.weight"), "BF16", &[48, cfg.hidden]),
+            t(format!("{a}.in_proj_a.weight"), "BF16", &[48, cfg.hidden]),
+            t(format!("{a}.out_proj.weight"), "BF16", &[cfg.hidden, cfg.gdn_value_width()]),
+            t(format!("{a}.conv1d.weight"), "BF16", &[cfg.gdn_conv_width(), 1, 4]),
+            t(format!("{a}.norm.weight"), "BF16", &[128]),
+            t(format!("{p}.mlp.gate.weight"), "BF16", &[2, cfg.hidden]),
+            t(format!("{p}.mlp.shared_expert.gate_proj.weight"), "BF16", &[640, cfg.hidden]),
+            t(format!("{p}.mlp.shared_expert.up_proj.weight"), "BF16", &[640, cfg.hidden]),
+            t(format!("{p}.mlp.shared_expert_gate.weight"), "BF16", &[1, cfg.hidden]),
+            t(format!("{p}.mlp.shared_expert.down_proj.weight"), "BF16", &[cfg.hidden, 640]),
+        ];
+        for (prefix, inject) in [(format!("{p}.attn_hyper_connection"), true),
+            (format!("{p}.mlp_hyper_connection"), true),
+            ("model.language_model.hyper_connection_mixer".to_string(), false)] {
+            tensors.extend([t(format!("{prefix}.hc_norm.weight"), "BF16", &[cfg.hidden]),
+                t(format!("{prefix}.input_mix_weight_down.weight"), "BF16", &[4, cfg.hidden]),
+                t(format!("{prefix}.input_mix_weight_up.weight"), "BF16", &[cfg.hidden, 4])]);
+            if inject { tensors.push(t(format!("{prefix}.block_inject_weight.weight"), "BF16", &[4, cfg.hidden])); }
+        }
+        for dtype in ["BF16", "F32"] {
+            let mut tensors = tensors.clone();
+            tensors.extend([t(format!("{a}.A_log"), dtype, &[48]), t(format!("{a}.dt_bias"), dtype, &[48])]);
+            write_snapshot(fixture.directory(), &config, &tensors, None);
+            let checkpoint = Checkpoint::open(fixture.directory())?;
+            for tensor in &checkpoint.tensors {
+                let bytes = match tensor.meta.dtype {
+                    DType::Bf16 => (0..tensor.meta.byte_length / 2).flat_map(|i|
+                        (((0.125 * (1 + i % 7) as f32).to_bits() >> 16) as u16).to_le_bytes()).collect::<Vec<_>>(),
+                    DType::F32 => (0..tensor.meta.byte_length / 4).flat_map(|i|
+                        (0.125 * (1 + i % 7) as f32).to_le_bytes()).collect(),
+                    _ => unreachable!(),
+                };
+                std::fs::File::options().write(true).open(checkpoint.snapshot.join(&tensor.shard))?
+                    .write_all_at(&bytes, tensor.meta.byte_offset)?;
+            }
+            let loader = Qwen4Loader { library: &library, checkpoint: &checkpoint, fp8_decode: false,
+                fp8_scales: crate::shared::fp8_linear::Fp8Scales::Amax, stream: std::ptr::null_mut(),
+                dense: std::rc::Rc::new(DenseLoad::mount(&library)), arenas: None };
+            let fp8_loader = Qwen4Loader { fp8_decode: true, ..loader.clone() };
+            let layouts = cuteafd_loader::families::qwen4::weight_layout::coordinator_arenas(
+                &checkpoint, &cfg, &[0], 1, false,
+                resident::Qwen4Representation { fp8_projections: true, fp8_head: false }, 0)?;
+            let payload = layouts.iter().map(|(_, layout)| layout.payload_bytes()).sum::<usize>();
+            fixture.configure_memory(&library, 0, payload)?;
+            let before = library.cuda_memory_info()?.0;
+            let error = match fp8_loader.with_arenas(&cfg, &[0], &[(Device { library: &library, id: 0 },
+                std::ptr::null_mut())], false, false, false) {
+                Ok(_) => anyhow::bail!("startup admitted payload without live staging"),
+                Err(error) => error,
+            };
+            assert!(error.to_string().contains("startup arenas and dense workspace"), "{error:#}");
+            assert_eq!(library.cuda_memory_info()?.0, before, "refusal allocated a backing");
+            fixture.configure_memory(&library, 0, 1 << 30)?;
+            let mounted = loader.model(&cfg, 1, false, false)?;
+            let admitted = resident::checkpoint_resident_bytes(&checkpoint, &cfg, 1, false,
+                resident::Qwen4Representation::default())?;
+            assert_eq!(mounted.bytes() as u64, admitted.target_bytes + admitted.head_bytes);
+            let load = std::rc::Rc::new(DenseLoad::push(&library));
+            let planning = Qwen4Loader { dense: load.clone(), ..loader };
+            let (pushed, mut records) = dense::recording(|| planning.model(&cfg, 1, false, false))?;
+            records.extend(load.sink.as_ref().unwrap().take_all());
+            let sockets = tempfile::tempdir_in(fixture.directory())?;
+            let _committed = crate::shared::experts::rtx::push::tests::receive_pushed(
+                Device { library: &library, id: 0 }, None, &checkpoint.snapshot, sockets.path(), &records, None, 0, 0)?;
+            assert_eq!(pushed.bytes(), mounted.bytes());
+            let devices = cuteafd_loader::placement::planner::CoordinatorDevices::new(&[0])?;
+            for model in [&mounted, &pushed] {
+                let receipts = model.allocation_receipts(devices)?;
+                let backings = receipts.iter().filter(|r| r.allocation.view.is_none()).collect::<Vec<_>>();
+                assert_eq!(backings.len(), 1);
+                assert!(backings[0].allocation.id.contains("qwen4/target/"));
+                assert!(receipts.iter().filter(|r| r.allocation.view.is_some()).count() > 10);
+                assert_eq!(backings[0].allocation.bytes, model.bytes() as u64);
+            }
+            for (name, allocation) in mounted.layers[0].operands() {
+                let other = &pushed.layers[0].operands[name];
+                // Only logical widened rows are initialized below the native min-256 extent.
+                let bytes = if ["a_log", "dt_bias"].contains(&name) { 48 * 4 } else { allocation.buffer.bytes };
+                let read = |a: &Allocation<'_>| -> Result<Vec<u8>> {
+                    let mut out = vec![0; bytes];
+                    library.copy_d2h(&mut out, cuteafd_ffi::CuteafdDeviceBuffer { bytes, ..a.buffer })?;
+                    Ok(out)
+                };
+                assert_eq!(read(allocation)?, read(other)?, "{name}");
+            }
+            for key in ["a_log", "dt_bias"] {
+                let mounted = &mounted.layers[0].operands[key];
+                let pushed = &pushed.layers[0].operands[key];
+                assert_eq!((mounted.buffer.bytes, pushed.buffer.bytes), (256, 256));
+                let read = |allocation: &Allocation<'_>| -> Result<Vec<u8>> {
+                    let mut bytes = vec![0; 48 * 4];
+                    library.copy_d2h(&mut bytes, allocation.buffer)?;
+                    Ok(bytes)
+                };
+                assert_eq!(read(mounted)?, read(pushed)?);
+            }
+        }
+        Ok(())
+    }
 
     #[test]
     fn a_projection_is_resident_in_exactly_one_representation() {

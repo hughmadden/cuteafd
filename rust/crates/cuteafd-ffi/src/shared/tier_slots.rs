@@ -127,9 +127,9 @@ mod tests {
         let kernel = library.v41_tier_slots()?;
         let shape = TierSlotShape { layers: 40, experts: 384 };
         let capacity = 4096 * 6;
-        let mut ids_buffer = library.alloc_device_buffer(capacity * 4)?;
-        let mut slots_buffer = library.alloc_device_buffer(capacity * 4)?;
-        let mut tables_buffer = library.alloc_device_buffer(shape.bytes())?;
+        let mut ids_buffer = library.alloc_device_buffer(capacity * 4, crate::memory_ledger::Tag::workspace("test/tier-slots"))?;
+        let mut slots_buffer = library.alloc_device_buffer(capacity * 4, crate::memory_ledger::Tag::workspace("test/tier-slots"))?;
+        let mut tables_buffer = library.alloc_device_buffer(shape.bytes(), crate::memory_ledger::Tag::workspace("test/tier-slots"))?;
         let stream = library.cuda_stream_create()?;
         let bytes = |values: &[i32]| values.iter().flat_map(|value| value.to_ne_bytes()).collect::<Vec<_>>();
         let read = |buffer: CuteafdDeviceBuffer, count: usize| -> Result<Vec<i32>> {

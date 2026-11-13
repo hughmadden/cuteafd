@@ -2,6 +2,7 @@
 use crate::shared::decode_graph::{fatal_drain, BindingGraphs};
 use super::{DsparkProjection, DsparkWeights, ProjectionKind};
 use crate::families::deepseek_v41::v41_dspark_cache::{DsparkWindow, WindowChunk, WindowWrite};
+use crate::shared::memory::Tag;
 use crate::shared::memory::{DeviceAllocation, HostAllocation, LoadStream};
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::{CuteafdDeviceBuffer, NativeLibrary, V41AttentionOps};
@@ -41,7 +42,7 @@ impl<'library> DsparkWeights<'library> {
             DsparkMainContext::device_bytes(library, capacity)? <= budget,
             "dSpark main context exceeds budget"
         );
-        let normalized = DeviceAllocation::new(library, capacity as usize * 10240)?;
+        let normalized = DeviceAllocation::new(library, capacity as usize * 10240, Tag::drafter_workspace("v41/draft-context"))?;
         let kv = |stage| unsafe {
             self.projection_from(ProjectionKind::Kv(stage), capacity, normalized.buffer,
                 DsparkProjection::external_input_bytes(library, ProjectionKind::Kv(stage), capacity)?)
@@ -65,19 +66,19 @@ impl<'library> DsparkWeights<'library> {
                 self.tensor("mtp.2.attn.kv_norm.weight")?,
             ],
             normalized,
-            positions: DeviceAllocation::new(library, capacity as usize * 8)?,
-            frequencies: DeviceAllocation::new(library, capacity as usize * 256)?,
+            positions: DeviceAllocation::new(library, capacity as usize * 8, Tag::drafter_workspace("v41/draft-context"))?,
+            frequencies: DeviceAllocation::new(library, capacity as usize * 256, Tag::drafter_workspace("v41/draft-context"))?,
             rotated: [
-                DeviceAllocation::new(library, capacity as usize * 1024)?,
-                DeviceAllocation::new(library, capacity as usize * 1024)?,
-                DeviceAllocation::new(library, capacity as usize * 1024)?,
+                DeviceAllocation::new(library, capacity as usize * 1024, Tag::drafter_workspace("v41/draft-context"))?,
+                DeviceAllocation::new(library, capacity as usize * 1024, Tag::drafter_workspace("v41/draft-context"))?,
+                DeviceAllocation::new(library, capacity as usize * 1024, Tag::drafter_workspace("v41/draft-context"))?,
             ],
             capacity,
-            graph: BindingGraphs::new(library)?,
+            graph: BindingGraphs::new(library, "dspark_main_context")?,
             ready: None,
             pending_writes: None,
-            commit_descriptors: [DeviceAllocation::new(library, cuteafd_core::V41_WRITE_DESCRIPTOR_BYTES)?, DeviceAllocation::new(library, cuteafd_core::V41_WRITE_DESCRIPTOR_BYTES)?, DeviceAllocation::new(library, cuteafd_core::V41_WRITE_DESCRIPTOR_BYTES)?],
-            commit_staging: HostAllocation::new(library, capacity as usize*8 + 3 * cuteafd_core::V41_WRITE_DESCRIPTOR_BYTES)?,
+            commit_descriptors: [DeviceAllocation::new(library, cuteafd_core::V41_WRITE_DESCRIPTOR_BYTES, Tag::drafter_workspace("v41/draft-context"))?, DeviceAllocation::new(library, cuteafd_core::V41_WRITE_DESCRIPTOR_BYTES, Tag::drafter_workspace("v41/draft-context"))?, DeviceAllocation::new(library, cuteafd_core::V41_WRITE_DESCRIPTOR_BYTES, Tag::drafter_workspace("v41/draft-context"))?],
+            commit_staging: HostAllocation::new(library, capacity as usize*8 + 3 * cuteafd_core::V41_WRITE_DESCRIPTOR_BYTES, Tag::staging("v41/draft-context"))?,
         })
     }
 }
@@ -249,38 +250,12 @@ impl DsparkMainContext<'_, '_> {
     }
     /// # Safety
     /// Same initialized-input and exclusive-use contract as execute.
-    pub unsafe fn capture(&mut self, rows: u32) -> Result<()> {
-        self.prepare(rows)?;
-        ensure!(self.graph.is_none(), "main context already captured");
-        unsafe {
-            self.execute(rows)?;
-        }
-        self.ready = None;
-        unsafe {
-            self.stream
-                .library
-                .cuda_graph_begin_capture(self.stream.raw)?;
-        }
-        let launched = unsafe { self.enqueue(rows) };
-        let captured = unsafe { self.stream.library.cuda_graph_end_capture(self.stream.raw) };
-        match (launched, captured) {
-            (Ok(()), Ok(graph)) => unsafe { self.graph.insert(rows, graph)?; },
-            (Err(error), Ok(graph)) => {
-                unsafe {
-                    self.stream.library.cuda_graph_exec_destroy(graph)?;
-                }
-                return Err(error);
-            }
-            (Err(error), Err(_)) | (Ok(()), Err(error)) => return Err(error),
-        }
-        Ok(())
-    }
-    /// # Safety
-    /// Same initialized-input and exclusive-use contract as execute.
     pub unsafe fn replay(&mut self, rows: u32) -> Result<()> {
         self.prepare(rows)?;
-        let (graph, captured) = self.graph.get().context("main context not captured")?;
-        ensure!(rows == captured, "main context replay rows differ");
+        let Some(graph) = self.graph.cached_launch(&rows) else {
+            // SAFETY: replay and eager execution have the same input contract.
+            return unsafe { self.execute(rows) };
+        };
         let launched = unsafe {
             self.stream
                 .library
@@ -371,5 +346,14 @@ impl Drop for DsparkMainContext<'_, '_> {
         self.pending_writes = None; // Stream drained before slot reservations release.
         // SAFETY: owning stream has drained before executable retirement.
         fatal_drain(unsafe { self.graph.clear() }, "dSpark main_context graphs");
+    }
+}
+
+impl DsparkMainContext<'_, '_> {
+    pub(crate) fn visit_graph_banks(&mut self, f: &mut super::chain::GraphVisitor<'_>) -> Result<()> {
+        f(self.normalized.buffer.device_id, "dspark_main_context", false, &mut self.graph)?;
+        self.main.visit_graph_banks(f)?;
+        for child in &mut self.kv { child.visit_graph_banks(f)?; }
+        Ok(())
     }
 }

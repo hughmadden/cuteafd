@@ -16,7 +16,7 @@
 //! `w_gate_up`) concatenate their grids (every part but the last is a whole
 //! number of 128-row blocks). BF16 operands: norms, the router, the LM head and
 //! `w_ik` (`wk` FP8 dequantized on the GPU with its scales, `weights_proj` BF16).
-use crate::shared::memory::{DeviceAllocation, device::Device};
+use crate::shared::memory::{DeviceAllocation, Tag, device::Device};
 use crate::shared::dense_trellis::{CoreWeightLayout, CoreWeights};
 use cuteafd_loader::families::glm5::core::CoreInventory;
 use cuteafd_loader::families::glm5::names::Operand as Op;
@@ -30,6 +30,7 @@ use std::ffi::c_void;
 use std::os::unix::fs::FileExt;
 use crate::shared::peer_split::{slice_2d, Axis};
 use super::landing::{self, Land};
+use cuteafd_core::memory_layout::ArenaTag;
 
 pub(crate) struct GlmLayer<'a> {
     pub dense: bool,
@@ -44,12 +45,13 @@ pub(crate) struct GlmLayer<'a> {
     /// Set only after this rank's attention operands have loaded successfully.
     attention_resident: bool,
     operands: HashMap<&'static str, DeviceAllocation<'a>>,
-    /// The EXLR8 checkpoint's own dense operands (`dense_weights::key`), when
+    /// The EXLR8 checkpoint's own dense operands (`requests::key`), when
     /// the layer runs natively; empty on the official path.
     pub(crate) native: HashMap<String, DeviceAllocation<'a>>,
-    pub(crate) native_projections: HashMap<&'static str, crate::shared::experts::exlr8::dense_weights::NativeProjection>,
+    pub(crate) native_projections: HashMap<&'static str, cuteafd_loader::plan::exlr8::dense::requests::NativeProjection>,
     /// Standard HF K6 payload/vector owners, separate from EXLR8 encodings.
     pub(crate) core: std::collections::BTreeMap<&'static str, CoreWeights<'a>>,
+    pub(crate) attention_native: std::collections::BTreeMap<&'static str, crate::shared::memory::device::DeviceOwner<'a, crate::shared::native_attention::NativeAttentionWeights<'a>>>,
 }
 
 /// The `{w}_fp8` / `{w}_scale` operand names of an FP8 weight, and its
@@ -105,10 +107,44 @@ fn native_projection_ranges(name: &str, range: impl Fn(&str) -> Option<crate::sh
     // Input transform, payload, output transform; scaled native formats keep
     // their payload/scale order. Only this rank's resident components enter.
     ["suh", "trellis", "svh", "q4", "s4", "fp8", "e8m0", "scale", "bf16", "fp32"]
-        .into_iter().filter_map(|component| range(&crate::shared::experts::exlr8::dense_weights::key(name, component))).collect()
+        .into_iter().filter_map(|component| range(&cuteafd_loader::plan::exlr8::dense::requests::key(name, component))).collect()
 }
 
 impl GlmLayer<'_> {
+    pub(crate) fn allocation_receipts(&self, inventory: &mut crate::shared::memory::receipts::Inventory<'_>, prefix: &str) -> Result<()> {
+        for (name, owner) in &self.operands { owner.inventory(inventory, &format!("{prefix}.operand.{name}"))?; }
+        for (name, owner) in &self.native { owner.inventory(inventory, &format!("{prefix}.native.{name}"))?; }
+        for (name, weights) in &self.core {
+            for (component, owner) in [("payload", &weights.payload), ("suh", &weights.suh), ("svh", &weights.svh)] {
+                owner.inventory(inventory, &format!("{prefix}.core.{name}.{component}"))?;
+            }
+        }
+        for (name, weights) in &self.attention_native {
+            weights.values.inventory(inventory, &format!("{prefix}.native.{name}.values"))?;
+            if let Some(scales) = &weights.scales { scales.inventory(inventory, &format!("{prefix}.native.{name}.scales"))?; }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn allocation_buffers(&self) -> Vec<(String, CuteafdDeviceBuffer)> {
+        let mut out = self.operands.iter().map(|(name, owner)| (format!("operand.{name}"), owner.buffer))
+            .chain(self.native.iter().map(|(name, owner)| (format!("native.{name}"), owner.buffer)))
+            .collect::<Vec<_>>();
+        for (name, weights) in &self.core {
+            for (component, owner) in [("payload", &weights.payload), ("suh", &weights.suh), ("svh", &weights.svh)] {
+                out.push((format!("core.{name}.{component}"), owner.buffer));
+            }
+        }
+        for (name, weights) in &self.attention_native {
+            out.push((format!("native.{name}.values"), weights.values.buffer));
+            if let Some(scales) = &weights.scales {
+                out.push((format!("native.{name}.scales"), scales.buffer));
+            }
+        }
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
+    }
+
     /// The loader's attention residency controls cache and prefix-snapshot ownership.
     pub fn holds_attention(&self) -> bool {
         self.attention_resident
@@ -125,6 +161,10 @@ impl GlmLayer<'_> {
             if let Some(w) = self.core.get(name) {
                 return trellis_ranges(w.payload.buffer, w.suh.buffer, w.svh.buffer);
             }
+            if let Some(weight) = self.attention_native.get(name) {
+                return std::iter::once(&weight.values).chain(weight.scales.as_ref())
+                    .map(|a| (a.buffer.ptr.cast_const(), a.buffer.bytes)).collect();
+            }
             native_projection_ranges(name, |key| self.native.get(key)
                 .map(|a| (a.buffer.ptr.cast_const(), a.buffer.bytes)))
         })
@@ -138,6 +178,7 @@ impl GlmLayer<'_> {
     pub fn bytes(&self) -> usize {
         self.operands.values().chain(self.native.values()).map(|a| a.buffer.bytes).sum::<usize>()
             + self.core.values().map(|w| w.payload.buffer.bytes + w.suh.buffer.bytes + w.svh.buffer.bytes).sum::<usize>()
+            + self.attention_native.values().map(|w| w.values.buffer.bytes + w.scales.as_ref().map_or(0, |s| s.buffer.bytes)).sum::<usize>()
     }
 
     /// A native operand's device buffer.
@@ -217,7 +258,12 @@ pub(crate) struct GlmLoader<'a> {
     /// Push mode: class-2 operands are allocated and recorded, filled later by
     /// the push group; transforms of their bytes wait for the commit.
     pub push: Option<std::rc::Rc<super::landing::PushSink>>,
+    pub arenas: Option<std::rc::Rc<std::collections::BTreeMap<i32, crate::shared::memory::weight_arena::DeviceWeightArena<'a>>>>,
+    pub allocation_prefix: String,
 }
+
+#[path = "weight_routes.rs"]
+mod routes;
 
 fn f32_bytes(values: &[f32]) -> Vec<u8> {
     let mut out = vec![0u8; values.len() * 4];
@@ -233,6 +279,22 @@ fn peer_router_names(cfg: &GlmDsaConfig, layer: usize) -> impl Iterator<Item = (
 }
 
 impl<'a> GlmLoader<'a> {
+    pub(crate) fn allocate(&self, name: &str, bytes: usize) -> Result<DeviceAllocation<'a>> {
+        Ok(DeviceAllocation::from_allocation(self.allocate_owner(name, bytes)?))
+    }
+
+    pub(crate) fn allocate_owner(&self, name: &str, bytes: usize) -> Result<crate::shared::memory::device::Allocation<'a>> {
+        let device = Device { library: self.library, id: self.library.cuda_get_device()? };
+        let arena = self.arenas.as_ref().map(|arenas| arenas.get(&device.id)
+            .context("GLM current device has no admitted target arena")).transpose()?;
+        let rank = arena.map(|arena| arena.layout().id().rsplit('/').next().unwrap()).unwrap_or("0");
+        let name = if name == "embedding" { "glm.weights.embedding".into() }
+            else { format!("glm.weights.gpu.{}.{}{name}", rank, self.allocation_prefix) };
+        crate::shared::memory::weight_arena::weight_allocation(device, arena, &name, bytes, ArenaTag::weights("glm/target"))
+    }
+
+    fn scoped(&self, prefix: String) -> Self { Self { allocation_prefix: prefix, ..self.clone() } }
+
     /// Replicate only admitted local routers; their bytes are charged to the TP2 expert arena.
     pub(crate) fn peer_routers(&self, cfg: &GlmDsaConfig, layers: &mut [GlmLayer<'a>], range: std::ops::Range<usize>) -> Result<()> {
         let peer = *self.peers.first().context("TP2 router replica needs peer")?;
@@ -250,10 +312,11 @@ impl<'a> GlmLoader<'a> {
                         let mut bytes = vec![0u8; source.bytes];
                         crate::shared::memory::load_timing::read(bytes.len(), || std::fs::File::open(&source.path)?
                             .read_exact_at(&mut bytes, source.offset))?;
-                        let allocation = DeviceAllocation::new(self.library, bytes.len().max(256))?;
+                        let allocation = DeviceAllocation::new(self.library, bytes.len().max(256),
+                            Tag::weights("glm/tp2-router"))?;
                         self.library.copy_h2d(allocation.buffer, &bytes)?;
                         Ok(allocation)
-                    } else { self.one(&name) }
+                    } else { GlmLoader { arenas: None, ..self.clone() }.one(operand, &name) }
                 })?;
                 layers[index].operands.insert(operand, allocation);
             }
@@ -273,22 +336,22 @@ impl<'a> GlmLoader<'a> {
 
     /// One operand on this loader's current device filled from checkpoint
     /// rectangles that land unchanged (class 2).
-    fn landed(&self, lands: &[Land], bytes: usize) -> Result<DeviceAllocation<'a>> {
+    fn landed(&self, key: &str, lands: &[Land], bytes: usize) -> Result<DeviceAllocation<'a>> {
         if let Some(push) = &self.push {
-            let allocation = DeviceAllocation::new(self.library, bytes.max(256))?;
+            let allocation = self.allocate(key, bytes.max(256))?;
             push.record(self.catalog, self.library.cuda_get_device()?, allocation.buffer, lands, bytes)?;
             return Ok(allocation);
         }
-        self.upload(&landing::read(self.catalog, lands, bytes)?)
+        self.upload(key, &landing::read(self.catalog, lands, bytes)?)
     }
 
     /// `lands` replicated on every rank (one read, rank 0 upload, peer copies;
     /// pushed, each rank receives its own copy).
-    fn landed_all(&self, ranks: usize, lands: &[Land], bytes: usize) -> Result<Vec<DeviceAllocation<'a>>> {
+    fn landed_all(&self, key: &str, ranks: usize, lands: &[Land], bytes: usize) -> Result<Vec<DeviceAllocation<'a>>> {
         if self.push.is_some() {
-            return (0..ranks).map(|rank| self.on_rank(rank, |_| self.landed(lands, bytes))).collect();
+            return (0..ranks).map(|rank| self.on_rank(rank, |_| self.landed(key, lands, bytes))).collect();
         }
-        self.upload_all(ranks, &landing::read(self.catalog, lands, bytes)?)
+        self.upload_all(key, ranks, &landing::read(self.catalog, lands, bytes)?)
     }
 
     /// Whether every part is E4M3 with its own FP32 block grid.
@@ -296,21 +359,21 @@ impl<'a> GlmLoader<'a> {
         names.iter().try_fold(true, |all, name| Ok(all && landing::native_fp8_block(self.catalog, name)?))
     }
 
-    fn upload(&self, bytes: &[u8]) -> Result<DeviceAllocation<'a>> {
-        let allocation = DeviceAllocation::new(self.library, bytes.len().max(256))?;
+    fn upload(&self, key: &str, bytes: &[u8]) -> Result<DeviceAllocation<'a>> {
+        let allocation = self.allocate(key, bytes.len().max(256))?;
         crate::shared::memory::load_timing::upload(bytes.len(), || self.library.copy_h2d(allocation.buffer, bytes))?;
         Ok(allocation)
     }
 
     /// The row-concatenation of 2-D `names` as one BF16 operand (FP8 parts
     /// dequantized on the GPU with their FP32 block scales).
-    fn rows(&self, names: &[String]) -> Result<DeviceAllocation<'a>> {
+    fn rows(&self, key: &str, names: &[String]) -> Result<DeviceAllocation<'a>> {
         let _memory_format = cuteafd_ffi::memory_ledger::format("bf16");
         let tensors = names.iter().map(|n| self.raw(n).map(|t| (n, t))).collect::<Result<Vec<_>>>()?;
         let cols = tensors[0].1 .2[1];
         let rows: usize = tensors.iter().map(|(_, (_, _, shape))| shape[0]).sum();
         ensure!(tensors.iter().all(|(_, (_, _, s))| s.len() == 2 && s[1] == cols), "{names:?} do not share columns");
-        let out = DeviceAllocation::new(self.library, rows * cols * 2)?;
+        let out = self.allocate(key, rows * cols * 2)?;
         let k_blocks = cols.div_ceil(128);
         let mut row = 0;
         for (name, (bytes, dtype, shape)) in &tensors {
@@ -326,7 +389,8 @@ impl<'a> GlmLoader<'a> {
                     let (scale, scale_dtype, _) = self.raw(&landing::block_grid(self.catalog, name))?;
                     ensure!(scale_dtype == DType::F32, "{name}: block scales must be FP32");
                     ensure!(scale.len() == shape[0].div_ceil(128) * k_blocks * 4, "{name}: unexpected scale grid");
-                    let (w, s) = (self.upload(bytes)?, self.upload(&scale)?);
+                    let temporary = GlmLoader { arenas: None, ..self.clone() };
+                    let (w, s) = (temporary.upload("transient.values", bytes)?, temporary.upload("transient.scales", &scale)?);
                     // SAFETY: fp8 [shape], its scale grid and the destination rows
                     // are live; the stream is drained before the temporaries drop.
                     unsafe {
@@ -443,12 +507,12 @@ impl<'a> GlmLoader<'a> {
     }
 
     /// E4M3 `[N, K]` and the FP32 block grid of `names` on the device.
-    fn fp8(&self, names: &[String]) -> Result<(DeviceAllocation<'a>, DeviceAllocation<'a>)> {
+    fn fp8(&self, key: &str, names: &[String]) -> Result<(DeviceAllocation<'a>, DeviceAllocation<'a>)> {
         let _memory_format = cuteafd_ffi::memory_ledger::format("fp8");
         if let Some(((values, values_bytes), (grid, grid_bytes))) = self.fp8_lands(names)? {
-            return Ok((self.landed(&values, values_bytes)?, self.landed(&grid, grid_bytes)?));
+            return Ok((self.landed(fp8_operand_names(key).0, &values, values_bytes)?, self.landed(fp8_operand_names(key).1, &grid, grid_bytes)?));
         }
-        self.with_fp8(names, |values, grid, _, _| Ok((self.upload(values)?, self.upload(&f32_bytes(&grid))?)))
+        self.with_fp8(names, |values, grid, _, _| Ok((self.upload(fp8_operand_names(key).0, values)?, self.upload(fp8_operand_names(key).1, &f32_bytes(&grid))?)))
     }
 
     /// Native block FP8 `names` row-concatenated: the E4M3 values and the
@@ -530,8 +594,8 @@ impl<'a> GlmLoader<'a> {
         };
         let (uk_s, uv_s) = (f32_bytes(&uk_s), f32_bytes(&uv_s));
         (0..ranks).map(|rank| self.on_rank(rank, |_| Ok((
-            (self.upload(&part(&uk, rank))?, self.upload(&part(&uk_s, rank))?),
-            (self.upload(&part(&uv, rank))?, self.upload(&part(&uv_s, rank))?))))).collect()
+            (self.upload("w_uk_fp8", &part(&uk, rank))?, self.upload("w_uk_scale", &part(&uk_s, rank))?),
+            (self.upload("w_uv_fp8", &part(&uv, rank))?, self.upload("w_uv_scale", &part(&uv_s, rank))?))))).collect()
         })
     }
 
@@ -567,10 +631,10 @@ impl<'a> GlmLoader<'a> {
     /// The BF16 weights `names` concatenated by rows, sliced over `ranks` along `axis`:
     /// rank `r` takes part `r` of every concatenated weight's rows (so a head- or
     /// intermediate-split `gate | up` stays gate rows then up rows), or of the columns.
-    fn bf16_split(&self, names: &[String], axis: Axis, ranks: usize) -> Result<Vec<DeviceAllocation<'a>>> {
+    fn bf16_split(&self, key: &str, names: &[String], axis: Axis, ranks: usize) -> Result<Vec<DeviceAllocation<'a>>> {
         let _memory_format = cuteafd_ffi::memory_ledger::format("bf16");
         if ranks == 1 {
-            return Ok(vec![self.upload(&self.bf16_rows(names)?.0)?]);
+            return Ok(vec![self.upload(key, &self.bf16_rows(names)?.0)?]);
         }
         let parts = names.iter().map(|n| self.bf16_rows(std::slice::from_ref(n))).collect::<Result<Vec<_>>>()?;
         ensure!(axis == Axis::Rows || parts.len() == 1, "{names:?}: concatenated weights split by rows");
@@ -581,7 +645,7 @@ impl<'a> GlmLoader<'a> {
                     "{names:?}: [{rows}, {cols}] does not split over {ranks} GPUs");
                 bytes.extend(slice_2d(values, *rows, *cols, 2, axis, rank, ranks));
             }
-            self.on_rank(rank, |_| self.upload(&bytes))
+            self.on_rank(rank, |_| self.upload(key, &bytes))
         }).collect()
     }
 
@@ -615,19 +679,19 @@ impl<'a> GlmLoader<'a> {
             }
         });
         let part = |bytes: &[u8], rank: usize| bytes[rank * bytes.len() / ranks..(rank + 1) * bytes.len() / ranks].to_vec();
-        (0..ranks).map(|rank| self.on_rank(rank, |_| Ok((self.upload(&part(&uk, rank))?, self.upload(&part(&uv, rank))?))))
+        (0..ranks).map(|rank| self.on_rank(rank, |_| Ok((self.upload("w_uk", &part(&uk, rank))?, self.upload("w_uv", &part(&uv, rank))?))))
             .collect()
     }
 
-    fn one(&self, name: &str) -> Result<DeviceAllocation<'a>> {
+    fn one(&self, key: &str, name: &str) -> Result<DeviceAllocation<'a>> {
         let _memory_format = cuteafd_ffi::memory_ledger::format("bf16");
         let meta = &self.catalog.tensor(name)?.metadata;
         if meta.shape.len() == 2 && meta.dtype == DType::F8E4M3 {
-            return self.rows(&[name.to_string()]);
+            return self.rows(key, &[name.to_string()]);
         }
         let land = Land::whole(self.catalog, name, 0)?;
         let bytes = land.bytes();
-        self.landed(&[land], bytes)
+        self.landed(key, &[land], bytes)
     }
 
     /// GPUs of the head split this loader fills (1: no split).
@@ -647,14 +711,14 @@ impl<'a> GlmLoader<'a> {
     /// The FP8 weights `names` concatenated by rows, each sliced over `ranks`
     /// along `axis` in whole 128-row / 128-K blocks: per rank its E4M3 bytes and
     /// the matching part of the FP32 128x128 grid. Rows-sliced weights read once.
-    fn fp8_split(&self, names: &[String], axis: Axis, ranks: usize)
+    fn fp8_split(&self, key: &str, names: &[String], axis: Axis, ranks: usize)
         -> Result<Vec<(DeviceAllocation<'a>, DeviceAllocation<'a>)>> {
         let _memory_format = cuteafd_ffi::memory_ledger::format("fp8");
         if ranks == 1 {
-            return Ok(vec![self.fp8(names)?]);
+            return Ok(vec![self.fp8(key, names)?]);
         }
         if let ([name], Axis::Cols) = (names, axis) {
-            return self.fp8_cols(name, ranks);
+            return self.fp8_cols(key, name, ranks);
         }
         ensure!(axis == Axis::Rows, "{names:?}: concatenated weights split by rows");
         if self.native_fp8(names)? {
@@ -662,7 +726,7 @@ impl<'a> GlmLoader<'a> {
             return (0..ranks).map(|rank| {
                 let (values, values_bytes) = landing::row_shares(self.catalog, names, ranks, rank, 128)?;
                 let (grid, grid_bytes) = landing::row_shares(self.catalog, &grids, ranks, rank, 1)?;
-                self.on_rank(rank, |_| Ok((self.landed(&values, values_bytes)?, self.landed(&grid, grid_bytes)?)))
+                self.on_rank(rank, |_| Ok((self.landed(fp8_operand_names(key).0, &values, values_bytes)?, self.landed(fp8_operand_names(key).1, &grid, grid_bytes)?)))
             }).collect();
         }
         // Per rank: the E4M3 rows and grid rows of every part, uploaded straight from the
@@ -681,8 +745,8 @@ impl<'a> GlmLoader<'a> {
                 for (rank, slot) in out.iter_mut().enumerate() {
                     self.on_rank(rank, |_| {
                         if slot.is_none() {
-                            *slot = Some((DeviceAllocation::new(self.library, total_rows / ranks * cols)?,
-                                DeviceAllocation::new(self.library, total_rows / ranks / 128 * kb * 4)?));
+                            *slot = Some((self.allocate(fp8_operand_names(key).0, total_rows / ranks * cols)?,
+                                self.allocate(fp8_operand_names(key).1, total_rows / ranks / 128 * kb * 4)?));
                         }
                         let (dv, dg) = slot.as_ref().context("rank buffers")?;
                         let at = |buffer: CuteafdDeviceBuffer, offset: usize, bytes: usize| CuteafdDeviceBuffer {
@@ -705,7 +769,7 @@ impl<'a> GlmLoader<'a> {
     /// One FP8 weight sliced by columns over `ranks`: the whole E4M3 weight goes up
     /// once to rank 0 and each rank's columns are a pitched device copy from it
     /// (over peer memory for rank 1); the grid's column blocks are sliced on the host.
-    fn fp8_cols(&self, name: &str, ranks: usize) -> Result<Vec<(DeviceAllocation<'a>, DeviceAllocation<'a>)>> {
+    fn fp8_cols(&self, key: &str, name: &str, ranks: usize) -> Result<Vec<(DeviceAllocation<'a>, DeviceAllocation<'a>)>> {
         let _memory_format = cuteafd_ffi::memory_ledger::format("fp8");
         if self.native_fp8(&[name.to_string()])? {
             let shape = &self.catalog.tensor(name)?.metadata.shape;
@@ -714,20 +778,20 @@ impl<'a> GlmLoader<'a> {
             return (0..ranks).map(|rank| {
                 let (values, values_bytes) = landing::col_share(self.catalog, name, ranks, rank)?;
                 let (grid, grid_bytes) = landing::col_share(self.catalog, &landing::block_grid(self.catalog, name), ranks, rank)?;
-                self.on_rank(rank, |_| Ok((self.landed(&[values], values_bytes)?, self.landed(&[grid], grid_bytes)?)))
+                self.on_rank(rank, |_| Ok((self.landed(fp8_operand_names(key).0, &[values], values_bytes)?, self.landed(fp8_operand_names(key).1, &[grid], grid_bytes)?)))
             }).collect();
         }
         let (whole, grid, rows, cols) = self.with_fp8(&[name.to_string()], |values, grid, rows, cols| {
             ensure!(rows % 128 == 0 && cols % (128 * ranks) == 0,
                 "{name}: [{rows}, {cols}] does not split into whole 128-K blocks over {ranks} GPUs");
-            Ok((self.upload(values)?, grid, rows, cols))
+            Ok((GlmLoader { arenas: None, ..self.clone() }.upload("transient.values", values)?, grid, rows, cols))
         })?;
         let width = cols / ranks;
         let grid_bytes = f32_bytes(&grid);
         let out = (0..ranks).map(|rank| {
             let part = slice_2d(&grid_bytes, rows / 128, cols / 128, 4, Axis::Cols, rank, ranks);
             self.on_rank(rank, |stream| {
-                let values = DeviceAllocation::new(self.library, rows * width)?;
+                let values = self.allocate(fp8_operand_names(key).0, rows * width)?;
                 let source = CuteafdDeviceBuffer {
                     // SAFETY: column block `rank` of every row lies inside the whole weight.
                     ptr: unsafe { whole.buffer.ptr.cast::<u8>().add(rank * width) }.cast(),
@@ -741,7 +805,7 @@ impl<'a> GlmLoader<'a> {
                     self.library.copy_d2d_2d_async(values.buffer, width, source, cols, width, rows, stream)?;
                     self.library.cuda_stream_synchronize(stream)?;
                 }
-                Ok((values, self.upload(&part)?))
+                Ok((values, self.upload(fp8_operand_names(key).1, &part)?))
             })
         }).collect();
         drop(whole);
@@ -750,37 +814,35 @@ impl<'a> GlmLoader<'a> {
 
     /// Every rank's copy of a small operand read once.
     /// A whole non-FP8 tensor (a norm) on every rank, landing unchanged.
-    fn replicated_tensor(&self, ranks: usize, name: &str) -> Result<Vec<DeviceAllocation<'a>>> {
+    fn replicated_tensor(&self, key: &str, ranks: usize, name: &str) -> Result<Vec<DeviceAllocation<'a>>> {
         let meta = &self.catalog.tensor(name)?.metadata;
         ensure!(!(meta.shape.len() == 2 && meta.dtype == DType::F8E4M3), "{name}: replicated operands are not FP8");
         let land = Land::whole(self.catalog, name, 0)?;
         let bytes = land.bytes();
-        self.landed_all(ranks, &[land], bytes)
+        self.landed_all(key, ranks, &[land], bytes)
     }
 
     /// A per-head BF16 vector `[heads]`, each rank its contiguous `heads / ranks` (the query
     /// heads a head split gives it); one rank keeps the whole vector.
-    fn head_vector(&self, ranks: usize, name: &str) -> Result<Vec<DeviceAllocation<'a>>> {
+    fn head_vector(&self, key: &str, ranks: usize, name: &str) -> Result<Vec<DeviceAllocation<'a>>> {
         let _memory_format = cuteafd_ffi::memory_ledger::format("bf16");
-        let (bytes, dtype, shape) = self.raw(name)?;
-        ensure!(dtype == DType::Bf16 && shape.len() == 1 && shape[0] % ranks == 0,
-            "{name}: expected a BF16 [heads] vector over {ranks} GPUs, found {dtype:?} {shape:?}");
-        let part = bytes.len() / ranks;
-        (0..ranks).map(|rank| self.on_rank(rank, |_| self.upload(&bytes[rank * part..][..part]))).collect()
-    }
-
-    fn replicated(&self, ranks: usize, read: impl FnOnce() -> Result<Vec<u8>>) -> Result<Vec<DeviceAllocation<'a>>> {
-        self.upload_all(ranks, &read()?)
+        let meta = &self.catalog.tensor(name)?.metadata;
+        ensure!(ranks > 0 && meta.dtype == DType::Bf16 && meta.shape.len() == 1 && meta.shape[0] % ranks == 0,
+            "{name}: expected a BF16 [heads] vector over {ranks} GPUs, found {:?} {:?}", meta.dtype, meta.shape);
+        (0..ranks).map(|rank| {
+            let (land, bytes) = landing::col_share(self.catalog, name, ranks, rank)?;
+            self.on_rank(rank, |_| self.landed(key, &[land], bytes))
+        }).collect()
     }
 
     /// `bytes` on every rank: one upload to rank 0, peer copies to the others (faster than
     /// a second pageable host upload).
-    fn upload_all(&self, ranks: usize, bytes: &[u8]) -> Result<Vec<DeviceAllocation<'a>>> {
-        let first = self.upload(bytes)?;
+    fn upload_all(&self, key: &str, ranks: usize, bytes: &[u8]) -> Result<Vec<DeviceAllocation<'a>>> {
+        let first = self.upload(key, bytes)?;
         let mut out = Vec::with_capacity(ranks);
         for rank in 1..ranks {
             out.push(self.on_rank(rank, |stream| {
-                let copy = DeviceAllocation::new(self.library, bytes.len().max(256))?;
+                let copy = self.allocate(key, bytes.len().max(256))?;
                 // SAFETY: both allocations hold `bytes.len()` bytes; peer access to rank 0 is
                 // enabled (the split setup); the stream drains before return.
                 unsafe {
@@ -795,84 +857,39 @@ impl<'a> GlmLoader<'a> {
     }
 
     fn core_weights(&self, layout: cuteafd_loader::formats::trellis_core::CoreWeightLayout,
-        rank: usize) -> Result<CoreWeights<'a>> {
+        checkpoint: &cuteafd_loader::plan::Checkpoint, rank: usize, prefix: &str) -> Result<CoreWeights<'a>> {
+        use crate::shared::experts::rtx::dense::DenseLoad;
         let layout = CoreWeightLayout::from_shared(layout);
-        let loaded = layout.read(|name| {
-            let (bytes, dtype, shape) = self.raw(name)?;
-            let tensor = self.catalog.tensor(name)?;
-            Ok(cuteafd_loader::LoadedTensor {
-                info: cuteafd_core::TensorInfo { name: name.into(), file: tensor.shard.clone(), dtype, shape,
-                    byte_offset: tensor.metadata.byte_offset, byte_length: tensor.metadata.byte_length,
-                    role: cuteafd_core::TensorRole::Other, layer_id: None, expert_id: None,
-                    is_quantization_metadata: false }, source_path: self.catalog.snapshot().join(&tensor.shard),
-                bytes, elapsed_micros: 0, sha256: String::new(),
+        let dense = if self.push.is_some() { DenseLoad::push(self.library) }
+            else { DenseLoad::mount(self.library) };
+        let weights = self.on_rank(rank, |stream| {
+            let device = Device { library: self.library, id: self.library.cuda_get_device()? };
+            let arena = self.arenas.as_ref().map(|arenas| arenas.get(&device.id)
+                .context("K6 current device has no admitted GLM target arena")).transpose()?;
+            layout.load_recorded_with(device, checkpoint, &dense, stream, |name, bytes| {
+                let suffix = name.rsplit('.').next().context("K6 member suffix")?;
+                let suffix = if suffix == "trellis" { "payload" } else { suffix };
+                crate::shared::memory::weight_arena::weight_allocation(device, arena,
+                    &format!("glm.weights.gpu.{rank}.{prefix}.{suffix}"), bytes, ArenaTag::weights("glm/target"))
             })
         })?;
-        self.on_rank(rank, |_| layout.upload(Device { library: self.library,
-            id: self.library.cuda_get_device()? }, loaded))
+        if let Some(push) = &self.push {
+            let (operands, steps) = dense.sink.as_ref().context("K6 push sink")?.take();
+            for operand in operands { push.dense.operand(operand)?; }
+            for step in steps { push.dense.step(step)?; }
+        }
+        Ok(weights)
     }
 
-    fn attention_operands(&self, cfg: &GlmDsaConfig, layer: usize, core: bool)
-        -> Result<Vec<HashMap<&'static str, DeviceAllocation<'a>>>> {
+    fn packed_fp8(&self, qkv_a: &[String]) -> Result<Vec<(DeviceAllocation<'a>, DeviceAllocation<'a>, DeviceAllocation<'a>)>> {
         let ranks = self.ranks();
-        let p = format!("model.layers.{layer}");
-        let full_indexer = cfg.indexers[layer] == GlmIndexer::Full;
-        let mut ops: Vec<HashMap<&'static str, DeviceAllocation<'a>>> = (0..ranks).map(|_| HashMap::new()).collect();
-        let put = |ops: &mut Vec<HashMap<&'static str, DeviceAllocation<'a>>>, key: &'static str,
-            parts: Vec<DeviceAllocation<'a>>| {
-            for (map, part) in ops.iter_mut().zip(parts) {
-                map.insert(key, part);
-            }
-        };
-        // The checkpoint's E4M3 bytes and FP32 scale grid: the only copy (per rank's slice).
-        let with_fp8 = |ops: &mut Vec<HashMap<&'static str, DeviceAllocation<'a>>>, name: &'static str,
-            parts: &[String], axis: Axis| -> Result<()> {
-            let (w8_name, scale_name, _) = fp8_operand_names(name);
-            let split = if ranks > 1 { self.fp8_split(parts, axis, ranks)? } else { vec![self.fp8(parts)?] };
-            for (map, (w8, scale)) in ops.iter_mut().zip(split) {
-                map.insert(w8_name, w8);
-                map.insert(scale_name, scale);
-            }
-            Ok(())
-        };
-        let qkv_a = [format!("{p}.self_attn.q_a_proj.weight"), format!("{p}.self_attn.kv_a_proj_with_mqa.weight")];
-        let attention = [&qkv_a[..], &[format!("{p}.self_attn.q_b_proj.weight"),
-            format!("{p}.self_attn.kv_b_proj.weight"), format!("{p}.self_attn.o_proj.weight")]].concat();
-        if core {
-            // Variant operands by name: GLM's q-LoRA norm, the latent norm on
-            // latent owners, per-head query-scale vectors where the variant has them.
-            for (key, op) in [("q_a_norm", Op::QANorm), ("kv_a_norm", Op::KvANorm)] {
-                if let Some(name) = cfg.weight(layer, op) { put(&mut ops, key, self.replicated_tensor(ranks, &name)?); }
-            }
-            // Per-head query-scale vectors follow the heads: each rank of a head split its own.
-            for (key, op) in [("query_scale_s", Op::QueryScaleS), ("query_scale_b", Op::QueryScaleB)] {
-                if let Some(name) = cfg.weight(layer, op) { put(&mut ops, key, self.head_vector(ranks, &name)?); }
-            }
-            for (rank, (uk, uv)) in self.kv_b_bf16(cfg, layer, ranks)?.into_iter().enumerate() {
-                ops[rank].insert("w_uk", uk);
-                ops[rank].insert("w_uv", uv);
-            }
-        } else if !cfg.variant.is_glm() {
-            anyhow::bail!("layer {layer}: {} serves its K6 core publication only", "Mistral Large 4");
-        } else if self.bf16_native(&attention)? {
-            // The checkpoint's BF16 attention as-is (the BF16 programs).
-            put(&mut ops, "w_qkv_a", self.upload_all(ranks, &self.bf16_rows(&qkv_a)?.0)?);
-            put(&mut ops, "q_a_norm", self.replicated_tensor(ranks, &format!("{p}.self_attn.q_a_layernorm.weight"))?);
-            put(&mut ops, "kv_a_norm", self.replicated_tensor(ranks, &format!("{p}.self_attn.kv_a_layernorm.weight"))?);
-            put(&mut ops, "w_q_b", self.bf16_split(&[format!("{p}.self_attn.q_b_proj.weight")], Axis::Rows, ranks)?);
-            for (rank, (uk, uv)) in self.kv_b_bf16(cfg, layer, ranks)?.into_iter().enumerate() {
-                ops[rank].insert("w_uk", uk);
-                ops[rank].insert("w_uv", uv);
-            }
-            put(&mut ops, "w_o", self.bf16_split(&[format!("{p}.self_attn.o_proj.weight")], Axis::Cols, ranks)?);
-        } else {
-        let (values, scale, kscale) = if let Some(((values, values_bytes), (grid, grid_bytes))) = self.fp8_lands(&qkv_a)? {
+        let (values, scale, kscale) = if let Some(((values, values_bytes), (grid, grid_bytes))) = self.fp8_lands(qkv_a)? {
             // Prefill: per-row scales K-block major, widened on each GPU from its landed grid.
             let rows: usize = values.iter().map(|land| land.rows.len()).sum();
             let kb = values[0].width().div_ceil(128);
-            let (values, grid) = (self.landed_all(ranks, &values, values_bytes)?, self.landed_all(ranks, &grid, grid_bytes)?);
+            let (values, grid) = (self.landed_all("w_qkv_a_fp8", ranks, &values, values_bytes)?, self.landed_all("w_qkv_a_scale", ranks, &grid, grid_bytes)?);
             let kscale = grid.iter().enumerate().map(|(rank, grid)| self.on_rank(rank, |stream| {
-                let kscale = DeviceAllocation::new(self.library, (rows * kb * 4).max(256))?;
+                let kscale = self.allocate("w_qkv_a_kscale", (rows * kb * 4).max(256))?;
                 let job = landing::Kmajor { device: self.library.cuda_get_device()?, grid: grid.buffer,
                     kmajor: kscale.buffer, rows, kb };
                 match &self.push {
@@ -883,190 +900,199 @@ impl<'a> GlmLoader<'a> {
                 Ok(kscale)
             })).collect::<Result<Vec<_>>>()?;
             (values, grid, kscale)
-        } else { self.with_fp8(&qkv_a, |values, grid, rows, cols| {
+        } else { self.with_fp8(qkv_a, |values, grid, rows, cols| {
             // Prefill: per-row scales K-block major (the block-FP8 GEMM wants whole 128-row blocks).
             let kb = cols.div_ceil(128);
             let grid_ref = &grid;
             let kscale: Vec<f32> = (0..kb).flat_map(|b| (0..rows).map(move |r| grid_ref[(r / 128) * kb + b])).collect();
-            let each = |bytes: &[u8]| self.upload_all(ranks, bytes);
-            Ok((each(values)?, each(&f32_bytes(&grid))?, each(&f32_bytes(&kscale))?))
+            Ok((self.upload_all("w_qkv_a_fp8", ranks, values)?, self.upload_all("w_qkv_a_scale", ranks, &f32_bytes(&grid))?, self.upload_all("w_qkv_a_kscale", ranks, &f32_bytes(&kscale))?))
         })? };
-        put(&mut ops, "w_qkv_a_fp8", values);
-        put(&mut ops, "w_qkv_a_scale", scale);
-        put(&mut ops, "w_qkv_a_kscale", kscale);
-        put(&mut ops, "q_a_norm", self.replicated_tensor(ranks, &format!("{p}.self_attn.q_a_layernorm.weight"))?);
-        put(&mut ops, "kv_a_norm", self.replicated_tensor(ranks, &format!("{p}.self_attn.kv_a_layernorm.weight"))?);
-        // q_b rows are head-major (each head's 192 + 64 query rows): whole heads per rank.
-        with_fp8(&mut ops, "w_q_b", &[format!("{p}.self_attn.q_b_proj.weight")], Axis::Rows)?;
-        for (rank, ((uk, uk_scale), (uv, uv_scale))) in self.kv_b(cfg, &p, ranks)?.into_iter().enumerate() {
-            ops[rank].insert("w_uk_fp8", uk);
-            ops[rank].insert("w_uk_scale", uk_scale);
-            ops[rank].insert("w_uv_fp8", uv);
-            ops[rank].insert("w_uv_scale", uv_scale);
-        }
-        with_fp8(&mut ops, "w_o", &[format!("{p}.self_attn.o_proj.weight")], Axis::Cols)?;
-        }
-        if full_indexer {
-            let wq_b = [cfg.weight(layer, Op::IndexQ).context("indexer wq_b")?];
-            if cfg.variant.ml4().is_some() {
-                // The direct-query indexer's wq_b in the checkpoint's own form: the K6 core
-                // (loaded with the core layouts), or its shipped FP8 block-128 E4M3 + grid,
-                // replicated (ml4_index_q). Anything else is refused, never re-quantized.
-                if self.catalog.tensor(&wq_b[0]).is_ok() {
-                    ensure!(self.native_fp8(&wq_b)?, "{}: Mistral Large 4 serves the indexer wq_b from the \
-                        K6 core or its shipped FP8 block-128 form only", wq_b[0]);
-                    let (w8_name, scale_name, _) = fp8_operand_names("w_iq");
-                    let ((values, values_bytes), (grid, grid_bytes)) = self.fp8_lands(&wq_b)?
-                        .context("Mistral Large 4 FP8 wq_b landing")?;
-                    put(&mut ops, w8_name, self.landed_all(ranks, &values, values_bytes)?);
-                    put(&mut ops, scale_name, self.landed_all(ranks, &grid, grid_bytes)?);
-                }
-            } else if core || self.bf16_native(&wq_b)? {
-                put(&mut ops, "w_iq", self.upload_all(ranks, &self.bf16_rows(&wq_b)?.0)?);
-            } else {
-                let (w8_name, scale_name, _) = fp8_operand_names("w_iq");
-                if let Some(((values, values_bytes), (grid, grid_bytes))) = self.fp8_lands(&wq_b)? {
-                    put(&mut ops, w8_name, self.landed_all(ranks, &values, values_bytes)?);
-                    put(&mut ops, scale_name, self.landed_all(ranks, &grid, grid_bytes)?);
-                } else {
-                    let (values, grid) = self.with_fp8(&wq_b, |values, grid, _, _| Ok((values.to_vec(), f32_bytes(&grid))))?;
-                    put(&mut ops, w8_name, self.replicated(ranks, || Ok(values))?);
-                    put(&mut ops, scale_name, self.replicated(ranks, || Ok(grid))?);
-                }
-            }
-            // `w_ik`: BF16 (FP8 `wk` dequantized) on rank 0, copied to the others.
-            let w_ik = self.rows(&[cfg.weight(layer, Op::IndexK).context("indexer wk")?,
-                cfg.weight(layer, Op::IndexWeights).context("indexer weights_proj")?])?;
-            let mut copies = vec![];
-            for rank in 1..ranks {
-                copies.push(self.on_rank(rank, |stream| {
-                    let copy = DeviceAllocation::new(self.library, w_ik.buffer.bytes)?;
-                    // SAFETY: both allocations hold the whole operand; peer access to rank 0 is
-                    // enabled (the split setup); the stream drains before return.
-                    unsafe {
-                        self.library.copy_d2d_async(copy.buffer, w_ik.buffer, w_ik.buffer.bytes, stream)?;
-                        self.library.cuda_stream_synchronize(stream)?;
-                    }
-                    Ok(copy)
-                })?);
-            }
-            put(&mut ops, "w_ik", std::iter::once(w_ik).chain(copies).collect());
-            let k_norm = cfg.stem(layer, Op::IndexKNorm).context("indexer k_norm")?;
-            put(&mut ops, "k_norm_w", self.replicated_tensor(ranks, &format!("{k_norm}.weight"))?);
-            put(&mut ops, "k_norm_b", self.replicated_tensor(ranks, &format!("{k_norm}.bias"))?);
-            // Direct-query variants: the indexer query's input LayerNorm and query scale.
-            if let Some(q_norm) = cfg.stem(layer, Op::IndexQNorm) {
-                put(&mut ops, "index_q_norm_w", self.replicated_tensor(ranks, &format!("{q_norm}.weight"))?);
-                put(&mut ops, "index_q_norm_b", self.replicated_tensor(ranks, &format!("{q_norm}.bias"))?);
-            }
-            for (key, op) in [("index_scale_s", Op::IndexQueryScaleS), ("index_scale_b", Op::IndexQueryScaleB)] {
-                if let Some(name) = cfg.weight(layer, op) { put(&mut ops, key, self.replicated_tensor(ranks, &name)?); }
-            }
-        }
-        Ok(ops)
+        
+        
+        
+
+
+        Ok(values.into_iter().zip(scale).zip(kscale).map(|((v,s),k)| (v,s,k)).collect())
     }
 
-    /// FFNs are rank-split; attention is either head-split with replicated
-    /// latent/indexer operands or loaded whole on `owner`. Residual norms stay
-    /// replicated and routers live on rank 0 until local TP2 admission.
     fn layer(&self, cfg: &GlmDsaConfig, layer: usize,
-        checkpoint: &cuteafd_loader::plan::checkpoint::Checkpoint, core: &CoreInventory, owner: Option<u8>,
+        checkpoint: &cuteafd_loader::plan::Checkpoint, core: &CoreInventory, owner: Option<u8>,
         native_shared: bool) -> Result<Vec<GlmLayer<'a>>> {
+        use routes::{Operation, layer_routes};
+        let scoped = self.scoped(format!("layer.{layer}.operand."));
         let ranks = self.ranks();
         let dense = layer < cfg.first_moe_layer;
-        let full_indexer = cfg.indexers[layer] == GlmIndexer::Full;
-        let mut ops: Vec<HashMap<&'static str, DeviceAllocation<'a>>> = (0..ranks).map(|_| HashMap::new()).collect();
-        let put = |ops: &mut Vec<HashMap<&'static str, DeviceAllocation<'a>>>, key: &'static str,
-            parts: Vec<DeviceAllocation<'a>>| {
-            for (map, part) in ops.iter_mut().zip(parts) {
-                map.insert(key, part);
-            }
-        };
-        // The checkpoint's E4M3 bytes and FP32 scale grid: the only copy (per rank's slice).
-        let with_fp8 = |ops: &mut Vec<HashMap<&'static str, DeviceAllocation<'a>>>, name: &'static str,
-            parts: &[String], axis: Axis| -> Result<()> {
-            let (w8_name, scale_name, _) = fp8_operand_names(name);
-            let split = if ranks > 1 { self.fp8_split(parts, axis, ranks)? } else { vec![self.fp8(parts)?] };
-            for (map, (w8, scale)) in ops.iter_mut().zip(split) {
-                map.insert(w8_name, w8);
-                map.insert(scale_name, scale);
-            }
-            Ok(())
-        };
-        put(&mut ops, "input_norm", self.replicated_tensor(ranks, &cfg.weight(layer, Op::InputNorm).context("input norm")?)?);
-        put(&mut ops, "post_norm", self.replicated_tensor(ranks, &cfg.weight(layer, Op::PostAttentionNorm).context("post norm")?)?);
-        // The first core projection of the variant (q_a, or the direct query).
-        let first = cfg.stem(layer, Op::QA).or_else(|| cfg.stem(layer, Op::QB)).context("query projection")?;
-        let core_attention = core.get_weight(&first).is_some();
-        let mut attention_resident = vec![false; ranks];
-        let attention = if let Some(owner) = owner {
-            let (device, stream) = if owner == 0 { (self.device, self.stream) }
-                else { let peer = self.peers.get(usize::from(owner) - 1).context("attention owner")?; (peer.device, peer.stream) };
-            let local = GlmLoader { library: self.library, catalog: self.catalog, device, stream, peers: Vec::new(),
-                push: self.push.clone() };
-            let mut maps = self.on_rank(usize::from(owner), |_| local.attention_operands(cfg, layer, core_attention))?;
-            let attention = maps.pop().context("whole attention operands")?;
-            ensure!(!attention.is_empty() && maps.is_empty(), "whole attention operands per owner");
-            ops[usize::from(owner)].extend(attention);
-            attention_resident[usize::from(owner)] = true;
-            None
-        } else { Some(self.attention_operands(cfg, layer, core_attention)?) };
-        if let Some(attention) = attention {
-            ensure!(attention.len() == ranks, "attention operands per rank");
-            for ((ops, resident), attention) in ops.iter_mut().zip(&mut attention_resident).zip(attention) {
-                ensure!(!attention.is_empty(), "resident attention operands");
-                ops.extend(attention);
-                *resident = true;
-            }
-        }
-        let [gate, up, down_stem] = [Op::Gate, Op::Up, Op::Down].map(|op| cfg.stem(layer, op));
-        let (gate, up, down_stem) = (gate.context("ffn gate")?, up.context("ffn up")?, down_stem.context("ffn down")?);
-        let mlp = gate.rsplit_once('.').map_or(gate.clone(), |(module, _)| module.to_owned());
+        let gate = cfg.stem(layer, Op::Gate).context("FFN gate")?;
         let mlp_numerics = if native_shared && !dense {
             cuteafd_loader::plan::checkpoint::ModuleNumerics::CheckpointPrecision
         } else { checkpoint.module_numerics(&gate)? };
-        let core_ffn = core.get_weight(&gate).is_some();
-        if (dense || !native_shared) && !core_ffn {
-        for projection in [&up, &down_stem] {
-            ensure!(checkpoint.module_numerics(projection)? == mlp_numerics,
-                "{mlp}: mixed declared MLP arithmetic is unsupported");
-        }
-        let (gate_up, down) = ([format!("{gate}.weight"), format!("{up}.weight")], [format!("{down_stem}.weight")]);
-        if !dense && self.bf16_native(&[&gate_up[..], &down[..]].concat())? {
-            // The checkpoint's BF16 shared expert as-is.
-            put(&mut ops, "w_gate_up", self.bf16_split(&gate_up, Axis::Rows, ranks)?);
-            put(&mut ops, "w_down", self.bf16_split(&down, Axis::Cols, ranks)?);
-        } else {
-            with_fp8(&mut ops, "w_gate_up", &gate_up, Axis::Rows)?;
-            with_fp8(&mut ops, "w_down", &down, Axis::Cols)?;
-        }
-        // Retain the checkpoint's static activation scales for every execution shape.
-        if dense {
-            if let (Some(gu), Some(d)) = (self.tensor_scales(&gate_up)?, self.tensor_scales(&down)?) {
-                put(&mut ops, "w_gate_up_tscale", self.upload_all(ranks, &gu)?);
-                put(&mut ops, "w_down_tscale", self.upload_all(ranks, &d)?);
+        let mut layers = (0..ranks).map(|rank| GlmLayer {
+            dense, full_indexer: cfg.indexers[layer] == GlmIndexer::Full, mlp_numerics,
+            split: ranks > 1, attention_split: ranks > 1 && owner.is_none(), attention_owner: owner,
+            attention_resident: owner.is_none_or(|owner| usize::from(owner) == rank),
+            operands: HashMap::new(), native: HashMap::new(), native_projections: HashMap::new(), core: Default::default(),
+            attention_native: Default::default(),
+        }).collect::<Vec<_>>();
+        layer_routes(self.catalog, cfg, layer, checkpoint, core, ranks, owner, native_shared, bf16_programs(), |route| {
+            let mut loaded = Vec::<(usize, &'static str, DeviceAllocation<'a>)>::new();
+            if let Operation::Core(layout) = route.operation {
+                let rank = route.ranks[0];
+                let weights = self.core_weights(layout, checkpoint, rank, &format!("layer.{layer}.core.{}", route.key))?;
+                let actual = [("payload", weights.payload.buffer), ("suh", weights.suh.buffer), ("svh", weights.svh.buffer)]
+                    .into_iter().map(|(suffix, buffer)| (format!("glm.weights.gpu.{rank}.layer.{layer}.core.{}.{suffix}", route.key), buffer)).collect::<Vec<_>>();
+                self.check_weight_requests(&route.requests, &actual)?;
+                layers[rank].core.insert(route.key, weights);
+                return Ok(());
             }
-        }
-        }
-        if !dense {
-            ops[0].insert("gate", self.one(&cfg.weight(layer, Op::Router).context("router")?)?);
-            // Sigmoid noaux_tc routers carry a correction bias; softmax routers none.
-            if let Some(bias) = cfg.weight(layer, Op::RouterBias) { ops[0].insert("gate.bias", self.one(&bias)?); }
-        }
+            if let Operation::NativeAttention(layout) = route.operation {
+                use crate::shared::native_attention::{attention_records, AttentionRecord, NativeAttentionWeights};
+                let rank = route.ranks[0];
+                let device = crate::shared::memory::device::Device { library: self.library,
+                    id: if rank == 0 { self.library.cuda_get_device()? } else { self.peers[rank - 1].device } };
+                let weights = device.own(|| self.on_rank(rank, |stream| {
+                    let [n, k] = layout.shape;
+                    let native = self.scoped(format!("layer.{layer}.native.{}.", route.key));
+                    let values = native.allocate("values", (n * k * if layout.fp8 { 1 } else { 2 }).max(256))?;
+                    let scales = layout.fp8.then(|| native.allocate("scales",
+                        (n.div_ceil(128) * k.div_ceil(128) * 4).max(256))).transpose()?;
+                    let selected = checkpoint.projection(&layout.stem)?;
+                    let cuteafd_loader::plan::checkpoint::ProjectionStorage::Native { shape, .. } = &selected.storage
+                        else { anyhow::bail!("native attention load selected compressed source"); };
+                    let receipt = cuteafd_loader::placement::families::glm5::weights::native_attention_mount(
+                        &layout, [shape[0], shape[1]],
+                        checkpoint.converts_to_fp8(&format!("{}.weight", layout.stem)))?;
+                    let records = attention_records(self.catalog.snapshot(), &selected,
+                        checkpoint.projection_view(&layout.stem), &layout, crate::shared::fp8_linear::Fp8Scales::Amax,
+                        values.buffer, scales.as_ref().map(|s| s.buffer))?;
+                    let mount = crate::shared::experts::rtx::dense::DenseLoad::mount(self.library);
+                    mount.admit_mount(receipt)?;
+                    for record in records {
+                        match (&self.push, record) {
+                            (Some(push), AttentionRecord::Operand(record)) => push.dense.operand(record)?,
+                            (Some(push), AttentionRecord::Step(record)) => push.dense.step(record)?,
+                            (None, AttentionRecord::Operand(record)) => mount.operand(record)?,
+                            (None, AttentionRecord::Step(record)) => mount.step(record, stream)?,
+                        }
+                    }
+                    // SAFETY: this rank owns the load stream and every destination
+                    // remains live until its queued load/transform work completes.
+                    if let Err(drain) = unsafe { self.library.cuda_stream_synchronize(stream) } {
+                        self.library.quarantine_module_after_failed_drain();
+                        return Err(drain.context("GLM native attention owners quarantined after failed load drain"));
+                    }
+                    Ok(NativeAttentionWeights { layout, values, scales })
+                }))?;
+                let mut actual = vec![(format!("glm.weights.gpu.{rank}.layer.{layer}.native.{}.values", route.key), weights.values.buffer)];
+                if let Some(scales) = &weights.scales {
+                    actual.push((format!("glm.weights.gpu.{rank}.layer.{layer}.native.{}.scales", route.key), scales.buffer));
+                }
+                self.check_weight_requests(&route.requests, &actual)?;
+                layers[rank].attention_native.insert(route.key, weights);
+                return Ok(());
+            }
+            let first = route.ranks[0];
+            let device = if first == 0 { self.device } else { self.peers[first-1].device };
+            let stream = if first == 0 { self.stream } else { self.peers[first-1].stream };
+            let local = GlmLoader { device, stream, peers: Vec::new(), ..scoped.clone() };
+            let loader = if route.ranks.len() == ranks { &scoped } else { &local };
+            let parts = route.ranks.len();
+            self.on_rank(first, |_| {
+                let mut put = |key, buffers: Vec<DeviceAllocation<'a>>| -> Result<()> {
+                    ensure!(buffers.len() == parts, "weight operation returned wrong rank count");
+                    loaded.extend(route.ranks.iter().copied().zip(buffers).map(|(rank, buffer)| (rank, key, buffer)));
+                    Ok(())
+                };
+                match route.operation {
+                    Operation::Tensor(name) => put(route.key, if parts == 1 { vec![loader.one(route.key, &name)?] }
+                        else { loader.replicated_tensor(route.key, parts, &name)? })?,
+                    Operation::Rows(names) => {
+                        let first = loader.rows(route.key, &names)?;
+                        let mut buffers = Vec::with_capacity(parts);
+                        for rank in 1..parts {
+                            buffers.push(loader.on_rank(rank, |stream| {
+                                let buffer = loader.allocate(route.key, first.buffer.bytes)?;
+                                // SAFETY: both complete operands are live; the copy drains before publication.
+                                unsafe {
+                                    self.library.copy_d2d_async(buffer.buffer, first.buffer, first.buffer.bytes, stream)?;
+                                    self.library.cuda_stream_synchronize(stream)?;
+                                }
+                                Ok(buffer)
+                            })?);
+                        }
+                        put(route.key, std::iter::once(first).chain(buffers).collect())?;
+                    }
+                    Operation::Projection { names, axis, bf16, kmajor, replicated } => {
+                        if kmajor {
+                            let (mut values, mut grids, mut ks) = (Vec::new(), Vec::new(), Vec::new());
+                            for (v, s, k) in loader.packed_fp8(&names)? { values.push(v); grids.push(s); ks.push(k); }
+                            put("w_qkv_a_fp8", values)?; put("w_qkv_a_scale", grids)?; put("w_qkv_a_kscale", ks)?;
+                        } else if bf16 {
+                            let buffers = if replicated { loader.upload_all(route.key, parts, &loader.bf16_rows(&names)?.0)? }
+                                else { loader.bf16_split(route.key, &names, axis, parts)? };
+                            put(route.key, buffers)?;
+                        } else {
+                            let buffers = if replicated && parts > 1 {
+                                if let Some(((values, values_bytes), (grid, grid_bytes))) = loader.fp8_lands(&names)? {
+                                    loader.landed_all(fp8_operand_names(route.key).0, parts, &values, values_bytes)?.into_iter()
+                                        .zip(loader.landed_all(fp8_operand_names(route.key).1, parts, &grid, grid_bytes)?).collect()
+                                } else { loader.with_fp8(&names, |values, grid, _, _| {
+                                    Ok(loader.upload_all(fp8_operand_names(route.key).0, parts, values)?.into_iter().zip(loader.upload_all(fp8_operand_names(route.key).1, parts, &f32_bytes(&grid))?).collect())
+                                })? }
+                            } else { loader.fp8_split(route.key, &names, axis, parts)? };
+                            let (values, grids): (Vec<_>, Vec<_>) = buffers.into_iter().unzip();
+                            let (value_key, grid_key, _) = fp8_operand_names(route.key);
+                            put(value_key, values)?; put(grid_key, grids)?;
+                        }
+                    }
+                    Operation::KvB { layer, bf16 } => {
+                        if bf16 {
+                            let (uk, uv): (Vec<_>, Vec<_>) = loader.kv_b_bf16(cfg, layer, parts)?.into_iter().unzip();
+                            put("w_uk", uk)?; put("w_uv", uv)?;
+                        } else {
+                            let (mut uk, mut uks, mut uv, mut uvs) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+                            for ((k, ks), (v, vs)) in loader.kv_b(cfg, &format!("model.layers.{layer}"), parts)? {
+                                uk.push(k); uks.push(ks); uv.push(v); uvs.push(vs);
+                            }
+                            put("w_uk_fp8", uk)?; put("w_uk_scale", uks)?; put("w_uv_fp8", uv)?; put("w_uv_scale", uvs)?;
+                        }
+                    }
+                    Operation::HeadVector(name) => put(route.key, loader.head_vector(route.key, parts, &name)?)?,
+                    Operation::TensorScales(names) => put(route.key, loader.upload_all(route.key, parts,
+                        &loader.tensor_scales(&names)?.context("declared tensor scales missing")?)?)?,
+                    Operation::Core(_) | Operation::NativeAttention(_) => unreachable!(),
+                }
+                Ok(())
+            })?;
+            let actual = loaded.iter().map(|(rank, key, buffer)|
+                (format!("glm.weights.gpu.{rank}.layer.{layer}.operand.{key}"), buffer.buffer)).collect::<Vec<_>>();
+            self.check_weight_requests(&route.requests, &actual)?;
+            for (rank, key, buffer) in loaded {
+                ensure!(layers[rank].operands.insert(key, buffer).is_none(), "duplicate weight operand {key}");
+            }
+            Ok(())
+        })?;
         if mlp_numerics == cuteafd_loader::plan::checkpoint::ModuleNumerics::W8A8 {
-            ensure!(ops.iter().all(|operands| operands.contains_key("w_gate_up_tscale")
-                && operands.contains_key("w_down_tscale")),
-                "{mlp}: declared W8A8 needs native per-tensor activation scales");
+            ensure!(layers.iter().all(|layer| layer.operands.contains_key("w_gate_up_tscale")
+                && layer.operands.contains_key("w_down_tscale")), "declared W8A8 needs native activation scales");
         }
-        let layouts = core.layer_weights(cfg, layer, ranks, owner)?;
-        ops.into_iter().zip(layouts).enumerate().map(|(rank, (operands, layouts))| {
-            let core = layouts.into_iter().map(|(name, layout)| Ok((name, self.core_weights(layout, rank)?)))
-                .collect::<Result<_>>()?;
-            Ok(GlmLayer { dense, full_indexer, mlp_numerics, split: ranks > 1,
-                attention_split: ranks > 1 && owner.is_none(), attention_owner: owner,
-                attention_resident: attention_resident[rank], operands,
-                native: HashMap::new(), native_projections: HashMap::new(), core })
-        }).collect()
+        Ok(layers)
+    }
+
+    fn check_weight_requests(&self, requests: &[cuteafd_loader::placement::planner::Allocation],
+        actual: &[(String, CuteafdDeviceBuffer)]) -> Result<()> {
+        ensure!(requests.len() == actual.len(), "GLM weight request/owner count differs");
+        for request in requests {
+            let buffer = actual.iter().find(|(id, _)| id == &request.id)
+                .with_context(|| format!("missing loaded owner {}", request.id))?.1;
+            let cuteafd_loader::placement::planner::Device::Coordinator(rank) = request.location.device else {
+                anyhow::bail!("weight request is not coordinator-owned");
+            };
+            let device = if rank == 0 { self.device } else { self.peers[usize::from(rank)-1].device };
+            ensure!(!buffer.ptr.is_null() && buffer.bytes as u64 == request.bytes && buffer.device_id == device,
+                "{}: actual weight extent/device {}/{} differs from request {}/{}", request.id,
+                buffer.bytes, buffer.device_id, request.bytes, device);
+        }
+        Ok(())
     }
 
     /// Layers `0..layers` (all of them unless the caller stops early): rank 0's
@@ -1075,27 +1101,70 @@ impl<'a> GlmLoader<'a> {
     #[allow(clippy::type_complexity)]
     pub fn model(&self, cfg: &GlmDsaConfig, layers: usize, owners: Option<&[u8]>, native_shared: bool)
         -> Result<(GlmWeights<'a>, Vec<Vec<GlmLayer<'a>>>)> {
+        ensure!(self.arenas.is_some(), "GLM target model requires admitted coordinator arenas");
         ensure!(owners.is_none_or(|o| o.len() == layers && self.ranks() == 2 && o.iter().all(|&r| r < 2)),
             "whole attention needs one owner per layer and two ranks");
         let split = crate::shared::memory::load_timing::Split::start();
-        let checkpoint = cuteafd_loader::plan::checkpoint::Checkpoint::inventory(self.catalog.snapshot())?;
+        let mut checkpoint = if let Some(view) = self.catalog.selected_view() {
+            cuteafd_loader::plan::Checkpoint::coordinator_view(view, false, false)?
+        } else { cuteafd_loader::plan::checkpoint::Checkpoint::inventory(self.catalog.snapshot())? };
         let core = CoreInventory::from_checkpoint(cfg, &checkpoint)?;
+        // Inventory is header-light. Reuse only the native core headers already
+        // opened by the catalog; recorded recipes need their exact rectangles.
+        for projection in core.projections.values() {
+            for suffix in ["trellis", "suh", "svh", projection.codebook.marker()] {
+                let name = format!("{}.{suffix}", projection.stem);
+                if !checkpoint.tensors.iter().any(|tensor| tensor.meta.name == name) {
+                    let tensor = self.catalog.tensor(&name)?;
+                    checkpoint.tensors.push(cuteafd_loader::plan::checkpoint::CheckpointTensor {
+                        shard: tensor.shard.clone(), meta: tensor.metadata.clone() });
+                }
+            }
+        }
+        if !core.native.is_empty() {
+            let view = self.catalog.selected_view().context("GLM native attention selected view")?;
+            let native = cuteafd_loader::plan::Checkpoint::open_view_for_role(view,
+                "GLM native attention load records", |name| name.rsplit_once('.')
+                    .is_some_and(|(stem, _)| core.native.contains_key(stem)))?;
+            for tensor in native.tensors {
+                if !checkpoint.tensors.iter().any(|current| current.meta.name == tensor.meta.name) {
+                    checkpoint.tensors.push(tensor);
+                }
+            }
+        }
+        checkpoint.tensors.sort_by(|a, b| a.meta.name.cmp(&b.meta.name));
         let mut shares: Vec<Vec<GlmLayer<'a>>> = (0..self.ranks()).map(|_| Vec::new()).collect();
         for layer in 0..layers.min(cfg.layers) {
             for (share, part) in shares.iter_mut().zip(self.layer(cfg, layer, &checkpoint, &core, owners.map(|o| o[layer]), native_shared)?) {
                 share.push(part);
             }
         }
+        let (mut norm, mut head) = (None, None);
+        routes::global_routes(self.catalog, cfg, &core, |route| {
+            let actual = match route.operation {
+                routes::Operation::Tensor(name) => {
+                    let allocation = self.one(route.key, &name)?;
+                    let actual = vec![(format!("glm.weights.gpu.0.{}", route.key), allocation.buffer)];
+                    if route.key == "norm" { norm = Some(allocation); }
+                    else { head = Some(GlmHead::Bf16(allocation)); }
+                    actual
+                }
+                routes::Operation::Core(layout) => {
+                    let weights = self.core_weights(layout, &checkpoint, 0, "core.head")?;
+                    let actual = [("payload", weights.payload.buffer), ("suh", weights.suh.buffer), ("svh", weights.svh.buffer)]
+                        .into_iter().map(|(suffix, buffer)| (format!("glm.weights.gpu.0.core.head.{suffix}"), buffer)).collect();
+                    head = Some(GlmHead::K6(weights));
+                    actual
+                }
+                _ => anyhow::bail!("invalid global weight operation"),
+            };
+            self.check_weight_requests(&route.requests, &actual)
+        })?;
         let mut shares = shares.into_iter();
         let weights = GlmWeights {
             layers: shares.next().context("rank 0")?,
-            norm: self.one(cfg.final_norm())?,
-            head: match core.get_weight(cfg.head()) {
-                Some(projection) => GlmHead::K6(self.core_weights(
-                    cuteafd_loader::formats::trellis_core::CoreWeightLayout::new(projection,
-                        cuteafd_loader::formats::dense_trellis::TrellisSide::Output, 0, 1)?, 0)?),
-                None => GlmHead::Bf16(self.one(&format!("{}.weight", cfg.head()))?),
-            },
+            norm: norm.context("global norm route")?,
+            head: head.context("global head route")?,
             rope_alpha: cfg.variant.ml4().map(|_| -> Result<Vec<f32>> {
                 let (bytes, dtype, shape) = self.raw("lerope.alpha")?;
                 ensure!(dtype == DType::Bf16 && shape == [cfg.qk_rope_head_dim / 2], "lerope.alpha must be BF16 [rope/2]");
@@ -1107,6 +1176,22 @@ impl<'a> GlmLoader<'a> {
         Ok((weights, shares.collect()))
     }
 
+    fn native_layer_owner(cfg: &GlmDsaConfig, layer: usize, name: &str) -> Result<String> {
+        let prefix = format!("layers.{layer}.");
+        let name = name.strip_prefix(&prefix).context("native GLM allocation layer differs")?;
+        let key = if name.starts_with("w_") {
+            format!("operand.{name}")
+        } else if name == cuteafd_loader::plan::exlr8::dense::requests::key("router", "bf16") {
+            "operand.gate".into()
+        } else if let Some((key, _)) = cfg.plain_owners(layer).into_iter().find(|(_, tensor)| tensor == name) {
+            format!("operand.{key}")
+        } else {
+            ensure!(name.starts_with("n."), "unknown native GLM allocation {name}");
+            format!("native.{name}")
+        };
+        Ok(format!("layer.{layer}.{key}"))
+    }
+
     /// An EXLR8 checkpoint's own dense operands (no official snapshot):
     /// `records[rank]` for each head-split rank, filled through `load` (mount
     /// now, or recorded for the push group), the final norm on rank 0 and the
@@ -1114,33 +1199,41 @@ impl<'a> GlmLoader<'a> {
     /// Routed experts and the shared expert stay on their native owners.
     #[allow(clippy::type_complexity)]
     pub fn native_model(&self, cfg: &GlmDsaConfig, layers: usize,
-        records: &[crate::shared::experts::exlr8::dense_weights::NativeDenseRecords], load: &crate::shared::experts::rtx::dense::DenseLoad<'a>,
+        records: &[cuteafd_loader::plan::exlr8::dense::requests::NativeDenseRecords], owners: Option<&[u8]>, load: &crate::shared::experts::rtx::dense::DenseLoad<'a>,
         vocabulary: std::rc::Rc<crate::shared::token_io::native::NativeVocabulary<'a>>)
         -> Result<(GlmWeights<'a>, Vec<Vec<GlmLayer<'a>>>)> {
+        ensure!(self.arenas.is_some(), "native GLM target model requires admitted coordinator arenas");
         let ranks = self.ranks();
         ensure!(records.len() == ranks && cfg.heads % ranks == 0, "native GLM records per coordinator rank");
+        ensure!(owners.is_none_or(|owners| ranks == 2 && owners.len() == layers
+            && owners.iter().all(|&owner| usize::from(owner) < ranks)), "native GLM attention owners");
         let split = crate::shared::memory::load_timing::Split::start();
         let mut shares: Vec<Vec<GlmLayer<'a>>> = (0..ranks).map(|_| Vec::new()).collect();
         for layer in 0..layers.min(cfg.layers) {
             for (rank, share) in shares.iter_mut().enumerate() {
                 let layer_records = records[rank].layers.get(layer).context("native layer records")?;
+                let owner = owners.map(|owners| owners[layer]);
+                let attention_resident = owner.is_none_or(|owner| usize::from(owner) == rank);
+                ensure!(layer_records.kv_b.is_some() == attention_resident, "native GLM attention record ownership");
                 let part = self.on_rank(rank, |stream| -> Result<GlmLayer<'a>> {
                     let _memory_format = cuteafd_ffi::memory_ledger::format("native");
-                    let mut native = crate::shared::experts::exlr8::dense_weights::load_layer(self.library, load, layer_records, stream)?;
+                    let mut native = crate::shared::experts::exlr8::dense_weights::load_layer_packed_with(
+                        self.library, load, layer_records, &[], stream, |name, bytes| {
+                            self.allocate_owner(&Self::native_layer_owner(cfg, layer, name)?, bytes)
+                        })?;
                     let p = format!("model.layers.{layer}");
                     let mut operands: HashMap<&'static str, DeviceAllocation<'a>> = HashMap::new();
                     for (key, name) in [("w_uk_fp8", "w_uk_fp8"), ("w_uk_scale", "w_uk_scale"), ("w_uv_fp8", "w_uv_fp8"),
                         ("w_uv_scale", "w_uv_scale")] {
-                        operands.insert(key, native.remove(name).context("native kv_b split")?);
+                        if attention_resident {
+                            operands.insert(key, native.remove(name).context("native kv_b owner")?);
+                        }
                     }
-                    for (key, tensor) in [("input_norm", "input_layernorm.weight"), ("post_norm", "post_attention_layernorm.weight"),
-                        ("q_a_norm", "self_attn.q_a_layernorm.weight"), ("kv_a_norm", "self_attn.kv_a_layernorm.weight"),
-                        ("k_norm_w", "self_attn.indexer.k_norm.weight"), ("k_norm_b", "self_attn.indexer.k_norm.bias"),
-                        ("gate.bias", "mlp.gate.e_score_correction_bias")] {
-                        if let Some(allocation) = native.remove(&format!("{p}.{tensor}")) { operands.insert(key, allocation); }
+                    for (key, tensor) in cfg.plain_owners(layer) {
+                        if let Some(allocation) = native.remove(&tensor) { operands.insert(key, allocation); }
                     }
                     // The router (BF16 record) on rank 0, as on the official path.
-                    if let Some(gate) = native.remove(&crate::shared::experts::exlr8::dense_weights::key("router", "bf16")) {
+                    if let Some(gate) = native.remove(&cuteafd_loader::plan::exlr8::dense::requests::key("router", "bf16")) {
                         operands.insert("gate", gate);
                     }
                     let dense = layer < cfg.first_moe_layer;
@@ -1149,25 +1242,20 @@ impl<'a> GlmLoader<'a> {
                         "{p}: native layer operands incomplete on rank {rank}");
                     Ok(GlmLayer { dense, full_indexer: cfg.indexers[layer] == GlmIndexer::Full,
                         mlp_numerics: cuteafd_loader::plan::checkpoint::ModuleNumerics::CheckpointPrecision,
-                        split: ranks > 1, attention_split: ranks > 1, attention_owner: None,
-                        attention_resident: true, operands, native,
+                        split: ranks > 1, attention_split: ranks > 1 && owner.is_none(), attention_owner: owner,
+                        attention_resident, operands, native,
                         native_projections: layer_records.projections.iter().map(|(&stem, (p, _))| (stem, p.clone())).collect(),
-                        core: Default::default() })
+                        core: Default::default(), attention_native: Default::default() })
                 })?;
                 share.push(part);
             }
         }
-        let norm = {
-            let component = &records[0].norm;
-            let allocation = DeviceAllocation::new(self.library,
-                cuteafd_loader::plan::exlr8::dense::DenseTransform::Identity.allocation_bytes(component)?)?;
-            load.operand(crate::shared::experts::rtx::dense::Operand { device: self.library.cuda_get_device()?,
-                buffer: allocation.buffer, bytes: component.source.bytes,
-                lands: vec![(crate::shared::experts::rtx::dense::Rect { name: "model.norm.weight".into(),
-                    path: component.source.path.clone(), base: component.source.offset, row_bytes: component.source.bytes,
-                    rows: 0..1, cols: 0..component.source.bytes }, 0)] })?;
-            allocation
-        };
+        let norm = self.on_rank(0, |stream| {
+            crate::shared::experts::exlr8::dense_weights::landed_with(self.library, load,
+                cfg.final_norm(), &records[0].norm,
+                cuteafd_loader::plan::exlr8::dense::DenseTransform::Identity, stream,
+                |_, bytes| self.allocate_owner("norm", bytes))
+        })?;
         let mut shares = shares.into_iter();
         let weights = GlmWeights { layers: shares.next().context("rank 0")?, norm, head: GlmHead::RowFp8(vocabulary),
             rope_alpha: None };
@@ -1182,10 +1270,13 @@ impl<'a> GlmLoader<'a> {
 /// the bytes (one RTX PRO 6000, coordinator alone: C1 step 28.6 vs 21.0 ms, 8K prefill 3.35
 /// vs 2.74 s), a decision pending in PLAN.md Phase 5.
 pub(crate) fn bf16_programs() -> bool {
-    static NATIVE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *NATIVE.get_or_init(|| std::env::var("CUTEAFD_GLM_BF16").is_ok_and(|v| v == "native"))
+    cuteafd_loader::families::glm5::native_bf16()
 }
 
 #[cfg(test)]
 #[path = "weights_tests.rs"]
 mod operand_tests;
+
+#[cfg(test)]
+#[path = "weight_inventory_tests.rs"]
+mod inventory_tests;

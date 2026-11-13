@@ -18,12 +18,12 @@ fn gpu_reply_copy_engine_bandwidth() -> Result<()> {
     let library = unsafe { NativeLibrary::load(&path)? };
     library.cuda_set_device(0)?;
     let device = Device { library: &library, id: 0 };
-    let mut host = HostAllocation::new(&library, BYTES)?;
+    let mut host = HostAllocation::new(&library, BYTES, crate::shared::memory::TEST)?;
     for (i, byte) in host.bytes_mut().iter_mut().enumerate() { *byte = (i % 251) as u8; }
-    let output = DeviceAllocation::new(&library, BYTES)?;
+    let output = DeviceAllocation::new(&library, BYTES, crate::shared::memory::TEST)?;
     let streams = (0..RANKS).map(|_| Stream::new(device)).collect::<Result<Vec<_>>>()?;
-    let mut start = Event::new(device)?;
-    let mut end = Event::new(device)?;
+    let mut start = Event::timing(device)?;
+    let mut end = Event::timing(device)?;
     let mut done = (0..RANKS).map(|_| Event::new(device)).collect::<Result<Vec<_>>>()?;
     for (name, copies, stream_count) in [("one", 1, 1), ("six_serial", RANKS, 1), ("six_streams", RANKS, RANKS)] {
         let chunk = BYTES / copies;
@@ -86,8 +86,8 @@ fn gpu_reply_ce_land_before_arrival_pressure() -> Result<()> {
     let library = unsafe { NativeLibrary::load(&path)? };
     library.cuda_set_device(0)?;
     let device = Device { library: &library, id: 0 };
-    let host = HostAllocation::new(&library, 304_349_184)?;
-    let output = DeviceAllocation::new(&library, host.buffer.bytes)?;
+    let host = HostAllocation::new(&library, 304_349_184, crate::shared::memory::TEST)?;
+    let output = DeviceAllocation::new(&library, host.buffer.bytes, crate::shared::memory::TEST)?;
     struct ReleaseWords<'a>(&'a HostAllocation<'a>);
     impl Drop for ReleaseWords<'_> {
         fn drop(&mut self) {
@@ -98,8 +98,8 @@ fn gpu_reply_ce_land_before_arrival_pressure() -> Result<()> {
         }
     }
     for pressure in [0, 4, 16] {
-        let control = HostAllocation::new(&library, 128)?;
-        let pressure_outputs = (0..=pressure).map(|_| DeviceAllocation::new(&library, 65536)).collect::<Result<Vec<_>>>()?;
+        let control = HostAllocation::new(&library, 128, crate::shared::memory::TEST)?;
+        let pressure_outputs = (0..=pressure).map(|_| DeviceAllocation::new(&library, 65536, crate::shared::memory::TEST)).collect::<Result<Vec<_>>>()?;
         let streams = (0..=pressure).map(|_| Stream::new(device)).collect::<Result<Vec<_>>>()?;
         let copy_stream = Stream::new(device)?;
         let mut done = Event::new(device)?;
@@ -169,15 +169,16 @@ fn gpu_reply_ce_current_event_depth_three() -> Result<()> {
     let path = library_path()?;
     // SAFETY: the opt-in path names the matching built native library.
     let library = Arc::new(unsafe { NativeLibrary::load(&path)? });
+    crate::shared::inventory::preload_native_modules(&library)?;
     library.cuda_set_device(0)?;
     let device = Device { library: &library, id: 0 };
-    let mut host = HostAllocation::new(&library, BYTES)?;
+    let mut host = HostAllocation::new(&library, BYTES, crate::shared::memory::TEST)?;
     for (i, byte) in host.bytes_mut().iter_mut().enumerate() { *byte = (i % 251) as u8; }
-    let output = DeviceAllocation::new(&library, SLOTS * BYTES)?;
-    let input = DeviceAllocation::new(&library, STAGING)?;
-    let staging = HostAllocation::new(&library, SLOTS * STAGING)?;
-    let table = DeviceAllocation::new(&library, SLOTS * TABLES)?;
-    let descriptors = HostAllocation::new(&library, Pulls::bytes(SLOTS))?;
+    let output = DeviceAllocation::new(&library, SLOTS * BYTES, crate::shared::memory::TEST)?;
+    let input = DeviceAllocation::new(&library, STAGING, crate::shared::memory::TEST)?;
+    let staging = HostAllocation::new(&library, SLOTS * STAGING, crate::shared::memory::TEST)?;
+    let table = DeviceAllocation::new(&library, SLOTS * TABLES, crate::shared::memory::TEST)?;
+    let descriptors = HostAllocation::new(&library, Pulls::bytes(SLOTS), crate::shared::memory::TEST)?;
     let pulls = Pulls { base: descriptors.buffer.ptr as usize };
     let stream = Stream::new(device)?;
     let copy = Stream::new(device)?;
@@ -209,7 +210,7 @@ fn gpu_reply_ce_current_event_depth_three() -> Result<()> {
     copy.drain()?;
     let mut results = Vec::new();
     for ce in [false, true] {
-        let control = HostAllocation::new(&library, Counter::words(SLOTS) * LINE)?;
+        let control = HostAllocation::new(&library, Counter::words(SLOTS) * LINE, crate::shared::memory::TEST)?;
         let words = Words { base: control.buffer.ptr as usize, slots: SLOTS };
         let stop = Arc::new(AtomicBool::new(false));
         let (send, receive) = std::sync::mpsc::channel::<(u32, usize)>();
@@ -440,6 +441,74 @@ impl Backend for Fake {
         if !reached(self.world.load(Counter::Landed), sequence) { self.world.store(Counter::Landed, sequence); }
         self.world.released.store(true, Ordering::Release);
     }
+}
+
+#[test]
+fn worker_census_reports_actual_mock_views_without_post_poll_or_retry() -> Result<()> {
+    use cuteafd_transport::{TransportAllocationCensus, TransportHostAllocation};
+    struct CensusBackend { bytes: Vec<u8>, observed: Arc<AtomicUsize> }
+    impl Backend for CensusBackend {
+        type Wave = ();
+        fn allocation_census(&self) -> TransportAllocationCensus {
+            self.observed.fetch_add(1, Ordering::Relaxed);
+            TransportAllocationCensus { host: vec![TransportHostAllocation { owner: "rank.0.receive".into(),
+                address: self.bytes.as_ptr() as u64, bytes: self.bytes.len() as u64,
+                flags: cuteafd_ffi::CUTEAFD_HOST_BUFFER_FLAG_PINNED, mapped: None, audit_owner: None }],
+                unclassified: Vec::new(), pinned_frame_audits: Vec::new() }
+        }
+        fn counter(&self, _: Counter) -> u32 { 0 }
+        fn post(&mut self, _: Job) -> Result<()> { panic!("census must not post") }
+        fn poll(&mut self, _: &mut (), _: &WaveInfo) -> Result<bool> { panic!("census must not poll") }
+        fn publish(&mut self, _: u32) { panic!("census must not publish") }
+    }
+    let observed = Arc::new(AtomicUsize::new(0));
+    let mut backend = CensusBackend { bytes: vec![0; 768], observed: observed.clone() };
+    let expected = (backend.bytes.as_ptr() as u64, backend.bytes.len() as u64);
+    let (jobs, inbox) = mpsc::channel();
+    std::thread::scope(|scope| -> Result<()> {
+        let worker = scope.spawn(move || run_worker(&mut backend, &inbox, Duration::from_secs(5), false));
+        let census = worker_census(Some(&jobs), Duration::from_secs(1));
+        assert!(census.unclassified.is_empty());
+        assert_eq!(census.host.len(), 1);
+        assert_eq!((census.host[0].address, census.host[0].bytes), expected);
+        assert_eq!(observed.load(Ordering::Relaxed), 1);
+        jobs.send(Command::Cancel).map_err(|_| anyhow::anyhow!("worker command channel closed"))?;
+        assert_eq!(worker.join().unwrap().0?, Stop::Cancelled);
+        Ok(())
+    })?;
+    assert_eq!(observed.load(Ordering::Relaxed), 1);
+    let absent = worker_census(None, Duration::from_millis(1));
+    assert_eq!(absent.unclassified[0].owner, "worker");
+    assert!(absent.unclassified[0].reason.contains("unavailable"));
+    let (jobs, inbox) = mpsc::channel();
+    let unavailable = worker_census(Some(&jobs), Duration::from_millis(1));
+    assert!(unavailable.host.is_empty());
+    assert!(unavailable.unclassified[0].reason.contains("did not answer"));
+    assert!(matches!(inbox.try_recv(), Ok(Command::Census(_))));
+    assert!(matches!(inbox.try_recv(), Err(mpsc::TryRecvError::Empty)), "census must not retry");
+    drop(inbox);
+    assert!(worker_census(Some(&jobs), Duration::from_millis(1)).unclassified[0].reason.contains("closed"));
+    Ok(())
+}
+
+#[test]
+fn worker_census_marks_busy_and_missing_backend_unclassified() -> Result<()> {
+    let world = World::new(1);
+    let mut backend = Fake { world: world.clone() };
+    let (jobs, inbox) = mpsc::channel();
+    jobs.send(Command::Wave(job(1, 0, 0))).map_err(|_| anyhow::anyhow!("worker command channel closed"))?;
+    let (reply, answer) = mpsc::sync_channel(1);
+    jobs.send(Command::Census(reply)).map_err(|_| anyhow::anyhow!("worker command channel closed"))?;
+    jobs.send(Command::Cancel).map_err(|_| anyhow::anyhow!("worker command channel closed"))?;
+    assert_eq!(run_worker(&mut backend, &inbox, Duration::from_secs(1), false).0?, Stop::Cancelled);
+    let census = answer.recv_timeout(Duration::from_secs(1))?;
+    assert!(census.host.is_empty());
+    assert!(census.unclassified[0].reason.contains("in-flight"));
+    assert!(world.posted.lock().unwrap().is_empty());
+    assert_eq!(world.polls.load(Ordering::Relaxed), 0);
+    let missing = backend.allocation_census();
+    assert!(missing.unclassified[0].reason.contains("unavailable"));
+    Ok(())
 }
 
 fn job(sequence: u32, slot: usize, consumed: u32) -> Job {
@@ -754,7 +823,7 @@ impl EchoWorld {
             pools: (0..ranks).map(|_| Mutex::new(Vec::new())).collect(), released: AtomicUsize::new(0) });
         for rank in 0..ranks {
             for _ in 0..2 * depth {
-                let host = library.alloc_host_buffer(frame_bytes + 16)?;
+                let host = library.alloc_host_buffer(frame_bytes + 16, crate::shared::memory::TEST)?;
                 buffers.owned.lock().unwrap().push((host.ptr as usize, host.bytes));
                 buffers.pools[rank].lock().unwrap().push((host.ptr as usize + 4, frame_bytes));
             }
@@ -866,6 +935,7 @@ fn gpu_exchange_queues_a_step_ahead_and_lands_byte_exact() -> Result<()> {
     let path = std::env::var_os("CUTEAFD_PLANE_UPLOAD_LIBRARY").context("set CUTEAFD_PLANE_UPLOAD_LIBRARY")?;
     // SAFETY: the opt-in path names the built native library for this GPU.
     let library = std::sync::Arc::new(unsafe { NativeLibrary::load(&path)? });
+    crate::shared::inventory::preload_native_modules(&library)?;
     cuteafd_transport::set_verbs_host_native_library_path(std::path::PathBuf::from(&path))?;
     // The compact reducer sums rows of the process-wide expert hidden size
     // (5120 unless a family sets another; this test process never does), so
@@ -888,7 +958,7 @@ fn gpu_exchange_queues_a_step_ahead_and_lands_byte_exact() -> Result<()> {
         let cuts = [(slots, max_rows)];
         let reserve = slots * max_rows;
         let total = layers as usize;
-        let ranges_owned = (0..ranks).map(|_| DeviceAllocation::new(&library, reserve * row_bytes))
+        let ranges_owned = (0..ranks).map(|_| DeviceAllocation::new(&library, reserve * row_bytes, crate::shared::memory::TEST))
             .collect::<Result<Vec<_>>>()?;
         let ranges: Vec<CuteafdDeviceBuffer> = ranges_owned.iter().map(|range| range.buffer).collect();
         let max_layout = RouteStaging::new(max_rows, topk, row_bytes)?;
@@ -916,11 +986,11 @@ fn gpu_exchange_queues_a_step_ahead_and_lands_byte_exact() -> Result<()> {
         let mut exchange = Waves::start(&library, intake, echo, Vec::new(), arenas, false, storage.clone())?;
         let _ = words.set(exchange.words());
         let stream = crate::shared::spark_intake::WarmStream::new(library.as_ref())?;
-        let ids = DeviceAllocation::new(&library, max_rows * topk * 4)?;
-        let weights = DeviceAllocation::new(&library, max_rows * topk * 4)?;
+        let ids = DeviceAllocation::new(&library, max_rows * topk * 4, crate::shared::memory::TEST)?;
+        let weights = DeviceAllocation::new(&library, max_rows * topk * 4, crate::shared::memory::TEST)?;
         // One input and one output per layer, all live until the end.
-        let inputs = (0..total).map(|layer| DeviceAllocation::new(&library, widths[layer] * row_bytes)).collect::<Result<Vec<_>>>()?;
-        let outputs = (0..total).map(|layer| DeviceAllocation::new(&library, widths[layer] * row_bytes)).collect::<Result<Vec<_>>>()?;
+        let inputs = (0..total).map(|layer| DeviceAllocation::new(&library, widths[layer] * row_bytes, crate::shared::memory::TEST)).collect::<Result<Vec<_>>>()?;
+        let outputs = (0..total).map(|layer| DeviceAllocation::new(&library, widths[layer] * row_bytes, crate::shared::memory::TEST)).collect::<Result<Vec<_>>>()?;
         let mut expected = Vec::new();
         for (layer, input) in inputs.iter().enumerate() {
             let host = &hosts[layer];
@@ -1009,9 +1079,73 @@ fn gpu_terminal_close_returns_the_transport_with_waves_in_flight() -> Result<()>
 #[test]
 #[ignore = "requires a GPU and native codec exports; run alone (--exact)"]
 fn gpu_compressed_close_retains_reducer_and_reset_reuses_storage() -> Result<()> {
-    cuteafd_core::spark_reply::set_requested(Some(cuteafd_core::SparkReplyFormat::Nvfp4))
+    cuteafd_core::spark_reply::set_requested(cuteafd_core::spark_reply::SparkReplyFormats {
+        prefill: Some(cuteafd_core::SparkReplyFormat::Nvfp4), decode: Some(cuteafd_core::SparkReplyFormat::Nvfp4) })
         .map_err(anyhow::Error::msg)?;
     terminal_close_with_codec(true)
+}
+
+#[test]
+#[ignore = "requires a GPU and native codec exports; run alone (--exact)"]
+fn gpu_decode_reduction_captured_before_first_wave_reads_replay_format() -> Result<()> {
+    use crate::shared::memory::DeviceAllocation;
+    use cuteafd_core::{SparkReplyFormat::Fp8, spark_reply::SparkReplyFormats};
+    cuteafd_core::spark_reply::set_requested(SparkReplyFormats { prefill: None, decode: Some(Fp8) })
+        .map_err(anyhow::Error::msg)?;
+    let path = library_path()?;
+    // SAFETY: the opt-in path names the matching built native library.
+    let library = Arc::new(unsafe { NativeLibrary::load(&path)? });
+    crate::shared::inventory::preload_native_modules(&library)?;
+    let (hidden, rows, ranks) = (5120usize, 8usize, 2usize);
+    let row_bytes = hidden * 2;
+    let planes = (0..ranks).map(|_| DeviceAllocation::new(&library, rows * row_bytes, crate::shared::memory::TEST)).collect::<Result<Vec<_>>>()?;
+    let ranges = planes.iter().map(|plane| plane.buffer).collect::<Vec<_>>();
+    let words = Arc::new(std::sync::OnceLock::new());
+    let echo = EchoWorld::new(library.clone(), ranks, row_bytes, 3,
+        ranges.iter().map(|range| range.ptr as usize).collect(), Vec::new(), words.clone(), Duration::ZERO,
+        Duration::ZERO, 1, rows * row_bytes)?;
+    let intake = Intake { prefill: false, ranks, row_bytes, ranges,
+        geometry: crate::shared::wave_geometry::SlotGeometry::new(1, rows)?, landing: 3, placed: true };
+    let storage = std::rc::Rc::new(ExchangeStorage::new(&library, &intake)?);
+    let layout = RouteStaging::new(rows, 6, row_bytes)?;
+    let exchange = Waves::start(&library, intake, echo, Vec::new(), vec![StagingArena::new(layout.bytes)?], false, storage)?;
+    let binding = exchange.reduction(0);
+    assert!(binding.fused.is_some(), "decode format is bound before any host-observed wave");
+    let stream = crate::shared::spark_intake::WarmStream::new(library.as_ref())?;
+    let output = DeviceAllocation::new(&library, rows * row_bytes, crate::shared::memory::TEST)?;
+    // Warm module loading before capture. The mode defaults to BF16.
+    for plane in &planes { library.copy_h2d(plane.buffer, &vec![0; rows * row_bytes])?; }
+    // SAFETY: all planes, mode, output and stream survive the captured graph and drainage.
+    let graph = unsafe {
+        binding.launch(&library, std::ptr::null(), output.buffer.ptr.cast(), rows, stream.raw())?;
+        library.cuda_stream_synchronize(stream.raw())?;
+        library.cuda_graph_begin_capture(stream.raw())?;
+        binding.launch(&library, std::ptr::null(), output.buffer.ptr.cast(), rows, stream.raw())?;
+        let raw = library.cuda_graph_end_capture_for_test(stream.raw())?;
+        crate::shared::decode_graph::GraphOwner::new(&library, library.cuda_get_device()?, raw, binding)?
+    };
+    for mode in [0u32, 1, 2, 0, 2, 1] {
+        let payload: Vec<u8> = match mode {
+            0 => (0..rows * hidden).flat_map(|_| 0x3f80u16.to_le_bytes()).collect(),
+            1 => (0..rows).flat_map(|_| [vec![0x38; hidden], vec![127; hidden / 32]].concat()).collect(),
+            _ => (0..rows).flat_map(|_| [vec![0x22; hidden / 2], vec![0x38; hidden / 16]].concat()).collect(),
+        };
+        for plane in &planes { library.copy_h2d(plane.buffer, &payload)?; }
+        exchange.words.store(Counter::ReplyFormat(0), mode);
+        // SAFETY: graph and all captured resources remain live; mode/planes were published before replay.
+        unsafe { library.cuda_graph_launch(graph.raw, stream.raw())?; }
+        // SAFETY: this live stream has no concurrent writers.
+        unsafe { library.cuda_stream_synchronize(stream.raw())?; }
+        let mut actual = vec![0; rows * row_bytes];
+        library.copy_d2h(&mut actual, output.buffer)?;
+        assert!(actual.chunks_exact(2).all(|b| b == 0x4000u16.to_le_bytes()), "replay mode {mode}");
+    }
+    drop(graph);
+    ensure!(exchange.outstanding.is_empty() && exchange.unread.iter().all(|unread| !unread),
+        "the exchange closes only after every wave is consumed");
+    let (_, _, result) = exchange.close::<EchoWorld>()?;
+    result?;
+    Ok(())
 }
 
 fn terminal_close_with_codec(compressed: bool) -> Result<()> {
@@ -1019,6 +1153,7 @@ fn terminal_close_with_codec(compressed: bool) -> Result<()> {
     let path = std::env::var_os("CUTEAFD_PLANE_UPLOAD_LIBRARY").context("set CUTEAFD_PLANE_UPLOAD_LIBRARY")?;
     // SAFETY: the opt-in path names the built native library for this GPU.
     let library = std::sync::Arc::new(unsafe { NativeLibrary::load(&path)? });
+    crate::shared::inventory::preload_native_modules(&library)?;
     cuteafd_transport::set_verbs_host_native_library_path(std::path::PathBuf::from(&path))?;
     let (hidden, topk, ranks, rows, waves, layers) = (5120usize, 6usize, 3usize,
         if compressed { 65usize } else { 4usize }, 2usize, 4usize);
@@ -1059,9 +1194,9 @@ fn terminal_close_with_codec(compressed: bool) -> Result<()> {
     let mut exchange = Waves::start(&library, intake, echo, Vec::new(), arenas, false, storage)?;
     let _ = words.set(exchange.words());
     let stream = crate::shared::spark_intake::WarmStream::new(library.as_ref())?;
-    let ids = DeviceAllocation::new(&library, rows * topk * 4)?;
-    let weights = DeviceAllocation::new(&library, rows * topk * 4)?;
-    let input = DeviceAllocation::new(&library, rows * row_bytes)?;
+    let ids = DeviceAllocation::new(&library, rows * topk * 4, crate::shared::memory::TEST)?;
+    let weights = DeviceAllocation::new(&library, rows * topk * 4, crate::shared::memory::TEST)?;
+    let input = DeviceAllocation::new(&library, rows * row_bytes, crate::shared::memory::TEST)?;
     // The worker checks each request against the layer's (zero) input rows;
     // a fresh allocation is not zeroed.
     library.cuda_zero_bytes(input.buffer, rows * row_bytes)?;
@@ -1134,7 +1269,7 @@ fn link_teardown_and_reset_take_the_transport_back_from_the_exchange() {
     // A reset re-opens the sessions before the exchange restarts: its device
     // landing mask is read from the live sessions, as after bootstrap.
     let reset = link.split("pub(crate) fn reset_connections(&mut self)").nth(1).unwrap().split("\n    }\n").next().unwrap();
-    let reopened = reset.find("transport.bootstrap(&request)?").expect("reset re-opens the sessions");
+    let reopened = reset.find("transport.bootstrap(shape)?").expect("reset re-opens the sessions");
     assert!(reopened < reset.find("self.start()").unwrap(), "{reset}");
 }
 
@@ -1253,8 +1388,8 @@ fn ring_backend(ring: Ring, slots: usize) -> (Native<Ring>, Vec<u8>, Vec<u8>) {
     let pulls_at = Pulls { base: (pulls.as_mut_ptr() as usize).next_multiple_of(16) };
     let ranks = ring.ranks;
     let row_bytes = ring.row_bytes;
-    (Native { transport: ring, reply_format: cuteafd_core::SparkReplyFormat::Bf16, reply_payloads: vec![0; slots],
-        prefill_rows: 0, compressed_prefill_rows: 0, mixed_fallback_rows: 0, timing: false, arenas: Vec::new(), words, pulls: pulls_at, slots, ranks, row_bytes, landing: 0,
+    (Native { transport: ring, reply_formats: cuteafd_core::spark_reply::SparkReplyFormats::default(), reply_payloads: vec![0; slots],
+        prefill_rows: 0, compressed_prefill_rows: 0, mixed_decode_rows: 0, timing: false, arenas: Vec::new(), words, pulls: pulls_at, slots, ranks, row_bytes, landing: 0,
         placed: true, receiving: (0..ranks).map(|_| (0, Vec::new(), Vec::new())).collect(), retained: VecDeque::new() },
         control, pulls)
 }
@@ -1501,11 +1636,12 @@ fn gpu_pinned_pull_waits_for_its_rank_and_the_control_clobbers() -> Result<()> {
     let path = library_path()?;
     // SAFETY: the opt-in path names the built native library for this GPU.
     let library = std::sync::Arc::new(unsafe { NativeLibrary::load(&path)? });
+    crate::shared::inventory::preload_native_modules(&library)?;
     cuteafd_transport::set_verbs_host_native_library_path(std::path::PathBuf::from(&path))?;
     let (hidden, topk, ranks, rows) = (5120usize, 6usize, 2usize, 64usize);
     let row_bytes = hidden * 2;
     for control in [false, true] {
-        let ranges_owned = (0..ranks).map(|_| DeviceAllocation::new(&library, rows * row_bytes))
+        let ranges_owned = (0..ranks).map(|_| DeviceAllocation::new(&library, rows * row_bytes, crate::shared::memory::TEST))
             .collect::<Result<Vec<_>>>()?;
         let ranges: Vec<CuteafdDeviceBuffer> = ranges_owned.iter().map(|range| range.buffer).collect();
         let layout = RouteStaging::new(rows, topk, row_bytes)?;
@@ -1536,10 +1672,10 @@ fn gpu_pinned_pull_waits_for_its_rank_and_the_control_clobbers() -> Result<()> {
             arenas, false, storage.clone())?;
         let _ = words.set(exchange.words());
         let stream = crate::shared::spark_intake::WarmStream::new(library.as_ref())?;
-        let ids = DeviceAllocation::new(&library, rows * topk * 4)?;
-        let weights = DeviceAllocation::new(&library, rows * topk * 4)?;
-        let inputs = (0..2).map(|_| DeviceAllocation::new(&library, rows * row_bytes)).collect::<Result<Vec<_>>>()?;
-        let outputs = (0..2).map(|_| DeviceAllocation::new(&library, rows * row_bytes)).collect::<Result<Vec<_>>>()?;
+        let ids = DeviceAllocation::new(&library, rows * topk * 4, crate::shared::memory::TEST)?;
+        let weights = DeviceAllocation::new(&library, rows * topk * 4, crate::shared::memory::TEST)?;
+        let inputs = (0..2).map(|_| DeviceAllocation::new(&library, rows * row_bytes, crate::shared::memory::TEST)).collect::<Result<Vec<_>>>()?;
+        let outputs = (0..2).map(|_| DeviceAllocation::new(&library, rows * row_bytes, crate::shared::memory::TEST)).collect::<Result<Vec<_>>>()?;
         for (input, host) in inputs.iter().zip(&inputs_host) { library.copy_h2d(input.buffer, host)?; }
         let done = library.cuda_event_create()?;
         for layer in 0..2usize {
@@ -1762,12 +1898,13 @@ fn native_post_selects_reply_wire_and_preserves_bf16_slot_geometry() -> Result<(
         ("mimo-flash", 4096), ("mimo-pro", 6144), ("kimi", 3584),
         ("qwen", 2560), ("step5", 4096), ("ml4", 6144)] {
     let row_bytes = hidden * 2;
-    for selected in [Bf16, Fp8, Nvfp4] {
+    for (selected, decode) in [Bf16, Fp8, Nvfp4].into_iter()
+        .flat_map(|prefill| [Bf16, Fp8, Nvfp4].map(|decode| (prefill, decode))) {
         for landing in [0, (1 << ranks) - 1] {
             let (mut backend, _control, _pulls) = ring_backend(Ring::new(ranks, slots, slot_rows, row_bytes), slots);
-            backend.reply_format = selected;
+            backend.reply_formats = cuteafd_core::spark_reply::SparkReplyFormats { prefill: Some(selected), decode: Some(decode) };
             backend.landing = landing;
-            for (index, (sources, eligible)) in cases.iter().enumerate() {
+            for (index, (sources, _eligible)) in cases.iter().enumerate() {
                 let origins: Vec<_> = sources.iter().enumerate().flat_map(|(id, &(rows, kind))|
                     std::iter::repeat_n((id as u64 + 1, kind), rows)).collect();
                 let rows = origins.len();
@@ -1779,7 +1916,7 @@ fn native_post_selects_reply_wire_and_preserves_bf16_slot_geometry() -> Result<(
                         row_index: row, expert_id: 0, gate_weight: 1.0 }).collect(),
                     bytes::Bytes::from(vec![0; rows * row_bytes]))?;
                 let before = request.encode()?;
-                let actual = if *eligible { selected } else { Bf16 };
+                let actual = if sources.iter().all(|(_, kind)| *kind == Prefill) { selected } else { decode };
                 let payload_bytes = rows * actual.row_bytes(hidden).unwrap();
                 backend.transport.payload_bytes = Some(payload_bytes);
                 let sequence = index as u32 + 1;
@@ -1818,7 +1955,7 @@ fn native_post_selects_reply_wire_and_preserves_bf16_slot_geometry() -> Result<(
                 }
             }
             assert_eq!(backend.compressed_prefill_rows,
-                if selected == Bf16 { 0 } else { 195 }, "{family} {selected}");
+                (if selected == Bf16 { 0 } else { 516 }) + if decode == Bf16 { 0 } else { 130 }, "{family} {selected}");
         }
     }
     }
@@ -1972,13 +2109,13 @@ fn reply_path_times(library: &NativeLibrary, ranks: usize, plane_bytes: usize, i
     use crate::shared::memory::DeviceAllocation;
     use cuteafd_ffi::peer_exchange::{PullEntry, PullFrames};
     ensure!((1..=MAX_INTAKE_RANKS).contains(&ranks) && plane_bytes % 16 == 0, "invalid reply probe shape");
-    let mut frames = (0..ranks).map(|_| HostAllocation::new(library, plane_bytes)).collect::<Result<Vec<_>>>()?;
+    let mut frames = (0..ranks).map(|_| HostAllocation::new(library, plane_bytes, crate::shared::memory::TEST)).collect::<Result<Vec<_>>>()?;
     for (rank, frame) in frames.iter_mut().enumerate() {
         for (index, byte) in frame.bytes_mut().iter_mut().enumerate() { *byte = (index * 7 + rank * 13) as u8; }
     }
-    let planes = (0..ranks).map(|_| DeviceAllocation::new(library, plane_bytes)).collect::<Result<Vec<_>>>()?;
-    let mut staging = HostAllocation::new(library, ranks * plane_bytes)?;
-    let mut block = HostAllocation::new(library, ranks * std::mem::size_of::<PullFrames>() + LINE)?;
+    let planes = (0..ranks).map(|_| DeviceAllocation::new(library, plane_bytes, crate::shared::memory::TEST)).collect::<Result<Vec<_>>>()?;
+    let mut staging = HostAllocation::new(library, ranks * plane_bytes, crate::shared::memory::TEST)?;
+    let mut block = HostAllocation::new(library, ranks * std::mem::size_of::<PullFrames>() + LINE, crate::shared::memory::TEST)?;
     ensure!(library.cuda_host_buffer_device_alias(block.buffer)?.ptr == block.buffer.ptr,
         "mapped pinned memory is not device-visible at its host address");
     let word = block.buffer.ptr.cast::<u8>().wrapping_add(ranks * std::mem::size_of::<PullFrames>()).cast::<u32>();
@@ -2177,17 +2314,17 @@ fn gpu_reply_reduction_adds_the_tier_plane_after_the_ranks() -> Result<()> {
         ((state >> 11) as f32 / (1u64 << 53) as f32 - 0.5) * [1.0f32, 64.0, 1.0 / 64.0][(state % 3) as usize]
     };
     let stream = crate::shared::spark_intake::WarmStream::new(&library)?;
-    let mode = HostAllocation::new(&library, LINE)?;
+    let mode = HostAllocation::new(&library, LINE, crate::shared::memory::TEST)?;
     for (ranks, rows) in [(4usize, 1usize), (4, 6), (6, 96), (6, 2048)] {
         let count = rows * hidden;
         // Rank planes, then the tier's plane, then the shared expert's.
         let host: Vec<Vec<u16>> = (0..ranks + 2).map(|_| (0..count).map(|_| bf16(value())).collect()).collect();
         let buffers = host.iter().map(|plane| -> Result<DeviceAllocation<'_>> {
-            let allocation = DeviceAllocation::new(&library, count * 2)?;
+            let allocation = DeviceAllocation::new(&library, count * 2, crate::shared::memory::TEST)?;
             library.copy_h2d(allocation.buffer, &plane.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>())?;
             Ok(allocation)
         }).collect::<Result<Vec<_>>>()?;
-        let output = DeviceAllocation::new(&library, count * 2)?;
+        let output = DeviceAllocation::new(&library, count * 2, crate::shared::memory::TEST)?;
         let mut planes = [std::ptr::null::<u16>(); MAX_INTAKE_RANKS];
         for (pointer, buffer) in planes.iter_mut().zip(&buffers[..ranks]) { *pointer = buffer.buffer.ptr.cast_const().cast(); }
         let reduction = ReplyReduction { planes, ranks: ranks as u32, hidden, capacity: rows, fused: None,
@@ -2256,7 +2393,7 @@ fn gpu_fused_reply_reduction_adds_the_tier_plane_after_the_ranks() -> Result<()>
     let mut state = 0x7e1d_f05eu64;
     let mut next = move || { state ^= state << 13; state ^= state >> 7; state ^= state << 17; state };
     let stream = crate::shared::spark_intake::WarmStream::new(&library)?;
-    let mode = HostAllocation::new(&library, LINE)?;
+    let mode = HostAllocation::new(&library, LINE, crate::shared::memory::TEST)?;
     for format in [Fp8, Nvfp4, Bf16] {
         for (ranks, rows) in [(4usize, 65usize), (6, 130), (8, 65)] {
             let count = rows * hidden;
@@ -2300,14 +2437,14 @@ fn gpu_fused_reply_reduction_adds_the_tier_plane_after_the_ranks() -> Result<()>
             let extras: Vec<Vec<u16>> = (0..2).map(|_| (0..count).map(|_| bf16(((next() >> 11) as f32
                 / (1u64 << 53) as f32 - 0.5) * [1.0f32, 64.0, 1.0 / 64.0][(next() % 3) as usize])).collect()).collect();
             let upload = |bytes: &[u8]| -> Result<DeviceAllocation<'_>> {
-                let allocation = DeviceAllocation::new(&library, bytes.len())?;
+                let allocation = DeviceAllocation::new(&library, bytes.len(), crate::shared::memory::TEST)?;
                 library.copy_h2d(allocation.buffer, bytes)?;
                 Ok(allocation)
             };
             let planes_on_device = wires.iter().map(|wire| upload(wire)).collect::<Result<Vec<_>>>()?;
             let extras_on_device = extras.iter().map(|plane| upload(&plane.iter().flat_map(|v| v.to_le_bytes())
                 .collect::<Vec<_>>())).collect::<Result<Vec<_>>>()?;
-            let output = DeviceAllocation::new(&library, count * 2)?;
+            let output = DeviceAllocation::new(&library, count * 2, crate::shared::memory::TEST)?;
             let mut planes = [std::ptr::null::<u16>(); MAX_INTAKE_RANKS];
             for (pointer, plane) in planes.iter_mut().zip(&planes_on_device) { *pointer = plane.buffer.ptr.cast_const().cast(); }
             // SAFETY: the mapped mode word is read by the launches below, after this write.
@@ -2355,6 +2492,7 @@ fn gpu_host_ordered_collects_land_byte_exact_by_either_route() -> Result<()> {
     let path = std::env::var_os("CUTEAFD_PLANE_UPLOAD_LIBRARY").context("set CUTEAFD_PLANE_UPLOAD_LIBRARY")?;
     // SAFETY: the opt-in path names the built native library for this GPU.
     let library = std::sync::Arc::new(unsafe { NativeLibrary::load(&path)? });
+    crate::shared::inventory::preload_native_modules(&library)?;
     cuteafd_transport::set_verbs_host_native_library_path(std::path::PathBuf::from(&path))?;
     let (hidden, topk) = (5120usize, 6usize);
     let row_bytes = hidden * 2;
@@ -2363,7 +2501,7 @@ fn gpu_host_ordered_collects_land_byte_exact_by_either_route() -> Result<()> {
         for (ranks, landing, slots, rows, layers, stagger_us) in [(4usize, 0u8, 1usize, 1usize, 24u32, 0u64),
             (4, 0, 2, 6, 24, 0), (4, 0, 1, 16, 24, 50), (4, 0, 2, 128, 12, 200), (6, 0b100001, 1, 6, 24, 0)] {
             let reserve = slots * rows;
-            let ranges_owned = (0..ranks).map(|_| DeviceAllocation::new(&library, reserve * row_bytes))
+            let ranges_owned = (0..ranks).map(|_| DeviceAllocation::new(&library, reserve * row_bytes, crate::shared::memory::TEST))
                 .collect::<Result<Vec<_>>>()?;
             let ranges: Vec<CuteafdDeviceBuffer> = ranges_owned.iter().map(|range| range.buffer).collect();
             let layout = RouteStaging::new(rows, topk, row_bytes)?;
@@ -2385,10 +2523,10 @@ fn gpu_host_ordered_collects_land_byte_exact_by_either_route() -> Result<()> {
             let _ = words.set(exchange.words());
             exchange.set_landing_route(route.clone());
             let stream = crate::shared::spark_intake::WarmStream::new(library.as_ref())?;
-            let ids = DeviceAllocation::new(&library, rows * topk * 4)?;
-            let weights = DeviceAllocation::new(&library, rows * topk * 4)?;
-            let inputs = (0..total).map(|_| DeviceAllocation::new(&library, rows * row_bytes)).collect::<Result<Vec<_>>>()?;
-            let outputs = (0..total).map(|_| DeviceAllocation::new(&library, rows * row_bytes)).collect::<Result<Vec<_>>>()?;
+            let ids = DeviceAllocation::new(&library, rows * topk * 4, crate::shared::memory::TEST)?;
+            let weights = DeviceAllocation::new(&library, rows * topk * 4, crate::shared::memory::TEST)?;
+            let inputs = (0..total).map(|_| DeviceAllocation::new(&library, rows * row_bytes, crate::shared::memory::TEST)).collect::<Result<Vec<_>>>()?;
+            let outputs = (0..total).map(|_| DeviceAllocation::new(&library, rows * row_bytes, crate::shared::memory::TEST)).collect::<Result<Vec<_>>>()?;
             for (layer, input) in inputs.iter().enumerate() {
                 library.copy_h2d(input.buffer, &hosts[layer])?;
                 let (h, l) = (hidden, layer);
@@ -2454,12 +2592,12 @@ fn device_ordered_landing_us(library: &NativeLibrary, ranks: usize, frame_bytes:
         &[(*mut c_void, *const c_void, u64)], *mut c_void) -> Result<()>, iterations: usize) -> Result<f64> {
     use crate::shared::memory::DeviceAllocation;
     use cuteafd_ffi::peer_exchange::{PullEntry, PullFrames};
-    let mut frames = (0..ranks).map(|_| HostAllocation::new(library, frame_bytes)).collect::<Result<Vec<_>>>()?;
+    let mut frames = (0..ranks).map(|_| HostAllocation::new(library, frame_bytes, crate::shared::memory::TEST)).collect::<Result<Vec<_>>>()?;
     for (rank, frame) in frames.iter_mut().enumerate() {
         for (index, byte) in frame.bytes_mut().iter_mut().enumerate().step_by(4096) { *byte = (index + rank) as u8; }
     }
-    let planes = (0..ranks).map(|_| DeviceAllocation::new(library, frame_bytes)).collect::<Result<Vec<_>>>()?;
-    let mut block = HostAllocation::new(library, ranks * std::mem::size_of::<PullFrames>() + LINE)?;
+    let planes = (0..ranks).map(|_| DeviceAllocation::new(library, frame_bytes, crate::shared::memory::TEST)).collect::<Result<Vec<_>>>()?;
+    let mut block = HostAllocation::new(library, ranks * std::mem::size_of::<PullFrames>() + LINE, crate::shared::memory::TEST)?;
     let word = block.buffer.ptr.cast::<u8>().wrapping_add(ranks * std::mem::size_of::<PullFrames>()).cast::<u32>();
     let replies: Vec<*const PullFrames> = (0..ranks).map(|rank|
         block.buffer.ptr.cast::<PullFrames>().wrapping_add(rank).cast_const()).collect();
@@ -2556,16 +2694,32 @@ fn device_ordered_landing_on_this_host() -> Result<()> {
 }
 
 #[test]
-fn bf16_units_under_compressed_settings_dispatch_zero_reply_decode_launches() {
+fn omitted_phase_settings_keep_all_combined_replies_bf16() {
     use cuteafd_transport::ExpertV2SourceKind::{Decode, MtpVerify, Prefill};
-    for available in [false, true] {
-        for (rows, kind) in [(1, Decode), (96, Decode), (192, MtpVerify), (64, Prefill)] {
-            assert!(!compressed_reduction(single_reply_eligible(rows, kind), available));
-        }
-        assert_eq!(compressed_reduction(single_reply_eligible(65, Prefill), available), available);
-        for rows in [vec![(1, true); 64].into_iter().chain(vec![(2, true); 65]).collect::<Vec<_>>(),
-            vec![(1, true); 65].into_iter().chain(vec![(2, false); 96]).collect()] {
-            assert!(!compressed_reduction(combined_reply_eligible(rows), available));
-        }
+    for (rows, kind) in [(1, Decode), (96, Decode), (192, MtpVerify), (64, Prefill), (65, Prefill)] {
+        assert!(!single_reply_eligible(rows, kind));
     }
+    assert!(!combined_reply_eligible([(1, true), (2, false)]));
+}
+
+#[test]
+fn native_wait_guard_reuses_preweight_load_on_each_device() -> Result<()> {
+    let fixture = cuteafd_ffi::native_library_lifetime_fixture::Fixture::build_for_tests()?;
+    let library = fixture.load()?;
+    for device in [0, 1] {
+        library.cuda_set_device(device)?;
+        let before = fixture.native_initializations(&library)?;
+        assert!(native_initialize_before_waits(&library).is_err());
+        assert_eq!(fixture.native_initializations(&library)?, before, "guard must not be the first loader");
+        crate::shared::inventory::preload_native_modules(&library)?;
+        let loaded = fixture.native_initializations(&library)?;
+        assert_eq!(loaded, device + 1);
+        native_initialize_before_waits(&library)?;
+        native_initialize_before_waits(&library)?;
+        assert_eq!(fixture.native_initializations(&library)?, loaded, "Spark start must not load again");
+    }
+    library.cuda_set_device(0)?;
+    native_initialize_before_waits(&library)?;
+    assert_eq!(fixture.native_initializations(&library)?, 2);
+    Ok(())
 }

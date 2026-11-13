@@ -1,6 +1,5 @@
 //! Bounded chunks carry request-selected rank partials in token order.
-use super::{BackboneRequest, SparkTopology, V41_NATIVE_COORDINATOR_REQUEST_FLAG, V41_NATIVE_GROUP_REQUEST_FLAG,
-    V41Tp4Planes};
+use super::{BackboneRequest, V41Tp4Planes};
 use crate::{
     EXPERT_PROTOCOL_V2_FLAG_DEBUG_CHECKSUM, EXPERT_PROTOCOL_V2_FLAG_RESPONSE_MORE_CHUNKS,
     EXPERT_PROTOCOL_V2_FLAG_RESPONSE_ROW_INDICES, EXPERT_PROTOCOL_V2_RESPONSE_DEBUG_HEADER_LEN,
@@ -76,7 +75,7 @@ impl BackboneRequest<'_> {
                 output_row_stride_bytes: self.output_row_bytes()?,
                 output_payload_bytes: partials.len() as u64,
                 status: ExpertProtocolV2Status::Ok,
-                flags: (request.flags & !(V41_NATIVE_GROUP_REQUEST_FLAG | V41_NATIVE_COORDINATOR_REQUEST_FLAG))
+                flags: (request.flags & !super::V41_COORDINATOR_ROUTES_REQUEST_FLAG)
                     | EXPERT_PROTOCOL_V2_FLAG_RESPONSE_ROW_INDICES
                     | if end < self.rows() {
                         EXPERT_PROTOCOL_V2_FLAG_RESPONSE_MORE_CHUNKS
@@ -125,9 +124,6 @@ impl V41Tp4ChunkReceiver {
         Self::new_ranks(request, &executors, max_frame_bytes)
     }
     /// Generic constructor for the validated physical rank counts 1..=8.
-    ///
-    /// A request admitted under the native replicated-group contract must match
-    /// its topology's world size.
     pub fn new_ranks(
         request: &BackboneRequest<'_>,
         executors: &[u64],
@@ -135,14 +131,8 @@ impl V41Tp4ChunkReceiver {
     ) -> Result<Self> {
         ensure!(
             (1..=cuteafd_core::MAX_SPARK_WORLD).contains(&executors.len()),
-            "native TP/EP requires 1..=8 executors"
+            "native TP requires 1..=8 executors"
         );
-        if let Some(topology) = request.native_topology() {
-            ensure!(
-                executors.len() == topology.world_size(),
-                "native group executor count does not match its topology"
-            );
-        }
         let identity = V41Tp4Planes::new_ranks(request, executors)?;
         identity.check_frame_budget(max_frame_bytes, request.response_header_bytes())?;
         Ok(Self {
@@ -167,12 +157,6 @@ impl V41Tp4ChunkReceiver {
         executors: &[u64],
         max_frame_bytes: usize,
     ) -> Result<Self> {
-        // Ownership words are undecodable without the group count, so a native
-        // group request needs the topology-bound constructor below.
-        ensure!(
-            request.header.flags & V41_NATIVE_GROUP_REQUEST_FLAG == 0,
-            "native group ownership requires a topology-bound receiver"
-        );
         BackboneRequest::validate_owned(request, max_rows)?;
         ensure!(
             request.wire_stats().wire_bytes <= max_frame_bytes,
@@ -188,47 +172,6 @@ impl V41Tp4ChunkReceiver {
         identity.check_frame_budget(max_frame_bytes, header_bytes)?;
         Ok(Self {
             identity,
-            received: [0; cuteafd_core::MAX_SPARK_WORLD],
-            finished: [false; cuteafd_core::MAX_SPARK_WORLD],
-            max_frame_bytes,
-        })
-    }
-    /// Ownership-aware constructor for a worker bound to one native topology.
-    pub(crate) fn from_owned_topology(
-        request: &crate::ExpertProtocolV2Request,
-        max_rows: u32,
-        executors: &[u64],
-        topology: SparkTopology,
-        max_frame_bytes: usize,
-    ) -> Result<Self> {
-        ensure!(
-            executors.len() == topology.world_size(),
-            "native group executor count does not match its topology"
-        );
-        ensure!(
-            request.header.flags & V41_NATIVE_GROUP_REQUEST_FLAG != 0,
-            "topology-bound receiver requires a native group request"
-        );
-        BackboneRequest::validate_owned_native_group(request, max_rows, topology)?;
-        ensure!(
-            request.wire_stats().wire_bytes <= max_frame_bytes,
-            "native request exceeds RoCE frame budget"
-        );
-        let header_bytes = if request.header.flags & EXPERT_PROTOCOL_V2_FLAG_DEBUG_CHECKSUM != 0 {
-            EXPERT_PROTOCOL_V2_RESPONSE_DEBUG_HEADER_LEN
-        } else {
-            EXPERT_PROTOCOL_V2_RESPONSE_HEADER_LEN
-        };
-        ensure!(
-            max_frame_bytes
-                >= header_bytes
-                    + V41Tp4Planes::from_header_ranks(&request.header, executors)?.output_row_bytes
-                        as usize
-                    + 4,
-            "response frame cannot fit one native token row"
-        );
-        Ok(Self {
-            identity: V41Tp4Planes::from_header_ranks(&request.header, executors)?,
             received: [0; cuteafd_core::MAX_SPARK_WORLD],
             finished: [false; cuteafd_core::MAX_SPARK_WORLD],
             max_frame_bytes,

@@ -138,6 +138,15 @@ fn occupancy(client: &Client) -> Value {
     client.pool_observation()
 }
 
+fn request_error(error: &anyhow::Error, phase: &str, request: usize) -> Value {
+    let mut value = json!({"phase": phase, "request": request, "error": format!("{error:#}")});
+    if let Some(http) = error.downcast_ref::<crate::client::UpstreamHttpError>() {
+        value["http_status"] = json!(http.code);
+        value["response_body"] = json!(http.body);
+    }
+    value
+}
+
 /// Observe pool use without adding stats reads to the request hot path. The
 /// condition variable ends the sampler immediately when the wave completes.
 /// The wave runs a retained base, which re-renders the model's own answer.
@@ -294,26 +303,86 @@ impl ContextLoad {
             );
             let words = ((length as f64 - intercept) / slope).max(8.0) as usize;
             let messages = base(&run, length, words);
-            let cold = match ctx.client.chat(body(&ctx.info.configuration, messages.clone(), 1), None) {
+            let cold = match ctx.client.chat_diagnostic(body(&ctx.info.configuration, messages.clone(), 1)) {
                 Ok(chat) => chat,
                 Err(error) => {
                     for &c in &options.levels {
-                        points.push(json!({"context": length, "c": c, "status": "failed", "reason": format!("base prefill: {error:#}")}));
+                        points.push(json!({"context": length, "requested_context": requested, "c": c, "status": "failed", "reason": format!("base prefill: {error:#}"),
+                            "request_errors": [request_error(&error, "base prefill", 0)]}));
                     }
+                    ctx.progress.partial(record(&bases, &points));
                     continue;
                 }
             };
-            let actual = cold.timing.prompt_tokens;
-            bases.push(json!({"context": length, "requested_context": requested, "prompt_tokens": actual,
-                "cold_ttft_s": cold.timing.ttft_s, "cached_tokens": cold.timing.cached_tokens, "pool_after": occupancy(ctx.client)}));
+            let mut diagnostic = json!({"target_context": length, "requested_context": requested,
+                "cold_response": cold, "attempted_assistant": cold.assistant_message()});
+            // A one-token limit may emit only a control token. Never close and
+            // replay that unfinished turn as if the model had answered.
+            let completion_limit = 512.min(ctx.max_output);
+            // Correct the corpus fit using the actual probe length, reserving
+            // one page for the requested short answer and its template markers.
+            let completed_words = (words as f64 + (length as f64 - page as f64 - cold.timing.prompt_tokens as f64) / slope).max(8.0) as usize;
+            let messages = base(&run, length, completed_words);
+            let completed = ctx.client.chat_diagnostic(body(&ctx.info.configuration, messages.clone(), completion_limit));
+            let completed = match completed {
+                Ok(chat) => chat,
+                Err(error) => {
+                    diagnostic["completion_error"] = json!(format!("{error:#}"));
+                    bases.push(diagnostic);
+                    for &c in &options.levels {
+                        points.push(json!({"context": length, "requested_context": requested, "c": c, "status": "failed",
+                            "reason": format!("base completion: {error:#}"), "request_errors": [request_error(&error, "base completion", 0)]}));
+                    }
+                    ctx.progress.partial(record(&bases, &points));
+                    continue;
+                }
+            };
+            diagnostic["completion_limit"] = json!(completion_limit);
+            diagnostic["completed_response"] = json!(completed);
+            diagnostic["assistant_replay"] = completed.assistant_message();
+            if !matches!(completed.timing.finish_reason.as_deref(), Some("stop" | "tool_calls"))
+                || (completed.content.is_empty() && completed.reasoning.is_empty() && completed.tool_calls.is_empty()) {
+                let reason = format!("base reply must finish before replay (limit {completion_limit}, finish_reason {:?})", completed.timing.finish_reason);
+                bases.push(diagnostic);
+                for &c in &options.levels {
+                    points.push(json!({"context": length, "requested_context": requested, "c": c, "status": "failed", "reason": reason}));
+                }
+                ctx.progress.partial(record(&bases, &points));
+                continue;
+            }
             let mut retained = messages.as_array().unwrap().clone();
-            retained.push(json!({"role": "assistant", "content": cold.content}));
+            retained.push(completed.assistant_message());
             let retained = json!(retained);
+            // Count and retain the rendered base + completed turn, not merely
+            // the original user prompt. This reply is deliberately not replayed.
+            let retained_count = match ctx.client.chat_diagnostic(body(&ctx.info.configuration, retained.clone(), 1)) {
+                Ok(chat) => chat,
+                Err(error) => {
+                    diagnostic["retained_error"] = json!(format!("{error:#}"));
+                    bases.push(diagnostic);
+                    for &c in &options.levels {
+                        points.push(json!({"context": length, "requested_context": requested, "c": c, "status": "failed",
+                            "reason": format!("retained prewarm: {error:#}"), "request_errors": [request_error(&error, "retained prewarm", 0)]}));
+                    }
+                    ctx.progress.partial(record(&bases, &points));
+                    continue;
+                }
+            };
+            let actual = retained_count.timing.prompt_tokens;
+            diagnostic["context"] = json!(actual);
+            diagnostic["prompt_tokens"] = json!(completed.timing.prompt_tokens);
+            diagnostic["retained_prefix_tokens"] = json!(actual);
+            diagnostic["cold_ttft_s"] = json!(cold.timing.ttft_s);
+            diagnostic["completed_turn_tokens"] = json!(completed.timing.completion_tokens);
+            diagnostic["retained_prewarm"] = json!(retained_count);
+            diagnostic["pool_after"] = occupancy(ctx.client);
+            bases.push(diagnostic);
             let mut cache_failed = false;
             for &c in &options.levels {
                 ctx.client.check()?;
                 let (copied, shared, why) = fit(pool, slots, c, actual, output + suffix, page);
-                let mut point = json!({"context": length, "requested_context": requested, "base_tokens": actual, "c": c,
+                let mut point = json!({"context": actual, "target_context": length, "requested_context": requested, "base_tokens": actual,
+                    "retained_prefix_tokens": actual, "base_index": bases.len() - 1, "c": c,
                     "cold_ttft_s": cold.timing.ttft_s, "pool_tokens": pool, "tokens_per_page": page, "max_tokens": output, "suffix_allowance_tokens": suffix, "suffix_tokens": options.suffix_tokens,
                     "copied_estimate_tokens": copied, "shared_estimate_tokens": shared,
                     "admission_estimate": "shared full pages; one base plus per-request suffix, output and partial tail; state marks observed separately"});
@@ -346,6 +415,8 @@ impl ContextLoad {
                     .filter_map(|r| r.as_ref().err().map(|e| format!("{e:#}")))
                     .collect();
                 point["warm_errors"] = json!(warm_errors);
+                point["request_errors"] = json!(warm.iter().enumerate().filter_map(|(i, r)|
+                    r.as_ref().err().map(|e| request_error(e, "warm", i))).collect::<Vec<_>>());
                 let warm_reused = warm.iter().all(|r| {
                     r.as_ref().is_ok_and(|r| {
                         r.chat.timing.cached_tokens >= actual.saturating_sub(page.max(actual / 50))
@@ -363,6 +434,7 @@ impl ContextLoad {
                     point["reason"] =
                         json!("warm batch rejected requests or did not reuse the base");
                     points.push(point);
+                    ctx.progress.partial(record(&bases, &points));
                     continue;
                 }
                 // Never retry failures sequentially: that would pretend a queued
@@ -373,6 +445,8 @@ impl ContextLoad {
                     .iter()
                     .filter_map(|r| r.as_ref().err().map(|e| format!("{e:#}")))
                     .collect();
+                point["request_errors"] = json!(results.iter().enumerate().filter_map(|(i, r)|
+                    r.as_ref().err().map(|e| request_error(e, "timed", i))).collect::<Vec<_>>());
                 let ok: Vec<_> = results.into_iter().filter_map(Result::ok).collect();
                 let reused = ok.iter().all(|r| {
                     r.chat.timing.cached_tokens >= actual.saturating_sub(page.max(actual / 50))
@@ -427,6 +501,7 @@ impl ContextLoad {
             }
         }
         let result = record(&bases, &points);
+        ctx.progress.partial(result.clone());
         validate_suffix(&result, options.suffix_tokens).map_err(anyhow::Error::msg)?;
         Ok(result)
     }

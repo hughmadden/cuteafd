@@ -15,17 +15,82 @@ use std::{
     collections::BTreeMap,
     ffi::c_void,
 };
+use crate::shared::memory::Tag;
+
+/// Why a submission body's failure may stay local to its request (#1817).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Recovery {
+    /// Nothing of this step was queued on any device, peer or Spark link yet.
+    BeforeSubmission,
+    /// A host-side table gather or its staging admission timed out at the
+    /// consumer, before that consumer queued anything. Earlier layers of the
+    /// step may hold device-local work; only an owner set with no peer or
+    /// Spark work in flight can drain it without terminal abort words.
+    HostGather,
+}
+
+/// The only request-local failure a submission body can raise. Any other
+/// error reaching the boundary is terminal (see [`classify`]).
+#[derive(Debug, thiserror::Error)]
+#[error("{message}")]
+pub(crate) struct RecoverableStepError {
+    pub kind: Recovery,
+    message: String,
+}
+
+impl RecoverableStepError {
+    pub(crate) fn new(kind: Recovery, message: impl Into<String>) -> Self {
+        Self { kind, message: message.into() }
+    }
+}
 
 /// Full submission boundary, including captured graph replays and caller-side
-/// exchanges. Shutdown must publish aborts before draining and retire the engine;
-/// A failed drain may return only if the caller retains every queued owner;
-/// callers without quarantine ownership must terminate in shutdown instead.
+/// exchanges. Every body failure leaves as exactly one of these.
+///
+/// `Terminal`: shutdown published aborts before draining and retired the
+/// engine. A failed drain may return only if the caller retains every queued
+/// owner; callers without quarantine ownership must terminate in shutdown.
+///
+/// `Recoverable`: the family's cancel proved this step's queued work drained
+/// and released its request-owned tickets; the engine keeps serving and the
+/// caller releases only this request's placement.
 #[derive(Debug, thiserror::Error)]
-#[error("submission failed permanently: {cause:#}; {drain}")]
-pub(crate) struct TerminalStepError {
-    #[source]
-    cause: anyhow::Error,
-    drain: String,
+pub(crate) enum StepFailure {
+    #[error("request failed; engine still serving: {cause:#}")]
+    Recoverable {
+        kind: Recovery,
+        #[source]
+        cause: anyhow::Error,
+    },
+    #[error("submission failed permanently: {cause:#}; {drain}")]
+    Terminal {
+        #[source]
+        cause: anyhow::Error,
+        drain: String,
+    },
+}
+
+impl StepFailure {
+    pub(crate) fn is_terminal(error: &anyhow::Error) -> bool {
+        matches!(error.downcast_ref::<Self>(), Some(Self::Terminal { .. }))
+    }
+    pub(crate) fn is_recoverable(error: &anyhow::Error) -> bool {
+        matches!(error.downcast_ref::<Self>(), Some(Self::Recoverable { .. }))
+    }
+}
+
+/// The one classification point (#1817). Fail-safe: only the typed
+/// request-local marker (or an inner submission that already recovered) is
+/// recoverable. CUDA, peer, transport, drain, route-check (#1840
+/// `RouteSourceChanged`) and every untyped error are terminal.
+pub(crate) fn classify(cause: &anyhow::Error) -> Option<Recovery> {
+    match cause.downcast_ref::<StepFailure>() {
+        Some(StepFailure::Recoverable { kind, .. }) => Some(*kind),
+        Some(StepFailure::Terminal { .. }) => None,
+        // A live route-source flip means the ranks' arithmetic identity changed.
+        None if cause.downcast_ref::<super::routes::RouteSourceChanged>().is_some() => None,
+        None => cause.downcast_ref::<RecoverableStepError>().map(|marker| marker.kind),
+    }
 }
 
 /// Families supply owners; this sequence is also exercised by CPU fault tests.
@@ -153,6 +218,9 @@ impl<S: FnOnce() -> Result<()>> SubmissionGuard<S> {
     }
 }
 
+/// Terminal-only boundary: every body failure, including a request-local
+/// marker, retires the engine. Owners that can prove request-local drainage
+/// use [`submit_recoverable`].
 pub(crate) fn submit<T>(
     require_live: impl FnOnce() -> Result<()>,
     shutdown: impl FnOnce() -> Result<()>,
@@ -166,47 +234,71 @@ pub(crate) fn submit_scoped<T>(
     shutdown: impl FnOnce() -> Result<()>,
     body: impl FnOnce(&SubmissionScope<'_>) -> Result<T>,
 ) -> Result<T> {
+    run_submission(require_live, None::<fn(Recovery) -> Result<()>>, shutdown, body)
+}
+
+/// As [`submit_scoped`], but a body failure [`classify`] marks request-local
+/// first runs `cancel(kind)`: it must drain (or prove idle) every stream the
+/// step queued on and drop the request's tickets, and must refuse a kind it
+/// cannot prove for its owner set. Only then is the failure
+/// [`StepFailure::Recoverable`]. A cancel error or panic escalates to the
+/// terminal `shutdown`.
+pub(crate) fn submit_recoverable<T>(
+    require_live: impl FnOnce() -> Result<()>,
+    cancel: impl FnOnce(Recovery) -> Result<()>,
+    shutdown: impl FnOnce() -> Result<()>,
+    body: impl FnOnce(&SubmissionScope<'_>) -> Result<T>,
+) -> Result<T> {
+    run_submission(require_live, Some(cancel), shutdown, body)
+}
+
+fn run_submission<T>(
+    require_live: impl FnOnce() -> Result<()>,
+    cancel: Option<impl FnOnce(Recovery) -> Result<()>>,
+    shutdown: impl FnOnce() -> Result<()>,
+    body: impl FnOnce(&SubmissionScope<'_>) -> Result<T>,
+) -> Result<T> {
     require_live()?;
     let mut guard = SubmissionGuard(Some(shutdown));
-    match body(&guard.scope()) {
+    // Test-only (`shared::fault`): fail a recoverable boundary before its body
+    // queues anything, exercising the same request-local path every adopter uses.
+    let result = if cancel.is_some() && crate::shared::fault::fire(crate::shared::fault::Site::BeforeSubmission) {
+        Err(RecoverableStepError::new(Recovery::BeforeSubmission,
+            "injected failure before submission (dev fault hook)").into())
+    } else {
+        body(&guard.scope())
+    };
+    let mut cause = match result {
         Ok(value) => {
             guard.0.take();
-            Ok(value)
+            return Ok(value);
         }
-        Err(cause) => {
-            // Teardown may abort to retain unsafe-to-release owners. Preserve
-            // the submission error before that fail-safe can hide its cause.
-            tracing::error!(error = %format!("{cause:#}"), "submission failed; draining queued owners");
-            let drain = match guard.shutdown() {
-                Ok(()) => "queued streams drained; engine cannot be reused".to_string(),
-                Err(error) => format!("queued owners retained: {error:#}"),
-            };
-            Err(TerminalStepError { cause, drain }.into())
+        Err(cause) => cause,
+    };
+    if let (Some(kind), Some(cancel)) = (classify(&cause), cancel) {
+        tracing::warn!(error = %format!("{cause:#}"), ?kind,
+            "request-local submission failure; draining this step's queued work");
+        // The terminal guard stays armed: a panicking cancel still retires.
+        match cancel(kind) {
+            Ok(()) => {
+                guard.0.take();
+                if StepFailure::is_recoverable(&cause) { return Err(cause); }
+                return Err(StepFailure::Recoverable { kind, cause }.into());
+            }
+            Err(error) => cause = cause.context(format!("request-local cancellation refused: {error:#}")),
         }
     }
+    // Teardown may abort to retain unsafe-to-release owners. Preserve
+    // the submission error before that fail-safe can hide its cause.
+    tracing::error!(error = %format!("{cause:#}"), "submission failed; draining queued owners");
+    let drain = match guard.shutdown() {
+        Ok(()) => "queued streams drained; engine cannot be reused".to_string(),
+        Err(error) => format!("queued owners retained: {error:#}"),
+    };
+    Err(StepFailure::Terminal { cause, drain }.into())
 }
 
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct PackedRoutes {
-    pub section: usize,
-    pub weights: usize,
-    pub bytes: usize,
-}
-impl PackedRoutes {
-    pub(crate) fn with_input_bytes(rows: usize, topk: usize, input_row_bytes: usize) -> usize {
-        Self::new(rows, topk).bytes + rows * input_row_bytes
-    }
-
-    pub(crate) fn new(rows: usize, topk: usize) -> Self {
-        let section = rows * topk * 4;
-        let weights = section.next_multiple_of(16);
-        Self {
-            section,
-            weights,
-            bytes: (weights + section).next_multiple_of(16),
-        }
-    }
-}
+pub(crate) use cuteafd_loader::placement::families::glm5::local_physical::PackedRoutes;
 
 /// Who publishes a layer's canonical routes (and, for a source-only router,
 /// its FP8 K32 wire rows) to the peer.
@@ -214,6 +306,78 @@ impl PackedRoutes {
 struct Broadcast {
     source: usize,
     wire: bool,
+}
+
+/// A complete routed owner on one stream, without peer routes or reduction storage.
+pub(crate) struct Whole<'a, C = WholeCombine<'a>> {
+    pub layers: Vec<usize>,
+    backend: RefCell<Box<dyn RtxExpertLayer + 'a>>,
+    add: C,
+    device: i32,
+    hidden: usize,
+    max_rows: usize,
+}
+
+pub(crate) enum WholeCombine<'a> {
+    Bf16(cuteafd_ffi::Bf16Add<'a>),
+    F32(cuteafd_ffi::RtxTp2Combine<'a>),
+}
+
+impl<'a> Whole<'a> {
+    pub(crate) fn new(library: &'a NativeLibrary, device: i32,
+        backend: Box<dyn RtxExpertLayer + 'a>, hidden: usize, max_rows: usize) -> Result<Self> {
+        Self::bind(device, backend, hidden, max_rows, |dtype| Ok(match dtype {
+            PartialDtype::Bf16 => WholeCombine::Bf16(library.bf16_add()?),
+            PartialDtype::F32 => WholeCombine::F32(library.rtx_tp2_combine()?),
+        }))
+    }
+
+    pub(crate) fn uses_fp8_input(&self) -> bool { self.backend.borrow().uses_fp8_input() }
+    pub(crate) fn group_rows(&self, rows: usize) -> Result<usize> { self.backend.borrow().group_rows(rows) }
+    pub(crate) fn weight_read_bytes(&self) -> Result<usize> { self.backend.borrow().weight_read_bytes() }
+    pub(crate) fn allocation_receipts(&self, inventory: &mut crate::shared::memory::receipts::Inventory<'_>,
+        name: &str) -> Result<()> { self.backend.try_borrow()?.allocation_receipts(inventory, name) }
+
+    /// # Safety
+    /// Input, routes, shared and output are live on this device's serialized stream.
+    /// Shared/output are disjoint from backend storage and retained through completion.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) unsafe fn enqueue(&self, layer: usize, rows: usize, input: ExpertInput,
+        routes: Routes, shared: CuteafdDeviceBuffer, output: CuteafdDeviceBuffer,
+        stream: *mut c_void, abort: &mut dyn FnMut()) -> Result<()> {
+        ensure!(rows > 0 && rows <= self.max_rows && self.layers.binary_search(&layer).is_ok(),
+            "whole routed submission outside admitted extent");
+        let count = rows.checked_mul(self.hidden).context("whole routed output extent")?;
+        let mut backend = self.backend.try_borrow_mut()?;
+        // SAFETY: the caller retains operands on this serialized stream; combine
+        // consumes the result before any subsequent enqueue can reuse its scratch.
+        unsafe {
+            backend.enqueue(layer, rows, input, routes, stream, abort)?;
+            match &self.add {
+                WholeCombine::Bf16(add) => add.launch(CuteafdDeviceBuffer {
+                    ptr: backend.output(), bytes: count * 2, device_id: self.device, flags: 0 },
+                    shared, output, count, stream),
+                // Native EXL3 retains FP32 routed sums until the single BF16
+                // shared+routed boundary; no conversion arena or extra rounding.
+                WholeCombine::F32(add) => add.partial(backend.output().cast(), shared.ptr.cast(),
+                    output.ptr, count, ExchangeDtype::Bf16, stream),
+            }
+        }
+    }
+}
+
+impl<'a, C> Whole<'a, C> {
+    fn bind(device: i32, backend: Box<dyn RtxExpertLayer + 'a>, hidden: usize, max_rows: usize,
+        combine: impl FnOnce(PartialDtype) -> Result<C>) -> Result<Self> {
+        ensure!(backend.shard() == RtxShard::Whole && backend.device() == device
+            && backend.partial_layout(max_rows)? == super::PartialLayout::Tokens,
+            "whole routed owner requires device-local token sums");
+        let layers = backend.layers().to_vec();
+        ensure!(!layers.is_empty() && layers.windows(2).all(|pair| pair[0] < pair[1])
+            && hidden > 0 && max_rows > 0, "invalid whole routed extent");
+        let add = combine(backend.partial())?;
+        Ok(Self { layers, backend: RefCell::new(backend), add, device, hidden, max_rows })
+    }
 }
 
 pub(crate) struct Pair<'a> {
@@ -242,6 +406,30 @@ pub(crate) struct Pair<'a> {
 }
 
 impl<'a> Pair<'a> {
+    pub(crate) fn allocation_receipts(&self, inventory: &mut crate::shared::memory::receipts::Inventory<'_>,
+        name: &str) -> Result<()> {
+        for (rank, backend) in self.ranks.iter().enumerate() {
+            backend.try_borrow()?.allocation_receipts(inventory, &format!("{name}.rank.{rank}"))?;
+        }
+        for (rank, key, buffer) in self.routes.allocation_buffers() {
+            inventory.device(&format!("{name}.routes.rank.{rank}.{key}"), buffer)?;
+        }
+        if let Some((address, bytes)) = self.routes.diagnostic_host_backing()? {
+            inventory.host_backing(&format!("{name}.routes.ordinals"), address, bytes)?;
+        }
+        inventory.host(&format!("{name}.active"), &*self.active.try_borrow()?)?;
+        if let Some(checks) = self.checks.try_borrow()?.as_ref() {
+            for (slot, layers) in checks.allocation_storage().enumerate() {
+                for (layer, ranks) in layers {
+                    for (rank, host) in ranks.iter().enumerate() {
+                        inventory.pinned(&format!("{name}.checks.{slot}.{layer}.{rank}"), host.buffer)?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         library: &'a NativeLibrary,
@@ -365,7 +553,7 @@ impl<'a> Pair<'a> {
     /// Starts a call's route diagnostics: whether this call checks (`force` or
     /// the CUTEAFD_ROUTE_CHECK interval). When it does, every slot's max-row
     /// pinned storage exists before the caller queues any peer wait; strict
-    /// (forced) checks fail on a mismatch, interval checks fall back to broadcast.
+    /// (forced) checks fail on a mismatch; live interval checks reject identity changes.
     pub(crate) fn start_checks(&self, force: bool) -> Result<bool> {
         let steps = self.steps.get() + 1;
         self.steps.set(steps);
@@ -379,7 +567,7 @@ impl<'a> Pair<'a> {
         ensure!(self.active.borrow().iter().all(Option::is_none), "undrained TP2 route diagnostics");
         let storage = (0..self.lanes).map(|_| self.layers.iter().map(|&layer| {
             let hosts = (0..2).map(|rank| self.routes.on(rank, ||
-                HostAllocation::new(self.library, self.max_rows * self.topk * 8))).collect::<Result<Vec<_>>>()?;
+                HostAllocation::new(self.library, cuteafd_loader::placement::families::glm5::local_physical::route_check_bytes(self.max_rows, self.topk)?, Tag::staging("experts/route-checks")))).collect::<Result<Vec<_>>>()?;
             Ok((layer, hosts.try_into().map_err(|_| anyhow::anyhow!("two ranks"))?))
         }).collect::<Result<BTreeMap<_, _>>>()).collect::<Result<Vec<_>>>()?;
         *checks = Some(SlotRouteChecks::new(storage, force)?);
@@ -397,7 +585,7 @@ impl<'a> Pair<'a> {
     }
 
     /// Drains both producer streams, then compares the unit's routes trimmed
-    /// to its rows. A mismatch switches to broadcast (strict: an error).
+    /// to its rows. Startup can select broadcast; live identity changes are errors.
     pub(crate) fn finish_unit(&self, slot: usize, unit: usize) -> Result<()> {
         if !self.checking.get() { return Ok(()); }
         let mut checks = self.checks.borrow_mut();
@@ -419,7 +607,7 @@ impl<'a> Pair<'a> {
                 }) }).collect())
         })?;
         *self.active.borrow_mut().get_mut(slot).context("route diagnostic slot")? = None;
-        if let Some(identity) = identity { self.publish_identity(&identity); }
+        if let Some(identity) = identity { self.check_identity(&identity)?; }
         Ok(())
     }
 
@@ -452,20 +640,15 @@ impl<'a> Pair<'a> {
         result.and(span)
     }
 
-    fn publish_identity(&self, identity: &RouteIdentity) {
-        if identity.source() == RouteSource::Broadcast {
-            self.source.set(RouteSource::Broadcast);
-        }
+    fn check_identity(&self, identity: &RouteIdentity) -> Result<()> {
+        self.source.set(self.source.get().checked(identity, cuteafd_bench::context::readiness_s().is_some())?);
         tracing::info!(layers_checked = identity.layers_checked, rows_checked = identity.rows_checked,
             first_mismatch = ?identity.first_mismatch, source = ?self.source.get(), "RTX TP2 route identity");
-        cuteafd_bench::context::set_resolved(
-            "route-source",
-            if self.source.get() == RouteSource::Broadcast {
-                "broadcast"
-            } else {
-                "replicated"
-            },
-        );
+        Ok(())
+    }
+
+    pub(crate) fn publish_route_source(&self) {
+        cuteafd_bench::context::set_resolved("route-source", self.source.get().label());
     }
 
     /// Resolve all lazy backend capacities before either rank queues a peer wait.
@@ -948,8 +1131,8 @@ impl<'a> OwnerPair<'a> {
                 timing: timing
                     .then(|| {
                         Ok::<_, anyhow::Error>([
-                            Event::new(devices[rank])?,
-                            Event::new(devices[rank])?,
+                            Event::timing(devices[rank])?,
+                            Event::timing(devices[rank])?,
                         ])
                     })
                     .transpose()?,
@@ -1241,6 +1424,33 @@ impl SubmissionOwners for TestSubmission<'_> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn whole_executor_binds_nonzero_native_f32_and_bf16_prefixes() -> anyhow::Result<()> {
+        use super::*;
+        struct Backend(PartialDtype, super::super::PartialLayout);
+        impl RtxExpertLayer for Backend {
+            fn shard(&self) -> RtxShard { RtxShard::Whole }
+            fn partial(&self) -> PartialDtype { self.0 }
+            fn partial_layout(&self, _: usize) -> Result<super::super::PartialLayout> { Ok(self.1) }
+            fn uses_fp8_input(&self) -> bool { true }
+            fn layers(&self) -> &[usize] { &[3, 4] }
+            fn device(&self) -> i32 { 0 }
+            fn workspace_bytes(&self) -> usize { 4096 }
+            fn output(&self) -> *mut c_void { std::ptr::null_mut() }
+            unsafe fn enqueue(&mut self, _: usize, _: usize, _: ExpertInput, _: Routes,
+                _: *mut c_void, _: &mut dyn FnMut()) -> Result<()> { unreachable!() }
+        }
+        for dtype in [PartialDtype::F32, PartialDtype::Bf16] {
+            let backend = Box::new(Backend(dtype, super::super::PartialLayout::Tokens));
+            let owner = Whole::bind(0, backend, 6144, 64, Ok)?;
+            assert_eq!(owner.layers, [3, 4]);
+            assert_eq!(owner.add, dtype, "bind the combine for the backend's real output dtype");
+        }
+        let routes = Box::new(Backend(PartialDtype::F32, super::super::PartialLayout::Routes { topk: 8 }));
+        assert!(Whole::bind(0, routes, 6144, 64, Ok).is_err());
+        Ok(())
+    }
+
     /// GLM's legacy pair keeps its exact behavior: rank 0 publishes routes only
     /// when the route check selected broadcast, slots carry no wire, and the
     /// generalized source broadcast reduces to the same push, wait and signal.
@@ -1317,6 +1527,57 @@ mod tests {
     }
 
     #[test]
+    fn failed_peer_capture_cancels_ticket_without_retiring_submission_or_rerunning_peer() {
+        use crate::shared::decode_graph::{GraphBank, device::{self, Basis, Cycle, Preference, Site}};
+        let site = Site { name: "peer-oom-test", cycle: Cycle::Decode, preference: Preference::Capture,
+            bootstrap: 10, basis: Basis::Bytes, spans_devices: true };
+        use std::cell::Cell;
+        for failed_rank in 0..2 {
+            let mut banks = [GraphBank::new(None), GraphBank::new(None)];
+            for (rank, bank) in banks.iter_mut().enumerate() {
+                bank.attach_device_for_test(-920 - (failed_rank * 2 + rank) as i32, 1000,
+                    site).unwrap();
+            }
+            let eager = [Cell::new(0), Cell::new(0)];
+            let queued = [Cell::new(0), Cell::new(0)];
+            let retired = Cell::new(false);
+            submit(|| Ok(()), || { retired.set(true); Ok(()) }, || {
+                for (rank, bank) in banks.iter_mut().enumerate() {
+                    let ticket = bank.cache_ticket(&1, false, None).unwrap();
+                    if rank == failed_rank {
+                        // The native regression injects this recoverable OOM and
+                        // checks that the next peer wait has no stale CUDA error.
+                        drop(ticket);
+                        eager[rank].set(eager[rank].get() + 1);
+                    } else {
+                        bank.cache_commit(1, 42, ticket, 2, 1, true);
+                    }
+                    queued[rank].set(queued[rank].get() + 1);
+                }
+                Ok(())
+            }).unwrap();
+            assert!(!retired.get());
+            assert_eq!([queued[0].get(), queued[1].get()], [1, 1]);
+            assert_eq!(eager[failed_rank].get(), 1);
+            assert_eq!(eager[1 - failed_rank].get(), 0);
+            let failed = &mut banks[failed_rank];
+            assert_eq!(failed.len(), 0);
+            let device = -920 - (failed_rank * 3) as i32;
+            let snapshot = || device::snapshots().into_iter()
+                .find(|snapshot| snapshot.device == device).unwrap();
+            let pending = snapshot();
+            assert_eq!(pending.pending_capture, 0);
+            assert_eq!(pending.pools.live_execs, 0);
+            // Failed instantiation can grow driver storage: observe it even
+            // though the ticket cancelled, then admit the next submission.
+            assert!(failed.cache_needs_boundary());
+            failed.cache_measured(10);
+            assert_eq!(snapshot().charged, 10);
+            assert!(failed.cache_ticket(&2, false, None).is_some());
+        }
+    }
+
+    #[test]
     fn submission_faults_abort_then_drain_before_return_and_reject_replay() {
         for failure in 0..12 {
             let owners = RefCell::new(TestSubmission::new(None));
@@ -1330,10 +1591,7 @@ mod tests {
                     Ok(())
                 },
             );
-            assert!(result
-                .unwrap_err()
-                .downcast_ref::<TerminalStepError>()
-                .is_some());
+            assert!(StepFailure::is_terminal(&result.unwrap_err()));
             owners.borrow().verify_retired().unwrap();
             let replayed = Cell::new(false);
             assert!(submit(
@@ -1371,7 +1629,7 @@ mod tests {
                 assert!(logged.contains("short-prompt prefill: injected original cause"), "{logged}");
                 Ok(())
             }, |_| Err(anyhow::anyhow!("injected original cause").context("short-prompt prefill")));
-            assert!(result.unwrap_err().downcast_ref::<TerminalStepError>().is_some());
+            assert!(StepFailure::is_terminal(&result.unwrap_err()));
         });
     }
 
@@ -1418,6 +1676,147 @@ mod tests {
         assert!(abort < publication && publication < release && release < ranks);
     }
 
+    /// #1817 model: one request's step queues work on a stream and holds table
+    /// tickets; the family cancel must drain the stream and drop every ticket
+    /// before the boundary returns, and nothing is released twice.
+    struct RequestOwners {
+        queued: Cell<usize>,
+        tickets: RefCell<Vec<std::rc::Rc<()>>>,
+        retired: Cell<bool>,
+        cancels: Cell<usize>,
+        fail_cancel: bool,
+    }
+    impl RequestOwners {
+        fn new(fail_cancel: bool) -> Self {
+            Self { queued: Cell::new(0), tickets: RefCell::new(Vec::new()), retired: Cell::new(false),
+                cancels: Cell::new(0), fail_cancel }
+        }
+        fn live(&self) -> Result<()> { ensure!(!self.retired.get(), "retired engine"); Ok(()) }
+        fn cancel(&self, _: Recovery) -> Result<()> {
+            self.cancels.set(self.cancels.get() + 1);
+            ensure!(!self.fail_cancel, "injected stream drain failure");
+            self.queued.set(0);
+            self.tickets.borrow_mut().clear();
+            Ok(())
+        }
+        fn shutdown(&self) -> Result<()> {
+            ensure!(!self.retired.replace(true), "retired twice");
+            self.queued.set(0);
+            self.tickets.borrow_mut().clear();
+            Ok(())
+        }
+        /// One step: queue `layers` launches and hold a ticket, then fail at the
+        /// consumer with `fail` (or succeed).
+        fn step(&self, ticket: &std::rc::Rc<()>, fail: Option<anyhow::Error>) -> Result<usize> {
+            self.queued.set(self.queued.get() + 3);
+            self.tickets.borrow_mut().push(std::rc::Rc::clone(ticket));
+            if let Some(error) = fail { return Err(error); }
+            self.tickets.borrow_mut().clear();
+            Ok(self.queued.replace(0))
+        }
+        fn submit(&self, ticket: &std::rc::Rc<()>, fail: Option<anyhow::Error>) -> Result<usize> {
+            submit_recoverable(|| self.live(), |kind| self.cancel(kind), || self.shutdown(), |_| self.step(ticket, fail))
+        }
+    }
+
+    fn gather_timeout() -> anyhow::Error {
+        anyhow::Error::new(RecoverableStepError::new(Recovery::HostGather, "ple token-table: gather wait timed out"))
+            .context("layer 2 PLE")
+    }
+
+    #[test]
+    fn injected_gather_timeout_fails_only_its_request_and_the_next_succeeds() {
+        let owners = RequestOwners::new(false);
+        let ticket = std::rc::Rc::new(());
+        let error = owners.submit(&ticket, Some(gather_timeout())).unwrap_err();
+        assert!(StepFailure::is_recoverable(&error), "{error:#}");
+        assert!(!StepFailure::is_terminal(&error));
+        assert!(format!("{error:#}").contains("gather wait timed out"));
+        assert_eq!(classify(&error), Some(Recovery::HostGather));
+        // Cancellation drained the request's queued work and every ticket it held.
+        assert_eq!((owners.queued.get(), owners.cancels.get()), (0, 1));
+        assert_eq!(std::rc::Rc::strong_count(&ticket), 1, "a table ticket leaked past cancellation");
+        assert!(!owners.retired.get(), "a request-local failure retired the server");
+        assert_eq!(owners.submit(&ticket, None).unwrap(), 3, "the next request must succeed");
+        assert_eq!(std::rc::Rc::strong_count(&ticket), 1);
+        // A recovered inner submission stays recoverable through an outer one, unwrapped once.
+        let inner = owners.submit(&ticket, Some(gather_timeout())).unwrap_err();
+        let outer = submit_recoverable(|| owners.live(), |kind| owners.cancel(kind), || owners.shutdown(),
+            |_| -> Result<()> { Err(inner) }).unwrap_err();
+        assert!(matches!(outer.downcast_ref::<StepFailure>(),
+            Some(StepFailure::Recoverable { cause, .. }) if cause.downcast_ref::<StepFailure>().is_none()));
+        assert!(!owners.retired.get());
+    }
+
+    #[test]
+    fn cuda_peer_drain_and_untyped_failures_still_retire_the_server() {
+        let route_flip = anyhow::Error::new(super::super::routes::RouteSource::Replicated.checked(
+            &super::super::routes::RouteIdentity { first_mismatch: Some((7, 3)), ..Default::default() }, true)
+            .unwrap_err());
+        assert!(route_flip.downcast_ref::<super::super::routes::RouteSourceChanged>().is_some());
+        for cause in [
+            anyhow::anyhow!("cudaErrorLaunchFailure in qwen4_ple_fp8"),
+            anyhow::Error::new(crate::shared::peer_split::TerminalPeerError::Retain("peer drain failed".into())),
+            anyhow::anyhow!("terminal compute drainage failed: compute drain rank 1"),
+            route_flip,
+        ] {
+            let owners = RequestOwners::new(false);
+            let ticket = std::rc::Rc::new(());
+            let error = owners.submit(&ticket, Some(cause)).unwrap_err();
+            assert!(StepFailure::is_terminal(&error), "{error:#}");
+            assert_eq!(owners.cancels.get(), 0, "terminal causes must not take the request-local path");
+            assert!(owners.retired.get());
+            assert_eq!(std::rc::Rc::strong_count(&ticket), 1);
+            let replayed = Cell::new(false);
+            assert!(owners.submit(&ticket, None).map(|_| replayed.set(true)).is_err());
+            assert!(!replayed.get(), "a retired server accepted another submission");
+        }
+    }
+
+    #[test]
+    fn failed_request_local_cancellation_escalates_to_terminal_retirement() {
+        let owners = RequestOwners::new(true);
+        let ticket = std::rc::Rc::new(());
+        let error = owners.submit(&ticket, Some(gather_timeout())).unwrap_err();
+        assert!(StepFailure::is_terminal(&error), "{error:#}");
+        assert!(format!("{error:#}").contains("request-local cancellation refused: injected stream drain failure"));
+        assert_eq!(owners.cancels.get(), 1);
+        assert!(owners.retired.get());
+        assert_eq!(std::rc::Rc::strong_count(&ticket), 1);
+    }
+
+    #[test]
+    fn terminal_only_boundaries_retire_even_on_request_local_markers() {
+        let retired = Cell::new(false);
+        let error = submit(|| Ok(()), || { retired.set(true); Ok(()) },
+            || -> Result<()> { Err(gather_timeout()) }).unwrap_err();
+        assert!(StepFailure::is_terminal(&error) && retired.get());
+        // Panicking cancellation still runs the armed terminal guard.
+        let owners = RequestOwners::new(false);
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = submit_recoverable(|| Ok(()), |_| -> Result<()> { panic!("cancel panicked") },
+                || owners.shutdown(), |_| -> Result<()> { Err(gather_timeout()) });
+        }));
+        assert!(unwound.is_err() && owners.retired.get());
+    }
+
+    #[test]
+    fn injected_before_submission_hook_recovers_without_running_the_body() {
+        crate::shared::fault::arm_for_test(crate::shared::fault::Site::BeforeSubmission, 1);
+        let owners = RequestOwners::new(false);
+        let ticket = std::rc::Rc::new(());
+        let error = owners.submit(&ticket, None).unwrap_err();
+        assert_eq!(classify(&error), Some(Recovery::BeforeSubmission));
+        assert!(StepFailure::is_recoverable(&error));
+        assert_eq!(owners.cancels.get(), 1);
+        assert_eq!(std::rc::Rc::strong_count(&ticket), 1, "the body must not have run");
+        assert_eq!(owners.submit(&ticket, None).unwrap(), 3);
+        // Terminal-only boundaries never consume the hook.
+        crate::shared::fault::arm_for_test(crate::shared::fault::Site::BeforeSubmission, 1);
+        assert!(submit(|| Ok(()), || Ok(()), || Ok(())).is_ok());
+        crate::shared::fault::arm_for_test(crate::shared::fault::Site::BeforeSubmission, 0);
+    }
+
     #[test]
     fn submission_preserves_primary_cause_and_reports_retained_owners() {
         let error = submit(
@@ -1426,7 +1825,7 @@ mod tests {
             || -> Result<()> { anyhow::bail!("projection enqueue failed") },
         )
         .unwrap_err();
-        assert!(error.downcast_ref::<TerminalStepError>().is_some());
+        assert!(StepFailure::is_terminal(&error));
         assert!(format!("{error:#}").contains("copy drain failed; owners quarantined"));
         assert!(error
             .chain()
@@ -1437,6 +1836,7 @@ mod tests {
         [
             "crate::shared::experts::rtx::pair::submit(",
             "crate::shared::experts::rtx::pair::submit_scoped(",
+            "crate::shared::experts::rtx::pair::submit_recoverable(",
         ]
         .iter()
         .any(|call| {
@@ -1495,7 +1895,7 @@ mod tests {
             ),
             (
                 include_str!("../../../families/glm5/engine.rs"),
-                "step_lanes",
+                "step_lanes_with",
                 "replay_on",
             ),
             (
@@ -1513,6 +1913,14 @@ mod tests {
                 assert!(wrapper.contains("self.step_units_inner(scope,"));
                 assert!(units.contains("pub(super) fn step_units_inner(&self, _scope: &crate::shared::experts::rtx::pair::SubmissionScope<'_>"));
             }
+            if step == "step_lanes_with" {
+                let delegate = source.split_once("    fn step_lanes(").unwrap().1
+                    .split_once("\n    }").unwrap().0.split_once('{').unwrap().1;
+                let compact: String = delegate.chars().filter(|c| !c.is_whitespace()).collect();
+                assert_eq!(compact,
+                    "self.step_lanes_with(lanes,chunks,depth,logit_rows,link,runtime,None)",
+                    "step_lanes must only delegate to the audited shared boundary");
+            }
             assert!(
                 shared_submission_entrypoint(wrapper),
                 "{step} bypasses the shared boundary"
@@ -1525,6 +1933,10 @@ mod tests {
                 )
                 .replace(
                     "crate::shared::experts::rtx::pair::submit_scoped(",
+                    "backend.enqueue(",
+                )
+                .replace(
+                    "crate::shared::experts::rtx::pair::submit_recoverable(",
                     "backend.enqueue(",
                 );
             assert!(
@@ -1548,7 +1960,7 @@ mod tests {
         }
         let mimo = include_str!("../../../families/mimo_v2/engine.rs");
         assert!(shared_submission_entrypoint(mimo));
-        assert!(!mimo.contains("pub(crate) struct TerminalStepError"));
+        assert!(!mimo.contains("pub(crate) enum StepFailure"));
     }
 
     #[test]

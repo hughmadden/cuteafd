@@ -22,6 +22,7 @@ use std::ffi::c_void;
 
 /// One sequence's prefill call: its tokens from `start`, ring slot and pages.
 pub(crate) struct PrefillCall<'c> {
+    pub packed: Vec<(StepSequence<'c>, crate::shared::prefill_packing::Segment)>,
     pub request: u64,
     pub slot: usize,
     pub start: usize,
@@ -31,6 +32,7 @@ pub(crate) struct PrefillCall<'c> {
     pub slots: usize,
     pub logit_rows: usize,
     pub media: Option<&'c cuteafd_engine::media::RequestMedia>,
+    pub scoring: Option<crate::shared::probe::ScoringRows<'c>>,
 }
 
 /// Head microbatches within a unit, paired with their output-suffix row offset.
@@ -114,6 +116,14 @@ impl MusePrefill<'_, '_, '_> {
     /// from the head rank's `hidden` (the unit's slot view), at their window offset.
     fn tap(&self, layer: usize, unit: &Unit) -> Result<()> {
         let Some(draft) = self.draft else { return Ok(()) };
+        if !self.call.packed.is_empty() {
+            let state = self.units[unit.index].as_ref().context("Muse packed unit not begun")?;
+            let hidden = state.lanes[self.ranks.len() - 1].plane("hidden")?;
+            for (_, segment) in &self.call.packed {
+                draft.tap(layer, hidden, segment.end_row() - segment.tap_rows, segment.tap_rows, segment.tap_offset)?;
+            }
+            return Ok(());
+        }
         let window = self.tap_window();
         let (from, to) = (unit.rows.start.max(window.start), unit.rows.end.min(window.end));
         if from >= to { return Ok(()); }
@@ -137,8 +147,12 @@ impl PrefillHooks for MusePrefill<'_, '_, '_> {
         let tokens = &self.call.tokens[unit.rows.clone()];
         let sequence = StepSequence { slot: self.call.slot, start: self.call.start + unit.rows.start, rows,
             pages: self.call.pages };
-        let meta = StepMetadata::build(&[sequence], self.call.ring_rows, self.call.slots, self.ranks[0].lane.views.rows, true)?;
-        let wave = WaveStep { segments: vec![WaveSegment { request: self.call.request, rows }],
+        let sequences = if self.call.packed.is_empty() { vec![sequence] }
+            else { self.call.packed.iter().map(|(sequence, _)| sequence.clone()).collect() };
+        let meta = StepMetadata::build(&sequences, self.call.ring_rows, self.call.slots, self.ranks[0].lane.views.rows, true)?;
+        let segments = if self.call.packed.is_empty() { vec![WaveSegment { request: self.call.request, rows }] }
+            else { sequences.iter().map(|s| WaveSegment { request: s.slot as u64 + 1, rows: s.rows }).collect() };
+        let wave = WaveStep { segments,
             kind: cuteafd_transport::ExpertV2SourceKind::Prefill };
         let mut media = cuteafd_engine::media::MediaChunk::default();
         if let Some(request) = self.call.media {
@@ -207,7 +221,12 @@ impl PrefillHooks for MusePrefill<'_, '_, '_> {
         let (rank, lane, stream) = (&self.ranks[last], &state.lanes[last], self.streams[last]);
         for (rows, offset) in chunks {
             let logits = rank.device.run(|| super::forward::head(self.cfg, rank, lane, rows, stream))?;
-            if self.call.logit_rows == 1 {
+            if let Some(scoring) = self.call.scoring {
+                let device_logits = crate::shared::token_io::DeviceLogits { ptr: logits.ptr.cast_const(),
+                    rows: logits.bytes / (self.cfg.vocab_size * 4), vocab: self.cfg.vocab_size,
+                    stride: self.cfg.vocab_size, stream, greedy: None };
+                rank.device.run(|| scoring.record(rank.device.library, offset, &device_logits))?;
+            } else if self.call.logit_rows == 1 {
                 self.logits = Some(logits);
             } else {
                 let output = rank.prefill_logits.as_ref().context("Muse prefill logits not admitted")?.buffer;
@@ -234,6 +253,18 @@ impl PrefillHooks for MusePrefill<'_, '_, '_> {
 #[cfg(test)]
 mod tests {
     use crate::shared::prefill_pipeline::{prefill_schedule, sequence_units, FfnRoute, Step};
+
+    #[test]
+    fn streamed_head_is_consumed_before_unit_commit_without_full_buffer() {
+        let source = include_str!("prefill.rs");
+        let end = source.split_once("    fn end_unit(").unwrap().1
+            .split_once("    fn commit_unit(").unwrap().0;
+        let streamed = end.split_once("if let Some(scoring) = self.call.scoring {").unwrap().1
+            .split_once("} else if").unwrap().0;
+        assert!(streamed.contains("scoring.record(rank.device.library, offset, &device_logits)"));
+        assert!(!streamed.contains("prefill_logits"));
+        assert!(end.find("super::forward::head").unwrap() < end.find("scoring.record").unwrap());
+    }
 
     #[test]
     fn scored_suffix_tiles_units_and_head_microbatches() -> anyhow::Result<()> {

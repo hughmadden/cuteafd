@@ -74,8 +74,8 @@ pub(crate) struct ServeArgs {
     pub model_id: Option<String>,
     /// With --draft: verify this many DFlash drafts per sequence every step
     /// instead of the adaptive plan.
-    #[arg(long)]
-    pub draft_fixed: Option<usize>,
+    #[command(flatten)]
+    pub draft_length: crate::shared::draft::length::DraftLength,
     #[command(flatten)]
     pub decode_share: DecodeShareArgs,
     #[command(flatten)]
@@ -119,7 +119,25 @@ pub(crate) use crate::shared::prefix::{PrefixArgs, Toggle};
 use crate::shared::probe;
 
 
+pub(super) fn resolve_serving_capacity(engine_args: &mut super::EngineArgs, max_sequences: usize, prefix_draft: bool) {
+    engine_args.rings = cuteafd_core::concurrency::request_slots(max_sequences as u64, engine_args.rings as u64) as usize;
+    engine_args.draft_sequences = engine_args.draft_sequences.max(max_sequences);
+    engine_args.draft_context_slots = Some(serving_context_slots(
+        engine_args.draft_sequences, engine_args.rings, engine_args.draft_context_slots, prefix_draft));
+    for (name, value) in [("max-sequences", max_sequences), ("rings", engine_args.rings),
+        ("draft-sequences", engine_args.draft_sequences)] {
+        cuteafd_bench::context::set_resolved(name, &value.to_string());
+    }
+    if let Some(slots) = engine_args.draft_context_slots {
+        cuteafd_bench::context::set_resolved("draft-context-slots", &slots.to_string());
+    }
+}
+
 pub(crate) async fn run_serve(mut args: ServeArgs) -> Result<()> {
+    if probe::streamed_prefill_scoring("mimo_v2") {
+        cuteafd_bench::context::set_resolved("prefill-scoring", "streamed");
+    }
+    args.draft_length.report_inactive(args.engine.draft.is_some() || args.engine.mtp > 0);
     let max_sequences = crate::shared::memory::budget::serving_concurrency(
         args.max_sequences, &args.engine.native_lib, args.engine.device)?;
     cuteafd_core::concurrency::validate("mimo_v2", max_sequences as u64)?;
@@ -137,29 +155,20 @@ pub(crate) async fn run_serve(mut args: ServeArgs) -> Result<()> {
         args.model_id.clone().or_else(|| crate::families::glm5_flash::serve::model_id(&snapshot)).context("model id")?,
         ModelEncoding::Qwen(Arc::new(encoding)),
     );
+    profile.expert_usage = args.engine.expert_usage_reader.clone();
     let depth = serving_queue_depth(args.http_queue_depth, max_sequences);
     anyhow::ensure!(depth > 0, "--http-queue-depth must be positive");
     let (queue, receive) = mpsc::channel::<NativeRequest>(depth);
     let stats = Arc::new(Mutex::new(serde_json::Value::Null));
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
     let mut engine_args = args.engine.clone();
-    engine_args.rings = cuteafd_core::concurrency::request_slots(max_sequences as u64, engine_args.rings as u64) as usize;
+    resolve_serving_capacity(&mut engine_args, max_sequences, args.prefix.mimo_prefix_draft);
     let (worker_stats, max_sequences) = (stats.clone(), max_sequences);
-    engine_args.draft_sequences = engine_args.draft_sequences.max(max_sequences);
-    engine_args.draft_context_slots = Some(serving_context_slots(
-        engine_args.draft_sequences, engine_args.rings, engine_args.draft_context_slots, args.prefix.mimo_prefix_draft));
-    for (name, value) in [("max-sequences", max_sequences), ("rings", engine_args.rings),
-        ("draft-sequences", engine_args.draft_sequences)] {
-        cuteafd_bench::context::set_resolved(name, &value.to_string());
-    }
-    if let Some(slots) = engine_args.draft_context_slots {
-        cuteafd_bench::context::set_resolved("draft-context-slots", &slots.to_string());
-    }
-    let draft = Policy { fixed: args.draft_fixed,
+    let draft = Policy { length: args.draft_length,
         decode_share: args.decode_share, chunk_s: args.prefill_chunk_s,
         snapshot_wait: args.mimo_snapshot_wait };
     let prefix = args.prefix.clone();
-    let hub = console::hub(args.console.console_text, || Ok(console_layout(&args, &profile.id, max_sequences)));
+    let layout = console_layout(&args, &profile.id, max_sequences, 0);
     let vision = args.vision;
     let audio = args.audio;
     let remote = super::media::RemoteVision::from_args(&args)?;
@@ -167,8 +176,8 @@ pub(crate) async fn run_serve(mut args: ServeArgs) -> Result<()> {
     let media_cache_bytes = args.media_cache_bytes;
     let worker = tokio::task::spawn_blocking(move ||
         serve_loop(engine_args, receive, ready_tx, worker_stats, max_sequences, draft, prefix, vision, audio,
-            media_cache_bytes, remote, remote_audio, args.loop_abort.config()));
-    let (max_context, media) = ready_rx.await.context("engine failed before it was ready")??;
+            media_cache_bytes, remote, remote_audio, layout, args.console.console_text, args.loop_abort.config()));
+    let (max_context, media, hub) = ready_rx.await.context("engine failed before it was ready")??;
     let limits = args.prefix.reserve.limits(max_context)?;
     if let Some((preparer, audio_preparer, health, audio_health)) = media {
         if let Some(preparer) = preparer {
@@ -188,16 +197,17 @@ pub(crate) async fn run_serve(mut args: ServeArgs) -> Result<()> {
     // lazy graphs or loads more code.
     crate::shared::memory_report::log("ready");
     tracing::info!(listen = %args.listen, model = %profile.id, "MiMo V2 API is ready");
+    let mut worker = Some(worker);
     tokio::select! {
-        served = axum::serve(listener, api.app(router, hub)
-            .into_make_service_with_connect_info::<std::net::SocketAddr>()) => served?,
-        _ = crate::shared::api::watch_scheduler(worker) => unreachable!(),
+        served = crate::shared::api::serve_http(listener, api.app(router, hub), "mimo_v2") => served?,
+        _ = crate::shared::api::watch_scheduler(&mut worker) => unreachable!(),
     }
+    crate::shared::api::finish_scheduler(&mut worker, "mimo_v2").await?;
     Ok(())
 }
 
 /// What the live console shows for MiMo V2 (Flash and V2.6 Pro).
-fn console_layout(args: &ServeArgs, model: &str, max_sequences: usize) -> console::Layout {
+fn console_layout(args: &ServeArgs, model: &str, max_sequences: usize, native: usize) -> console::Layout {
     use console::{Color::*, StepGroup};
     let mut layout = console::Layout::new("mimo_v2", model.into(), args.engine.snapshot.clone());
     let sparks = args.engine.peers.as_deref().map_or(0, |peers| peers.split(',').count());
@@ -205,10 +215,10 @@ fn console_layout(args: &ServeArgs, model: &str, max_sequences: usize) -> consol
         args.engine.local_experts);
     layout.split = args.engine.split_device.map(|_| "head split".into());
     layout.concurrency = max_sequences;
-    let policy = args.draft_fixed.map_or_else(|| "adaptive".to_string(), |n| format!("fixed {n}"));
+    let policy = args.draft_length.label(native);
     let drafter = if args.engine.draft.is_some() { Some("DFlash") } else if args.engine.mtp > 0 { Some("MTP") } else { None };
     layout.speculator = drafter.map(|name| console::Speculator {
-        name: name.into(), positions: 8, policy: policy + " · agreed copy extension" });
+        name: name.into(), positions: native, policy });
     layout.steps = vec![
         StepGroup::new("Decode step", "host clock", &[("round.cycle", "step", Target),
             ("draft", "draft (DFlash / MTP)", Accepted), ("plan", "draft plan + copy windows", Ink),
@@ -225,7 +235,7 @@ fn console_layout(args: &ServeArgs, model: &str, max_sequences: usize) -> consol
 /// Neural draft settings and the shared resource-policy binding.
 #[derive(Debug, Clone, Copy)]
 struct Policy {
-    fixed: Option<usize>,
+    length: crate::shared::draft::length::DraftLength,
     decode_share: DecodeShareArgs,
     chunk_s: Option<f64>,
     snapshot_wait: bool,
@@ -234,9 +244,10 @@ struct Policy {
 type VisionReady = Option<(Option<Arc<cuteafd_api::openai::media::MediaPreparer>>,
     Option<Arc<cuteafd_api::openai::media::audio::AudioPreparer>>, Option<Arc<std::sync::atomic::AtomicBool>>, Option<Arc<std::sync::atomic::AtomicBool>>)>;
 
-fn serve_loop(args: super::EngineArgs, mut receive: mpsc::Receiver<NativeRequest>,
-    ready: tokio::sync::oneshot::Sender<Result<(usize, VisionReady)>>, stats: Arc<Mutex<serde_json::Value>>, max_sequences: usize,
+fn serve_loop(mut args: super::EngineArgs, mut receive: mpsc::Receiver<NativeRequest>,
+    ready: tokio::sync::oneshot::Sender<Result<(usize, VisionReady, Arc<cuteafd_api::openai::ConsoleHub>)>>, stats: Arc<Mutex<serde_json::Value>>, max_sequences: usize,
     draft: Policy, prefix: PrefixArgs, vision: cuteafd_loader::plan::MediaMode, audio: cuteafd_loader::plan::MediaMode, media_cache_bytes: Option<u64>, remote: Option<super::media::RemoteVision>, remote_audio: Option<super::media::RemoteAudio>,
+    mut layout: console::Layout, console_text: bool,
     loop_abort: crate::shared::loop_abort::LoopAbortConfig) -> Result<()> {
     let opened = match open(&args) {
         Ok(opened) => opened,
@@ -245,10 +256,12 @@ fn serve_loop(args: super::EngineArgs, mut receive: mpsc::Receiver<NativeRequest
             return Ok(());
         }
     };
-    let (vision, prefix) = match super::media::ReadyVision::load(&args, &opened.library, vision, audio, &prefix, media_cache_bytes, remote, remote_audio) {
+    let (mut vision, prefix) = match super::media::ReadyVision::load(&args, &opened.library, vision, audio, &prefix, media_cache_bytes, remote, remote_audio) {
         Ok(vision) => vision,
         Err(error) => { let _ = ready.send(Err(error)); return Ok(()); }
     };
+    args.planner_media_weights = vision.as_ref().and_then(|vision| vision.weights);
+    let media_push = vision.as_mut().map(|v| std::mem::take(&mut v.push)).unwrap_or_default();
     let preparer = vision.as_ref().and_then(|vision| vision.preparer.clone());
     let audio_preparer = vision.as_ref().and_then(|vision| vision.audio_preparer.clone());
     let (encoder, bytes) = vision.map_or((super::media::Encoder::Off, 0), |vision|
@@ -257,15 +270,21 @@ fn serve_loop(args: super::EngineArgs, mut receive: mpsc::Receiver<NativeRequest
     let audio_health = encoder.health_handle_for(true);
     let mut media = MediaAdmission::new(EmbeddingCache::new(bytes), encoder, 16);
     let mut ready = Some(ready);
-    let result = opened.with_engine_reserved(&args, Some((&prefix, max_sequences)),
+    let result = opened.with_engine_reserved_media(&args, Some((&prefix, max_sequences)), media_push.records(),
         if args.full_prefill_logits { cuteafd_loader::families::mimo_v2::MimoPrefillOutput::AllRows }
         else { cuteafd_loader::families::mimo_v2::MimoPrefillOutput::LastRow }, |engine, host_config| {
+        layout.speculator = engine.drafter.as_ref().map(|draft| ("DFlash", draft.cfg.drafts()))
+            .or_else(|| engine.mtp.as_ref().map(|mtp| ("MTP", mtp.stages.len())))
+            .map(|(name, native)| console::Speculator { name: name.into(), positions: native,
+                policy: draft.length.label(native) });
+        let mut hub = Some(console::hub(console_text, || Ok(layout)));
+        media_push.commit()?;
         anyhow::ensure!(engine.weights.layers.len() == engine.cfg.layers, "serve-mimo needs every layer");
         anyhow::ensure!(engine.has_experts(), "serve-mimo needs --peers (or --local-experts) for the routed experts");
         let spark = args.peers.is_some() && !args.local_experts;
         console::layer_classes(engine.weights.layers.iter().map(|l| console::layer_class(l.dense, spark)).collect());
-        // Every decode/verify shape the scheduler can step (1..=64 rows) is captured before
-        // the server is ready: serving replays them without capturing.
+        // Best-effort prewarm of the selected checkpoint/layout row shapes.
+        // Serving misses capture within the same reserve or run eagerly.
         let started = std::time::Instant::now();
         let graphs = engine.capture_decode_graphs(DECODE_ROWS)?;
         if graphs > 0 {
@@ -278,14 +297,13 @@ fn serve_loop(args: super::EngineArgs, mut receive: mpsc::Receiver<NativeRequest
         schedule(engine, &opened, &args.snapshot, &mut receive, &stats, max_sequences, draft, &prefix,
             loop_abort, args.token_io.token_select, host_config, &mut media, preparer.as_deref(), || {
                 if let Some(ready) = ready.take() {
-                    let _ = ready.send(Ok((engine.max_context, (preparer.is_some() || audio_preparer.is_some()).then(|| (preparer.clone(), audio_preparer.clone(), health.clone(), audio_health.clone())))));
+                    let _ = ready.send(Ok((engine.max_context, (preparer.is_some() || audio_preparer.is_some()).then(|| (preparer.clone(), audio_preparer.clone(), health.clone(), audio_health.clone())), hub.take().expect("console hub"))));
                 }
             })
     });
-    if let Some(ready) = ready.take() {
-        let _ = ready.send(result.as_ref().map(|_| (args.max_context, (preparer.is_some() || audio_preparer.is_some()).then(|| (preparer, audio_preparer, health, audio_health)))).map_err(|e| anyhow::anyhow!("{e:#}")));
-    }
-    result
+    crate::shared::serve::forward_initialization(result, ready.is_some(), "MiMo initialization failed", |error| {
+        ready.take().expect("pending readiness").send(Err(error)).map_err(|result| match result { Err(error) => error, Ok(_) => unreachable!("sent an error") })
+    })
 }
 
 /// An admitted prompt waiting for its remaining prefill chunks.
@@ -513,6 +531,7 @@ fn schedule_inner(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path
     media: &mut MediaAdmission<super::media::Prompt, super::media::Encoder>,
     preparer: Option<&cuteafd_api::openai::media::MediaPreparer>, ready: impl FnOnce()) -> Result<()> {
     let drafter = engine.drafter.as_ref();
+    if let Some(drafter) = drafter { drafter.prepare_workspace()?; }
     let mut free_slots: Vec<usize> = drafter.map_or(Vec::new(), |d| (0..d.slots).rev().collect());
     let head_numerics = match engine.head().weight {
         super::head::MimoHead::Bf16(_) => "head-bf16",
@@ -524,8 +543,8 @@ fn schedule_inner(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path
             Some(d) => resource::Prior::Selector(d.confidence_prior(head_numerics)?),
             None => resource::Prior::History,
         };
-        let mut shared = crate::shared::draft::runtime::SharedPolicy::with_geometry(
-            engine.draft_geometry(width)?, prior, cuteafd_core::PolicySeed::weak(width))?;
+        let mut shared = crate::shared::draft::runtime::SharedPolicy::with_length(
+            engine.draft_geometry(width)?, prior, cuteafd_core::PolicySeed::weak(width), policy.length)?;
         shared.policy.set_native_confidence_positions(width)?;
         engine.arm_draft_probe()?;
         resource::publish(&shared.policy, 0, 0, None);
@@ -596,7 +615,7 @@ fn schedule_inner(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path
                             }
                         };
                         failures.watch(&job.events);
-                        if let Err(error) = probe::validate_scoring(&job.probe, engine.full_prefill_logits()) {
+                        if let Err(error) = probe::validate_scoring(&job.probe, probe::prefill_scoring_admitted("mimo_v2", engine.full_prefill_logits())) {
                             let _ = job.events.send(Err(NativeFailure::BadRequest(format!("scoring: {error:#}"))));
                             continue;
                         }
@@ -680,7 +699,7 @@ fn schedule_inner(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path
                 continue;
             };
             // Disabled neural drafts need neither a ring slot nor context updates.
-            let slot = if probe::no_speculation(&ready.job().job.probe) || policy.fixed == Some(0) {
+            let slot = if probe::no_speculation(&ready.job().job.probe) {
                 None
             } else { free_slots.pop() };
             if prefix.mimo_prefix_draft && engine.drafter.is_some() { family.bind_drafter(ring, slot); }
@@ -732,9 +751,16 @@ fn schedule_inner(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path
                 let mut placement = admitted.placement;
                 let scored = probe::score(engine.library, &job.probe, &tokens, from,
                     engine.prefill_capacity(),
-                    DECODE_ROWS, probe::verify_rows(&job.probe), engine.full_prefill_logits(), &mut placement,
-                    |placement, chunk, rows| Ok(engine.prefill_media_device(placement, chunk, rows > 1, None, None, Some(&request_media))?
-                        .map(probe::ScoreLogits::Device)),
+                    DECODE_ROWS, probe::verify_rows(&job.probe), probe::prefill_scoring_admitted("mimo_v2", engine.full_prefill_logits()), &mut placement,
+                    |placement, chunk, rows, position| {
+                        if rows > 1 && !engine.full_prefill_logits() && probe::streamed_prefill_scoring("mimo_v2") {
+                            engine.prefill_streamed_scoring(placement, chunk, &request_media,
+                                probe::ScoringRows { probe: &job.probe, position })
+                        } else {
+                            Ok(engine.prefill_media_device(placement, chunk, rows > 1, None, None, Some(&request_media))?
+                                .map(probe::ScoreLogits::Device))
+                        }
+                    },
                     |placement, chunk| engine.verify_media_device(&mut [(placement, chunk.len())], chunk, None, Some(&request_media))?
                         .context("scoring needs every layer"));
                 match scored {
@@ -961,7 +987,7 @@ fn schedule_inner(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path
             continue;
         }
         let cycle = Instant::now();
-        let Some(finished) = runtime.block_on(lanes.run_one(|lease| decode_round(lease, engine, policy.fixed,
+        let Some(finished) = runtime.block_on(lanes.run_one(|lease| decode_round(lease, engine,
             prefix.mimo_prefix_draft, width, &mut lane, &mut active, &mut shared, selector, family, cache,
             &mut free_rings, &mut free_slots, &mut failures, &mut trace, cycle)))? else { continue };
         for index in (0..active.len()).rev() {
@@ -979,7 +1005,7 @@ fn schedule_inner(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path
             tracing::info!(tokens = request.generated, seconds, tok_s = request.generated as f64 / seconds,
                 active = active.len(), steps = lane.steps, verify_s = lane.verify_s, draft_s = lane.draft_s,
                 emit_s = lane.emit_s, gpu_wait_s = phases[0],
-                experts_s = phases[1], cycles, dflash, dflash_ok, copy, copy_ok, draft_calls, late_graphs = engine.late_captures(),
+                experts_s = phases[1], cycles, dflash, dflash_ok, copy, copy_ok, draft_calls,
                 "request complete");
             (lane.steps, lane.verify_s, lane.draft_s, lane.emit_s) = (0, 0.0, 0.0, 0.0);
             if let Some(row) = request.turn.as_ref().filter(|_| !request.looped && !probe::cold(&request.job.probe)) {
@@ -1045,7 +1071,7 @@ impl LaneCommit for DraftContext<'_, '_> {
 /// One round of lane 0: draft, plan, verify, select, emit and commit. `None`
 /// when a non-terminal step failure released every active request.
 #[allow(clippy::too_many_arguments)]
-async fn decode_round(lease: LaneLease<'_>, engine: &MimoEngine<'_>, fixed: Option<usize>, prefix_draft: bool,
+async fn decode_round(lease: LaneLease<'_>, engine: &MimoEngine<'_>, prefix_draft: bool,
     width: usize, lane: &mut DecodeLane, active: &mut Vec<Active<'_>>,
     shared: &mut Option<crate::shared::draft::runtime::SharedPolicy>, selector: &mut TokenSelector<'_>,
     family: &MimoPrefix<'_, '_>, cache: &mut PrefixCache<CudaCopyEngine<'_>>, free_rings: &mut Vec<i32>,
@@ -1077,7 +1103,7 @@ async fn decode_round(lease: LaneLease<'_>, engine: &MimoEngine<'_>, fixed: Opti
     let action_requests: Vec<_> = active.iter().zip(&limits).map(|(a, &room)| (a.ticket.id(), room)).collect();
     let run_draft = match shared.as_mut() {
         Some(shared) => select_draft_action(&mut shared.policy, &action_requests, &draft_rooms,
-            width, DECODE_ROWS, fixed)?,
+            width, DECODE_ROWS)?,
         None => false,
     };
     // DFlash drafts after every next token (sequences with a ring slot),
@@ -1115,7 +1141,7 @@ async fn decode_round(lease: LaneLease<'_>, engine: &MimoEngine<'_>, fixed: Opti
             out
         }
         // Native MTP drafts (MiMo V2 Flash; V2.6 Pro prefers DFlash).
-        None if run_draft && engine.mtp.is_some() && fixed != Some(0)
+        None if run_draft && engine.mtp.is_some()
             && limits.iter().any(|&limit| limit > 0) => {
             let indices: Vec<usize> = (0..active.len()).filter(|&i| draft_rooms[i] > 0).collect();
             for &i in &indices {
@@ -1175,7 +1201,7 @@ async fn decode_round(lease: LaneLease<'_>, engine: &MimoEngine<'_>, fixed: Opti
     let mut priors = priors;
     let copies: Vec<_> = active.iter().zip(&drafted).zip(&limits).zip(&mut priors)
         .map(|(((a, d), &limit), prior)| match (shared.as_ref(), d.as_ref()) {
-            (Some(shared), Some(d)) if fixed.is_none() => resource::copy_continuation(&shared.policy, active.len(),
+            (Some(shared), Some(d)) if !shared.policy.fixed() => resource::copy_continuation(&shared.policy, active.len(),
                 a.ticket.id(), &a.history, &d.tokens, prior, limit, a.job.sampling.is_greedy()),
             _ => None,
         }).collect();
@@ -1185,9 +1211,7 @@ async fn decode_round(lease: LaneLease<'_>, engine: &MimoEngine<'_>, fixed: Opti
         prior.truncate(available);
     }
     let mut predicted = None;
-    let mut planned = if let Some(fixed) = fixed {
-        drafted.iter().zip(&limits).map(|(d, &limit)| d.as_ref().map_or(0, |d| fixed.min(limit).min(d.tokens.len()))).collect()
-    } else if let Some(shared) = shared.as_mut().filter(|_| drafted_width > 0) {
+    let mut planned = if let Some(shared) = shared.as_mut().filter(|_| drafted_width > 0) {
         let candidates: Vec<_> = active.iter().zip(&priors).zip(&limits).map(|((a, prior), &limit)|
             resource::Candidate { id: a.ticket.id(), prior, limit, selector: false, cold: a.drafts.cold() }).collect();
         let selection = resource::select_drafted(&mut shared.policy, &candidates, drafted_width, DECODE_ROWS, drafted_requests);
@@ -1195,14 +1219,6 @@ async fn decode_round(lease: LaneLease<'_>, engine: &MimoEngine<'_>, fixed: Opti
         selection.lengths
     } else { vec![0; active.len()] };
     if resource::trim_budget_with_priors(&mut planned, DECODE_ROWS, &priors, |i| active[i].ticket.id()) { predicted = None; }
-    if fixed.is_some() {
-        if let Some(shared) = shared.as_ref() {
-            let candidates: Vec<_> = active.iter().zip(&priors).map(|(a, prior)|
-                cuteafd_core::DraftCandidate { id: a.ticket.id(), confidence: prior }).collect();
-            crate::shared::draft::binding::trace_selection(&shared.policy, &candidates,
-                drafted_width, drafted_requests, DECODE_ROWS, &planned);
-        }
-    }
     let sequences: Vec<Vec<u32>> = active.iter().enumerate().map(|(i, a)| {
         let full = copies[i].as_ref().map(|c| c.tokens.as_slice())
             .unwrap_or_else(|| drafted[i].as_ref().map_or(&[][..], |d| d.tokens.as_slice()));
@@ -1345,21 +1361,21 @@ async fn decode_round(lease: LaneLease<'_>, engine: &MimoEngine<'_>, fixed: Opti
         resource::publish(&shared.policy, lane.observed_rounds, lane.skipped_rounds, None);
     }
     if let Some(trace) = trace.as_mut() {
-        let line = serde_json::json!({"rows": sequences.iter().map(Vec::len).sum::<usize>(),
-            "draft_width": drafted_width, "drafted_requests": drafted_requests,
-            "lengths": sequences.iter().map(|s| s.len()-1).collect::<Vec<_>>(),
-            "accepted": verified.iter().map(|v| v.1.saturating_sub(1)).collect::<Vec<_>>(),
-            "neural_lengths": drafted.iter().map(|d| d.as_ref().map_or(0, |d| d.tokens.len())).collect::<Vec<_>>(),
-            "request_ids": active.iter().map(|a| a.ticket.id()).collect::<Vec<_>>(),
-            "neural_tokens": drafted.iter().map(|d| d.as_ref().map(|d| &d.tokens)).collect::<Vec<_>>(),
-            "copy_windows": copy_windows.as_ref().map(|windows| windows.iter().map(|(start, suffix, tokens)|
-                serde_json::json!({"start": start, "matched_suffix": suffix, "tokens": tokens})).collect::<Vec<_>>()),
-            "committed_tokens": active.iter().zip(&before).map(|(a, &n)| &a.history[n..]).collect::<Vec<_>>(),
-            "copy_agreement": copy_agreement,
-            "copy_neural_prefix": copies.iter().map(|c| c.as_ref().map(|c| c.neural)).collect::<Vec<_>>(),
-            "copy_lengths": copies.iter().map(|c| c.as_ref().map_or(0, |c| c.tokens.len())).collect::<Vec<_>>(),
-            "prior": priors, "predicted_us": predicted, "policy": resource::snapshot()});
-        if let Err(error) = trace.write(&line) {
+        let line = crate::shared::speculation_trace::record! {rows: sequences.iter().map(Vec::len).sum::<usize>(),
+            draft_width: drafted_width, drafted_requests: drafted_requests,
+            lengths: sequences.iter().map(|s| s.len()-1).collect::<Vec<_>>(),
+            accepted: verified.iter().map(|v| v.1.saturating_sub(1)).collect::<Vec<_>>(),
+            neural_lengths: drafted.iter().map(|d| d.as_ref().map_or(0, |d| d.tokens.len())).collect::<Vec<_>>(),
+            request_ids: active.iter().map(|a| a.ticket.id()).collect::<Vec<_>>(),
+            neural_tokens: drafted.iter().map(|d| d.as_ref().map(|d| d.tokens.clone())).collect::<Vec<_>>(),
+            copy_windows: copy_windows.as_ref().map(|windows| windows.iter().map(|(start, suffix, tokens)|
+                crate::shared::speculation_trace::record! {start: *start, matched_suffix: *suffix, tokens: tokens.clone()}).collect::<Vec<_>>()),
+            committed_tokens: active.iter().zip(&before).map(|(a, &n)| a.history[n..].to_vec()).collect::<Vec<_>>(),
+            copy_agreement: copy_agreement,
+            copy_neural_prefix: copies.iter().map(|c| c.as_ref().map(|c| c.neural)).collect::<Vec<_>>(),
+            copy_lengths: copies.iter().map(|c| c.as_ref().map_or(0, |c| c.tokens.len())).collect::<Vec<_>>(),
+            prior: priors, predicted_us: predicted, policy: resource::trace_snapshot()};
+        if let Err(error) = trace.write(line) {
             tracing::warn!(%error, "MiMo speculation trace write failed");
         }
     }
@@ -1382,10 +1398,16 @@ async fn decode_round(lease: LaneLease<'_>, engine: &MimoEngine<'_>, fixed: Opti
 fn publish(stats: &Mutex<serde_json::Value>, requests: u64, generated: u64, active: usize, prefilling: usize,
     cache: &PrefixCache<CudaCopyEngine<'_>>, media: &MediaAdmission<super::media::Prompt, super::media::Encoder>,
     preparer: Option<&cuteafd_api::openai::media::MediaPreparer>, reserve: &Reserve, stalled: usize) {
+    if requests > 0 {
+        static FIRST: std::sync::Once = std::sync::Once::new();
+        FIRST.call_once(|| crate::shared::memory_report::reconcile::capture("first_request"));
+    }
+    if active == 0 && prefilling == 0 { cache.refresh_serving_stats(); }
+    let prefix_stats = cache.serving_stats();
     if let Ok(mut stats) = stats.lock() {
         *stats = serde_json::json!({ "draft_policy": resource::snapshot(),"requests": requests, "generated_tokens": generated, "active": active,
-            "prefilling": prefilling, "prefix_cache": cache.stats(), "kv_reserve": reserve.snapshot(stalled),
-            "media": media.stats(cache.stats().media_key_collisions, preparer.map_or(0, |p| p.memo_hits()))});
+            "prefilling": prefilling, "prefix_cache": prefix_stats, "kv_reserve": reserve.snapshot(stalled),
+            "media": media.stats(prefix_stats.media_key_collisions, preparer.map_or(0, |p| p.memo_hits()))});
     }
 }
 
@@ -1394,7 +1416,7 @@ fn eligible_draft_rooms(limits: &[usize], ready: &[bool], width: usize) -> Vec<u
 }
 
 fn select_draft_action(policy: &mut cuteafd_core::DraftPolicy, requests: &[(u64, usize)],
-    rooms: &[usize], width: usize, max_rows: usize, fixed: Option<usize>) -> Result<bool> {
+    rooms: &[usize], width: usize, max_rows: usize) -> Result<bool> {
     let participants = rooms.iter().filter(|&&room| room > 0).count();
     let actions = [cuteafd_core::DraftAction { width: 0, draft_us: 0. }, cuteafd_core::DraftAction {
         width, draft_us: if participants > 0 {
@@ -1402,9 +1424,7 @@ fn select_draft_action(policy: &mut cuteafd_core::DraftPolicy, requests: &[(u64,
         } else { 0. } }];
     let skip_rooms = vec![0; requests.len()];
     let action_rooms = [skip_rooms.as_slice(), rooms];
-    let chosen = if fixed.is_none() {
-        policy.choose_action_with_rooms(false, requests, &actions, &action_rooms, max_rows)?
-    } else { fixed.map(|count| usize::from(count > 0)) };
+    let chosen = policy.choose_action_with_rooms(false, requests, &actions, &action_rooms, max_rows)?;
     // None is the shared policy's cold-start result, not a history bypass.
     let run = participants > 0 && max_rows > requests.len() && chosen.is_none_or(|action| action == 1);
     crate::shared::draft::binding::trace_action(policy, false, requests, &actions,
@@ -1412,8 +1432,10 @@ fn select_draft_action(policy: &mut cuteafd_core::DraftPolicy, requests: &[(u64,
     Ok(run)
 }
 
-fn serving_queue_depth(explicit: Option<usize>, concurrency: usize) -> usize {
-    explicit.unwrap_or(cuteafd_core::concurrency::queue_depth(concurrency as u64) as usize)
+pub(super) fn serving_queue_depth(explicit: Option<usize>, concurrency: usize) -> usize {
+    let depth = explicit.unwrap_or(cuteafd_core::concurrency::queue_depth(concurrency as u64) as usize);
+    cuteafd_bench::context::set_resolved("http-queue-depth", &depth.to_string());
+    depth
 }
 
 fn serving_context_slots(sequences: usize, rings: usize, explicit: Option<usize>, warm: bool) -> usize {
@@ -1423,6 +1445,29 @@ fn serving_context_slots(sequences: usize, rings: usize, explicit: Option<usize>
 
 #[cfg(test)]
 mod lane_tests {
+    #[test]
+    fn admission_and_completed_request_publish_reconciliation() {
+        let admission = include_str!("admission.rs");
+        let registered = admission.split_once("reserve::log_plan(&admitted.solved, \"mimo_v2\")").unwrap().1
+            .split_once("MiMo shared admission solve").unwrap().0;
+        assert!(registered.contains("memory_ledger::fault::set_inputs"));
+        for field in ["memory_reconciliation_provenance", "family", "source_commit", "native_sha256",
+            "programs_sha256", "layout", "devices", "spark_world", "onboard_layers", "prefill"] {
+            assert!(registered.contains(&format!("\"{field}\"")), "missing provenance {field}");
+        }
+        let source = include_str!("serve.rs");
+        let publish = source.split_once("\nfn publish(").unwrap().1
+            .split_once("\nfn eligible_draft_rooms").unwrap().0;
+        let completed = publish.find("if requests > 0").unwrap();
+        let once = publish.find("static FIRST: std::sync::Once").unwrap();
+        let capture = publish.find("FIRST.call_once(|| crate::shared::memory_report::reconcile::capture(\"first_request\"))").unwrap();
+        let replace = publish.find("*stats = serde_json::json!").unwrap();
+        assert!(completed < once && once < capture && capture < replace);
+        assert!(!publish.contains("graph_capture_stats"), "diagnostics belong to HTTP stats fetches");
+        assert!(publish.contains("cache.serving_stats()"));
+        assert!(include_str!("../../shared/api.rs").contains("profile.stats_diagnostics = Some(crate::shared::probe::graph_capture_stats)"));
+    }
+
     #[test]
     fn decode_runs_as_lane_zero_of_a_shared_lane_set() {
         let source = include_str!("serve.rs");
@@ -1508,11 +1553,9 @@ mod port_tests {
         let rooms = eligible_draft_rooms(&limits, &[true, false, true, true], 7);
         assert_eq!(rooms, [7, 0, 0, 2]);
         let requests = [(10, 7), (11, 7), (12, 0), (13, 2)];
-        assert!(select_draft_action(&mut shared.policy, &requests, &rooms, 7, 5, None).unwrap());
-        assert!(!select_draft_action(&mut shared.policy, &requests, &rooms, 7, 4, None).unwrap());
-        assert!(!select_draft_action(&mut shared.policy, &requests, &[0; 4], 7, 64, None).unwrap());
-        assert!(!select_draft_action(&mut shared.policy, &requests, &rooms, 7, 64, Some(0)).unwrap());
-        assert!(select_draft_action(&mut shared.policy, &requests, &rooms, 7, 64, Some(3)).unwrap());
+        assert!(select_draft_action(&mut shared.policy, &requests, &rooms, 7, 5).unwrap());
+        assert!(!select_draft_action(&mut shared.policy, &requests, &rooms, 7, 4).unwrap());
+        assert!(!select_draft_action(&mut shared.policy, &requests, &[0; 4], 7, 64).unwrap());
         let rates = [0.99; 7];
         let candidates: Vec<_> = requests.iter().zip(&rooms).map(|(&(id, _), &limit)|
             resource::Candidate { id, prior: if limit > 0 { &rates } else { &[] },

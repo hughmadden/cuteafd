@@ -20,7 +20,7 @@
 //! each logical page consists of disjoint owner-local layer records across both GPUs; tail
 //! copies and the host tier preserve all those segments without replicating any layer.
 use super::engine::{GlmEngine, GlmPlacement, INDEX_PAGE_BYTES, PAGE_ROWS, RECORD_BYTES};
-use crate::shared::memory::DeviceAllocation;
+use crate::shared::memory::{DeviceAllocation, Tag};
 use crate::shared::prefix::{view, PrefixCopies, Reader};
 use anyhow::Result;
 use cuteafd_engine::prefix::{BoxError, FamilyLayout, MarkSlot, MarkStore, PageOwners, PrefixFamily, ReuseRule,
@@ -121,23 +121,52 @@ pub(crate) fn draft_mark_bytes(windows_only: bool, window_bytes: usize) -> usize
 impl<'e, 'a> NativePrefix<'e, 'a> {
     /// `mark_slots`: the prefix arena's slots, each holding a window-ring drafter's windows.
     pub fn new(engine: &'e GlmEngine<'a>, partial: bool, mark_slots: usize) -> Result<Self> {
-        let _memory_scope = cuteafd_ffi::memory_ledger::scope("prefix");
         let paged = (0..engine.ranks())
             .flat_map(|rank| engine.paged_buffers_on(rank).into_iter().map(move |(records, index)| (rank, records, index)))
             .collect();
+        // A GPU1 drafter writes its window marks on its own bridge stream, so
+        // that stream is one of rank 1's readers: the copy fence orders it.
+        let draft_reader = engine.drafter.as_ref().and_then(|drafter| drafter.device().zip(drafter.stream()))
+            .map(|(device, stream)| Reader { device: device.id, stream });
         let copies = PrefixCopies::new(engine.library, (0..engine.ranks())
-            .map(|rank| Ok(vec![Reader { device: engine.on(rank, || engine.library.cuda_get_device())?,
-                stream: engine.stream_of(rank) }])).collect::<Result<_>>()?)?;
+            .map(|rank| {
+                let device = engine.on(rank, || engine.library.cuda_get_device())?;
+                Ok(std::iter::once(Reader { device, stream: engine.stream_of(rank) })
+                    .chain(draft_reader.filter(|reader| reader.device == device)).collect())
+            }).collect::<Result<_>>()?)?;
         let draft_marks = match engine.drafter.as_ref().filter(|d| d.mla_windows_only()) {
             Some(drafter) if mark_slots > 0 => {
                 let windows = drafter.mla_window_segments(0)?.iter().map(|w| w.bytes).sum::<usize>();
                 let bytes = draft_mark_bytes(true, windows).checked_mul(mark_slots)
                     .ok_or_else(|| anyhow::anyhow!("draft window marks overflow"))?;
-                Some(DraftMarks { storage: DeviceAllocation::new(engine.library, bytes.max(256))?, windows, slots: mark_slots })
+                // Marks snapshot the drafter's rings and live on its admitted GPU.
+                let storage = match drafter.device() {
+                    Some(device) => device.run(|| DeviceAllocation::new(engine.library, bytes.max(256),
+                        Tag::prefix("glm/prefix-draft-marks")))?,
+                    None => DeviceAllocation::new(engine.library, bytes.max(256),
+                        Tag::prefix("glm/prefix-draft-marks"))?,
+                };
+                Some(DraftMarks { storage, windows, slots: mark_slots })
             }
             _ => None,
         };
-        Ok(Self { engine, paged, partial, scratch: DeviceAllocation::new(engine.library, 256)?, copies, draft_marks })
+        Ok(Self { engine, paged, partial, copies, draft_marks,
+            scratch: DeviceAllocation::new(engine.library, 256, Tag::prefix("glm/prefix-tail"))? })
+    }
+
+    pub(crate) fn allocation_receipts(&self,
+        devices: cuteafd_loader::placement::planner::CoordinatorDevices<'_>)
+        -> Result<Vec<cuteafd_loader::placement::planner::Receipt>> {
+        use cuteafd_core::memory_layout::Category;
+        use cuteafd_loader::placement::planner::{Lifetime, Phase};
+        let mut inventory = crate::shared::memory::receipts::Inventory::new(devices, "glm.prefix",
+            Lifetime { first: Phase::Warmup, last: Phase::Growth }, Category::Prefix, "prefix owners");
+        inventory.device("scratch", self.scratch.buffer)?;
+        if let Some(marks) = &self.draft_marks { inventory.device("draft_marks", marks.storage.buffer)?; }
+        // Paged descriptors borrow target KV/index storage; charge only their host container here.
+        inventory.host("paged_descriptors", &self.paged)?;
+        self.copies.allocation_receipts(&mut inventory, "copies")?;
+        Ok(inventory.receipts)
     }
 
     /// The bytes of one prefix mark: a window-ring drafter's windows, otherwise none.
@@ -146,7 +175,7 @@ impl<'e, 'a> NativePrefix<'e, 'a> {
     /// The drafter whose state a snapshot of `placement` carries (a window-ring MLA drafter
     /// with the placement's slot), if any.
     fn draft_of(&self, placement: &GlmPlacement)
-        -> Option<(&crate::shared::speculation::dflash::DflashDrafter<'a>, usize)> {
+        -> Option<(&super::drafter::GlmDrafter<'a>, usize)> {
         let drafter = self.engine.drafter.as_ref().filter(|d| d.mla_windows_only() || d.mla_draft_page_bytes() > 0)?;
         Some((drafter, placement.draft_slot?))
     }
@@ -165,18 +194,26 @@ impl<'e, 'a> NativePrefix<'e, 'a> {
         drafter.copy_mla_windows(slot, &views, capture)
     }
 
+    /// Synchronous header copies run on the marks' (drafter's) device.
+    fn on_marks<T>(&self, work: impl FnOnce() -> Result<T>) -> Result<T> {
+        match self.engine.drafter.as_ref().and_then(|drafter| drafter.device()) {
+            Some(device) => device.run(work),
+            None => work(),
+        }
+    }
+
     fn write_draft_header(&self, mark: MarkSlot, frontier: Option<usize>) -> Result<()> {
         let marks = self.draft_marks.as_ref().ok_or_else(|| anyhow::anyhow!("no draft window marks"))?;
         let mut header = [0u8; DRAFT_MARK_HEADER];
         header[..8].copy_from_slice(&frontier.map_or(u64::MAX, |f| f as u64).to_le_bytes());
-        self.engine.library.copy_h2d(view(marks.mark(mark)?, 0, DRAFT_MARK_HEADER)?, &header)?;
+        self.on_marks(|| self.engine.library.copy_h2d(view(marks.mark(mark)?, 0, DRAFT_MARK_HEADER)?, &header))?;
         Ok(())
     }
 
     fn read_draft_header(&self, mark: MarkSlot) -> Result<Option<usize>> {
         let marks = self.draft_marks.as_ref().ok_or_else(|| anyhow::anyhow!("no draft window marks"))?;
         let mut header = [0u8; DRAFT_MARK_HEADER];
-        self.engine.library.copy_d2h(&mut header, view(marks.mark(mark)?, 0, DRAFT_MARK_HEADER)?)?;
+        self.on_marks(|| self.engine.library.copy_d2h(&mut header, view(marks.mark(mark)?, 0, DRAFT_MARK_HEADER)?))?;
         let frontier = u64::from_le_bytes(header[..8].try_into().unwrap());
         Ok((frontier != u64::MAX).then_some(frontier as usize))
     }
@@ -616,7 +653,7 @@ mod ownership_tests {
         let mut args = Parse::try_parse_from(["test", "--snapshot", &env("CUTEAFD_GOLDEN_SNAPSHOT")?,
             "--native-lib", &env("CUTEAFD_NATIVE_LIB")?, "--manifest", &env("CUTEAFD_PROGRAM_MANIFEST")?,
             "--peers", &env("CUTEAFD_GOLDEN_PEERS")?, "--dspark", "--pool-tokens", "0",
-            "--max-context", "1048576", "--rtx-expert-layers", "0", "--draft-window-marks", "2"] )?.engine;
+            "--max-context-tokens", "1048576", "--rtx-expert-layers", "0", "--draft-window-marks", "2"] )?.engine;
         super::super::resolve_prefill(&mut args)?;
         let opened = super::super::open(&args)?;
         ensure!(opened.cfg.variant.ml4().is_some(), "native proof requires ML4");

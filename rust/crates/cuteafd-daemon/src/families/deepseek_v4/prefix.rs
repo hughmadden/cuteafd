@@ -32,7 +32,7 @@
 use super::engine::Engine;
 use super::metadata::{compressed_page_bytes, INDEX_PAGE_BYTES, MAIN_PAGE_BYTES, SOURCE_PAGE_TOKENS, WINDOW};
 use super::pool::{Placement, PoolAllocator};
-use crate::shared::memory::DeviceAllocation;
+use crate::shared::memory::{DeviceAllocation, Tag};
 use crate::shared::prefix::view;
 use crate::shared::spark_intake::SparkLink;
 use anyhow::{ensure, Context, Result};
@@ -50,6 +50,9 @@ const WINDOW_MARK_BYTES: usize = WINDOW * (PAYLOAD_BYTES + SCALE_BYTES);
 /// C4 index page: 64 rows of 128 FP8 keys, then 64 FP32 scales.
 const INDEX_ROWS: usize = 64;
 const INDEX_KEY_BYTES: usize = 128;
+
+/// Retained prefix-cache marks: each slot's per-layer window rows and compressor state.
+const PREFIX_MARKS: Tag = Tag::prefix("v4/prefix-marks");
 
 /// One layer's device buffers.
 struct LayerBuffers {
@@ -117,7 +120,7 @@ impl<'e, 'a> Dsv4Prefix<'e, 'a> {
         let slots = slots(mark_bytes);
         let arenas = if slots > 0 {
             rank_mark_bytes.iter().enumerate().map(|(rank, &bytes)| {
-                engine.on(rank, || DeviceAllocation::new(engine.library, (slots * bytes).max(256)))
+                engine.on(rank, || DeviceAllocation::new(engine.library, (slots * bytes).max(256), PREFIX_MARKS))
             }).collect::<Result<Vec<_>>>()?
         } else {
             Vec::new()
@@ -818,13 +821,21 @@ mod tests {
             let host = HostCacheGeometry { unit_rows: runtime.page_rows as u64,
                 page_bytes: runtime.page_bytes as u64, mark_bytes: runtime.mark_bytes as u64, draft_bytes: 0 };
             for concurrency in [16, 64] {
+                // A context launch carries the build's C4 token-split programs.
+                let programs = dir.path().join("PROGRAMS.json");
+                let names = ["dsv4f_scored_index_topk_decode_m64",
+                    "dsv4f_dsa_candidate_merge", "dsv4f_lse_combine2", "dsv4f_paged_staging_gather_c4",
+                    "dsv4f_paged_staging_gather_index", "dsv4f_sparse_mla_partial_h0_s4_m64",
+                    "dsv4f_sparse_mla_partial_h32_s4_m64"].map(|name| serde_json::json!({"name": name}));
+                std::fs::write(&programs, serde_json::json!({"programs": names}).to_string()).unwrap();
                 let options = LayoutOptions { rtx_bytes: vec![96 << 30; 2], context_tokens: 4096,
                     pool_tokens: Some(8192), concurrency, native_mtp_layers: stages,
+                    workspace_manifest: Some(programs),
                     host_memory: Some((128 << 30, 128 << 30)), ..Default::default() };
                 let report = plan::plan(dir.path(), &PlanOptions { layout: Some(options),
                     attention_placement: Some(AttentionPlacement::Context), ..Default::default() }).unwrap();
                 let expected = host.resolve(None, 4096, concurrency, 128 << 30, host.chunk_bytes()).unwrap();
-                assert_eq!(report.host_budget_bytes, expected, "stages={stages}, C={concurrency}");
+                assert_eq!(report.host_budget_bytes, expected, "stages={stages}, C={concurrency}: {}", plan::render(&report));
                 let note = format!("host prefix: {} B per mark;", marks[0]);
                 assert!(report.memory_layout.as_ref().unwrap().notes.iter().any(|n| n.starts_with(&note)),
                     "{}", plan::render(&report));

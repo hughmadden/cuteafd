@@ -27,6 +27,9 @@ Porting a family or changing shared serve, prefill, exchange or admission code: 
   `ncu <args> <program>` on the host or in a dev container. No sudo. Never put
   anything under sudo inside a wrapper script or interpreter (`sudo python …`,
   `sudo bash …`): the approver can't see what it runs and will flag or deny it.
+  CPU sampling of your own processes also works on raptor
+  (`kernel.perf_event_paranoid=1`): add `--sample=process-tree
+  --cpuctxsw=process-tree` to nsys to find host-side stalls.
 - Canonical lock order: `sparks.lock` -> `gpu0.lock` -> `gpu1.lock` ->
   `rhea.lock` -> `moa.lock` -> `kakapo.lock` -> `cassowary.lock` ->
   `kakapo-export.lock` -> `cassowary-export.lock`. Never acquire an earlier lock
@@ -110,6 +113,19 @@ Porting a family or changing shared serve, prefill, exchange or admission code: 
   not bake in one card's SM count or L2 size; query them at runtime
   (`cudaDevAttr`) for grid, wave and prefetch sizing, and let the placement
   planner handle the memory difference between cards.
+- Static weights live in packed arenas, in every family (TJ, 2026-11-08).
+  One preplanned allocation per physical device per independently retired
+  weight set holds the target core and globals. Tensors are views at
+  aligned offsets of it. Optional drafters, onboarding transactions and
+  native media towers each get their own arena. Transient conversion
+  storage stays outside. A loader that issues a separate device allocation
+  per tensor is a defect, not a style choice. The rule applies to
+  coordinator loaders, Spark mount paths and RTX onboarding alike.
+- Every device allocation has a named, measured owner that admission
+  charges exactly once: the arena's physical bytes plus its single
+  allocation tail, never the payload plus the arena on top. A new loader
+  or family is not complete until its arenas are inventoried as one
+  backing with aliases and its admission charges them.
 - Multimodal input is supported only through a family's officially bundled
   encoder (the vision/audio tower the checkpoint actually ships). Don't
   attach a third-party encoder to a text checkpoint opportunistically.
@@ -147,42 +163,63 @@ Porting a family or changing shared serve, prefill, exchange or admission code: 
 - Submodules are pinned with tree locks (`third_party/*.lock.json`).
   Kernel changes go to `~/Developer/sparkinfer-glmrt` master, quantizer changes to
   `~/Developer/GPTQModel` main; push there first, then bump pin and lock here.
+  A fork or export-source bump regenerates and publishes V4 and all-family placement inputs (`scripts/build/export-placement-inputs.py`, `~/.cache/cuteafd/builds/placement-inputs/<sha>/` plus `current`)
+  at the merged dev SHA, validated beforehand through
+  `CUTEAFD_V4_PLACEMENT_INPUTS` / `CUTEAFD_DEPLOYMENT_TEST_PROGRAMS` without switching `current`.
   Dev images are toolchain-only and pin-independent: a SparkInfer bump
   needs only a new WIP slot build. Rebuild them with
   `scripts/build/build-dev-images.sh` only when the toolchain changes;
   `wip.sh` and `run.sh --wip` refuse a stale dev image and say so.
+- Batch kernel landings: kernel PRs merge to fork master as soon as their own
+  correctness oracles and benchmarks pass. At most one dev fork-pin bump is
+  in flight; snapshot fork master when it starts, and leave subsequent fork
+  merges for the next bump. Each bump publishes `CHANGES.md`, includes the
+  report in its pin PR body, and checks changed program groups against the
+  union of the batch's declared targets (`--expect`). Use the default CPU
+  gate for merges and pin bumps; the full tier is for releases.
 - Kernels: CuTe-DSL/Triton AOT exports from the b12x fork are the default;
   hand CUDA only where measured to pay. SM120 and SM121 are both targets.
 - Run CUDA/PyTorch checks inside the matching architecture's container.
 - Host checks: `cargo check/test --workspace` from `rust/` with
   `CARGO_TARGET_DIR=~/.cache/cuteafd/builds/<task>/target` (no Python
   needed). Script tests: `.venv/bin/python -m pytest -q scripts/tests`
-  (`uv venv --python 3.12 .venv` + pytest pytest-xdist numpy tokenizers "huggingface-hub>=2.2" jsonschema pyyaml pillow matplotlib safetensors);
+  (`uv venv --python 3.12 .venv && uv pip sync --python .venv/bin/python scripts/dev/gate-requirements.txt`;
+  `cpu-gate` verifies the active venv against `scripts/dev/gate-requirements.txt`
+  and prefers `~/.cache/cuteafd/gate-venv` before a main checkout's `.venv`);
   `scripts/dev/cpu-gate --task NAME --jobs N` runs both suites concurrently
   (or set `CUTEAFD_TEST_JOBS`; default half the logical CPUs). The gate uses
   nextest when present on PATH or in the persistent architecture Cargo home,
   with cargo test as fallback. Install without root:
   `CARGO_HOME="$HOME/.cache/cuteafd/cargo-home/$(uname -m)" cargo install --locked cargo-nextest`.
-  Default is for iteration and feature merges: it excludes the 15 measured
-  full-plan/cache IDs in `scripts/dev/cpu-gate`'s `FULL_TESTS`; receipts list
-  every exclusion. Use `cpu-gate --full` before merging into dev and for
-  releases to restore every nonignored test, including installed example
-  plans through the launcher's `release_prefill_shape`. That sweep uses
+  Default is the merge gate (TJ, 2026-11-06): iteration, feature merges into
+  dev and SparkInfer pin bumps. It excludes the measured full-plan/cache IDs in
+  `scripts/dev/cpu-gate`'s `FULL_TESTS`; receipts list every exclusion. A pin
+  bump or placement-input republish also runs the installed deployment tests
+  by name, since they are what read the new inputs. Use `cpu-gate --full` for
+  release cuts only, to restore every nonignored test, including installed
+  example plans through the launcher's `release_prefill_shape`. That sweep uses
   `HF_HOME` (or `~/.cache/huggingface`); override with
   `CUTEAFD_DEPLOYMENT_TEST_HF_HOME` and optionally supply the matching
-  `CUTEAFD_DEPLOYMENT_TEST_PROGRAMS` manifest and adjacent exports. Missing
-  checkpoints/revisions skip explicitly; installed planner failures still fail.
+  `CUTEAFD_DEPLOYMENT_TEST_PROGRAMS` manifest and adjacent exports (default
+  `~/.cache/cuteafd/builds/placement-inputs/current/share/PROGRAMS.json`). The gate
+  supplies this single manifest variable to all installed planner tests on
+  every host, including the default tier's installed GLM physical test. Missing
+  checkpoints/revisions or missing/stale exports fail; only the explicitly
+  recorded `--skip-live-planners` opts out. Installed inventories exclude
+  retired example configs and read live cells from `benchmarks/current-matrix.json`.
   Release cuts also add `--slow`
   for explicit ignored CPU soaks, not arbitrary ignored GPU/network tests.
   Full-plan tests use `plan::testing::BudgetedPlanInput`'s strict 30 s per-plan
   budget with phase diagnostics; multi-shape tests may take longer in total.
   The nextest and cargo-test fallback selections agree. Add no failing ids.
-- Kernel/exporter pre-merge gate: CPU-only `scripts/build/compare-sm-exports.py --sms 188,170`; review object/cubin differences.
+- Kernel and exporter changes gate on their own oracles plus the full CPU gate's installed/placement tests.
+  Don't run a whole-tree `scripts/build/compare-sm-exports.py` object/cubin diff as a routine per-merge gate (TJ, 2026-11-06).
+  Target it instead: when an edit to shared kernel source could plausibly reach other programs, compare just those
+  `--groups` (e.g. a shared MMA helper change checks the families that call it). From a git worktree, run it in `scripts/build/cuteafd-dev.sh cpu`
+  by the worktree's real path (`cd ~/Developer/cute-worktrees/cuteafd-<task> && CUTEAFD_SOURCE_ROOT=$PWD ...`),
+  not `/workspace/cuteafd`: relative submodule gitfiles resolve only from the real path.
   SM89 exporter changes add `--arch sm89` (offline SM89 target, 128 and 114 SMs); programs in
   `scripts/build/sm89-export-variation.json` may differ in device code only, the toolchain's own run-to-run variation.
-  From a git worktree, run it in `scripts/build/cuteafd-dev.sh cpu` by the worktree's real path
-  (`cd ~/Developer/cute-worktrees/cuteafd-<task> && CUTEAFD_SOURCE_ROOT=$PWD ...`), not `/workspace/cuteafd`:
-  relative submodule gitfiles resolve only from the real path.
 - Kernel row curves: for new kernels/families/expert formats, duel winners or export/tiling/threshold changes,
   measure warmed time per routed row across the policy's live-row band (8192/k, k=2..4: 2048/2752/4096 plus real tails),
   using runtime-selected exports on SM120 and SM121 where the kernel runs, with fork bench `--capacity` and `--routes`.
@@ -226,7 +263,9 @@ Porting a family or changing shared serve, prefill, exchange or admission code: 
   `scripts/build/cuteafd-dev.sh cpu -- COMMAND` runs CPU-only with the canonical
   `/workspace/cuteafd` source mount and passes optional cache mounts/setup. Container
   targets use `CUTEAFD_DEV_TARGET_DIR=$HOME/.cache/cuteafd/builds/<task>/target`
-  (guarded NVMe bind mount); do not use an image-layer target cache as a substitute. Prefer canonical CPU gates
+  (guarded NVMe bind mount); do not use an image-layer target cache as a substitute.
+  `CUTEAFD_DEV_BASELINE_SOURCE=<engine checkout>` mounts a second pinned checkout read-only
+  at its own path for `compare-sm-exports.py --baseline-source`. Prefer canonical CPU gates
   for cross-worktree hits; never normalize `CARGO_MANIFEST_DIR` away (it is a real runtime input).
   Opt-in artifacts carry `COMPILER_PROVENANCE.json`: source commit/dirty, toolchain,
   actual cache mode/fallback, flags/remapping and binary SHA256. Vanilla hashes may
@@ -247,9 +286,10 @@ Porting a family or changing shared serve, prefill, exchange or admission code: 
 - Iterate with `./wip.sh --slot S` then `./run.sh --wip S --restart`; A/B two
   checkouts with `scripts/bench/bench-ab.py`. `cuteafd plan MODEL` (any HF id or
   snapshot dir) says what a checkpoint needs before any kernel work.
-  `--coordinator-gpu-budget-gib` is the logical per-GPU ceiling for plan,
-  serve and golden; plan defaults to 95.5 GiB. Its distinct weights-only
-  cap is `--coordinator-weight-budget-gib` (default 80 GiB);
+  `--gpu-memory-cap` (`GPU_MEMORY_CAP`) is the total per-GPU ceiling for
+  plan, serve and golden (default: the full device); reserves and KV
+  target/min/max are the other memory policy keys in `docs/options.md`. Its
+  distinct weights-only cap is `--coordinator-weight-budget-gib` (default 80 GiB);
   `cuteafd fabric` shows ports, link/PCIe rates, subnets and the rail plan
   (services log the same line at startup).
 
@@ -311,6 +351,10 @@ Porting a family or changing shared serve, prefill, exchange or admission code: 
   allocation; zero steady-state graph captures per request.
 - Rust: typed errors inside crates, `anyhow` at edges, `tracing`, no
   `unsafe` outside FFI and verbs layers, each block with a safety comment.
+- A change that adds, removes or changes a user-facing launch key, a
+  `./run.sh` option, a default, or a family's accepted values updates
+  `docs/options.md` in the same PR; `scripts/tests/test_options_doc.py`
+  checks the family and attention tables against the launcher.
 - Keep weights, build artifacts, benchmark runs and local config out of Git
   (published reports under `benchmarks/` are the exception).
 
@@ -322,10 +366,17 @@ Porting a family or changing shared serve, prefill, exchange or admission code: 
   Re-run a family's rows after changes that target that family's code (or a
   shared hot path that plausibly moves it); skip irrelevant changes,
   staleness is fine.
+- A PR that adds an optional, default-off performance lever (a launch key or
+  an MC core view) adds its row to `docs/options.md`'s
+  [Optional performance levers](docs/options.md#optional-performance-levers)
+  table in the same PR, with its measured effect or `unmeasured` and its
+  precision or quality cost.
 - `benchmarks/current-matrix.json` is the table's input: one row per
-  family × checkpoint, each cell `current`, `simulated-5090` (the 5090
-  column's memory-capped simulation, replaced by a real card when one
-  exists), or `held`/`pending`/`na` with the reason it renders. A row
+  family × checkpoint, each cell `current` or `held`/`pending`/`na` with
+  the reason it renders. A memory-capped 5090 simulation stays `pending`
+  until measured, then uses `current` with its report path. Report metadata
+  (`BENCH_HARDWARE_CLASS=5090`, the GPU cap and `BENCH_SIMULATED=5090`)
+  labels it "simulated 5090"; a real card is preferred when available. A row
   leaves the table by leaving the matrix; its reports stay in
   `benchmarks/` and the index.
 - Other profiles run only when specifically requested: their exports
@@ -391,7 +442,10 @@ Host policy and read-only inventory: [host tuning](docs/host-tuning.md).
 - `maxq`: WSL2 x86-64, RTX PRO 6000 Blackwell Max-Q 96 GB (SM120),
   reached as `ssh maxq`. Builds, AOT exports, quants, CPU gates and
   single-GPU correctness only; never perf A/B, cards or serving. Its
-  hardware lock is `~/.cache/cuteafd/maxq.lock` on raptor.
+  hardware lock is `~/.cache/cuteafd/maxq.lock` on raptor. CPU gates on
+  `maxq` use `~/.cache/cuteafd/gate-venv` (synced to
+  `scripts/dev/gate-requirements.txt`, or linked as the worktree's `.venv`);
+  never touch `~/Developer/cuteafd/.venv` on `maxq` (TJ's quant venv).
 
 - `raptor`: coordinator, x86-64, 2× RTX PRO 6000 Blackwell 96 GB (SM120),
   power-limited by the gpu-powerd daemon (900 W shared budget, thermal

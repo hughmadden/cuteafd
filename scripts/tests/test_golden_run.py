@@ -95,6 +95,8 @@ if args[:1] == ['inspect']:
     print(json.dumps(names[args[-1]]['labels'])); sys.exit(0)
 if args[:2] == ['rm', '-f']:
     names.pop(find(args[2]), None); save(); sys.exit(0)
+if args[:1] == ['run'] and args[-1:] == ['--help']:
+    print(os.environ['STUB_GOLDEN_HELP']); sys.exit(0)
 if args[:1] == ['run']:
     name = args[args.index('--name') + 1]
     labels = {}
@@ -179,6 +181,7 @@ def env(tmp_path, monkeypatch):
     monkeypatch.setattr(golden.hwlock, 'LOCK_DIR', locks)
     monkeypatch.setattr(golden.PowerSampler, '_loop', lambda self: None)
     monkeypatch.setattr(golden, 'POWER_STATE', tmp_path / 'no-powerd.json')
+    monkeypatch.setenv('STUB_GOLDEN_HELP', CLI_HELP)
     return dict(home=home, tmp=tmp_path, locks=locks, log=tmp_path / 'docker.log', state=tmp_path / 'docker-state.json')
 
 
@@ -187,11 +190,16 @@ def docker_calls(env):
 
 
 def runs(env):
-    return [c for c in docker_calls(env) if c[:1] == ['run']]
+    return [c for c in docker_calls(env) if c[:1] == ['run'] and c[-1:] != ['--help']]
 
 
 BASE = ['--task', 'gr', '--family', 'glm', '--model', 'org/model']
 GOLDEN = ['--', '--snapshot', '{snapshot}', '--device', '0', '--split-device', '1', '--skip-routed-experts', '--nll']
+
+
+def test_minimax_golden_uses_shared_runner_subcommand():
+    assert golden.golden_args('minimax', ['--snapshot', '{snapshot}', '--nll']) == [
+        'minimax-golden', '--snapshot', '{snapshot}', '--nll']
 
 
 @pytest.mark.parametrize('family,sub', sorted(golden.SUBCOMMANDS.items()))
@@ -498,6 +506,73 @@ def test_compare_pairs_reads_safetensors_row_dumps(tmp_path):
     table = next(line for line in (root / 'summary.md').read_text().splitlines()
                  if line.startswith('| a | b |') and 'repeat' not in line)
     assert '| False |' in table and 'row-00000001.safetensors' in table
+
+
+@pytest.mark.parametrize('positions', [None, [1, 2], [4, 5]])
+def test_compare_pairs_aligns_bin_nll_with_scored_positions(tmp_path, positions):
+    root = tmp_path / 'golden'
+    logits = np.array([[8, 0, -2], [-2, 0, 8]], dtype='<f4')
+    tokens = np.array([2, 0, 2] if positions is None or positions[0] == 1
+                      else [2, 1, 1, 1, 0, 2], dtype='<u4')
+    for arm in ('a', 'b'):
+        out = root / arm / 'r1' / 'window'
+        out.mkdir(parents=True)
+        logits.tofile(out / 'logits.bin')
+        tokens.tofile(out / 'tokens.bin')
+        if positions is not None:
+            (out / 'meta.json').write_text(json.dumps(dict(positions=positions)))
+    state = dict(root=str(root), vocab=3, slots={})
+    result, = golden.compare_pairs(state, [('a', 'b')], 1)
+    assert not result.get('error') and result['nll_rows'] == 2
+    expected = -float(log_probs(logits)[np.arange(2), [0, 2]].mean())
+    assert result['nll_a'] == pytest.approx(expected, abs=1e-7)
+    assert result['nll_b'] == pytest.approx(expected, abs=1e-7)
+    assert result['mean_kl'] == 0 and result['top1_agreement'] == 1
+
+
+@pytest.mark.parametrize('with_metadata', [False, True])
+def test_compare_pairs_preserves_full_prompt_bin_final_unscored_row(tmp_path, with_metadata):
+    root = tmp_path / 'golden'
+    logits = np.array([[8, 0, -2], [-2, 0, 8], [1, 2, 3]], dtype='<f4')
+    for arm in ('a', 'b'):
+        out = root / arm / 'r1'
+        out.mkdir(parents=True)
+        logits.tofile(out / 'logits.bin')
+        np.array([2, 0, 2], dtype='<u4').tofile(out / 'tokens.bin')
+        if with_metadata:
+            (out / 'meta.json').write_text(json.dumps(dict(positions=[1, 2, 3])))
+    result, = golden.compare_pairs(dict(root=str(root), vocab=3, slots={}), [('a', 'b')], 1)
+    assert not result.get('error') and result['rows'] == 3 and result['nll_rows'] == 2
+    assert result['nll_a'] == pytest.approx(-float(log_probs(logits[:2])[np.arange(2), [0, 2]].mean()), abs=1e-7)
+
+
+@pytest.mark.parametrize('positions', [None, [0, 1], [4], [4, 6], [4, 6.0], [5, 6]])
+def test_compare_pairs_refuses_ambiguous_bin_nll_alignment(tmp_path, positions):
+    root = tmp_path / 'golden'
+    for arm in ('a', 'b'):
+        out = root / arm / 'r1'
+        out.mkdir(parents=True)
+        np.zeros((2, 3), dtype='<f4').tofile(out / 'logits.bin')
+        np.zeros(6, dtype='<u4').tofile(out / 'tokens.bin')
+        if positions is not None:
+            (out / 'meta.json').write_text(json.dumps(dict(positions=positions)))
+    result, = golden.compare_pairs(dict(root=str(root), vocab=3, slots={}), [('a', 'b')], 1)
+    assert result.get('error')
+
+
+@pytest.mark.parametrize('mismatch', ['positions', 'tokens'])
+def test_compare_pairs_refuses_misaligned_bin_arms(tmp_path, mismatch):
+    root = tmp_path / 'golden'
+    for arm in ('a', 'b'):
+        out = root / arm / 'r1'
+        out.mkdir(parents=True)
+        np.zeros((2, 3), dtype='<f4').tofile(out / 'logits.bin')
+        np.array([0, 0, int(arm == 'b' and mismatch == 'tokens'), 0, 0, 0],
+                 dtype='<u4').tofile(out / 'tokens.bin')
+        positions = [3, 4] if arm == 'b' and mismatch == 'positions' else [4, 5]
+        (out / 'meta.json').write_text(json.dumps(dict(positions=positions)))
+    result, = golden.compare_pairs(dict(root=str(root), vocab=3, slots={}), [('a', 'b')], 1)
+    assert 'different' in result['error']
 
 
 def test_resolve_model_uses_hub_paths(env):
@@ -881,15 +956,14 @@ def test_leftover_worker_is_refused(spark_env, capsys):
     assert 'golden-gr-a-expert2 already exists' in capsys.readouterr().err
 
 
-def test_dry_run_prints_workers_and_takes_nothing(spark_env, monkeypatch, capsys):
+def test_dry_run_reports_locks_without_argv_and_takes_nothing(spark_env, monkeypatch, capsys):
     taken = []
     monkeypatch.setattr(golden.hwlock, 'hold', lambda *a, **k: taken.append(a))
     assert golden.main(spark_argv(spark_env, '--dry-run')) == 0
     out = capsys.readouterr().out
     assert '# locks (fair queue, in order): sparks,gpu1,rhea,moa' in out
-    for rank, host in enumerate(SPARKS):
-        assert f'# a r1 expert rank {rank} on {host}' in out
-    assert 'native_step5_layer_chain' in out and 'golden-run: preflight pass' in out
+    assert 'native_step5_layer_chain' not in out
+    assert 'golden-run: preflight pass' in out
     assert not taken and not runs(spark_env)
     assert not any(c[:2] == ['run', '-d'] for c in docker_calls(spark_env))
     assert not (spark_env['home'] / '.cache/cuteafd/builds/gr/golden').exists()
@@ -949,12 +1023,17 @@ def test_fixture_and_spark_argument_refusals(env, capsys, extra, match):
     assert not runs(env)
 
 
-@pytest.mark.parametrize('family', ['kimi', 'muse'])
-def test_raw_family_requires_raw_mode(env, capsys, family):
-    write_slot(env['home'], 'i1')
-    argv = ['--task', 'gr', '--family', family, '--model', 'org/model', '--arm', 'a=i1:s1', '--', '--x']
-    assert golden.main(argv) == 2
-    assert 'has no golden subcommand' in capsys.readouterr().err
+def test_kimi_golden_routes_to_its_subcommand():
+    args = ['--snapshot', '{snapshot}', '--windows', '/panel', '--peers', '{peers}']
+    assert golden.golden_args('kimi', args, sparks=True) == ['kimi-golden', *args]
+
+
+def test_muse_golden_routes_packing_and_worker_arguments():
+    args = ['--snapshot', '{snapshot}', '--golden', '/reference', '--packed-check', '4',
+            '--prefill-packing', 'unrestricted', '--peers', '{peers}']
+    assert golden.golden_args('muse', args, sparks=True) == ['muse-golden', *args]
+    with pytest.raises(ValueError, match='Spark peers come from'):
+        golden.golden_args('muse', args, sparks=False)
 
 
 def test_muse_command_runs_from_sealed_slot_without_sparks(env):
@@ -1058,3 +1137,196 @@ def test_command_mode_does_not_auto_mount_host_executables_and_prefers_usr_local
     assert golden.main(explicit) == 0
     mounts = [runs(env)[-1][i + 1] for i, a in enumerate(runs(env)[-1]) if a == '-v']
     assert f'{host_exe}:{host_exe}:ro' in mounts
+
+
+CLI_HELP = """Usage: cuteafd glm-golden --snapshot <SNAPSHOT>
+Options:
+      --snapshot <SNAPSHOT>
+      --device <DEVICE> [default: 0]
+      --split-device <SPLIT_DEVICE>
+      --skip-routed-experts
+      --nll
+      --trace <TRACE>
+      --golden <GOLDEN>
+      --save-logits <SAVE_LOGITS>
+      --resume-at <RESUME_AT>
+      --resume-span <RESUME_SPAN>
+      --resume-decode <RESUME_DECODE>
+      --peers <PEERS>
+      --prefill-rows <PREFILL_ROWS>
+      --prefill-waves <PREFILL_WAVES>
+"""
+
+
+def test_sealed_help_has_no_gpu_or_host_network(monkeypatch, tmp_path):
+    commands = []
+    def run(cmd, **kwargs):
+        commands.append(cmd)
+        return subprocess.CompletedProcess(cmd, 0, CLI_HELP, '')
+    monkeypatch.setattr(golden, 'run', run)
+    assert golden.sealed_help({'root': str(tmp_path), 'image_id': IMAGE}, 'glm-golden') == CLI_HELP
+    cmd = commands[0]
+    assert '--gpus' not in cmd and '--device' not in cmd
+    assert cmd[cmd.index('--network') + 1] == 'none'
+    assert cmd[-2:] == ['glm-golden', '--help']
+    assert cmd[cmd.index('--entrypoint') + 1] == '/usr/bin/timeout'
+    assert cmd[cmd.index(IMAGE) + 1] == '45'
+
+
+@pytest.mark.parametrize('args,message', [
+    (['--snapshot', '{snapshot}', '--max-context', '4096'], 'unrecognized arguments'),
+    (['--nll'], '--dump-dir'),
+    (['--dump-dir', '{out}/dump', '--device', '0'], 'unrecognized arguments'),
+])
+def test_sealed_cli_refusals_precede_lock(env, monkeypatch, capsys, args, message):
+    write_slot(env['home'], 'i1')
+    help_text = CLI_HELP if '--max-context' in args else (
+        'Usage: cuteafd dsv4-golden --dump-dir <DUMP_DIR>\nOptions:\n      --dump-dir <DUMP_DIR>\n      --nll\n')
+    monkeypatch.setattr(golden, 'sealed_help', lambda *a: help_text)
+    taken = []
+    monkeypatch.setattr(golden.hwlock, 'hold', lambda *a, **k: taken.append(a))
+    assert golden.main(BASE + ['--arm', 'a=i1:s1', '--', *args]) == 2
+    assert message in capsys.readouterr().err
+    assert not taken and not runs(env)
+
+
+def test_v41_uses_rtx_gpus_not_device(env, monkeypatch, capsys):
+    write_slot(env['home'], 'i1')
+    text = 'Usage: cuteafd v41-golden\nOptions:\n      --rtx-gpus <RTX_GPUS> [default: 1]\n'
+    monkeypatch.setattr(golden, 'sealed_help', lambda *a: text)
+    args = BASE.copy()
+    args[3] = 'v41'
+    assert golden.main(args + ['--arm', 'a=i1:s1', '--preflight-only', '--', '--device', '0']) == 2
+    assert 'unrecognized arguments' in capsys.readouterr().err
+    assert golden.main(args + ['--arm', 'a=i1:s1', '--preflight-only', '--', '--rtx-gpus', '1']) == 0
+
+
+def test_physical_gpu_one_is_logical_zero(env, capsys):
+    write_slot(env['home'], 'i1')
+    base = BASE + ['--arm', 'a=i1:s1', '--gpus', '1', '--preflight-only', '--', '--snapshot', '{snapshot}']
+    assert golden.main(base + ['--device', '1']) == 2
+    assert 'container-visible logical ordinal' in capsys.readouterr().err
+    assert golden.main(base + ['--device', '0']) == 0
+
+
+@pytest.mark.parametrize('flag,value', [('--prefill-rows', '80'), ('--prefill-rows', '4160'),
+                                       ('--prefill-waves', '5')])
+def test_invalid_prefill_shape_precedes_lock(env, monkeypatch, capsys, flag, value):
+    write_slot(env['home'], 'i1')
+    taken = []
+    monkeypatch.setattr(golden.hwlock, 'hold', lambda *a, **k: taken.append(a))
+    assert golden.main(BASE + ['--arm', 'a=i1:s1'] + GOLDEN + [flag, value]) == 2
+    assert flag in capsys.readouterr().err
+    assert not taken and not runs(env)
+
+
+def test_sparknest_requires_rdma_before_lock(env, monkeypatch, capsys):
+    write_slot(env['home'], 'i1')
+    monkeypatch.setenv('CUTEAFD_NAMESPACE_ROOT', str(env['tmp'] / 'hub'))
+    base = BASE + ['--arm', 'a=i1:s1', '--preflight-only']
+    assert golden.main(base + GOLDEN) == 2
+    assert 'add --rdma' in capsys.readouterr().err
+    assert golden.main(base + ['--rdma'] + GOLDEN) == 0
+
+
+def test_missing_reference_env_derived_from_sealed_image(env, monkeypatch):
+    write_slot(env['home'], 'i1')
+    monkeypatch.delenv('CUTEAFD_REFERENCE_IMAGE', raising=False)
+    monkeypatch.delenv('CUTEAFD_REFERENCE_IMAGE_SHA256', raising=False)
+    assert golden.main(BASE + ['--arm', 'a=i1:s1'] + GOLDEN) == 0
+    record = json.loads((env['home'] / '.cache/cuteafd/builds/gr/golden/a/r1/argv.json').read_text())
+    assert record['env']['CUTEAFD_REFERENCE_IMAGE'] == IMAGE
+    assert record['env']['CUTEAFD_REFERENCE_IMAGE_SHA256'] == IMAGE
+
+
+def test_v41_prefill_uses_live_row_floor(env, monkeypatch, capsys):
+    write_slot(env['home'], 'i1')
+    text = 'Usage: cuteafd v41-golden\nOptions:\n      --prefill-batch-tokens <ROWS>\n        [default: 80]\n'
+    monkeypatch.setattr(golden, 'sealed_help', lambda *a: text)
+    args = BASE.copy()
+    args[3] = 'v41'
+    args += ['--arm', 'a=i1:s1', '--preflight-only', '--', '--prefill-batch-tokens']
+    assert golden.main(args + ['80']) == 2
+    assert 'page-aligned' in capsys.readouterr().err
+    assert golden.main(args + ['128']) == 2
+    assert 'live rows' in capsys.readouterr().err
+    assert golden.main(args + ['256']) == 0
+
+
+def test_arm_specific_cli_options_are_validated(env, capsys):
+    write_slot(env['home'], 'i1')
+    assert golden.main(BASE + ['--arm', 'a=i1:s1', '--arm-arg', 'a:--max-context',
+                               '--arm-arg', 'a:4096', '--preflight-only'] + GOLDEN) == 2
+    assert '--max-context' in capsys.readouterr().err
+
+
+def test_dump_dir_is_required_and_writable(env, monkeypatch):
+    write_slot(env['home'], 'i1')
+    text = 'Usage: cuteafd dsv4-golden --dump-dir <DUMP_DIR>\nOptions:\n      --dump-dir <DUMP_DIR>\n'
+    monkeypatch.setattr(golden, 'sealed_help', lambda *a: text)
+    assert golden.main(BASE + ['--arm', 'a=i1:s1', '--preflight-only', '--',
+                               '--dump-dir', '{out}/dump']) == 0
+
+
+def test_clap_multiline_defaults_and_optional_values():
+    text = """Usage: cuteafd glmf-golden [OPTIONS] --snapshot <SNAPSHOT>
+
+Options:
+      --snapshot <SNAPSHOT>
+          Checkpoint snapshot directory
+
+      --expert-usage[=<EXPERT_USAGE>]
+          Count routes
+          [default: true]
+          [possible values: true, false]
+
+      --prefill-rows <PREFILL_ROWS>
+          Rows; zero selects automatic resolution
+          [default: 0]
+
+      --prefill-waves <PREFILL_WAVES>
+          Waves; zero selects automatic resolution
+          [default: 0]
+
+      --resume-at <RESUME_AT>
+          --resume-at accepts multiple positions.
+
+  -h, --help
+          Print help
+"""
+    state = dict(golden=['glmf-golden', '--snapshot', '{snapshot}', '--expert-usage=false'],
+                 family='glmf', gpus=[1], snapshot_container='/model', hub='/hub', sparks=None)
+    golden.validate_golden_cli(state, {}, text)
+    parser, defaults = golden.cli_from_help(text)
+    assert defaults['--prefill-rows'] == '0'
+    assert parser.parse_args(['--snapshot', '/model', '--expert-usage=false']).expert_usage == 'false'
+    assert parser.parse_args(['--snapshot', '/model', '--expert-usage']).expert_usage is None
+
+
+def test_arm_dump_dir_must_be_writable(env, monkeypatch, capsys):
+    write_slot(env['home'], 'i1')
+    text = 'Usage: cuteafd dsv4-golden --dump-dir <DUMP_DIR>\nOptions:\n      --dump-dir <DUMP_DIR>\n      --nll\n'
+    monkeypatch.setattr(golden, 'sealed_help', lambda *a: text)
+    assert golden.main(BASE + ['--arm', 'a=i1:s1', '--arm-arg', 'a:--dump-dir',
+                               '--arm-arg', 'a:/readonly/dump', '--preflight-only', '--', '--nll']) == 2
+    assert 'write outputs under the arm directory' in capsys.readouterr().err
+
+
+def test_sealed_help_failure_does_not_print_argv(env, monkeypatch, capsys):
+    write_slot(env['home'], 'i1')
+    def failed(*args):
+        raise subprocess.CalledProcessError(2, ['private-program', 'private-argument'])
+    monkeypatch.setattr(golden, 'sealed_help', failed)
+    assert golden.main(BASE + ['--arm', 'a=i1:s1', '--preflight-only'] + GOLDEN) == 2
+    error = capsys.readouterr().err
+    assert 'sealed CLI/container check failed' in error
+    assert 'private-program' not in error and 'private-argument' not in error
+
+
+def test_required_native_library_is_supplied_by_slot_environment():
+    text = 'Usage: cuteafd golden --native-lib <NATIVE_LIB> --golden <GOLDEN>\nOptions:\n' + (
+        '      --native-lib <NATIVE_LIB>\n      --golden <GOLDEN>\n')
+    parser, _ = golden.cli_from_help(text)
+    assert parser.parse_args(['--golden', '/golden']).native_lib is None
+    with pytest.raises(ValueError, match='--golden'):
+        parser.parse_args([])

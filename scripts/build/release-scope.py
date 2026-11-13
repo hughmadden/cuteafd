@@ -17,7 +17,7 @@ import re
 import tarfile
 
 PREFIX = 'CUTEAFD_RELEASE_'
-SWITCHES = ('DSV4', 'GLM', 'GLMF', 'MIMO', 'QWEN4', 'QWEN_DENSE', 'STEP5', 'KIMIK3', 'MUSE', 'AUDIO', 'CONTEXT_SPLIT', 'EXLR8')
+SWITCHES = ('DSV4', 'GLM', 'GLMF', 'MIMO', 'QWEN4', 'QWEN_DENSE', 'STEP5', 'KIMIK3', 'MUSE', 'AUDIO', 'CONTEXT_SPLIT', 'EXLR8', 'MINIMAX')
 LISTS = ('EXPERT_FAMILIES', 'GENERIC_SPARK_COUNTS', 'SPARK_TP_ROLES', 'MIMO_GEOMETRIES',
          'FP8_MOE_BF16_FAMILIES', 'EXLR8_FAMILIES')
 # v2.0.0 shipped set: complete releases retain this previous-release floor.
@@ -42,7 +42,9 @@ PREVIOUS_RELEASE_FLOOR = {
         }.items() for count in counts
     } | {'qwen4:nvfp4=6', 'qwen4:nvfp4a4=6'},
 }
-DEFAULT_MATRIX = 'scripts/bench/release-smoke-v4.json'
+DEFAULT_MATRIX = 'scripts/bench/release-smoke-v5.json'
+# WIP scope switches with no release key: release images always build V4.1 and vision.
+WIP_ONLY = {'V41_AOT', 'VISION_ATTENTION_AOT'}
 
 
 # Retained package/layout floor from the stopped v2.0.0 images.
@@ -78,6 +80,14 @@ def previous_release_packages():
 
 def scopes_module(repo):
     spec = importlib.util.spec_from_file_location('wip_aot_scopes', repo / 'scripts/lib/wip_aot_scopes.py')
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def spark_packages_module():
+    path = Path(__file__).resolve().parents[2] / 'python/tools/lib/spark_packages.py'
+    spec = importlib.util.spec_from_file_location('release_spark_packages', path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
@@ -134,6 +144,8 @@ def derive(repo, matrix, scope='all', environ=None):
             if suffix == 'COORDINATOR_EXPERT_FAMILIES':
                 suffix = 'EXPERT_FAMILIES'
             target = PREFIX + suffix
+            if suffix in WIP_ONLY:
+                continue
             if suffix.endswith('_AOT') and value == 'ON':
                 result[target] = 'ON'
             elif suffix in LISTS:
@@ -166,10 +178,7 @@ def derive(repo, matrix, scope='all', environ=None):
     if scope == 'all':
         # Card scopes are intentionally narrow. A complete release must instead
         # expose every alias backed by its enabled families' width-class objects.
-        path = Path(__file__).resolve().parents[2] / 'python/tools/lib/spark_packages.py'
-        spec = importlib.util.spec_from_file_location('release_spark_packages', path)
-        packages = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(packages)
+        packages = spark_packages_module()
         counts = tokens(result[PREFIX + 'GENERIC_SPARK_COUNTS'])
         experts = tokens(result[PREFIX + 'EXPERT_FAMILIES'])
         for expert in tuple(experts):
@@ -195,13 +204,14 @@ def derive(repo, matrix, scope='all', environ=None):
 
 
 def requirements(repo, matrix, scope):
+    packages = spark_packages_module()
     result = []
     for entry in entries_for(repo, matrix, scope):
         family, values, scopes = entry_scopes(repo, entry)
         experts = tokens(scopes['CUTEAFD_WIP_COORDINATOR_EXPERT_FAMILIES'])
         dual = int(values.get('RTX_GPUS', '1').replace('auto', '2')) == 2
         count = int(values.get('SPARK_COUNT', '0'))
-        tp = int(values.get('SPARK_TP') or count or 1)
+        tp = count or 1
         programs = set()
         if family == 'deepseek_v4':
             tag = 'dsv4p' if any(s.startswith('dsv4p:') for s in experts) else 'dsv4f'
@@ -224,10 +234,31 @@ def requirements(repo, matrix, scope):
             programs = {'step5', 'step52'} if dual else {'step5'}
         elif family == 'kimi_k3':
             programs = {'kimik3', 'dense_trellis_k6', 'kimi_split'}
+            checkpoint = scopes_module(repo).checkpoint_config(values) or {}
+            text = checkpoint.get('text_config', checkpoint)
+            if (checkpoint.get('model_type') == 'kimi_k31'
+                    or 'KimiK31ForConditionalGeneration' in checkpoint.get('architectures', [])
+                    or 'dsa_config' in text):
+                programs.add('kimik31')
+        elif family == 'mistral_large4':
+            programs = {'ml4', 'dense_trellis_k6'} | ({'ml42'} if dual else set())
+        elif family == 'minimax_m3':
+            programs = {'minimax'}
         elif family == 'muse_spark':
             programs = {'muse', 'dense_trellis_k6', 'expert_partial'} | ({'muse2'} if dual else set())
+        spark_experts = sorted(tokens(scopes['CUTEAFD_WIP_EXPERT_FAMILIES']))
+        spark_layouts = {item: [layout.removesuffix('/m1') for layout in scopes_module(repo).exl3_spark_layouts(item, tp)]
+                         for item in spark_experts if ':exl3-' in item}
+        native_spark_symbols = {}
+        for item in spark_experts:
+            tag, kind = item.split(':')
+            if tag in ('dsv4f', 'dsv4p') and kind.startswith('spark'):
+                world = 4 if kind == 'spark' else int(kind.removeprefix('spark_tp'))
+                artifacts = packages.native_spark_artifacts(tag)[world]
+                native_spark_symbols[item] = [artifact.prefix(tag) + 'launch' for artifact in artifacts]
         result.append(dict(name=entry['name'], family=family, programs=sorted(programs),
-                           experts=sorted(experts), spark_experts=sorted(tokens(scopes['CUTEAFD_WIP_EXPERT_FAMILIES'])),
+                           experts=sorted(experts), spark_experts=spark_experts, spark_layouts=spark_layouts,
+                           native_spark_symbols=native_spark_symbols,
                            spark_count=count, spark_tp=tp, dual=dual,
                            roles=sorted(tokens(scopes['CUTEAFD_WIP_SPARK_TP_ROLES'])),
                            nvfp4='nvfp4' in values.get('MODEL_ID', '').lower(),
@@ -275,7 +306,11 @@ def check_package(root, package, layouts, role, verified=None):
     require(manifest.get('role') == ('spark' if role == 'expert' else role), f'{package}: wrong role')
     if package.startswith('exl3/'):
         require(manifest.get('schema') == 'cuteafd.exl3-package.v1', f'{package}: invalid EXL3 schema')
-        present = {v['directory'].split('/')[0] for v in manifest.get('variants', [])}
+        variants = {v['directory'] for v in manifest.get('variants', [])}
+        present = {directory.split('/')[0] for directory in variants}
+        if role == 'expert':
+            missing = sorted(layout + '/m1' for layout in layouts if layout + '/m1' not in variants)
+            require(not missing, f'{package}: missing m1 variants {missing}')
     else:
         present = set(manifest.get('layouts', {}))
         # Both Spark and coordinator H128 slices require exact-width siblings.
@@ -303,7 +338,8 @@ def check_package(root, package, layouts, role, verified=None):
         require(file.stat().st_size == record['bytes'] and hashlib.sha256(file.read_bytes()).hexdigest() == record['sha256'],
                 f'{package}: file hash mismatch {name}')
     for layout in layouts:
-        require(any(name.startswith(layout + '/') and name.endswith('.so') for name in files),
+        prefix = layout + ('/m1/' if package.startswith('exl3/') and role == 'expert' else '/')
+        require(any(name.startswith(prefix) and name.endswith('.so') for name in files),
                 f'{package}: missing library for {layout}')
     if verified is not None:
         verified.add(path)
@@ -367,7 +403,7 @@ def check_inventory(root, role, wanted, symbols=None):
             for item in scopes:
                 family, kind = item.split(':')
                 if kind.startswith('exl3-'):
-                    layouts = [f'tp{entry["spark_tp"]}-rank{rank}' for rank in range(entry['spark_tp'])] if role == 'expert' else ['rtx-tp1']
+                    layouts = entry['spark_layouts'][item] if role == 'expert' else ['rtx-tp1']
                     if role == 'coordinator' and entry['dual']:
                         layouts.extend(['rtx-tp2-rank0', 'rtx-tp2-rank1'] if family == 'qwen4' else ['rtx-tp2'])
                     check_package(root, f'exl3/exl3-{family}-{kind[5:]}', layouts, role, verified)
@@ -386,11 +422,18 @@ def check_inventory(root, role, wanted, symbols=None):
                     if family == 'qwen4' and kind.startswith('nvfp4') and role == 'coordinator':
                         check_package(root, 'fp8/fp8-qwen4', ['tp1'], role, verified)
                 elif (role == 'coordinator') == kind.startswith('rtx_'):
-                    tag = {'rtx_backbone': '_local', 'rtx_tp2': '_tp2', 'spark': '', 'spark_tp2': '_spark_tp2'}[kind]
-                    symbol = f'cuteafd_{family}{tag}_expert_launch'
-                    require(symbol in symbols, f'missing native expert package {item} ({symbol})')
+                    if role == 'expert':
+                        required = entry['native_spark_symbols'][item]
+                        require(bool(required), f'empty native expert symbol inventory {item}')
+                    else:
+                        tag = {'rtx_backbone': '_local', 'rtx_tp2': '_tp2'}[kind]
+                        required = [f'cuteafd_{family}{tag}_expert_launch']
+                    for symbol in required:
+                        require(symbol in symbols, f'missing native expert package {item} ({symbol})')
             if entry['audio']:
                 require('cuteafd_audio_required' in symbols, 'missing audio tower package (cuteafd_audio_required)')
+                if entry['family'] == 'muse_spark':
+                    require('cuteafd_pcm_required' in symbols, 'missing Muse audio tower package (cuteafd_pcm_required)')
         except (ValueError, KeyError, TypeError) as error:
             raise ValueError(f'entry {entry["name"]} ({role}): {error}') from error
 
@@ -429,7 +472,7 @@ def revision_requirements(repo, revision):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('action', choices=('derive', 'requirements', 'check-image', 'check-files'))
+    parser.add_argument('action', choices=('default-matrix', 'derive', 'requirements', 'check-image', 'check-files'))
     parser.add_argument('--repo', type=Path, default=None)
     parser.add_argument('--matrix', type=Path)
     parser.add_argument('--revision')
@@ -440,6 +483,9 @@ def main():
     parser.add_argument('--root', type=Path)
     parser.add_argument('--requirements')
     args = parser.parse_args()
+    if args.action == 'default-matrix':
+        print(DEFAULT_MATRIX)
+        return
     try:
         # Inventory checks supplied with requirements work when sent over stdin,
         # without resolving __file__ or assuming a remote working directory.

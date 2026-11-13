@@ -7,6 +7,8 @@ import subprocess
 import pytest
 
 ROOT = Path(__file__).resolve().parents[2]
+FAILURE_HEADER = '#include "' + str(ROOT / "native/shared/include/memory_failure.h") + '"\n'
+CALLBACK_SOURCE = ROOT / "native/shared/src/memory_failure.cc"
 SOURCE = ROOT / "native/shared/src/tp2_kernel_inventory.cc"
 ABI = """#pragma once
 #include <cstdint>
@@ -187,8 +189,7 @@ def test_peer_watchdog_reports_counters_and_opt_in_exchange_identity():
     engine = (family / "engine.rs").read_text()
     assert 'routes.trace_identity("glmf-tp2-routes")' in engine
     assert 'exchange.trace_identity("glmf-target-main")' in engine
-    assert 'IDENTITY: &str = "glmf-remote-dflash:taps,input,hidden,logits"' in (
-        family / "remote_dflash.rs").read_text()
+    assert '"glmf-remote-dflash:taps,input,hidden,logits"' in (family / "mod.rs").read_text()
     assert "exchange.trace_identity(identity)" in (
         family.parent.parent / "shared/draft/remote.rs").read_text()
 
@@ -233,7 +234,7 @@ static_assert(sizeof(cuteafd_peer_diagnostic_t) == 64);
 
 def test_remote_context_wait_is_ordered_after_cooperative_target_producer():
     family = ROOT / "rust/crates/cuteafd-daemon/src/families/glm5_flash"
-    remote = (family / "remote_dflash.rs").read_text()
+    remote = (family.parent.parent / "shared/draft/remote_dflash.rs").read_text()
     update = remote.split("pub fn update(&self", 1)[1].split("pub fn put_taps", 1)[0]
     assert "self.synchronize()?" not in update
     assert "cuda_stream_synchronize" not in update
@@ -294,61 +295,248 @@ def test_owner_pair_diagnostic_timing_waits_for_end_before_elapsed_query():
     assert "end.record(&rank.stream)?;" in execute
 
 
-def test_compiled_bf16_blas_handles_follow_device_and_retry_failed_creation(tmp_path):
+BLAS_MOCK = r"""
+#pragma once
+#include <cassert>
+#include <cstddef>
+#include <cstdint>
+#include <cstdlib>
+#include <limits>
+#include <memory>
+#include <string>
+#include <thread>
+using cudaStream_t = void*;
+using cudaStreamCaptureStatus = int;
+using cudaError_t = int;
+using cuteafd_status_t = int;
+using cublasStatus_t = int;
+using cublasMath_t = int;
+using cublasAtomicsMode_t = int;
+struct MockBlas { int device; std::thread::id thread; void* stream; void* workspace;
+                  int math = 0, atomics = 0; };
+using cublasHandle_t = MockBlas*;
+using cublasLtHandle_t = MockBlas*;
+constexpr int cudaSuccess = 0, cudaStreamCaptureStatusNone = 0;
+constexpr int CUBLAS_STATUS_SUCCESS = 0, CUBLAS_STATUS_NOT_INITIALIZED = 1;
+constexpr int CUBLAS_STATUS_ALLOC_FAILED = 3, CUBLAS_STATUS_INVALID_VALUE = 7;
+constexpr int CUBLAS_DEFAULT_MATH = 0, CUBLAS_ATOMICS_ALLOWED = 0;
+constexpr int CUBLAS_MATH_DISALLOW_REDUCED_PRECISION_REDUCTION = 16;
+constexpr int CUTEAFD_STATUS_OK = 0, CUTEAFD_STATUS_INVALID_ARGUMENT = 1;
+constexpr int CUTEAFD_STATUS_INTERNAL_ERROR = 2, CUTEAFD_STATUS_CAPTURE_REQUIRES_PREPARE = 9;
+constexpr int CUBLAS_OP_T = 0, CUBLAS_OP_N = 1, CUDA_R_16BF = 0;
+constexpr int CUBLAS_COMPUTE_32F = 0, CUBLAS_GEMM_DEFAULT_TENSOR_OP = 0;
+constexpr int cudaStreamCaptureModeThreadLocal = 1;
+inline thread_local int device = 0, device_error = 0, cuda_last_error = 0;
+inline thread_local bool capturing = false;
+inline int creates = 0, lt_creates = 0, destroys = 0, lt_destroys = 0;
+inline int allocations = 0, frees = 0, bindings = 0, gemms = 0, begins = 0, drains = 0;
+inline int create_error = 0, alloc_error = 0, capture_error = 0;
+inline std::string last_error;
+inline cublasHandle_t last_gemm = nullptr;
+inline int cudaGetDevice(int* out) { *out = device; return device_error; }
+inline int cudaSetDevice(int id) { device = id; return 0; }
+inline int cudaDeviceSynchronize() { ++drains; return 0; }
+inline int cudaStreamIsCapturing(void*, int* out) { *out = capturing ? 1 : 0; return 0; }
+inline int cudaMalloc(void** out, size_t bytes) {
+  assert(!capturing && bytes == (4 << 20));
+  if (alloc_error) return alloc_error;
+  ++allocations; *out = malloc(1); return *out ? 0 : 2;
+}
+inline int cudaFree(void* ptr) { ++frees; free(ptr); return 0; }
+inline int cublasCreate(cublasHandle_t* out) {
+  assert(!capturing); ++creates;
+  if (create_error) return create_error;
+  *out = new MockBlas{device, std::this_thread::get_id(), nullptr, nullptr}; return 0;
+}
+inline int cublasLtCreate(cublasLtHandle_t* out) {
+  assert(!capturing); ++lt_creates;
+  *out = new MockBlas{device, std::this_thread::get_id(), nullptr, nullptr}; return 0;
+}
+inline int cublasDestroy(cublasHandle_t h) { assert(device == h->device); ++destroys; delete h; return 0; }
+inline int cublasLtDestroy(cublasLtHandle_t h) { assert(device == h->device); ++lt_destroys; delete h; return 0; }
+inline int cublasSetStream(cublasHandle_t h, void* s) {
+  assert(h->device == device && h->thread == std::this_thread::get_id());
+  ++bindings; h->stream = s; h->workspace = nullptr; return 0;
+}
+inline int cublasSetWorkspace(cublasHandle_t h, void* w, size_t bytes) {
+  assert(w && bytes == (4 << 20)); h->workspace = w; return 0;
+}
+inline int cublasSetMathMode(cublasHandle_t h, int mode) { h->math = mode; return 0; }
+inline int cublasSetAtomicsMode(cublasHandle_t h, int mode) { h->atomics = mode; return 0; }
+template<class... Args> int cublasGemmEx(cublasHandle_t h, Args...) {
+  assert(h->workspace && h->math == CUBLAS_MATH_DISALLOW_REDUCED_PRECISION_REDUCTION && h->atomics == 0);
+  ++gemms; last_gemm = h; return 0;
+}
+inline int cudaGetLastError() { const int status = cuda_last_error; cuda_last_error = 0; return status; }
+inline int cudaStreamBeginCapture(void* s, int mode) {
+  assert(s && mode == cudaStreamCaptureModeThreadLocal && !capturing);
+  if (capture_error) cuda_last_error = capture_error;
+  ++begins; capturing = capture_error == 0; return capture_error;
+}
+inline void cuteafd_set_last_error_message(const char* s) { last_error = s; }
+inline int status_from_cuda(int s) { return s; }
+inline int status_from_cublas(int s) { return s; }
+inline int fail(int status, const char*) { return status; }
+inline int fail_cuda(int status, const char*, int) { return status; }
+inline int ok() { return 0; }
+inline int validate_linear_bf16_args(const uint16_t*, const uint16_t*, uint16_t*, size_t, size_t, size_t) { return 0; }
+"""
+
+
+def _compile_blas_fixture(tmp_path, main, extra=""):
     compiler = shutil.which("g++")
     if not compiler:
         pytest.skip("C++ compiler unavailable")
-    source = (ROOT / "native/shared/cuda/linear.cu").read_text()
-    helper = source.split("cuteafd_status_t cublas_handle(", 1)[1].split(
+    (tmp_path / "mock_blas.h").write_text(BLAS_MOCK)
+    for name in ("cuda_runtime.h", "cublas_v2.h", "cublasLt.h"):
+        (tmp_path / name).write_text('#include "mock_blas.h"\n')
+    linear = (ROOT / "native/shared/cuda/linear.cu").read_text()
+    helper = "constexpr size_t kLinearBlasWorkspace" + linear.split(
+        "constexpr size_t kLinearBlasWorkspace", 1)[1].split(
         "cuteafd_status_t validate_linear_args", 1)[0]
-    mock = r'''
-#include <cassert>
-#include <unordered_map>
-using cuteafd_status_t = int;
-using cublasHandle_t = int*;
-using cublasStatus_t = int;
-using cudaError_t = int;
-constexpr int CUTEAFD_STATUS_OK = 0, CUTEAFD_STATUS_INVALID_ARGUMENT = 1;
-constexpr int cudaSuccess = 0, CUBLAS_STATUS_SUCCESS = 0;
-static int device = 0, device_error = 0, create_error = 0, creates = 0, logs = 0;
-static int owners[8];
-int cudaGetDevice(int* out) { *out = device; return device_error; }
-int cublasCreate(cublasHandle_t* out) {
-  ++creates;
-  if (create_error) return create_error;
-  owners[creates] = device;
-  *out = &owners[creates];
-  return 0;
-}
-int status_from_cuda(int status) { return status; }
-int status_from_cublas(int status) { return status; }
-void log_blas_handle_created(const char*) { ++logs; }
-'''
-    main = r'''
+    prepare = 'extern "C" cuteafd_status_t cuteafd_cuda_prepare_cublas_stream(' + linear.split(
+        'extern "C" cuteafd_status_t cuteafd_cuda_prepare_cublas_stream(', 1)[1].split(
+        'extern "C" cuteafd_status_t cuteafd_cuda_graph_update_linear_bf16_node', 1)[0]
+    native = (ROOT / "native/shared/src/cuteafd_native.cc").read_text()
+    capture = 'extern "C" cuteafd_status_t cuteafd_cuda_graph_begin_capture(' + native.split(
+        'extern "C" cuteafd_status_t cuteafd_cuda_graph_begin_capture(', 1)[1].split(
+        'extern "C" cuteafd_status_t cuteafd_cuda_graph_end_capture(', 1)[0]
+    launch = "cuteafd_status_t launch_linear_bf16_cublas(" + linear.split(
+        "cuteafd_status_t launch_linear_bf16_cublas(", 1)[1].split(
+        "  if (bias != nullptr) {", 1)[0] + "  (void)bias; return 0;\n}\n"
+    diagnostics = (ROOT / "native/shared/include/cuteafd_graph_diagnostics.h").read_text()
+    clear_error = "inline cudaError_t diagnostic_cuda" + diagnostics.split(
+        "inline cudaError_t diagnostic_cuda", 1)[1].split("using GraphEdgesQuery", 1)[0]
+    fixture = tmp_path / "blas.cc"
+    fixture.write_text('#define CUTEAFD_NATIVE_ENABLE_CUDA 1\n#include "blas_owner.h"\n' +
+                       'namespace cuteafd {\n' + clear_error + '}\n' +
+                       helper + prepare + capture + launch + main)
+    sources = [str(fixture), str(CALLBACK_SOURCE)]
+    if extra:
+        other = tmp_path / "borrower.cc"
+        other.write_text('#include "blas_owner.h"\n' + extra)
+        sources.append(str(other))
+    executable = tmp_path / "blas"
+    built = subprocess.run([compiler, "-std=c++17", "-pthread", "-Wall", "-Wextra", "-Werror",
+                            *sources, "-I", str(tmp_path), "-I", str(ROOT / "native/shared/include"),
+                            "-o", str(executable)], capture_output=True, text=True)
+    assert built.returncode == 0, built.stderr
+    ran = subprocess.run([str(executable)], capture_output=True, text=True)
+    assert ran.returncode == 0, ran.stderr
+    return ran.stderr
+
+
+def test_compiled_bf16_blas_handles_follow_device_and_retry_failed_creation(tmp_path):
+    logs = _compile_blas_fixture(tmp_path, r"""
+std::shared_ptr<cuteafd::BlasOwner> other_borrower(bool lt);
 int main() {
   cublasHandle_t first = nullptr, second = nullptr, again = nullptr;
-  assert(cublas_handle(nullptr) == CUTEAFD_STATUS_INVALID_ARGUMENT);
-  assert(creates == 0);
-  assert(cublas_handle(&first) == 0 && *first == 0);
+  std::shared_ptr<cuteafd::BlasOwner> invalid;
+  assert(cuteafd::borrow_blas(false, invalid, "") == 7 && creates == 0);
+  assert(cublas_handle(nullptr) == 1 && creates == 0);
+  assert(cublas_handle(&first) == 0 && first->device == 0);
+  uint32_t kind = 0; char name[128] = {}; size_t required = 0;
+  assert(cuteafd_last_allocation_tag(&kind, name, sizeof(name), &required) == 0);
+  assert(kind == CUTEAFD_MEMORY_KIND_WORKSPACE && std::string(name) == "shared/blas/linear");
+  auto shared = other_borrower(false);
+  assert(shared->gemm_owner == "shared/blas/linear");
+  assert(shared->gemm == first && creates == 1);
+  assert(other_borrower(true) == shared && lt_creates == 1);
+  void* workspace = first->workspace;
+  assert(cuteafd::bind_blas(shared, nullptr, workspace, 4 << 20, 5, 1) == 0);
+  assert(first->math == 5 && first->atomics == 1);
+  assert(cublas_handle(&again) == 0 && again == first);
+  assert(first->math == CUBLAS_MATH_DISALLOW_REDUCED_PRECISION_REDUCTION
+      && first->atomics == 0 && first->workspace == workspace);
   device = 1; create_error = 7;
   assert(cublas_handle(&second) == 7 && second == nullptr);
-  create_error = 0;
-  assert(cublas_handle(&second) == 0 && *second == 1 && first != second);
+  create_error = 0; alloc_error = 2;
+  assert(cublas_handle(&second) == 2 && second == nullptr);
+  alloc_error = 0;
+  assert(cublas_handle(&second) == 0 && second->device == 1 && first != second);
+  assert(creates == 3 && allocations == 2);
   device = 0;
   assert(cublas_handle(&again) == 0 && again == first);
-  device = 1;
-  assert(cublas_handle(&again) == 0 && again == second);
   device_error = 19;
-  assert(cublas_handle(&again) == 19 && again == second);
-  assert(creates == 3 && logs == 2);
+  assert(cublas_handle(&again) == 19 && again == first);
+  device_error = 0;
+  std::thread worker([&] {
+    assert(cuteafd::bind_blas(shared, nullptr, workspace, 4 << 20) == 7);
+    auto local = other_borrower(false);
+    assert(local != shared && local->gemm != first);
+  });
+  worker.join();
+  assert(creates == 4 && destroys == 1);
 }
-'''
-    fixture = tmp_path / "blas_handles.cc"
-    fixture.write_text(mock + "cuteafd_status_t cublas_handle(" + helper + main)
-    executable = tmp_path / "blas_handles"
-    subprocess.run([compiler, "-std=c++17", "-Wall", "-Wextra", "-Werror",
-                    str(fixture), "-o", str(executable)], check=True, capture_output=True)
-    subprocess.run([str(executable)], check=True, capture_output=True)
+""", r"""
+std::shared_ptr<cuteafd::BlasOwner> other_borrower(bool lt) {
+  std::shared_ptr<cuteafd::BlasOwner> owner;
+  assert(cuteafd::borrow_blas(lt, owner, "test/blas/serving") == 0);
+  return owner;
+}
+""")
+    assert logs.count("event=create backend=gemm") == 3
+    assert logs.count("event=create backend=lt") == 1
+    assert logs.count("event=destroy backend=gemm") == 3
+    assert logs.count("event=destroy backend=lt") == 1
+    assert logs.count("blas_workspace ") == 2
+    assert "thread_id=" in logs and "thread_name=" in logs
+
+
+def test_compiled_graph_capture_requires_explicit_blas_prepare_without_changing_stream(tmp_path):
+    _compile_blas_fixture(tmp_path, r"""
+int main() {
+  void* capture_stream = reinterpret_cast<void*>(uintptr_t(0x10));
+  void* eager_stream = reinterpret_cast<void*>(uintptr_t(0x20));
+  uint16_t buffer = 0;
+  auto gemm = [&](void* stream) {
+    assert(launch_linear_bf16_cublas(&buffer, &buffer, nullptr, &buffer, 1, 1, 1, stream) == 0);
+    assert(last_gemm->stream == stream);
+  };
+  assert(cuteafd_cuda_graph_begin_capture(nullptr) == 1 && creates == 0);
+  assert(cuteafd_cuda_graph_begin_capture(capture_stream) == 0 && creates == 0);
+  assert(launch_linear_bf16_cublas(&buffer, &buffer, nullptr, &buffer, 1, 1, 1, capture_stream) == 9);
+  assert(capturing && creates == 0 && allocations == 0 && bindings == 0 && gemms == 0);
+  assert(last_error.find("cuteafd_cuda_linear_bf16_cublas_async") != std::string::npos);
+  assert(last_error.find("before capture") != std::string::npos);
+  capturing = false;
+  assert(cuteafd_cuda_prepare_cublas_stream(capture_stream) == 0);
+  cublasHandle_t first = nullptr;
+  gemm(capture_stream); first = last_gemm;
+  auto captured_workspace = first->workspace;
+  assert(cuteafd_cuda_prepare_cublas_stream(eager_stream) == 0);
+  auto eager_workspace = first->workspace;
+  assert(eager_workspace != captured_workspace && allocations == 2 && creates == 1);
+  const auto bound = bindings;
+  assert(cuteafd_cuda_graph_begin_capture(capture_stream) == 0);
+  assert(bindings == bound && first->stream == eager_stream);
+  gemm(capture_stream);
+  assert(first->workspace == captured_workspace && allocations == 2 && creates == 1);
+  capturing = false;
+  gemm(eager_stream);
+  assert(first->workspace == eager_workspace);
+  device = 1;
+  assert(cuteafd_cuda_prepare_cublas_stream(capture_stream) == 0 && creates == 2);
+  assert(cuteafd_cuda_graph_begin_capture(capture_stream) == 0);
+  gemm(capture_stream);
+  assert(last_gemm != first && last_gemm->device == 1);
+  capturing = false; device = 0;
+  std::thread worker([&] {
+    assert(cuteafd_cuda_prepare_cublas_stream(capture_stream) == 0 && creates == 3);
+    assert(cuteafd_cuda_graph_begin_capture(capture_stream) == 0);
+    gemm(capture_stream);
+    assert(last_gemm != first && last_gemm->device == 0);
+    capturing = false;
+  });
+  worker.join();
+  assert(frees == 1 && destroys == 1 && drains == 1);
+  capture_error = 71;
+  assert(cuteafd_cuda_graph_begin_capture(capture_stream) == 2);
+  assert(cudaGetLastError() == cudaSuccess);
+  assert(!capturing && creates == 3 && begins == 5 && gemms == 5);
+  assert(first->stream == eager_stream);
+}
+""")
 
 
 def test_inventory_signature_matches_installed_toolkit_without_cuda_initialization(tmp_path):
@@ -363,3 +551,81 @@ def test_inventory_signature_matches_installed_toolkit_without_cuda_initializati
     subprocess.run([compiler, "-std=c++17", "-I", str(tmp_path),
                     "-I", str(header.parents[1]), "-fsyntax-only", str(SOURCE)],
                    check=True, capture_output=True)
+
+
+def test_every_family_measures_shared_native_preload_before_its_baseline():
+    daemon = ROOT / "rust/crates/cuteafd-daemon/src"
+    inventory = (daemon / "shared/inventory.rs").read_text()
+    window = inventory.split("let (before, _) = library.cuda_memory_info()?;", 1)[1].split("let tracked", 1)[0]
+    assert window.index("if phase == InventoryPhase::PreWeight { preload_native_modules(library)?; }") < window.index("|| library.cuda_memory_info()")
+    assert "library.tp2_native_initialize()" in inventory.split("pub(crate) fn preload_native_modules", 1)[1]
+    for family, paths in {
+        "deepseek_v4": ["mod.rs"],
+        "deepseek_v41": ["v41_native_serve.rs", "v41_native_serve/distributed.rs"],
+        "glm5": ["mod.rs"], "glm5_flash": ["mod.rs"],
+        "kimi_k3": ["startup.rs"], "muse_spark": ["serve.rs"],
+        "qwen4": ["mod.rs", "dual.rs"], "step5": ["serve.rs"],
+    }.items():
+        for path in paths:
+            source = (daemon / "families" / family / path).read_text()
+            assert "RuntimeInventory::measure(" in source, (family, path)
+            assert "InventoryPhase::PreWeight" in source, (family, path)
+            assert "library.tp2_native_initialize()?" not in source, (family, path)
+    for family, path, sample in [
+        ("mimo_v2", "mod.rs", "let after = self.library.cuda_memory_info()"),
+        ("qwen3_5", "engine.rs", "let (free, total) = library.cuda_memory_info()"),
+    ]:
+        source = (daemon / "families" / family / path).read_text()
+        source = source.split("// Load only selected modules, then measure the admission baseline before tensors.", 1)[-1]
+        assert source.index("crate::shared::inventory::preload_native_modules(") < source.index(sample)
+    spark = (daemon / "shared/spark_waves.rs").read_text()
+    guard = spark.split("fn native_initialize_before_waits", 1)[1].split("impl<'a> Waves", 1)[0]
+    assert guard.index("ensure!(library.native_modules_preloaded()?") < guard.index("library.tp2_native_initialize()")
+    assert "native_initialize_before_waits(library)?;" in spark.split("pub(crate) fn start", 1)[1]
+
+
+def test_spark_wait_guard_callers_have_an_earlier_preweight_window():
+    daemon = ROOT / "rust/crates/cuteafd-daemon/src"
+    # Same-function ordering, with split-rank loops retained around inventory.
+    for path, end in [
+        ("families/deepseek_v4/mod.rs", "transports.push(SparkLink::"),
+        ("families/deepseek_v41/v41_native_serve.rs", "transport.bootstrap("),
+        ("families/deepseek_v41/v41_native_serve/distributed.rs", "transport.get_mut().bootstrap("),
+        ("families/glm5/mod.rs", "SparkLink::prepared("),
+        ("families/glm5_flash/mod.rs", "crate::shared::spark_intake::SparkLink::new_waves("),
+        ("families/qwen4/mod.rs", "crate::shared::spark_intake::SparkLink::new_waves("),
+        ("families/step5/serve.rs", "SparkLink::new_waves("),
+        ("families/muse_spark/serve.rs", "super::engine::MuseEngine::connect("),
+        ("families/kimi_k3/startup.rs", "Engine::load_admitted("),
+    ]:
+        source = (daemon / path).read_text()
+        assert source.index("InventoryPhase::PreWeight") < source.index(end), path
+    mimo = (daemon / "families/mimo_v2/mod.rs").read_text().split(
+        "// Load only selected modules, then measure the admission baseline before tensors.", 1)[1]
+    assert mimo.index("preload_native_modules(") < mimo.index("crate::shared::spark_intake::SparkLink::new(")
+    # EXLR8 and ML4 execute the same GLM engine body; no alternate Spark startup.
+    glm = (daemon / "families/glm5/mod.rs").read_text()
+    assert "fn with_resolved_engine_media" in glm
+    assert "CheckpointFormat::Exlr8" in glm and "ml4_draft" in glm
+    serve = (daemon / "families/glm5/serve.rs").read_text()
+    assert "opened.with_resolved_engine_media(" in serve
+    # The ordinary Spark workers (all native/FP8/EXL3/EXLR8 roles) are servers,
+    # not coordinator Wave consumers; they must never acquire this wait guard.
+    worker = daemon / "shared/experts/service"
+    for path in [daemon / "shared/experts/service.rs", *worker.rglob("*.rs")]:
+        source = path.read_text()
+        assert "SparkLink::" not in source and "Waves::start(" not in source, path
+    # Qualification-only coordinators explicitly enter the shared preload too.
+    for path in ["families/step5/golden.rs", "families/step5/chain.rs",
+                 "shared/experts/tp_gate.rs", "shared/experts/exlr8_decode_gate.rs"]:
+        assert "crate::shared::inventory::preload_native_modules(" in (daemon / path).read_text(), path
+
+
+def test_step5_qualification_preloads_on_the_selected_device():
+    source = (ROOT / "rust/crates/cuteafd-daemon/src/families/step5/chain.rs").read_text()
+    # cache_test_device may select GPU1 while leaving GPU0 current.
+    windows = source.split("let device = crate::shared::memory::device::cache_test_device(&library)?;")[1:]
+    assert len(windows) == 2
+    for window in windows:
+        preload = window.split("let programs", 1)[0]
+        assert "device.run(|| crate::shared::inventory::preload_native_modules(&library))?;" in preload

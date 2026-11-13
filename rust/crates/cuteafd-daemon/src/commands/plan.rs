@@ -8,12 +8,9 @@ use std::path::PathBuf;
 
 use crate::cli::PlanArgs;
 
-/// The coordinator GPU budget: `--coordinator-gpu-budget-gib`, else the CUDA-reported
-/// total of `arch`'s reference card (the RTX PRO 6000's
-/// `placement::inventory::PRO_TOTAL_BYTES` on sm_120), what the runtime's own sample sees.
-fn coordinator_bytes(gib: Option<f64>, arch: cuteafd_core::GpuArch) -> Result<u64, PlanError> {
-    gib.map_or(Ok(cuteafd_loader::placement::inventory::ArchContext::reference_total_bytes(arch)),
-        |gib| budget_bytes("--coordinator-gpu-budget-gib", gib))
+/// The coordinator GPU cap: `--gpu-memory-cap`, else the selected architecture's reference-card total.
+fn coordinator_bytes(args: &PlanArgs) -> u64 {
+    args.memory.policy().gpu_cap.unwrap_or(cuteafd_loader::placement::inventory::ArchContext::reference_total_bytes(args.coordinator_arch))
 }
 
 /// The planning options `args` name, validated before any checkpoint is read.
@@ -29,17 +26,15 @@ fn options(args: &PlanArgs) -> Result<PlanOptions, PlanError> {
         mapped_scale_preload_bytes: cuteafd_loader::plan::mapped_scale_preload_bytes(args.mapped_scale_preload_gib)?,
         mapped_scale_host_budget_bytes: None,
         draft_ownership: None,
+        qwen_auto_mtp: false,
         attention_placement: cuteafd_loader::placement::attention::parse(&args.attention_placement)
             .map_err(|reason| PlanError::InvalidOption { option: "--attention-placement", reason })?,
         vision: args.vision,
         audio: args.audio,
         placement: ExpertPlacement::from_spark_ranks(args.spark_ranks.unwrap_or(args.available_sparks)),
-        spark_budget_bytes: args.spark_budget_gib.map(|gib| budget_bytes("--spark-budget-gib", gib)).transpose()?,
-        coordinator_budget_bytes: budget_bytes("--coordinator-weight-budget-gib", args.coordinator_weight_budget_gib)?
-            .min(if args.layout || args.coordinator_gpu_budget_gib.is_some()
-                || args.coordinator_arch != cuteafd_core::GpuArch::Sm120 {
-                coordinator_bytes(args.coordinator_gpu_budget_gib, args.coordinator_arch)?
-            } else { u64::MAX }),
+        spark_budget_bytes: args.memory.spark_memory_cap,
+        coordinator_budget_bytes: budget_bytes("--coordinator-weight-budget-gib", args.coordinator_weight_budget_gib)?,
+        coordinator_gpu_budget_bytes: coordinator_bytes(args),
         layout: args.layout.then(|| -> Result<_, PlanError> {
             if !(1..=2).contains(&args.rtx) {
                 return Err(PlanError::InvalidOption { option: "--rtx", reason: "1 or 2 coordinator GPUs".into() });
@@ -52,10 +47,9 @@ fn options(args: &PlanArgs) -> Result<PlanOptions, PlanError> {
                     crate::shared::prefix::HostBudget::Bytes(bytes) => Some(bytes),
                 },
                 media_cache_bytes: args.media_cache_bytes,
-                rtx_bytes: vec![coordinator_bytes(args.coordinator_gpu_budget_gib, args.coordinator_arch)?; args.rtx],
+                rtx_bytes: vec![coordinator_bytes(args); args.rtx],
                 coordinator_arch: args.coordinator_arch,
-                spark_allocation_budget_bytes: args.spark_budget_gib
-                    .map(|gib| budget_bytes("--spark-budget-gib", gib)).transpose()?,
+                spark_allocation_budget_bytes: args.memory.spark_memory_cap,
                 pool_tokens: args.pool_tokens,
                 dense_qwen_kv: args.kv_format.map(|format| match format {
                     cuteafd_core::MlaCacheFormat::Bf16 => cuteafd_loader::families::qwen4::Qwen4KvCache::Bf16,
@@ -80,9 +74,11 @@ fn options(args: &PlanArgs) -> Result<PlanOptions, PlanError> {
                 expert_tier: args.gpu_expert_tier,
                 expert_tier_profile: args.gpu_expert_tier_profile.clone(),
                 exchange_f32: args.exchange_f32,
-                context_tokens: args.context_tokens,
+                context_tokens: args.context_tokens.unwrap_or(0),
                 prefill_rows: args.prefill_rows,
                 full_prefill_logits: args.full_prefill_logits,
+                bf16_target_head: args.target_head.unwrap_or_else(crate::shared::target_head::TargetHead::configured).blas_head(true),
+                expert_usage: args.expert_usage.unwrap_or(true),
                 // Lane families still read prefill_lanes until their unit ports land.
                 prefill_lanes: args.prefill_waves,
                 prefill_waves: args.prefill_waves.max(1),
@@ -92,16 +88,16 @@ fn options(args: &PlanArgs) -> Result<PlanOptions, PlanError> {
                 glmf_decode_rows: args.decode_rows,
                 glmf_representation: cuteafd_loader::families::glm5_flash::resident::GlmfRepresentation {
                     kda_fp8: args.kda_fp8 != crate::families::glm5_flash::fp8::KdaFp8::Off,
-                    fp8_head: args.fp8_head, ..Default::default() },
+                    head: args.head_format, ..Default::default() },
                 glmf_kda_state: args.kda_state.into(),
                 glmf_index: args.index_cache.into(),
-                headroom_bytes: budget_bytes("--headroom-gib", args.headroom_gib)?,
-                graph_budget_bytes: args.graph_budget_mib.map(|mib| mib << 20),
                 glmf_pool_marks: args.prefix_marks == crate::families::glm5_flash::prefix::PrefixMarks::Pool,
-                glmf_shared_replay: args.replay_records == crate::families::glm5_flash::engine::ReplayRecords::Shared,
+                glmf_shared_replay: args.replay_records == crate::cli::PlanReplayRecords::Shared,
+                glmf_auto_replay: args.replay_records == crate::cli::PlanReplayRecords::Auto,
                 concurrency: args.concurrency,
-                dspark_draft_limit: args.dspark_draft_limit.unwrap_or(5),
+                v41_draft_width: args.draft_length.unwrap_or(5).min(7) as u8,
                 tp2_dspark_experts: args.tp2_dspark_experts,
+                tp2_dflash: args.tp2_dflash.unwrap_or(false),
                 state_slots: args.state_slots,
                 glmf_mark_lanes: args.mark_lanes,
                 prefix_slots: args.prefix_slots,
@@ -115,7 +111,8 @@ fn options(args: &PlanArgs) -> Result<PlanOptions, PlanError> {
                 draft_sequences: args.draft_sequences,
                 draft_kv_cache: args.draft_kv_cache,
                 draft_context_slots: args.draft_context_slots,
-                mimo_decode_graphs: args.mimo_decode_graphs,
+                mimo_decode_graphs: args.mimo_decode_graphs == "on",
+                step5_decode_graphs: args.step5_decode_graphs == "on",
                 physical_sms: args.physical_sms,
                 mimo_draft_bf16: args.mimo_draft_bf16,
                 mimo_expert_manifest: args.mimo_expert_manifest.clone(),
@@ -130,7 +127,10 @@ fn options(args: &PlanArgs) -> Result<PlanOptions, PlanError> {
                 muse_drafter_snapshot: None,
                 muse_partial_bf16_max_rows: args.expert_partial_bf16_max_rows,
                 dense_qwen_drafter_snapshot: args.drafter_snapshot.clone().filter(|_| args.speculator != "off"),
-                kimi_draft_fp8: args.draft_fp8,
+                kimi_draft_fp8: args.draft_fp8.unwrap_or(false),
+                glmf_draft_representation: cuteafd_loader::families::glm5::draft_representation::GlmDraftRepresentation::from_fp8_option(
+                    args.draft_fp8),
+                glmf_draft_fp8_mode: args.draft_linear.code() as u8,
                 glm5_attention_plan_rows: args.attention_plan_rows,
                 drafter_bytes: if args.drafter_gib > 0.0 { budget_bytes("--drafter-gib", args.drafter_gib)? } else { 0 },
                 ..Default::default()
@@ -153,26 +153,53 @@ pub(crate) fn layout_options_for_test(args: &PlanArgs) -> cuteafd_loader::plan::
 /// for tests that size runtime owners from the deployment plan.
 #[cfg(test)]
 pub(crate) fn v41_report_for_test(mut args: PlanArgs) -> Result<cuteafd_loader::plan::PlanReport> {
-    let mut options = options(&args)?;
     let snapshot = PathBuf::from(&args.model);
-    let input = cuteafd_loader::plan::PlanInput::open(&snapshot)?;
+    let view = args.attention.select(&snapshot)?;
+    let input = cuteafd_loader::plan::PlanInput::open_view(&view)?;
     let family = cuteafd_loader::plan::family::detect(input.checkpoint()).map_or("", |family| family.id());
     anyhow::ensure!(family == "deepseek_v41", "expected a DeepSeek V4.1 checkpoint, found {family:?}");
     let cfg = launch_config(args.config.as_deref())?;
+    resolve_expert_usage(&mut args, &cfg)?;
+    resolve_context_tokens(&mut args, &cfg)?;
     resolve_speculator(&mut args, &snapshot, family, &cfg)?;
+    let mut options = options(&args)?;
     options.draft_ownership = Some(cuteafd_loader::plan::spec::DraftOwnership::selected(family, &args.speculator));
     if let Some(layout) = &mut options.layout {
         if !options.draft_ownership.unwrap().uses_checkpoint() { layout.native_mtp_layers = 0; }
         v41_layout(layout, &args);
-        layout.dspark_draft_limit = v41_draft_limit(&args, &cfg)?;
-        layout.tp2_dspark_experts = v41_tp2_dspark_experts(&args, family, &cfg)?;
+        layout.v41_draft_width = v41_draft_limit(&args, &cfg)?;
+        layout.tp2_dspark_experts = tp2_dspark_experts(&args, family, &cfg)?;
     }
     options.vision = glm_flash_vision(&args, family, &snapshot);
     Ok(input.plan_spark_count(&options, args.available_sparks, args.spark_ranks)?)
 }
 
+fn resolve_context_tokens(args: &mut PlanArgs, cfg: &std::collections::BTreeMap<String, String>) -> Result<()> {
+    if args.context_tokens.is_none() {
+        args.context_tokens = cfg.get("MAX_CONTEXT_TOKENS").filter(|value| !value.is_empty())
+            .map(|value| crate::shared::context::parse_tokens::<u64>(value)
+                .map_err(|error| anyhow::anyhow!("MAX_CONTEXT_TOKENS: {error}"))).transpose()?;
+    }
+    Ok(())
+}
+
+fn resolve_expert_usage(args: &mut PlanArgs, cfg: &std::collections::BTreeMap<String, String>) -> Result<()> {
+    let configured = match cfg.get("EXPERT_USAGE").map(String::as_str) {
+        None | Some("") | Some("on") => true,
+        Some("off") => false,
+        Some(_) => anyhow::bail!("EXPERT_USAGE must be on or off"),
+    };
+    args.expert_usage = Some(args.expert_usage.unwrap_or(configured));
+    Ok(())
+}
+
+fn resolve_mimo_drafter(layout: &mut cuteafd_loader::plan::layout::LayoutOptions, speculator: &str) {
+    layout.mimo_drafter_disabled = speculator != "dflash2";
+}
+
 fn v41_layout(layout: &mut cuteafd_loader::plan::layout::LayoutOptions, args: &PlanArgs) {
-    layout.prefix_slots = args.prefix_slots.or(Some(cuteafd_core::prefix::mark_slots_with_host(0, args.prefix_cache_entries.unwrap_or_else(|| cuteafd_core::concurrency::prefix_entries(layout.resolved_concurrency("deepseek_v41"))), 1, u64::MAX, layout.host_cache_bytes != Some(0))));
+    // Absent: the loader sizes the arena with serving's `MarkRule` once dSpark is resolved.
+    layout.prefix_slots = args.prefix_slots;
     // Workers must cover both prefill and the 256-row replay bucket.
     layout.spark_capacity_rows = if args.prefill_rows == 0 { 4096 }
         else if args.prefill_rows <= 256 { 256 }
@@ -180,9 +207,9 @@ fn v41_layout(layout: &mut cuteafd_loader::plan::layout::LayoutOptions, args: &P
         else { 4096 };
 }
 
-fn v41_tp2_dspark_experts(args: &PlanArgs, family: &str,
+fn tp2_dspark_experts(args: &PlanArgs, family: &str,
     cfg: &std::collections::BTreeMap<String, String>) -> Result<bool> {
-    let applicable = args.layout && family == "deepseek_v41" && args.rtx == 2 && args.speculator == "dspark";
+    let applicable = args.layout && matches!(family, "deepseek_v41" | "deepseek_v4") && args.rtx == 2 && args.speculator == "dspark";
     let enabled = args.tp2_dspark_experts || match cfg.get("TP2_DSPARK_EXPERTS").map(String::as_str) {
         None | Some("") => applicable,
         Some("off") => false,
@@ -190,24 +217,63 @@ fn v41_tp2_dspark_experts(args: &PlanArgs, family: &str,
         Some(_) => anyhow::bail!("TP2_DSPARK_EXPERTS must be on or off"),
     };
     anyhow::ensure!(!enabled || applicable,
-        "--tp2-dspark-experts requires V4.1, --layout, --rtx 2 and dSpark");
+        "--tp2-dspark-experts requires V4/V4.1, --layout, --rtx 2 and dSpark");
     Ok(enabled)
 }
 
+fn tp2_dflash(args: &PlanArgs, family: &str,
+    cfg: &std::collections::BTreeMap<String, String>) -> Result<bool> {
+    let default_on = crate::cli::tp2_dflash_default(family, args.layout && args.rtx == 2
+            && (family != "glm5_flash" || args.drafter_gib == 0.0),
+        args.speculator == "dflash2");
+    let configured = match cfg.get("TP2_DFLASH").map(String::as_str) {
+        None | Some("") => default_on,
+        Some("off") => false,
+        Some("on") => true,
+        Some(_) => anyhow::bail!("TP2_DFLASH must be on or off"),
+    };
+    let enabled = args.tp2_dflash.unwrap_or(configured);
+    anyhow::ensure!(!enabled || (args.layout && args.rtx == 2 && args.speculator == "dflash2"
+        && matches!(family, "mimo_v2" | "kimi_k3" | "glm5_flash" | "muse_spark")),
+        "TP2_DFLASH requires MiMo/Kimi/GLM Flash/Muse, --layout, --rtx 2 and DFlash2");
+    Ok(enabled)
+}
+
+fn glmf_tp2_dflash_auto(args: &PlanArgs, family: &str,
+    cfg: &std::collections::BTreeMap<String, String>) -> bool {
+    family == "glm5_flash" && args.layout && args.rtx == 2 && args.drafter_gib == 0.0 && args.speculator == "dflash2"
+        && args.tp2_dflash.is_none() && cfg.get("TP2_DFLASH").is_none_or(String::is_empty)
+}
+
+fn resolve_exlr8_draft(args: &mut PlanArgs, snapshot: &std::path::Path, family: &str,
+    cfg: &std::collections::BTreeMap<String, String>, options: &mut PlanOptions) -> Result<()> {
+    resolve_speculator(args, snapshot, family, cfg)?;
+    let split = tp2_dflash(args, family, cfg)?;
+    if let Some(layout) = &mut options.layout {
+        layout.tp2_dflash = split;
+        layout.glmf_tp2_dflash_auto = glmf_tp2_dflash_auto(args, family, cfg);
+        if family == "glm5_flash" { layout.glmf_drafter_snapshot = args.drafter_snapshot.clone(); }
+    }
+    Ok(())
+}
+
 fn v41_draft_limit(args: &PlanArgs, cfg: &std::collections::BTreeMap<String, String>) -> Result<u8> {
-    let limit = args.dspark_draft_limit.map(Ok).unwrap_or_else(|| {
-        cfg.get("DSPARK_DRAFT_LIMIT").filter(|limit| !limit.is_empty())
-            .map(|limit| limit.parse::<u8>().context("DSPARK_DRAFT_LIMIT must be in 1..7"))
+    let limit = args.draft_length.map(Ok).unwrap_or_else(|| {
+        cfg.get("DRAFT_LENGTH").filter(|limit| !limit.is_empty())
+            .map(|limit| limit.parse::<u64>().context("DRAFT_LENGTH must be a positive integer"))
             .unwrap_or(Ok(5))
     })?;
-    anyhow::ensure!((1..=7).contains(&limit), "DSPARK_DRAFT_LIMIT must be in 1..7");
+    anyhow::ensure!(limit > 0, "DRAFT_LENGTH must be a positive integer");
+    let limit = limit.min(7) as u8;
     Ok(limit)
 }
 
 fn validate_glmf_precision(args: &PlanArgs, family: &str) -> Result<(), PlanError> {
-    if family == "glm5_flash" && args.target_head == Some(crate::shared::target_head::TargetHead::Tensor) && args.fp8_head {
-        return Err(PlanError::InvalidOption { option: "--target-head", reason:
-            "explicit tensor head needs --fp8-head false; the FP8 head has its own program".into() });
+    use crate::families::glm5_flash::head::GlmfHeadFormat;
+    if family == "glm5_flash" && args.target_head == Some(crate::shared::target_head::TargetHead::Tensor)
+        && args.head_format != GlmfHeadFormat::Bf16 {
+        return Err(PlanError::InvalidOption { option: "--target-head", reason: format!(
+            "explicit tensor head needs --fp8-head false; the {} head has its own GEMV", args.head_format.name()) });
     }
     Ok(())
 }
@@ -219,12 +285,11 @@ pub(crate) fn run_plan(mut args: PlanArgs) -> Result<()> {
         if let Some(value) = &args.kv_pool_size {
             value.parse::<crate::shared::memory::budget::ByteSize>()?;
         }
-        if let Some(value) = &args.memory_reservation {
-            value.parse::<crate::shared::memory::budget::Reservation>()?;
-        }
     }
     if args.config.is_some() {
         let cfg = launch_config(args.config.as_deref())?;
+        resolve_expert_usage(&mut args, &cfg)?;
+        resolve_context_tokens(&mut args, &cfg)?;
         args.available_sparks = (0..8).take_while(|rank|
             cfg.get(&format!("SPARK_{rank}_HOST")).is_some_and(|host| !host.is_empty())).count();
         if args.spark_ranks.is_none() {
@@ -266,7 +331,8 @@ pub(crate) fn run_plan(mut args: PlanArgs) -> Result<()> {
             .snapshot_path
             .with_context(|| format!("no snapshot of {} under {}", args.model, hf_home.display()))?
     };
-    if cuteafd_loader::plan::exlr8::recognizes(&snapshot)? {
+    let view = args.attention.select(&snapshot)?;
+    if view.mode() == cuteafd_loader::plan::checkpoint::CoreView::Original && cuteafd_loader::plan::exlr8::recognizes(&snapshot)? {
         if args.spark_range {
             return Err(PlanError::InvalidOption { option: "--spark-range", reason:
                 "EXLR8 range geometry requires its native manifest planner".into() }.into());
@@ -275,20 +341,19 @@ pub(crate) fn run_plan(mut args: PlanArgs) -> Result<()> {
             "EXLR8 file manifests and fetching are not supported");
         if args.layout {
             use cuteafd_loader::plan::deployment::{AdmissionArgs, DeploymentOptions, DeploymentSpec};
-            anyhow::ensure!(args.spark_tp.is_none() && args.spark_ep.is_none(),
-                "EXLR8 requires canonical Spark wire, not explicit ownership topology");
             let cfg = launch_config(args.config.as_deref())?;
-            resolve_speculator(&mut args, &snapshot, "glm5", &cfg)?;
+            let family = cuteafd_loader::plan::exlr8::architecture(&view.config()?)?;
             let mut native_options = options.clone();
+            resolve_exlr8_draft(&mut args, &snapshot, family, &cfg, &mut native_options)?;
             native_options.placement = ExpertPlacement::from_spark_ranks(args.spark_ranks.unwrap_or(args.available_sparks));
             let native = cuteafd_loader::plan::exlr8::native_plan(&snapshot,
                 args.exlr8_manifest.as_deref().context("EXLR8 native layout requires --exlr8-manifest up1|bit325")?,
                 &native_options, &args.speculator)?;
             if args.deployment {
-                let deployment = DeploymentOptions { rtx_gpus: args.rtx, spark_tp: None, spark_ep: None,
+                let deployment = DeploymentOptions { rtx_gpus: args.rtx,
                     peers: args.deployment_peers.clone(), speculator: args.speculator.clone(),
                     admission: AdmissionArgs { kv_pool_size: args.kv_pool_size.clone(),
-                        memory_reservation: args.memory_reservation.clone(), pool_tokens: args.pool_tokens } };
+                        pool_tokens: args.pool_tokens, memory_policy: args.memory.policy() } };
                 println!("{}", serde_json::to_string_pretty(&DeploymentSpec::from_exlr8(&native, &deployment)?)?);
             } else if args.json { println!("{}", serde_json::to_string_pretty(&native.report)?); }
             else { print!("{}", render(&native.report));
@@ -310,23 +375,35 @@ pub(crate) fn run_plan(mut args: PlanArgs) -> Result<()> {
     anyhow::ensure!(args.exlr8_prefill_activations.is_none(),
         "--exlr8-prefill-activations requires an EXLR8 checkpoint");
     let role_inventory = args.files || args.fetch || args.role.is_some();
-    let input = if role_inventory { None } else { Some(cuteafd_loader::plan::PlanInput::open(&snapshot)?) };
+    let input = if role_inventory { None } else { Some(cuteafd_loader::plan::PlanInput::open_view(&view)?) };
     let inventory;
     let checkpoint = if let Some(input) = &input { input.checkpoint() } else {
-        inventory = cuteafd_loader::plan::Checkpoint::inventory(&snapshot)?;
+        inventory = cuteafd_loader::plan::Checkpoint::inventory_view(&view)?;
         &inventory
     };
     let family = cuteafd_loader::plan::family::detect(checkpoint).map_or("", |family| family.id());
-    validate_glmf_precision(&args, family)?;
+    args.attention.validate_view(&view)?;
+    let mut precision = args.clone();
+    if family == "glm5_flash" {
+        let cfg = cuteafd_loader::families::glm5_flash::GlmNextConfig::from_hf(&checkpoint.config)?;
+        let core = cuteafd_loader::families::glm5_flash::core::CoreInventory::from_checkpoint(&cfg, checkpoint)?;
+        precision.head_format = args.head_format.resolve(core.get_weight("lm_head").is_some(), args.rtx);
+    }
+    validate_glmf_precision(&precision, family)?;
     let cfg = launch_config(args.config.as_deref())?;
     resolve_speculator(&mut args, &snapshot, family, &cfg)?;
-    let tp2_dspark_experts = v41_tp2_dspark_experts(&args, family, &cfg)?;
+    options.qwen_auto_mtp = family == "qwen4" && args.speculator == "auto";
+    let tp2_dspark_experts = tp2_dspark_experts(&args, family, &cfg)?;
+    let tp2_dflash = tp2_dflash(&args, family, &cfg)?;
     options.draft_ownership = Some(cuteafd_loader::plan::spec::DraftOwnership::selected(family, &args.speculator));
     if let Some(layout) = &mut options.layout {
         layout.tp2_dspark_experts = tp2_dspark_experts;
-        if !options.draft_ownership.unwrap().uses_checkpoint() { layout.native_mtp_layers = 0; }
+        layout.tp2_dflash = tp2_dflash;
+        layout.glmf_tp2_dflash_auto = glmf_tp2_dflash_auto(&args, family, &cfg);
+        if !options.qwen_auto_mtp && !options.draft_ownership.unwrap().uses_checkpoint() { layout.native_mtp_layers = 0; }
         layout.glmf_drafter_disabled = args.speculator == "off";
         layout.glm5_drafter_disabled = args.speculator == "off";
+        resolve_mimo_drafter(layout, &args.speculator);
         if family == "qwen3_5" { layout.dense_qwen_mtp = args.speculator == "mtp"; }
         if family == "qwen3_5" && args.speculator == "dspark" {
             let resolved = file_args(args.clone(), &snapshot)?;
@@ -348,10 +425,10 @@ pub(crate) fn run_plan(mut args: PlanArgs) -> Result<()> {
             || config.get("architectures").and_then(serde_json::Value::as_array)
                 .is_some_and(|arches| arches.iter().any(|arch| arch == "DeepseekV41ForCausalLM"));
         if v41 { v41_layout(layout, &args); }
-        if v41 { layout.dspark_draft_limit = v41_draft_limit(&args, &cfg)?; }
+        if v41 { layout.v41_draft_width = v41_draft_limit(&args, &cfg)?; }
     }
     if args.files || args.fetch || args.role.is_some() {
-        use cuteafd_loader::plan::files::{manifest_roles, ReadRole};
+        use cuteafd_loader::plan::files::{manifest_roles_view, ReadRole};
         let args = file_args(args, &snapshot)?;
         let placement = ExpertPlacement::from_spark_ranks(args.spark_ranks.unwrap_or(args.available_sparks));
         let parse = |name: &str| {
@@ -376,7 +453,7 @@ pub(crate) fn run_plan(mut args: PlanArgs) -> Result<()> {
             } else {
                 let manifests = hosts.iter().map(|(host, names)| {
                     let roles = complete_roles(names.iter().map(|name| parse(name)).collect::<Result<Vec<_>>>()?);
-                    let mut manifest = manifest_roles(&snapshot, &roles)?;
+                    let mut manifest = manifest_roles_view(&view, &roles)?;
                     attach_snapshots(&mut manifest, &roles, &args)?;
                     Ok((host.clone(), manifest))
                 }).collect::<Result<std::collections::BTreeMap<_, _>>>()?;
@@ -406,7 +483,7 @@ pub(crate) fn run_plan(mut args: PlanArgs) -> Result<()> {
             vec![parse(args.role.as_deref().unwrap_or("coordinator"))?]
         };
         let roles = complete_roles(roles);
-        let mut manifest = manifest_roles(&snapshot, &roles)?;
+        let mut manifest = manifest_roles_view(&view, &roles)?;
         attach_snapshots(&mut manifest, &roles, &args)?;
         if args.fetch {
             transfer(&snapshot, &manifest, &args)?;
@@ -418,14 +495,14 @@ pub(crate) fn run_plan(mut args: PlanArgs) -> Result<()> {
             }
         } else {
             let mut headers = 0;
-            for role in &roles { headers += cuteafd_loader::plan::files::open_role(&snapshot, *role)?.tensors.len(); }
+            for role in &roles { headers += cuteafd_loader::plan::files::open_role_view(&view, *role)?.tensors.len(); }
             if args.json { println!("{}", serde_json::to_string_pretty(&manifest)?); }
             else { println!("role {} HEADERS READY: {headers} tensor headers, {} required files",
                 manifest.role, manifest.files.len()); }
         }
         return Ok(());
     }
-    options.vision = glm_flash_vision(&args, family, &snapshot);
+    options.vision = glm_flash_vision_view(&args, family, &view);
     let input = input.context("full planner input missing after role-inventory dispatch")?;
     if args.spark_range {
         let columns = input.spark_ranges(&options)?;
@@ -440,11 +517,10 @@ pub(crate) fn run_plan(mut args: PlanArgs) -> Result<()> {
     if args.deployment {
         use cuteafd_loader::plan::deployment::{AdmissionArgs, DeploymentOptions, DeploymentSpec};
         let deployment = DeploymentOptions {
-            rtx_gpus: args.rtx, spark_tp: args.spark_tp.map(usize::from),
-            spark_ep: args.spark_ep.map(usize::from), peers: args.deployment_peers.clone(),
+            rtx_gpus: args.rtx, peers: args.deployment_peers.clone(),
             speculator: args.speculator.clone(),
             admission: AdmissionArgs { kv_pool_size: args.kv_pool_size.clone(),
-                memory_reservation: args.memory_reservation.clone(), pool_tokens: args.pool_tokens },
+                pool_tokens: args.pool_tokens, memory_policy: args.memory.policy() },
         };
         println!("{}", serde_json::to_string_pretty(&DeploymentSpec::from_report(&report, &deployment)?)?);
     } else if args.json {
@@ -467,8 +543,13 @@ pub(crate) fn run_plan(mut args: PlanArgs) -> Result<()> {
 /// cannot mark images; the note goes to stderr once. Chat files a plan cannot read leave the policy
 /// as given: a plan needs only the checkpoint's config and tensor headers.
 fn glm_flash_vision(args: &PlanArgs, family: &str, snapshot: &std::path::Path) -> cuteafd_loader::plan::MediaMode {
+    args.attention.select(snapshot).map(|view| glm_flash_vision_view(args, family, &view)).unwrap_or(args.vision)
+}
+
+fn glm_flash_vision_view(args: &PlanArgs, family: &str,
+    view: &cuteafd_loader::plan::checkpoint::CheckpointView) -> cuteafd_loader::plan::MediaMode {
     if family != "glm5_flash" { return args.vision; }
-    match crate::families::glm5_flash::serve::auto_vision(args.vision, snapshot, args.chat_template_from.as_deref()) {
+    match crate::families::glm5_flash::serve::auto_vision_view(args.vision, view, args.chat_template_from.as_deref()) {
         Ok((vision, note)) => {
             if let Some(note) = note { eprintln!("note: {note}"); }
             vision
@@ -518,11 +599,12 @@ fn resolve_speculator(args: &mut PlanArgs, snapshot: &std::path::Path, family: &
             else if let Some(depth) = cfg.get("MTP") { if depth == "0" { "off" } else { "mtp" }.into() }
             else if let Some(mode) = cfg.get("DSPARK") { if mode == "on" { "dspark" } else { "off" }.into() }
             else if family == "mimo_v2" && cfg.get("DFLASH").is_some_and(|v| v == "off") { "off".into() }
+            else if family == "qwen4" { "auto".into() }
             else { default.into() }
         });
     }
-    if args.speculator == "auto" { args.speculator = default.into(); }
-    anyhow::ensure!(["off", "mtp", "dspark", "dflash2"].contains(&args.speculator.as_str()), "unknown SPECULATOR={}", args.speculator);
+    if args.speculator == "auto" && family != "qwen4" { args.speculator = default.into(); }
+    anyhow::ensure!(["auto", "off", "mtp", "dspark", "dflash2"].contains(&args.speculator.as_str()), "unknown SPECULATOR={}", args.speculator);
     anyhow::ensure!(!(args.no_speculator && args.include_speculator), "--no-speculator conflicts with --include-speculator");
     if args.no_speculator {
         anyhow::ensure!(args.drafter_snapshot.is_none() && args.role.as_deref() != Some("drafter"), "--no-speculator conflicts with drafter inputs/role");
@@ -533,7 +615,7 @@ fn resolve_speculator(args: &mut PlanArgs, snapshot: &std::path::Path, family: &
     }
     let enabled = match (family, args.speculator.as_str()) {
         (_, "off") | ("qwen3_5", "dspark" | "mtp") | ("kimi_k3" | "muse_spark", "dflash2") | ("glm5", "dflash2") | ("glm5_flash", "dflash2" | "dspark")
-        | ("mimo_v2", "dflash2" | "mtp") | ("qwen4" | "step5", "mtp")
+        | ("mimo_v2", "dflash2" | "mtp") | ("qwen4", "auto") | ("qwen4" | "step5", "mtp")
         | ("deepseek_v4" | "deepseek_v41" | "mistral_large4", "dspark") => true,
         _ => false,
     };
@@ -545,7 +627,7 @@ fn resolve_speculator(args: &mut PlanArgs, snapshot: &std::path::Path, family: &
 /// Never execute a shell configuration while constructing a file inventory.
 fn file_args(mut args: PlanArgs, snapshot: &std::path::Path) -> Result<PlanArgs> {
     use cuteafd_loader::plan::MediaMode;
-    let inventory = cuteafd_loader::plan::checkpoint::Checkpoint::inventory(snapshot)?;
+    let inventory = cuteafd_loader::plan::checkpoint::Checkpoint::inventory_view(&args.attention.select(snapshot)?)?;
     let family = cuteafd_loader::plan::family::detect(&inventory).context("unsupported checkpoint family")?.id();
     let cfg = launch_config(args.config.as_deref())?;
     if let Some(model) = cfg.get("MODEL_ID") {
@@ -557,7 +639,21 @@ fn file_args(mut args: PlanArgs, snapshot: &std::path::Path) -> Result<PlanArgs>
         if cfg.get("EXPERT_BACKEND").is_some_and(|v| v == "local") { args.spark_ranks = Some(0); }
         else if let Some(ranks) = cfg.get("SPARK_COUNT") { args.spark_ranks = Some(ranks.parse().context("SPARK_COUNT")?); }
     }
+    if family == "kimi_k3" {
+        if let Some(value) = cfg.get("TP2_DFLASH") {
+            let configured = match value.as_str() {
+                "on" => true, "off" => false,
+                _ => anyhow::bail!("TP2_DFLASH must be on or off"),
+            };
+            args.tp2_dflash.get_or_insert(configured);
+        }
+    }
     resolve_speculator(&mut args, snapshot, family, &cfg)?;
+    // File inventories have no admitted layout. Retain the checkpoint-native
+    // superset so fetching headers cannot omit a subsequently selected MTP owner.
+    if family == "qwen4" && args.speculator == "auto" {
+        args.speculator = if args.native_mtp_layers > 0 { "mtp" } else { "off" }.into();
+    }
     let needs_drafter = if let Some(layout) = &args.file_layout {
         let hosts: std::collections::BTreeMap<String, Vec<String>> =
             cuteafd_loader::read_json_file(layout)?;
@@ -598,7 +694,7 @@ fn file_args(mut args: PlanArgs, snapshot: &std::path::Path) -> Result<PlanArgs>
         args.vision = MediaMode::Off;
     }
     if let Some(mode) = cfg.get("AUDIO") { args.audio = mode.parse().map_err(anyhow::Error::msg)?; }
-    args.audio = cuteafd_loader::plan::resolve_audio(args.audio, snapshot)?;
+    args.audio = cuteafd_loader::plan::resolve_audio_config(args.audio, snapshot, &inventory.config)?;
     Ok(args)
 }
 
@@ -804,6 +900,115 @@ mod tests {
     use cuteafd_loader::plan::testing::{mimo_flash_config, mimo_flash_tensors, mimo_pro_config, mimo_pro_tensors,
         write_snapshot};
 
+    fn configured_context(flags: &[&str]) -> cuteafd_loader::placement::planner::Context {
+        use clap::Parser;
+        let config = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../examples/configs/muse-spark-exl3-min.config");
+        let argv = [vec!["cuteafd", "plan", "model", "--layout", "--config", config.to_str().unwrap()],
+            flags.to_vec()].concat();
+        let crate::cli::Commands::Plan(mut request) = crate::cli::Cli::try_parse_from(argv).unwrap().command
+            else { panic!("plan") };
+        let cfg = launch_config(request.config.as_deref()).unwrap();
+        resolve_context_tokens(&mut request, &cfg).unwrap();
+        let layout = options(&request).unwrap().layout.unwrap();
+        let value = flags.get(1).copied().unwrap_or(&cfg["MAX_CONTEXT_TOKENS"]);
+        let crate::cli::Commands::ServeMuse(serve) = crate::cli::Cli::try_parse_from([
+            "cuteafd", "serve-muse", "--snapshot", "/model", "--native-lib", "/native.so",
+            "--max-context-tokens", value]).unwrap().command else { panic!("serve-muse") };
+        let served = cuteafd_loader::placement::planner::Context::resolve(1048576, serve.max_context);
+        let planned = cuteafd_loader::placement::planner::Context::resolve(1048576,
+            (layout.context_tokens > 0).then_some(layout.context_tokens));
+        assert_eq!(planned, served);
+        planned
+    }
+
+    #[test]
+    fn installed_kimi_min_auto_context_matches_serve_and_admitted_pool() -> Result<()> {
+        use clap::Parser;
+        use cuteafd_loader::placement::planner::Context;
+        let config = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../examples/configs/kimi-k3-exl3-k6-min.config");
+        let cfg = launch_config(Some(&config))?;
+        let hf_home = std::env::var_os("CUTEAFD_DEPLOYMENT_TEST_HF_HOME").map(PathBuf::from)
+            .unwrap_or_else(default_hf_home);
+        let snapshot = cuteafd_loader::model_cache_dir(&hf_home, &cfg["MODEL_ID"])
+            .join("snapshots").join(&cfg["MODEL_REVISION"]);
+        if !snapshot.is_dir() {
+            eprintln!("installed Kimi minimum checkpoint absent; skipping installed context check");
+            return Ok(());
+        }
+        let manifest = std::env::var_os("CUTEAFD_DEPLOYMENT_TEST_PROGRAMS").map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(std::env::var_os("HOME").unwrap())
+                .join(".cache/cuteafd/builds/placement-inputs/current/share/PROGRAMS.json"));
+        anyhow::ensure!(manifest.is_file(), "installed Kimi context check requires {}", manifest.display());
+        let cli = crate::cli::Cli::try_parse_from([
+            "cuteafd", "plan", snapshot.to_str().unwrap(), "--layout", "--config", config.to_str().unwrap(),
+            "--rtx", "1", "--spark-ranks", "6", "--speculator", "dflash2", "--vision", "off", "--audio", "off",
+            "--workspace-manifest", manifest.to_str().unwrap(), "--prefill-rows", "1024",
+            "--spark-memory-cap", "118111600640"])?;
+        let crate::cli::Commands::Plan(mut request) = cli.command else { panic!("plan") };
+        request.memory = cli.memory;
+        request.hf_home = Some(hf_home);
+        resolve_context_tokens(&mut request, &cfg)?;
+        let mut request = file_args(request, &snapshot)?;
+        let mut selected = options(&request)?;
+        resolve_speculator(&mut request, &snapshot, "kimi_k3", &cfg)?;
+        selected.layout.as_mut().unwrap().kimi_drafter_snapshot = request.drafter_snapshot.clone();
+        let report = plan(&snapshot, &selected)?;
+        anyhow::ensure!(report.fits && report.placement_supported, "installed Kimi minimum refused: {:?}", report.hints);
+        let memory = report.memory_layout.context("installed Kimi minimum memory layout")?;
+        let checkpoint: serde_json::Value = serde_json::from_slice(&std::fs::read(snapshot.join("config.json"))?)?;
+        let maximum = cuteafd_loader::serving_capacity::checkpoint_context_limit(&checkpoint)?.context("Kimi model maximum")?;
+        let crate::cli::Commands::ServeKimi(serve) = crate::cli::Cli::try_parse_from([
+            "cuteafd", "serve-kimi", "--snapshot", snapshot.to_str().unwrap(), "--native-lib", "/native.so",
+            "--max-context-tokens", cfg.get("MAX_CONTEXT_TOKENS").map(String::as_str).unwrap_or("auto")])?.command
+            else { panic!("serve-kimi") };
+        let served = crate::shared::context::pool_context("kimi_k3",
+            Context::resolve(maximum, serve.max_context.map(|tokens| tokens as u64)), memory.pool_tokens as usize)?;
+        assert_eq!(served as u64, maximum.min(memory.pool_tokens));
+        assert!(served <= cuteafd_loader::families::kimi_k3::COMPILED_CONTEXT);
+        assert!(memory.notes.iter().any(|note| note.starts_with(&format!("Kimi API max context: {served} tokens;"))),
+            "{:?}", memory.notes);
+        Ok(())
+    }
+
+    #[test]
+    fn plan_config_uses_installed_muse_context_pin() {
+        use cuteafd_loader::placement::planner::{Context, Pin};
+        assert_eq!(configured_context(&[]), Context { maximum: 1048576, pin: Pin::Exact(634304) });
+    }
+
+    #[test]
+    fn plan_context_cli_overrides_installed_muse_config() {
+        use cuteafd_loader::placement::planner::{Context, Pin};
+        assert_eq!(configured_context(&["--max-context-tokens", "131072"]),
+            Context { maximum: 1048576, pin: Pin::Exact(131072) });
+        assert_eq!(configured_context(&["--max-context-tokens", "auto"]), Context::automatic(1048576));
+    }
+
+    #[test]
+    fn plan_config_context_omitted_or_empty_stays_automatic() {
+        for configured in [None, Some(""), Some("auto")] {
+            let mut request = args(std::path::Path::new("model"), 4, false);
+            request.context_tokens = None;
+            let cfg = configured.map(|value| ("MAX_CONTEXT_TOKENS".into(), value.into()))
+                .into_iter().collect();
+            resolve_context_tokens(&mut request, &cfg).unwrap();
+            assert_eq!(options(&request).unwrap().layout.unwrap().context_tokens, 0);
+        }
+    }
+
+    #[test]
+    fn plan_config_context_rejects_non_launcher_values() {
+        for value in ["0", "-1", "+1", "01", "1048577", "18446744073709551616"] {
+            let mut request = args(std::path::Path::new("model"), 4, false);
+            request.context_tokens = None;
+            let cfg = [("MAX_CONTEXT_TOKENS".into(), value.into())].into_iter().collect();
+            assert!(resolve_context_tokens(&mut request, &cfg).unwrap_err().to_string()
+                .contains("MAX_CONTEXT_TOKENS: context must be auto or a positive integer in 1..1048576"), "{value}");
+        }
+    }
+
     #[test]
     fn plan_prefill_waves_and_span_reach_both_layout_fields() {
         use clap::Parser;
@@ -821,6 +1026,7 @@ mod tests {
     #[test]
     fn exlr8_native_cli_resolves_default_config_and_opt_out_before_admission() {
         let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("config.json"), r#"{"model_type":"glm_moe_dsa","architectures":["GlmMoeDsaForCausalLM"]}"#).unwrap();
         let experts = dir.path().join("experts");
         std::fs::create_dir(&experts).unwrap();
         let header = br#"{"__metadata__":{"format":"exlr8-v2"}}"#;
@@ -850,6 +1056,78 @@ mod tests {
             }
             let error = run_plan(request).unwrap_err().to_string();
             assert!(error.contains(expected), "{selected}/{configured:?}/{no_speculator}: {error}");
+        }
+    }
+
+    #[test]
+    fn exlr8_tp2_dflash_resolves_default_config_and_explicit_off_before_admission() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("config.json"),
+            r#"{"model_type":"glm5_next","architectures":["Glm5NextForConditionalGeneration"]}"#).unwrap();
+        let experts = dir.path().join("experts");
+        std::fs::create_dir(&experts).unwrap();
+        let header = br#"{"__metadata__":{"format":"exlr8-v2"}}"#;
+        let mut index = (header.len() as u64).to_le_bytes().to_vec();
+        index.extend_from_slice(header);
+        std::fs::write(experts.join("exlr8-layer-3.index.safetensors"), index).unwrap();
+        for configured in [None, Some("on"), Some("off")] {
+            for explicit in [None, Some(false), Some(true)] {
+                let mut request = args(dir.path(), 0, false);
+                request.rtx = 2;
+                request.exlr8_manifest = Some("k4".into());
+                request.tp2_dflash = explicit;
+                let cfg = configured.map(|value| ("TP2_DFLASH".into(), value.into()))
+                    .into_iter().collect();
+                let mut resolved = options(&request).unwrap();
+                let family = cuteafd_loader::plan::exlr8::architecture(
+                    &serde_json::from_slice(&std::fs::read(dir.path().join("config.json")).unwrap()).unwrap()).unwrap();
+                resolve_exlr8_draft(&mut request, dir.path(), family, &cfg, &mut resolved).unwrap();
+                let layout = resolved.layout.unwrap();
+                assert_eq!(layout.tp2_dflash, explicit.unwrap_or(configured != Some("off")));
+                assert_eq!(layout.glmf_tp2_dflash_auto, explicit.is_none() && configured.is_none());
+                // Invalid topology must fail in the early-return path, before native admission.
+                request.rtx = 1;
+                request.tp2_dflash = Some(true);
+                let error = run_plan(request).unwrap_err().to_string();
+                assert!(error.contains("TP2_DFLASH requires"), "{error}");
+            }
+        }
+    }
+
+    #[test]
+    fn glmf_tp2_auto_requires_two_gpus_and_checkpoint_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        for rtx in [1, 2] {
+            for drafter_gib in [0.0, 12.0] {
+                let mut request = args(dir.path(), 0, false);
+                request.rtx = rtx;
+                request.drafter_gib = drafter_gib;
+                request.speculator = "dflash2".into();
+                let cfg = Default::default();
+                let expected = rtx == 2 && drafter_gib == 0.0;
+                assert_eq!(tp2_dflash(&request, "glm5_flash", &cfg).unwrap(), expected);
+                assert_eq!(glmf_tp2_dflash_auto(&request, "glm5_flash", &cfg), expected);
+                let cfg = [("TP2_DFLASH".into(), "off".into())].into_iter().collect();
+                assert!(!tp2_dflash(&request, "glm5_flash", &cfg).unwrap());
+                assert!(!glmf_tp2_dflash_auto(&request, "glm5_flash", &cfg));
+            }
+        }
+    }
+
+    #[test]
+    fn glmf_plan_preserves_explicit_drafter_representation_and_rows() {
+        use clap::Parser;
+        use cuteafd_loader::families::glm5::draft_representation::GlmDraftRepresentation;
+        for (flags, representation, mode) in [
+            (vec![], GlmDraftRepresentation::Fp8Only, 0),
+            (vec!["--draft-fp8", "false", "--draft-linear", "wide"], GlmDraftRepresentation::Bf16Only, 1),
+            (vec!["--draft-fp8", "true", "--draft-linear", "w8a8"], GlmDraftRepresentation::Fp8Only, 2),
+        ] {
+            let argv = [vec!["cuteafd", "plan", "model", "--layout"], flags].concat();
+            let crate::cli::Commands::Plan(request) = crate::cli::Cli::try_parse_from(argv).unwrap().command else { panic!("plan") };
+            let layout = options(&request).unwrap().layout.unwrap();
+            assert_eq!(layout.glmf_draft_representation, representation);
+            assert_eq!(layout.glmf_draft_fp8_mode, mode);
         }
     }
 
@@ -917,6 +1195,27 @@ mod tests {
     }
 
     #[test]
+    fn expert_usage_plan_defaults_on_and_config_off_matches_explicit_cli_off() {
+        use clap::Parser;
+        for configured in [None, Some("on"), Some("off")] {
+            for requested in [None, Some(false), Some(true)] {
+                let mut argv = vec!["cuteafd", "plan", "/model", "--layout"];
+                if let Some(enabled) = requested {
+                    argv.push(if enabled { "--expert-usage" } else { "--expert-usage=false" });
+                }
+                let crate::cli::Commands::Plan(mut request) = crate::cli::Cli::try_parse_from(argv).unwrap().command
+                    else { panic!("expected plan") };
+                let cfg = configured.map(|value| ("EXPERT_USAGE".into(), value.into())).into_iter().collect();
+                resolve_expert_usage(&mut request, &cfg).unwrap();
+                assert_eq!(options(&request).unwrap().layout.unwrap().expert_usage,
+                    requested.unwrap_or(configured != Some("off")));
+            }
+        }
+        let mut request = args(std::path::Path::new("/model"), 6, false);
+        assert!(resolve_expert_usage(&mut request, &[("EXPERT_USAGE".into(), "bad".into())].into()).is_err());
+    }
+
+    #[test]
     fn step5_plan_defaults_to_fp8_and_preserves_explicit_bf16() {
         use cuteafd_loader::families::qwen4::Qwen4KvCache;
         let mut args = args(std::path::Path::new("/model"), 6, false);
@@ -940,59 +1239,129 @@ mod tests {
     }
 
     #[test]
-    fn v41_tp2_dspark_cli_and_config_resolve_before_layout() {
+    fn tp2_dflash_plan_and_direct_serve_defaults_agree() {
+        use clap::{CommandFactory, FromArgMatches, Parser};
+        for (family, command) in [("mimo_v2", "serve-mimo"), ("kimi_k3", "serve-kimi"), ("muse_spark", "serve-muse")] {
+            for split in [false, true] {
+                for draft in [false, true] {
+                    for explicit in [None, Some(false), Some(true)] {
+                        let mut plan = vec!["cuteafd", "plan", "model", "--layout", "--rtx", if split { "2" } else { "1" },
+                            "--speculator", if draft { "dflash2" } else { "off" }];
+                        let mut serve = vec!["cuteafd", command, "--snapshot", "/model", "--native-lib", "/native.so"];
+                        if split { serve.extend(["--split-device", "1"]); }
+                        if draft { serve.extend(["--draft", "/draft"]); }
+                        if let Some(enabled) = explicit {
+                            let flag = if enabled { "true" } else { "false" };
+                            plan.extend(["--tp2-dflash", flag]);
+                            serve.extend(["--tp2-dflash", flag]);
+                        }
+                        let crate::cli::Commands::Plan(planned) = crate::cli::Cli::try_parse_from(plan).unwrap().command
+                            else { panic!("expected plan") };
+                        let matches = crate::cli::Cli::command().try_get_matches_from(serve).unwrap();
+                        let mut parsed = crate::cli::Cli::from_arg_matches(&matches).unwrap();
+                        crate::cli::resolve_tp2_dflash(&mut parsed.command, &matches);
+                        let served = match parsed.command {
+                            crate::cli::Commands::ServeMimo(args) => args.engine.tp2_dflash,
+                            crate::cli::Commands::ServeKimi(args) => args.tp2_dflash,
+                            crate::cli::Commands::ServeMuse(args) => args.tp2_dflash,
+                            _ => panic!("expected serve"),
+                        };
+                        let resolved = tp2_dflash(&planned, family, &Default::default());
+                        if explicit == Some(true) && !(split && draft) { assert!(resolved.is_err()); }
+                        else { assert_eq!(resolved.unwrap(), served); }
+                        assert_eq!(served, explicit.unwrap_or(split && draft));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn tp2_dflash_explicit_off_overrides_config_on() {
+        use clap::Parser;
+        let argv = ["cuteafd", "plan", "model", "--layout", "--rtx", "2", "--speculator", "dflash2"];
+        let cfg = [("TP2_DFLASH".into(), "on".into())].into();
+        for (explicit, expected) in [("false", false), ("true", true)] {
+            let crate::cli::Commands::Plan(request) = crate::cli::Cli::try_parse_from(
+                argv.into_iter().chain(["--tp2-dflash", explicit])).unwrap().command
+                else { panic!("expected plan") };
+            for family in ["mimo_v2", "kimi_k3", "glm5_flash", "muse_spark"] {
+                assert_eq!(tp2_dflash(&request, family, &cfg).unwrap(), expected);
+            }
+            assert_eq!(options(&request).unwrap().layout.unwrap().tp2_dflash, expected);
+        }
+        let crate::cli::Commands::Plan(mut request) = crate::cli::Cli::try_parse_from(argv).unwrap().command
+            else { panic!("expected plan") };
+        for family in ["mimo_v2", "kimi_k3", "glm5_flash", "muse_spark"] {
+            assert!(tp2_dflash(&request, family, &Default::default()).unwrap());
+            assert!(!tp2_dflash(&request, family, &[("TP2_DFLASH".into(), "off".into())].into()).unwrap());
+            assert!(tp2_dflash(&request, family, &cfg).unwrap());
+        }
+        request.rtx = 1;
+        for family in ["mimo_v2", "kimi_k3", "glm5_flash", "muse_spark"] {
+            assert!(!tp2_dflash(&request, family, &Default::default()).unwrap());
+            assert!(tp2_dflash(&request, family, &cfg).is_err());
+        }
+    }
+
+    #[test]
+    fn v4_and_v41_tp2_dspark_cli_and_config_resolve_before_layout() {
         use clap::Parser;
         let argv = ["cuteafd", "plan", "model", "--layout", "--rtx", "2", "--speculator", "dspark"];
         let crate::cli::Commands::Plan(mut request) = crate::cli::Cli::try_parse_from(argv).unwrap().command
             else { panic!("expected plan") };
         for (configured, expected) in [(None, true), (Some(""), true), (Some("off"), false), (Some("on"), true)] {
             let cfg = configured.map(|value| [("TP2_DSPARK_EXPERTS".into(), value.into())].into()).unwrap_or_default();
-            assert_eq!(v41_tp2_dspark_experts(&request, "deepseek_v41", &cfg).unwrap(), expected);
+            for family in ["deepseek_v4", "deepseek_v41"] {
+                assert_eq!(tp2_dspark_experts(&request, family, &cfg).unwrap(), expected);
+            }
         }
         let cfg = [("TP2_DSPARK_EXPERTS".into(), "on".into())].into();
         for (family, rtx, layout, speculator) in [("glm5_flash", 2, true, "dspark"),
             ("deepseek_v41", 1, true, "dspark"), ("deepseek_v41", 2, false, "dspark"),
-            ("deepseek_v41", 2, true, "off")] {
+            ("deepseek_v41", 2, true, "off"), ("deepseek_v4", 1, true, "dspark"),
+            ("deepseek_v4", 2, false, "dspark"), ("deepseek_v4", 2, true, "off")] {
             request.rtx = rtx;
             request.layout = layout;
             request.speculator = speculator.into();
-            assert!(!v41_tp2_dspark_experts(&request, family, &Default::default()).unwrap());
+            assert!(!tp2_dspark_experts(&request, family, &Default::default()).unwrap());
             let off = [("TP2_DSPARK_EXPERTS".into(), "off".into())].into();
-            assert!(!v41_tp2_dspark_experts(&request, family, &off).unwrap());
-            assert!(v41_tp2_dspark_experts(&request, family, &cfg).is_err());
+            assert!(!tp2_dspark_experts(&request, family, &off).unwrap());
+            assert!(tp2_dspark_experts(&request, family, &cfg).is_err());
         }
         let crate::cli::Commands::Plan(request) = crate::cli::Cli::try_parse_from(
             argv.into_iter().chain(["--tp2-dspark-experts"])).unwrap().command else { panic!("expected plan") };
         assert!(options(&request).unwrap().layout.unwrap().tp2_dspark_experts);
-        assert!(v41_tp2_dspark_experts(&request, "deepseek_v41", &Default::default()).unwrap());
+        assert!(tp2_dspark_experts(&request, "deepseek_v41", &Default::default()).unwrap());
         assert!(crate::cli::Cli::try_parse_from(["cuteafd", "plan", "model", "--tp2-dspark-experts"]).is_err());
         let mut request = request;
         request.tp2_dspark_experts = false;
         let invalid = [("TP2_DSPARK_EXPERTS".into(), "invalid".into())].into();
-        assert!(v41_tp2_dspark_experts(&request, "deepseek_v41", &invalid).is_err());
+        assert!(tp2_dspark_experts(&request, "deepseek_v41", &invalid).is_err());
     }
 
     #[test]
     fn v41_configured_draft_limit_matches_serving_width() {
         let mut request = args(std::path::Path::new("/not-read"), 3, false);
         for (configured, expected) in [(None, 5), (Some(""), 5), (Some("5"), 5), (Some("6"), 6), (Some("7"), 7)] {
-            let cfg = configured.map(|value| [("DSPARK_DRAFT_LIMIT".into(), value.into())].into()).unwrap_or_default();
+            let cfg = configured.map(|value| [("DRAFT_LENGTH".into(), value.into())].into()).unwrap_or_default();
             assert_eq!(v41_draft_limit(&request, &cfg).unwrap(), expected);
         }
-        for value in ["0", "8", "invalid"] {
-            let cfg = [("DSPARK_DRAFT_LIMIT".into(), value.into())].into();
+        for value in ["0", "invalid"] {
+            let cfg = [("DRAFT_LENGTH".into(), value.into())].into();
             assert!(v41_draft_limit(&request, &cfg).is_err());
-            request.dspark_draft_limit = Some(7);
+            request.draft_length = Some(7);
             assert_eq!(v41_draft_limit(&request, &cfg).unwrap(), 7);
-            request.dspark_draft_limit = None;
+            request.draft_length = None;
         }
-        request.dspark_draft_limit = Some(7);
-        assert_eq!(options(&request).unwrap().layout.unwrap().dspark_draft_limit, 7);
+        request.draft_length = Some(7);
+        assert_eq!(options(&request).unwrap().layout.unwrap().v41_draft_width, 7);
     }
 
     fn args(model: &std::path::Path, spark_ranks: usize, require_ready: bool) -> PlanArgs {
         PlanArgs {
             coordinator_arch: cuteafd_core::GpuArch::Sm120,
+            attention: Default::default(),
             draft_kv_cache: cuteafd_loader::families::qwen4::Qwen4KvCache::Bf16,
             expert_partial_bf16_max_rows: cuteafd_loader::families::muse_spark::replies::DEFAULT_BF16_MAX_ROWS,
             exlr8_manifest: None,
@@ -1009,25 +1378,25 @@ mod tests {
             spark_ranks: Some(spark_ranks),
             available_sparks: 6,
             spark_range: false,
-            spark_budget_gib: Some(100.0),
             coordinator_weight_budget_gib: 80.0,
+            memory: crate::cli::MemoryArgs { spark_memory_cap: Some(100 << 30), ..Default::default() },
             json: true,
-            deployment: false, spark_tp: None, spark_ep: None, deployment_peers: vec![],
-            kv_pool_size: None, memory_reservation: None,
+            deployment: false, deployment_peers: vec![],
+            kv_pool_size: None,
             files: false, role: None, host: None, file_layout: None, fetch_parallel: 2, fetch: false, destination: None, source: None, forward_agent: false,
             dry_run: false, force: false, include_speculator: false,
             config: None, speculator: "auto".into(), no_speculator: false,
-            drafter_snapshot: None, draft_fp8: false, vision_snapshot: None, audio_snapshot: None,
+            drafter_snapshot: None, draft_fp8: None, draft_linear: Default::default(), vision_snapshot: None, audio_snapshot: None,
             require_ready,
             layout: true,
             rtx: 2,
-            coordinator_gpu_budget_gib: None,
             pool_tokens: None,
             kv_format: Default::default(),
             fp8_decode: false, mtp_fp8_head: true, attention_plan_rows: None,
             kda_fp8: crate::families::glm5_flash::fp8::KdaFp8::Row128,
             kda_state: crate::families::glm5_flash::engine::KdaState::F32,
-            fp8_head: true, target_head: None, draft_head: crate::shared::speculation::dflash::DraftHead::Exact,
+            head_format: crate::families::glm5_flash::head::GlmfHeadFormat::Fp8, target_head: None,
+            draft_head: crate::shared::speculation::dflash::DraftHead::Exact,
             drafter_gib: 0.0,
             rtx_expert_layers: None,
             gpu_expert_tier: Default::default(),
@@ -1035,18 +1404,17 @@ mod tests {
             deprecated_peer_expert_ranges: false,
             exchange_f32: false,
             attention_placement: "auto".into(),
-            context_tokens: 262144,
+            context_tokens: Some(262144),
             prefill_rows: 0,
-            full_prefill_logits: false,
+            full_prefill_logits: false, expert_usage: Some(false),
             prefill_waves: 0, prefill_span_rows: 0, decode_lanes: None,
             decode_rows: 64,
             index_cache: crate::families::glm5_flash::engine::IndexCache::Keys,
-            headroom_gib: 2.0,
-            graph_budget_mib: None,
-            replay_records: crate::families::glm5_flash::engine::ReplayRecords::Own,
+            replay_records: crate::cli::PlanReplayRecords::Own,
             concurrency: 8,
-            dspark_draft_limit: None,
+            draft_length: None,
             tp2_dspark_experts: false,
+            tp2_dflash: None,
             state_slots: None,
             mark_lanes: None,
             prefix_slots: None,
@@ -1060,7 +1428,8 @@ mod tests {
             expert_input: crate::families::mimo_v2::engine::ExpertInput::Fp8,
             draft_sequences: None,
             draft_context_slots: None,
-            mimo_decode_graphs: false,
+            mimo_decode_graphs: "on".into(),
+            step5_decode_graphs: "on".into(),
             physical_sms: None,
             mimo_draft_bf16: false,
             glm5_draft_bf16: false,
@@ -1090,6 +1459,49 @@ mod tests {
         attach_snapshots(&mut manifest, &[coordinator], &args).unwrap();
         assert_eq!(manifest.additional_snapshots.len(), 1);
         assert!(manifest.additional_snapshots[0].files.iter().any(|f| f.path == "model-00001-of-00001.safetensors"));
+    }
+
+    #[test]
+    fn mimo_external_drafter_is_owned_only_by_dflash2() {
+        let snapshot = tempfile::tempdir().unwrap();
+        write_snapshot(snapshot.path(), &mimo_flash_config(), &mimo_flash_tensors(), Some(1));
+        // A bad bundled config must be irrelevant to both off and native MTP.
+        std::fs::create_dir(snapshot.path().join("dflash")).unwrap();
+        std::fs::write(snapshot.path().join("dflash/config.json"), "{}").unwrap();
+        std::fs::write(snapshot.path().join("dflash/dflash_draft_model.safetensors"), "").unwrap();
+        for speculator in ["off", "mtp", "dflash2"] {
+            let mut layout = cuteafd_loader::plan::layout::LayoutOptions {
+                host_memory: Some((128 << 30, 128 << 30)), native_mtp_layers: 0,
+                host_cache_bytes: Some(0), ..Default::default() };
+            resolve_mimo_drafter(&mut layout, speculator);
+            assert_eq!(layout.mimo_drafter_disabled, speculator != "dflash2");
+            let report = plan(snapshot.path(), &cuteafd_loader::plan::PlanOptions {
+                layout: Some(layout), placement: cuteafd_loader::plan::ExpertPlacement::Sparks { ranks: 4 },
+                ..Default::default() }).unwrap();
+            if speculator == "dflash2" {
+                assert!(!report.placement_supported, "the selected drafter's invalid geometry must refuse");
+            } else {
+                assert!(report.placement_supported, "{speculator}: {:?}", report.hints);
+                assert!(!report.memory_layout.unwrap().devices[0].items.iter()
+                    .any(|item| item.category == cuteafd_core::memory_layout::Category::Drafter));
+            }
+        }
+    }
+
+    #[test]
+    fn kimi_tp2_dflash_config_preserves_explicit_cli_false() {
+        use cuteafd_loader::plan::testing::*;
+        let target = tempfile::tempdir().unwrap();
+        write_snapshot(target.path(), &kimi_k3_config(), &[t("unused.weight", "BF16", &[2])], None);
+        let config = target.path().join("pair.config");
+        std::fs::write(&config, "SPECULATOR=off\nTP2_DFLASH=on\nVISION=off\nAUDIO=off\n").unwrap();
+        let mut input = args(target.path(), 6, false);
+        input.config = Some(config.clone());
+        assert_eq!(file_args(input.clone(), target.path()).unwrap().tp2_dflash, Some(true));
+        input.tp2_dflash = Some(false);
+        assert_eq!(file_args(input.clone(), target.path()).unwrap().tp2_dflash, Some(false));
+        std::fs::write(&config, "SPECULATOR=off\nTP2_DFLASH=auto\nVISION=off\nAUDIO=off\n").unwrap();
+        assert!(file_args(input, target.path()).is_err());
     }
 
     #[test]
@@ -1189,6 +1601,36 @@ mod tests {
                 Some(&cfg["SPECULATOR_MODEL_REVISION"])).unwrap().snapshot_path.unwrap();
             assert_eq!(resolved.drafter_snapshot.as_deref(), Some(draft.as_path()), "{}", config.display());
         }
+    }
+
+    #[test]
+    fn qwen_speculator_auto_is_deferred_but_overrides_and_file_owners_are_explicit() {
+        use cuteafd_loader::plan::testing::*;
+        let target = tempfile::tempdir().unwrap();
+        let config = qwen4_config(4);
+        write_snapshot(target.path(), &config, &[t("mtp.layers.0.enorm.weight", "BF16", &[2560])], None);
+        for (selected, configured, disabled, expected) in [
+            ("auto", None, false, "auto"),
+            ("auto", Some("auto"), false, "auto"),
+            ("auto", Some("mtp"), false, "mtp"),
+            ("auto", Some("off"), false, "off"),
+            ("mtp", Some("off"), false, "mtp"),
+            ("off", Some("mtp"), false, "off"),
+            ("auto", None, true, "off"),
+        ] {
+            let mut request = args(target.path(), 2, false);
+            request.speculator = selected.into();
+            request.no_speculator = disabled;
+            let cfg = configured.map(|value| std::collections::BTreeMap::from([("SPECULATOR".into(), value.into())]))
+                .unwrap_or_default();
+            resolve_speculator(&mut request, target.path(), "qwen4", &cfg).unwrap();
+            assert_eq!(request.speculator, expected);
+        }
+        let files = file_args(args(target.path(), 2, false), target.path()).unwrap();
+        assert_eq!(files.speculator, "mtp", "file inventory retains MTP's checkpoint superset");
+        let mut off = args(target.path(), 2, false);
+        off.speculator = "off".into();
+        assert_eq!(file_args(off, target.path()).unwrap().speculator, "off");
     }
 
     #[test]
@@ -1616,25 +2058,31 @@ mod tests {
     }
 
     #[test]
-    fn rtx_budget_flag_and_legacy_alias_bound_every_layout_gpu() {
+    fn gpu_memory_cap_bounds_every_layout_gpu_and_rejects_percentages() {
         use clap::Parser;
-        for flag in ["--coordinator-gpu-budget-gib", "--rtx-budget-gib", "--rtx-gib"] {
-            let cli = crate::cli::Cli::try_parse_from(["cuteafd", "plan", "/not-read", "--layout", "--rtx", "2", flag, "32"])
-                .unwrap();
+        for (size, bytes) in [("32GiB", 32u64 << 30), ("34359738368", 32 << 30), ("32768MiB", 32 << 30), ("40GB", 40_000_000_000)] {
+            let cli = crate::cli::Cli::try_parse_from(["cuteafd", "plan", "/not-read", "--layout", "--rtx", "2",
+                "--gpu-memory-cap", size]).unwrap();
             let crate::cli::Commands::Plan(mut args) = cli.command else { panic!("plan") };
-            args.coordinator_gpu_budget_gib = cli.coordinator_gpu_budget_gib;
+            args.memory = cli.memory;
             let options = options(&args).unwrap();
-            assert_eq!(options.layout.unwrap().rtx_bytes, vec![32 << 30; 2]);
-            assert_eq!(options.coordinator_budget_bytes, 32 << 30);
+            assert_eq!(options.coordinator_gpu_budget_bytes, bytes);
+            assert_eq!(options.layout.unwrap().rtx_bytes, vec![bytes; 2]);
+            assert_eq!(options.coordinator_budget_bytes, cuteafd_loader::placement::ResidentWeights::DEFAULT_LIMIT.0);
         }
         let cli = crate::cli::Cli::try_parse_from(["cuteafd", "plan", "/not-read"]).unwrap();
         let crate::cli::Commands::Plan(plan_args) = cli.command else { panic!("plan") };
         assert!(options(&plan_args).unwrap().layout.is_none());
-        for gib in [0.0, -1.0, f64::NAN, f64::INFINITY] {
-            let dir = tempfile::tempdir().unwrap();
-            let error = options(&PlanArgs { coordinator_gpu_budget_gib: Some(gib), ..args(dir.path(), 4, false) }).unwrap_err();
-            assert!(matches!(error, PlanError::InvalidOption { option: "--coordinator-gpu-budget-gib", .. }));
+        for invalid in ["50%", "-1GiB", "NaN", "32TB", "GiB"] {
+            assert!(crate::cli::Cli::try_parse_from(["cuteafd", "plan", "/not-read", "--gpu-memory-cap", invalid]).is_err(),
+                "{invalid}");
         }
+        for removed in ["--coordinator-gpu-budget-gib", "--rtx-budget-gib", "--rtx-gib"] {
+            assert!(crate::cli::Cli::try_parse_from(["cuteafd", "plan", "/not-read", removed, "32"]).is_err(), "{removed}");
+        }
+        let mut invalid = PlanOptions::default();
+        invalid.coordinator_gpu_budget_bytes = 0;
+        assert!(matches!(invalid.validate(), Err(PlanError::InvalidOption { option: "coordinator GPU budget", .. })));
     }
 
     #[test]
@@ -1642,13 +2090,11 @@ mod tests {
         let mut args = args(std::path::Path::new("/not-read"), 4, false);
         let mut layout = cuteafd_loader::plan::layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)), ..Default::default() };
         for entries in [0, 1, 20, 128] {
-            let slots = cuteafd_core::prefix::mark_slots_with_host(0, entries as u64, 1, u64::MAX,
-                layout.host_cache_bytes != Some(0));
             args.prefix_cache_entries = Some(entries);
             for (rows, capacity) in [(0, 4096), (80, 256), (256, 256), (1024, 1024), (2048, 4096)] {
                 args.prefill_rows = rows;
                 v41_layout(&mut layout, &args);
-                assert_eq!(layout.prefix_slots, Some(slots));
+                assert_eq!(layout.prefix_slots, None);
                 assert_eq!(layout.spark_capacity_rows, capacity);
             }
         }
@@ -1671,58 +2117,53 @@ mod tests {
     }
 
     #[test]
-    fn unified_budget_matches_aliases_and_serving_capacity() {
+    fn gpu_memory_cap_is_global_on_either_side_of_the_subcommand() {
         use clap::Parser;
-        let parse = |flag: &str, before: bool| {
+        let parse = |before: bool| {
             let argv = if before {
-                vec!["cuteafd", flag, "31.8", "plan", "/not-read", "--layout"]
+                vec!["cuteafd", "--gpu-memory-cap", "31.8GiB", "plan", "/not-read", "--layout"]
             } else {
-                vec!["cuteafd", "plan", "/not-read", "--layout", flag, "31.8"]
+                vec!["cuteafd", "plan", "/not-read", "--layout", "--gpu-memory-cap", "31.8GiB"]
             };
             let cli = crate::cli::Cli::try_parse_from(argv).unwrap();
             let crate::cli::Commands::Plan(mut args) = cli.command else { panic!("plan") };
-            args.coordinator_gpu_budget_gib = cli.coordinator_gpu_budget_gib;
+            args.memory = cli.memory;
             let mut selected = options(&args).unwrap();
             selected.layout.as_mut().unwrap().host_memory = Some((128 << 30, 128 << 30));
             selected
         };
-        let expected = parse("--coordinator-gpu-budget-gib", false);
+        let expected = parse(false);
         let snapshot = tempfile::tempdir().unwrap();
         write_snapshot(snapshot.path(), &mimo_flash_config(), &mimo_flash_tensors(), Some(1));
         let expected_report = serde_json::to_value(plan(snapshot.path(), &expected).unwrap()).unwrap();
-        for flag in ["--coordinator-gpu-budget-gib", "--rtx-budget-gib", "--rtx-gib"] {
-            for before in [false, true] {
-                let actual = parse(flag, before);
-                assert_eq!(serde_json::to_value(plan(snapshot.path(), &actual).unwrap()).unwrap(), expected_report);
-                assert_eq!(actual.layout.unwrap().rtx_bytes, expected.layout.as_ref().unwrap().rtx_bytes);
-                assert_eq!(actual.coordinator_budget_bytes, expected.coordinator_budget_bytes);
-            }
-        }
+        let actual = parse(true);
+        assert_eq!(serde_json::to_value(plan(snapshot.path(), &actual).unwrap()).unwrap(), expected_report);
+        assert_eq!(actual.layout.unwrap().rtx_bytes, expected.layout.as_ref().unwrap().rtx_bytes);
+        // The same decimal size the serving cap would install.
         let serving = cuteafd_core::serving_capacity::GpuMemoryBudget::from_gib(31.8).unwrap();
         assert_eq!(expected.layout.unwrap().rtx_bytes, vec![serving.0]);
-        assert_eq!(crate::cli::deprecated_budget_flags(["--rtx-gib=31.8", "--rtx-budget-gib", "31.8"]),
-            vec!["--coordinator-gpu-budget-gib"]);
-        assert!(crate::cli::deprecated_budget_flags(["--coordinator-gpu-budget-gib", "31.8"]).is_empty());
     }
 
     #[test]
-    fn weight_budget_remains_a_distinct_cap_with_deprecated_alias() {
+    fn weight_budget_is_global_and_independent_of_total_memory() {
         use clap::Parser;
-        for flag in ["--coordinator-weight-budget-gib", "--coordinator-budget-gib"] {
-            let cli = crate::cli::Cli::try_parse_from(["cuteafd", "plan", "/not-read", "--layout", flag, "10"]).unwrap();
-            let crate::cli::Commands::Plan(args) = cli.command else { panic!("plan") };
+        for argv in [
+            vec!["cuteafd", "--coordinator-weight-budget-gib", "10", "plan", "/not-read", "--layout"],
+            vec!["cuteafd", "plan", "/not-read", "--layout", "--coordinator-weight-budget-gib", "10"],
+        ] {
+            let cli = crate::cli::Cli::try_parse_from(argv).unwrap();
+            let crate::cli::Commands::Plan(mut args) = cli.command else { panic!("plan") };
+            args.coordinator_weight_budget_gib = cli.coordinator_weight_budget_gib.unwrap();
             let options = options(&args).unwrap();
             assert_eq!(options.coordinator_budget_bytes, 10 << 30);
             assert_eq!(options.layout.unwrap().rtx_bytes, vec![cuteafd_loader::placement::inventory::PRO_TOTAL_BYTES]);
         }
-        assert_eq!(crate::cli::deprecated_budget_flags(["--coordinator-budget-gib", "10"]),
-            vec!["--coordinator-weight-budget-gib"]);
     }
 
     #[test]
     fn spark_encoder_admission_honors_runtime_budget() {
         let mut request = args(std::path::Path::new("/not-read"), 4, false);
-        request.spark_budget_gib = Some(82.0);
+        request.memory.spark_memory_cap = Some(82 << 30);
         let options = options(&request).unwrap();
         assert_eq!(options.spark_budget_bytes, Some(82 << 30));
         let layout = options.layout.unwrap();
@@ -1733,7 +2174,7 @@ mod tests {
     #[test]
     fn unset_spark_budget_preserves_separate_defaults() {
         let mut request = args(std::path::Path::new("/not-read"), 4, false);
-        request.spark_budget_gib = None;
+        request.memory.spark_memory_cap = None;
         let options = options(&request).unwrap();
         assert_eq!(options.spark_budget_bytes, None);
         assert_eq!(options.spark_budget(), 100 << 30);
@@ -1765,27 +2206,36 @@ mod tests {
             let crate::cli::Commands::Plan(args) = cli.command else { panic!("plan") };
             args
         };
+        use crate::families::glm5_flash::head::GlmfHeadFormat;
         let defaults = parse(&[]);
-        assert_eq!((defaults.kda_fp8, defaults.kda_state, defaults.fp8_head), (KdaFp8::Row128, KdaState::F32, true));
+        assert_eq!((defaults.kda_fp8, defaults.kda_state, defaults.head_format),
+            (KdaFp8::Off, KdaState::F32, GlmfHeadFormat::Auto));
         for state in ["f32", "bf16", "bf16-tile"] {
             for kda in ["off", "row128", "channel"] {
-                for head in ["true", "false"] {
+                for (head, format) in [("true", GlmfHeadFormat::Fp8), ("false", GlmfHeadFormat::Bf16),
+                    ("packed", GlmfHeadFormat::Packed), ("fp8", GlmfHeadFormat::Fp8), ("bf16", GlmfHeadFormat::Bf16)] {
                     let args = parse(&["--kda-state", state, "--kda-fp8", kda, "--fp8-head", head]);
                     let layout = options(&args).unwrap().layout.unwrap();
                     assert_eq!(layout.glmf_kda_state.bytes(), if state == "f32" { 4 } else { 2 });
                     assert_eq!(layout.glmf_representation.kda_fp8, kda != "off");
-                    assert_eq!(layout.glmf_representation.fp8_head, head == "true");
+                    assert_eq!(layout.glmf_representation.head, format);
                 }
             }
         }
+        assert!(crate::cli::Cli::try_parse_from(["cuteafd", "plan", "/not-read", "--layout", "--fp8-head", "maybe"]).is_err());
         let tensor = parse(&["--target-head", "tensor"]);
         assert!(validate_glmf_precision(&tensor, "glm5_flash").is_err());
         assert!(validate_glmf_precision(&tensor, "glm5").is_ok());
+        // The packed head runs its own exact GEMV: an explicit tensor route is refused, exact is inert.
+        let packed_tensor = parse(&["--fp8-head", "packed", "--target-head", "tensor"]);
+        let error = validate_glmf_precision(&packed_tensor, "glm5_flash").unwrap_err().to_string();
+        assert!(error.contains("exact 12-bit"), "{error}");
+        assert!(validate_glmf_precision(&parse(&["--fp8-head", "packed", "--target-head", "exact"]), "glm5_flash").is_ok());
         for target in ["exact", "tensor"] {
             for draft in ["exact", "tensor"] {
                 let layout = options(&parse(&["--fp8-head", "false", "--target-head", target,
                     "--draft-head", draft])).unwrap().layout.unwrap();
-                assert!(!layout.glmf_representation.fp8_head);
+                assert_eq!(layout.glmf_representation.head, GlmfHeadFormat::Bf16);
                 assert_eq!(layout.drafter_bytes, 0, "head arithmetic must not add a weight copy");
             }
         }
@@ -1881,9 +2331,10 @@ mod tests {
         let model = snapshot.path().display().to_string();
         let layout = |extra: &[&str]| {
             let argv = ["cuteafd", "plan", model.as_str(), "--layout", "--spark-ranks", "4", "--rtx", "1",
-                "--rtx-gib", "96", "--pool-tokens", "0", "--drafter-gib", "2"];
+                "--gpu-memory-cap", "96GiB", "--pool-tokens", "0", "--drafter-gib", "2"];
             let cli = crate::cli::Cli::try_parse_from(argv.into_iter().chain(extra.iter().copied())).unwrap();
-            let crate::cli::Commands::Plan(args) = cli.command else { panic!("plan") };
+            let crate::cli::Commands::Plan(mut args) = cli.command else { panic!("plan") };
+            args.memory = cli.memory;
             options(&args).unwrap()
         };
         // (marks, state) bytes on the GPU.
@@ -1933,7 +2384,11 @@ mod tests {
             "--prefix-cache-entries", "6", "--prefix-cache-mark-mib", "1971", "--replay-records", "shared"]);
         let knobs = custom.layout.as_ref().unwrap();
         assert_eq!((knobs.concurrency, knobs.state_slots, knobs.glmf_mark_lanes, knobs.mimo_prefix_entries,
-            knobs.mimo_prefix_mark_bytes, knobs.glmf_shared_replay), (16, Some(16), Some(16), 6, 1971 << 20, true));
+            knobs.mimo_prefix_mark_bytes, knobs.glmf_shared_replay, knobs.glmf_auto_replay),
+            (16, Some(16), Some(16), 6, 1971 << 20, true, false));
+        let auto_replay = layout(&["--replay-records", "auto"]);
+        let auto_knobs = auto_replay.layout.as_ref().unwrap();
+        assert_eq!((auto_knobs.glmf_shared_replay, auto_knobs.glmf_auto_replay), (false, true));
         for zero in ["--state-slots", "--mark-lanes"] {
             assert!(crate::cli::Cli::try_parse_from(["cuteafd", "plan", "/not-read", "--layout", zero, "0"]).is_err());
         }
@@ -1955,20 +2410,65 @@ mod tests {
     fn layout_refuses_full_storage_shortfall_even_when_weights_fit() {
         let snapshot = tempfile::tempdir().unwrap();
         write_snapshot(snapshot.path(), &mimo_flash_config(), &mimo_flash_tensors(), Some(1));
-        let tiny = PlanArgs { coordinator_gpu_budget_gib: Some(2.0), ..args(snapshot.path(), 4, true) };
+        let tiny = PlanArgs { memory: crate::cli::MemoryArgs { gpu_memory_cap: Some(2 << 30), ..args(snapshot.path(), 4, true).memory },
+            ..args(snapshot.path(), 4, true) };
         let mut weight_only = options(&tiny).unwrap();
         weight_only.layout = None;
+        assert_eq!(weight_only.coordinator_budget_bytes, 80 << 30);
+        assert_eq!(weight_only.coordinator_gpu_budget_bytes, 2 << 30);
         let inventory = plan(snapshot.path(), &weight_only).unwrap();
-        assert!(inventory.fits, "weight inventory fits");
-        assert!(!inventory.placement_supported && !inventory.executable());
+        assert!(!inventory.fits && !inventory.placement_supported && !inventory.executable());
         assert!(inventory.hints.iter().any(|h| h.what.contains("MiMo placement")
-            && (h.what.contains("mandatory") || h.what.contains("pool"))), "{:?}", inventory.hints);
+            && h.what.contains("memory budget 'rtx0'")), "{:?}", inventory.hints);
         let report = plan(snapshot.path(), &options(&tiny).unwrap()).unwrap();
         assert!(!report.fits && !report.executable());
         assert!(report.hints.iter().any(|h| h.what.contains("MiMo placement")
-            && (h.what.contains("mandatory") || h.what.contains("pool"))), "{:?}", report.hints);
+            && h.what.contains("memory budget 'rtx0'")), "{:?}", report.hints);
         let error = run_plan(tiny).unwrap_err();
         assert!(error.to_string().contains("is not servable"), "{error:#}");
+    }
+
+    #[test]
+    fn resident_weight_shortfall_refuses_even_when_storage_is_sufficient() {
+        let snapshot = tempfile::tempdir().unwrap();
+        write_snapshot(snapshot.path(), &mimo_flash_config(), &mimo_flash_tensors(), Some(1));
+        for layout in [false, true] {
+            let request = PlanArgs { layout, memory: crate::cli::MemoryArgs { gpu_memory_cap: Some((95 << 30) + (1 << 29)),
+                ..args(snapshot.path(), 4, true).memory }, ..args(snapshot.path(), 4, true) };
+            let admitted = plan(snapshot.path(), &options(&request).unwrap()).unwrap();
+            assert!(admitted.executable(), "{:?}", admitted.hints);
+            let capped = PlanArgs { coordinator_weight_budget_gib: 0.125, ..request };
+            let selected = options(&capped).unwrap();
+            assert_eq!(selected.coordinator_budget_bytes, 128 << 20);
+            assert_eq!(selected.coordinator_gpu_budget_bytes, (95 << 30) + (1 << 29));
+            let refused = plan(snapshot.path(), &selected).unwrap();
+            assert!(!refused.fits && !refused.executable());
+            use cuteafd_loader::families::mimo_v2::{MimoV2Config, resident::{MimoResidentLayout, MimoResidentOptions},
+                projection::MimoProjectionRepresentation as R};
+            let checkpoint = cuteafd_loader::plan::Checkpoint::open(snapshot.path()).unwrap();
+            let cfg = MimoV2Config::from_hf(&checkpoint.config).unwrap();
+            let ranks = selected.layout.as_ref().map_or(1, |options| options.rtx_bytes.len());
+            use cuteafd_loader::families::mimo_v2::weight_policy::{default_policy, MimoDefaultPolicy};
+            let qualified_fp8 = default_policy(&checkpoint, &cfg) == MimoDefaultPolicy::Fp8;
+            let representation = |name: &str| {
+                let tensor = checkpoint.tensors.iter().find(|tensor| tensor.meta.name == name).unwrap();
+                if tensor.meta.dtype == cuteafd_core::DType::Bf16 && !qualified_fp8 { R::Bf16 } else { R::Fp8 }
+            };
+            let owners = MimoResidentLayout::new(&checkpoint, &cfg, &MimoResidentOptions {
+                layers: cfg.layers, coordinator_ranks: ranks, checkpoint_tp: 1, native_mtp_layers: 0,
+                gpu_embedding: true, head_format: representation("lm_head.weight"),
+                output_formats: (0..cfg.layers).map(|layer| {
+                    let name = format!("model.layers.{layer}.self_attn.o_proj.weight");
+                    let format = representation(&name);
+                    (name, format)
+                }).collect(),
+            }).unwrap();
+            let required = owners.ranks[0].iter().map(|owner| owner.bytes).sum::<u64>();
+            let refusal = format!("rtx0 resident weights need {required} bytes, over the {} byte weight budget", 128 << 20);
+            assert!(refused.hints.iter().any(|h| h.what.contains(&refusal)), "{:?}", refused.hints);
+            let error = run_plan(capped).unwrap_err();
+            assert!(error.to_string().contains("is not servable"), "{error:#}");
+        }
     }
 
     /// `cuteafd plan` plans the vision policy serve-glmf serves: automatic vision on a GLM 5.3 Flash
@@ -2028,10 +2528,11 @@ mod tests {
         let error = run_plan(args(pro.path(), 4, true)).unwrap_err();
         assert!(error.to_string().contains("is not servable by this build"), "{error:#}");
         // Options that describe no deployment fail before the checkpoint is read.
-        for (ranks, budget) in [(9, 100.0), (4, f64::NAN), (4, 0.0), (4, -3.0)] {
-            let error = run_plan(PlanArgs { spark_budget_gib: Some(budget), ..args(flash.path(), ranks, false) }).unwrap_err();
+        for (ranks, budget) in [(9, 100u64 << 30), (4, 0)] {
+            let error = run_plan(PlanArgs { memory: crate::cli::MemoryArgs { spark_memory_cap: Some(budget), ..Default::default() },
+                ..args(flash.path(), ranks, false) }).unwrap_err();
             assert!(matches!(error.downcast_ref::<PlanError>(), Some(PlanError::InvalidOption { .. })),
-                "{ranks} ranks, {budget} GiB: {error:#}");
+                "{ranks} ranks, {budget} bytes: {error:#}");
         }
     }
 }

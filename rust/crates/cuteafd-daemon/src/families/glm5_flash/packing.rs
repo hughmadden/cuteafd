@@ -1,4 +1,4 @@
-//! Packed admission prefill (`serve-glmf --prefill-batch`): the layout of one prefill pass over
+//! Packed admission prefill (`serve-glmf --prefill-packing`): the layout of one prefill pass over
 //! the next chunks of several sequences ([`super::engine::GlmfEngine::prefill_packed`]).
 //!
 //! The sequences' rows sit back to back in one step, each sequence's rows contiguous and in

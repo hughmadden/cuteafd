@@ -4,29 +4,38 @@ use crate::shared::{prefix::PrefixArgs, qwen::scheduler::{self, Backend}};
 use anyhow::{ensure, Context, Result};
 use cuteafd_api::openai::{chat::kimi::KimiEncoding, ModelEncoding, ModelProfile, NativeLimits, NativeRequest};
 use std::{net::SocketAddr, path::PathBuf, sync::{Arc, Mutex}};
-use cuteafd_loader::families::kimi_k3::{COMPILED_CONTEXT, DEFAULT_CONTEXT};
+use cuteafd_loader::families::kimi_k3::COMPILED_CONTEXT;
 
 #[derive(Debug, Clone, clap::Args)]
 pub(crate) struct ServeArgs {
+    #[command(flatten)]
+    pub(crate) attention: crate::cli::CoreViewArgs,
     /// Target and drafter share the exact selected MLA record.
     #[arg(long, default_value = "fp8")] pub kv_cache: cuteafd_core::MlaCacheFormat,
     #[arg(long)] pub snapshot: PathBuf,
+    /// Aggregate executed routed-expert selections on each canonical producer GPU.
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set,
+        num_args = 0..=1, default_missing_value = "true", require_equals = true)]
+    pub expert_usage: bool,
+    #[arg(skip)] pub expert_usage_reader: cuteafd_core::expert_usage::Reader,
     #[arg(long, env = "CUTEAFD_NATIVE_LIB")] pub native_lib: PathBuf,
     #[arg(long, default_value = "/opt/cuteafd/share/PROGRAMS.json")] pub manifest: PathBuf,
     #[arg(long, default_value_t = 0)] pub device: i32,
     /// Optional distinct physical peer; absent serves the full model on --device.
     #[arg(long)] pub split_device: Option<i32>,
+    /// MLA auto uses context on two devices, whole ownership on one; KDA stays head-split on a pair.
+    #[arg(long, env = "CUTEAFD_ATTENTION_PLACEMENT", default_value = "auto",
+        value_parser = ["auto", "heads", "context", "layers"])]
+    pub attention_placement: String,
     #[arg(long, value_delimiter = ',')] pub peers: Vec<SocketAddr>,
     /// Auto admission grows beyond the selected context floor while memory allows.
     #[arg(long)] pub pool_tokens: Option<u64>,
-    /// Native allocation extent and API ceiling; unset takes the checkpoint core's
-    /// default (the compiled 1M for a K6 core, 512K for a BF16 core).
-    #[arg(long)] pub max_context: Option<usize>,
+    /// Served context: auto fits the model maximum and admitted pool; a number pins it.
+    #[arg(long = "max-context-tokens", value_parser = crate::shared::context::parse_tokens::<usize>)]
+    pub max_context: Option<usize>,
     /// RTX expert layers: auto, all (every routed-expert layer of the target
     /// model), or an exact N.
     #[arg(long, default_value = "auto")] pub rtx_expert_layers: cuteafd_loader::placement::OnboardSetting,
-    /// Complete per-rank allocation ceiling, estimated until the first worker census.
-    #[arg(long)] pub spark_budget_gib: Option<f64>,
     #[arg(long, default_value = "0.0.0.0:8000")] pub listen: String,
     #[arg(long, default_value_t = 16, value_parser = clap::value_parser!(u8).range(1..=64))]
     pub max_sequences: u8,
@@ -34,15 +43,19 @@ pub(crate) struct ServeArgs {
     /// Opt in to a checkpoint-native MLA DFlash2 drafter.
     #[arg(long)] pub draft: Option<PathBuf>,
     #[arg(long, default_value_t = false, action = clap::ArgAction::Set)] pub draft_fp8: bool,
+    /// Split the native draft cache and attention over both physical GPUs.
+    #[arg(long, default_value_t = false, action = clap::ArgAction::Set)] pub tp2_dflash: bool,
     /// Fixed draft depth; absent lets the shared policy choose up to the checkpoint width.
-    #[arg(long, requires = "draft", value_parser = clap::value_parser!(u8).range(1..=7))]
-    pub draft_fixed: Option<u8>,
+    #[command(flatten)]
+    pub draft_length: crate::shared::draft::length::DraftLength,
     /// Prefill unit rows, at most 4096; unset follows the shared wave policy.
     /// The lane holds the exact shared shape (8256 rows for three waves).
     #[arg(long)] pub prefill_rows: Option<usize>,
     /// Prefill units in flight on one transport; unset follows the shared six-Spark policy.
     #[arg(long, value_parser = clap::value_parser!(u8).range(1..=4))]
     pub prefill_waves: Option<u8>,
+    /// Admit every prefill row's logits for diagnostic fidelity scoring.
+    #[arg(long)] pub full_prefill_logits: bool,
     /// Pack already queued prompts, or run unknown arithmetic routes alone in exact mode.
     #[arg(long, value_enum, default_value = "unrestricted")]
     pub prefill_packing: crate::shared::prefill_packing::PackingMode,
@@ -55,32 +68,30 @@ pub(crate) struct ServeArgs {
 
 impl ServeArgs {
     /// `admitted` is the engine's resolved context extent (the explicit
-    /// --max-context, else the checkpoint core's default).
+    /// --max-context-tokens, else the admitted automatic extent).
     fn api_limits(&self, admitted: usize) -> Result<NativeLimits> {
-        self.prefix.reserve.limits(self.max_context.unwrap_or(admitted).min(admitted))
-    }
-
-    fn max_context(&self, core: &cuteafd_loader::families::kimi_k3::core::CoreInventory) -> usize {
-        self.max_context.unwrap_or_else(|| cuteafd_loader::families::kimi_k3::default_context(core))
+        self.prefix.reserve.limits(self.max_context.filter(|&tokens| tokens > 0).unwrap_or(admitted).min(admitted))
     }
 
     pub(super) fn prefill(&self) -> Result<cuteafd_loader::serving_capacity::prefill_waves::PrefillPlan> {
         use cuteafd_loader::serving_capacity::prefill_waves::{prefill_shape, PrefillOverrides};
-        Ok(prefill_shape(self.peers.len(), cuteafd_loader::plan::Family::prefill_limits(&cuteafd_loader::plan::families::kimi::KIMI_K3), PrefillOverrides {
+        let plan = prefill_shape(self.peers.len(), cuteafd_loader::plan::Family::prefill_limits(&cuteafd_loader::plan::families::kimi::KIMI_K3), PrefillOverrides {
             unit_rows: self.prefill_rows.map(|rows| rows as u64),
             waves: self.prefill_waves.map(u64::from), span_rows: None, reserve_rows: None,
-        })?)
+        })?;
+        cuteafd_bench::context::ResolvedSettings::prefill(plan).publish();
+        Ok(plan)
     }
 
     fn validate(&self) -> Result<()> {
+        ensure!(!self.tp2_dflash || (self.draft.is_some() && self.split_device.is_some()),
+            "Kimi TP2 DFlash requires a drafter and two coordinator devices");
         ensure!(self.device >= 0 && self.split_device.is_none_or(|peer| peer >= 0 && peer != self.device),
             "Kimi serving requires one device or two distinct coordinator devices");
-        ensure!((1..=8).contains(&self.peers.len()) && self.peers.iter().collect::<std::collections::HashSet<_>>().len() == self.peers.len(),
-            "Kimi serving requires 1..8 distinct real Spark endpoints");
-        ensure!(self.max_context.is_none_or(|context| (1..=COMPILED_CONTEXT).contains(&context)),
+        ensure!(self.peers.len() <= 8 && self.peers.iter().collect::<std::collections::HashSet<_>>().len() == self.peers.len(),
+            "Kimi serving accepts at most eight distinct Spark endpoints");
+        ensure!(self.max_context.is_none_or(|context| context == 0 || (1..=COMPILED_CONTEXT).contains(&context)),
             "Kimi context exceeds the compiled 1M extent");
-        ensure!(self.spark_budget_gib.is_none_or(|gib| gib.is_finite() && gib > 0.0),
-            "Kimi requires a finite positive estimated --spark-budget-gib");
         self.prefill()?;
         ensure!(self.prefix.prefix_partial == crate::shared::prefix::Toggle::Off,
             "Kimi serving requires exact prefix frontiers");
@@ -97,20 +108,24 @@ fn load_target<'a, const RANKS: usize>(args: &ServeArgs,
     slots: usize, marks: usize, prefill: cuteafd_loader::serving_capacity::prefill_waves::PrefillPlan)
     -> Result<startup::Loaded<'a>> {
     let draft = args.draft.as_ref().map(|snapshot| super::draft::Options {
-        snapshot: snapshot.clone(), fp8: args.draft_fp8, cache_format: args.kv_cache });
-    startup::load(library, programs, checkpoint, cfg, cfg, startup::Options {
-        cache_format: args.kv_cache, devices, native_lib: &args.native_lib,
+        snapshot: snapshot.clone(), fp8: args.draft_fp8, tp2_dflash: args.tp2_dflash, cache_format: args.kv_cache });
+    startup::load(library, programs, checkpoint, cfg, cfg, startup::Options { role: startup::Role::Serve,
+        expert_usage: args.expert_usage, expert_usage_reader: args.expert_usage_reader.clone(),
+        cache_format: args.kv_cache, devices, native_lib: &args.native_lib, manifest: &args.manifest,
+        attention: cuteafd_loader::placement::attention::parse(&args.attention_placement).map_err(anyhow::Error::msg)?,
         peers: args.peers.clone(), rtx_expert_layers: args.rtx_expert_layers,
-        spark_budget_gib: args.spark_budget_gib,
         rows: usize::try_from(prefill.span_rows)?, waves: usize::try_from(prefill.waves)?,
         prefill_rows: Some(usize::try_from(prefill.unit_rows)?), slots, marks,
-        max_context: args.max_context(&cuteafd_loader::plan::families::kimi::core_inventory(checkpoint)?),
+        max_context: args.max_context.filter(|&tokens| tokens > 0).unwrap_or(cfg.max_position),
+        context: cuteafd_loader::placement::planner::Context::resolve(cfg.max_position as u64, args.max_context.map(|n| n as u64)),
         pool_tokens: args.pool_tokens.filter(|&tokens| tokens > 0), graphs: true,
-        ffn_mode: cuteafd_ffi::KimiFfnMode::default(), hosted_layers: None, draft, verify_rows: 0,
+        full_prefill_logits: args.full_prefill_logits,
+        ffn_mode: cuteafd_ffi::KimiFfnMode::default(), hosted_layers: None, draft, verify_rows: 0, prefix: Some(&args.prefix),
     })
 }
 
 pub(crate) async fn run(mut args: ServeArgs) -> Result<()> {
+    args.draft_length.report_inactive(args.draft.is_some());
     cuteafd_core::concurrency::validate("kimi_k3", args.max_sequences as u64)?;
     args.prefix.resolve_entries(args.max_sequences as usize);
     args.validate()?;
@@ -122,7 +137,8 @@ pub(crate) async fn run(mut args: ServeArgs) -> Result<()> {
         let (organization, model) = name.split_once("--")?;
         Some(format!("{organization}/{model}"))
     })).context("Kimi serving requires --model-id for a snapshot without HF identity")?;
-    let profile = ModelProfile::new(model, ModelEncoding::Kimi(encoding));
+    let mut profile = ModelProfile::new(model, ModelEncoding::Kimi(encoding));
+    profile.expert_usage = args.expert_usage_reader.clone();
     let (queue, mut receive) = tokio::sync::mpsc::channel::<NativeRequest>(cuteafd_core::concurrency::queue_depth(args.max_sequences as u64) as usize);
     let stats = Arc::new(Mutex::new(serde_json::Value::Null));
     let worker_stats = stats.clone();
@@ -133,10 +149,26 @@ pub(crate) async fn run(mut args: ServeArgs) -> Result<()> {
         let result = (|| -> Result<()> {
             cuteafd_core::set_expert_geometry(cuteafd_core::ExpertGeometry::KIMI_K3)
                 .map_err(|_| anyhow::anyhow!("Kimi serving needs an isolated process"))?;
-            let checkpoint = cuteafd_loader::plan::Checkpoint::coordinator(&worker_args.snapshot, false, false)?;
+            let view = worker_args.attention.selected_view.clone().map(Ok)
+                .unwrap_or_else(|| worker_args.attention.select(&worker_args.snapshot))?;
+            worker_args.attention.validate_view(&view)?;
+            let checkpoint = cuteafd_loader::plan::Checkpoint::coordinator_view(&view, false, false)?;
             let cfg = cuteafd_loader::families::kimi_k3::config::KimiK3Config::from_hf(&checkpoint.config)?;
             cfg.release_geometry()?;
             cuteafd_bench::context::set_family(cfg.family_id());
+            let view = checkpoint.view.as_ref()
+                .context("Kimi serving requires the immutable selected checkpoint view")?;
+            use cuteafd_loader::plan::checkpoint::{view::FP8_RECIPE, CoreView};
+            let mode = match view.mode() {
+                CoreView::Original => "original", CoreView::K6Compact => "k6-compact", CoreView::K8Compact => "k8-compact",
+                CoreView::Fp8Compact => "fp8-compact",
+            };
+            let recipe = if view.mode() == CoreView::Fp8Compact { FP8_RECIPE } else { "none" };
+            cuteafd_bench::context::set_resolved("core-view", mode);
+            cuteafd_bench::context::set_resolved("core-view-fingerprint", view.fingerprint());
+            cuteafd_bench::context::set_resolved("core-fp8-recipe", recipe);
+            tracing::info!(core_view = mode, bundle = view.fingerprint(), fp8_recipe = recipe,
+                "selected immutable attention bundle");
             let concurrency = usize::from(worker_args.max_sequences);
             let slots = cuteafd_core::concurrency::state_slots(concurrency as u64) as usize;
             let prefill = worker_args.prefill()?;
@@ -158,16 +190,18 @@ pub(crate) async fn run(mut args: ServeArgs) -> Result<()> {
             crate::shared::memory_report::release_load_staging(&library)?;
             loaded.engine.configure_packing(worker_args.prefill_packing)?;
             let backend = KimiBackend::new(&loaded.engine)?;
+            if crate::shared::probe::streamed_prefill_scoring("kimi_k3") {
+                cuteafd_bench::context::set_resolved("prefill-scoring", "streamed");
+            }
             // The shared selector allocates on the calling thread's device and
             // consumes logits on the terminal rank's exact producing stream.
             library.cuda_set_device(worker_args.split_device.unwrap_or(worker_args.device))?;
             scheduler::schedule(&backend, &worker_args.snapshot, &mut receive, &worker_stats, concurrency,
                 match loaded.engine.native_draft() {
                     Some(draft) => scheduler::Drafts::Neural {
-                        depth: worker_args.draft_fixed.map_or(draft.drafts(), usize::from),
-                        fixed: worker_args.draft_fixed.is_some() },
+                        depth: draft.drafts() },
                     None => scheduler::Drafts::None,
-                }, eos, worker_args.decode_share, &worker_args.prefix,
+                }, worker_args.draft_length, eos, worker_args.decode_share, &worker_args.prefix,
                 worker_args.loop_abort.config(), worker_args.token_io.token_select,
                 &mut super::super::qwen3_5::serve::text_media(), None, || {
                     loaded.engine.require_live()?;
@@ -181,12 +215,9 @@ pub(crate) async fn run(mut args: ServeArgs) -> Result<()> {
                     Ok(())
                 })
         })();
-        if let Some(ready) = ready.take() {
-            let error = result.as_ref().err().map(|error| format!("{error:#}"))
-                .unwrap_or_else(|| "scheduler exited before readiness".into());
-            let _ = ready.send(Err(anyhow::anyhow!("Kimi initialization failed: {error}")));
-        }
-        result
+        crate::shared::serve::forward_initialization(result, ready.is_some(), "Kimi initialization failed", |error| {
+            ready.take().expect("pending readiness").send(Err(error)).map_err(|result| match result { Err(error) => error, Ok(_) => unreachable!("sent an error") })
+        })
     });
     let compiled_context = ready_rx.await.context("Kimi worker exited before readiness")??;
     let limits = args.api_limits(compiled_context)?;
@@ -200,11 +231,12 @@ pub(crate) async fn run(mut args: ServeArgs) -> Result<()> {
     let listener = tokio::net::TcpListener::bind(&args.listen).await?;
     cuteafd_bench::ready(&listener);
     crate::shared::memory_report::log("ready");
+    let mut worker = Some(worker);
     tokio::select! {
-        served = axum::serve(listener, api.app(router, hub)
-            .into_make_service_with_connect_info::<SocketAddr>()) => served?,
-        _ = crate::shared::api::watch_scheduler(worker) => unreachable!(),
+        served = crate::shared::api::serve_http(listener, api.app(router, hub), "kimi_k3") => served?,
+        _ = crate::shared::api::watch_scheduler(&mut worker) => unreachable!(),
     }
+    crate::shared::api::finish_scheduler(&mut worker, "kimi_k3").await?;
     Ok(())
 }
 
@@ -222,22 +254,82 @@ mod tests {
     }
 
     #[test]
-    fn native_draft_is_opt_in_with_explicit_precision_and_bounded_fixed_depth() -> Result<()> {
+    fn expert_usage_off_and_skip_have_no_reader_or_native_owners() -> Result<()> {
+        assert!(args(&[])?.expert_usage);
+        let off = args(&["--expert-usage=false"])?;
+        assert!(!off.expert_usage);
+        assert_eq!(off.expert_usage_reader.snapshot()["enabled"], false);
+        assert!(args(&["--expert-usage"])?.expert_usage);
+        assert!(!off.expert_usage_reader.configure(true, true).map_err(anyhow::Error::msg)?);
+        assert!(off.expert_usage_reader.require_enabled().is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn core_view_flags_are_explicit_and_reject_removed_flags() -> Result<()> {
+        use cuteafd_loader::plan::checkpoint::CoreView;
+        assert_eq!(args(&[])?.attention.mode(), CoreView::Original);
+        assert_eq!(args(&["--core-view", "k6-compact"])?.attention.mode(), CoreView::K6Compact);
+        assert_eq!(args(&["--core-view", "k8-compact"])?.attention.mode(), CoreView::K8Compact);
+        assert_eq!(args(&["--core-view", "fp8-compact"])?.attention.mode(), CoreView::Fp8Compact);
+        for flag in ["--compact-attention", "--fp8-compact-attention"] { assert!(args(&[flag]).is_err()); }
+        Ok(())
+    }
+
+    #[test]
+    fn attention_selector_defaults_auto_and_preserves_explicit_modes() -> Result<()> {
+        assert_eq!(args(&[])?.attention_placement, "auto");
+        for value in ["auto", "heads", "context", "layers"] {
+            assert_eq!(args(&["--attention-placement", value])?.attention_placement, value);
+        }
+        assert!(args(&["--attention-placement", "invalid"]).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn native_draft_is_opt_in_with_explicit_precision_and_fixed_length() -> Result<()> {
         let defaults = args(&[])?;
         assert!(defaults.draft.is_none());
         assert!(!defaults.draft_fp8);
-        assert!(defaults.draft_fixed.is_none());
+        assert!(!defaults.tp2_dflash);
+        assert!(defaults.draft_length.draft_length.is_none());
         for fp8 in ["false", "true"] {
-            let selected = args(&["--draft", "/drafter", "--draft-fp8", fp8, "--draft-fixed", "7"])?;
+            let selected = args(&["--draft", "/drafter", "--draft-fp8", fp8, "--draft-length", "7"])?;
             assert_eq!(selected.draft.as_deref(), Some(std::path::Path::new("/drafter")));
             assert_eq!(selected.draft_fp8, fp8 == "true");
-            assert_eq!(selected.draft_fixed, Some(7));
+            assert_eq!(selected.draft_length.draft_length, Some(7));
         }
+        for enabled in ["false", "true"] {
+            assert_eq!(args(&["--tp2-dflash", enabled])?.tp2_dflash, enabled == "true");
+        }
+        assert!(args(&["--tp2-dflash"]).is_err());
         assert!(args(&["--draft-fp8"]).is_err());
-        assert!(args(&["--draft-fixed", "1"]).is_err());
-        for depth in ["0", "8"] {
-            assert!(args(&["--draft", "/drafter", "--draft-fixed", depth]).is_err());
+        assert!(args(&["--draft-length", "1"]).is_ok());
+        for depth in ["0", "invalid"] {
+            assert!(args(&["--draft", "/drafter", "--draft-length", depth]).is_err());
         }
+        Ok(())
+    }
+
+    #[test]
+    fn context_draft_validation_requires_drafter_and_physical_peer() -> Result<()> {
+        let base = ["--tp2-dflash", "true", "--peers", "127.0.0.1:8001"];
+        assert!(args(&base)?.validate().is_err());
+        let mut selected = base.to_vec();
+        selected.extend(["--draft", "/drafter"]);
+        assert!(args(&selected)?.validate().is_err());
+        selected.extend(["--split-device", "1"]);
+        args(&selected)?.validate()?;
+        Ok(())
+    }
+
+    #[test]
+    fn full_prefill_logits_is_explicit_and_preserves_shape() -> Result<()> {
+        let ordinary = args(&[])?;
+        let scoring = args(&["--full-prefill-logits"])?;
+        assert!(!ordinary.full_prefill_logits);
+        assert!(scoring.full_prefill_logits);
+        assert_eq!(ordinary.prefill()?, scoring.prefill()?);
         Ok(())
     }
 
@@ -302,17 +394,10 @@ mod tests {
         let peers = "127.0.0.1:1,127.0.0.1:2,127.0.0.1:3,127.0.0.1:4,127.0.0.1:5,127.0.0.1:6";
         let defaults = args(&["--peers", peers])?;
         defaults.validate()?;
-        // Unset follows the checkpoint core: 1M for a header-native K6 core, 512K for BF16.
+        // Automatic context is independent of core weight precision.
         assert_eq!(defaults.max_context, None);
-        let bf16 = cuteafd_loader::families::kimi_k3::core::CoreInventory::default();
-        assert_eq!(defaults.max_context(&bf16), DEFAULT_CONTEXT);
-        let mut k6 = bf16.clone();
-        let head = "language_model.lm_head".to_owned();
-        k6.projections.insert(head.clone(), cuteafd_loader::families::kimi_k3::core::CoreProjection { stem: head,
-            bits: 6, codebook: cuteafd_loader::formats::exl3_storage::Exl3Codebook::Mcg, shape: [163840, 7168],
-            stored_outputs: 163840, split: cuteafd_loader::families::kimi_k3::core::CoreSplit::Whole, source_bytes: 0 });
-        assert_eq!(defaults.max_context(&k6), COMPILED_CONTEXT);
-        assert_eq!(args(&["--peers", peers, "--max-context", "524288"])?.max_context(&k6), 524_288);
+        assert_eq!(args(&["--peers", peers, "--max-context-tokens", "auto"])?.max_context, Some(0));
+        assert_eq!(args(&["--peers", peers, "--max-context-tokens", "524288"])?.max_context, Some(524_288));
         assert_eq!(defaults.kv_cache, cuteafd_core::MlaCacheFormat::Fp8);
         assert_eq!(cuteafd_loader::plan::layout::LayoutOptions::default().mla_kv, defaults.kv_cache);
         assert_eq!(args(&["--peers", peers, "--kv-cache", "bf16"])?.kv_cache, cuteafd_core::MlaCacheFormat::Bf16);
@@ -322,11 +407,10 @@ mod tests {
         assert_eq!(defaults.max_sequences, 16);
         assert!(args(&["--peers", peers, "--native-k6"]).is_err());
         assert_eq!(defaults.pool_tokens, None);
-        assert_eq!(defaults.spark_budget_gib, None);
-        assert_eq!(defaults.api_limits(DEFAULT_CONTEXT)?.context(), DEFAULT_CONTEXT as u32);
+        assert_eq!(defaults.api_limits(524_288)?.context(), 524_288);
         assert_eq!(defaults.api_limits(COMPILED_CONTEXT)?.context(), COMPILED_CONTEXT as u32);
-        args(&["--peers", peers, "--max-context", "1048576"])?.validate()?;
-        let limited = args(&["--peers", peers, "--max-context", "262144"])?;
+        args(&["--peers", peers, "--max-context-tokens", "1048576"])?.validate()?;
+        let limited = args(&["--peers", peers, "--max-context-tokens", "262144"])?;
         limited.validate()?;
         let limits = limited.api_limits(COMPILED_CONTEXT)?;
         assert_eq!(limits.context(), 262144);
@@ -336,14 +420,14 @@ mod tests {
             cuteafd_loader::placement::OnboardSetting::Layers(3));
         assert_eq!(args(&["--peers", peers, "--rtx-expert-layers", "all"])?.rtx_expert_layers,
             cuteafd_loader::placement::OnboardSetting::All);
-        args(&["--peers", peers, "--rtx-expert-layers", "auto", "--spark-budget-gib", "108"])?.validate()?;
-        for budget in ["0", "NaN", "inf"] {
-            assert!(args(&["--peers", peers, "--spark-budget-gib", budget])?.validate().is_err());
-        }
-        assert!(args(&[])?.validate().is_err());
-        for extra in [["--split-device", "0"], ["--max-context", "1048577"],
+        args(&["--peers", peers, "--rtx-expert-layers", "auto"])?.validate()?;
+        // The Spark cap is the global --spark-memory-cap, not a serve-kimi flag.
+        assert!(args(&["--peers", peers, "--spark-budget-gib", "108"]).is_err());
+        args(&[])?.validate()?;
+        for extra in [["--split-device", "0"], ["--max-context-tokens", "1048577"],
             ["--embedding-placement", "host"], ["--prefix-partial", "on"]] {
-            assert!(args(&["--peers", peers, extra[0], extra[1]])?.validate().is_err());
+            assert!(args(&["--peers", peers, extra[0], extra[1]]).is_err()
+                || args(&["--peers", peers, extra[0], extra[1]])?.validate().is_err());
         }
         assert!(!defaults.prefix.host_cache_bytes.enabled(), "host retention remains opt-in");
         for budget in ["0", "auto", "1", "32GiB"] {

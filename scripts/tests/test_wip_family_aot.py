@@ -33,7 +33,7 @@ CASES = [
     ('step5', 'Step-5-Preview-EXL3-K4-Core-K6', 6, 'STEP5', 'step5:exl3-k46'),
     ('kimi_k3', 'Kimi-K3-EXL3-K2', 6, 'KIMIK3', 'kimik3:exl3-k23'),
     ('muse_spark', 'Muse-Spark-Open-EXL3-K4-Core-K6', 6, 'MUSE', 'muse:exl3-k45'),
-    ('mistral_large4', 'Mistral-Large-4-EXL3-K4-Core-K6', 6, 'ML4', 'ml4:exl3-k45'),
+    ('mistral_large4', 'Mistral-Large-4-EXL3-K4', 6, 'ML4', 'ml4:exl3-k45'),
 ]
 
 
@@ -228,9 +228,9 @@ def test_missing_or_malformed_programs_are_refused(tmp_path, contents):
         aot.check_programs('qwen4', tmp_path / 'missing.json')
 
 
-@pytest.mark.parametrize('count,tp,role', [('6', '2', 'tp2'), ('6', '6', 'tp6'), ('3', '3', 'tp3'), ('6', '', 'tp6'), ('8', '8', 'tp8')])
-def test_v41_direct_config_uses_explicit_spark_tp_role(count, tp, role):
-    values = {'FAMILY': 'deepseek_v41', 'SPARK_COUNT': count, 'SPARK_TP': tp}
+@pytest.mark.parametrize('count,role', [('6', 'tp6'), ('3', 'tp3'), ('8', 'tp8'), ('5', 'tp5')])
+def test_v41_direct_config_uses_the_spark_count_role(count, role):
+    values = {'FAMILY': 'deepseek_v41', 'SPARK_COUNT': count}
     _, scopes = aot.config_scopes(values)
     assert scopes['CUTEAFD_WIP_SPARK_TP_ROLES'] == role
 
@@ -293,17 +293,21 @@ def test_unknown_family_has_no_silent_empty_scope(operation, tmp_path):
 
 
 @pytest.mark.parametrize('family,model,count,program,coordinator,spark,counts,roles,extra', [
-    ('deepseek_v41', 'DeepSeek-V4.1-Flash', 4, None, '', '', '', '', {}),
+    ('deepseek_v41', 'DeepSeek-V4.1-Flash', 4, None, '', '', '', '', {'CUTEAFD_WIP_V41_AOT': 'ON'}),
     ('deepseek_v4', 'DeepSeek-V4-Flash', 2, 'DSV4', 'dsv4f:rtx_backbone;dsv4f:spark_tp2',
      'dsv4f:rtx_backbone;dsv4f:spark_tp2', '', '', {}),
     ('glm5', 'GLM-5.3-EXL3-K4', 4, 'GLM', 'glm:exl3-k45;glm:fp8', 'glm:exl3-k45;glm:fp8', 'glm=4', '', {}),
-    ('glm5_flash', 'GLM-5.3-Flash-NVFP4', 4, 'GLMF', 'glmf:nvfp4;glmfdense:nvfp4', 'glmf:nvfp4', 'glmf=4', '', {}),
+    ('glm5_flash', 'GLM-5.3-Flash-NVFP4', 4, 'GLMF', 'glmf:nvfp4;glmfdense:nvfp4', 'glmf:nvfp4', 'glmf=4', '',
+     {'CUTEAFD_WIP_VISION_ATTENTION_AOT': 'ON'}),
     ('mimo_v2', 'MiMo-V2.6-Pro', 6, 'MIMO', 'mimop:fp8', 'mimop:fp8', 'mimop=6', '',
      {'CUTEAFD_WIP_AUDIO_AOT': 'ON', 'CUTEAFD_WIP_MIMO_GEOMETRIES': 'mimop'}),
-    ('qwen4', 'Qwen3.8-Flash-Next-EXL3', 0, 'QWEN4', 'qwen4:exl3-k45;qwen4:nvfp4', '', '', '', {}),
+    ('qwen4', 'Qwen3.8-Flash-Next-EXL3', 0, 'QWEN4', 'qwen4:exl3-k45;qwen4:nvfp4', '', '', '',
+     {'CUTEAFD_WIP_VISION_ATTENTION_AOT': 'ON'}),
     ('kimi_k3', 'Kimi-K3-EXL3-K2', 6, 'KIMIK3', 'kimik3:exl3-k23', 'kimik3:exl3-k23', 'kimik3=6', '', {}),
-    ('muse_spark', 'Muse-Spark-Open-EXL3-K4-Core-K6', 6, 'MUSE', 'muse:exl3-k45', 'muse:exl3-k45', 'muse=6', '', {}),
-    ('mistral_large4', 'Mistral-Large-4-EXL3-K4-Core-K6', 6, 'ML4', 'ml4:exl3-k45', 'ml4:exl3-k45', 'ml4=6', '', {}),
+    ('muse_spark', 'Muse-Spark-Open-EXL3-K4-Core-K6', 6, 'MUSE', 'muse:exl3-k45', 'muse:exl3-k45', 'muse=6', '',
+     {'CUTEAFD_WIP_AUDIO_AOT': 'ON', 'CUTEAFD_WIP_VISION_ATTENTION_AOT': 'ON'}),
+    ('mistral_large4', 'Mistral-Large-4-EXL3-K4', 6, 'ML4', 'ml4:exl3-k45', 'ml4:exl3-k45', 'ml4=6', '',
+     {'CUTEAFD_WIP_VISION_ATTENTION_AOT': 'ON'}),
 ])
 def test_existing_family_scope_outputs_are_unchanged(family, model, count, program,
         coordinator, spark, counts, roles, extra):
@@ -448,7 +452,7 @@ def test_glm_context_only_passes_only_supported_base_geometries(tmp_path, mode, 
     else:
         expected = ['glm', 'glm2']
         if kimi:
-            expected += ['kimik3', 'dense_trellis_k6', 'kimi_split']
+            expected += ['kimik3', 'kimik31', 'dense_trellis_k6', 'kimi_split']
         else:
             expected += ['dense_trellis_k6']
         expected += ['glm_stage', 'glm2_stage']
@@ -527,7 +531,7 @@ def test_kimi_builds_always_package_k6_programs(tmp_path):
                  'native/CMakeLists.txt', 'native/cmake/shared/dsv4_programs.cmake'):
         assert 'KIMIK6' not in (ROOT / name).read_text(), name
     table = (ROOT / 'native/cmake/shared/dsv4_programs.cmake').read_text()
-    assert '"kimik3,dense_trellis_k6,kimi_split"' in table
+    assert '"kimik3,kimik31,dense_trellis_k6,kimi_split"' in table
     for exporter in ['export_b12x_dense_trellis_k6_aot.py', 'export_b12x_kimi_split_aot.py']:
         assert exporter in table
 
@@ -600,7 +604,7 @@ def test_ml4_engine_program_names_are_exported_stems():
 
 @pytest.mark.parametrize('family,exl3_model,fp8_model,exl3_scope,extra', [
     ('glm5', 'wrldsuksgo2mars/GLM-5.3-EXL3-K4-v1', 'zai-org/GLM-5.3', 'glm:exl3-k45', {}),
-    ('glm5_flash', 'brandonmusic/GLM-5.3-Flash-tr3-4bpw', 'zai-org/GLM-5.3-Flash', 'glmf:exl3-k34', {}),
+    ('glm5_flash', 'wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K4-MC', 'zai-org/GLM-5.3-Flash', 'glmf:exl3-k34', {}),
     ('mimo_v2', 'test/MiMo-V2.6-Flash-EXL3-K4', 'XiaomiMiMo/MiMo-V2.6-Flash-MOPD', 'mimof:exl3-k45', {}),
     ('qwen4', 'wrldsuksgo2mars/Qwen3.8-Flash-Next-EXL3-K4.25-PLE-FP8-v1', 'nvidia/Qwen3.8-Flash-Next-NVFP4', 'qwen4:exl3-k45', {}),
     ('step5', 'wrldsuksgo2mars/Step-5-Preview-EXL3-K4-Core-K6', 'stepfun-ai/Step-5-Preview', 'step5:exl3-k46', {}),
@@ -648,7 +652,7 @@ def test_expert_scope_derived_from_checkpoint_not_card_name(tmp_path, monkeypatc
 
 @pytest.mark.parametrize('family,exl3_model,fp8_model,exl3_scope,extra', [
     ('glm5', 'wrldsuksgo2mars/GLM-5.3-EXL3-K4-v1', 'zai-org/GLM-5.3', 'glm:exl3-k45', {}),
-    ('glm5_flash', 'brandonmusic/GLM-5.3-Flash-tr3-4bpw', 'zai-org/GLM-5.3-Flash', 'glmf:exl3-k34', {}),
+    ('glm5_flash', 'wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K4-MC', 'zai-org/GLM-5.3-Flash', 'glmf:exl3-k34', {}),
     ('mimo_v2', 'test/MiMo-V2.6-Flash-EXL3-K4', 'XiaomiMiMo/MiMo-V2.6-Flash-MOPD', 'mimof:exl3-k45', {}),
     ('qwen4', 'wrldsuksgo2mars/Qwen3.8-Flash-Next-EXL3-K4.25-PLE-FP8-v1', 'nvidia/Qwen3.8-Flash-Next-NVFP4', 'qwen4:exl3-k45', {}),
     ('step5', 'wrldsuksgo2mars/Step-5-Preview-EXL3-K4-Core-K6', 'stepfun-ai/Step-5-Preview', 'step5:exl3-k46', {}),

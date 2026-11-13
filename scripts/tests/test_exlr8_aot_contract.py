@@ -70,15 +70,29 @@ def test_serving_and_glue_export_inventory():
     variant = serving_default()
     assert variant == "k1_k23_coalesced"
     namespace = {"compile_exlr8_group_aot": lambda **kwargs: kwargs, "compile_exlr8_a16_aot": lambda **kwargs: kwargs,
-                 "DEFAULT_SERVING_VARIANT": variant}
+                 "compile_exlr8_reply_aot": lambda **kwargs: kwargs, "DEFAULT_SERVING_VARIANT": variant}
     # Drop the local CUDA-dependent import; constructing the lambdas compiles nothing.
     builder.body = [node for node in builder.body if not isinstance(node, ast.ImportFrom)]
     exec(compile(ast.Module(body=[builder], type_ignores=[]), "exlr8_inventory", "exec"), namespace)
     inventory = namespace["exlr8_export_programs"]
     spark = inventory("spark")
+    reply_names = ["a16_serving_core", "reply_1", "reply_2",
+                   "a16_grouped_reply1", "a8_grouped_reply1", "a16_grouped64_reply1",
+                   "a16_grouped_reply2", "a8_grouped_reply2", "a16_grouped64_reply2"]
     assert [p[0] for p in spark] == [
         "a16_serving", "group", "a16_grouped", "a8_grouped", "grouped_group",
-        "a16_grouped64"]
+        "a16_grouped64", *reply_names]
+    by_name = {p[0]: p for p in spark}
+    assert by_name["a16_serving_core"][3]() == {**spark[0][3](), "core_only": True}
+    for format in (1, 2):
+        epilogue = by_name[f"reply_{format}"][3]()
+        assert epilogue["format"] == format and epilogue["variant"] == variant
+        for activation in ("a16", "a8"):
+            producer = by_name[f"{activation}_grouped_reply{format}"][3]()
+            assert producer["grouped"] is True and producer["activations"] == activation
+            assert producer["reply_format"] == format
+        grouped_reply = by_name[f"a16_grouped64_reply{format}"][3]()
+        assert grouped_reply["fc2_partials"] == "f32" and grouped_reply["reply_format"] == format
     a16_grouped = dict(spark[2][2])
     a8_grouped = dict(spark[3][2])
     assert a16_grouped == {"max_rows": 4096} and a8_grouped == {"max_rows": 4096, "activations": "a8"}
@@ -101,7 +115,7 @@ def test_serving_and_glue_export_inventory():
     coordinator = inventory("coordinator")
     assert [p[0] for p in coordinator] == [
         "a16_serving", "group", "shared_a16_serving", "shared_group",
-        "a16_grouped", "a8_grouped", "grouped_group", "a16_grouped64"]
+        "a16_grouped", "a8_grouped", "grouped_group", "a16_grouped64", *reply_names]
     routed_coordinator = [p for p in coordinator if not p[0].startswith("shared_")]
     assert [p[:3] for p in routed_coordinator] == [p[:3] for p in spark]
     assert [p[3]() for p in routed_coordinator] == [p[3]() for p in spark]
@@ -171,3 +185,32 @@ def test_no_changes_to_existing_export_builders():
     spec.loader.exec_module(module)
     assert "exlr8" not in module.GEOMETRIES
     assert "exlr8" not in module.EXL3_GEOMETRIES
+
+
+@pytest.mark.parametrize("build_kind", ["development", "release"])
+def test_engine_build_kind_selects_reply_producers(monkeypatch, build_kind):
+    import os
+    tree = ast.parse((ROOT / "python/tools/aot/export_b12x_exlr8_aot.py").read_text())
+    builder = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "programs")
+    builder.body = [n for n in builder.body if not isinstance(n, ast.ImportFrom)]
+    names = ["a16_serving", "group", "a16_grouped", "a8_grouped", "grouped_group", "a16_grouped64",
+             "a16_serving_core", "reply_1", "reply_2", "a16_grouped_reply1", "a8_grouped_reply1",
+             "a16_grouped64_reply1", "a16_grouped_reply2", "a8_grouped_reply2", "a16_grouped64_reply2"]
+    inventory = [(name, "kind", {}, lambda: None) for name in names]
+    namespace = {"os": os, "exlr8_export_programs": lambda *args, **kwargs: inventory}
+    monkeypatch.setenv("CUTEAFD_BUILD_KIND", build_kind)
+    exec(compile(ast.Module(body=[builder], type_ignores=[]), "engine_exlr8_policy", "exec"), namespace)
+    assert [item[0] for item in namespace["programs"](role="spark")] == (
+        names if build_kind == "release" else names[:6])
+
+
+@pytest.mark.parametrize("build_kind", [None, "development", "release"])
+def test_cmake_build_identity_preserves_release_argument(tmp_path, build_kind):
+    import subprocess
+    cmake = (ROOT / "native/CMakeLists.txt").read_text()
+    policy = cmake[cmake.index("if(NOT DEFINED CUTEAFD_BUILD_KIND)"):cmake.index("# Read target")]
+    script = tmp_path / "identity.cmake"
+    script.write_text(policy + '\nmessage(STATUS "identity=${CUTEAFD_BUILD_KIND}")\n')
+    args = ["cmake", *([] if build_kind is None else [f"-DCUTEAFD_BUILD_KIND={build_kind}"]), "-P", str(script)]
+    result = subprocess.run(args, capture_output=True, text=True, check=True)
+    assert f"identity={build_kind or 'development'}" in result.stdout

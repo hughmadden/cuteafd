@@ -22,6 +22,7 @@ use crate::shared::memory::{DeviceAllocation, HostAllocation};
 use anyhow::Result;
 use cuteafd_ffi::{CuteafdDeviceBuffer, NativeLibrary};
 use std::ffi::c_void;
+use crate::shared::memory::Tag;
 
 /// GLM Flash router ids are plain expert indices (no flag bits).
 const ROUTE_MASK: u32 = u32::MAX;
@@ -35,6 +36,7 @@ pub(crate) struct RingCheck {
 
 pub(crate) struct RoundProbe<'a> {
     collect_routes: bool,
+    collect_timing: bool,
     clock: LayerClock<'a>,
     routes: RoundRoutes,
     /// Pinned `[layer][row][slot]` u32 ids, packed to this round's row stride.
@@ -60,17 +62,28 @@ pub(crate) struct RoundProbe<'a> {
 }
 
 impl<'a> RoundProbe<'a> {
+    pub(crate) fn allocation_receipts(&self,
+        inventory: &mut crate::shared::memory::receipts::Inventory<'_>, name: &str) -> Result<()> {
+        inventory.pinned(&format!("{name}.ring"), self.ring.buffer)?;
+        inventory.device(&format!("{name}.device_ring"), self.device_ring.buffer)?;
+        inventory.host(&format!("{name}.dense"), &self.dense)?;
+        inventory.host(&format!("{name}.ringed"), &self.ringed)?;
+        inventory.host(&format!("{name}.staged"), &self.staged)?;
+        self.clock.allocation_receipts(inventory, &format!("{name}.clock"))?;
+        self.routes.allocation_receipts(inventory, &format!("{name}.routes"))
+    }
     /// A probe for `dense.len()` layers of `topk` routes and steps of up to
     /// `capacity` rows, on the current device.
     pub fn new(library: &'a NativeLibrary, dense: Vec<bool>, topk: usize, capacity: usize) -> Result<Self> {
         let layers = dense.len();
         let bytes = layers * capacity * topk * 4;
-        let ring = HostAllocation::new(library, bytes)?;
-        let device_ring = DeviceAllocation::new(library, bytes)?;
+        let ring = HostAllocation::new(library, bytes, Tag::staging("shared/route-probe"))?;
+        let device_ring = DeviceAllocation::new(library, bytes, Tag::workspace("shared/route-probe"))?;
         // Initialize padding once: the single contiguous download includes unused row slots.
         library.cuda_zero_bytes(device_ring.buffer, bytes)?;
         let last_owned = dense.iter().rposition(|&dense| !dense);
         Ok(Self { collect_routes: super::binding::configured_needs_routes(),
+            collect_timing: super::binding::configured_needs_timing(),
             clock: LayerClock::new(library, layers)?, routes: RoundRoutes::new(layers, topk), ring,
             device_ring, last_owned, downloaded: false, capacity,
             topk, ringed: vec![false; layers], staged: vec![false; layers], dense,
@@ -80,7 +93,7 @@ impl<'a> RoundProbe<'a> {
 
     /// Start a verify step of `rows` rows.
     pub fn begin(&mut self, rows: usize) {
-        if !self.collect_routes { self.pending = true; return; }
+        if !self.collect_routes && !self.collect_timing { self.pending = true; return; }
         self.routes.begin(rows);
         for (layer, &dense) in self.dense.iter().enumerate() {
             if dense { let _ = self.routes.dense(layer); }
@@ -103,7 +116,7 @@ impl<'a> RoundProbe<'a> {
 
     /// Whether a layer's ids go through the ring: every local layer, and
     /// Spark layers too under the ring check.
-    pub fn wants_ring(&self, spark: bool) -> bool { self.active && (!spark || self.check) }
+    pub fn wants_ring(&self, spark: bool) -> bool { self.active && self.collect_routes && (!spark || self.check) }
 
     /// Mark the end of `layer` on `stream`.
     ///
@@ -112,8 +125,8 @@ impl<'a> RoundProbe<'a> {
     pub unsafe fn mark(&mut self, layer: usize, stream: *mut c_void) -> Result<()> {
         if self.active {
             // SAFETY: forwarded from the caller; no read of this round's marks is in flight.
-            unsafe { self.clock.mark(layer, stream, false) };
-            if Some(layer) == self.last_owned && self.ringed.iter().any(|&queued| queued) {
+            if self.collect_timing { unsafe { self.clock.mark(layer, stream, false) }; }
+            if self.collect_routes && Some(layer) == self.last_owned && self.ringed.iter().any(|&queued| queued) {
                 // SAFETY: all owner-local D2D writes precede this download on the same stream;
                 // the pinned ring remains owned until the existing verifier sync and finish.
                 unsafe { self.device_ring.library.copy_d2h_host_buffer_async(
@@ -130,7 +143,7 @@ impl<'a> RoundProbe<'a> {
     /// # Safety
     /// `stream` is live on this probe's device and ordered after the input transfer.
     pub unsafe fn mark_entry(&mut self, layer: usize, stream: *mut c_void) {
-        if self.active {
+        if self.active && self.collect_timing {
             // SAFETY: the caller guarantees the event and stream ownership/order.
             unsafe { self.clock.mark_entry(layer, stream, false); }
         }
@@ -138,7 +151,7 @@ impl<'a> RoundProbe<'a> {
 
     /// A Spark layer's staged ids: `rows * topk` little-endian u32 in row order.
     pub fn staged(&mut self, layer: usize, bytes: &[u8]) {
-        if !self.active || self.error.is_some() { return; }
+        if !self.active || !self.collect_routes || self.error.is_some() { return; }
         match self.routes.push_bytes(layer, bytes, ROUTE_MASK) {
             Ok(()) => self.staged[layer] = true,
             Err(error) => self.error = Some(error),
@@ -153,7 +166,7 @@ impl<'a> RoundProbe<'a> {
     /// engine's live stream; the ring is read only after the step's sync.
     pub unsafe fn ring(&mut self, library: &NativeLibrary, layer: usize, ids: CuteafdDeviceBuffer, rows: usize,
         stream: *mut c_void) -> Result<()> {
-        if !self.active || layer >= self.ringed.len() || rows > self.capacity { return Ok(()); }
+        if !self.active || !self.collect_routes || layer >= self.ringed.len() || rows > self.capacity { return Ok(()); }
         let bytes = rows * self.topk * 4;
         let offset = layer * rows * self.topk * 4;
         let arena = self.device_ring.buffer;
@@ -176,7 +189,9 @@ impl<'a> RoundProbe<'a> {
         let _timing = super::clock::HostSpan::new(super::clock::HostStage::Routes);
         self.active = false;
         if !std::mem::take(&mut self.pending) { return None; }
-        if !self.collect_routes { return Some((&self.routes, Vec::new())); }
+        if !self.collect_routes {
+            return Some((&self.routes, if self.collect_timing { self.clock.read() } else { Vec::new() }));
+        }
         if self.ringed.iter().any(|&queued| queued) && !self.downloaded {
             tracing::debug!("draft policy route arena was not downloaded before verifier sync");
             return None;
@@ -232,6 +247,126 @@ mod tests {
     use super::*;
 
     #[test]
+    fn probe_census_is_passive_and_does_not_initialize_route_ids() -> Result<()> {
+        use crate::shared::memory::receipts::Inventory;
+        use cuteafd_core::memory_layout::Category;
+        use cuteafd_loader::placement::planner::{CoordinatorDevices, Lifetime};
+        let (_directory, fixture) = crate::shared::memory::cpu_stream_fixture()?;
+        let library = fixture.load()?;
+        let probe = RoundProbe::new(&library, vec![true, false, false], 2, 8)?;
+        let before = fixture.events()?;
+        let physical = [0];
+        let mut inventory = Inventory::new(CoordinatorDevices::new(&physical)?, "fixture",
+            Lifetime::TARGET, Category::Workspace, "probe");
+        probe.allocation_receipts(&mut inventory, "probe")?;
+        for (name, ptr, bytes) in [("ring", probe.ring.buffer.ptr as u64, probe.ring.buffer.bytes),
+            ("device_ring", probe.device_ring.buffer.ptr as u64, probe.device_ring.buffer.bytes)] {
+            let receipt = inventory.receipts.iter().find(|r| r.allocation.id == format!("fixture.probe.{name}")).unwrap();
+            assert_eq!((receipt.address, receipt.allocation.bytes), (ptr, bytes as u64));
+        }
+        assert!(inventory.receipts.iter().all(|r| r.allocation.id != "fixture.probe.routes.ids"));
+        assert_eq!(probe.routes.rows(), 0);
+        assert_eq!(fixture.events()?, before);
+        Ok(())
+    }
+
+    #[test]
+    fn step5_owner_local_rings_merge_into_a_policy_observation() -> Result<()> {
+        use crate::shared::draft::{clock::RoundTimes, evidence::DraftSource, resource};
+        let (_directory, fixture) = crate::shared::memory::cpu_stream_fixture()?;
+        let library = fixture.load()?;
+        fixture.immediate_copies(&library)?;
+        let (layers, rows, topk) = (92, 3, 8);
+        let ids = DeviceAllocation::new(&library, rows * topk * 4, crate::shared::memory::TEST)?;
+        let bytes = (0..rows * topk).flat_map(|id| (id as u32).to_le_bytes()).collect::<Vec<_>>();
+        library.copy_h2d(ids.buffer, &bytes)?;
+        let canonical = |layer: usize| usize::from((30..60).contains(&layer));
+        let mut routes = RoundRoutes::new(layers, topk);
+        routes.begin(rows);
+        let mut times = vec![None; layers];
+        let before = fixture.events()?;
+        for rank in 0..2 {
+            let dense = (0..layers).map(|l| !(3..91).contains(&l) || canonical(l) != rank).collect();
+            let mut probe = RoundProbe::new(&library, dense, topk, 64)?;
+            probe.collect_routes = true;
+            probe.collect_timing = true;
+            probe.begin(rows);
+            for layer in (0..layers).filter(|&l| canonical(l) == rank) {
+                // SAFETY: the fixture owns these buffers/events and accepts a synthetic stream.
+                unsafe {
+                    if layer == 0 { probe.mark_entry(layer, std::ptr::null_mut()); }
+                    else if canonical(layer - 1) != rank { probe.mark(layer - 1, std::ptr::null_mut())?; }
+                    if (3..91).contains(&layer) { probe.ring(&library, layer, ids.buffer, rows, std::ptr::null_mut())?; }
+                    probe.mark(layer, std::ptr::null_mut())?;
+                }
+            }
+            probe.end();
+            let (local, timing) = probe.finish().expect("owner ring completed");
+            for layer in (0..layers).filter(|&l| canonical(l) == rank) {
+                if (3..91).contains(&layer) {
+                    let words = rows * topk;
+                    routes.push_narrow(layer, &local.flat()[layer * words..][..words])?;
+                } else { routes.dense(layer)?; }
+                times[layer] = timing[layer];
+            }
+        }
+        routes.complete()?;
+        assert!(times.iter().all(Option::is_some));
+        assert_eq!(fixture.events()?[before.len()..].matches('S').count(), 0, "no probe synchronization");
+        let homes = (0..layers).map(|layer| if (3..91).contains(&layer) {
+            resource::LayerHome::Remote { slice_bytes: 3e6 }
+        } else { resource::LayerHome::Dense }).collect::<Vec<_>>();
+        let geometry = resource::geometry(&homes, 352, topk, 64, 3, 0)?;
+        let mut policy = cuteafd_core::DraftPolicy::new(geometry, cuteafd_core::PolicySeed::weak(3), false)?;
+        let prior = [0.8; 2];
+        let request = [resource::Verified { id: 1, rows, accepted: 2, source: DraftSource::Neural,
+            prior: Some(&prior), features: None, censor: None }];
+        resource::observe_drafted(&mut policy, &request, &routes, &times,
+            RoundTimes { total_us: 70_000, draft_us: Some(3_000) }, 3, None, Some(1))?;
+        assert_eq!(policy.stats().rounds, 1);
+        assert_eq!(policy.stats().verified_rows, rows as u64);
+        Ok(())
+    }
+
+    #[test]
+    fn timing_only_probe_records_events_without_copying_routes() -> Result<()> {
+        let (_directory, fixture) = crate::shared::memory::cpu_stream_fixture()?;
+        let library = fixture.load()?;
+        fixture.immediate_copies(&library)?;
+        let ids = DeviceAllocation::new(&library, 4, crate::shared::memory::TEST)?;
+        library.copy_h2d(ids.buffer, &7u32.to_le_bytes())?;
+        let mut probe = RoundProbe::new(&library, vec![false; 2], 1, 1)?;
+        probe.collect_timing = true;
+        for routes in [false, true] {
+            probe.collect_routes = routes;
+            probe.begin(1);
+            assert_eq!(probe.wants_ring(false), routes);
+            let before = fixture.events()?;
+            // SAFETY: the CPU fixture owns the buffers/events and accepts a synthetic stream.
+            unsafe {
+                probe.mark_entry(0, std::ptr::null_mut());
+                for layer in 0..2 {
+                    probe.ring(&library, layer, ids.buffer, 1, std::ptr::null_mut())?;
+                    probe.mark(layer, std::ptr::null_mut())?;
+                }
+            }
+            probe.staged(0, &7u32.to_le_bytes());
+            assert_eq!(probe.staged[0], routes);
+            probe.end();
+            let (observed, times) = probe.finish().expect("valid capture");
+            assert!(times.iter().any(Option::is_some));
+            if routes { assert_eq!(observed.flat(), &[7, 7]); }
+            let after = fixture.events()?;
+            let calls = &after[before.len()..];
+            assert_eq!(calls.matches('R').count(), 3);
+            assert_eq!(calls.matches('S').count(), 0, "probe timing must be asynchronous");
+            assert_eq!(calls.matches('C').count(), if routes { 2 } else { 0 });
+            assert_eq!(calls.matches('J').count(), usize::from(routes));
+        }
+        Ok(())
+    }
+
+    #[test]
     #[ignore = "requires an allocated CPU build slot and explicit NVMe fixture directory"]
     fn probe_initialization_keeps_load_staging_released_and_ordered_sources_live() -> Result<()> {
         use cuteafd_ffi::{memory_ledger::{self, Space}, native_library_lifetime_fixture::Fixture};
@@ -242,7 +377,7 @@ mod tests {
         let _owner = memory_ledger::owner(&tag);
         let pinned = || memory_ledger::snapshot().by_owner(Space::Pinned, -1)
             .get(tag.as_str()).copied().unwrap_or(0);
-        let target = DeviceAllocation::new(&library, 256)?;
+        let target = DeviceAllocation::new(&library, 256, crate::shared::memory::TEST)?;
         library.copy_h2d(target.buffer, &[1; 128])?;
         // SAFETY: the fixture retains this destination and its ordered source until the drain below.
         unsafe { library.copy_h2d_ordered(target.buffer, &[2; 256], 1usize as *mut c_void)?; }

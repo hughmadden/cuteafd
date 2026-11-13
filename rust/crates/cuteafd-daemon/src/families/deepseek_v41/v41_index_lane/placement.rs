@@ -16,6 +16,7 @@ impl<'a> IndexLaneWeights<'a> {
         }
         Ok(bytes)
     }
+    #[cfg(test)]
     pub fn load_distributed(
         library: &'a NativeLibrary,
         catalog: &OfficialV41Catalog,
@@ -32,11 +33,19 @@ impl<'a> IndexLaneWeights<'a> {
         );
         Self::load_placed(library, catalog, staging, Some(placement))
     }
+    #[cfg(test)]
     pub(super) fn load_placed(
         library: &'a NativeLibrary,
         catalog: &OfficialV41Catalog,
         staging: usize,
         placement: Option<CachePlacement>,
+    ) -> Result<Self> {
+        Self::load_in(library, catalog, staging, placement, None)
+    }
+    pub(crate) fn load_in(
+        library: &'a NativeLibrary, catalog: &OfficialV41Catalog, staging: usize,
+        placement: Option<CachePlacement>,
+        arenas: Option<&crate::families::deepseek_v41::weight_layout::TargetArenas<'a>>,
     ) -> Result<Self> {
         let original = library.cuda_get_device()?;
         let weights = LAYERS
@@ -46,13 +55,12 @@ impl<'a> IndexLaneWeights<'a> {
                     Some(map) => map.attention(layer)? as i32,
                     None => original,
                 };
+                let arena = arenas.map(|arenas| arenas.get(id)).transpose()?;
                 Device { library, id }.own(|| {
-                    IndexQueryWeights::load(
-                        library,
-                        catalog,
-                        layer,
+                    IndexQueryWeights::load_in(
+                        library, catalog, layer,
                         IndexQueryWeights::device_bytes(library, catalog, layer)?,
-                        staging,
+                        staging, arena,
                     )
                 })
             })
@@ -149,7 +157,7 @@ mod tests {
         for id in [0, 1, 0] {
             Device { library: &lib, id }.run(|| {
                 let fill = |bytes: &[u8]| -> Result<DeviceAllocation<'_>> {
-                    let allocation = DeviceAllocation::new(&lib, bytes.len())?;
+                    let allocation = DeviceAllocation::new(&lib, bytes.len(), crate::shared::memory::TEST)?;
                     lib.copy_h2d(allocation.buffer, bytes)?;
                     Ok(allocation)
                 };
@@ -168,7 +176,7 @@ mod tests {
                 let lengths = fill(&u64s(&[256]))?;
                 let metadata = fill(&u64s(&[0, 256, 256, 0, 0, 1]))?;
                 let positions = fill(&u64s(&[0, 255, 256, u64::MAX]))?;
-                let output = DeviceAllocation::new(&lib, 16)?;
+                let output = DeviceAllocation::new(&lib, 16, crate::shared::memory::TEST)?;
                 let stream = LoadStream {
                     library: &lib,
                     raw: lib.cuda_stream_create()?,
@@ -200,7 +208,7 @@ mod tests {
                         stream.raw,
                     )
                 };
-                let captured = unsafe { lib.cuda_graph_end_capture(stream.raw) };
+                let captured = unsafe { lib.cuda_graph_end_capture_for_test(stream.raw) };
                 let graph = captured?;
                 let checked = (|| -> Result<()> {
                     queued?;

@@ -65,6 +65,40 @@ pub fn date(rfc3339: &str) -> &str {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn card_marks_adaptive_and_fixed_drafts() {
+        let mut report = crate::sample::full_report();
+        for (mode, label) in [("adaptive", "adaptive draft"), ("fixed 4", "fixed draft 4")] {
+            report.server.configuration.draft = mode.into();
+            let svg = super::card::card_svg(&report);
+            assert!(svg.contains(label));
+            assert!(svg.contains("text-anchor=\"end\""));
+            let png = super::png::png(&svg, 1.0).unwrap();
+            assert!(png.starts_with(b"\x89PNG\r\n\x1a\n"));
+            if let Some(directory) = std::env::var_os("CUTEAFD_CARD_TEST_OUTPUT") {
+                let directory = std::path::PathBuf::from(directory);
+                std::fs::create_dir_all(&directory).unwrap();
+                let name = mode.replace(' ', "-");
+                std::fs::write(directory.join(format!("{name}.svg")), svg).unwrap();
+                std::fs::write(directory.join(format!("{name}.png")), png).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn card_without_speculator_never_claims_adaptive_or_fixed_drafts() {
+        let mut report = crate::sample::full_report();
+        report.server.configuration.speculator = None;
+        for mode in ["adaptive", "fixed 4"] {
+            report.server.configuration.draft = mode.into();
+            let svg = super::card::card_svg(&report);
+            assert!(svg.contains("no speculation"));
+            assert!(!svg.contains("adaptive draft") && !svg.contains("fixed draft"));
+        }
+        report.server.configuration = serde_json::from_str("{}").unwrap();
+        assert!(super::card::card_svg(&report).contains("no speculation"));
+    }
+
+    #[test]
     fn wrap_breaks_a_word_longer_than_the_line() {
         let lines = super::bodies::wrap("dev · https://github.com/tpurtell/cuteafd @ 9db3e0b7", 12.0, 120.0);
         assert!(lines.iter().all(|l| l.chars().count() <= 16), "{lines:?}");
@@ -85,6 +119,18 @@ mod tests {
         assert!(!card.contains("thinking off"));
         let configuration = super::report::panel_svg(&report, "configuration");
         assert!(configuration.contains(label), "{configuration}");
+    }
+
+    #[test]
+    fn layer_timing_is_visible_on_cards_with_and_without_profiling() {
+        for value in ["off", "on (perturbing)"] {
+            let mut report = crate::sample::full_report();
+            report.server.configuration.settings.push(crate::report::Setting {
+                name: "per-layer-timing".into(), value: Some(value.into()), default: None, source: "resolved".into(),
+            });
+            let card = super::card::card_svg(&report);
+            assert!(card.contains(&format!("per-layer-timing={value}")), "{card}");
+        }
     }
 
     #[test]

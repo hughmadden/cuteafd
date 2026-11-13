@@ -1,3 +1,4 @@
+#include "memory_failure.h"
 #include "v41_capacity.h"
 #include <cuda_runtime.h>
 #include <math_constants.h>
@@ -83,6 +84,7 @@ extern "C" int32_t cuteafd_v41_dspark_confidence(const uint16_t* hidden,
   return cudaGetLastError();
 }
 
+#include "blas_owner.h"
 #include <cublas_v2.h>
 #include <cublasLt.h>
 #include <new>
@@ -98,11 +100,12 @@ struct TensorHeadPlan {
     if (input) cublasLtMatrixLayoutDestroy(input);
     if (weight) cublasLtMatrixLayoutDestroy(weight);
     if (operation) cublasLtMatmulDescDestroy(operation);
-    if (blas) cublasLtDestroy(blas);
+
   }
 };
 struct MarkovHandle {
-  cublasHandle_t blas; int device; void* workspace; int width; int max_rows; int vocab_rows;
+  std::shared_ptr<cuteafd::BlasOwner> owner;
+  cublasHandle_t blas; int mode; int device; void* workspace; int width; int max_rows; int vocab_rows;
   TensorHeadPlan tensor;
 };
 constexpr uint64_t kMarkovWorkspace = 4 * 1024 * 1024;
@@ -112,7 +115,8 @@ int32_t blas_status(cublasStatus_t status) { return status == CUBLAS_STATUS_SUCC
 static cublasStatus_t create_tensor_plan(MarkovHandle* handle) {
   auto& plan = handle->tensor;
   const int width = handle->width, vocab = handle->vocab_rows;
-  auto status = cublasLtCreate(&plan.blas);
+  auto status = cuteafd::borrow_blas(true, handle->owner, "shared/blas/vocabulary");
+  if (status == CUBLAS_STATUS_SUCCESS) plan.blas = handle->owner->lt;
   if (status != CUBLAS_STATUS_SUCCESS) return status;
   status = cublasLtMatmulDescCreate(&plan.operation, CUBLAS_COMPUTE_32F, CUDA_R_32F);
   if (status != CUBLAS_STATUS_SUCCESS) return status;
@@ -177,8 +181,8 @@ static cublasStatus_t create_tensor_plan(MarkovHandle* handle) {
 }
 
 }
-static int32_t create_head(void* workspace, uint64_t bytes, void** output, int width, int max_rows, int vocab_rows = 129280) {
-  if (!output) return cudaErrorInvalidValue;
+static int32_t create_head(void* workspace, uint64_t bytes, void** output, int width, int max_rows, int mode, int vocab_rows = 129280) {
+  if (!output || (mode != 0 && mode != 1)) return cudaErrorInvalidValue;
   *output = nullptr;
   if (vocab_rows < 1 || vocab_rows > 262144) return cudaErrorInvalidValue;
   if (bytes < kMarkovWorkspace || !span(workspace, kMarkovWorkspace, 256)) return cudaErrorInvalidValue;
@@ -186,42 +190,52 @@ static int32_t create_head(void* workspace, uint64_t bytes, void** output, int w
   if (!handle) return cudaErrorMemoryAllocation;
   auto status = cudaGetDevice(&handle->device);
   if (status != cudaSuccess) { delete handle; return status; }
-  auto created = cublasCreate(&handle->blas);
-  if (created != CUBLAS_STATUS_SUCCESS) { delete handle; return blas_status(created); }
+  handle->mode = mode;
+  if (mode == 0) {
+    const auto created = cuteafd::borrow_blas(false, handle->owner, width == 256 ? "v41/blas/markov" : "shared/blas/vocabulary");
+    if (created != CUBLAS_STATUS_SUCCESS) { delete handle; return blas_status(created); }
+    handle->blas = handle->owner->gemm;
+  }
   handle->workspace = workspace;
   handle->width = width;
   handle->max_rows = max_rows;
   handle->vocab_rows = vocab_rows;
-  if (width >= 1024) handle->tensor.status = create_tensor_plan(handle);
+  if (mode == 1) {
+    handle->tensor.status = create_tensor_plan(handle);
+    if (handle->tensor.status != CUBLAS_STATUS_SUCCESS) {
+      const auto error = handle->tensor.status; delete handle; return blas_status(error);
+    }
+  }
   *output = handle;
   return 0;
 }
 extern "C" int32_t cuteafd_v41_markov_create(void* workspace, uint64_t bytes, void** output) {
-  return create_head(workspace, bytes, output, 256, CUTEAFD_V41_MAX_LANE_MEMBERS);
+  return create_head(workspace, bytes, output, 256, CUTEAFD_V41_MAX_LANE_MEMBERS, 0);
 }
-extern "C" int32_t cuteafd_v41_vocabulary_head_create(void* workspace, uint64_t bytes, void** output) {
-  return create_head(workspace, bytes, output, 5120, CUTEAFD_V41_VOCAB_ROWS);
+extern "C" int32_t cuteafd_v41_vocabulary_head_create(void* workspace, uint64_t bytes, int32_t mode, void** output) {
+  return create_head(workspace, bytes, output, 5120, CUTEAFD_V41_VOCAB_ROWS, mode);
 }
 extern "C" int32_t cuteafd_v41_vocabulary_shard_create(void* workspace, uint64_t bytes,
-    int32_t vocab_rows, void** output) {
-  return create_head(workspace, bytes, output, 5120, CUTEAFD_V41_VOCAB_ROWS, vocab_rows);
+    int32_t vocab_rows, int32_t mode, void** output) {
+  return create_head(workspace, bytes, output, 5120, CUTEAFD_V41_VOCAB_ROWS, mode, vocab_rows);
 }
 extern "C" int32_t cuteafd_v41_markov_destroy(void* opaque) {
   if (!opaque) return cudaErrorInvalidValue;
   auto* handle = static_cast<MarkovHandle*>(opaque);
-  const auto status = cublasDestroy(handle->blas);
   delete handle;
-  return blas_status(status);
+  return 0;
 }
 static int32_t launch_head(void* opaque, const uint16_t* embedding,
     const uint16_t* weight, float* logits, int32_t rows, void* stream, int width, int tensor_op = 0) {
   if (!opaque || rows < 1) return cudaErrorInvalidValue;
   auto* handle = static_cast<MarkovHandle*>(opaque);
-  if (handle->width != width || rows > handle->max_rows) return cudaErrorInvalidValue;
+  if (handle->width != width || rows > handle->max_rows || (tensor_op == 2 ? handle->mode != 1 : handle->mode != 0)) return cudaErrorInvalidValue;
   int device;
   auto status = cudaGetDevice(&device);
   if (status != cudaSuccess) return status;
   if (device != handle->device) return cudaErrorInvalidDevice;
+  const auto owner_status = cuteafd::check_blas_owner(handle->owner);
+  if (owner_status != CUBLAS_STATUS_SUCCESS) return blas_status(owner_status);
   const uint64_t e = uint64_t(rows) * width * 2, w = uint64_t(handle->vocab_rows) * width * 2;
   const uint64_t o = uint64_t(rows) * handle->vocab_rows * 4;
   if (!span(embedding, e, 2) || !span(weight, w, 2) || !span(logits, o, 4) ||
@@ -253,10 +267,8 @@ static int32_t launch_head(void* opaque, const uint16_t* embedding,
         plan.output, &plan.algorithm, handle->workspace, kMarkovWorkspace,
         reinterpret_cast<cudaStream_t>(stream)));
   }
-  auto result = cublasSetStream(handle->blas, reinterpret_cast<cudaStream_t>(stream));
-  if (result != CUBLAS_STATUS_SUCCESS) return blas_status(result);
-  // SetStream resets the workspace: rebind this wave's owned storage afterward.
-  result = cublasSetWorkspace(handle->blas, handle->workspace, kMarkovWorkspace);
+  auto result = cuteafd::bind_blas(handle->owner, reinterpret_cast<cudaStream_t>(stream),
+      handle->workspace, kMarkovWorkspace);
   if (result != CUBLAS_STATUS_SUCCESS) return blas_status(result);
   const float alpha = 1, beta = 0;
   // Diagnostic exact mode uses FP32 CUDA-core math at model widths. Drafters
@@ -276,17 +288,17 @@ extern "C" int32_t cuteafd_v41_markov_launch(void* handle, const uint16_t* input
 }
 // Model-width vocabulary head (DeepSeek V4: 4096, V4 Pro: 7168).
 extern "C" int32_t cuteafd_vocabulary_head_create(void* workspace, uint64_t bytes,
-    int32_t width, int32_t max_rows, void** output) {
+    int32_t width, int32_t max_rows, int32_t mode, void** output) {
   if (width < 1024 || width > 16384 || width % 64 || max_rows < 1 || max_rows > 65536)
     return cudaErrorInvalidValue;
-  return create_head(workspace, bytes, output, width, max_rows);
+  return create_head(workspace, bytes, output, width, max_rows, mode);
 }
 // Same, for a vocabulary other than DeepSeek's 129280 rows (GLM: 154880).
 extern "C" int32_t cuteafd_vocabulary_head_create_vocab(void* workspace, uint64_t bytes,
-    int32_t width, int32_t max_rows, int32_t vocab_rows, void** output) {
+    int32_t width, int32_t max_rows, int32_t vocab_rows, int32_t mode, void** output) {
   if (width < 1024 || width > 16384 || width % 64 || max_rows < 1 || max_rows > 65536)
     return cudaErrorInvalidValue;
-  return create_head(workspace, bytes, output, width, max_rows, vocab_rows);
+  return create_head(workspace, bytes, output, width, max_rows, mode, vocab_rows);
 }
 extern "C" int32_t cuteafd_vocabulary_head_launch_width(void* handle, const uint16_t* input,
     const uint16_t* weight, float* output, int32_t rows, void* stream) {

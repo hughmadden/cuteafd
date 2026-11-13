@@ -41,7 +41,7 @@
 //! homes. The LM head stays on rank 0; the drafter follows its admitted movable placement.
 //! Explicit per-layer placement keeps KDA/FFNs split and assigns each MLA layer
 //! (complete operands, KV and index state) to one owner with BF16 residual handoff.
-use crate::shared::decode_graph::{GraphBank, GraphOwner, GraphStats};
+use crate::shared::decode_graph::{GraphBank, GraphOwner, GraphPolicy};
 use super::packing;
 use super::weights::{GlmfLayer, GlmfWeights};
 use crate::shared::peer_split::{PeerExchange, RankDevice, DIRECT};
@@ -50,7 +50,7 @@ use crate::shared::target_head::TargetHead as TargetHeadRoute;
 use crate::shared::speculation::dflash::TargetHead;
 use crate::shared::experts::fp8::{Fp8Experts, Fp8Layer};
 use crate::shared::launch_grid::Fp8QuantizeGrid;
-use crate::shared::memory::{DeviceAllocation, HostAllocation};
+use crate::shared::memory::{DeviceAllocation, HostAllocation, Tag};
 use crate::shared::token_io::{DeviceLogits, TokenEmbedding, TokenSelector};
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::programs::{Programs, Scalar, VocabularyHead};
@@ -76,8 +76,8 @@ struct Dev<'a> {
     _owner: Rc<DeviceAllocation<'a>>,
 }
 impl<'a> Dev<'a> {
-    fn new(library: &'a NativeLibrary, bytes: usize) -> Result<Self> {
-        let owner = Rc::new(DeviceAllocation::new(library, bytes)?);
+    fn new(library: &'a NativeLibrary, bytes: usize, tag: Tag) -> Result<Self> {
+        let owner = Rc::new(DeviceAllocation::new(library, bytes, tag)?);
         Ok(Self { buffer: owner.buffer, _owner: owner })
     }
     fn view(owner: Rc<DeviceAllocation<'a>>, offset: usize, bytes: usize) -> Result<Self> {
@@ -836,7 +836,8 @@ struct Temporaries<'a> {
     logits: Dev<'a>,
     /// The LM head (rank 0 only).
     head: Option<VocabularyHead<'a>>,
-    _head_workspace: Dev<'a>,
+    /// The BF16 head's cuBLAS workspace, or the packed head's GEMV scratch (rank 0 only).
+    head_workspace: Dev<'a>,
 }
 
 impl<'a> std::ops::Deref for Workspace<'a> {
@@ -874,6 +875,8 @@ pub(crate) struct StepPlan<'p, 'a> {
     cfg: &'p GlmNextConfig,
     scratch: GlmfScratchOptions,
     native: GlmfCoreScratch,
+    native_head: bool,
+    target_head: TargetHeadRoute,
     /// Rank 0's shape (rank 1 is not the lead and runs no experts).
     shape: GlmfStepShape,
     /// Rows of the decode workspace (`--decode-rows`): it runs the `_m64` programs, and with 128 the
@@ -895,6 +898,7 @@ pub(crate) struct StepExperts {
 /// The engine settings a step plan depends on besides its layers and experts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct StepSettings {
+    pub target_head: TargetHeadRoute,
     pub kda_fp32_partials: bool,
     pub kda_output_shard: bool,
     pub kda_prefill_expanded: bool,
@@ -916,7 +920,7 @@ pub(crate) struct StepSettings {
 impl<'p, 'a> StepPlan<'p, 'a> {
     /// The plan of an engine over `layers` with `experts` and `settings` (rank 0's shape).
     pub(crate) fn new(library: &'a NativeLibrary, programs: &'a Programs<'a>, cfg: &'p GlmNextConfig,
-        layers: &[GlmfLayer<'_>], native_head: bool, experts: StepExperts, settings: StepSettings) -> Self {
+        layers: &[GlmfLayer<'_>], head: &GlmfHead<'_>, experts: StepExperts, settings: StepSettings) -> Self {
         let split = layers.first().is_some_and(|l| l.split);
         let (table_pages, table_pool_pages) = glmf_table_pages(settings.max_context as u64);
         // As `GlmfEngine::new` resolves it: without an MLA layer there is no index cache.
@@ -932,11 +936,17 @@ impl<'p, 'a> StepPlan<'p, 'a> {
             library,
             programs,
             cfg,
+            native_head: head.bf16().is_none(),
+            target_head: settings.target_head,
             native: GlmfCoreScratch {
                 kda: layers.iter().filter(|l| l.attention == GlmNextAttention::Kda)
-                    .all(|l| l.core.contains_key("self_attn.q_proj") || native::is_native(l)),
+                    .all(|l| ["q_proj", "k_proj", "v_proj", "o_proj"].iter()
+                        .all(|leaf| l.core.contains_key(&format!("self_attn.{leaf}"))
+                            || l.attention_native.contains_key(&format!("self_attn.{leaf}"))) || native::is_native(l)),
                 mla: layers.iter().filter(|l| l.attention == GlmNextAttention::Mla && l.attention_share.present())
-                    .all(|l| l.core.contains_key("self_attn.q_a_proj") || native::is_native(l)),
+                    .all(|l| ["q_a_proj", "kv_a_proj_with_mqa", "q_b_proj", "o_proj"].iter()
+                        .all(|leaf| l.core.contains_key(&format!("self_attn.{leaf}"))
+                            || l.attention_native.contains_key(&format!("self_attn.{leaf}"))) || native::is_native(l)),
                 ffn: layers.iter().all(|l| core::native_ffn(l) || native::is_native(l)),
             },
             scratch: GlmfScratchOptions { split, kda_w8: layers.iter().any(|layer| layer.has("w_in_fp8")),
@@ -952,7 +962,7 @@ impl<'p, 'a> StepPlan<'p, 'a> {
                 partial_bytes: if settings.kda_fp32_partials { 4 } else { 2 },
                 output_shard: settings.kda_output_shard,
                 // K6 scoring downloads tiles through the ordinary bounded staging.
-                full_prefill_logits: settings.full_prefill_logits && !native_head,
+                full_prefill_logits: settings.full_prefill_logits && !matches!(head, GlmfHead::K6(_) | GlmfHead::RowFp8(_) | GlmfHead::BlockFp8 { .. }),
                 table_pages,
                 table_pool_pages,
             },
@@ -977,15 +987,15 @@ impl<'p, 'a> StepPlan<'p, 'a> {
             decode_scratch, prefill_scratch).device_bytes())
     }
 
-    fn key(&self) -> (GlmfScratchOptions, GlmfCoreScratch, GlmfStepShape, usize, u64) {
-        (self.scratch, self.native, self.shape, self.decode_rows, self.shared_records)
+    fn key(&self) -> (GlmfScratchOptions, GlmfCoreScratch, GlmfStepShape, usize, u64, bool, TargetHeadRoute) {
+        (self.scratch, self.native, self.shape, self.decode_rows, self.shared_records, self.native_head, self.target_head)
     }
 }
 
 /// A GPU's step workspaces allocated before its engine (eager start-up): the decode workspace and
 /// every prefill lane, so the KV pool is sized from the memory they leave.
 pub(crate) struct StepWorkspaces<'a> {
-    key: (GlmfScratchOptions, GlmfCoreScratch, GlmfStepShape, usize, u64),
+    key: (GlmfScratchOptions, GlmfCoreScratch, GlmfStepShape, usize, u64, bool, TargetHeadRoute),
     rows: usize,
     decode: Workspace<'a>,
     lanes: Vec<Workspace<'a>>,
@@ -1014,19 +1024,19 @@ impl<'a> StepPlan<'_, 'a> {
         if rank == 0 { self.shape } else { GlmfStepShape { lead: false, local_experts: false, spark: false, ..self.shape } }
     }
 
-    fn alloc(&self, bytes: u64) -> Result<Dev<'a>> {
-        Dev::new(self.library, usize::try_from(bytes)?.max(256))
+    fn alloc(&self, bytes: u64, tag: Tag) -> Result<Dev<'a>> {
+        Dev::new(self.library, usize::try_from(bytes)?.max(256), tag)
     }
 
-    fn zeroed(&self, bytes: u64) -> Result<Dev<'a>> {
-        let allocation = self.alloc(bytes)?;
+    fn zeroed(&self, bytes: u64, tag: Tag) -> Result<Dev<'a>> {
+        let allocation = self.alloc(bytes, tag)?;
         self.library.cuda_zero_bytes(allocation.buffer, allocation.buffer.bytes)?;
         Ok(allocation)
     }
 
     /// Rank `rank`'s temporaries for steps of up to `rows` rows, on the current device.
     fn temporaries(&self, rank: usize, rows: usize, decode: bool) -> Result<Temporaries<'a>> {
-        let _memory_scope = cuteafd_ffi::memory_ledger::scope("workspace");
+        let tag = Tag::workspace("glmf/temporaries");
         let shape = self.shape(rank);
         let lookup = |name: &str| self.programs.spec(name).ok()
             .map(|spec| spec.scratch.get("scratch").copied().unwrap_or(0));
@@ -1036,42 +1046,42 @@ impl<'a> StepPlan<'_, 'a> {
             scratch.programs = scratch.programs.max(self.shared_records);
         }
         let bytes = glmf_temporary_bytes(self.cfg, rows as u64, decode, &shape, scratch);
-        let head_workspace = self.alloc(bytes.head_workspace)?;
+        let head_workspace = self.alloc(bytes.head_workspace, tag)?;
         Ok(Temporaries {
             rows,
-            query: self.alloc(bytes.query)?,
-            q_resid: self.alloc(bytes.q_resid)?,
-            latent: self.alloc(bytes.latent)?,
-            q_fp8: self.alloc(bytes.q_fp8)?,
-            head_weights: self.alloc(bytes.head_weights)?,
-            pools: self.alloc(bytes.pools)?,
-            indices: self.alloc(bytes.indices)?,
-            lengths: self.alloc(bytes.lengths)?,
-            scratch: self.alloc(bytes.scratch)?,
-            topk_scratch: self.zeroed(bytes.topk_scratch)?,
-            logits: self.alloc(bytes.logits)?,
+            query: self.alloc(bytes.query, tag)?,
+            q_resid: self.alloc(bytes.q_resid, tag)?,
+            latent: self.alloc(bytes.latent, tag)?,
+            q_fp8: self.alloc(bytes.q_fp8, tag)?,
+            head_weights: self.alloc(bytes.head_weights, tag)?,
+            pools: self.alloc(bytes.pools, tag)?,
+            indices: self.alloc(bytes.indices, tag)?,
+            lengths: self.alloc(bytes.lengths, tag)?,
+            scratch: self.alloc(bytes.scratch, tag)?,
+            topk_scratch: self.zeroed(bytes.topk_scratch, tag)?,
+            logits: self.alloc(bytes.logits, tag)?,
             // SAFETY: the workspace buffer lives in the same struct and drops after the head.
-            head: if shape.lead {
+            head: if shape.lead && !self.native_head {
                 Some(unsafe { self.library.vocabulary_head_rows(head_workspace.buffer.ptr, self.cfg.hidden as u32,
-                    rows as u32, self.cfg.vocab_size as u32)? })
+                    rows as u32, self.cfg.vocab_size as u32, self.target_head.native_mode())? })
             } else {
                 None
             },
-            _head_workspace: head_workspace,
+            head_workspace,
         })
     }
 
     /// Rank `rank`'s lane buffers for steps of up to `rows` rows over `temps`, on the current device.
     fn lane(&self, rank: usize, rows: usize, decode: bool, temps: Rc<Temporaries<'a>>) -> Result<Workspace<'a>> {
-        self.slot(rank, rows, decode, temps, &mut |bytes| self.alloc(bytes))
+        self.slot(rank, rows, decode, temps, &mut |bytes| self.alloc(bytes, Tag::workspace("glmf/lane")))
     }
 
     /// All live prefill rows share one allocation; hook-local scratch stays separate.
     fn slots(&self, rank: usize, rows: usize, count: usize) -> Result<Vec<Workspace<'a>>> {
-        let _scope = cuteafd_ffi::memory_ledger::scope("workspace");
         let bytes = glmf_lane_bytes(self.cfg, rows as u64, false, &self.shape(rank)).arena_bytes();
         let owner = Rc::new(DeviceAllocation::new(self.library,
-            usize::try_from(bytes)?.checked_mul(count).context("prefill arena overflow")?)?);
+            usize::try_from(bytes)?.checked_mul(count).context("prefill arena overflow")?,
+            Tag::workspace("glmf/prefill-slots"))?);
         let temps = Rc::new(self.temporaries(rank, rows, false)?);
         let mut offset = 0;
         (0..count).map(|_| self.slot(rank, rows, false, temps.clone(), &mut |bytes| {
@@ -1084,7 +1094,6 @@ impl<'a> StepPlan<'_, 'a> {
 
     fn slot(&self, rank: usize, rows: usize, decode: bool, temps: Rc<Temporaries<'a>>,
         alloc: &mut impl FnMut(u64) -> Result<Dev<'a>>) -> Result<Workspace<'a>> {
-        let _memory_scope = cuteafd_ffi::memory_ledger::scope("workspace");
         ensure!(rows <= temps.rows, "a lane of {rows} rows over temporaries of {}", temps.rows);
         let bytes = glmf_lane_bytes(self.cfg, rows as u64, decode, &self.shape(rank));
         Ok(Workspace {
@@ -1137,7 +1146,7 @@ impl<'a> DenseNvfp4<'a> {
     /// Loads the package at `directory` with scratch, ids and weights for `rows` rows.
     pub fn load(library: &'a NativeLibrary, directory: &std::path::Path, cfg: &GlmNextConfig, rows: usize)
         -> Result<Self> {
-        let _memory_scope = cuteafd_ffi::memory_ledger::scope("weights/dense-nvfp4");
+        let tag = Tag::workspace("glmf/dense-nvfp4");
         // SAFETY: a trusted package for the current device; the engine drains its
         // stream before dropping it.
         let module = unsafe { cuteafd_ffi::fp8_moe::Fp8MoeModule::load(directory) }
@@ -1148,10 +1157,10 @@ impl<'a> DenseNvfp4<'a> {
             && matches!(info.weights, cuteafd_ffi::fp8_moe::Fp8MoeWeights::Nvfp4),
             "{} ({info:?}) is not the dense NVFP4 MLP package", directory.display());
         let top = info.capacity_for(rows).with_context(|| format!("dense NVFP4 package has no capacity for {rows} rows"))?;
-        let scratch = crate::shared::memory::DeviceAllocation::new(library, module.scratch_bytes(top)?.max(256))?;
-        let ids = crate::shared::memory::DeviceAllocation::new(library, rows * 4)?;
+        let scratch = crate::shared::memory::DeviceAllocation::new(library, module.scratch_bytes(top)?.max(256), tag)?;
+        let ids = crate::shared::memory::DeviceAllocation::new(library, rows * 4, tag)?;
         library.copy_h2d(ids.buffer, &vec![0u8; rows * 4])?;
-        let weights = crate::shared::memory::DeviceAllocation::new(library, rows * 4)?;
+        let weights = crate::shared::memory::DeviceAllocation::new(library, rows * 4, tag)?;
         let ones: Vec<u8> = (0..rows).flat_map(|_| 1f32.to_le_bytes()).collect();
         library.copy_h2d(weights.buffer, &ones)?;
         Ok(Self { module, scratch, ids, weights })
@@ -1250,8 +1259,8 @@ impl<'a> Caches<'a> {
     fn new(library: &'a NativeLibrary, cfg: &GlmNextConfig, layers: &[GlmfLayer<'_>], pages: usize, pool_pages: usize,
         slots: usize, kda_heads: usize, index_cache: IndexCache, kda_state: KdaState, decode_rows: usize,
         records: Option<PrefillScratch<'a>>, pool_marks: bool) -> Result<Self> {
-        let zeroed = |bytes: usize| -> Result<Dev<'a>> {
-            let allocation = Dev::new(library, bytes.max(256))?;
+        let zeroed = |bytes: usize, tag: Tag| -> Result<Dev<'a>> {
+            let allocation = Dev::new(library, bytes.max(256), tag)?;
             library.cuda_zero_bytes(allocation.buffer, allocation.buffer.bytes)?;
             Ok(allocation)
         };
@@ -1268,10 +1277,10 @@ impl<'a> Caches<'a> {
                         index.push(None);
                         continue;
                     }
-                    kv.push(Some(zeroed(pages * PAGE_ROWS * RECORD_BYTES)?));
+                    kv.push(Some(zeroed(pages * PAGE_ROWS * RECORD_BYTES, Tag::kv("glmf/kv-records"))?));
                     index.push(Some(IndexLayer {
-                        keys: if keys { Some(zeroed(pages * PAGE_ROWS * KEY_BYTES)?) } else { None },
-                        pools: zeroed(pool_pages * PAGE_ROWS * 132)?,
+                        keys: if keys { Some(zeroed(pages * PAGE_ROWS * KEY_BYTES, Tag::kv("glmf/index-keys"))?) } else { None },
+                        pools: zeroed(pool_pages * PAGE_ROWS * 132, Tag::kv("glmf/pool-keys"))?,
                     }));
                     mla_layers += 1;
                 }
@@ -1283,7 +1292,8 @@ impl<'a> Caches<'a> {
             }
         }
         let index_tails = compact_index_extents(index_cache, mla_layers, slots, decode_rows)
-            .map(|(tails, replay)| -> Result<_> { Ok((zeroed(tails)?, zeroed(replay)?)) }).transpose()?;
+            .map(|(tails, replay)| -> Result<_> { Ok((zeroed(tails, Tag::kv("glmf/index-tails"))?,
+                zeroed(replay, Tag::workspace("glmf/index-replay"))?)) }).transpose()?;
         let mark_geometry = cuteafd_loader::serving_capacity::RankCacheGeometry {
             persistent_unit_bytes: (mla_layers * (UNIT_ROWS * (RECORD_BYTES + if keys { KEY_BYTES } else { 0 })
                 + PAGE_ROWS * 132)) as u64,
@@ -1292,8 +1302,8 @@ impl<'a> Caches<'a> {
         };
         let pool_mark_unit_bytes = usize::try_from(mark_geometry.glmf_pool_mark_backing_unit_bytes(pool_marks))?;
         let pool_mark_backing = if pool_mark_unit_bytes > 0 {
-            let _memory_scope = cuteafd_ffi::memory_ledger::scope("prefix/KDA-only pool marks");
-            Some(zeroed(pool_pages.checked_mul(pool_mark_unit_bytes).context("KDA pool backing overflow")?)?)
+            Some(zeroed(pool_pages.checked_mul(pool_mark_unit_bytes).context("KDA pool backing overflow")?,
+                Tag::prefix("glmf/prefix-pool-marks"))?)
         } else { None };
         let replay = kda_layers * replay;
         let (kda_replay, owner) = match records {
@@ -1305,15 +1315,16 @@ impl<'a> Caches<'a> {
                     RecordsOwner::Shared { _temporaries: temps })
             }
             None => {
-                let own = zeroed(replay)?;
+                let own = zeroed(replay, Tag::workspace("glmf/kda-replay"))?;
                 (own.buffer, RecordsOwner::Own { _records: own })
             }
         };
         let mla_ordinal = local_mla_ordinals(layers.iter().map(|layer| (layer.attention, layer.attention_share)));
-        Ok(Self { kv, index, mla_ordinal, kda_state: zeroed(kda_layers * slots * state)?,
-            kda_conv: zeroed(kda_layers * slots * conv)?,
+        Ok(Self { kv, index, mla_ordinal, kda_state: zeroed(kda_layers * slots * state, Tag::kv("glmf/kda-state"))?,
+            kda_conv: zeroed(kda_layers * slots * conv, Tag::kv("glmf/kda-conv"))?,
             kda_replay, _kda_replay_owner: owner, index_tails,
-            commit_tables: zeroed(3 * decode_rows * 4)?, pool_logical: zeroed(pool_pages * 4)?,
+            commit_tables: zeroed(3 * decode_rows * 4, Tag::workspace("glmf/commit-tables"))?,
+            pool_logical: zeroed(pool_pages * 4, Tag::kv("glmf/pool-map"))?,
             pool_marks, pool_mark_backing, pool_mark_unit_bytes, kda_heads })
     }
 }
@@ -1423,7 +1434,7 @@ pub(crate) struct GlmfEngine<'a> {
     layer_waves: RefCell<Vec<Option<crate::shared::spark_waves::WaveTicket>>>,
     /// The head split's second GPU and the exchange between the two.
     peer: Option<GlmfPeer<'a>>,
-    exchange: Option<PeerExchange<'a>>,
+    exchange: Option<std::rc::Rc<PeerExchange<'a>>>,
     terminal: Cell<crate::shared::peer_split::TerminalState>,
     tp2: Option<Tp2Experts<'a>>,
     local: Option<(Vec<usize>, Experts<'a>)>,
@@ -1463,14 +1474,15 @@ pub(crate) struct GlmfEngine<'a> {
     /// Captured decode segments (CUTEAFD_GLMF_GRAPHS=0 runs decode eagerly), within the graph
     /// budget when one is set.
     graphs: RefCell<GraphBank<GraphKey, GraphExec<'a>>>,
-    /// Executables evicted from either rank's cache (rank, executable): destroyed at the next
-    /// decode step, once every rank's stream has drained.
     use_graphs: bool,
-    /// Every serving decode graph captured at startup (`CUTEAFD_GLMF_STARTUP_GRAPHS`, on unless 0);
-    /// a graph budget (`--graph-budget-mib`) captures lazily within it instead.
-    pub(crate) startup_graphs: bool,
+    /// Either prewarm pass runs: the masked bucket owns the FFN boundary, so no real
+    /// rows are routed.
     warming_graphs: std::cell::Cell<bool>,
-    logged_graph_shapes: RefCell<std::collections::HashSet<(usize, usize, bool, GraphGeometry)>>,
+    /// The prewarm's eager pass: every decode segment runs eagerly with the masked
+    /// boundary a capture would bake in, before any graph is created.
+    prewarming_graphs: std::cell::Cell<bool>,
+    /// The prewarm finished. Before it every decode segment runs eagerly.
+    graphs_warmed: std::cell::Cell<bool>,
     /// Opt-in matched-token/route evidence; never adds a device readback.
     split_audit: bool,
     /// The shared draft policy's per-step signals (layer events, routes), armed by
@@ -1490,6 +1502,7 @@ pub(crate) struct GlmfEngine<'a> {
     pub embedding: TokenEmbedding<'a>,
     /// The serving loop's token selector when start-up made it before the KV pool.
     selector: RefCell<Option<TokenSelector<'a>>>,
+    pub(super) admitted_host: Option<cuteafd_hostcache::config::Config>,
 }
 
 /// Which prefill projections run W8A8 block-FP8 GEMMs (E4M3 activations per
@@ -1508,9 +1521,9 @@ pub(crate) struct Fp8Prefill {
 // and do not enlarge the startup graph set. Counters still count every capture.
 use crate::shared::decode_graph::{check_bucket_thresholds, masked_row, ProjectionThreshold};
 
-pub(crate) use cuteafd_loader::serving_capacity::glmf_graphs::{DecodeBuckets, GraphGeometry, decode_strides, serving_graph_shapes, serving_graph_reserve};
+pub(crate) use cuteafd_loader::serving_capacity::glmf_graphs::{DecodeBuckets, GraphGeometry, GlmfLayout, decode_strides, glmf_prewarm_list, glmf_prewarm_shapes};
 #[allow(unused_imports)]
-use cuteafd_loader::serving_capacity::glmf_graphs::{graph_geometries, graph_reserve_bytes, MIN_PAGE_STRIDE, PLAIN_DECODE_BUCKETS, SPEC_DECODE_BUCKETS};
+use cuteafd_loader::serving_capacity::glmf_graphs::{graph_geometries, MIN_PAGE_STRIDE, PLAIN_DECODE_BUCKETS, SPEC_DECODE_BUCKETS};
 // Inclusive arithmetic crossovers audited against the pinned AOT exporter: an FP8 decode
 // projection has none below its capacity (`FP8_DECODE_ROWS`), where the row-invariant GEMV
 // hands over to the W8A16 GEMM. Full/half-head shapes share these thresholds; MoE
@@ -1549,56 +1562,6 @@ fn check_decode_thresholds(buckets: &DecodeBuckets, sequences: usize, speculatio
     if speculation { check_bucket_thresholds(&buckets.spec, &thresholds)?; }
     Ok(())
 }
-// WP9 2026-10-07, RTX PRO 6000 SM120, runtime99c: each new LM lane
-// adds 71,942,144 B beyond tracked buffers; drafter adds 68,269,888 B. This
-// measured/calibrated allowance is not exact cuBLAS allocator ownership.
-#[allow(unused_imports)]
-use cuteafd_loader::serving_capacity::glmf_graphs::WORKSPACE_RUNTIME_OVERHEAD_BYTES;
-
-/// Per rank, the device bytes its step workspaces take before the KV pool, for an admission that
-/// sizes the pool before they exist: the decode workspace and `lanes` prefill lanes of `prefill_rows`
-/// rows over their one set of shared temporaries (`plan`'s arithmetic, which the engine allocates),
-/// plus the measured untracked runtime memory per workspace, the drafter's included. A plan with
-/// all-row prefill logits (`--full-prefill-logits`) gives the exact union scoring runs in: a serial
-/// prefill runs in lane 0, and the logits live once, in the lanes' shared temporaries.
-pub(crate) fn workspace_reserve(plan: &StepPlan<'_, '_>, prefill_rows: usize, lanes: usize, peer: bool,
-    drafter: bool) -> Result<Vec<u64>> {
-    (0..if peer { 2 } else { 1 }).map(|rank| {
-        // The planner separately admits drafter storage. Its runtime overhead is additional.
-        Ok(workspace_reserve_bytes(plan.workspace_bytes(rank, prefill_rows, lanes)?, lanes, rank == 0 && drafter))
-    }).collect()
-}
-
-/// A rank's `tracked` workspace bytes with the untracked runtime memory of its decode workspace,
-/// `lanes` prefill lanes and (`drafter`) the drafter's.
-fn workspace_reserve_bytes(tracked: u64, lanes: usize, drafter: bool) -> u64 {
-    tracked + cuteafd_loader::serving_capacity::glmf_graphs::workspace_runtime_overhead(lanes, drafter)
-}
-
-fn startup_graph_policy(graphs: Option<&str>, startup: Option<&str>) -> bool {
-    graphs != Some("0") && startup != Some("0")
-}
-pub(crate) fn startup_graphs_enabled() -> bool {
-    startup_graph_policy(std::env::var("CUTEAFD_GLMF_GRAPHS").ok().as_deref(),
-        std::env::var("CUTEAFD_GLMF_STARTUP_GRAPHS").ok().as_deref())
-}
-
-pub(crate) use cuteafd_loader::serving_capacity::glmf_graphs::StartupGraphReserve;
-
-/// Admission policy lives in the loader; CUDA error classification stays at the edge.
-pub(crate) fn admit_beside_decode_graphs(startup: Option<StartupGraphReserve>,
-    admit: impl FnMut(Option<u64>) -> Result<usize>) -> Result<(usize, bool)> {
-    let result = cuteafd_loader::serving_capacity::glmf_graphs::admit_beside_decode_graphs(
-        startup, admit, crate::shared::memory_report::kv_shortfall,
-        |retry, refused| retry.context(format!("admitting the GLM Flash KV pool with lazily captured \
-            decode graphs, after the startup set's admission was refused ({refused:#})")));
-    if let (Some(graphs), Ok((tokens, false))) = (startup, &result) {
-        tracing::warn!(startup_graph_bytes = graphs.reserve, graph_allowance_bytes = graphs.allowance,
-            lazy_pool_tokens = tokens, "GLM Flash startup decode graphs refused: capturing lazily within the graph allowance");
-    }
-    result
-}
-
 /// A startup capture's tables: `rows` masked rows over `geometry`.
 fn startup_tables(rows: usize, spec: bool, geometry: GraphGeometry) -> StepTables {
     let mut tables = StepTables { decode: true, spec, long: geometry.long, pool_width: geometry.pool_width,
@@ -1633,11 +1596,12 @@ fn pad_decode_tables(tables: &mut StepTables, bucket: usize) {
 }
 
 /// What a captured decode segment baked in.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize)]
 struct GraphKey {
     segment: usize,
     rows: usize,
     spec: bool,
+    head: bool,
     long: bool,
     pool_width: usize,
     page_stride: usize,
@@ -1649,15 +1613,26 @@ impl GraphKey {
     /// ([`GraphGeometry::keyed`]: a short step keys no pool-table width or stride).
     fn new(segment: usize, rows: usize, tables: &StepTables) -> Self {
         let geometry = GraphGeometry::keyed(tables.pool_width, tables.page_stride, tables.pool_stride, tables.long);
-        Self { segment, rows, spec: tables.spec, long: geometry.long, pool_width: geometry.pool_width,
+        Self { segment, rows, spec: tables.spec, head: false, long: geometry.long, pool_width: geometry.pool_width,
             page_stride: geometry.page_stride, pool_stride: geometry.pool_stride }
+    }
+
+    fn normalized(mut self, attention: Option<GlmNextAttention>) -> Self {
+        self.head = attention.is_none();
+        if self.head { self.spec = false; }
+        if attention != Some(GlmNextAttention::Mla) {
+            self.long = false;
+            self.pool_width = 0;
+            self.page_stride = 0;
+            self.pool_stride = 0;
+        }
+        self
     }
 }
 
 /// What the decode graph caches did and hold.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct GraphCounts {
-    pub stats: GraphStats,
     /// Executables held, the step shapes they belong to (segment 0's), and their charged bytes.
     pub held: usize,
     pub shapes: usize,
@@ -1686,8 +1661,7 @@ fn audit_route_counts(routes: &[ExpertProtocolV2RouteEntry]) -> std::collections
 
 /// A Spark wave of `layer`: `rows` rows of E4M3 input with a UE8M0 scale per 32 values
 /// (`hidden + hidden / 32` bytes each) and `topk` routes per row, answered with compact BF16
-/// partials. Serving waves (`spark_dispatch`) and the start-up warm-up ([`spark_warmup_request`])
-/// both take this format.
+/// partials. Session negotiation reserves this format without constructing a request.
 fn spark_request(hidden: usize, topk: usize, layer: usize, rows: usize, routes: Vec<ExpertProtocolV2RouteEntry>,
     wire: Vec<u8>, kind: ExpertV2SourceKind, bf16: bool) -> Result<ExpertProtocolV2Request> {
     spark_request_bytes(hidden, topk, layer, rows, routes, wire.into(), kind, bf16)
@@ -1709,19 +1683,13 @@ fn spark_request_bytes(hidden: usize, topk: usize, layer: usize, rows: usize, ro
     Ok(request)
 }
 
-/// The wave that warms a Spark transport at start-up (as GLM-5, MiMo and DeepSeek V4 warm theirs):
-/// `rows` zero rows of prefill at the first selected Spark layer, every gate zero and the experts in turn. Each
-/// rank's session sizes its rings for the request that opens it, and the transport drops and
-/// reconnects a rank whose rings a later request outgrows, so a transport warmed with the most rows
-/// any of its waves carries never reconnects while serving.
-pub(crate) fn spark_warmup_request(cfg: &GlmNextConfig, rows: usize, layer: usize, bf16: bool) -> Result<ExpertProtocolV2Request> {
-    ensure!(layer < cfg.layers && cfg.dense.get(layer) == Some(&false),
-        "Spark transport warmup layer {layer} is not a routed layer");
-    let (h, topk) = (cfg.hidden, cfg.topk);
-    let routes = (0..rows * topk).map(|i| ExpertProtocolV2RouteEntry {
-        row_index: (i / topk) as u32, expert_id: (i % cfg.experts) as u32, gate_weight: 0.0,
-    }).collect();
-    spark_request(h, topk, layer, rows, routes, vec![0; rows * (if bf16 { h * 2 } else { h + h / 32 })], ExpertV2SourceKind::Prefill, bf16)
+/// Reserve a full lane without selecting a layer or executing expert work.
+pub(crate) fn spark_session_shape(cfg: &GlmNextConfig, rows: usize, bf16: bool) -> Result<cuteafd_transport::SparkSessionShape> {
+    let mut shape = cuteafd_transport::SparkSessionShape::new(u32::try_from(rows)?,
+        u32::try_from(cfg.hidden)?, u32::try_from(cfg.topk)?,
+        if bf16 { ExpertV2Dtype::Bf16 } else { ExpertV2Dtype::Fp8E4m3Ue8m0K32 })?;
+    shape.flags |= EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16;
+    Ok(shape)
 }
 
 fn validate_attention_shares(plan: &cuteafd_loader::placement::LayerExecutionPlan,
@@ -1754,7 +1722,6 @@ impl<'a> GlmfEngine<'a> {
         slots: usize, embedding: TokenEmbedding<'a>, index_cache: IndexCache, kda_state: KdaState, decode_rows: usize,
         records: Option<PrefillScratch<'a>>, context_mode: Option<GlmfAttention>, pool_marks: bool,
         execution: &cuteafd_loader::placement::LayerExecutionPlan, step_experts: StepExperts) -> Result<Self> {
-        let _memory_scope = cuteafd_ffi::memory_ledger::scope("kv");
         let sms = library.sm_count()?;
         let quantize_grid = Fp8QuantizeGrid::new(sms, None)?;
         ensure!(decode_rows == DECODE_ROWS || decode_rows == WIDE_DECODE_ROWS,
@@ -1820,10 +1787,10 @@ impl<'a> GlmfEngine<'a> {
             peer: None, exchange: None, drafter: None, pool_logical_host: RefCell::new(vec![0; pool_pages]), pool_pages,
             table_pages, table_pool_pages, decode_workspace: RefCell::new(None),
             prefill_slots: RefCell::new(Vec::new()),
-            experts: None, packed_row_cap: Cell::new(None), packed_programs: Default::default(), tp2: None, local: None, expert_routing: None, dense_nvfp4: None, profile: RefCell::new([0.0; 3]), graphs: RefCell::new(GraphBank::new(None)),
-            use_graphs: std::env::var("CUTEAFD_GLMF_GRAPHS").map_or(true, |v| v != "0"),
-            startup_graphs: startup_graphs_enabled(),
-            warming_graphs: std::cell::Cell::new(false), logged_graph_shapes: RefCell::new(std::collections::HashSet::new()),
+            experts: None, packed_row_cap: Cell::new(None), packed_programs: Default::default(), tp2: None, local: None, expert_routing: None, dense_nvfp4: None, profile: RefCell::new([0.0; 3]), graphs: RefCell::new(GraphBank::with_family(GraphPolicy::Budgeted { bytes: None }, "glm5_flash")),
+            use_graphs: Self::graphs_enabled(),
+            warming_graphs: std::cell::Cell::new(false),
+            prewarming_graphs: std::cell::Cell::new(false), graphs_warmed: std::cell::Cell::new(false),
             split_audit: std::env::var("CUTEAFD_GLMF_SPLIT_AUDIT").is_ok_and(|v| v == "1"),
             spark_bf16: false, full_prefill_logits: false,
             draft_probe: RefCell::new(None), capturing: std::cell::Cell::new(false),
@@ -1831,18 +1798,12 @@ impl<'a> GlmfEngine<'a> {
             fp8_prefill: Fp8Prefill::default(), kda_fp32_partials: false,
             kda_output_shard: false, mark_slots: 0,
             kda_prefill_expanded: false, kda_state, l2: None, target_head: TargetHeadRoute::Tensor, embedding,
-            selector: RefCell::new(None) })
-    }
-
-    /// Decode graphs captured lazily as steps arrive, at their exact rows, instead of the startup set
-    /// (the KV admission found no room for it: `admit_beside_decode_graphs`).
-    pub(crate) fn capture_graphs_lazily(&mut self) {
-        self.startup_graphs = false;
+            selector: RefCell::new(None), admitted_host: None })
     }
 
     /// Own every ordinary text/media workspace before readiness: both ranks' decode workspaces and
     /// the prefill lanes a Spark prefill runs in (`--prefill-lanes`, over one set of temporaries;
-    /// otherwise the serial workspace, lane 0), and the drafter's. No shared BLAS handles.
+    /// otherwise the serial workspace, lane 0), and the drafter's. BLAS pools are thread/device shared.
     pub fn prepare_serving_workspaces(&self) -> Result<()> {
         let lanes = if self.pipelined() { self.prefill_waves } else { 1 };
         for rank in 0..self.ranks() {
@@ -1853,87 +1814,167 @@ impl<'a> GlmfEngine<'a> {
         self.synchronize()
     }
 
-    /// Capture the complete serving key set on masked rows, without expert traffic. The bucket sets
-    /// pass the projection thresholds before readiness in every graph mode.
-    pub fn warm_decode_graphs(&self, sequences: usize, speculation: bool) -> Result<usize> {
-        if !self.use_graphs { return Ok(0); }
-        check_decode_thresholds(&self.buckets, sequences, speculation)?;
-        tracing::info!(plain_rows = ?self.buckets.plain, spec_rows = ?self.buckets.spec, decode_rows = self.decode_rows,
-            verify_rows = self.verify_rows, startup = self.startup_graphs,
-            "GLM Flash decode buckets pass the projection thresholds");
-        if !self.startup_graphs { return Ok(0); }
-        let startup = cuteafd_loader::serving_capacity::glmf_graphs::startup_set(
-            self.max_context, self.pages * PAGE_ROWS, self.cfg.dense_context(), sequences,
-            speculation, self.weights.layers.len(), self.peer.is_some(), &self.buckets);
-        ensure!(self.peer.as_ref().is_none_or(|peer| peer.layers.len() == self.weights.layers.len()),
-            "startup graph peer layer inventory differs from planner");
-        let shapes = startup.keys;
-        let segments = self.weights.layers.len() + 1;
-        let expected = startup.inventory.ranks.iter().map(|rank| rank.executables as usize).sum::<usize>();
-        tracing::info!(shapes = shapes.len(), graphs = expected, plain_rows = ?self.buckets.plain,
-            spec_rows = ?self.buckets.spec, "GLM Flash startup decode graph admission");
-        // Allocate fixed workspaces before measuring the graph executables' physical memory.
-        for rank in 0..self.ranks() {
-            drop(self.decode_workspace_of(rank)?);
-        }
-        self.synchronize()?;
-        let free = || (0..self.ranks()).map(|rank| self.on(rank,
-            || self.library.cuda_allocatable_memory_info().map(|(free, _)| free as i64))).collect::<Result<Vec<_>>>();
-        let before = free()?;
-        let started = std::time::Instant::now();
-        self.warming_graphs.set(true);
-        let captured = (|| -> Result<()> {
-            for &(rows, spec, geometry) in &shapes {
-                self.decode_primitive(&startup_tables(rows, spec, geometry), &vec![0; rows], rows, None, None, None)?;
-            }
-            self.synchronize()
-        })();
-        self.warming_graphs.set(false);
-        captured?;
-        let graphs = self.graphs.borrow().len() + self.peer.as_ref().map_or(0, |p| p.graphs.borrow().len());
-        ensure!(graphs == expected, "startup captured {graphs} graphs, expected {expected}");
-        for rank in 0..self.ranks() {
-            let end = if rank == 0 { segments } else { segments - 1 };
-            let keys: Vec<_> = shapes.iter().flat_map(|&(rows, spec, geometry)| {
-                let tables = startup_tables(rows, spec, geometry);
-                (0..end).map(move |segment| GraphKey::new(segment, rows, &tables))
-            }).collect();
-            self.graphs_of(rank).borrow_mut().seal_startup(&keys)?;
-        }
-        for &(rows, spec, geometry) in &shapes {
-            let tables = startup_tables(rows, spec, geometry);
-            for rank in 0..self.ranks() {
-                let graphs = if rank == 0 { &self.graphs } else { &self.peer()?.graphs };
-                let end = if rank == 0 { segments } else { segments - 1 };
-                for segment in 0..end {
-                    ensure!(graphs.borrow().contains(&GraphKey::new(segment, rows, &tables)),
-                        "startup graph coverage missing");
-                }
-            }
-        }
-        let bytes: Vec<i64> = before.into_iter().zip(free()?).map(|(before, after)| before - after).collect();
-        tracing::info!(graphs, shapes = shapes.len(), ?bytes, elapsed_ms = started.elapsed().as_millis() as u64,
-            "GLM Flash decode graphs captured at startup");
-        Ok(graphs)
+    /// Best-effort prewarm of the launch's checked-in shape list, on masked rows without
+    /// expert traffic: an eager pass first (module, workspace and BLAS first touch outside
+    /// executable residency), then a capture pass. Never sealed: an unlisted or uncaptured
+    /// request shape captures or runs eagerly inside the same measured reserve.
+    /// Returns the resident keys and each rank's before/after sample.
+    /// Whether this process captures decode segments (`CUTEAFD_GLMF_GRAPHS=0` runs decode eagerly).
+    pub(crate) fn graphs_enabled() -> bool {
+        std::env::var("CUTEAFD_GLMF_GRAPHS").map_or(true, |v| v != "0")
     }
 
-    pub(crate) fn check_admitted_graphs(&self, admitted: &cuteafd_loader::placement::GraphSet) -> Result<()> {
-        ensure!(admitted.lifetime == cuteafd_loader::placement::Lifetime::Startup
-            && admitted.ranks.len() == self.ranks(), "startup graph admission does not match executor ranks");
-        for (rank, expected) in admitted.ranks.iter().enumerate() {
-            let actual = if rank == 0 { self.graphs.borrow().len() } else { self.peer()?.graphs.borrow().len() };
-            ensure!(actual as u64 == expected.executables,
-                "GLM Flash rank {rank} captured {actual} graphs, admission reserved {}", expected.executables);
+    /// Returns whether the prewarm ran.
+    pub fn warm_decode_graphs(&self, sequences: usize, speculation: bool) -> Result<bool> {
+        if !self.use_graphs { return Ok(false); }
+        check_decode_thresholds(&self.buckets, sequences, speculation)?;
+        tracing::info!(plain_rows = ?self.buckets.plain, spec_rows = ?self.buckets.spec, decode_rows = self.decode_rows,
+            verify_rows = self.verify_rows, "GLM Flash decode buckets pass the projection thresholds");
+        let layout = self.graph_layout();
+        let shapes = glmf_prewarm_shapes(self.max_context, self.pages * PAGE_ROWS, self.cfg.dense_context(),
+            sequences.min(self.decode_rows), speculation, &self.buckets, layout);
+        ensure!(self.peer.as_ref().is_none_or(|peer| peer.layers.len() == self.weights.layers.len()),
+            "prewarm peer layer inventory differs from planner");
+        ensure!(!self.graphs_warmed.get() && (0..self.ranks()).all(|rank| self.graphs_of(rank).borrow().len() == 0),
+            "GLM Flash graph prewarm already ran");
+        let started = std::time::Instant::now();
+        use crate::shared::decode_graph::device::Cycle;
+        for rank in 0..self.ranks() { self.graphs_of(rank).borrow_mut().cache_cycle(Cycle::Other); }
+        // Allocate fixed workspaces before measuring the graph executables' physical memory.
+        for rank in 0..self.ranks() { drop(self.decode_workspace_of(rank)?); }
+        let run = |eager: bool| -> Result<()> {
+            // Both passes keep the masked bucket boundary; only the second creates graphs.
+            self.warming_graphs.set(true);
+            self.prewarming_graphs.set(eager);
+            let result = (|| -> Result<()> {
+                for &(rows, spec, geometry) in &shapes {
+                    self.decode_primitive(&startup_tables(rows, spec, geometry), &vec![0; rows], rows, None, None, None)?;
+                }
+                self.synchronize()
+            })();
+            self.prewarming_graphs.set(false);
+            self.warming_graphs.set(false);
+            result
+        };
+        // Same segment closures and masked FFN semantics, without creating a graph.
+        run(true)?;
+        let before = self.graph_memory_samples()?;
+        let captured = run(false);
+        captured?;
+        self.graphs_warmed.set(true);
+        let after = self.graph_memory_samples()?;
+        let held: usize = (0..self.ranks()).map(|rank| self.graphs_of(rank).borrow().len()).sum();
+        tracing::info!(graphs = held, layout = %layout,
+            free = ?(0..self.ranks()).map(|rank| (before[rank].free, after[rank].free)).collect::<Vec<_>>(),
+            shapes = shapes.len(), elapsed_ms = started.elapsed().as_millis() as u64,
+            "GLM Flash decode graphs warmed at startup");
+        Ok(true)
+    }
+
+    /// Bind each rank's banks at its admitted charge, then record the shared
+    /// reserve policy that charge came from: the traced base plus the fixed
+    /// allocation tail, with runtime capture headroom from the shared extra.
+    pub fn configure_graph_cache(&self, charged: &[u64], bases: &[u64], bootstraps: &[u64], tail: u64) -> Result<()> {
+        use crate::shared::decode_graph::device::{Cycle, Preference, Site};
+        let basis = self.graph_basis();
+        if basis == crate::shared::decode_graph::device::Basis::Bytes {
+            tracing::warn!("GLM Flash graph cache uses a per-site byte estimate: no node-rate calibration for this route");
+        }
+        for rank in 0..self.ranks() {
+            let device = if rank == 0 { self.device } else { self.peer()?.device };
+            self.graphs_of(rank).borrow_mut().attach_device(self.library, device, charged[rank], Site {
+                name: "glm5_flash.decode", cycle: Cycle::Decode, preference: Preference::Adaptive,
+                bootstrap: bootstraps[rank], basis,
+                spans_devices: self.ranks() > 1 || self.peer.is_some(),
+            })?;
+            let policy = cuteafd_loader::placement::graph_reserve::current(rank, false, bases[rank], tail)?;
+            crate::shared::decode_graph::device::set_reserve_policy(device, policy)?;
         }
         Ok(())
+    }
+
+    /// #1612 calibrated no GLM Flash route, so every device estimates in bytes: the site's
+    /// bootstrap until its own measured capture replaces it.
+    fn graph_basis(&self) -> crate::shared::decode_graph::device::Basis {
+        crate::shared::decode_graph::device::Basis::Bytes
+    }
+
+    /// The resolved graph layout this launch serves under: its coordinator
+    /// device count, and whether Spark ranks serve its routed experts. The
+    /// second coordinator GPU under a head split is not a Spark attachment:
+    /// a 2-RTX launch with local TP2 experts (Sparks idle) and one with Spark
+    /// experts are different layouts, and a 1-RTX launch with Sparks is not
+    /// `1`.
+    fn graph_layout(&self) -> GlmfLayout {
+        GlmfLayout::resolved(self.ranks(), matches!(self.experts, Some(Experts::Spark { .. })))
+    }
+
+    /// Whether this launch's layout's checked-in prewarm list pins this shape:
+    /// only what that layout's trace shows is always hot. A layout with no
+    /// trace prewarms its bootstrap set unpinned and lets ARC decide.
+    fn graph_pinned(&self, key: &GraphKey) -> bool {
+        let attention = self.weights.layers.get(key.segment).map(|layer| layer.attention);
+        glmf_prewarm_list().layout(self.graph_layout()).is_some_and(|layout| {
+            layout.entries.iter().filter(|entry| entry.pin).any(|entry| {
+                let (rows, spec, geometry) = entry.shape();
+                GraphKey { segment: key.segment, rows, spec, head: false, long: geometry.long,
+                    pool_width: geometry.pool_width, page_stride: geometry.page_stride,
+                    pool_stride: geometry.pool_stride }.normalized(attention) == *key
+            })
+        })
+    }
+
+    /// Every rank's launches for the completed step are queued: observe the
+    /// device once per physical GPU, tick each site's cycle and retire the
+    /// victims without draining a lane. GLM Flash every graph owner pins `()`
+    /// and captures only persistent engine buffers, so destroying a victim
+    /// executable never releases storage an in-flight launch reads.
+    fn observe_graphs_completed(&self) -> Result<()> {
+        let spans = self.ranks() > 1 || self.peer.is_some();
+        // SAFETY: every GLM Flash graph owner pins `()` (see `GraphOwner::new`
+        // in `replay_on`) and its captured pointers are persistent engine
+        // buffers, never per-graph allocations.
+        unsafe {
+            crate::shared::decode_graph::device::observe_completed(&self.library, |visit| {
+                for rank in 0..self.ranks() {
+                    let device = if rank == 1 { self.peer()?.device } else { self.device };
+                    visit(device, "glm5_flash.decode", spans,
+                        &mut *self.graphs_of(rank).borrow_mut())?;
+                }
+                Ok(())
+            })
+        }
+    }
+
+    /// Physical free/total and the ledger's tracked bytes on both ranks, with
+    /// the streams drained so no queued work lands inside the window.
+    fn graph_memory_samples(&self) -> Result<Vec<cuteafd_loader::placement::inventory::GraphMemorySample>> {
+        use cuteafd_loader::placement::inventory::GraphMemorySample;
+        // SAFETY: both ranks' streams are live; nothing else is queued.
+        unsafe { self.library.cuda_stream_synchronize(self.stream)? };
+        if self.peer.is_some() {
+            let stream = self.stream_of(1);
+            self.on(1, || unsafe { self.library.cuda_stream_synchronize(stream) })?;
+        }
+        let ledger = cuteafd_ffi::memory_ledger::snapshot();
+        use cuteafd_ffi::memory_ledger::Space;
+        (0..self.ranks()).map(|rank| self.on(rank, || {
+            let device = self.library.cuda_get_device()?;
+            let (free, total) = self.library.cuda_physical_memory_info()?;
+            Ok(GraphMemorySample { free: free as u64, total: total as u64,
+                tracked_device: ledger.total(Space::Device, device) as u64,
+                tracked_pinned: ledger.rows.iter().filter(|row| row.key.space == Space::Pinned)
+                    .map(|row| row.bytes as u64).sum(),
+                tracked_managed: ledger.rows.iter().filter(|row| row.key.space == Space::Managed)
+                    .map(|row| row.bytes as u64).sum() })
+        })).collect()
     }
 
     /// All-owner real-row byte gate; plain steps restore the complete persistent state. With the wide
     /// programs the speculative steps also pad 65 rows and the verify budget less one into the
     /// budget's bucket (65 -> 127 and 126 -> 127 on an RTX 5090).
     pub fn check_decode_padding(&self, tokens: &[u32]) -> Result<()> {
-        ensure!(self.use_graphs && self.startup_graphs,
-            "padding check needs graphs and CUTEAFD_GLMF_STARTUP_GRAPHS=1");
+        ensure!(self.use_graphs, "padding check needs decode graphs (CUTEAFD_GLMF_GRAPHS=1)");
         let mut spec_rows = vec![3, 9, 17, 33];
         if self.verify_rows > DECODE_ROWS {
             spec_rows.extend([DECODE_ROWS + 1, self.verify_rows - 1]);
@@ -2070,6 +2111,17 @@ impl<'a> GlmfEngine<'a> {
         ensure!(failures.is_empty(), "{}", failures.join("; ")); Ok(())
     }
 
+    /// Request-local cancellation (#1817, `pair::submit_recoverable`). GLM
+    /// Flash reads no host token table, so only a failure raised before the
+    /// body queued anything is request-local: it leaves no device, peer, Spark
+    /// or drafter work to drain and the exchange stays Active. Every other
+    /// failure retires through [`Self::shutdown_submission`].
+    fn cancel_submission(&self, kind: crate::shared::experts::rtx::pair::Recovery) -> Result<()> {
+        use crate::shared::experts::rtx::pair::Recovery;
+        ensure!(kind == Recovery::BeforeSubmission, "GLM Flash has no request-local {kind:?} recovery");
+        Ok(())
+    }
+
     fn shutdown_submission(&self) -> Result<()> {
         use crate::shared::{experts::rtx::pair::{teardown, Teardown}, peer_split::TerminalState};
         if self.terminal.get() == TerminalState::Drained { return Ok(()); }
@@ -2086,13 +2138,14 @@ impl<'a> GlmfEngine<'a> {
                 self.terminal_links(|link| link.terminal_release())?;
                 self.layer_waves.borrow_mut().clear();
                 for rank in 0..self.ranks() {
-                    self.on(rank, || { *self.graphs_of(rank).borrow_mut() = GraphBank::new(None); Ok(()) })?;
+                    self.on(rank, || { *self.graphs_of(rank).borrow_mut() =
+                    GraphBank::with_family(GraphPolicy::Budgeted { bytes: None }, "glm5_flash"); Ok(()) })?;
                 }
                 Ok(())
             },
             finish: |drained| {
                 self.terminal.set(if drained { TerminalState::Drained } else { TerminalState::Retained });
-                for exchange in self.exchange.iter().chain(self.tp2.iter().map(|tp2| &tp2.routes)) {
+                for exchange in self.exchange.iter().map(|exchange| exchange.as_ref()).chain(self.tp2.iter().map(|tp2| &tp2.routes)) {
                     exchange.finish_terminal(drained);
                 }
                 if let Some(drafter) = &self.drafter { drafter.finish_terminal(drained); }
@@ -2103,7 +2156,7 @@ impl<'a> GlmfEngine<'a> {
 
     fn publish_tp2_abort(&self) -> Result<()> {
         let mut failures = Vec::new();
-        for exchange in self.exchange.iter().chain(self.tp2.iter().map(|tp2| &tp2.routes)) {
+        for exchange in self.exchange.iter().map(|exchange| exchange.as_ref()).chain(self.tp2.iter().map(|tp2| &tp2.routes)) {
             match exchange.terminal_state() {
                 crate::shared::peer_split::TerminalState::Aborting
                 | crate::shared::peer_split::TerminalState::Drained => continue,
@@ -2205,11 +2258,13 @@ impl<'a> GlmfEngine<'a> {
         let tokens: Vec<u32> = (0..rows).map(|i| (i % self.cfg.vocab_size) as u32).collect();
         *tp2.schedule.borrow_mut() = Some(Default::default());
         tp2.checking.set(true);
-        self.prefill_units_with(&mut placement, &tokens, false, false, None, 1, None, None)?;
+        self.prefill_units_with(&mut placement, &tokens, false, false, None, 1, None, None, None)?;
         *tp2.schedule.borrow_mut() = Some(Default::default());
         tp2.checking.set(true);
         self.decode_step(&mut [(&mut placement, 1)], &[1], None, false, None, None, true)?;
-        self.synchronize()
+        self.synchronize()?;
+        cuteafd_bench::context::set_resolved("route-source", tp2.source.get().label());
+        Ok(())
     }
 
     pub(crate) fn install_local(&mut self, layers: Vec<usize>, experts: Experts<'a>) -> Result<()> {
@@ -2300,7 +2355,7 @@ impl<'a> GlmfEngine<'a> {
                     ensure!(projections.iter().all(|name| layer.native_projections.contains_key(name))
                         && shares[rank].present(), "native attention projections differ from admission at layer {index} rank {rank}");
                 }
-                let native = layer.core.contains_key("self_attn.o_proj");
+                let native = core::stage_attention(layer);
                 let operands: &[&str] = match layer.attention {
                     GlmNextAttention::Mla if checkpoint_native => &["q_a_norm", "kv_a_norm", "w_uk_fp8", "w_uk_scale",
                         "w_uv_fp8", "w_uv_scale", "k_norm_w", "k_norm_b", "ape", "index_gate"],
@@ -2320,7 +2375,9 @@ impl<'a> GlmfEngine<'a> {
                         GlmNextAttention::Mla => &["q_a_proj", "kv_a_proj_with_mqa", "q_b_proj", "o_proj"],
                     };
                     ensure!(shares[rank].present() && leaves.iter().all(|leaf|
-                        layer.core.contains_key(&format!("self_attn.{leaf}"))), "Flash K6 attention group incomplete");
+                        layer.core.contains_key(&format!("self_attn.{leaf}"))
+                            || layer.attention_native.contains_key(&format!("self_attn.{leaf}"))),
+                        "Flash selected attention group incomplete");
                 }
                 if shares[rank].present() { weights.push(rank as u8); }
                 match layer.attention {
@@ -2390,28 +2447,26 @@ impl<'a> GlmfEngine<'a> {
             };
             ensure!(tp > 0, "GLM Flash layer {layer} has no installed expert ranks");
             let catalog = catalog.context("GLM Flash routed expert catalog missing")?;
-            let slice_bytes = if let Some(tp2) = self.tp2.as_ref().filter(|tp2| tp2.layers.contains(&layer)) {
-                let left = tp2.ranks[0].borrow();
-                let right = tp2.ranks[1].borrow();
-                tp2_weight_read_bytes([left.as_ref(), right.as_ref()])? as f64
-            } else if catalog.format() == cuteafd_loader::plan::checkpoint::CheckpointFormat::Exlr8 {
-                match self.routed_experts(layer) {
-                    Some(Experts::LocalNative(local)) => local.borrow().weight_read_bytes()? as f64,
-                    Some(Experts::Spark { .. }) => resource::worker_weight_read_bytes(&remote, layer)? as f64,
-                    _ => anyhow::bail!("GLM Flash layer {layer} has no installed native byte descriptor"),
-                }
-            } else { match (catalog.fp8(), catalog.exl3()) {
-                (Some(_), _) => {
-                    let bytes = match self.routed_experts(layer) {
-                        Some(Experts::Local(local)) => local.experts.borrow().weight_read_bytes(),
-                        Some(Experts::Spark { .. }) => resource::worker_weight_read_bytes(&remote, layer)?,
+            let slice_bytes = resource::layer_slice_bytes(catalog.exl3(), layer, tp, || {
+                if let Some(tp2) = self.tp2.as_ref().filter(|tp2| tp2.layers.contains(&layer)) {
+                    let left = tp2.ranks[0].borrow();
+                    let right = tp2.ranks[1].borrow();
+                    tp2_weight_read_bytes([left.as_ref(), right.as_ref()])
+                } else if catalog.format() == cuteafd_loader::plan::checkpoint::CheckpointFormat::Exlr8 {
+                    match self.routed_experts(layer) {
+                        Some(Experts::LocalNative(local)) => local.borrow().weight_read_bytes(),
+                        Some(Experts::Spark { .. }) => resource::worker_weight_read_bytes(&remote, layer),
+                        _ => anyhow::bail!("GLM Flash layer {layer} has no installed native byte descriptor"),
+                    }
+                } else {
+                    anyhow::ensure!(catalog.fp8().is_some(), "GLM Flash routed expert format cannot be priced");
+                    match self.routed_experts(layer) {
+                        Some(Experts::Local(local)) => Ok(local.experts.borrow().weight_read_bytes()),
+                        Some(Experts::Spark { .. }) => resource::worker_weight_read_bytes(&remote, layer),
                         _ => anyhow::bail!("GLM Flash layer {layer} has no installed FP8-family byte descriptor"),
-                    };
-                    bytes as f64
+                    }
                 }
-                (_, Some(manifest)) => resource::exl3_slice_bytes(manifest, layer, tp)?,
-                _ => anyhow::bail!("GLM Flash routed expert format cannot be priced"),
-            }};
+            })?;
             Ok(if matches!(self.routed_experts(layer), Some(Experts::Spark { .. })) && !self.tp2_layer(layer) {
                 LayerHome::Remote { slice_bytes }
             } else { LayerHome::Local { slice_bytes } })
@@ -2490,8 +2545,9 @@ impl<'a> GlmfEngine<'a> {
         for &layer in &tp2.layers {
             for (lane, &rows) in rows.iter().enumerate() {
                 let bytes = rows * self.cfg.topk * 8;
-                checks.insert((layer, lane), (rows, [self.on(0, || HostAllocation::new(self.library, bytes))?,
-                    self.on(1, || HostAllocation::new(self.library, bytes))?]));
+                checks.insert((layer, lane), (rows, [
+                    self.on(0, || HostAllocation::new(self.library, bytes, Tag::staging("glmf/tp2-route-checks")))?,
+                    self.on(1, || HostAllocation::new(self.library, bytes, Tag::staging("glmf/tp2-route-checks")))?]));
             }
         }
         Ok(())
@@ -2508,8 +2564,9 @@ impl<'a> GlmfEngine<'a> {
             for &layer in &tp2.layers {
                 let bytes = self.prefill_rows * self.cfg.topk * 8;
                 layers.insert(layer, RouteHosts { hosts: [
-                    self.on(0, || HostAllocation::new(self.library, bytes))?,
-                    self.on(1, || HostAllocation::new(self.library, bytes))?], collected: [false; 2] });
+                    self.on(0, || HostAllocation::new(self.library, bytes, Tag::staging("glmf/tp2-unit-checks")))?,
+                    self.on(1, || HostAllocation::new(self.library, bytes, Tag::staging("glmf/tp2-unit-checks")))?],
+                    collected: [false; 2] });
             }
             storage.push(layers);
         }
@@ -2548,9 +2605,7 @@ impl<'a> GlmfEngine<'a> {
             }).collect()
         })?;
         if let Some(identity) = identity {
-            if identity.source() == RouteSource::Broadcast { tp2.source.set(RouteSource::Broadcast); }
-            cuteafd_bench::context::set_resolved("route-source", if tp2.source.get() == RouteSource::Broadcast {
-                "broadcast" } else { "replicated" });
+            tp2.source.set(tp2.source.get().checked(&identity, cuteafd_bench::context::readiness_s().is_some())?);
             tracing::info!(unit = unit.index, slot = unit.slot, layers_checked = identity.layers_checked,
                 rows_checked = identity.rows_checked, "GLM Flash unit route identity");
         }
@@ -2616,11 +2671,9 @@ impl<'a> GlmfEngine<'a> {
                 ranks: hosts.map(|h| h.bytes().to_vec()) }
         }).collect::<Vec<_>>();
         let identity = RouteIdentity::check(&checks);
-        if identity.source() == RouteSource::Broadcast { tp2.source.set(RouteSource::Broadcast); }
+        tp2.source.set(tp2.source.get().checked(&identity, cuteafd_bench::context::readiness_s().is_some())?);
         tracing::info!(layers_checked = identity.layers_checked, rows_checked = identity.rows_checked,
             first_mismatch = ?identity.first_mismatch, source = ?tp2.source.get(), "GLM Flash TP2 route identity");
-        cuteafd_bench::context::set_resolved("route-source", if tp2.source.get() == RouteSource::Broadcast {
-            "broadcast" } else { "replicated" });
         Ok(())
     }
 
@@ -2752,7 +2805,10 @@ impl<'a> GlmfEngine<'a> {
             RankDevice { device, stream }], if self.kda_output_shard { 6 } else { 4 } * self.prefill_waves,
             rows * self.cfg.hidden * (self.partial_bytes()
                 + if self.weights.layers.iter().chain(&layers).flat_map(|l| l.core.values())
-                    .any(|w| w.side == cuteafd_loader::formats::dense_trellis::TrellisSide::Input) { 2 } else { 0 }),
+                    .any(|w| w.side == cuteafd_loader::formats::dense_trellis::TrellisSide::Input)
+                    || self.weights.layers.iter().chain(&layers).any(|layer|
+                        layer.attention_native.values().any(|w| w.layout.ranks > 1
+                            && w.layout.split == cuteafd_loader::formats::trellis_core::CoreSplit::Input)) { 2 } else { 0 }),
             decode_peer_bytes(self.decode_rows, self.cfg.hidden))?;
         exchange.trace_identity("glmf-target-main");
         // Compact state belongs only to whole MLA owners, or to both context halves.
@@ -2763,17 +2819,16 @@ impl<'a> GlmfEngine<'a> {
         let peer = exchange.on(1, || -> Result<GlmfPeer<'a>> {
             // Its own and the shares' programs.
             self.programs.load_matching(|name| super::glmf_startup_program(name, true, self.decode_rows > DECODE_ROWS))?;
-            let _memory_scope = cuteafd_ffi::memory_ledger::scope("kv");
             let local = if self.context_mode.is_some() { 2 } else { 1 };
             let caches = Caches::new(self.library, &self.cfg, &layers, self.pages / local, self.pool_pages / local,
                 self.slots, self.caches.kda_heads, self.index_cache, self.kda_state, self.decode_rows, None,
                 self.caches.pool_marks)?;
             Ok(GlmfPeer { device, stream, layers, caches,
                 decode_workspace: RefCell::new(None), prefill_slots: RefCell::new(Vec::new()),
-                graphs: RefCell::new(GraphBank::new(self.graphs.borrow().budget())), l2: None })
+                graphs: RefCell::new(GraphBank::with_family(GraphPolicy::Budgeted { bytes: self.graphs.borrow().budget() }, "glm5_flash")), l2: None })
         })?;
         self.peer = Some(peer);
-        self.exchange = Some(exchange);
+        self.exchange = Some(std::rc::Rc::new(exchange));
         // Native kernels load lazily on first launch, and a lazy load can wait for the device:
         // queued a layer ahead, rank 1 would then wait for its own stream, which waits on a
         // push the host has not queued yet. Load the native MLA prefill on both GPUs now.
@@ -2795,13 +2850,14 @@ impl<'a> GlmfEngine<'a> {
     }
 
     fn warm_mla_prefill_width(&self, rank: usize, heads: usize, kernel: i32) -> Result<()> {
-        let q = self.alloc(heads * self.cfg.kv_lora_rank * 2)?;
-        let kv = self.alloc(PAGE_ROWS * RECORD_BYTES)?;
-        let indices = self.alloc(SPARSE_TOPK * 4)?;
+        let tag = Tag::workspace("glmf/mla-warmup");
+        let q = self.alloc(heads * self.cfg.kv_lora_rank * 2, tag)?;
+        let kv = self.alloc(PAGE_ROWS * RECORD_BYTES, tag)?;
+        let indices = self.alloc(SPARSE_TOPK * 4, tag)?;
         self.library.copy_h2d(indices.buffer, &vec![0xFFu8; SPARSE_TOPK * 4])?;
-        let lengths = self.alloc(4)?;
+        let lengths = self.alloc(4, tag)?;
         self.library.cuda_zero_bytes(lengths.buffer, 256)?;
-        let out = self.alloc(heads * self.cfg.kv_lora_rank * 2)?;
+        let out = self.alloc(heads * self.cfg.kv_lora_rank * 2, tag)?;
         // SAFETY: every buffer above is live and sized for one row of `heads` heads; the
         // stream drains before they drop.
         unsafe {
@@ -2820,8 +2876,12 @@ impl<'a> GlmfEngine<'a> {
         self.peer.as_ref().context("no head-split peer")
     }
 
+    pub(crate) fn draft_exchange(&self) -> Result<std::rc::Rc<PeerExchange<'a>>> {
+        self.exchange.clone().context("TP2 DFlash requires a target peer exchange")
+    }
+
     fn exchange(&self) -> Result<&PeerExchange<'a>> {
-        self.exchange.as_ref().context("no head-split exchange")
+        self.exchange.as_deref().context("no head-split exchange")
     }
 
     /// The stream of rank `rank`.
@@ -2899,7 +2959,7 @@ impl<'a> GlmfEngine<'a> {
         let writes = match &self.drafter {
             Some(super::dspark::Drafter::RemoteDflash(d)) => d.replay_write_ranges(),
             Some(super::dspark::Drafter::Dflash2(d)) => d.replay_write_ranges().into_iter()
-                .map(|(name, buffer)| (self.device, name, buffer)).collect(),
+                .map(|(name, buffer)| (buffer.device_id, name, buffer)).collect(),
             _ => Vec::new(),
         };
         let encode = |ranges: &[(i32, String, cuteafd_ffi::CuteafdDeviceBuffer)]| {
@@ -3099,10 +3159,8 @@ impl<'a> GlmfEngine<'a> {
         let split = self.peer.is_some();
         for rank in 0..self.ranks() {
             let caches = self.caches_of(rank);
-            if rank == 1 {
-                // SAFETY: the engine owns the peer stream; drained before its tables are rewritten.
-                self.on(1, || unsafe { self.library.cuda_stream_synchronize(self.stream_of(1)) })?;
-            }
+            // Each rank's ordered upload follows its previous commit reader and precedes
+            // the new one on the same stream; put retains the host source in pinned staging.
             self.on(rank, || self.put(&caches.commit_tables, &tables))?;
             let mut pointers = vec![("state", caches.kda_state.buffer.ptr),
                 ("conv_state", caches.kda_conv.buffer.ptr), ("replay", caches.kda_replay.ptr),
@@ -3122,8 +3180,8 @@ impl<'a> GlmfEngine<'a> {
         Ok(())
     }
 
-    fn alloc(&self, bytes: usize) -> Result<Dev<'a>> {
-        Dev::new(self.library, bytes.max(256))
+    fn alloc(&self, bytes: usize, tag: Tag) -> Result<Dev<'a>> {
+        Dev::new(self.library, bytes.max(256), tag)
     }
 
     fn run(&self, name: &str, pointers: &[(&str, *mut c_void)], scalars: &[Scalar]) -> Result<()> {
@@ -3222,8 +3280,8 @@ impl<'a> GlmfEngine<'a> {
 
     /// This engine's step plan: what its workspaces hold, given its configuration and experts.
     fn step_plan(&self) -> StepPlan<'_, 'a> {
-        StepPlan::new(self.library, self.programs, &self.cfg, &self.weights.layers, matches!(self.weights.head, GlmfHead::K6(_) | GlmfHead::RowFp8(_)), self.step_experts,
-            StepSettings { kda_fp32_partials: self.kda_fp32_partials, kda_output_shard: self.kda_output_shard,
+        StepPlan::new(self.library, self.programs, &self.cfg, &self.weights.layers, &self.weights.head, self.step_experts,
+            StepSettings { target_head: self.target_head, kda_fp32_partials: self.kda_fp32_partials, kda_output_shard: self.kda_output_shard,
                 kda_prefill_expanded: self.kda_prefill_expanded, full_prefill_logits: self.full_prefill_logits,
                 max_context: self.max_context, index_cache: self.index_cache, kda_state: self.kda_state,
                 replay_records: self.replay_records, decode_rows: self.decode_rows })
@@ -3459,6 +3517,16 @@ impl<'a> GlmfEngine<'a> {
             })).transpose()
     }
 
+    /// Preserve the serving transformer's units; consume each head tile before reuse.
+    pub(crate) fn prefill_streamed_scoring(&self, placement: &mut GlmfPlacement, tokens: &[u32],
+        media: &cuteafd_engine::media::RequestMedia, scoring: crate::shared::probe::ScoringRows<'_>)
+        -> Result<Option<crate::shared::probe::ScoreLogits>> {
+        let waves = if self.pipelined() { self.prefill_waves } else { 1 };
+        self.prefill_units_with(placement, tokens, true, false, Some(media), waves,
+            None, None, Some(scoring))?;
+        Ok((self.weights.layers.len() == self.cfg.layers).then_some(crate::shared::probe::ScoreLogits::Recorded))
+    }
+
     fn prefill_step(&self, placement: &mut GlmfPlacement, tokens: &[u32],
         on_layer: Option<&mut dyn FnMut(usize, &[u8]) -> Result<()>>,
         forced: Option<&dyn Fn(usize) -> Option<Vec<u8>>>, all_logits: bool, device: bool, media: Option<&cuteafd_engine::media::RequestMedia>)
@@ -3470,14 +3538,14 @@ impl<'a> GlmfEngine<'a> {
         }
         let waves = if on_layer.is_some() || forced.is_some() || !self.pipelined() { 1 }
             else { self.prefill_waves };
-        self.prefill_units_with(placement, tokens, all_logits, device, media, waves, on_layer, forced)
+        self.prefill_units_with(placement, tokens, all_logits, device, media, waves, on_layer, forced, None)
     }
 
     /// Compare executor widths without changing row cuts or numerical kernels.
     pub(crate) fn prefill_unit_width(&self, placement: &mut GlmfPlacement, tokens: &[u32], waves: usize)
         -> Result<Option<Vec<f32>>> {
         ensure!(waves > 0 && waves <= self.prefill_waves, "unit width exceeds admitted slots");
-        self.prefill_units_with(placement, tokens, true, false, None, waves, None, None)?
+        self.prefill_units_with(placement, tokens, true, false, None, waves, None, None, None)?
             .map(|logits| logits.into_host(self.library)).transpose()
     }
 
@@ -3503,7 +3571,8 @@ impl<'a> GlmfEngine<'a> {
     fn prefill_units_with(&self, placement: &mut GlmfPlacement, tokens: &[u32], all_logits: bool,
         device: bool, media: Option<&cuteafd_engine::media::RequestMedia>, waves: usize,
         on_layer: Option<&mut dyn FnMut(usize, &[u8]) -> Result<()>>,
-        forced: Option<&dyn Fn(usize) -> Option<Vec<u8>>>) -> Result<Option<StepLogits>> {
+        forced: Option<&dyn Fn(usize) -> Option<Vec<u8>>>,
+        scoring: Option<crate::shared::probe::ScoringRows<'_>>) -> Result<Option<StepLogits>> {
         let (start, t) = (placement.len, tokens.len());
         // Cuts preserve MLA page alignment and recurrent state order.
         let cuts = if on_layer.is_some() || forced.is_some() {
@@ -3525,7 +3594,7 @@ impl<'a> GlmfEngine<'a> {
             first += n;
         }
         let logits = self.step_units_with(&steps, if all_logits { t } else { 1 }, device, media,
-            waves, on_layer, forced)?;
+            waves, on_layer, forced, scoring)?;
         placement.len += t;
         placement.kda_len = placement.len;
         Ok(logits)
@@ -3630,6 +3699,7 @@ impl<'a> GlmfEngine<'a> {
     }
 
     /// Whether a packed prefill can run at all: one GPU and every layer resident.
+    /// TP2 needs sequence-aware context tables and peer hooks first (#1865).
     pub(crate) fn packs_prefill(&self) -> bool {
         self.peer.is_none() && self.weights.layers.len() == self.cfg.layers
     }
@@ -3742,11 +3812,12 @@ impl<'a> GlmfEngine<'a> {
         self.synchronize()
     }
 
-    pub(crate) fn production_replay_ready(&self) -> bool { self.use_graphs && self.startup_graphs }
+    /// Production replay is ready once the prewarm finished: before it every segment is eager.
+    pub(crate) fn production_replay_ready(&self) -> bool { self.use_graphs && self.graphs_warmed.get() }
 
-    /// Physical row count of an ordinary serving verify (lazy graphs use exact rows).
+    /// Physical row count of an ordinary serving verify (an eager step keeps its exact rows).
     pub(crate) fn serving_decode_rows(&self, rows: usize, spec: bool) -> usize {
-        if self.use_graphs && self.startup_graphs { self.buckets.bucket(rows, spec) } else { rows }
+        if self.use_graphs { self.buckets.bucket(rows, spec) } else { rows }
     }
 
     /// [`Self::verify`] (`spec`: [`Self::verify_spec`]) leaving every row's
@@ -3799,6 +3870,11 @@ impl<'a> GlmfEngine<'a> {
         if spec {
             // The commit that follows reads this step's records.
             self.records.recorded();
+        }
+        {
+            use crate::shared::decode_graph::device::Cycle;
+            let cycle = if spec { Cycle::Verify } else { Cycle::Decode };
+            for rank in 0..self.ranks() { self.graphs_of(rank).borrow_mut().cache_cycle(cycle); }
         }
         let graphed = self.use_graphs && !tables.eager && on_layer.is_none() && trace.is_none()
             && media.is_none_or(|m| m.spans().is_empty());
@@ -4043,7 +4119,7 @@ impl<'a> GlmfEngine<'a> {
         self.post_pre_on(1, w1, sum, 0, layer, "ffn", "post_norm", rows, cap)?;
         let out = self.peer_ffn_out(index, w1, layer)?;
         // Startup bucket graphs exclude both ranks' real-row shared FFNs and their peer publication.
-        if !layer.dense && self.startup_graphs && self.capturing.get() { return Ok(()); }
+        if !layer.dense && self.capturing.get() { return Ok(()); }
         // A dense MLP rank 0 runs whole leaves rank 1's zero rows as its partial.
         match (layer.dense, layer.has("w_gate_up_fp8") || core::native_ffn(layer) || native::dense_ffn(layer)) {
             (true, false) => {}
@@ -4073,7 +4149,8 @@ impl<'a> GlmfEngine<'a> {
     /// layer's FFN exchange and this layer's attention-site collapse (layer 0: rank 0's
     /// streams), its attention half and FFN half.
     fn peer_segment(&self, index: usize, w1: &Workspace<'_>, t: usize, tables: &StepTables) -> Result<()> {
-        let key = GraphKey::new(index, t, tables);
+        let key = GraphKey::new(index, t, tables)
+            .normalized(self.weights.layers.get(index).map(|layer| layer.attention));
         self.replay_on(1, key, || {
             if let Some(previous) = index.checked_sub(1) {
                 self.peer_post(previous, 0, w1, t, decode_cap(t))?;
@@ -4081,7 +4158,7 @@ impl<'a> GlmfEngine<'a> {
             self.peer_attention(index, 0, w1, t, decode_cap(t), tables)
         })?;
         let layer = &self.peer()?.layers[index];
-        if self.startup_graphs && !layer.dense && !self.tp2_layer(index) {
+        if !layer.dense && !self.tp2_layer(index) {
             let out = self.peer_ffn_out(index, w1, layer)?;
             if self.warming_graphs.get() {
                 self.on(1, || unsafe {
@@ -4111,9 +4188,15 @@ impl<'a> GlmfEngine<'a> {
     fn decode_primitive(&self, tables: &StepTables, tokens: &[u32], logit_rows: usize,
         on_layer: Option<&mut dyn FnMut(usize, &[u8]) -> Result<()>>,
         trace: Option<&std::path::Path>, media: Option<&cuteafd_engine::media::RequestMedia>) -> Result<Option<DeviceLogits>> {
-        crate::shared::experts::rtx::pair::submit_scoped(
-            || self.require_live(), || self.shutdown_submission(),
-            |scope| self.decode_primitive_inner(scope, tables, tokens, logit_rows, on_layer, trace, media))
+        crate::shared::experts::rtx::pair::submit_recoverable(
+            || self.require_live(), |kind| self.cancel_submission(kind), || self.shutdown_submission(),
+            |scope| {
+                let result = self.decode_primitive_inner(scope, tables, tokens, logit_rows, on_layer, trace, media)?;
+                // Every rank's launches are queued now: this completed step is the
+                // measurement boundary for a capture queued inside it.
+                self.observe_graphs_completed()?;
+                Ok(result)
+            })
     }
 
     fn decode_primitive_inner(&self, scope: &crate::shared::experts::rtx::pair::SubmissionScope<'_>,
@@ -4296,7 +4379,6 @@ impl<'a> GlmfEngine<'a> {
     #[allow(clippy::too_many_arguments)]
     fn decode_graphed(&self, w: &Workspace<'_>, w1: Option<&Workspace<'_>>, tables: &StepTables, tables1: &StepTables,
         t: usize, rows: Scalar, logit_rows: usize) -> Result<Option<DeviceLogits>> {
-        self.release_retired_graphs()?;
         let layers = &self.weights.layers;
         // Every layer resident: the last segment ends in the head and the greedy selection.
         let head = layers.len() == self.cfg.layers && logit_rows == t;
@@ -4305,8 +4387,9 @@ impl<'a> GlmfEngine<'a> {
         // graph key, so one capacity per captured segment).
         let cap = decode_cap(t);
         for index in 0..=layers.len() {
-            let key = GraphKey::new(index, t, tables);
-            self.replay(key, || -> Result<()> {
+            let key = GraphKey::new(index, t, tables)
+            .normalized(self.weights.layers.get(index).map(|layer| layer.attention));
+            let segment = || -> Result<()> {
                 // Layer `index - 1`'s output streams land in buffer 0 first thing.
                 let tap = || match (&self.drafter, index.checked_sub(1)) {
                     (Some(drafter), Some(previous)) => drafter.tap_streams(previous, w.streams[0].buffer.ptr, HC, 0, t),
@@ -4348,13 +4431,12 @@ impl<'a> GlmfEngine<'a> {
                 self.post_pre_on(0, w, attended, 0, layer, "ffn", "post_norm", rows, cap)?;
                 if layer.dense {
                     self.ffn(w, layer, self.cfg.dense_intermediate, cap, w.delta.buffer.ptr, rows)
-                } else if self.startup_graphs {
+                } else {
                     // Real width is runtime data, not part of a bucket graph key.
                     Ok(())
-                } else {
-                    self.moe_front(w, index, layer, t, rows, cap, &[Span { first: 0, rows: t }])
                 }
-            })?;
+            };
+            if index == layers.len() && !head { segment()?; } else { self.replay(key, segment)?; }
             // Outside capture: every replay queues its matching peer landing.
             if index == layers.len() {
                 if let Some(w1) = w1 { self.replicate_terminal(w, w1, 0, t)?; }
@@ -4385,7 +4467,7 @@ impl<'a> GlmfEngine<'a> {
                             self.library.cuda_zero_bytes_async(buffer, t * self.cfg.hidden * 2, self.stream_of(1))
                         })?;
                     }
-                } else if self.startup_graphs {
+                } else {
                     // A padded step's real rows run the router, the expert wire and the shared expert
                     // at the step's capacity (a bucket past 64 rows holds more than 64 real rows); the
                     // padding tail of the decode workspace's `delta` is cleared after the expert work.
@@ -4413,10 +4495,6 @@ impl<'a> GlmfEngine<'a> {
                             Ok(())
                         }
                     })?;
-                } else {
-                    // The router ran inside this layer's segment: its ids are still in place.
-                    self.probe_ring(index, w, t)?;
-                    self.moe_experts(w, index, &layers[index], t, rows, cap, true, w1)?;
                 }
             }
             if self.tp2_layer(index) {
@@ -4446,8 +4524,9 @@ impl<'a> GlmfEngine<'a> {
 
     /// The vocabulary projection of the last `logit_rows` normalized rows into
     /// `w.logits` through the one resident head: BF16 (the shared target-head route: tensor
-    /// cores at every row count, or `--target-head exact`'s pedantic GEMM), or the FP8 head
-    /// (--fp8-head) in 16-row spans for every row count.
+    /// cores at every row count, or `--target-head exact`'s pedantic GEMM), the FP8 head
+    /// (--fp8-head) in 16-row spans for every row count, or the packed head's exact GEMV
+    /// (--fp8-head packed) in the workspace's head workspace, which no cuBLAS route then uses.
     fn logits(&self, w: &Workspace<'_>, t: usize, logit_rows: usize, _decode: bool) -> Result<()> {
         ensure!(logit_rows <= t && t <= w.rows, "head input exceeds admitted rows");
         ensure!(logit_rows <= units::logits_capacity(w.logits.buffer.bytes, self.cfg.vocab_size)?,
@@ -4465,11 +4544,18 @@ impl<'a> GlmfEngine<'a> {
                 // SAFETY: normalized rows and output logits are live on the owner's stream.
                 unsafe { owner.head_logits(x, w.logits.buffer.ptr.cast(), logit_rows, self.stream) }
             },
-            GlmfHead::Fp8 { .. } => self.timed("glmf_head_fp8", || {
+            GlmfHead::Fp8 { .. } | GlmfHead::BlockFp8 { .. } => self.timed("glmf_head_fp8", || {
                 // SAFETY: `x` holds `logit_rows` normalized rows and `w.logits` their
                 // FP32 logits (the workspace's logit capacity); the engine stream orders them.
                 unsafe { self.weights.head.launch_fp8(self.programs, x, w.logits.buffer.ptr.cast(), logit_rows, h,
                     self.cfg.vocab_size, self.stream) }
+            }),
+            GlmfHead::Packed { .. } => self.timed("glmf_head_packed", || {
+                // SAFETY: `x` holds `logit_rows` normalized rows, `w.logits` their FP32 logits and the
+                // lead workspace's head workspace the GEMV's scratch (checked at pack time and by the
+                // native launch); the engine stream orders them.
+                unsafe { self.weights.head.launch_packed(self.library, x, w.logits.buffer.ptr.cast(), logit_rows,
+                    false, Some(w.head_workspace.buffer), self.stream) }
             }),
             // SAFETY: the head's input and operands are live buffers of these shapes.
             GlmfHead::Bf16(head) => unsafe {
@@ -4491,82 +4577,101 @@ impl<'a> GlmfEngine<'a> {
                 // SAFETY: the drafter supplies live normalized rows/output on the target device.
                 unsafe { owner.head_logits(x, logits, rows, stream) }
             })),
-            fp8 @ GlmfHead::Fp8 { .. } => TargetHead::Launch(Box::new(move |x, logits, rows, stream| {
+            fp8 @ (GlmfHead::Fp8 { .. } | GlmfHead::BlockFp8 { .. }) => TargetHead::Launch(Box::new(move |x, logits, rows, stream| {
                 // SAFETY: the drafter passes its live normalized rows and logits
                 // workspace for `rows` rows, on the stream it launches the head on.
                 unsafe { fp8.launch_fp8(self.programs, x, logits, rows, self.cfg.hidden, self.cfg.vocab_size, stream) }
+            })),
+            // Drafts read the coarse plane (as V4.1's dSpark drafter does) in the scratch the drafter
+            // bound ([`GlmfHead::bind_draft`]); the target verifies every proposal exactly.
+            packed @ GlmfHead::Packed { .. } => TargetHead::Launch(Box::new(move |x, logits, rows, stream| {
+                // SAFETY: the drafter passes its live normalized rows and logits workspace for `rows`
+                // rows, on the stream it launches the head on; the bound scratch lives with the head.
+                unsafe { packed.launch_packed(self.library, x, logits, rows, true, None, stream) }
             })),
         }
     }
 
     /// Launches `segment` through a graph captured the first time `key` is seen.
-    fn replay(&self, key: GraphKey, segment: impl FnOnce() -> Result<()>) -> Result<()> {
+    fn replay(&self, key: GraphKey, segment: impl Fn() -> Result<()>) -> Result<()> {
         self.replay_on(0, key, segment)
     }
 
-    /// [`Self::replay`] on rank `rank`'s stream (its own graphs). A capture measures its
-    /// executable's device bytes (free memory before the capture and after its instantiation);
-    /// executables evicted past the graph budget retire until the next decode step.
-    fn replay_on(&self, rank: usize, key: GraphKey, segment: impl FnOnce() -> Result<()>) -> Result<()> {
+    /// [`Self::replay`] on rank `rank`'s stream (its own graphs): a hit launches the captured
+    /// segment, a miss captures it (or runs it eagerly where capture is unavailable), and every
+    /// failed capture cancels its ticket. A capture's cost is measured at the completed step
+    /// boundary (`observe_graphs_completed`), never by a sync inside a segment.
+    fn replay_on(&self, rank: usize, key: GraphKey, segment: impl Fn() -> Result<()>) -> Result<()> {
         self.require_live()?;
         let graphs = self.graphs_of(rank);
         let stream = self.stream_of(rank);
-        let cached = graphs.borrow_mut().launch(&key).map(|graph| graph.raw);
-        if let Some(exec) = cached {
+        if let Some(graph) = graphs.borrow_mut().cached_launch(&key) {
             // SAFETY: the graph's pointers are persistent engine buffers of that rank.
-            return self.on(rank, || unsafe { self.library.cuda_graph_launch(exec, stream) });
+            return self.on(rank, || unsafe { self.library.cuda_graph_launch(graph.raw, stream) });
         }
-        ensure!(self.tp2.is_none() || self.warming_graphs.get(),
-            "GLM Flash TP2 unseen post-ready graph key: rank {rank}, {key:?}");
-        let geometry = GraphGeometry { pool_width: key.pool_width, page_stride: key.page_stride,
-            pool_stride: key.pool_stride, long: key.long };
-        // Lazily captured graphs (a graph budget) capture unseen shapes by design.
-        if !self.warming_graphs.get() && self.startup_graphs
-            && self.logged_graph_shapes.borrow_mut().insert((rank, key.rows, key.spec, geometry)) {
-            tracing::warn!(rank, rows = key.rows, spec = key.spec, long = key.long, pool_width = key.pool_width,
-                page_stride = key.page_stride, pool_stride = key.pool_stride, "GLM Flash unseen serving graph geometry");
+        // Before the prewarm, and through its eager pass, every segment runs eagerly.
+        if self.prewarming_graphs.get()
+            || (!self.graphs_warmed.get() && !self.warming_graphs.get()) {
+            return self.eager_segment(segment);
         }
-        let calibrating = graphs.borrow().calibrating();
-        let free = || self.on(rank, || self.library.cuda_memory_info().map(|(free, _)| free));
-        let before = if calibrating { Some(free()?) } else { None };
-        // SAFETY: capture records this stream's launches; nothing in a segment
-        // synchronizes the host or allocates.
-        self.on(rank, || unsafe { self.library.cuda_graph_begin_capture(stream) })?;
-        self.capturing.set(true);
+        let pinned = self.graph_pinned(&key);
+        let crate::shared::decode_graph::device::Miss::Capture(ticket) =
+            graphs.borrow_mut().cache_miss(&key, pinned, None) else {
+            return self.eager_segment(segment);
+        };
+        // No synchronization here: peer segments may not yet have been queued.
+        // SAFETY: capture records launches on this rank's persistent stream.
+        if let Err(error) = self.on(rank, || unsafe { self.library.cuda_graph_begin_capture(stream) }) {
+            if graphs.borrow_mut().cache_capture_failed(ticket, &error) {
+                tracing::warn!(%error, "graph capture unavailable; running eagerly");
+            }
+            return self.eager_segment(segment);
+        }
         let captured = segment();
-        self.capturing.set(false);
-        // SAFETY: ends the capture begun above on the same stream.
-        let exec = self.on(rank, || unsafe { self.library.cuda_graph_end_capture(stream) });
-        captured?;
-        // SAFETY: persistent engine storage is drained before bank destruction.
-        let exec = unsafe { GraphOwner::new(self.library, if rank == 1 { self.peer()?.device } else { self.device }, exec?, ())? };
-        let measured = match before {
-            Some(before) => Some(before.saturating_sub(free()?) as u64),
-            None => None,
+        let exec = self.on(rank, || unsafe { self.library.cuda_graph_end_capture_topology(stream) });
+        if let Err(error) = captured {
+            graphs.borrow_mut().cache_capture_failed(ticket, exec.as_ref().err().unwrap_or(&error));
+            if let Ok((raw, _, _, _, _)) = exec {
+                // SAFETY: the capture failed; this executable owns no live launch.
+                let _ = self.on(rank, || unsafe { self.library.cuda_graph_exec_destroy(raw) });
+            }
+            return Err(error);
+        }
+        let (raw, nodes, width, spans_devices, inspection_error) = match exec {
+            Ok(info) => info,
+            Err(error) => {
+                if graphs.borrow_mut().cache_capture_failed(ticket, &error) {
+                    tracing::warn!(%error, "graph instantiation unavailable; running eagerly");
+                }
+                return self.eager_segment(segment);
+            }
         };
-        // SAFETY: the new graph reads and writes persistent engine buffers.
-        self.on(rank, || unsafe { self.library.cuda_graph_launch(exec.raw, stream) })?;
-        let (recaptured, evicted, held, stats) = {
-            let mut graphs = graphs.borrow_mut();
-            let recaptured = graphs.seen(&key);
-            let retired = graphs.retired_len();
-            graphs.insert(key, exec, measured);
-            (recaptured, graphs.retired_len() - retired, graphs.bytes(), graphs.stats())
-        };
-        if recaptured {
-            tracing::debug!(rank, ?key, recaptures = stats.recaptures, "decode graph recaptured");
+        if let Some(error) = inspection_error {
+            static WARNED: std::sync::Once = std::sync::Once::new();
+            WARNED.call_once(|| tracing::warn!(site = "glm5_flash.decode", %error,
+                "graph topology unknown; retaining executable without chain reuse"));
         }
-        if calibrating && !graphs.borrow().calibrating() {
-            tracing::info!(rank, executables = stats.captures, each_bytes = graphs.borrow().each(),
-                budget = ?graphs.borrow().budget(), "decode graph size calibrated at the first eviction");
-        }
-        if evicted > 0 {
-            tracing::info!(rank, evicted, held = graphs.borrow().len(), held_bytes = held,
-                budget = ?graphs.borrow().budget(),
-                captures = stats.captures, recaptures = stats.recaptures, evictions = stats.evictions,
-                "decode graphs past the budget retire");
-        }
+        let device = if rank == 1 { self.peer()?.device } else { self.device };
+        // SAFETY: persistent engine storage outlives the executable, which teardown drains first.
+        let graph = unsafe { GraphOwner::new(self.library, device, raw, ())? };
+        crate::shared::decode_graph::census::capture_key("glm5_flash", "decode",
+            graphs.as_ptr() as usize, rank as i32, Some(0), &key, graph.raw);
+        graphs.borrow_mut().cache_topology(ticket, nodes as u64, width, spans_devices);
+        // Own the executable and ticket before launch: a launch error is drained by the
+        // submission guard before either its pointers or owner can retire.
+        graphs.borrow_mut().cache_insert(key, graph, ticket, pinned);
+        let bank = graphs.borrow();
+        let graph = bank.get(&key).context("inserted graph")?;
+        self.on(rank, || unsafe { self.library.cuda_graph_launch(graph.raw, stream) })?;
         Ok(())
+    }
+
+    /// `segment` eagerly, with the masked/shared-FFN boundary a capture would bake in.
+    fn eager_segment(&self, segment: impl FnOnce() -> Result<()>) -> Result<()> {
+        self.capturing.set(true);
+        let result = segment();
+        self.capturing.set(false);
+        result
     }
 
     fn graphs_of(&self, rank: usize) -> &RefCell<GraphBank<GraphKey, GraphExec<'a>>> {
@@ -4576,42 +4681,13 @@ impl<'a> GlmfEngine<'a> {
         }
     }
 
-    /// Destroys retired decode graphs once every rank's stream has drained (none of them can be
-    /// in flight). Called between decode steps: a sync inside one could wait on a peer push the
-    /// host has not queued yet.
-    fn release_retired_graphs(&self) -> Result<()> {
-        if (0..self.ranks()).all(|rank| self.graphs_of(rank).borrow().retired_len() == 0) {
-            return Ok(());
-        }
-        self.synchronize()?;
-        for rank in 0..self.ranks() {
-            let retired = self.graphs_of(rank).borrow_mut().drain_retired(|| Ok(()))?;
-            self.on(rank, || { drop(retired); Ok(()) })?;
-        }
-        Ok(())
-    }
-
-    /// The decode graph budget of every rank (None: unbounded).
-    pub(crate) fn set_graph_budget(&self, budget: Option<u64>) {
-        for rank in 0..self.ranks() {
-            self.graphs_of(rank).borrow_mut().set_budget(budget);
-        }
-    }
-
-    /// Decode graph captures, recaptures and evictions, and the measured bytes held (every rank).
+    /// Decode graph cache occupancy: executables held, their step shapes and charged bytes.
     pub(crate) fn graph_stats(&self) -> GraphCounts {
         (0..self.ranks()).fold(GraphCounts::default(), |total, rank| {
             let graphs = self.graphs_of(rank).borrow();
-            let stats = graphs.stats();
-            GraphCounts {
-                stats: GraphStats { captures: total.stats.captures + stats.captures,
-                    recaptures: total.stats.recaptures + stats.recaptures,
-                    evictions: total.stats.evictions + stats.evictions,
-                    eager_runs: total.stats.eager_runs + stats.eager_runs },
-                held: total.held + graphs.len(),
+            GraphCounts { held: total.held + graphs.len(),
                 shapes: total.shapes + graphs.count(|key| key.segment == 0),
-                bytes: total.bytes + graphs.bytes(),
-            }
+                bytes: total.bytes + graphs.bytes() }
         })
     }
 
@@ -4713,7 +4789,7 @@ impl<'a> GlmfEngine<'a> {
         let out_bytes = if self.precise_attention(layer) { 4 } else { 2 };
         let rows_at = [row_at(&w.x, first, h * 2), row_at(&w.kda_slots, first, 4), row_at(&w.seq_first, first, 4),
             w.delta.buffer.ptr.wrapping_byte_add(first * h * out_bytes)];
-        if layer.core.contains_key("self_attn.q_proj") {
+        if core::stage_attention(layer) {
             ensure!(self.kda_state == KdaState::F32, "native Flash K6 requires the F32 KDA stage package");
             return self.core_kda(rank, w, layer, rows, first, cap, spec, [conv_state, state, replay]);
         }
@@ -4870,7 +4946,7 @@ impl<'a> GlmfEngine<'a> {
         decode: bool, cache: cuteafd_ffi::CuteafdDeviceBuffer) -> Result<()> {
         if native::is_native(layer) { return self.native_mla_producer(rank, w, layer, rows, cap, cache); }
         let cache = cache.ptr;
-        if layer.core.contains_key("self_attn.q_a_proj") {
+        if core::stage_attention(layer) {
             return self.core_mla_producer(rank, w, layer, rows, cap, cache);
         }
         // FP8-only weights: decode rows up to `fp8_rows` on the GEMV; prefill W8A8 or W8A16.
@@ -4940,7 +5016,7 @@ impl<'a> GlmfEngine<'a> {
     fn mla_output(&self, rank: usize, w: &Workspace<'_>, layer: &GlmfLayer<'_>, cap: &str, rows: Scalar, decode: bool)
         -> Result<()> {
         if native::is_native(layer) { return self.native_mla_output(rank, w, layer, rows, cap); }
-        if layer.core.contains_key("self_attn.o_proj") {
+        if core::stage_attention(layer) {
             return self.core_mla_output(rank, w, layer, rows, cap);
         }
         let fp8 = decode || self.fp8_prefill.mla;
@@ -4972,7 +5048,7 @@ impl<'a> GlmfEngine<'a> {
         if let Some(dir) = trace {
             let qkv_width = self.cfg.q_lora_rank + self.cfg.kv_lora_rank;
             let q_width = heads * self.cfg.qk_nope_dim;
-            let native = layer.core.contains_key("self_attn.q_a_proj");
+            let native = core::stage_attention(layer);
             if native {
                 let slot = w.core.as_ref().context("native MLA trace without stage buffers")?;
                 // q_a has been normalized into q_resid; its stage now contains q_b.
@@ -5069,7 +5145,7 @@ impl<'a> GlmfEngine<'a> {
         }
         self.mla_output(rank, w, layer, cap, rows, decode)?;
         if let Some(dir) = trace {
-            let values = if layer.core.contains_key("self_attn.o_proj") {
+            let values = if core::stage_attention(layer) {
                 w.core.as_ref().context("native MLA trace without stage buffers")?.stage("values")?
             } else { w.scratch.buffer };
             std::fs::write(dir.join("mla_values.bin"), self.download_buffer(values,
@@ -5377,17 +5453,18 @@ impl<'a> GlmfEngine<'a> {
     /// Execute one continuous span with retained per-unit slots.
     fn step_units(&self, units: &[(StepTables, &[u32])], logit_rows: usize, device: bool,
         media: Option<&cuteafd_engine::media::RequestMedia>) -> Result<Option<StepLogits>> {
-        self.step_units_with(units, logit_rows, device, media, self.prefill_waves, None, None)
+        self.step_units_with(units, logit_rows, device, media, self.prefill_waves, None, None, None)
     }
 
     fn step_units_with(&self, units: &[(StepTables, &[u32])], logit_rows: usize, device: bool,
         media: Option<&cuteafd_engine::media::RequestMedia>, waves: usize,
         on_layer: Option<&mut dyn FnMut(usize, &[u8]) -> Result<()>>,
-        forced: Option<&dyn Fn(usize) -> Option<Vec<u8>>>) -> Result<Option<StepLogits>> {
-        crate::shared::experts::rtx::pair::submit_scoped(
-            || self.require_live(), || self.shutdown_submission(),
+        forced: Option<&dyn Fn(usize) -> Option<Vec<u8>>>,
+        scoring: Option<crate::shared::probe::ScoringRows<'_>>) -> Result<Option<StepLogits>> {
+        crate::shared::experts::rtx::pair::submit_recoverable(
+            || self.require_live(), |kind| self.cancel_submission(kind), || self.shutdown_submission(),
             |scope| self.step_units_inner(scope, units, logit_rows, device, media,
-                waves, on_layer, forced))
+                waves, on_layer, forced, scoring))
     }
 }
 
@@ -5584,8 +5661,8 @@ mod tp2_tests {
             std::fs::write(std::env::var("CUTEAFD_GLMF_FATAL_RANK_EVIDENCE")?,
                 fixture.directory().join("events").to_str().context("fixture evidence path")?)?;
             let library = fixture.load()?;
-            let storage = [Allocation::new(Device { library: &library, id: 0 }, 256)?,
-                Allocation::new(Device { library: &library, id: 1 }, 256)?];
+            let storage = [Allocation::new(Device { library: &library, id: 0 }, 256, crate::shared::memory::TEST)?,
+                Allocation::new(Device { library: &library, id: 1 }, 256, crate::shared::memory::TEST)?];
             fixture.configure_pack(&library, 0, 1)?;
             fixture.configure_drain_after(&library, after.parse()?)?;
             let result = drain_ranks(2, |rank| Device { library: &library, id: rank as i32 }.run(|| {
@@ -5619,8 +5696,8 @@ mod tp2_tests {
         use crate::shared::memory::device::{Allocation, Device};
         let fixture = Fixture::build()?;
         let library = fixture.load()?;
-        let storage = [Allocation::new(Device { library: &library, id: 0 }, 256)?,
-            Allocation::new(Device { library: &library, id: 1 }, 256)?];
+        let storage = [Allocation::new(Device { library: &library, id: 0 }, 256, crate::shared::memory::TEST)?,
+            Allocation::new(Device { library: &library, id: 1 }, 256, crate::shared::memory::TEST)?];
         fixture.configure_pack(&library, 0, 0)?;
         library.cuda_set_device(1)?;
         crate::shared::decode_graph::fatal_drain(drain_ranks(2, |rank|
@@ -5733,7 +5810,10 @@ mod prefill_lane_tests {
             // Fork #189 adds route metadata only; launch keys, arithmetic and thresholds stay unchanged.
             // Fork c81a39a2/0b9292f1 add a separate prefill-router exporter; decode projection
             // dispatch, shapes, arithmetic and capacity thresholds are unchanged.
-            ("integration/cuteafd/glmf.py", 0x9384fb38251982be_u64),
+            // Fork #269 makes Kimi BF16 wide prefill opt-in; GLM leaves bf16_wide off
+            // and bf16_wide_min_rows None, preserving its routes. The pin-bump CHANGES
+            // receipt changes only kimik3_* / draft_bf16_*: all GLM objects are identical.
+            ("integration/cuteafd/glmf.py", 0xe9850fac36cb38d5_u64),
             // b729115b uses canonical BF16 MMA at every positive row count.
             // Hugh Madden fork #30 (TMA fences before consumer_release): fence-only change.
             // Fork #136 adds only an optional weight TMA cache policy; MMA and K order are unchanged.
@@ -5742,7 +5822,10 @@ mod prefill_lane_tests {
             // True); projection routes and thresholds untouched. SM188/170 vs the master-pinned
             // baseline: glm, glm2, glmf, glm-stage programs byte-identical including SASS.
             // Re-audit shared with Mistral commit a14370e52.
-            ("integration/cuteafd/_glm_kernels.py", 0x481c_c910_48bc_d648),
+            // Fork #269 forwards optional wide_min_rows, default None; GLM retains
+            // its existing wide floor and byte-identical exported objects.
+            // Fork #278 adds an opt-in UE8M0 index-scale route for K3.1; the default FP32 route and GLM/GLM Flash exports are unchanged (678/678 objects identical).
+            ("integration/cuteafd/_glm_kernels.py", 0x2087_8fca_2f4a_b67c),
             // Fork #146 adds `fp8_gemv_tuning`/`fp8_gemv_wide`/`fp8_gemv_wide_kernel` and the
             // `NcMmaFp8Gemv` load path. Selected shapes keep the shipped `warps`; every change is a
             // grid partition (groups, cta_tiles). The (5120, 17408) wide tile's `nc` load path
@@ -5751,7 +5834,18 @@ mod prefill_lane_tests {
             // Fork #150 keys the tables by the warps each cell was measured at and applies an
             // entry only when it matches the caller's warps, restoring callers #146 moved.
             // Fork #189 adds route metadata only; launch keys, arithmetic and thresholds stay unchanged.
-            ("integration/cuteafd/_fp8_weights.py", 0x43a74e768ef10f78_u64),
+            // Fork #249 keeps TP2 q_b's four-way K split, narrows its thin column grid,
+            // and preserves the wide tile. #250 selects bitwise-equal direct E4M3 widening
+            // only for M16 outputs and a 2x2 TP2 q_b grid only at M64: the same MMAs,
+            // K/fold order and FP32 accumulation; routes and capacity thresholds stay fixed.
+            // Fork #252 selects NcMmaFp8Gemv for full HQA q_b (2 warps, 1 group,
+            // 4 tiles) and o (4 warps, 2 groups, 2 tiles) at M17..64; TP2 o keeps
+            // the base kernel. Shipped K splits, thresholds and row-scale routes stay fixed.
+            ("integration/cuteafd/_fp8_weights.py", 0xcc76ce5ed134d682_u64),
+            // The #252 NC rewrite preserves scaled BF16 operands, per-warp K/MMA order,
+            // FP32 accumulation and ascending-warp fold. It changes load/prefetch scheduling,
+            // grid order and vectorized fold/store pairs, not per-output arithmetic.
+            ("integration/cuteafd/_fp8_gemv_nc.py", 0x0fab72d50aa7cf81_u64),
             // 5dcdd837 opts decode mHC into partial-group fusion; projection thresholds and arithmetic stay unchanged.
             ("integration/cuteafd/dsv4_mhc.py", 0x978a_179d_ef8c_2101),
             // KDAGeometry import/export and signed-byte operand registration only;
@@ -5778,7 +5872,15 @@ mod prefill_lane_tests {
             // glmf/glmf2 SM188/170 exports remain byte-identical (88/88 objects and SASS).
             // Router-only row tiles do not change RoutedBf16Projection or its default kernels.
             // Fork #189 adds route metadata only; launch keys, arithmetic and thresholds stay unchanged.
-            ("gemm/bf16_gemv/_skinny.py", 0xf2bb7e72f51a9d1b_u64),
+            // Fork #257/#258 add ordered-K16 native HQA tiles at non-Flash shapes;
+            // no existing Flash tile, threshold or accumulation order changes.
+            // Fork #269 adds Kimi-only decode bands and optional tile_k; existing
+            // entries retain tile_k=64. Optional wide_min_rows defaults to the old
+            // WIDE_PREFILL_MIN_ROWS, preserving GLM keys, floors and exported objects.
+            // Fork #287 selects a three-stage wide-prefill tile only for (6144, 7168)
+            // and includes that override in its key. Decode routes, floors and tables
+            // are unchanged; GLM Flash's projection shapes do not select the override.
+            ("gemm/bf16_gemv/_skinny.py", 0x9e8c_5d70_3fea_8d81_u64),
         ] {
             let bytes = std::fs::read(root.join(path)).unwrap();
             let hash = bytes.iter().fold(0xcbf2_9ce4_8422_2325_u64,
@@ -5825,122 +5927,8 @@ mod prefill_lane_tests {
         assert_eq!(super::partial_exchange_reserve(2, 4096, 4096, 4), 268_435_456);
         assert_eq!(super::partial_exchange_reserve(2, 4096, 4096, 2), 0);
         assert_eq!(super::partial_exchange_reserve(4, 2048, 4096, 4), super::partial_exchange_reserve(2, 4096, 4096, 4));
-        // Whole workspaces kept a serial one beside the lanes (1 + lanes past one lane); shared lanes
-        // run a serial prefill in lane 0, so scoring's union is the configured lanes' (with all-row
-        // logits in their temporaries: `step_workspaces_reproduce_...`), one allowance per workspace.
-        for lanes in 1..=MAX_PREFILL_WAVES {
-            for drafter in [false, true] {
-                assert_eq!(super::workspace_reserve_bytes(10_000, lanes, drafter),
-                    10_000 + super::WORKSPACE_RUNTIME_OVERHEAD_BYTES * (2 + usize::from(drafter)) as u64);
-            }
-        }
+
     }
-
-    /// The startup set's fallback, against an admission modelled on a 5090 at 131,072 tokens and 16
-    /// sequences: 49,408 tokens of 11,804 B fit beside the planner's 1.5 GiB graph allowance, and the
-    /// startup set needs 3,388,063,576 B more (28,060 graphs).
-    #[test]
-    fn startup_graphs_fall_back_to_lazy_capture_only_on_a_real_shortfall() {
-        use super::{admit_beside_decode_graphs, StartupGraphReserve};
-        use crate::shared::memory_report::NoKvRoom;
-        let allowance = 1_610_612_736;
-        let startup = Some(StartupGraphReserve { reserve: allowance + 3_388_063_576, allowance });
-        // Whole 256-token units of 11,804 B in the room past the fixed costs and `extra`.
-        let modelled = |room: u64| move |extra: u64| -> anyhow::Result<usize> {
-            let tokens = room.saturating_sub(extra) / 11_804 / 256 * 256;
-            anyhow::ensure!(tokens >= 256, NoKvRoom { free_after_reserve: vec![room as i64 - extra as i64] });
-            Ok(tokens as usize)
-        };
-        let calls = std::cell::RefCell::new(Vec::new());
-        // A planned admission: the startup set's bytes above the allowance, nothing for lazy capture.
-        let counted = |room: u64| { let admit = modelled(room); let calls = &calls;
-            move |graphs: Option<u64>| { calls.borrow_mut().push(graphs);
-                admit(graphs.map_or(0, |bytes| bytes.saturating_sub(allowance))) } };
-        let set = Some(allowance + 3_388_063_576);
-        // Fits: startup capture, one admission keeping the startup set.
-        let (tokens, at_startup) = admit_beside_decode_graphs(startup, counted(8_000_000_000)).unwrap();
-        assert!(at_startup && tokens == 390_656);
-        assert_eq!(calls.take(), [set]);
-        // A real shortfall: no room beside the startup set, 49,408 tokens with lazily captured graphs.
-        let (tokens, at_startup) = admit_beside_decode_graphs(startup, counted(49_408 * 11_804)).unwrap();
-        assert!(!at_startup && tokens == 49_408);
-        assert_eq!(calls.take(), [set, None]);
-        // No room either way: the startup admission's refusal stands.
-        let error = admit_beside_decode_graphs(startup, counted(1_000)).unwrap_err();
-        assert!(error.to_string().contains(&format!("{}", 1_000 - 3_388_063_576_i64)), "{error}");
-        assert_eq!(calls.take(), [set, None]);
-        // Any other refusal is not a shortfall: no retry.
-        let failing = |_: Option<u64>| -> anyhow::Result<usize> { anyhow::bail!("CUDA error 2") };
-        assert!(admit_beside_decode_graphs(startup, failing).unwrap_err().to_string().contains("CUDA error"));
-        // A startup set within the allowance adds nothing to retry without; startup capture off runs lazily.
-        let within = Some(StartupGraphReserve { reserve: allowance, allowance });
-        assert!(admit_beside_decode_graphs(within, counted(1_000)).is_err());
-        assert_eq!(calls.take(), [Some(allowance)]);
-        assert_eq!(admit_beside_decode_graphs(None, counted(49_408 * 11_804)).unwrap(), (49_408, false));
-        assert_eq!(calls.take(), [None]);
-    }
-
-    /// The lazy retry after each refusal for want of memory: a pool falls back to lazy capture; a retry
-    /// short of memory too (either kind) keeps the startup refusal; a retry that fails for another
-    /// reason returns its own error, with the startup refusal as context. Same startup set as above.
-    #[test]
-    fn the_lazy_retry_keeps_the_startup_refusal_only_when_it_is_short_too() {
-        use super::{admit_beside_decode_graphs, StartupGraphReserve};
-        use crate::shared::memory_report::{kv_shortfall, NoKvRoom};
-        use cuteafd_core::serving_capacity::CapacityError;
-        // The modelled launch above (49,408 tokens of 11,804 B fit beside the allowance alone).
-        fn no_room() -> anyhow::Error {
-            NoKvRoom { free_after_reserve: vec![583_212_032 - 3_388_063_576] }.into()
-        }
-        // An automatic pool's one-unit check (`GpuMemoryBudget::admit`), as a 5090 refused it at 131,072
-        // tokens and 16 sequences with host embedding; the retry then admitted 91,904 tokens.
-        fn over_budget() -> anyhow::Error {
-            CapacityError::GpuBudgetExceeded { device: 0, required: 36_016_220_192, budget: 33_711_521_792,
-                shortfall: 2_304_698_400 }.into()
-        }
-        // The retry's refreshed memory sample or checkpoint read failing: none is a shortfall.
-        let others: [fn() -> anyhow::Error; 4] = [
-            || CapacityError::Invalid("invalid GPU budget or physical memory sample").into(),
-            || CapacityError::Overflow("GPU allocation budget").into(),
-            || anyhow::anyhow!("cuteafd_cuda_memory_info returned status 1: unspecified launch failure"),
-            || anyhow::Error::from(std::io::Error::from(std::io::ErrorKind::NotFound)).context("opening config.json"),
-        ];
-        let allowance = 1_610_612_736;
-        let startup = Some(StartupGraphReserve { reserve: allowance + 3_388_063_576, allowance });
-        let calls = std::cell::RefCell::new(Vec::new());
-        // The admission keeping the startup set is refused with `first`; the retry answers `retry`.
-        let scripted = |first: anyhow::Error, retry: anyhow::Result<usize>| {
-            let mut answers = vec![retry, Err(first)];
-            let calls = &calls;
-            move |graphs: Option<u64>| { calls.borrow_mut().push(graphs); answers.pop().expect("at most two admissions") }
-        };
-        let both = [Some(allowance + 3_388_063_576), None];
-        let chain = |error: &anyhow::Error| error.chain().map(|cause| cause.to_string()).collect::<Vec<_>>();
-        let refusals: [(fn() -> anyhow::Error, usize); 2] = [(no_room, 49_408), (over_budget, 91_904)];
-        for (refusal, pool) in refusals {
-            // A pool with lazily captured graphs: lazy capture.
-            let admitted = admit_beside_decode_graphs(startup, scripted(refusal(), Ok(pool))).unwrap();
-            assert_eq!(admitted, (pool, false));
-            assert_eq!(calls.take(), both);
-            // Short either way: the startup refusal, unchanged.
-            for (short, _) in refusals {
-                let error = admit_beside_decode_graphs(startup, scripted(refusal(), Err(short()))).unwrap_err();
-                assert!(kv_shortfall(&error));
-                assert_eq!(chain(&error), chain(&refusal()));
-                assert_eq!(calls.take(), both);
-            }
-            // Another failure: the retry's own error, whole, beneath the startup refusal as context.
-            for other in others {
-                let error = admit_beside_decode_graphs(startup, scripted(refusal(), Err(other()))).unwrap_err();
-                assert!(!kv_shortfall(&error), "{error:#}");
-                assert_eq!(&chain(&error)[1..], chain(&other()).as_slice());
-                assert!(error.to_string().contains(&format!("({:#})", refusal())), "{error:#}");
-                assert_eq!(calls.take(), both);
-            }
-        }
-    }
-
-
 
     #[test]
     fn step_workspaces_reproduce_the_frozen_accounting_and_share_the_lanes_temporaries() {
@@ -5975,9 +5963,6 @@ mod prefill_lane_tests {
         assert_eq!(shared, 2_950_470_912);
         let spark = GlmfStepShape { local_experts: false, spark: true, ..shape };
         assert_eq!(glmf_step_workspaces(&cfg, 2, 4096, 64, &spark, decode, prefill).device_bytes(), 2_882_837_760);
-        let reserve = super::workspace_reserve_bytes(shared, 2, true);
-        assert_eq!(reserve, shared + 3 * super::WORKSPACE_RUNTIME_OVERHEAD_BYTES);
-        assert!(reserve >= shared + 2 * 71_942_144 + 68_269_888);
         // The programs' scratch keeps its capacity whatever a lane's rows.
         for rows in [1, 64, 512, 4096] {
             let temps = glmf_temporary_bytes(&cfg, rows, false, &shape, prefill);
@@ -6000,12 +5985,12 @@ mod prefill_lane_tests {
         // times (a serial workspace and two lanes). Runtime now owns decode and one arena.
         let scoring = glmf_step_workspaces(&cfg, 2, 4096, 64, &full, decode, prefill).device_bytes();
         assert_eq!(scoring - shared, (4096 - 64) * 154_880 * 4);
-        assert_eq!(super::workspace_reserve_bytes(scoring, 2, false), scoring + 2 * super::WORKSPACE_RUNTIME_OVERHEAD_BYTES);
     }
 
     #[test]
     fn million_token_graphs_add_only_three_long_geometries() {
         use super::*;
+        use cuteafd_loader::serving_capacity::glmf_graphs::{glmf_graph_reserve, serving_graph_shapes};
         let pages = 2_097_152 / PAGE_ROWS;
         for (verify, expected) in [(64, 300), (128, 330)] {
             let buckets = DecodeBuckets::new(verify);
@@ -6027,16 +6012,22 @@ mod prefill_lane_tests {
                     }
                 }
             }
-            let reserves = serving_graph_reserve(1_048_576, 2_097_152, 2051, 16, true, 45, true, &buckets);
-            let old = serving_graph_reserve(131_072, 2_097_152, 2051, 16, true, 45, true, &buckets);
-            assert!(reserves.iter().zip(old).all(|(new, old)| new - old < (512 << 20)));
+            let wide = glmf_graph_reserve(1_048_576, 2_097_152, 2051, 16, true, 45, 1, verify, 188, true);
+            let narrow = glmf_graph_reserve(131_072, 2_097_152, 2051, 16, true, 45, 1, verify, 188, true);
+            // Startup prewarms every traced shape this context admits; the long
+            // geometries only exist at the wide context, so the wide reserve is
+            // a superset and pays for the trace's whole demand.
+            assert_eq!(wide.executables[0], 644);
+            assert!(narrow.shapes.iter().all(|shape| wide.shapes.contains(shape)));
+            assert!(narrow.reserves[0] <= wide.reserves[0]);
         }
     }
 
     #[test]
     fn startup_graph_shapes_cover_all_admitted_capacities_and_positions() {
-        use super::{decode_bucket, glmf_table_pages, serving_graph_shapes, DecodeBuckets, GraphGeometry, GraphKey,
+        use super::{decode_bucket, glmf_table_pages, DecodeBuckets, GraphGeometry, GraphKey,
             StepTables, DECODE_ROWS, MIN_PAGE_STRIDE, UNIT_PAGES, UNIT_ROWS};
+        use cuteafd_loader::serving_capacity::glmf_graphs::serving_graph_shapes;
         let buckets = DecodeBuckets::new(DECODE_ROWS);
         for (context, pages, dense) in [(32768usize, 4096usize, 2051usize), (777, 28, 99), (3000, 36, 2051)] {
             let shapes = serving_graph_shapes(context, pages, dense, 16, true, &buckets);
@@ -6092,15 +6083,24 @@ mod prefill_lane_tests {
         assert_eq!(super::decode_bucket(9, false), 16);
         assert_eq!(super::decode_bucket(17, false), 32);
         let buckets = super::DecodeBuckets::new(super::DECODE_ROWS);
+        use cuteafd_loader::serving_capacity::glmf_graphs::{GlmfLayout, glmf_graph_reserve, glmf_prewarm_list, glmf_prewarm_shapes, serving_graph_shapes};
+        let layout = GlmfLayout::resolved(1, true);
         for sequences in [8, 16] {
-            let shapes = super::serving_graph_shapes(32768, 32768, 2051, sequences, true, &buckets);
+            let shapes = serving_graph_shapes(32768, 32768, 2051, sequences, true, &buckets);
             assert_eq!(shapes.len() * 46, 6440);
-            let reserve = super::serving_graph_reserve(32768, 2_097_152, 2051, sequences, true, 45, true, &buckets);
-            assert_eq!(reserve, [1_198_944_016, super::graph_reserve_bytes(6300)]);
-            assert_eq!(super::serving_graph_shapes(32768, 32768, 2051, sequences, false, &buckets).len() * 46, 2576);
+            // Startup reserves the traced shapes this launch admits; rank 0
+            // carries the head segment on top of the 45 layer segments.
+            let plan = glmf_graph_reserve(32768, 2_097_152, 2051, sequences, true, 45, 1, 64, 188, true);
+            let warm = glmf_prewarm_shapes(32768, 2_097_152, 2051, sequences, true, &buckets, layout);
+            assert_eq!(plan.executables, [warm.len() as u64 * 46]);
+            let list = glmf_prewarm_list().layout(layout).expect("the min column is traced");
+            let packed = |count: u64| list.arena_bytes(0, count).div_ceil(2 << 20) * (2 << 20);
+            assert_eq!(plan.reserves, [packed(warm.len() as u64 * 46)]);
+            assert_eq!(plan.extra, list.reserve_extra_bytes.div_ceil(2 << 20) * (2 << 20));
+            assert_eq!(serving_graph_shapes(32768, 32768, 2051, sequences, false, &buckets).len() * 46, 2576);
         }
-        assert_eq!(super::serving_graph_shapes(32768, 32768, 2051, 32, true, &buckets).len() * 46, 7084);
-        assert_eq!(super::serving_graph_shapes(32768, 32768, 2051, 64, true, &buckets).len() * 46, 7728);
+        assert_eq!(serving_graph_shapes(32768, 32768, 2051, 32, true, &buckets).len() * 46, 7084);
+        assert_eq!(serving_graph_shapes(32768, 32768, 2051, 64, true, &buckets).len() * 46, 7728);
     }
 
     #[test]
@@ -6320,12 +6320,12 @@ mod wide_decode_tests {
 
     /// The startup set grows by one speculative bucket per geometry: at 16 sequences and the 2,097,152-
     /// token pool target, 50 -> 55 shapes at 8,192 tokens, 140 -> 154 at 32,768 and 270 -> 297 at
-    /// 131,072 (the geometries of the graph keys); at 8,192 tokens its reserve grows by 230 graphs
-    /// (40,422,684 B). Each added shape is the budget's bucket, keyed as its own shape by its capture's
-    /// padded tables.
+    /// 131,072 (the geometries of the graph keys); each added shape is 46 executables. The added shape
+    /// is the budget's bucket, keyed as its own shape by its capture's padded tables.
     #[test]
     fn the_startup_set_grows_by_one_speculative_bucket_per_geometry() {
-        use super::{graph_reserve_bytes, serving_graph_reserve, serving_graph_shapes, startup_tables, GraphKey, PAGE_ROWS};
+        use super::{startup_tables, GraphKey, PAGE_ROWS};
+        use cuteafd_loader::serving_capacity::glmf_graphs::{GlmfLayout, glmf_graph_reserve, serving_graph_shapes};
         let pages = 2_097_152usize.div_ceil(PAGE_ROWS);
         let (narrow, wide) = (DecodeBuckets::new(DECODE_ROWS), DecodeBuckets::new(127));
         for (context, before, after) in [(8_192usize, 50usize, 55usize), (32_768, 140, 154), (131_072, 270, 297)] {
@@ -6337,18 +6337,24 @@ mod wide_decode_tests {
             for (rows, spec, geometry) in added {
                 assert_eq!((rows, spec), (127, true));
                 let tables = startup_tables(rows, spec, geometry);
-                assert_eq!(GraphKey::new(0, rows, &tables), GraphKey { segment: 0, rows, spec, long: geometry.long,
+                assert_eq!(GraphKey::new(0, rows, &tables), GraphKey { segment: 0, rows, spec, head: false, long: geometry.long,
                     pool_width: geometry.pool_width, page_stride: geometry.page_stride, pool_stride: geometry.pool_stride });
             }
             // The plain set is unchanged.
             assert_eq!(serving_graph_shapes(context, pages, 2051, 16, false, &wide),
                 serving_graph_shapes(context, pages, 2051, 16, false, &narrow));
         }
-        let reserve = |buckets: &DecodeBuckets| serving_graph_reserve(8_192, 2_097_152, 2051, 16, true, 45, false,
-            buckets)[0];
-        assert_eq!(reserve(&narrow), graph_reserve_bytes(50 * 46));
-        assert_eq!(reserve(&narrow), 471_335_704);
-        assert_eq!(reserve(&wide) - reserve(&narrow), 40_422_684);
+        // A wider verify budget adds shapes the prewarm does not reserve, so the
+        // prewarm and its reserve stay the traced shapes this context admits.
+        let reserve = |decode_rows: usize| glmf_graph_reserve(8_192, 2_097_152, 2051, 16, true, 45, 1,
+            decode_rows, 188, true);
+        let short = cuteafd_loader::serving_capacity::glmf_graphs::glmf_prewarm_shapes(
+            8_192, 2_097_152, 2051, 16, true, &DecodeBuckets::new(DECODE_ROWS),
+            GlmfLayout::resolved(1, true));
+        let admitted = serving_graph_shapes(8_192, 2_097_152, 2051, 16, true, &DecodeBuckets::new(DECODE_ROWS));
+        assert!(short.iter().all(|shape| admitted.contains(shape)), "a prewarm never leaves its launch's set");
+        assert_eq!(reserve(DECODE_ROWS).executables[0], short.len() as u64 * 46);
+        assert_eq!(reserve(DECODE_ROWS), reserve(127));
     }
 
     /// A padded wide step (65, 100 or 126 -> 127 rows) keeps its real tables, masks the rest, runs the
@@ -6382,9 +6388,10 @@ mod wide_decode_tests {
 #[cfg(test)]
 mod graph_key_tests {
     use super::{check_bucket_thresholds, check_decode_thresholds, decode_bucket, decode_strides, glmf_table_pages,
-        graph_geometries, graph_reserve_bytes, serving_graph_reserve, serving_graph_shapes, startup_tables,
-        DecodeBuckets, GraphGeometry, GraphKey, StepTables, DECODE_PROJECTION_THRESHOLDS, DECODE_ROWS, MIN_PAGE_STRIDE,
-        PLAIN_DECODE_BUCKETS, SPEC_DECODE_BUCKETS, UNIT_PAGES, UNIT_ROWS};
+        graph_geometries, startup_tables, DecodeBuckets, GraphGeometry, GraphKey, StepTables,
+        DECODE_PROJECTION_THRESHOLDS, DECODE_ROWS, MIN_PAGE_STRIDE, PLAIN_DECODE_BUCKETS, SPEC_DECODE_BUCKETS,
+        UNIT_PAGES, UNIT_ROWS};
+    use cuteafd_loader::serving_capacity::glmf_graphs::serving_graph_shapes;
     use std::collections::HashSet;
 
     fn tables(long: bool, pool_width: usize, page_stride: usize, pool_stride: usize) -> StepTables {
@@ -6501,17 +6508,43 @@ mod graph_key_tests {
                     (rows, rows * geometry.page_stride, rows * geometry.pool_stride, 0));
                 assert!(tables.positions.iter().all(|&p| p == -1) && tables.kv_slots.iter().all(|&s| s == -1));
                 for segment in [0, 45] {
-                    assert_eq!(GraphKey::new(segment, rows, &tables), GraphKey { segment, rows, spec,
+                    assert_eq!(GraphKey::new(segment, rows, &tables), GraphKey { segment, rows, spec, head: false,
                         long: geometry.long, pool_width: geometry.pool_width, page_stride: geometry.page_stride,
                         pool_stride: geometry.pool_stride });
                 }
             }
         }
-        // The startup reserve on one GPU (46 segments a shape) at the engine's 146,459 B a graph.
-        for (context, before, after) in [(8192, 1_926_552_328, 471_335_704), (32768, 3_300_923_584, 1_198_944_016),
-            (131_072, 4_998_676_312u64, 2_249_933_800u64)] {
-            assert_eq!(graph_reserve_bytes(full_keys(context, 32768, dense).len() * 10 * 46), before);
-            assert_eq!(serving_graph_reserve(context, 2_097_152, dense, 16, true, 45, false, &buckets), [after]);
+    }
+
+    #[test]
+    fn normalized_keys_preserve_every_checked_in_prewarm_identity() {
+        use super::*;
+        let list = glmf_prewarm_list();
+        for layout in [GlmfLayout::resolved(1, false), GlmfLayout::resolved(1, true),
+            GlmfLayout::resolved(2, false), GlmfLayout::resolved(2, true)] {
+            if let Some(traced) = list.layout(layout) {
+                for entry in &traced.entries {
+                    let (rows, spec, geometry) = entry.shape();
+                    let tables = startup_tables(rows, spec, geometry);
+                    let raw = GraphKey::new(3, rows, &tables);
+                    for attention in [Some(GlmNextAttention::Mla), Some(GlmNextAttention::Kda), None] {
+                        let normalized = raw.normalized(attention);
+                        assert_eq!(normalized.rows, rows);
+                        assert_eq!(normalized.spec, attention.is_some() && spec);
+                        assert_eq!(normalized.head, attention.is_none());
+                        if attention == Some(GlmNextAttention::Mla) { assert_eq!(normalized, raw); }
+                        else {
+                            assert_eq!((normalized.long, normalized.pool_width, normalized.page_stride,
+                                normalized.pool_stride), (false, 0, 0, 0));
+                            let other = GraphKey { long: !raw.long, pool_width: 999,
+                                page_stride: 999, pool_stride: 999, ..raw };
+                            assert_eq!(normalized, other.normalized(attention));
+                        }
+                        let other = GraphKey { spec: !raw.spec, ..raw }.normalized(attention);
+                        assert_eq!(normalized == other, attention.is_none());
+                    }
+                }
+            }
         }
     }
 
@@ -6541,6 +6574,18 @@ mod graph_key_tests {
 #[cfg(test)]
 mod replay_record_tests {
     use super::{replay_bytes, RecordGuard, ReplayRecords, DECODE_ROWS, WIDE_DECODE_ROWS};
+
+    #[test]
+    fn commit_tables_are_uploaded_on_the_consumer_stream_without_a_host_drain() {
+        let source = include_str!("engine.rs");
+        let commit = source.split("    pub fn commit(&self, sequences:").nth(1).unwrap()
+            .split("    fn alloc(").next().unwrap();
+        assert!(!commit.contains("cuda_stream_synchronize"));
+        let upload = commit.find("self.on(rank, || self.put(&caches.commit_tables, &tables))").unwrap();
+        let reader = commit.find("self.run_on(rank, split, &commit_for(").unwrap();
+        assert!(upload < reader);
+        assert!(commit.contains("(\"tables\", caches.commit_tables.buffer.ptr)"));
+    }
 
     #[test]
     fn shared_records_commit_only_what_no_prefill_overwrote() {
@@ -6587,101 +6632,33 @@ mod replay_record_tests {
 }
 
 #[cfg(test)]
-mod spark_warmup_tests {
-    use super::{spark_request, spark_warmup_request,
-        DECODE_ROWS, MAX_PREFILL_WAVES};
-    use cuteafd_loader::families::glm5_flash::{GlmNextAttention, GlmNextConfig};
-    use cuteafd_transport::expert::EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16;
-    use cuteafd_transport::{ExpertProtocolV2Request, ExpertProtocolV2RouteEntry, ExpertV2Dtype, ExpertV2SourceKind,
-        EXPERT_PROTOCOL_V2_RESPONSE_HEADER_LEN};
-    use std::collections::BTreeSet;
-
-    /// GLM 5.3 Flash: 45 layers (0-2 dense), 288 routed experts, top-8, hidden 4096.
-    fn glm53_flash() -> GlmNextConfig {
-        GlmNextConfig { vocab_size: 154880, hidden: 4096, layers: 45,
-            attention: (0..45).map(|i| if i % 4 == 3 { GlmNextAttention::Mla } else { GlmNextAttention::Kda }).collect(),
-            dense: (0..45).map(|i| i < 3).collect(), dense_intermediate: 12288, experts: 288, topk: 8,
-            moe_intermediate: 2048, routed_scale: 2.5, swiglu_limit: 10.0, rms_norm_eps: 1e-5, hc_mult: 4,
-            kda_heads: 64, kda_head_dim: 128, heads: 64, q_lora_rank: 1536, kv_lora_rank: 512, qk_nope_dim: 256,
-            v_head_dim: 256, index_topk: 2048, index_kpool: 4, eos: vec![] }
-    }
-
-    /// The answer bytes a rank's session reserves for `request` (the transport's
-    /// `verbs_host_expected_response_wire_bytes` without a reduced-precision answer): the header,
-    /// then a row index and a partial row at least BF16-wide per row.
-    fn response_bytes(request: &ExpertProtocolV2Request) -> usize {
-        let header = &request.header;
-        EXPERT_PROTOCOL_V2_RESPONSE_HEADER_LEN + header.row_count as usize
-            * (4 + (header.hidden_row_stride_bytes as usize).max(2 * header.hidden_dim as usize))
-    }
-
-    /// A serving wave of `t` rows at the first MoE layer, as `spark_dispatch` builds one.
-    fn wave(cfg: &GlmNextConfig, t: usize, kind: ExpertV2SourceKind) -> ExpertProtocolV2Request {
-        let routes = (0..t * cfg.topk).map(|i| ExpertProtocolV2RouteEntry { row_index: (i / cfg.topk) as u32,
-            expert_id: (7 * i % cfg.experts) as u32, gate_weight: 0.125 }).collect();
-        spark_request(cfg.hidden, cfg.topk, 3, t, routes, vec![0x38; t * (cfg.hidden + cfg.hidden / 32)], kind, false).unwrap()
-    }
-
-    /// The warm-up is a full lane of prefill in the serving format: 4,096 zero rows at the first MoE
-    /// layer (3), every gate zero, all 288 experts routed, eight distinct a row. Each rank's session
-    /// then keeps 17,858,656 request and 33,570,912 answer bytes a slot: at the transport's default
-    /// eight 4 KiB-aligned slots, 411,500,544 B of rings, what the coordinator's `transport/rdma-rings`
-    /// ledger held per session once a 4,096-row lane had opened it (3,292,004,352 B for two lanes of
-    /// four ranks).
-    #[test]
-    fn the_warmup_is_a_full_lane_of_zero_gates_in_the_serving_format() {
-        let cfg = glm53_flash();
-        let warm = spark_warmup_request(&cfg, 4096, 3, false).unwrap();
-        let serving = wave(&cfg, 4096, ExpertV2SourceKind::Prefill);
-        assert_eq!((&warm.header, &warm.rows), (&serving.header, &serving.rows));
-        assert_eq!((warm.header.layer_id, warm.header.row_count, warm.header.hidden_dtype, warm.header.flags),
-            (3, 4096, ExpertV2Dtype::Fp8E4m3Ue8m0K32, EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16));
-        assert!(warm.rows.iter().all(|row| row.source_kind == ExpertV2SourceKind::Prefill));
-        assert!(warm.routes.iter().all(|route| route.gate_weight == 0.0));
-        assert!(warm.routes.chunks(8).enumerate().all(|(row, routes)| routes.iter().all(|r| r.row_index == row as u32)
-            && routes.iter().map(|r| r.expert_id).collect::<BTreeSet<_>>().len() == 8));
-        assert_eq!(warm.routes.iter().map(|r| r.expert_id).collect::<BTreeSet<_>>(), (0..288).collect());
-        assert!(warm.hidden_payload.len() == 4096 * (4096 + 128) && warm.hidden_payload.iter().all(|&b| b == 0));
-        let (request, answer) = (warm.wire_stats().wire_bytes, response_bytes(&warm));
-        assert_eq!((request, answer), (17_858_656, 33_570_912));
-        assert_eq!(8 * (request.next_multiple_of(4096) + answer.next_multiple_of(4096)), 411_500_544);
-    }
+mod spark_session_tests {
+    use super::{spark_request, spark_session_shape, DECODE_ROWS};
+    use cuteafd_loader::families::glm5_flash::GlmNextConfig;
+    use cuteafd_transport::{ExpertProtocolV2RouteEntry, ExpertV2SourceKind, SparkSessionShape};
 
     #[test]
-    fn warmup_targets_the_first_selected_remote_layer_not_the_first_moe() {
-        let cfg = glm53_flash();
-        let initial = spark_warmup_request(&cfg, 64, 3, false).unwrap();
-        let selected = spark_warmup_request(&cfg, 64, 24, false).unwrap();
-        assert_eq!(selected.header.layer_id, 24);
-        assert_eq!(selected.hidden_payload, initial.hidden_payload);
-        assert_eq!(selected.routes, initial.routes);
-        assert_eq!(selected.wire_stats().wire_bytes, initial.wire_stats().wire_bytes);
-        for layer in [0, 2, 45] { assert!(spark_warmup_request(&cfg, 64, layer, false).is_err()); }
-    }
-
-    /// No wave of a warmed transport is larger than its warm-up: decode and verify steps and prefill
-    /// lanes or serial chunks of up to the warmed rows fit the slots it opened, so `post` never drops
-    /// and reconnects a warmed rank while serving.
-    #[test]
-    fn no_wave_outgrows_a_warmed_session() {
-        let cfg = glm53_flash();
+    fn every_serving_wave_fits_the_layer_free_session() -> anyhow::Result<()> {
+        let cfg = GlmNextConfig::from_hf(&cuteafd_loader::plan::testing::glm5_flash_config(8))?;
         for rows in [2048, 4096] {
-            let warm = spark_warmup_request(&cfg, rows, 3, false).unwrap();
-            let (request, answer) = (warm.wire_stats().wire_bytes, response_bytes(&warm));
-            for t in [1, 2, DECODE_ROWS - 1, DECODE_ROWS, 128, 1023, 1024, 2048, 2072, 2109, 2176, 4095, 4096]
-                .into_iter().filter(|&t| t <= rows) {
-                for kind in [ExpertV2SourceKind::Decode, ExpertV2SourceKind::Prefill] {
-                    let serving = wave(&cfg, t, kind);
-                    assert!(serving.wire_stats().wire_bytes <= request && response_bytes(&serving) <= answer,
-                        "{t} rows of {kind:?} after a {rows}-row warm-up");
+            for bf16 in [false, true] {
+                let session = spark_session_shape(&cfg, rows, bf16)?;
+                for t in [1, 2, DECODE_ROWS, 128, 1024, 2048, 2072, 4095, 4096].into_iter().filter(|&t| t <= rows) {
+                    for layer in [3, 6] {
+                        let routes = (0..t * cfg.topk).map(|i| ExpertProtocolV2RouteEntry {
+                            row_index: (i / cfg.topk) as u32, expert_id: (i % cfg.experts) as u32, gate_weight: 0.125 }).collect();
+                        let request = spark_request(cfg.hidden, cfg.topk, layer, t, routes,
+                            vec![0; t * if bf16 { cfg.hidden * 2 } else { cfg.hidden + cfg.hidden / 32 }],
+                            ExpertV2SourceKind::Prefill, bf16)?;
+                        let serving = SparkSessionShape::from_request(&request)?;
+                        assert!(serving.request_wire_bytes <= session.request_wire_bytes);
+                        assert!(serving.response_wire_bytes <= session.response_wire_bytes);
+                    }
                 }
             }
-            let largest = wave(&cfg, rows, ExpertV2SourceKind::Prefill);
-            assert_eq!((largest.wire_stats().wire_bytes, response_bytes(&largest)), (request, answer));
         }
+        Ok(())
     }
-
-
 }
 
 #[cfg(test)]

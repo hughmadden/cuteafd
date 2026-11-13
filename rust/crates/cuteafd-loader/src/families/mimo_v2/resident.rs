@@ -26,9 +26,9 @@ pub struct MimoResidentOptions {
 pub struct MimoResidentLayout {
     pub ranks: Vec<Vec<MemoryReservation>>,
     /// Maximum extra source storage on each physical rank while target weights
-    /// load, before target KV exists. BF16 TP2 slices a whole output matrix on
-    /// the lead; selected FP8 packing stages at most1024 source rows per rank.
-    /// A checkpoint-native FP8 upload needs no device source staging.
+    /// load, before target KV exists. Native BF16 column shares land directly
+    /// in final owners; selected FP8 packing stages at most1024 source rows per
+    /// rank. Checkpoint-native BF16/FP8 uploads need no device source staging.
     pub loading_temporary_rank_bytes: Vec<u64>,
 }
 
@@ -301,7 +301,6 @@ fn block(
             &[DType::Bf16, DType::F8E4M3]
         },
     )?;
-    let o_bytes = mul("MiMo o_proj", &[cfg.hidden as u64, o_cols as u64, 2])?;
     let intermediate = cfg.dense_intermediate;
     if dense {
         for (projection, shape) in [
@@ -347,9 +346,6 @@ fn block(
             fp8_o,
             2,
         )?;
-        if !fp8_o && ranks > 1 && rank == 0 {
-            temporary[rank] = temporary[rank].max(o_bytes);
-        }
         if attention == MimoAttention::Sliding {
             let t = tensor(
                 checkpoint,
@@ -511,10 +507,8 @@ mod tests {
                 && !r.name.starts_with("model.embed_tokens")));
             let replica: Vec<_> = split.ranks[1].iter().filter(|r| r.name.contains(".mlp.gate.")).collect();
             assert_eq!(replica, split.ranks[0].iter().filter(|r| r.name.contains(".mlp.gate.")).collect::<Vec<_>>());
-            assert_eq!(
-                split.loading_temporary_rank_bytes,
-                [cfg.hidden as u64 * cfg.heads as u64 * 128 * 2, 0]
-            );
+            // Native BF16 column shares land in final owners, without device staging.
+            assert_eq!(split.loading_temporary_rank_bytes, [0, 0]);
             if let Some(rows) = padded_rows {
                 let qkv = one.ranks[0]
                     .iter()
@@ -577,7 +571,7 @@ mod tests {
                 .iter()
                 .any(|cost| cost.name == "model.layers.1.o_proj.fp8"));
         }
-        assert_eq!(layout.loading_temporary_rank_bytes, [4096 * 8192 * 2, 0]);
+        assert_eq!(layout.loading_temporary_rank_bytes, [0, 0]);
         selected.output_formats.remove(o);
         assert!(
             matches!(MimoResidentLayout::new(&checkpoint,&cfg,&selected),
@@ -668,6 +662,27 @@ impl MimoResidentLayout {
             return Err(CacheGeometryError::Unsupported {
                 family: "mimo_v2",
                 what: "resident model geometry or selected layers",
+            });
+        }
+        Self::describe(checkpoint, cfg, options)
+    }
+
+    /// The final operands a load admitted by `new` allocates, without
+    /// re-deciding serving support (predictor-only and fixture loads too).
+    pub fn describe(
+        checkpoint: &Checkpoint,
+        cfg: &MimoV2Config,
+        options: &MimoResidentOptions,
+    ) -> Result<Self, CacheGeometryError> {
+        if options.layers > cfg.layers
+            || ![1, 2].contains(&options.coordinator_ranks)
+            || cfg.attention.len() != cfg.layers
+            || cfg.dense.len() != cfg.layers
+            || options.checkpoint_tp == 0
+        {
+            return Err(CacheGeometryError::Unsupported {
+                family: "mimo_v2",
+                what: "resident layer selection",
             });
         }
         let mut costs = vec![Vec::new(); options.coordinator_ranks];

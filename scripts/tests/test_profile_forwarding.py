@@ -104,6 +104,41 @@ def test_family_launch_census_probe_reaches_coordinator_and_workers_only_when_as
             assert flag in line, (flag, line)
 
 
+def test_plan_preflight_admits_under_the_launch_instrumentation(tmp_path):
+    """The deployment plan runs with the PROFILE switches the server will get."""
+    prof = tmp_path / 'prof'
+    prof.mkdir()
+    plain = _family_launch_result(tmp_path / 'plain', GLMF_TWO_LAYER, 'test/glmf', '')
+    assert plain.returncode == 0, plain.stderr
+    plan = next(line for line in plain.stderr.splitlines() if 'cuteafd plan' in line)
+    assert 'CUTEAFD_GRAPH_CENSUS' not in plan
+    census = _family_launch_result(tmp_path / 'census', GLMF_TWO_LAYER, 'test/glmf',
+                                   f'PROFILE=census\nPROFILE_DIR={prof}\n')
+    assert census.returncode == 0, census.stderr
+    plan = next(line for line in census.stderr.splitlines() if 'cuteafd plan' in line)
+    for flag in ('CUTEAFD_GRAPH_CENSUS=1', 'CUTEAFD_STARTUP_MEMORY_PROBE=1', f'CUTEAFD_PROFILE_DIR={prof}'):
+        assert flag in plan, (flag, plan)
+
+
+@pytest.mark.parametrize("keys,expected", [
+    ("GPU_GRAPH_RESERVE=gpu0=300MB,gpu1=200MB\n", ["GPU_GRAPH_RESERVE=gpu0=300MB,gpu1=200MB"]),
+    ("GPU_GRAPH_RESERVE_EXTRA=gpu0=25%,gpu1=500MB\nGPU_GRAPH_RESERVE_EXTRA_CAP=100%\n",
+     ["GPU_GRAPH_RESERVE_EXTRA=gpu0=25%,gpu1=500MB", "GPU_GRAPH_RESERVE_EXTRA_CAP=100%"]),
+])
+def test_graph_reserve_policy_reaches_plan_and_coordinator_not_workers(tmp_path, keys, expected):
+    config = {"model_type": "glm_moe_dsa", "num_hidden_layers": 4, "first_k_dense_replace": 3}
+    result = _family_launch_result(tmp_path, config, "test/glm", keys)
+    assert result.returncode == 0, result.stderr
+    plan = next(line for line in result.stderr.splitlines() if 'cuteafd plan' in line)
+    coordinator = next(line for line in result.stderr.splitlines() if 'cuteafd serve-glm' in line)
+    for line in (plan, coordinator):
+        for value in expected:
+            assert f"CUTEAFD_{value}" in line, (value, line)
+    workers = [line for line in result.stderr.splitlines() if 'cuteafd expertd-native' in line]
+    assert workers
+    assert all('CUTEAFD_GPU_GRAPH_RESERVE' not in line for line in workers)
+
+
 def test_v41_native_census_probes_cover_all_card_sizes():
     family = ROOT / 'rust/crates/cuteafd-daemon/src/families/deepseek_v41'
     single = (family / 'v41_native_serve.rs').read_text()
@@ -119,13 +154,14 @@ def test_v41_native_census_probes_cover_all_card_sizes():
     assert single.index('"v41/before native preload"') < single.index('RuntimeInventory::measure(')
     assert single.index('RuntimeInventory::measure(') < single.index('"v41/after native preload"')
     assert single.index('"v41/after native preload"') < single.index('admission::admit_startup(')
-    assert single.index('"v41/ready"') < single.index('.send(Ok(vision.health_handle()))')
+    assert single.index('"v41/ready"') < single.index('.send(Ok((health, args.max_context_tokens)))')
     checkpoint = dual.split('let memory_checkpoint = ', 1)[1].split('memory_checkpoint("CUDA contexts', 1)[0]
     assert 'crate::shared::inventory::startup_probe(&lib, &[0, 1],' in checkpoint
     assert dual.index('memory_checkpoint("before native preload")') < dual.index('RuntimeInventory::measure(')
     assert dual.index('RuntimeInventory::measure(') < dual.index('memory_checkpoint("after native preload")')
-    assert dual.index('memory_checkpoint("after native preload")') < dual.index('BackboneLaneWeights::load_distributed')
-    assert dual.index('memory_checkpoint("ready")') < dual.index('.send(Ok(vision.health_handle()))')
+    assert dual.index('memory_checkpoint("after native preload")') < dual.index('TargetArenas::new(')
+    assert dual.index('TargetArenas::new(') < dual.index('BackboneLaneWeights::load_in(')
+    assert dual.index('memory_checkpoint("ready")') < dual.index('.send(Ok((health, args.max_context_tokens)))')
 
 
 CAPTURE_PATH_CASES = r'''
@@ -352,7 +388,7 @@ release_profile_exec "$@"
 @pytest.mark.parametrize('profile,directory,message', [
     ('census,flamegraph', '', 'unknown PROFILE switch flamegraph'),
     ('census;rm', '', 'PROFILE must be a comma list'),
-    ('', '/data/prof', 'PROFILE_DIR needs PROFILE or PROFILE_SPARK'),
+    ('', '/data/prof', 'PROFILE_DIR needs PROFILE, PROFILE_SPARK or a memory observer'),
     ('census', 'relative', 'PROFILE_DIR must be an absolute directory'),
     ('nsys', '', 'PROFILE=nsys needs PROFILE_DIR'),
     ('ncu', '', 'PROFILE=ncu needs PROFILE_DIR'),
@@ -424,8 +460,8 @@ def test_v41_worker_takes_profile_args_after_every_positional():
     assert '--profile-args' in invocation
     assert '"${rdma_args[@]}" "${wip_args[@]}" ${profile_args[@]+"${profile_args[@]}"}' in remote
     positional = ['image', 'name', '1', '107374182400', '19441', 'snapshot', 'fingerprint', '4',
-                  '0', '', '', '', '', '', 'info', '__none__']
-    assert len(positional) == 16
+                  '', '', 'info', '__none__', '-1', '19541', '', 'revision', '1']
+    assert len(positional) == 17
     for tail, expected in [([], []), (['--profile-args', '-e', 'CUTEAFD_EXPERT_TIMING=1', '-e', 'CUTEAFD_PROFILE_HOST=emu'],
                                       ['CUTEAFD_EXPERT_TIMING=1', 'CUTEAFD_PROFILE_HOST=emu'])]:
         result = subprocess.run(['bash', '-euc', 'source scripts/lib/release-common.sh; source scripts/lib/cdi-gpus.sh; HF_HOME="$(mktemp -d)"; trap \'rm -rf "$HF_HOME"\' EXIT; mkdir -p "$HF_HOME/hub" "$HF_HOME/snapshot"; CUTEAFD_SITE_HUB=1; docker() { printf "%s\\n" "$@"; }\n' + remote.replace(' >/dev/null', ''),

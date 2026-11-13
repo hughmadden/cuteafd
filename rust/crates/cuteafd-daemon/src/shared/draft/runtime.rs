@@ -19,8 +19,13 @@ impl SharedPolicy {
 
     /// Bind the family's installed resource classes, TP slices and draft widths.
     pub fn with_geometry(geometry: PolicyGeometry, prior: resource::Prior, seed: PolicySeed) -> Result<Self> {
-        let mut policy = DraftPolicy::seeded(geometry, seed)?;
-        super::apply_length_rule(&mut policy);
+        Self::with_length(geometry, prior, seed, super::length::DraftLength::default())
+    }
+
+    pub fn with_length(geometry: PolicyGeometry, prior: resource::Prior, seed: PolicySeed,
+        length: super::length::DraftLength) -> Result<Self> {
+        let native = *geometry.widths.last().ok_or_else(|| anyhow::anyhow!("missing native draft width"))?;
+        let policy = length.policy(geometry, seed, native)?;
         Ok(Self { policy, prior })
     }
 

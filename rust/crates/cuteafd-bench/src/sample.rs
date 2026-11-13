@@ -22,6 +22,7 @@ pub fn report(failed: bool) -> Report {
     let setting = |name: &str, value: &str, default: Option<&str>, source: &str| Setting { name: name.into(),
         value: Some(value.into()), default: default.map(str::to_string), source: source.into() };
     let configuration = Configuration {
+        draft: "adaptive".into(),
         supports_thinking_off: None,
         snapshot: Some("/mnt/sparknest/hf-home/hub/models--deepseek-ai--DeepSeek-V4.1-Flash/snapshots/dba1be0a40aa".into()),
         quant: vec![QuantGroup { group: "attention".into(), formats: vec!["fp8_block".into()] },
@@ -71,8 +72,8 @@ pub fn report(failed: bool) -> Report {
                         timing: timing(320, 319.0 / per_stream_median_tok_s) }).collect(), warmup_s: 3.0,
                     prompts: Some(if width == 1 { "code" } else { crate::panels::speed::DISTINCT_PROMPTS }.into()) })
                 .collect(),
-            prefill: Some(PrefillRate { prompt_tokens: 8192, tok_s: 2415.0, ttft_s: 3.392, runs: vec![] }),
-            warmup_s: Some(14.2), prompt_token_ratio: None,
+            prefill: Some(PrefillRate { prompt_tokens: 8192, tok_s: 2415.0, ttft_s: 3.392, runs: vec![], ..Default::default() }),
+            prefill_tail: None, skipped_prefill: vec![], warmup_s: Some(14.2), prompt_token_ratio: None,
             capacity: Some(Capacity { kv_tokens: Some(14_710_000), max_tokens: None, kv_pages: Some(28_728),
                 kv_format: Some("FP4 compressed (CSA/HCA) + FP8 window".into()), max_requests: Some(16),
                 max_context: Some(1 << 20), max_output: Some(131_072), host_cache_bytes: Some(64 << 30) }) },
@@ -277,6 +278,28 @@ mod tests {
         assert_eq!(restored.capacity_line(), expected);
         report.baseline.as_mut().unwrap().card.capacity.as_mut().unwrap().kv_tokens = Some(0);
         assert_eq!(report.capacity_line(), "20 RTX expert layers · FP8 MLA latent");
+    }
+
+    #[test]
+    fn contract_capacity_without_counterfactual_renders_and_round_trips() {
+        let mut report = super::report(false);
+        report.server.family = Some("glm5".into());
+        report.server.configuration.settings.push(Setting { name: "rtx-expert-layers".into(),
+            value: Some("6".into()), source: "resolved".into(), ..Default::default() });
+        report.baseline.as_mut().unwrap().card.capacity = Some(Capacity {
+            kv_tokens: Some(1_800_000), max_tokens: None,
+            kv_format: Some("FP8 MLA latent".into()), ..Default::default() });
+        let expected = "KV 1.8M tok · 6 RTX expert layers · FP8 MLA latent";
+        assert_eq!(report.capacity_line(), expected);
+        let card = render::card::card_svg(&report);
+        assert!(card.contains(expected));
+        assert!(!card.contains("KV 0") && !card.contains("null tokens") && !card.contains("(max "));
+        let json = serde_json::to_string(&report).unwrap();
+        assert!(!json.contains("\"max_tokens\""));
+        let restored: Report = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.capacity().max_tokens, None);
+        assert_eq!(restored.capacity_line(), expected);
+        assert!(render::card::card_svg(&restored).contains(expected));
     }
 
     #[test]

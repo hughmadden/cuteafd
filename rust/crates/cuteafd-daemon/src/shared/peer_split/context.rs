@@ -50,6 +50,7 @@ use cuteafd_ffi::peer_exchange::PeerPlane;
 use cuteafd_ffi::NativeLibrary;
 use cuteafd_loader::placement::{ContextBuffers, ContextExchangeLayout, CONTEXT_EXCHANGES};
 use std::ffi::c_void;
+use crate::shared::memory::Tag;
 
 /// The GPU that owns logical page `page` of any sequence.
 pub(crate) fn page_owner(page: usize) -> usize {
@@ -101,6 +102,7 @@ pub(crate) struct CommitPlane {
 
 /// Staging-to-pool copies, one `[source | destination | bytes]` list per plane.
 /// All lists are zero-padded to `limit`, and counts may differ between planes.
+#[derive(Clone)]
 pub(crate) struct CommitBlocks {
     pub table: Vec<u64>,
     pub counts: Vec<usize>,
@@ -150,6 +152,60 @@ pub(crate) fn commit_blocks(rank: usize, pages: &[u32], planes: &[CommitPlane], 
     Ok(CommitBlocks { table, counts })
 }
 
+/// Geometry of a contiguous-record context cache. Gather tables retain whole
+/// tail pages so a restored prefix can append inside its last owned page.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct GatheredPrefill {
+    pub page_rows: usize,
+    pub row_bytes: usize,
+    pub extent: usize,
+}
+
+#[derive(Clone)]
+pub(crate) struct GatheredUnit {
+    /// Compact owner tables; gather scatters them at stride two, offset owner.
+    pub tables: [Vec<u32>; 2],
+    pub history_pages: usize,
+    pub commit: CommitBlocks,
+}
+
+impl GatheredPrefill {
+    pub fn unit(&self, rank: usize, pages: &[u32], history: usize, first: usize,
+        rows: usize, commit_limit: usize) -> Result<GatheredUnit> {
+        ensure!(rank < 2 && self.page_rows > 0 && self.row_bytes > 0 && self.extent > 0,
+            "invalid gathered context geometry/rank");
+        let end = first.checked_add(rows).context("gathered context frontier overflow")?;
+        ensure!(history <= first && first <= self.extent && end <= self.extent,
+            "gathered context history/frontier exceeds admitted extent");
+        let history_pages = history.div_ceil(self.page_rows);
+        ensure!(end.div_ceil(self.page_rows) <= pages.len(), "gathered context lacks sequence pages");
+        let tables = [local_pages(&pages[..history_pages], 0)?, local_pages(&pages[..history_pages], 1)?];
+        let page_bytes = self.page_rows.checked_mul(self.row_bytes).context("gathered page extent overflow")?;
+        let commit = commit_blocks(rank, pages, &[CommitPlane { first, rows,
+            rows_per_unit: self.page_rows, row_bytes: self.row_bytes, base: 0,
+            unit_bytes: page_bytes }], commit_limit)?;
+        Ok(GatheredUnit { tables, history_pages, commit })
+    }
+}
+
+/// Eager multiquery arithmetic on logical staging; persistent pages stay owned.
+/// Families bind kernels, while the recording backend uses this same sequence.
+pub(crate) trait GatheredKernels {
+    fn gather(&mut self, owner: usize) -> Result<()>;
+    fn produce(&mut self) -> Result<()>;
+    fn attention(&mut self) -> Result<()>;
+    fn commit(&mut self) -> Result<()>;
+    fn output(&mut self) -> Result<()>;
+}
+
+pub(crate) fn gathered_prefill_with(kernels: &mut impl GatheredKernels) -> Result<()> {
+    for owner in 0..2 { kernels.gather(owner)?; }
+    kernels.produce()?;
+    kernels.attention()?;
+    kernels.commit()?;
+    kernels.output()
+}
+
 /// Partial value width (the latent's 512 BF16 values per head).
 pub(crate) const PARTIAL_DIM: usize = 512;
 
@@ -185,6 +241,10 @@ pub(crate) struct ContextExchange<'a> {
 }
 
 impl<'a> ContextExchange<'a> {
+    pub(crate) fn allocation_buffers(&self) -> [cuteafd_ffi::CuteafdDeviceBuffer; 2] {
+        self.storage.each_ref().map(|owner| owner.buffer)
+    }
+
     /// Allocates the exchange `buffers` describes on both GPUs (zeroed),
     /// enabling peer access both ways; `ranks[0]`'s device must be current,
     /// and is again on return. `abort`: the head split's terminal abort words
@@ -206,7 +266,7 @@ impl<'a> ContextExchange<'a> {
             on_device(library, ranks[rank].device, || {
                 library.cuda_enable_peer(ranks[1 - rank].device)?;
                 library.peer_exchange_initialize()?;
-                let allocation = DeviceAllocation::new(library, bytes)?;
+                let allocation = DeviceAllocation::new(library, bytes, Tag::transport("shared/context-exchange"))?;
                 library.cuda_zero_bytes(allocation.buffer, bytes)?;
                 Ok(allocation)
             })
@@ -576,6 +636,58 @@ mod tests {
         }
         assert_eq!(combine_order(0, "own", "peer"), ["own", "peer"]);
         assert_eq!(combine_order(1, "own", "peer"), ["peer", "own"]);
+    }
+
+    #[test]
+    fn gathered_prefill_maps_tail_history_and_commits_each_record_once() {
+        let pages = [4, 9, 0, 3, 6];
+        for row_bytes in [656, 1152] {
+            let geometry = GatheredPrefill { page_rows: 64, row_bytes, extent: 320 };
+            let mut total = 0;
+            for rank in 0..2 {
+                let unit = geometry.unit(rank, &pages, 65, 65, 128, 3).unwrap();
+                assert_eq!(unit.history_pages, 2);
+                assert_eq!(unit.tables, [vec![2], vec![4]]);
+                let n = unit.commit.counts[0];
+                total += unit.commit.table[6..6 + n].iter().sum::<u64>();
+            }
+            assert_eq!(total, (128 * row_bytes) as u64);
+            assert!(geometry.unit(2, &pages, 0, 0, 1, 1).is_err());
+            assert!(geometry.unit(0, &pages, 66, 65, 1, 1).is_err());
+            assert!(geometry.unit(0, &pages, 0, 319, 2, 1).is_err());
+            assert!(geometry.unit(0, &[4, 6], 65, 65, 1, 1).is_err());
+            let empty = geometry.unit(0, &[], 0, 0, 0, 1).unwrap();
+            assert!(empty.tables.iter().all(Vec::is_empty));
+            assert_eq!(empty.commit.counts, [0]);
+        }
+    }
+
+    #[test]
+    fn gathered_callbacks_stop_at_the_first_failed_operation() -> Result<()> {
+        struct Recording { steps: Vec<usize>, fail: Option<usize> }
+        impl Recording {
+            fn step(&mut self, step: usize) -> Result<()> {
+                self.steps.push(step);
+                ensure!(self.fail != Some(step), "injected gathered failure");
+                Ok(())
+            }
+        }
+        impl GatheredKernels for Recording {
+            fn gather(&mut self, owner: usize) -> Result<()> { self.step(owner) }
+            fn produce(&mut self) -> Result<()> { self.step(2) }
+            fn attention(&mut self) -> Result<()> { self.step(3) }
+            fn commit(&mut self) -> Result<()> { self.step(4) }
+            fn output(&mut self) -> Result<()> { self.step(5) }
+        }
+        for fail in 0..6 {
+            let mut recording = Recording { steps: Vec::new(), fail: Some(fail) };
+            assert!(gathered_prefill_with(&mut recording).is_err());
+            assert_eq!(recording.steps, (0..=fail).collect::<Vec<_>>());
+        }
+        let mut recording = Recording { steps: Vec::new(), fail: None };
+        gathered_prefill_with(&mut recording)?;
+        assert_eq!(recording.steps, (0..6).collect::<Vec<_>>());
+        Ok(())
     }
 
     #[test]

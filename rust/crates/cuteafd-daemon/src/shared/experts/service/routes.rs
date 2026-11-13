@@ -26,7 +26,7 @@ impl<'a> RouteStaging<'a> {
         let bytes = self.plane_bytes.checked_mul(2).context("route staging size overflow")?;
         self.slots.clear();
         for _ in 0..units {
-            self.slots.push(HostAllocation::named(library, bytes, "experts/workspace/route_staging")?);
+            self.slots.push(HostAllocation::new(library, bytes, crate::shared::memory::tag(crate::shared::memory::MemoryKind::Workspace, "experts/workspace/route_staging"))?);
         }
         Ok(())
     }

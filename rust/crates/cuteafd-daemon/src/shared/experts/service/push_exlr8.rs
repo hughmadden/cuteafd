@@ -2,6 +2,7 @@
 #[cfg(test)]
 #[path = "push_exlr8/tests.rs"]
 mod tests;
+use crate::shared::memory::Tag;
 use super::NativeExpertServiceConfig;
 use crate::shared::{experts::{exlr8::Exlr8Weights, layer::ExpertLoadBudget}, memory::{
     device::Device, push_consumer, push_exlr8::RankPlan, push_initialize,
@@ -12,6 +13,7 @@ use cuteafd_ffi::{push_ring::{RegisteredRing, DEFAULT_SLOT_BYTES, DEFAULT_SLOTS}
 use cuteafd_loader::{plan::exlr8::residency::Residency, push_load::{JoinArgs, PushClient}};
 use cuteafd_transport::worker_selection::push::{self, Offer};
 use std::{net::TcpStream, os::fd::AsRawFd, rc::Rc};
+use cuteafd_core::memory_layout::ArenaTag;
 
 pub(super) fn load<'a>(library: &'a NativeLibrary, config: &NativeExpertServiceConfig,
     residencies: &[Residency], budgets: &[ExpertLoadBudget], resident: usize,
@@ -23,7 +25,7 @@ pub(super) fn load<'a>(library: &'a NativeLibrary, config: &NativeExpertServiceC
         ensure!(checked.plan.files.iter().all(|file|
             cuteafd_loader::push_load::is_push_shard(&root.join(file))), "EXLR8 push source is not a SparkNest shard");
         // Original plans stay alive until the group commits or drains.
-        let headroom = super::spark_runtime_headroom()?;
+        let headroom = super::spark_runtime_headroom(config, cuteafd_core::expert_geometry(), plan.layout.bytes())?;
         let extra = workspace.checked_add(retained_host.checked_mul(2).ok_or_else(||
             anyhow::anyhow!("EXLR8 retained host overflow"))?)
             .and_then(|n| n.checked_add(descriptors))
@@ -49,8 +51,8 @@ fn receive<'a>(library: &'a NativeLibrary, plan: RankPlan,
     tracing::info!(group, rank = rank_id, "Spark EXLR8 push rank joining load group");
     let joined = (|| -> Result<_> {
         let expected = ExpectedCoverage::from_plan(checked, u32::try_from(rank_id)?)?;
-        let arena = LoadingArena::new(device, plan.layout.clone(), expected)?;
-        let ring = RegisteredRing::new(library, DEFAULT_SLOTS, DEFAULT_SLOT_BYTES)?;
+        let arena = LoadingArena::new(device, plan.layout.clone(), expected, ArenaTag::experts("experts/spark-exlr8"))?;
+        let ring = RegisteredRing::new(library, DEFAULT_SLOTS, DEFAULT_SLOT_BYTES, Tag::staging("experts/spark-push-ring"))?;
         let rank = client.join(JoinArgs { group, token, rank: u32::try_from(rank_id)?,
             ring_fd: ring.fd().as_raw_fd(), slots: u32::try_from(ring.slots())?,
             slot_bytes: u32::try_from(ring.slot_bytes())? })?;

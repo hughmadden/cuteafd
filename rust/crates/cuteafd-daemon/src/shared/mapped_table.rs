@@ -10,7 +10,35 @@ use cuteafd_loader::formats::mapped_table::ReadPriority;
 use cuteafd_loader::formats::mapped_table::lookahead::{LookaheadHandle, RowSource as AheadSource, UnitPlan};
 use cuteafd_loader::formats::mapped_table::token_table::{TokenTable, TokenTableLookahead};
 use cuteafd_loader::shared::token_table::TablePipeline;
+use cuteafd_loader::shared::token_table::AdmissionTimedOut;
 use std::{cell::{Cell, RefCell}, ffi::c_void, sync::{Arc, Mutex}, time::Duration};
+use crate::shared::memory::Tag;
+
+/// How long a consumer waits for its rows (and for a staging slot) before it
+/// gives up on the request (unchanged by #1817; only the failure is typed).
+const GATHER_WAIT: Duration = Duration::from_secs(120);
+
+/// Host gather and admission timeouts are the only request-local failures
+/// here: every copy, event, quarantine and worker failure stays terminal.
+fn gather_timeout(table: &str, cause: anyhow::Error) -> anyhow::Error {
+    anyhow::Error::new(crate::shared::experts::rtx::pair::RecoverableStepError::new(
+        crate::shared::experts::rtx::pair::Recovery::HostGather, format!("{table} token-table: {cause:#}")))
+}
+
+/// The consumer's bounded wait for its gathered rows. A timeout cancels the
+/// ticket (the worker returns the slot once its job ends) and is typed
+/// request-local; a failed job or stopped worker is not.
+pub(crate) fn wait_rows<S: Send + 'static, J>(table: &str, ticket: &mut GatherTicket<S, J, anyhow::Error>,
+    timeout: Duration) -> Result<cuteafd_loader::GatherLease<S, J>> {
+    match ticket.wait_timeout(timeout) {
+        Ok(GatherPoll::Ready(lease)) => Ok(lease),
+        Ok(_) => anyhow::bail!("token-table gather cancelled"),
+        Err(GatherFailure::TimedOut(waited)) =>
+            Err(gather_timeout(table, anyhow::anyhow!("gather wait timed out after {waited:?}"))),
+        Err(GatherFailure::Job(error)) => Err(error),
+        Err(GatherFailure::Worker(error)) => Err(error.into()),
+    }
+}
 pub(crate) trait RowSource: Send + Sync {
     fn units(&self) -> usize;
     fn rows(&self, unit: usize) -> &[i64];
@@ -66,7 +94,7 @@ impl<'a> MappedTableDevice<'a> {
         let table = TokenTable::new(table, shares, rows_per_token)?;
         let pipeline = |rows: usize, slots: usize, suffix: &str, priority: ReadPriority| -> Result<Arc<Pipeline>> {
             let table = Arc::clone(&table);
-            let storage = (0..slots).map(|_| Ok(RowSlot { bytes: library.pinned_bytes(rows * table.row_bytes())? }))
+            let storage = (0..slots).map(|_| Ok(RowSlot { bytes: library.pinned_bytes(rows * table.row_bytes(), Tag::staging("shared/mapped-table-rows"))? }))
                 .collect::<Result<Vec<_>>>()?;
             Ok(Arc::new(TablePipeline::new(&format!("{name}-{suffix}"), storage, move |slot: &mut RowSlot, job: &RowJob| {
                 let ids = job.batch.source.rows(job.unit);
@@ -131,16 +159,22 @@ impl<'a> MappedTableDevice<'a> {
         ensure!(!self.library.is_quarantined_after_failed_drain(), "token-table device is quarantined");
         ensure!(dst.device_id == self.device && dst.bytes >= pending.bytes, "token-table destination geometry");
         let started = std::time::Instant::now();
+        // #1817: until the copy below is enqueued this consumer queued nothing;
+        // a host-side wait that gives up here is request-local (`gather_timeout`).
+        // Dropping a ticket cancels its job; the worker returns the slot itself.
         let mut ticket = match pending.ticket.take() {
             Some(ticket) => ticket,
-            None => pending.pipeline.submit_timeout(pending.job.clone(), true, Duration::from_secs(120))?,
+            None => match pending.pipeline.submit_timeout(pending.job.clone(), true, GATHER_WAIT) {
+                Ok(ticket) => ticket,
+                Err(error) if error.is::<AdmissionTimedOut>() => return Err(gather_timeout(self.name, error)),
+                Err(error) => return Err(error),
+            },
         };
-        let mut lease = match ticket.wait_timeout(Duration::from_secs(120)) {
-            Ok(GatherPoll::Ready(lease)) => lease,
-            Ok(_) => anyhow::bail!("token-table gather cancelled"),
-            Err(GatherFailure::Job(error)) => return Err(error),
-            Err(GatherFailure::Worker(error)) => return Err(error.into()),
-        };
+        if super::fault::fire(super::fault::Site::GatherTimeout) {
+            ticket.cancel();
+            return Err(gather_timeout(self.name, anyhow::anyhow!("gather wait timed out after {GATHER_WAIT:?} (injected)")));
+        }
+        let mut lease = wait_rows(self.name, &mut ticket, GATHER_WAIT)?;
         self.lookahead.table().table().stats().record_stall(started.elapsed());
         let slot = lease.slot_mut().context("empty table lease")?;
         let mut destinations = self.destinations.borrow_mut();
@@ -184,6 +218,17 @@ impl<'a> MappedTableDevice<'a> {
         landed?;
         Ok(pending.bytes)
     }
+    /// Request-local recovery (#1817): drain this table's upload stream and
+    /// return every copied staging slot whose copy completed. The owner drains
+    /// the consuming streams first; a failure here is terminal.
+    pub fn drain(&self) -> Result<()> {
+        let _device = Device { library: self.library, id: self.device }.enter()?;
+        ensure!(!self.library.is_quarantined_after_failed_drain(), "token-table device is quarantined");
+        self.upload.drain()?;
+        self.prefill.reclaim_copies()?;
+        self.decode.reclaim_copies()
+    }
+
     /// Record immediately after the PLE reader (or its captured segment).
     /// # Safety
     /// stream contains the reader of the most recently landed destination.
@@ -269,6 +314,25 @@ mod tests {
         let new = source.split("pub fn new(library:").nth(1).unwrap().split("pub fn host_workspace_bytes").next().unwrap();
         assert!(new.contains("table.gather(&rows, &mut slot.bytes.bytes_mut()[..bytes], priority)"));
         assert!(new.contains("(\"mapped-table/row-cache\", cache_bytes as u64)"));
+    }
+
+    /// #1817: only the host-side wait and admission timeouts before any
+    /// enqueue are request-local; every later failure in `finish` is terminal.
+    #[test]
+    fn only_pre_enqueue_gather_timeouts_are_request_local() {
+        let source = include_str!("mapped_table.rs");
+        let finish = source.split("pub unsafe fn finish(").nth(1).unwrap().split("pub fn drain(").next().unwrap();
+        let enqueue = finish.find("super::token_table::enqueue(").unwrap();
+        let typed: Vec<_> = finish.match_indices("gather_timeout(").map(|(at, _)| at).collect();
+        assert!(!typed.is_empty() && typed.iter().all(|&at| at < enqueue), "a request-local error after the copy enqueue");
+        assert!(finish.find("wait_rows(self.name, &mut ticket, GATHER_WAIT)").unwrap() < enqueue);
+        assert!(finish.contains("Err(error) if error.is::<AdmissionTimedOut>()"));
+        assert!(finish.find("fault::Site::GatherTimeout").unwrap() < enqueue);
+        let wait = source.split("pub(crate) fn wait_rows<").nth(1).unwrap().split("\n}").next().unwrap();
+        assert_eq!(wait.matches("gather_timeout(").count(), 1, "only TimedOut is request-local");
+        assert!(wait.contains("Err(GatherFailure::Job(error)) => Err(error)"));
+        assert!(wait.contains("Err(GatherFailure::Worker(error)) => Err(error.into())"));
+        assert!(source.contains("const GATHER_WAIT: Duration = Duration::from_secs(120);"), "timeouts are unchanged");
     }
 
     #[test]

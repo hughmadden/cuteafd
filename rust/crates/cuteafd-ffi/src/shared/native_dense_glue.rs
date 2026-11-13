@@ -22,6 +22,7 @@ pub enum Op {
     TrellisInput { features: u32, rotated_bf16: bool },
     TrellisOutput { features: u32 },
     Mx8Quant { features: u32 },
+    Mx8QuantBf16 { features: u32 },
     SwigluSplit { inter: u32 },
     NarrowPack { width: u32, pitch: u32 },
     IndexWeights { width: u32, outputs: u32 },
@@ -41,6 +42,9 @@ impl Op {
                 ("output", "bfloat16", format!("[rows,{n}]"), "out")], &["rows", "cta_limit"]),
             Op::Mx8Quant { .. } => (vec![
                 ("rotated_inputs", "int64", "[4]".into(), "in"),
+                ("records", "uint8", "[record_bytes]".into(), "out")], &["rows", "rotation_id", "cta_limit"]),
+            Op::Mx8QuantBf16 { .. } => (vec![
+                ("rotated_inputs", "int64", "[1]".into(), "in"),
                 ("records", "uint8", "[record_bytes]".into(), "out")], &["rows", "rotation_id", "cta_limit"]),
             Op::SwigluSplit { inter } => (vec![
                 ("gate", "bfloat16", format!("[rows,{inter}]"), "in"),
@@ -69,12 +73,18 @@ pub fn op_of(entry: &serde_json::Value) -> Result<Option<Op>> {
     Ok(Some(match entry["op"].as_str() {
         Some("dense_mxfp8_quant") => {
             let features = u32_of(g, "input_features")?;
-            if ![2048, 6144, 8192, 12288, 16384].contains(&features)
-                || g["input_dtype"] != "f16" || g["rotation_count"] != 4 || g["max_rows"] != 4096
-                || g["abi_version"] != 2 {
+            if features % 128 != 0 || u64::from(features / 32) * 256 > (i32::MAX as u64) / 8
+                || g["max_rows"] != 4096 || g["abi_version"] != 2 {
                 return Err(invalid("MX8 quant geometry"));
             }
-            Op::Mx8Quant { features }
+            if g["input_dtype"] == "bf16" && g["rotation_count"] == 1 {
+                Op::Mx8QuantBf16 { features }
+            } else if g["input_dtype"] == "f16" && g["rotation_count"] == 4
+                && [2048, 6144, 8192, 12288, 16384].contains(&features) {
+                Op::Mx8Quant { features }
+            } else {
+                return Err(invalid("MX8 quant input dtype/rotation geometry"));
+            }
         }
         Some("trellis_input") => {
             if g["input_dtype"].as_str() != Some("bf16") { return Err(invalid("trellis input takes BF16 rows")); }
@@ -214,6 +224,32 @@ mod tests {
         let mut bad = spec("q", &quant, 4096);
         bad.scratch.insert("records".into(), 1);
         assert!(validate_entry(&bad, &quant).is_err());
+    }
+
+    #[test]
+    fn native_bf16_mx8_quant_has_one_unrotated_input() {
+        let quant = entry("dense_mxfp8_quant",
+            json!({"input_features":6144,"input_dtype":"bf16","rotation_count":1,
+                "max_rows":4096,"abi_version":2}),
+            json!([{"name":"rotated_inputs","dtype":"int64","shape":"[1]","role":"in"},
+                {"name":"records","dtype":"uint8","shape":"[record_bytes]","role":"out"}]),
+            &["rows", "rotation_id", "cta_limit"]);
+        for features in [512, 3072, 6144, 8192, 12288] {
+            let mut candidate = quant.clone();
+            candidate["geometry"]["input_features"] = json!(features);
+            assert_eq!(validate_entry(&spec("q", &candidate, 4096), &candidate).unwrap(),
+                Op::Mx8QuantBf16 { features });
+        }
+        for (field, value) in [("input_features", json!(129)), ("input_features", json!(33554432)),
+            ("input_dtype", json!("f16")), ("rotation_count", json!(4)),
+            ("max_rows", json!(64)), ("abi_version", json!(1))] {
+            let mut bad = quant.clone();
+            bad["geometry"][field] = value;
+            assert!(validate_entry(&spec("q", &bad, 4096), &bad).is_err(), "{field}");
+        }
+        let mut bad = quant.clone();
+        bad["pointers"][0]["shape"] = json!("[4]");
+        assert!(validate_entry(&spec("q", &bad, 4096), &bad).is_err());
     }
 
     #[test]

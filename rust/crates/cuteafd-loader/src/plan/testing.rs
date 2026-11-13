@@ -27,11 +27,7 @@ impl BudgetedPlanInput {
     #[track_caller]
     pub fn plan_spark_count(&self, options: &super::PlanOptions, available: usize,
         explicit: Option<usize>) -> Result<super::PlanReport, super::PlanError> {
-        let started = std::time::Instant::now();
-        let result = self.input.plan_spark_count(options, available, explicit);
-        assert!(started.elapsed() < std::time::Duration::from_secs(30),
-            "full Spark-count plan exceeded 30s: snapshot={} options={options:?}", self.checkpoint().snapshot.display());
-        result
+        super::plan_spark_count_with(&self.input, options, available, explicit, |candidate| self.plan(candidate))
     }
 
     #[track_caller]
@@ -48,6 +44,38 @@ impl BudgetedPlanInput {
 #[track_caller]
 pub fn plan(snapshot: &Path, options: &super::PlanOptions) -> Result<super::PlanReport, super::PlanError> {
     BudgetedPlanInput::open(snapshot)?.plan(options)
+}
+
+/// Rendered admission must retain exact arena extents and one tail per backing.
+#[track_caller]
+pub fn assert_weight_arena_items(
+    device: &cuteafd_core::memory_layout::DeviceLayout,
+    arenas: &[(&crate::serving_capacity::WeightArenaLayout, cuteafd_core::memory_layout::MemoryKind)],
+) {
+    let roots = device.items.iter().filter(|item| item.group == "weight arena").collect::<Vec<_>>();
+    let mut expected = std::collections::BTreeMap::new();
+    for (arena, kind) in arenas {
+        *expected.entry(kind.category()).or_insert(0u64) += arena.bytes() as u64;
+    }
+    assert_eq!(roots.len(), expected.len());
+    for root in &roots {
+        assert_eq!(Some(&root.bytes), expected.get(&root.category));
+    }
+    let bytes = arenas.iter().map(|(arena, _)| arena.bytes() as u64).sum::<u64>();
+    let mut tails = 0;
+    for (arena, kind) in arenas {
+        let id = format!("{}.tail (", arena.id());
+        let owners = device.items.iter().filter(|item| item.group == "allocation granularity"
+            && item.format.starts_with(&id)).collect::<Vec<_>>();
+        assert_eq!(owners.len(), 1, "{}", arena.id());
+        assert_eq!(owners[0].category, kind.category(), "{}", arena.id());
+        let extent = arena.bytes() as u64;
+        let tail = extent.div_ceil(2 << 20) * (2 << 20) - extent;
+        assert_eq!(owners[0].bytes, tail, "{}", arena.id());
+        tails += owners[0].bytes;
+    }
+    assert_eq!(bytes + tails, arenas.iter().map(|(arena, _)|
+        (arena.bytes() as u64).div_ceil(2 << 20) * (2 << 20)).sum::<u64>());
 }
 
 /// Tiny native TikToken snapshot, deliberately without tokenizer.json.
@@ -120,7 +148,17 @@ fn width(dtype: &str) -> u64 {
 pub fn write_safetensors(path: &Path, tensors: &[Tensor]) {
     let mut header = serde_json::Map::new();
     let mut offset = 0u64;
+    // Fixtures composed from several generators may declare one tensor twice
+    // (e.g. a router both the coordinator and expert fixtures carry): write it
+    // once. A conflicting second declaration is a broken fixture, never merged.
+    let mut seen = std::collections::BTreeMap::<&str, (&str, &[usize])>::new();
     for (name, dtype, shape) in tensors {
+        if let Some(&(first_dtype, first_shape)) = seen.get(name.as_str()) {
+            assert!(first_dtype == *dtype && first_shape == shape.as_slice(),
+                "fixture declares {name} twice with different headers");
+            continue;
+        }
+        seen.insert(name.as_str(), (dtype, shape.as_slice()));
         let bytes = shape.iter().product::<usize>() as u64 * width(dtype);
         header.insert(name.clone(), json!({"dtype": dtype, "shape": shape, "data_offsets": [offset, offset + bytes]}));
         offset += bytes;
@@ -491,6 +529,34 @@ pub fn glm_k6_programs(cfg: &crate::families::glm5::GlmDsaConfig, core: &crate::
                 "scratch_bytes_at_capacity":if i == 1 { json!({"partial":4096*k.div_ceil(1024)*n*4}) } else { json!({}) }}));
         }
     }
+    for ranks in [1, 2] { for owner in if ranks == 1 { vec![None] } else { vec![None, Some(0), Some(1)] } {
+        for layer in 0..cfg.layers {
+            for layouts in core.layer_native(cfg, layer, ranks, owner)? {
+                for layout in layouts.into_values() {
+                    use cuteafd_ffi::draft_projection::ProjectionOutput;
+                    let [n, k] = layout.shape;
+                    let output = crate::families::glm5::core::native_output(&layout);
+                    for stage in if layout.fp8 { &[64, 4096][..] } else { &[4096][..] } {
+                        let entry = if layout.fp8 {
+                            let suffix = if output == ProjectionOutput::F32 { "_f32" } else { "" };
+                            json!({"name":format!("native_attention_n{n}_k{k}_m{stage}{suffix}"),"capacity_rows":stage,
+                                "pointers":[{"name":"x"},{"name":"weight"},{"name":"scales"},{"name":"out"},{"name":"scratch"}],
+                                "scalars":[{"type":"int32"}],"scratch_bytes_at_capacity":{"scratch":256},
+                                "geometry":{"input_features":k,"output_features":n,"output_dtype":output.torch_dtype(),
+                                    "max_rows":stage,"decode_rows":64,"scale_block":128,"storage":"row_major_e4m3",
+                                    "reduction":"canonical_fp8_gemv64_w8a16"}})
+                        } else {
+                            json!({"name":output.program_name(k,n),"capacity_rows":stage,
+                                "pointers":[{"name":"x"},{"name":"w"},{"name":"out"}],"scalars":[{"type":"int32"}],
+                                "scratch_bytes_at_capacity":{},"geometry":{"width":k,"outputs":n,
+                                    "output_dtype":output.torch_dtype(),"reduction":"ordered_k16","tiles_by_rows":[[16,1,4,16,64,6]]}})
+                        };
+                        programs.insert(entry["name"].as_str().unwrap().to_owned(), entry);
+                    }
+                }
+            }
+        }
+    } }
     for (prefix, ranks) in [("glm", 1), ("glm2", 2)] {
         for inter in [cfg.dense_intermediate / ranks, cfg.moe_intermediate * cfg.shared_experts / ranks] {
             let name = format!("{prefix}_stage_swiglu_i{inter}");
@@ -560,6 +626,31 @@ pub fn glm5_flash_vision_tensors() -> Vec<Tensor> {
         .map(|(name, shape)| t(format!("model.visual.{name}"), "BF16", &shape)).collect()
 }
 
+/// Minimal executable FP8 Flash package and step exports for admission fixtures.
+pub fn write_glm5_flash_workspaces(root: &Path) -> std::path::PathBuf {
+    let share = root.join("share");
+    let package = root.join("lib/fp8/fp8-glmf");
+    fs::create_dir_all(&share).unwrap();
+    fs::create_dir_all(&package).unwrap();
+    let layout = json!({"abi_version":6,"projection":"bf16","activation":"silu_bf16_product","swiglu_limit":0.0,"swiglu_alpha":1.0,"swiglu_beta":0.0,"weights":"fp8","capacities":[{"capacity":4096,"scratch_bytes":4096}]});
+    fs::write(package.join("manifest.json"), json!({"layouts":{"tp1":layout,"tp2":layout}}).to_string()).unwrap();
+    let programs: Vec<_> = ["mhc_post_pre", "kda", "kda_s16", "kda_s16t", "kda_w8",
+        "kda_w8_s16", "kda_w8_s16t", "mla_producer", "o", "ffn_i2048",
+        "ffn_i12288", "index_producer"].into_iter().flat_map(|name|
+            ["m64", "m4096"].map(move |cap| format!("glmf_{name}_{cap}")))
+        .chain(["glmf_mhc_pre", "glmf_sparse_mla_decode_m64", "glmf_sparse_mla_prefill_m4096",
+            "glmf_index_topk_decode_m64", "glmf_index_topk_prefill_m4096",
+            "glmf2_kda_w8_norm_m64", "glmf2_kda_output_rows_m64",
+            "glmf2_kda_w8_norm_m4096", "glmf2_kda_output_rows_m4096",
+            "glmf2_kda_w8_norm_expanded_m4096", "glmf2_kda_output_rows_expanded_m4096",
+            "glmf2_kda_w8_m64", "glmf2_kda_w8_m4096",
+            "glmf2_kda_w8_expanded_m4096"].map(str::to_string))
+        .map(|name| json!({"name":name,"scratch_bytes_at_capacity":{"scratch":4096}})).collect();
+    let path = share.join("PROGRAMS.json");
+    fs::write(&path, json!({"capacities":{"max_context":131072},"programs":programs}).to_string()).unwrap();
+    path
+}
+
 /// Complete coordinator headers plus one expert per routed layer; payloads stay sparse.
 pub fn glm5_flash_tensors(config: &Value) -> Vec<Tensor> {
     use crate::families::glm5_flash::{GlmNextAttention, GlmNextConfig};
@@ -625,29 +716,88 @@ pub fn qwen4_config(layers: usize) -> Value {
 }
 
 /// Qwen's coordinator headers for `layers` target layers (and one native MTP
-/// layer with `mtp`): exactly what `checkpoint_resident_bytes` packs, so a
-/// fixture's plan charges the serve-qwen4 resident inventory.
+/// layer with `mtp`): the HF source tensors the serve-qwen4 loader reads, at
+/// their real shapes, so a fixture's plan charges the loader's own arena
+/// layouts (`weight_layout::coordinator_arenas`) and its resident inventory.
 pub fn qwen4_coordinator(config: &Value, mtp: bool) -> Vec<Tensor> {
-    use crate::families::qwen4::{resident::layer_projections, Qwen4Attention, Qwen4Config};
+    use crate::families::qwen4::{Qwen4Attention, Qwen4Config};
     let cfg = Qwen4Config::from_hf(config).unwrap();
     let h = cfg.hidden;
-    let mut out = vec![t("model.language_model.embed_tokens.weight", "BF16", &[cfg.vocab_size, h]),
+    // The stream width hyper-connections mix over, and their low rank.
+    let (stream, rank) = (cfg.hc_width(), cfg.hc_lowrank);
+    let lm = "model.language_model";
+    let mut out = vec![t(format!("{lm}.embed_tokens.weight"), "BF16", &[cfg.vocab_size, h]),
         t("lm_head.weight", "BF16", &[cfg.vocab_size, h])];
-    let layer = |out: &mut Vec<Tensor>, p: String, attention: Qwen4Attention| {
-        // Both selectable projections as one BF16 matrix each, at their packed shapes.
-        for projection in layer_projections(&cfg, attention, None) {
-            out.push(t(format!("{p}.self_attn.{}.weight", projection.operand), "BF16", &[projection.rows, projection.cols]));
+    // A hyper-connection site, at the installed checkpoint's shapes: norm over
+    // the stream, low-rank down (row-joined with the block injection), up.
+    let hyper = |out: &mut Vec<Tensor>, p: &str, inject: bool| {
+        out.extend([t(format!("{p}.hc_norm.weight"), "BF16", &[stream]),
+            t(format!("{p}.input_mix_weight_down.weight"), "BF16", &[rank, stream]),
+            t(format!("{p}.input_mix_weight_up.weight"), "BF16", &[stream, rank])]);
+        if inject { out.push(t(format!("{p}.block_inject_weight.weight"), "BF16", &[cfg.hc_count, stream])); }
+    };
+    let layer = |out: &mut Vec<Tensor>, p: String, attention: Qwen4Attention, ple: bool| {
+        hyper(out, &format!("{p}.attn_hyper_connection"), true);
+        hyper(out, &format!("{p}.mlp_hyper_connection"), true);
+        match attention {
+            Qwen4Attention::Gdn => {
+                let a = format!("{p}.linear_attn");
+                // [q; k; v] conv channels, then z, b and a: rows sum to layer_projections' w_in.
+                out.extend([t(format!("{a}.in_proj_qkv.weight"), "BF16", &[cfg.gdn_conv_width(), h]),
+                    t(format!("{a}.in_proj_z.weight"), "BF16", &[cfg.gdn_value_width(), h]),
+                    t(format!("{a}.in_proj_b.weight"), "BF16", &[cfg.gdn_value_heads, h]),
+                    t(format!("{a}.in_proj_a.weight"), "BF16", &[cfg.gdn_value_heads, h]),
+                    t(format!("{a}.out_proj.weight"), "BF16", &[h, cfg.gdn_value_width()]),
+                    t(format!("{a}.conv1d.weight"), "BF16", &[cfg.gdn_conv_width(), 1, cfg.conv_kernel]),
+                    t(format!("{a}.A_log"), "BF16", &[cfg.gdn_value_heads]),
+                    t(format!("{a}.dt_bias"), "BF16", &[cfg.gdn_value_heads]),
+                    t(format!("{a}.norm.weight"), "BF16", &[cfg.gdn_head_dim])]);
+            }
+            Qwen4Attention::Full => {
+                let a = format!("{p}.self_attn");
+                let (hd, ihd) = (cfg.head_dim, cfg.index_head_dim);
+                // Gated q, k, v and the indexer q/k: rows sum to layer_projections' w_in.
+                out.extend([t(format!("{a}.q_proj.weight"), "BF16", &[2 * cfg.heads * hd, h]),
+                    t(format!("{a}.k_proj.weight"), "BF16", &[cfg.kv_heads * hd, h]),
+                    t(format!("{a}.v_proj.weight"), "BF16", &[cfg.kv_heads * hd, h]),
+                    t(format!("{a}.indexer.index_qk_proj.weight"), "BF16", &[(cfg.index_heads + 1) * ihd, h]),
+                    t(format!("{a}.o_proj.weight"), "BF16", &[h, cfg.heads * hd]),
+                    t(format!("{a}.q_norm.weight"), "BF16", &[hd]),
+                    t(format!("{a}.k_norm.weight"), "BF16", &[hd]),
+                    t(format!("{a}.indexer.q_layernorm.weight"), "BF16", &[ihd]),
+                    t(format!("{a}.indexer.k_layernorm.weight"), "BF16", &[ihd])]);
+            }
         }
         let s = cfg.shared_intermediate;
-        out.extend([t(format!("{p}.mlp.shared_expert.gate_proj.weight"), "BF16", &[s, h]),
+        out.extend([t(format!("{p}.mlp.gate.weight"), "BF16", &[cfg.experts, h]),
+            t(format!("{p}.mlp.shared_expert.gate_proj.weight"), "BF16", &[s, h]),
             t(format!("{p}.mlp.shared_expert.up_proj.weight"), "BF16", &[s, h]),
             t(format!("{p}.mlp.shared_expert_gate.weight"), "BF16", &[1, h]),
             t(format!("{p}.mlp.shared_expert.down_proj.weight"), "BF16", &[h, s])]);
+        if ple {
+            // Installed shapes: key/norms/conv over the stream, value over hidden;
+            // key and value share columns, as their row concatenation requires.
+            let e = format!("{p}.ple");
+            out.extend([t(format!("{e}.key_proj.weight"), "BF16", &[stream, h]),
+                t(format!("{e}.value_proj.weight"), "BF16", &[h, h]),
+                t(format!("{e}.norm_key.weight"), "BF16", &[stream]),
+                t(format!("{e}.norm_query.weight"), "BF16", &[stream]),
+                t(format!("{e}.norm_conv.weight"), "BF16", &[stream]),
+                t(format!("{e}.conv1d.weight"), "BF16", &[stream, 1, cfg.conv_kernel])]);
+        }
     };
+    hyper(&mut out, &format!("{lm}.hyper_connection_mixer"), false);
     for l in 0..cfg.layers {
-        layer(&mut out, format!("model.language_model.layers.{l}"), cfg.attention[l]);
+        layer(&mut out, format!("{lm}.layers.{l}"), cfg.attention[l], cfg.ple_layers.contains(&l));
     }
-    if mtp { layer(&mut out, "mtp.layers.0".into(), Qwen4Attention::Full); }
+    if mtp {
+        layer(&mut out, "mtp.layers.0".into(), Qwen4Attention::Full, false);
+        hyper(&mut out, "mtp.hyper_connection_mixer", false);
+        out.extend([t("mtp.pre_fc_norm_hidden.weight", "BF16", &[cfg.hc_width()]),
+            t("mtp.pre_fc_norm_embedding.weight", "BF16", &[h]),
+            t("mtp.fc_hidden.weight", "BF16", &[h, h]),
+            t("mtp.fc_embedding.weight", "BF16", &[h, h])]);
+    }
     out
 }
 
@@ -1479,7 +1629,7 @@ fn install_step5_rtx_expert_packages(manifest: &std::path::Path) {
         let capacities = |scale: u64| [1u64, 16, 80, 256, 1024, 4096].map(|capacity|
             serde_json::json!({"capacity": capacity, "scratch_bytes": capacity * scale}));
         std::fs::write(package.join("manifest.json"), serde_json::to_vec(&serde_json::json!({"layouts": {
-            "tp1": {"capacities": capacities(65536)}, "tp2": {"capacities": capacities(32768)}}})).unwrap()).unwrap();
+            "tp1": {"abi_version":6,"projection":"bf16","activation":"silu_bf16_product","swiglu_limit":0.0,"swiglu_alpha":1.0,"swiglu_beta":0.0,"weights":"fp8","capacities": capacities(65536)}, "tp2": {"abi_version":6,"projection":"bf16","activation":"silu_bf16_product","swiglu_limit":0.0,"swiglu_alpha":1.0,"swiglu_beta":0.0,"weights":"fp8","capacities": capacities(32768)}}})).unwrap()).unwrap();
     }
     install_step5_exl3_rtx_package(manifest);
 }
@@ -1612,4 +1762,73 @@ pub fn write_mistral_large4_snapshot(dir: &Path, expert_layers: Option<&[usize]>
             "add_pre_mm_projector_layer_norm": true, "adapter_bias": false}}).to_string()).unwrap();
     fs::write(dir.join("processor_config.json"),
         include_str!("../families/mistral_large4/official-processor-config.json")).unwrap();
+}
+
+/// Three complete indexed core views with private core shards and one shared backing.
+pub fn write_mc_snapshot(dir: &Path, config: &Value, tensors: &[Tensor],
+    shapes: &std::collections::BTreeMap<String, Vec<usize>>) {
+    use sha2::{Digest, Sha256};
+    use std::collections::BTreeMap;
+    fs::create_dir_all(dir).unwrap();
+    let core_stems = shapes.keys().map(|n| n.strip_suffix(".weight").unwrap()).collect::<Vec<_>>();
+    let shared = tensors.iter().filter(|(name, ..)| !core_stems.iter().any(|stem|
+        name.strip_prefix(stem).is_some_and(|tail| tail.starts_with('.')))).cloned().collect::<Vec<_>>();
+    let shard = "shared-and-core.safetensors";
+    let mut h = Sha256::new();
+    let shared_map: BTreeMap<_, _> = shared.iter().map(|(name, ..)| (name.clone(), shard)).collect();
+    for (name, shard) in &shared_map { h.update(format!("{name}\0{shard}\n")); }
+    let shared_digest = format!("{:x}", h.finalize());
+    let all: BTreeMap<String, Tensor> = shared.iter().cloned().map(|t| (t.0.clone(), t)).collect();
+    let mut variants = Vec::new();
+    for (view, bits, suffix) in [("original", 16, ""), ("k6-compact", 6, ".k6"), ("k8-compact", 8, ".k8")] {
+        let index_name = format!("model{suffix}.safetensors.index.json");
+        let config_name = format!("config{suffix}.json");
+        let quant_name = format!("quantize_config{suffix}.json");
+        let mut active = shared.clone();
+        let mut core = Vec::new();
+        for (name, shape) in shapes {
+            let stem = name.strip_suffix(".weight").unwrap();
+            let generated = if bits == 16 { vec![t(name, "BF16", shape)] }
+                else { exl3(&format!("{stem}{suffix}"), shape[0].next_multiple_of(128), shape[1], bits) };
+            for mut tensor in generated {
+                // Views select the canonical module names but use private shards
+                // for alternate payloads that share tensor names.
+                tensor.0 = tensor.0.replace(&format!("{stem}{suffix}."), &format!("{stem}."));
+                core.push(tensor.0.clone());
+                active.push(tensor);
+            }
+        }
+        let core_shard = format!("core{suffix}.safetensors");
+        let core_set = core.iter().collect::<std::collections::BTreeSet<_>>();
+        write_safetensors(&dir.join(&core_shard), &active.iter().filter(|t| core_set.contains(&t.0)).cloned().collect::<Vec<_>>());
+        let weights: BTreeMap<_, _> = active.iter().map(|(name, ..)| (name.clone(),
+            if core_set.contains(name) { core_shard.as_str() } else { shard })).collect();
+        let projections = active.iter().filter_map(|(name, _, shape)| name.strip_suffix(".trellis")
+            .map(|stem| (stem.to_owned(), shape[2]/16, shape[0]*16, shape[1]*16))).collect::<Vec<_>>();
+        let mut cfg = config.clone();
+        let mut compact = exl3_compact(4);
+        if let Some(source) = config.get("quantization_config").and_then(Value::as_object) {
+            compact.as_object_mut().unwrap().extend(source.clone());
+        }
+        compact["per_module_metadata"] = json!(format!("{quant_name}:tensor_storage"));
+        cfg["quantization_config"] = compact.clone();
+        cfg["transformers_weights"] = json!(index_name);
+        let quant = exl3_manifest(&compact, &projections);
+        let mut hashes = BTreeMap::new();
+        for (name, value) in [(&config_name, cfg), (&quant_name, quant), (&index_name, json!({"weight_map":weights}))] {
+            let bytes = serde_json::to_vec(&value).unwrap();
+            hashes.insert(name.clone(), format!("{:x}", Sha256::digest(&bytes)));
+            fs::write(dir.join(name), bytes).unwrap();
+        }
+        core.sort();
+        let mut h = Sha256::new();
+        h.update(format!("cuteafd-mc-view-v1\0{view}\0{shared_digest}\0"));
+        for (name, digest) in &hashes { h.update(format!("{name}\0{digest}\n")); }
+        variants.push(json!({"name":view, "index":index_name, "config":config_name, "quantize":quant_name,
+            "core_bits":bits, "core_tensors":core, "metadata_sha256":hashes, "fingerprint":format!("{:x}", h.finalize())}));
+    }
+    write_safetensors(&dir.join(shard), &all.into_values().collect::<Vec<_>>());
+    fs::write(dir.join("cuteafd-mc.json"), json!({"schema":"cuteafd-mc-v1",
+        "source":{"repo":"test/source", "revision":"0123456789012345678901234567890123456789"},
+        "original_core_dtype":"BF16", "shared_inventory_sha256":shared_digest, "variants":variants}).to_string()).unwrap();
 }

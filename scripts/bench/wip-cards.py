@@ -26,9 +26,12 @@ import argparse
 import base64
 import concurrent.futures
 import contextlib
+import datetime
+import math
 import functools
 import itertools
 import hashlib
+from http.client import HTTPException
 import importlib.util
 import json
 import os
@@ -55,7 +58,7 @@ _cdi = importlib.util.module_from_spec(_cdi_spec)
 _cdi_spec.loader.exec_module(_cdi)
 cdi_gpu_args = _cdi.cdi_gpu_args
 sys.path.insert(0, str(REPO / 'scripts/lib'))
-from wip_aot_scopes import family_scopes
+from wip_aot_scopes import exl3_spark_layouts, family_scopes
 _hw_spec = importlib.util.spec_from_file_location('hwlock', REPO / 'scripts/hw/hwlock.py')
 hwlock = importlib.util.module_from_spec(_hw_spec)
 _hw_spec.loader.exec_module(hwlock)
@@ -80,7 +83,7 @@ ANSI = re.compile(r'\x1b\[[0-9;]*m')
 METRICS = ('C1', 'C8', '8K', 'kl', 'top1', 'pool', 'readiness_s')
 # Before -> after table: baseline card metrics, then the client sweep's levels
 # (sweep C<n>) and post-load C1, which are separate measurements.
-SUMMARY_METRICS = ('C1', 'C8', 'sweep C1', 'sweep C4', 'sweep C8', 'sweep C16', 'post-load C1', '8K', 'kl', 'top1', 'pool', 'readiness_s')
+SUMMARY_METRICS = ('C1', 'C8', 'sweep C1', 'sweep C4', 'sweep C8', 'sweep C16', 'post-load C1', '8K', '8K w/tail', 'kl', 'top1', 'pool', 'readiness_s')
 FIDELITY_PANELS = {'fidelity', 'fidelity_full'}
 LOWER_IS_BETTER = {'kl', 'readiness_s'}  # also every 'prefill N TTFT s'
 FAILURE = re.compile(r'(?i)(\berror\b|\bpanicked\b|\bfatal\b|\bfailed\b|undefined symbol|no such file|refus|exited:|timed out|out of memory|traceback)')
@@ -143,7 +146,7 @@ def resolve_container_keys(entry):
 def container_targets(job):
     resolved = resolve_container_keys(job['entry'])
     targets = [('raptor', 'cuteafd-coordinator-' + resolved['instance'])]
-    targets += [(host, f"cuteafd-spark-expert-{host}-{resolved['expert_port']}") for host in resolved['sparks']]
+    targets += [(host, f"cuteafd-spark-expert-{host}-{resolved['expert_port']}") for host in job.get('spark_role_hosts', resolved['sparks'])]
     return targets
 
 
@@ -340,8 +343,12 @@ def generate(entry, arm_name, arm, state, key_file, overrides, probes, expected_
     entry = json.loads(json.dumps(entry))
     requested_panels(entry.get('profile', 'smoke'), binary=binary)
     entry['fabric'] = 'fabric' in probes
-    values = config(entry['config'])
-    values.update(entry.pop('set', {}))
+    values = entry.pop('resolved_values', None)
+    if values is None:
+        values = config(entry['config'])
+        values.update(entry.pop('set', {}))
+    else:
+        entry.pop('set', None)
     simulated = values.pop('BENCH_SIMULATED', '') or 'sim5090' in entry['name'] or 'sim-5090' in entry['name']
     values.pop('BENCH_HARDWARE_CLASS', None)
     values.update(overrides)
@@ -396,11 +403,13 @@ def generate(entry, arm_name, arm, state, key_file, overrides, probes, expected_
     label = f'{card}-{arm_name}-r{repeat}' + ('-simulated' if simulated else '')
     dest = state / label
     dest.mkdir(parents=True, exist_ok=True)
-    if values.get('PROFILE') or values.get('PROFILE_SPARK'):
+    if values.get('PROFILE') or values.get('PROFILE_SPARK') or 'memory' in probes:
         # One per-job directory, mounted on the coordinator and every Spark at
         # the same path; Spark-side files are collected back after the run.
         values['PROFILE_DIR'] = str(dest / 'profile')
         (dest / 'profile').mkdir(exist_ok=True)
+        if 'memory' in probes:
+            save(dest / 'profile' / 'observer-context.json', {'pending': True})
         # nsys sessions start paused (the coordinator's under PROFILE=nsys, each
         # selected Spark rank's under PROFILE_SPARK=nsys); smoke opens them after
         # the sweep's first warm wave and closes them (writing the reports) at
@@ -464,14 +473,30 @@ def generate(entry, arm_name, arm, state, key_file, overrides, probes, expected_
     entry.update(name=label, config=str(base), set=values, gpus=gpus, sparks=hosts, run_args=run_args)
     job = dict(card=card, arm=arm_name, repeat=repeat, simulated=bool(simulated), state=str(dest), entry=entry, metadata=metadata, probes=probes, expected_pool=expected_pool, trace=bool(trace))
     hook = [sys.executable, str(Path(__file__).resolve())]
+    if 'census' in values.get('PROFILE', '').split(',') and (entry.get('levels') or entry.get('prefill_lengths')):
+        sample = dict(argv=hook + ['--census-final-sample', str(dest / 'job.json')], timeout_s=180, required=True)
+        window = entry.setdefault('window', dict(open=dict(argv=['true'], timeout_s=10, required=True)))
+        previous = window.get('close')
+        if previous:
+            sample['argv'] = window_argv([previous['argv'], sample['argv']])
+            sample['timeout_s'] += previous.get('timeout_s', 0)
+        window['close'] = sample
     timeout = int(entry.get('timeout_s', 900)) + int(entry.get('run_timeout_s', 900)) + 120
     if probes & {'memory', 'console'} or trace:
         entry['observer'] = dict(argv=hook + ['--observe', str(dest / 'job.json')], timeout_s=min(timeout, 7200),
                                  finish_timeout_s=OBSERVER_FINISH_TIMEOUT_S, required=True)
         if 'memory' in probes:
             entry['observer']['cleanup'] = sampler_cleanup(job)
-    if expected_pool is not None or 'image' in probes:
+    if expected_pool is not None or 'image' in probes or ('memory' in probes and hosts):
         entry['precheck'] = dict(argv=hook + ['--precheck', str(dest / 'job.json')], timeout_s=180, required=True)
+    if 'memory' in probes and hosts and (entry.get('levels') or entry.get('prefill_lengths')):
+        sample = dict(argv=hook + ['--spark-memory-boundary', str(dest / 'job.json')], timeout_s=20, required=True)
+        window = entry.setdefault('window', dict(open=dict(argv=['true'], timeout_s=10, required=True)))
+        previous = window.get('close')
+        if previous:
+            sample['argv'] = window_argv([previous['argv'], sample['argv']])
+            sample['timeout_s'] += previous.get('timeout_s', 0)
+        window['close'] = sample
     # Re-checked at grant: smoke runs prelaunch once it holds this card's locks.
     entry['prelaunch'] = dict(argv=hook + ['--preflight-job', str(dest / 'job.json')], timeout_s=300, required=True)
     save(dest / 'job.json', {**job, 'probes': sorted(probes)})
@@ -669,8 +694,39 @@ def preflight_at_grant(job, arm):
     """Smoke's prelaunch hook, run once it holds this card's locks: the absence of
     our containers is only meaningful then. Checked up front it would refuse a job
     queued behind a running task that still holds a container of the same name."""
+    artifacts = preflight_job(job, arm)
     assert_absent(job)
-    return preflight_job(job, arm)
+    if 'memory' in job['probes']:
+        save(Path(job['entry']['set']['PROFILE_DIR']) / 'observer-context.json', {'pending': True})
+    return artifacts
+
+
+def preflight_deployment(job, arm):
+    """Use the launcher's CPU deployment admission, not a second family policy."""
+    repo = Path(arm.get('repo', REPO))
+    entry = job['entry']
+    cmd = [str(repo / 'run.sh'), '--config', entry['config'],
+           *entry.get('run_args', []), '--dry-run', '--total-capacity']
+    for key, value in sorted(entry.get('set', {}).items()):
+        cmd += ['--set', f'{key}={value}']
+    try:
+        result = run(cmd, timeout=300)
+    except subprocess.CalledProcessError as error:
+        detail = (error.stderr or error.stdout or str(error)).strip()
+        raise ValueError('launcher deployment preflight refused: ' + detail) from None
+    except subprocess.TimeoutExpired:
+        raise ValueError('launcher deployment preflight timed out after 300 seconds') from None
+    decoder = json.JSONDecoder()
+    for offset, char in enumerate(result.stdout):
+        if char != '{':
+            continue
+        try:
+            deployment, _ = decoder.raw_decode(result.stdout[offset:])
+        except ValueError:
+            continue
+        if isinstance(deployment, dict) and isinstance(deployment.get('spark_roles'), list):
+            return deployment
+    raise ValueError('launcher deployment preflight returned no typed Spark roles')
 
 
 def preflight_job(job, arm):
@@ -686,26 +742,67 @@ def preflight_job(job, arm):
         container_targets(job)
     except ValueError as error:
         problems.append(str(error))
-    for host in ('raptor', *(h for h in job['entry']['sparks'] if isinstance(h, str) and h in HOSTS)):
+    if problems:
+        raise ValueError('; '.join(problems))
+    deployment = preflight_deployment(job, arm)
+    required_packages = deployment.get('artifact_requirements', {}).get('spark_packages')
+    if required_packages is None:
+        # Older sealed binaries register recipes but do not attest installed variants.
+        tp = deployment.get('topology', {}).get('tp') or int(values.get('SPARK_COUNT', 0))
+        required_packages = {package: exl3_spark_layouts(
+            package.removeprefix('exl3/exl3-').rsplit('-k', 1)[0] + ':exl3-k' + package.rsplit('-k', 1)[1], tp)
+            for package in needs['spark'] if package.startswith('exl3/') and tp}
+    inventory = resolve_container_keys(job['entry'])['sparks']
+    active_roles = {}
+    for role in deployment['spark_roles']:
+        rank = role.get('rank')
+        if type(rank) is not int or not 0 <= rank < len(inventory):
+            raise ValueError(f'planner Spark role rank has no configured host: {rank!r}')
+        active_roles[inventory[rank]] = role
+    job['spark_role_hosts'] = list(active_roles)
+    for host in ('raptor', *active_roles):
         meta = json.loads(slot_check(arm, host))
         release = 'release' in arm
         keys = ('image', 'image_id', 'repo_digests') if release else ('slot', 'seal_sha256', 'artifact_manifest_sha256')
         artifacts[host] = {k: meta[k] for k in keys}
         contents = meta.get('contents')
+        if host != 'raptor' and active_roles[host]['experts'] and required_packages and release:
+            command = ['docker', 'run', '--rm', '--network', 'none', '-i', '--entrypoint', 'python3',
+                       meta['image'], '-', json.dumps(required_packages),
+                       f"{job['card']} {job['entry'].get('family', '<unknown>')} {host} image {meta['image_id']}"]
+            try:
+                run(['ssh', '-o', 'BatchMode=yes', host, shlex.join(command)],
+                    input=(REPO / 'scripts/launch/preflight-spark-packages.py').read_text())
+            except subprocess.SubprocessError as error:
+                problems.append((getattr(error, 'stderr', None) or str(error)).strip())
+        if host != 'raptor' and active_roles[host]['experts'] and required_packages and not release:
+            present = set((contents or {}).get('spark_variants', []))
+            for package, layouts in required_packages.items():
+                for layout in layouts:
+                    variant = f'{package}/{layout}'
+                    if variant not in present:
+                        problems.append(f"{job['card']} {job['entry'].get('family', '<unknown>')}: {host}: "
+                                        f"missing Spark package {variant}; seal {meta['seal_sha256']} "
+                                        f"slot {arm['slot']}")
         if release or contents is None:
             continue
-        wanted = needs['coordinator'] if host == 'raptor' else needs['spark']
+        role = active_roles.get(host)
+        wanted = needs['coordinator'] if host == 'raptor' else (needs['spark'] if role['experts'] else [])
         missing = sorted(set(wanted) - set(contents['packages']))
         if missing:
             problems.append(f"{host}: slot {arm['slot']} lacks {', '.join(missing)} (build with the card's scopes: wip-cards --build)")
-        if needs['audio'] and contents.get('audio') is False:
+        needs_audio = needs['audio'] if host == 'raptor' else bool(role.get('audio_encoder'))
+        if needs_audio and contents.get('audio') is False:
             problems.append(f"{host}: slot {arm['slot']} was built without the audio tower (AUDIO={values.get('AUDIO', 'auto')}); "
                             'rebuild with CUTEAFD_WIP_AUDIO_AOT=ON or set AUDIO=off')
-        role = needs.get('tp_role')
+        if needs_audio and job['entry'].get('family') == 'muse_spark' and contents.get('pcm_audio') is not True:
+            problems.append(f"{host}: slot {arm['slot']} lacks the Muse audio tower (cuteafd_pcm_required); "
+                            'rebuild with CUTEAFD_WIP_AUDIO_AOT=ON')
+        tp_role = deployment.get('artifact_requirements', {}).get('spark_tp_role')
         # The seal check always reports tp_roles (None: no TP manifest); a record
         # without the field is not a seal check result and carries no attestation.
-        if role and host != 'raptor' and 'tp_roles' in contents:
-            problems.extend(tp_role_problems(host, arm['slot'], role, needs.get('nvfp4', False), contents))
+        if tp_role and host != 'raptor' and role['experts'] and 'tp_roles' in contents:
+            problems.extend(tp_role_problems(host, arm['slot'], tp_role, needs.get('nvfp4', False), contents))
     for key in ('SPECULATION_TRACE', 'PROFILE_DIR'):
         if values.get(key):
             directory = Path(values[key]) if key == 'PROFILE_DIR' else Path(values[key]).parent
@@ -865,14 +962,56 @@ def wait_detached(process, grace=SMOKE_STOP_GRACE_S):
             _LIVE.pop(id(process), None)
 
 
-def http(url, path, body=None):
+def http(url, path, body=None, timeout=120):
     data = None if body is None else json.dumps(body).encode()
     request = urllib.request.Request(url + path, data=data, headers={'Authorization': 'Bearer ' + os.environ['CUTEAFD_API_KEY'], 'Content-Type': 'application/json'})
     try:
-        with urllib.request.urlopen(request, timeout=120) as response:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
             return json.load(response)
     except urllib.error.HTTPError as error:
         raise RuntimeError(f'HTTP {error.code}: {error.read().decode(errors="replace")}') from None
+
+
+def census_final_sample(job):
+    """Close census evidence on the server's report clock, outside timed work."""
+    sample = http(os.environ['CUTEAFD_SMOKE_URL'], '/v1/thermal')
+    validate_census_clock(sample['now_s'])
+    save(Path(job['state']) / 'census-final-thermal.json', sample)
+
+
+def validate_census_clock(value):
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
+        raise ValueError('invalid census server clock')
+    return value
+
+
+def merge_census_marker(job):
+    """Translate server now_s through daemon clock anchors, never client time."""
+    dest = Path(job['state'])
+    sample = json.loads((dest / 'census-final-thermal.json').read_text())
+    now = validate_census_clock(sample['now_s'])
+    log = dest / 'smoke' / 'logs' / (job['entry']['name'] + '.coordinator.log')
+    text = log.read_text()
+    offsets = []
+    decoder = json.JSONDecoder()
+    for raw in text.splitlines():
+        line = ANSI.sub('', raw)
+        if 'cuteafd::thermal:' not in line or 'current=' not in line:
+            continue
+        stamp = datetime.datetime.fromisoformat(line.split()[0].replace('Z', '+00:00')).timestamp()
+        queried = validate_census_clock(decoder.raw_decode(line.split('current=', 1)[1])[0]['queried_s'])
+        if now < queried:
+            raise ValueError('final census sample precedes daemon thermal anchor')
+        offsets.append(stamp - queried)
+    if not offsets or max(offsets) - min(offsets) > .050:
+        raise ValueError('missing or inconsistent daemon thermal clock anchors')
+    stamp = datetime.datetime.fromtimestamp(statistics.median(offsets) + now, datetime.timezone.utc)
+    marker = (stamp.isoformat(timespec='microseconds').replace('+00:00', 'Z')
+              + ' INFO cuteafd::bench_census: final server thermal sample'
+              + f' server_now_s={now} source=census-final-thermal.json\n')
+    if marker not in text:
+        with log.open('a') as output:
+            output.write('\n' + marker)
 
 
 def red_square():
@@ -905,7 +1044,9 @@ def precheck(job):
     dest = Path(job['state'])
     result = {}
     try:
-        text = ready_log(job)
+        if 'memory' in job['probes'] and job['entry'].get('sparks'):
+            spark_memory_boundary(job, 'ready')
+        text = ready_log(job) if job['expected_pool'] is not None or 'image' in job['probes'] else ''
         if job['expected_pool'] is not None:
             result['pool'] = admitted_pool(text)
             if result['pool'] != job['expected_pool']:
@@ -939,6 +1080,8 @@ def check(rc):
     if rc: raise RuntimeError('CUDA/NVML status '+str(rc))
 check(nv.nvmlInit_v2())
 devices=[int(x) for x in os.environ['CARD_GPUS'].split(',')]
+# Both CUDA and NVML numeric indices are filtered by CDI inside this container.
+os.environ['CUDA_VISIBLE_DEVICES']=os.environ['CARD_GPU_UUIDS']
 for i in range(len(devices)):
     check(cuda.cudaSetDevice(i)); check(cuda.cudaFree(c.c_void_p()))
 while True:
@@ -957,6 +1100,183 @@ while True:
     print(json.dumps(dict(time=time.time(),devices=rows)),flush=True)
     time.sleep(.05)
 '''
+
+
+# A persistent SSH stream avoids a connection per sample and creates no CUDA
+# context. EOF or a lost observer heartbeat ends the remote process too.
+SPARK_MEMORY_SAMPLER = r'''
+import json, os, select, sys, time
+from pathlib import Path
+rank, host, lifetime = int(sys.argv[1]), sys.argv[2], float(sys.argv[3])
+fields = {'MemAvailable', 'MemFree', 'Cached', 'SReclaimable', 'AnonPages',
+          'PageTables', 'SecPageTables', 'Slab', 'VmallocUsed'}
+started = heartbeat = time.monotonic()
+phase = 'loading'
+pending = ''
+once = len(sys.argv) > 4 and sys.argv[4] == 'once'
+while time.monotonic() - started < lifetime:
+    began = time.monotonic()
+    readable, _, _ = select.select([sys.stdin], [], [], 0)
+    if readable and not once:
+        control = os.read(sys.stdin.fileno(), 65536)
+        if not control:
+            break
+        pending += control.decode()
+        while '\n' in pending:
+            line, pending = pending.split('\n', 1)
+            phase = json.loads(line)['phase']
+        heartbeat = began
+    if began - heartbeat > 5:
+        break
+    mem = {}
+    for line in Path('/proc/meminfo').read_text().splitlines():
+        key, value = line.split(':', 1)
+        if key in fields:
+            parts = value.split()
+            if parts[1:] != ['kB']:
+                raise RuntimeError(key + ': unexpected meminfo unit: ' + line)
+            mem[key] = int(parts[0]) * 1024
+    missing = fields - mem.keys()
+    # SecPageTables is not present on older kernels; retain that fact as null.
+    if missing - {'SecPageTables'}:
+        raise RuntimeError('missing meminfo fields: ' + str(sorted(missing)))
+    mem.setdefault('SecPageTables', None)
+    print(json.dumps(dict(time=time.time(), rank=rank, host=host, phase=phase, mem=mem)), flush=True)
+    if once:
+        break
+    time.sleep(max(0, .05 - (time.monotonic() - began)))
+'''
+
+
+def spark_memory_command(rank, host, lifetime):
+    return ['ssh', '-T', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=5',
+            '-o', 'ServerAliveInterval=2', '-o', 'ServerAliveCountMax=2', host,
+            shlex.join(['python3', '-I', '-u', '-c', SPARK_MEMORY_SAMPLER,
+                        str(rank), host, str(lifetime)])]
+
+
+def spark_memory_read(child, output, guard_bytes, job, rank, host, errors):
+    try:
+        for line in child.stdout:
+            row = json.loads(line)
+            if row['rank'] != rank or row['host'] != host:
+                raise ValueError('Spark sampler identity mismatch')
+            if guard_bytes and row['mem']['MemAvailable'] < guard_bytes:
+                row['guard'] = 'MemAvailable below 512 MiB'
+                output.write(json.dumps(row) + '\n')
+                output.flush()
+                stop_memory_worker(job, host)
+                raise RuntimeError(f'{host}: memory guard stopped this card worker')
+            output.write(json.dumps(row) + '\n')
+            output.flush()
+    except Exception as error:
+        errors.append(str(error))
+
+
+def stop_memory_worker(job, host):
+    values = job['entry']['set']
+    slot = next(iter(job['entry']['run_args'][1:]), None)
+    if not slot or '--wip' not in job['entry']['run_args']:
+        raise ValueError('memory guard requires a WIP card with verifiable worker mounts')
+    layout = '/.cache/cuteafd/wip-run/' + (values.get('WIP_INSTANCE', '') + '/' if values.get('WIP_INSTANCE') else '')
+    layout += slot + '/serve-' + values['INSTANCE'] + '/bin'
+    name = 'cuteafd-spark-expert-' + host + '-' + values['EXPERT_PORT']
+    program = '''import json,subprocess,sys
+name,layout=sys.argv[1:]
+p=subprocess.run(['docker','inspect',name],capture_output=True,text=True,timeout=2)
+if p.returncode: raise RuntimeError('card worker unavailable: '+name)
+info=json.loads(p.stdout)[0]
+if not any(m.get('Destination')=='/opt/cuteafd/bin' and m.get('Source','').endswith(layout) for m in info.get('Mounts',[])):
+    raise RuntimeError('refusing foreign card worker '+name)
+subprocess.run(['docker','stop','-t','1',info['Id']],check=True,timeout=3)
+'''
+    run(['ssh', '-T', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=2', host,
+         shlex.join(['python3', '-I', '-c', program, name, layout])], timeout=6)
+
+
+def spark_memory_phase(url, diagnostics, timeout=.5):
+    def telemetry(endpoint):
+        began = time.monotonic()
+        record = dict(endpoint=endpoint, timeout_s=timeout, exception_type=None)
+        try:
+            result = http(url, endpoint, timeout=timeout)
+            record['status'] = 'ok'
+            return result
+        except Exception as error:
+            record.update(status='unavailable', exception_type=type(error).__name__, error=str(error))
+            raise
+        finally:
+            record['elapsed_s'] = time.monotonic() - began
+            diagnostics.append(record)
+
+    try:
+        snapshot = telemetry('/v1/console/snapshot')
+        if snapshot.get('starting'):
+            return 'loading'
+        gauges = snapshot.get('g', {})
+        if gauges.get('prefilling_n', 0):
+            return 'prefill'
+        if gauges.get('active', 0):
+            return 'decode'
+        active = telemetry('/v1/bench/status').get('active')
+        return 'panel:' + str(active['panel']) if active else 'ready-idle'
+    except (OSError, HTTPException, RuntimeError, ValueError, TypeError, KeyError, AttributeError) as error:
+        diagnostics.append(dict(status='unavailable', source='phase-classification',
+                                exception_type=type(error).__name__, error=str(error)))
+        return 'unavailable'
+
+
+def spark_memory_boundary(job, boundary):
+    """Capture real host state at readiness/sweep completion, even for subsecond sweeps."""
+    diagnostics = []
+    # Boundary hooks can tolerate busy-server latency. Continuous observation
+    # keeps its short timeout so telemetry cannot starve Spark heartbeats.
+    phase = spark_memory_phase(os.environ['CUTEAFD_SMOKE_URL'], diagnostics, timeout=3.)
+    # Both hooks run after smoke has confirmed health; an older starting
+    # snapshot cannot make this known-ready boundary a loading sample.
+    if phase == 'loading':
+        phase = 'ready-idle'
+    evidence = dict(phase=phase, boundary=boundary, ready=True, telemetry=diagnostics)
+    save(Path(job['state']) / f'memory-phase-{boundary}.json', evidence)
+    hosts = job['entry'].get('sparks', [])
+    def sample(item):
+        rank, host = item
+        command = spark_memory_command(rank, host, 5)
+        command[-1] += ' once'
+        result = run(command, timeout=8)
+        row = json.loads(result.stdout)
+        if row['rank'] != rank or row['host'] != host:
+            raise ValueError('Spark boundary sampler identity mismatch')
+        row.update(evidence)
+        path = Path(job['state']) / f'memory-spark-rank{rank}-{boundary}.jsonl'
+        with path.open('w') as output:
+            output.write(json.dumps(row) + '\n')
+        if job.get('memory_guard_bytes', 0) and row['mem']['MemAvailable'] < job['memory_guard_bytes']:
+            stop_memory_worker(job, host)
+            raise RuntimeError(f'{host}: memory guard stopped this card worker at {boundary}')
+    if hosts:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(hosts)) as pool:
+            list(pool.map(sample, enumerate(hosts)))
+
+
+def spark_memory_report(dest):
+    ranks = {}
+    for path in sorted(dest.glob('memory-spark-rank*.jsonl')):
+        for line in path.read_text().splitlines():
+            row = json.loads(line)
+            rank = ranks.setdefault(str(row['rank']), dict(host=row['host'], samples=0, phases={}))
+            available = row['mem']['MemAvailable']
+            rank['samples'] += 1
+            rank['min_mem_available_bytes'] = min(rank.get('min_mem_available_bytes', available), available)
+            phase = rank['phases'].setdefault(row['phase'], dict(samples=0, min_mem_available_bytes=available, peak_bytes={}))
+            phase['samples'] += 1
+            phase['min_mem_available_bytes'] = min(phase['min_mem_available_bytes'], available)
+            for key, value in row['mem'].items():
+                if value is not None:
+                    phase['peak_bytes'][key] = max(phase['peak_bytes'].get(key, 0), value)
+            if row.get('guard'):
+                rank['guard'] = row['guard']
+    return ranks
 
 
 def console_frames(url, stop, output):
@@ -1024,10 +1344,43 @@ for ident in ids:
     return [sys.executable, '-c', program, name, owner]
 
 
+def publish_observer_context(job):
+    """Publish a complete measured sample indexed by container CUDA ordinal."""
+    dest = Path(job['state'])
+    with (dest / 'memory.jsonl').open() as samples:
+        line = samples.readline()
+    if not line.endswith('\n'):
+        return False
+    sample = json.loads(line)
+    physical = job['entry']['gpus']
+    measured = {row['gpu']: row['sampler_bytes'] for row in sample['devices']}
+    if set(measured) != set(physical) or any(type(n) is not int or n <= 0 for n in measured.values()):
+        raise ValueError('invalid measured observer context bytes')
+    path = Path(job['entry']['set']['PROFILE_DIR']) / 'observer-context.json'
+    temporary = path.with_suffix('.tmp')
+    save(temporary, {str(i): measured[gpu] for i, gpu in enumerate(physical)})
+    temporary.replace(path)
+    return True
+
+
+def observer_gpu_uuids(devices):
+    """Use the launcher's host-side identity resolver before CDI filtering."""
+    script = 'source "$1"\nrelease_resolve_coordinator_gpus "$2" "$3"\nprintf "%s\\n" "${RELEASE_COORDINATOR_GPU_UUIDS[@]}"'
+    resolved = run(['bash', '-c', script, 'observer-gpus',
+                    str(REPO / 'scripts/lib/release-common.sh'),
+                    ','.join(map(str, devices)), str(len(devices))], timeout=30)
+    uuids = resolved.stdout.splitlines()
+    if len(uuids) != len(devices) or any(not re.fullmatch(r'GPU-[A-Za-z0-9-]+', uuid) for uuid in uuids):
+        raise ValueError('launcher returned invalid observer GPU UUIDs')
+    return ','.join(uuids)
+
+
 def observe(job):
     dest = Path(job['state'])
     stop = Path(os.environ['CUTEAFD_SMOKE_STOP'])
     sampler = None
+    spark_samplers, spark_errors = [], []
+    memory_phase, phase_sample_at = 'loading', 0.
     name = 'cuteafd-card-memory-' + job['entry']['set']['INSTANCE']
     memory = (dest / 'memory.jsonl').open('w')
     console = (dest / 'console.jsonl').open('w')
@@ -1035,6 +1388,7 @@ def observe(job):
     policy = (dest / 'policy-stats.jsonl').open('w')
     policy_sample_at = 0.
     reader = None
+    observer_published = False
     if 'console' in job['probes']:
         reader = threading.Thread(target=console_frames, args=(os.environ['CUTEAFD_SMOKE_URL'], stop, frames), daemon=True)
         reader.start()
@@ -1044,18 +1398,50 @@ def observe(job):
             gpu_list = ','.join(map(str, e['gpus']))
             image = e['set'].get('COORDINATOR_DOCKER_DEV', 'cuteafd-coordinator-dev')
             owner = hashlib.sha256(job['state'].encode()).hexdigest()
-            cmd = ['docker', 'run', '--rm', '--init', '-i', '--name', name, '--label', 'cuteafd.card.owner=' + owner, '--pid=host', '--network=none', *cdi_gpu_args(gpu_list.split(',')), '-e', 'CARD_GPUS=' + gpu_list, '--entrypoint', 'python3', image, '-u', '-c', CUDA_SAMPLER]
+            cmd = ['docker', 'run', '--rm', '--init', '-i', '--name', name, '--label', 'cuteafd.card.owner=' + owner, '--pid=host', '--network=none', *cdi_gpu_args(gpu_list.split(',')), '-e', 'CARD_GPUS=' + gpu_list, '-e', 'CARD_GPU_UUIDS=' + observer_gpu_uuids(e['gpus']), '--entrypoint', 'python3', image, '-u', '-c', CUDA_SAMPLER]
             sampler = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=memory, stderr=subprocess.PIPE, text=True)
+            lifetime = min(float(e['observer']['timeout_s']), 7200)
+            for rank, host in enumerate(e.get('sparks', [])):
+                output = (dest / f'memory-spark-rank{rank}.jsonl').open('w')
+                error = (dest / f'memory-spark-rank{rank}.stderr').open('w')
+                try:
+                    child = subprocess.Popen(spark_memory_command(rank, host, lifetime), stdin=subprocess.PIPE,
+                                             stdout=subprocess.PIPE, stderr=error, text=True)
+                except Exception:
+                    output.close()
+                    error.close()
+                    raise
+                reader_thread = threading.Thread(target=spark_memory_read,
+                    args=(child, output, job.get('memory_guard_bytes', 0), job, rank, host, spark_errors), daemon=True)
+                spark_samplers.append((child, reader_thread, output, error))
+                reader_thread.start()
         trace_path = Path(job['entry']['set']['SPECULATION_TRACE']) if job.get('trace') else None
         trace_due = None
         while not stop.exists():
             if sampler and sampler.poll() is not None:
                 raise RuntimeError('memory sampler exited: ' + sampler.stderr.read())
+            if sampler and not observer_published:
+                observer_published = publish_observer_context(job)
+            if spark_errors:
+                raise RuntimeError('Spark memory sampler: ' + '; '.join(spark_errors))
+            if spark_samplers:
+                if time.monotonic() >= phase_sample_at:
+                    diagnostics = []
+                    memory_phase = spark_memory_phase(os.environ['CUTEAFD_SMOKE_URL'], diagnostics)
+                    with (dest / 'memory-phase.jsonl').open('a') as output:
+                        output.write(json.dumps(dict(time=time.time(), phase=memory_phase,
+                                                     telemetry=diagnostics)) + '\n')
+                    phase_sample_at = time.monotonic() + 1
+                for child, _, _, _ in spark_samplers:
+                    if child.poll() is not None:
+                        raise RuntimeError('Spark memory sampler exited: ' + str(child.returncode))
+                    child.stdin.write(json.dumps(dict(phase=memory_phase)) + '\n')
+                    child.stdin.flush()
             if trace_path and not (dest / 'trace-check.json').exists():
                 # After the baseline's warm-up (the first part of the run), the
                 # trace must have records. Diagnostic only: the row decides.
                 try:
-                    active = (http(os.environ['CUTEAFD_SMOKE_URL'], '/v1/bench/status').get('active') or {})
+                    active = (http(os.environ['CUTEAFD_SMOKE_URL'], '/v1/bench/status', timeout=.5).get('active') or {})
                     # Past the first warm-up: 5% into the run, or (a run that skips
                     # the baseline starts its first panel at once) 60 s into it.
                     if active and (active.get('fraction', 0) >= .05 or active.get('elapsed_s', 0) >= 60):
@@ -1068,11 +1454,11 @@ def observe(job):
                                                      'ok': bool(size) or not speculating(job['entry']['set'])})
             if 'console' in job['probes']:
                 try:
-                    snapshot = http(os.environ['CUTEAFD_SMOKE_URL'], '/v1/console/snapshot')
+                    snapshot = http(os.environ['CUTEAFD_SMOKE_URL'], '/v1/console/snapshot', timeout=.5)
                     console.write(json.dumps({'time': time.time(), 'snapshot': snapshot}) + '\n')
                     console.flush()
                     if time.monotonic() >= policy_sample_at:
-                        stats = http(os.environ['CUTEAFD_SMOKE_URL'], '/v1/stats')
+                        stats = http(os.environ['CUTEAFD_SMOKE_URL'], '/v1/stats', timeout=.5)
                         policy.write(json.dumps({'time': time.time(), 'stats': stats}) + '\n')
                         policy.flush()
                         policy_sample_at = time.monotonic() + 1.
@@ -1087,6 +1473,9 @@ def observe(job):
         deadline = teardown_start + budget_s
         phases = []
         stop.touch()
+        for child, _, _, _ in spark_samplers:
+            with contextlib.suppress(OSError):
+                child.stdin.close()
         if sampler:
             phase_start = time.monotonic()
             cleanup_timeout = min(budget_s * 0.6, max(0.0, deadline - phase_start))
@@ -1107,6 +1496,31 @@ def observe(job):
                     sampler.kill()
                 with contextlib.suppress(subprocess.TimeoutExpired, OSError):
                     sampler.wait(timeout=min(0.05, max(0.0, deadline - time.monotonic())))
+        # Give EOF a brief shared grace, then kill remaining SSH clients together
+        # before reaping, all against the same overall deadline.
+        eof_deadline = min(deadline, time.monotonic() + .15)
+        for child, _, _, _ in spark_samplers:
+            with contextlib.suppress(subprocess.TimeoutExpired):
+                child.wait(timeout=max(0, eof_deadline - time.monotonic()))
+        killed_sparks = set()
+        for child, _, _, _ in spark_samplers:
+            if child.poll() is None:
+                with contextlib.suppress(ProcessLookupError):
+                    child.kill()
+                    killed_sparks.add(child.pid)
+        for child, spark_reader, output, error in spark_samplers:
+            try:
+                child.wait(timeout=max(0, deadline - time.monotonic()))
+            except subprocess.TimeoutExpired:
+                spark_errors.append('Spark memory sampler teardown timed out')
+            if child.returncode not in (None, 0) and child.pid not in killed_sparks:
+                spark_errors.append(f'Spark memory sampler exit {child.returncode}; see {error.name}')
+            spark_reader.join(timeout=max(0, deadline - time.monotonic()))
+            if spark_reader.is_alive():
+                spark_errors.append('Spark memory reader teardown timed out')
+            else:
+                output.close()
+            error.close()
         if reader:
             phase_start = time.monotonic()
             join_timeout = max(0.0, deadline - phase_start)
@@ -1125,6 +1539,11 @@ def observe(job):
         ))
     if 'memory' in job['probes'] and not (dest / 'memory.jsonl').stat().st_size:
         raise ValueError('memory probe produced no samples')
+    if spark_errors:
+        raise RuntimeError('Spark memory sampler: ' + '; '.join(spark_errors))
+    for rank, host in enumerate(job['entry'].get('sparks', []) if 'memory' in job['probes'] else []):
+        if not (dest / f'memory-spark-rank{rank}.jsonl').stat().st_size:
+            raise ValueError(f'Spark memory probe produced no samples for rank {rank} ({host})')
     if 'console' in job['probes'] and not (dest / 'console.jsonl').stat().st_size:
         raise ValueError('console probe produced no authenticated snapshots')
 
@@ -1407,10 +1826,25 @@ def table_backend_findings(phases):
     return caveats, contaminated
 
 
+def timing_instrumentation(job):
+    values = {**config(job['entry']['config']), **job['entry'].get('set', {})} if job['entry'].get('config') else job['entry'].get('set', {})
+    profiles = set(filter(None, values.get('PROFILE', '').split(',')))
+    priced = values.get('DRAFT_POLICY', 'simple') == 'shared' and not values.get('DRAFT_LENGTH')
+    layer = bool(profiles & {'draft-timing', 'transport-timing'}) or priced
+    return {'per_layer_timing': 'on (perturbing)' if layer else 'off',
+            'profiling': bool(profiles), 'source': 'launch configuration'}
+
+
 def summarize_job(job, exit_code):
     dest = Path(job['state'])
     row = {k: job[k] for k in ('card', 'arm', 'repeat', 'simulated')}
-    row.update(exit_code=exit_code, status='failed' if exit_code else 'pass')
+    row.update(exit_code=exit_code, status='failed' if exit_code else 'pass', instrumentation=timing_instrumentation(job))
+    if 'census' in job['entry'].get('set', {}).get('PROFILE', '').split(',') and (
+            job['entry'].get('levels') or job['entry'].get('prefill_lengths')):
+        try:
+            merge_census_marker(job)
+        except (OSError, ValueError, KeyError, TypeError) as error:
+            fail(row, f'final census evidence: {error}', 'measurement')
     if 'artifacts' in job: row['artifacts'] = job['artifacts']
     if 'launcher' in job: row['launcher'] = job['launcher']
     reports = list((dest / 'reports').glob('**/report.json'))
@@ -1437,6 +1871,9 @@ def summarize_job(job, exit_code):
         fail(row, f'expected one report, found {len(reports)}')
     else:
         report = json.loads(reports[0].read_text())
+        for setting in report.get('server', {}).get('configuration', {}).get('settings', []):
+            if setting.get('name') == 'per-layer-timing':
+                row['instrumentation'].update(per_layer_timing=setting['value'], source='server resolved')
         row['table_caveats'], row['table_contaminated'] = table_backend_findings(table_backend_phases(report))
         if not row['fabric']:
             row['fabric'].extend(report.get('fabric') or [])
@@ -1449,7 +1886,7 @@ def summarize_job(job, exit_code):
         quality = baseline.get('quality') or {}
         checks = quality.get('checks', [])
         fidelity = next((c for c in checks if c['id'] == 'fidelity'), {})
-        row.update(C1=next((d['tok_s'] for d in card.get('decode', []) if d['content'] == 'code'), None), C8=next((c['aggregate_tok_s'] for c in card.get('concurrency', []) if c['width'] == 8), None), **{'8K': (card.get('prefill') or {}).get('tok_s')}, kl=fidelity.get('metrics', {}).get('kl'), top1=fidelity.get('metrics', {}).get('top1'), cache=next((c for c in checks if c['id'] in ('cache_exact', 'cache')), None), spec=next((c for c in checks if 'spec' in c['id']), None), pool=(card.get('capacity') or {}).get('kv_tokens'), readiness_s=report.get('server', {}).get('readiness_s'), report=str(reports[0]), quality=quality.get('status'))
+        row.update(C1=next((d['tok_s'] for d in card.get('decode', []) if d['content'] == 'code'), None), C8=next((c['aggregate_tok_s'] for c in card.get('concurrency', []) if c['width'] == 8), None), **{'8K': (card.get('prefill') or {}).get('tok_s'), '8K w/tail': (card.get('prefill_tail') or {}).get('tok_s')}, kl=fidelity.get('metrics', {}).get('kl'), top1=fidelity.get('metrics', {}).get('top1'), cache=next((c for c in checks if c['id'] in ('cache_exact', 'cache')), None), spec=next((c for c in checks if 'spec' in c['id']), None), pool=(card.get('capacity') or {}).get('kv_tokens'), readiness_s=report.get('server', {}).get('readiness_s'), report=str(reports[0]), quality=quality.get('status'))
         # Report/panel statuses serialize as 'failed'; Rust CheckStatus as 'fail'.
         failed = {'fail', 'failed'}
         bad = [c['id'] + (': ' + c['summary'] if c.get('summary') else '') for c in checks if c.get('status') in failed]
@@ -1457,6 +1894,9 @@ def summarize_job(job, exit_code):
             fail(row, 'quality: ' + '; '.join(bad)[:400], 'quality')
         elif report.get('status') in failed or quality.get('status') in failed:
             fail(row, 'report ' + str(report.get('status')) + ': ' + str(report.get('error') or '')[:300])
+        for panel in report.get('panels', []):
+            if panel.get('status') in failed:
+                fail(row, f"panel {panel['id']}: {panel.get('error') or panel['status']}", 'measurement')
         context_panel = next((p for p in report.get('panels', []) if p.get('id') == 'context_load'), None)
         if context_panel:
             records = context_panel.get('passes', [])
@@ -1518,11 +1958,18 @@ def summarize_job(job, exit_code):
             for point in sweep.get('prefill', []):
                 row[f"prefill {point['length']}"] = point['tok_s']
                 row[f"prefill {point['length']} TTFT s"] = point['ttft_s']
+                if point.get('label') == '8K w/tail':
+                    row['8K w/tail'] = point['tok_s']
             row['mapped_tables'] = {**{f"prefill {p['length']}": p['mapped_tables'] for p in sweep.get('prefill', [])
                                        if p.get('mapped_tables')},
                                     **{f"{p['phase']} C{p['c']}": p['mapped_tables'] for p in sweep.get('points', [])
                                        if p.get('mapped_tables')}}
     row['peaks'] = peaks(dest)
+    row['spark_memory'] = spark_memory_report(dest)
+    row['memory_probe'] = dict(cadence_s=.05, spark_phase_refresh_s=1,
+                               spark_guard_bytes=job.get('memory_guard_bytes', 0),
+                               spark_context='none; host /proc/meminfo, bytes',
+                               spark_phase_note='sampled labels; 1 s polling and up to 2 s console snapshot age; explicit ready/post-sweep samples')
     row['ledger'] = ledger(dest)
     coordinator = {k: v for k, v in row['ledger']['device_used_peak_bytes'].items() if '.coordinator.log:' in k}
     row['memory_crosscheck'] = {'ledger_device_used_peak_bytes': coordinator, 'cuda_corrected_peak_bytes': {k: v['corrected_bytes'] for k, v in row['peaks'].items()}, 'note': 'ledger point-in-time samples vs CUDA 50ms high-water; differences are retained, not treated as identical samples'}
@@ -1550,18 +1997,8 @@ def summarize_job(job, exit_code):
                    prompt_token_hashes=sorted(hashes), follow_up_prompts=follow_up_prompts(text),
                    arm_local_prompts=arm_local_prompts(text),
                    requests=matched_requests(dest), state=str(dest))
-        # Prefill-only sweeps (max_tokens 1) emit no decode rounds; the prompt
-        # token hash above is what matches their requests.
-        prefill_only = bool(job['entry'].get('prefill_lengths')) and not job['entry'].get('levels') \
-            and job['entry'].get('profile') == 'panels:'
-        # Fidelity panels score fixed windows through the probe endpoint and
-        # decode nothing, so a fidelity-only run has no console rounds either.
-        profile = job['entry'].get('profile') or ''
-        fidelity_only = not job['entry'].get('levels') and profile.startswith('panels:') \
-            and set(filter(None, profile[len('panels:'):].split(','))) <= FIDELITY_PANELS \
-            and job['entry'].get('baseline') is False
-        if not row['requests'] and not (prefill_only or fidelity_only):
-            fail(row, 'matched prompts produced no per-request console rounds')
+        if not hashes:
+            fail(row, 'matched prompts produced no prompt token hashes')
     row['fabric_caveats'] = fabric_assessment(row['fabric'])
     row.setdefault('table_caveats', [])
     row.setdefault('table_contaminated', False)
@@ -1776,7 +2213,16 @@ def write_summary(state, rows, arms):
                     text += '| ' + ' | '.join(map(cell, values)) + ' |\n'
         pauses = [p.get('health', {}).get('pause_counters', {}) for r in rows for phase in r.get('fabric', []) for p in phase.get('ports', []) if p.get('health')]
         text += '\nPFC pause: ' + ('per-priority deltas retained in JSON' if any(pauses) else 'unavailable in this report') + '. Retransmits cost goodput; no data is lost and results remain valid.\n\n'
-    text += '## Jobs\n\n| Card | Arm | Repeat | Status | Failure | Spec | Cache | Trace | Profile | Error |\n| --- | --- | ---: | --- | --- | --- | --- | --- | --- | --- |\n'
+    if any(r.get('spark_memory') for r in rows):
+        text += '## Spark Host Memory\n\nHost /proc/meminfo; no Spark CUDA context. Sampled phase labels, not exact wave boundaries. Minima are bytes.\n\n'
+        text += '| Card | Arm | Repeat | Rank | Host | Phase | Samples | Minimum MemAvailable bytes |\n| --- | --- | ---: | ---: | --- | --- | ---: | ---: |\n'
+        for r in rows:
+            for rank, memory in r.get('spark_memory', {}).items():
+                for phase, values in [('all', memory), *memory['phases'].items()]:
+                    text += '| ' + ' | '.join(map(cell, [r['card'], r['arm'], r['repeat'], rank, memory['host'], phase,
+                                                       values['samples'], values['min_mem_available_bytes']])) + ' |\n'
+        text += '\n'
+    text += '## Jobs\n\n| Card | Arm | Repeat | Status | Failure | Spec | Cache | Trace | Per-layer timing | Profile | Error |\n| --- | --- | ---: | --- | --- | --- | --- | --- | --- | --- | --- |\n'
     for r in rows:
         trace = r.get('trace') or {}
         trace_cell = (f"{trace.get('records', 0)} records" if trace.get('expected') else 'not expected') if trace else ''
@@ -1784,7 +2230,7 @@ def write_summary(state, rows, arms):
         profile_cell = f"{len(profile.get('files', []))} files" if profile else ''
         if profile.get('reports'):
             profile_cell += ': ' + ', '.join(f"{r['name']} ({r['bytes'] / 2**20:.1f} MiB)" for r in profile['reports'])
-        text += f"| {r['card']} | {r['arm']} | {r['repeat']} | {r['status']}{' (simulated)' if r.get('simulated') else ''} | {r.get('failure_kind') or ''} | {cell(spec_cell(r))} | {cell(status_cell(r.get('cache')))} | {trace_cell} | {profile_cell} | {cell((r.get('error') or '')[:240])} |\n"
+        text += f"| {r['card']} | {r['arm']} | {r['repeat']} | {r['status']}{' (simulated)' if r.get('simulated') else ''} | {r.get('failure_kind') or ''} | {cell(spec_cell(r))} | {cell(status_cell(r.get('cache')))} | {trace_cell} | {cell((r.get('instrumentation') or {}).get('per_layer_timing', 'unknown'))} | {profile_cell} | {cell((r.get('error') or '')[:240])} |\n"
     if failed:
         text += '\n## Failures\n\nlaunch = the server never served the card; quality = it served and a correctness check failed; measurement = it served and a measurement or evidence check failed; preflight = refused before hardware.\n\n'
         for r in failed:
@@ -1844,13 +2290,19 @@ host=pathlib.Path(root)/'slots'/slot/role
 def contents(p):
     art=p/'workspace/.cuteafd-wip'
     packages=sorted(str(d.relative_to(art)) for kind in ('exl3','fp8') if (art/kind).is_dir() for d in (art/kind).iterdir() if d.is_dir())
-    audio=None
+    audio=pcm_audio=None
     try:
         out=subprocess.run(['nm','-D','--defined-only',str(art/'libcuteafd_native.so')],capture_output=True,text=True,timeout=60)
-        if out.returncode==0: audio=any(line.split()[-1:]==['cuteafd_audio_required'] for line in out.stdout.splitlines())
+        if out.returncode==0:
+            symbols={line.split()[-1] for line in out.stdout.splitlines() if line.split()}
+            audio='cuteafd_audio_required' in symbols
+            pcm_audio='cuteafd_pcm_required' in symbols
     except (OSError,subprocess.SubprocessError):
         pass
-    return dict(packages=packages,audio=audio,tp_roles=tp_roles(p,art))
+    variants=sorted(str(lib.parent.relative_to(art)) for pattern in
+        ('exl3/*/tp*-rank*/m*/libcuteafd_exl3.so','fp8/*/tp*/libcuteafd_fp8moe.so')
+        for lib in art.glob(pattern) if lib.is_file())
+    return dict(packages=packages,spark_variants=variants,audio=audio,pcm_audio=pcm_audio,tp_roles=tp_roles(p,art))
 def tp_roles(p,art):
     # The V4.1 Spark TP roles this slot attests, verified as run-family.sh's
     # launch_deepseek_v41 verifies them; None when the slot carries no manifest.
@@ -1863,7 +2315,7 @@ def tp_roles(p,art):
         assert hashlib.sha256(data).hexdigest()==meta.get('v41_expert_tp_manifest_sha256'),'TP manifest hash mismatch'
         manifest=json.loads(data)
         roles=manifest.get('spark_tp_roles')
-        assert manifest.get('schema')==1 and isinstance(roles,list) and all(r in ('tp2','tp3','tp6') for r in roles),'invalid TP roles'
+        assert manifest.get('schema')==1 and isinstance(roles,list) and all(r in ('tp2','tp3','tp5','tp6','tp7','tp8') for r in roles),'invalid TP roles'
         assert roles==meta.get('spark_tp_roles'),'slot and artifact roles differ'
         lib=hashlib.sha256((art/'libcuteafd_native.so').read_bytes()).hexdigest()
         assert lib==manifest.get('native_library_sha256'),'native library hash mismatch'
@@ -1986,6 +2438,18 @@ def cleanup(arms, task, dry, seed=None):
 NEST_BUILD_AREA = Path('/mnt/sparknest/build-cache/wip')
 
 
+def resolved_card(card, overrides, unsets=()):
+    """One effective configuration for scope derivation and package preflight."""
+    values = {**config(card['config']), **card['set'], **overrides}
+    for key in unsets:
+        values.pop(key, None)
+    count = int(values.get('SPARK_COUNT', len(card.get('sparks', []))))
+    if not 0 <= count <= len(HOSTS):
+        raise ValueError('invalid Spark count')
+    sparks = [values.get(f'SPARK_{i}_HOST', card['sparks'][i] if i < len(card['sparks']) else HOSTS[i]) for i in range(count)]
+    return {**card, 'set': values, 'resolved_values': values, 'sparks': sparks}
+
+
 def build_scopes(cards):
     env = family_scopes(cards, config)
     env.update(CUTEAFD_KACHE_SPARK='1', CUTEAFD_WIP_EXPORT_LOCKS='on', CUTEAFD_KACHE=str(Path.home() / '.cache/cuteafd/tools/x86_64/kache'), CARGO_BUILD_JOBS=os.environ.get('CARGO_BUILD_JOBS', '16'), RUST_TEST_THREADS=os.environ.get('RUST_TEST_THREADS', '16'))
@@ -2012,7 +2476,7 @@ def slot_needs(card):
     scopes = build_scopes([card])
     coordinator = {package_dir(s) for s in scopes['CUTEAFD_WIP_COORDINATOR_EXPERT_FAMILIES'].split(';') if s} - {None}
     spark = {package_dir(s) for s in scopes['CUTEAFD_WIP_EXPERT_FAMILIES'].split(';') if s} - {None}
-    values = {**config(card['config']), **card.get('set', {})}
+    values = card['resolved_values'] if 'resolved_values' in card else {**config(card['config']), **card.get('set', {})}
     if int(values.get('SPARK_COUNT', len(card.get('sparks', [])))) == 0:
         spark = set()
     return dict(coordinator=sorted(coordinator), spark=sorted(spark),
@@ -2021,21 +2485,14 @@ def slot_needs(card):
 
 def v41_tp_role(card, values):
     """The SM121 expert role a DeepSeek V4.1 card's Spark TP requires, as the
-    launcher derives it (scripts/launch/run-family.sh, launch_deepseek_v41): an
-    explicit SPARK_TP/SPARK_EP topology with TP 2, 3 or 6, or a native non-EXL3
+    planner names it (`artifact_requirements.spark_tp_role`): a native non-EXL3
     count other than 0 and 4 (TP = count). TP4 is the built-in default role.
     NVFP4 checkpoints need the role's NVFP4 exports too."""
     if card.get('family') != 'deepseek_v41':
         return dict(tp_role=None, nvfp4=False)
     count = int(values.get('SPARK_COUNT', len(card.get('sparks', []))))
-    explicit = bool(values.get('SPARK_TP') or values.get('SPARK_EP'))
     exl3 = values.get('EXPERT_FORMAT', 'native') == 'exl3'
-    tp = int(values['SPARK_TP']) if explicit and values.get('SPARK_TP') else count
-    role = None
-    if explicit and tp in (2, 3, 6):
-        role = f'tp{tp}'
-    elif not explicit and not exl3 and count not in (0, 4) and count in (2, 3, 6):
-        role = f'tp{count}'
+    role = f'tp{count}' if not exl3 and 2 <= count <= 8 and count != 4 else None
     return dict(tp_role=role, nvfp4=checkpoint_is_nvfp4(values))
 
 
@@ -2068,7 +2525,7 @@ def toolchain_hash(revision):
 
 # Serving-only keys never belong in a build (staging) config.
 BUILD_DROP = {'SPARK_HOSTS', 'BENCH_SIMULATED', 'BENCH_HARDWARE_CLASS', 'BENCH_EXPECT_GLM_RING',
-              'SPARK_TP', 'SPARK_EP', 'API_KEY_FILE', 'INSTANCE',
+              'API_KEY_FILE', 'INSTANCE',
               'WIP_INSTANCE', 'WIP_ROOT', 'ADDR', 'EXPERT_PORT', 'PROFILE', 'PROFILE_DIR', 'SPECULATION_TRACE',
               'PROFILE_NCU_KERNEL', 'PROFILE_NCU_COUNT', 'PROFILE_NCU_SET', 'PROFILE_NSYS_GPU_METRICS',
               'PROFILE_NCU_SKIP', 'PROFILE_SPARK', 'PROFILE_SPARK_RANKS', 'PROFILE_SPARK_NCU_KERNEL', 'PROFILE_SPARK_NCU_COUNT',
@@ -2249,7 +2706,7 @@ def build_arms(builds, arms, cards, state, task, dry, seed=DEFAULT_SEED):
         arm['build_revision'] = revision
         arm['build_lock_mode'] = build_lock_mode(revision)
         # 0-Spark cards only (#90): a coordinator-only slot, no Spark stage or seed turn.
-        spark_cards = [card for card in cards if int({**config(card['config']), **card.get('set', {})}.get('SPARK_COUNT', len(card.get('sparks', [])))) > 0]
+        spark_cards = [card for card in cards if int((card['resolved_values'] if 'resolved_values' in card else {**config(card['config']), **card.get('set', {})}).get('SPARK_COUNT', len(card.get('sparks', [])))) > 0]
         build_role = 'both' if spark_cards else 'coordinator'
         arm['build_role'] = build_role
         build_cmd = ['nice', '-n', '19', str(source / 'wip.sh'), '--slot', arm['slot'], '--role', build_role, '--config', str(state / ('build-' + name + '.config'))]
@@ -2289,7 +2746,7 @@ def build_arms(builds, arms, cards, state, task, dry, seed=DEFAULT_SEED):
         # overrides, the union of Spark hosts, and no serving topology. Export
         # scopes (TP counts, families, audio) come from every card through
         # build_scopes, never from how many hosts receive the slot.
-        values = {**config(cards[0]['config']), **cards[0].get('set', {})}
+        values = dict(cards[0]['resolved_values']) if 'resolved_values' in cards[0] else {**config(cards[0]['config']), **cards[0].get('set', {})}
         for key in list(values):
             if key in BUILD_DROP or re.fullmatch(r'SPARK_[0-7]_(HOST|LANE_A|LANE_B)', key):
                 del values[key]
@@ -2394,6 +2851,8 @@ def main():
                         help='arm-specific private diagnostic in the launch environment (CUTEAFD_DIAG_* only; '
                         'the launcher forwards those to the coordinator unchanged)')
     parser.add_argument('--probe', action='append', default=[], metavar='[ARM:]CARD:image,memory,console,fabric')
+    parser.add_argument('--spark-memory-guard', action='store_true',
+                        help='with --probe memory: stop only a verified card WIP worker if host MemAvailable falls below 512 MiB')
     parser.add_argument('--panels', metavar='LIST', help='run these server panels on every card instead of its profile '
                         '(comma list; "baseline" for the basic card + quick quality alone; "none" for no server profile)')
     parser.add_argument('--lossless-set', type=Path, metavar='FILE', help='case file for the spec_lossless_set panel '
@@ -2413,6 +2872,7 @@ def main():
     parser.add_argument('--context-suffix', type=int, metavar='N', help='additional fresh context_load suffix tokens per request (0..1048576; default 0)')
     parser.add_argument('--prefill-repeat', action='store_true', help='each prefill point\'s timed request re-sends its '
                         'warm-up\'s corpus behind a fresh nonce (nominal warm: the same mapped-table rows, no prefix-cache reuse)')
+    parser.add_argument('--prefill-idle-seconds', type=float, help='idle after each ordinary prefill warm-up before the timed request (default 0)')
     parser.add_argument('--prefill-lengths', metavar='N,N', help='client-side cold prefill at these prompt lengths (one untimed warm '
                         'request each, then one measured), e.g. 8192')
     parser.add_argument('--trace', action='store_true', help='every job writes SPECULATION_TRACE to <job>/speculation-trace.jsonl; '
@@ -2429,6 +2889,8 @@ def main():
     parser.add_argument('--preflight-only', action='store_true', help='run every CPU check (slots, packages, audio, containers, '
                         'binary, trace dirs), write the plan and exit; for hwlock --preflight')
     parser.add_argument('--expect-pool', action='append', default=[], metavar='CARD=N')
+    parser.add_argument('--run-timeout', action='append', default=[], metavar='CARD=SECONDS',
+                        help="override a card's kit run_timeout_s (the timed sweep's limit), e.g. for a long-context panel")
     parser.add_argument('--build', action='append', default=[], metavar='ARM=REV')
     parser.add_argument('--build-only', action='store_true', help='build and seal selected arms without generating or launching smoke jobs')
     parser.add_argument('--seed', '--seed-host', dest='seed_host', default=DEFAULT_SEED, choices=SEEDS,
@@ -2440,7 +2902,15 @@ def main():
     parser.add_argument('--observe', type=Path, help=argparse.SUPPRESS)
     parser.add_argument('--precheck', type=Path, help=argparse.SUPPRESS)
     parser.add_argument('--preflight-job', type=Path, help=argparse.SUPPRESS)
+    parser.add_argument('--census-final-sample', type=Path, help=argparse.SUPPRESS)
+    parser.add_argument('--spark-memory-boundary', type=Path, help=argparse.SUPPRESS)
     args = parser.parse_args()
+    if args.spark_memory_boundary:
+        spark_memory_boundary(json.loads(args.spark_memory_boundary.read_text()), 'post-sweep')
+        return 0
+    if args.census_final_sample:
+        census_final_sample(json.loads(args.census_final_sample.read_text()))
+        return 0
     if not 0 < args.wait < float('inf'):
         parser.error('--wait must be finite and positive')
     if args.observe or args.precheck:
@@ -2532,6 +3002,9 @@ def main():
         parser.error('--post-load-repeat needs --post-load-c1')
     if args.prefill_repeat and not args.prefill_lengths:
         parser.error('--prefill-repeat needs --prefill-lengths')
+    if args.prefill_idle_seconds is not None and (not args.prefill_lengths or not math.isfinite(args.prefill_idle_seconds)
+                                                or not 0 <= args.prefill_idle_seconds < 2**64):
+        parser.error('--prefill-idle-seconds needs --prefill-lengths and finite nonnegative representable seconds')
     if args.sweep_tokens is not None and not (args.levels and 0 <= args.sweep_tokens <= 8192):
         parser.error('--sweep-tokens needs --levels and 0 (omit max_tokens) or 1..8192 tokens')
     levels = None
@@ -2595,6 +3068,8 @@ def main():
             card['lossless_dump'] = lossless_dump
         if prefill_lengths:
             card['prefill_lengths'] = prefill_lengths
+            if args.prefill_idle_seconds is not None:
+                card['prefill_idle_seconds'] = args.prefill_idle_seconds
             if args.prefill_repeat:
                 card['prefill_repeat'] = True
         if levels:
@@ -2610,15 +3085,22 @@ def main():
     for item in args.expect_pool:
         name, value = item.split('=', 1)
         expected[name] = int(value)
-    if (set(overrides) | set(probes) | set(expected)) - set(args.cards):
+    run_timeouts = {}
+    for item in args.run_timeout:
+        name, value = item.split('=', 1)
+        if not value.isdigit() or int(value) < 1:
+            raise ValueError('--run-timeout needs CARD=SECONDS with a positive integer')
+        run_timeouts[name] = int(value)
+    if (set(overrides) | set(probes) | set(expected) | set(run_timeouts)) - set(args.cards):
         raise ValueError('override/probe names must be selected cards')
     for card in cards:
         if args.matched_prompts or args.nonce_seed is not None:
-            probes[card['name']].add('console')
             if args.matched_prompts and 'image' in probes[card['name']]:
                 raise ValueError('--matched-prompts cannot precede its first benchmark request with an image probe')
         requested_panels(card.get('profile', 'smoke'), binary=panel_binary(args.binary, arms))
         card['set'].update(overrides.get(card['name'], {}))
+        if card['name'] in run_timeouts:
+            card['run_timeout_s'] = run_timeouts[card['name']]
         values = {**config(card['config']), **card['set']}
         count = int(values.get('SPARK_COUNT', len(card.get('sparks', []))))
         if not 0 <= count <= len(HOSTS):
@@ -2628,12 +3110,8 @@ def main():
     build_cards = []
     for name in arms:
         for card in cards:
-            variant = {**card, 'set': {**card['set'], **arm_overrides.get(name, {}).get(card['name'], {})}}
-            values = {**config(variant['config']), **variant['set']}
-            count = int(values.get('SPARK_COUNT', len(variant['sparks'])))
-            if not 0 <= count <= len(HOSTS):
-                raise ValueError('invalid Spark count')
-            variant['sparks'] = [values.get(f'SPARK_{i}_HOST', card['sparks'][i] if i < len(card['sparks']) else HOSTS[i]) for i in range(count)]
+            variant = resolved_card(card, {**arm_overrides.get(name, {}).get(card['name'], {}),
+                **arm_config.get(name, {})}, arm_unsets.get(name, set()))
             build_cards.append(variant)
     build_arms(builds, arms, build_cards, state, args.task, args.dry_run, args.seed_host)
     adopt_roots(arms)
@@ -2658,10 +3136,15 @@ def main():
     bindings = dict(item.split('=', 1) for item in args.card_arm)
     if bindings and (args.interleave or set(bindings) - set(args.cards) or set(bindings.values()) - set(arms)):
         raise ValueError('--card-arm needs selected cards/arms in matrix mode')
-    jobs = [generate(card, name, arm, state, key_file, {**overrides.get(card['name'], {}), **arm_overrides.get(name, {}).get(card['name'], {})}, probes[card['name']] | arm_probes.get(name, {}).get(card['name'], set()), expected[card['name']], repeat, args.trace, shlex.split(args.exact_state) if args.exact_state else None, [h for h in (args.cold_window or '').split(',') if h] or None, binary=panel_binary(args.binary, arms)) for card, name, arm, repeat in schedule(cards, arms, args.repeats if args.interleave else 1, args.interleave) if card['name'] not in bindings or bindings[card['name']] == name]
-    variants = {(c['name'], n): {**c, 'set': {**c['set'], **arm_overrides.get(n, {}).get(c['name'], {})}} for c in cards for n in arms}
+    jobs = [generate(resolved_card(card, {**arm_overrides.get(name, {}).get(card['name'], {}), **arm_config.get(name, {})}, arm_unsets.get(name, set())), name, arm, state, key_file, {}, probes[card['name']] | arm_probes.get(name, {}).get(card['name'], set()), expected[card['name']], repeat, args.trace, shlex.split(args.exact_state) if args.exact_state else None, [h for h in (args.cold_window or '').split(',') if h] or None, binary=panel_binary(args.binary, arms)) for card, name, arm, repeat in schedule(cards, arms, args.repeats if args.interleave else 1, args.interleave) if card['name'] not in bindings or bindings[card['name']] == name]
+    variants = {(c['name'], n): resolved_card(c, {**arm_overrides.get(n, {}).get(c['name'], {}),
+        **arm_config.get(n, {})}, arm_unsets.get(n, set())) for c in cards for n in arms}
     for job in jobs:
         apply_arm_config(job, arm_config.get(job['arm'], {}), arm_unsets.get(job['arm'], set()))
+        if args.spark_memory_guard:
+            if 'memory' not in job['probes'] or '--wip' not in job['entry']['run_args'] or not job['entry']['sparks']:
+                raise ValueError('--spark-memory-guard requires --probe memory on Spark-backed WIP cards')
+            job['memory_guard_bytes'] = 512 * 1024 * 1024
         job['launcher'] = dict(repo=arms[job['arm']]['repo'], commit=arms[job['arm']]['repo_commit'])
         job['needs'] = slot_needs(variants[(job['card'], job['arm'])])
         # Per arm: an A/B of two builds runs each arm's own smoke runner.
@@ -2728,10 +3211,13 @@ def main():
                     path.rename(attempt / path.name)
                 if job['entry']['set'].get('PROFILE_DIR'):
                     Path(job['entry']['set']['PROFILE_DIR']).mkdir(exist_ok=True)
+                    if 'memory' in job['probes']:
+                        save(Path(job['entry']['set']['PROFILE_DIR']) / 'observer-context.json', {'pending': True})
         if kept:
             print(f'wip-cards: resume keeps {len(kept)} passed job(s), reruns {len(jobs) - len(kept)}', file=sys.stderr)
     fields = ['fabric'] + (['levels', 'post_load_c1'] + (['post_load_repeat'] if args.post_load_repeat else []) if args.levels else []) + (['prefill_lengths'] if prefill_lengths else []) + \
         (['prefill_repeat'] if args.prefill_repeat else []) + \
+        (['prefill_idle_seconds'] if args.prefill_idle_seconds is not None else []) + \
         (['prefill_purge'] if any(job['entry'].get('prefill_purge') for job in jobs) else []) + \
         (['sweep_tokens'] if args.sweep_tokens is not None else []) + \
         (['baseline'] if any(job['entry'].get('baseline') is False for job in jobs) else []) + \

@@ -119,20 +119,26 @@ impl scheduler::DraftState for DraftState {
 }
 
 pub(crate) struct MuseBackend<'r, 'a> {
-    cfg: &'r MuseSparkConfig,
-    ranks: &'r [RankResources<'a>],
+    pub(crate) cfg: &'r MuseSparkConfig,
+    pub(crate) ranks: &'r [RankResources<'a>],
     streams: Vec<*mut c_void>,
     table: &'r TokenEmbedding<'a>,
     experts: RefCell<&'r mut dyn SparkExperts>,
     peer: Option<&'r super::peer::MusePeer<'a>>,
     library: &'a NativeLibrary,
     profile: RefCell<[f64; 2]>,
+    graphs: Vec<super::graphs::Graphs<'a>>,
+    graph_enabled: std::cell::Cell<bool>,
+    graph_warming: std::cell::Cell<bool>,
     media_binding: super::media::Binding,
     /// Prefill units: rows and waves in flight; the sequence slots, context, pool pages.
-    unit_rows: usize,
+    pub(crate) unit_rows: usize,
+    packed_row_cap: Option<usize>,
+    pub(crate) packed_fallback_reason: String,
     waves: usize,
     slots: usize,
     context: usize,
+    host_prefix_bytes: u64,
     pages: usize,
     ring_rows: usize,
     /// Each rank's onboarded experts (empty: every layer on the Sparks).
@@ -146,12 +152,45 @@ pub(crate) struct MuseBackend<'r, 'a> {
 }
 
 impl<'r, 'a> MuseBackend<'r, 'a> {
+    fn prefill_with(&self, placement: &mut Placement, tokens: &[u32], logit_rows: usize, scoring: Option<crate::shared::probe::ScoringRows<'_>>)
+        -> Result<Option<crate::shared::probe::ScoreLogits>> {
+        crate::shared::experts::rtx::pair::submit(|| self.require_live(), || self.shutdown(), || {
+            ensure!(logit_rows <= tokens.len(), "Muse prefill logit rows exceed tokens");
+            if logit_rows > 1 && scoring.is_none() {
+                let output = self.ranks.last().and_then(|rank| rank.prefill_logits.as_ref())
+                    .context("Muse prefill scoring requires --full-prefill-logits at launch")?;
+                ensure!(cuteafd_loader::families::muse_spark::lane::prefill_logits_bytes(logit_rows,
+                    self.cfg.vocab_size)? <= output.buffer.bytes, "Muse prefill scoring exceeds admitted rows");
+            }
+            let units = crate::shared::prefill_pipeline::prefill_units(tokens.len(), self.unit_rows, self.waves, 64)?
+                .into_iter().enumerate().map(|(index, rows)| crate::shared::prefill_pipeline::Unit { index, sequence: 0,
+                    segments: Vec::new(), rows, layers: 0..self.cfg.layers, slot: index % self.waves, barrier: false })
+                .collect::<Vec<_>>();
+            let mut ends = self.peer.map(|peer| (0..2).map(|rank| peer.rank(rank)).collect::<Vec<_>>()).unwrap_or_default();
+            let peers = ends.iter_mut().map(|end| end as &mut dyn super::device::PeerExchange).collect();
+            let mut experts = self.experts.borrow_mut();
+            let mut local = self.local.borrow_mut();
+            let call = PrefillCall { packed: Vec::new(), request: placement.slot as u64 + 1, slot: placement.slot, start: placement.len, tokens,
+                pages: &placement.pages, ring_rows: self.ring_rows, slots: self.slots, media: placement.media.as_ref(), logit_rows, scoring };
+            let mut hooks = MusePrefill::new(self.cfg, self.ranks, self.streams.clone(), self.table, &mut **experts, peers,
+                call, &mut local, self.draft.as_ref(), units.len())?;
+            crate::shared::prefill_pipeline::run_prefill_units(&mut hooks, &units, self.waves)?;
+            let logits = hooks.logits.take();
+            drop(hooks);
+            placement.len += tokens.len();
+            if logit_rows == 0 { return Ok(None); }
+            Ok(Some(if scoring.is_some() { crate::shared::probe::ScoreLogits::Recorded }
+                else { crate::shared::probe::ScoreLogits::Device(self.logits(
+                    logits.context("Muse prefill scored no rows")?, logit_rows)) }))
+        })
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(cfg: &'r MuseSparkConfig, ranks: &'r [RankResources<'a>], streams: Vec<*mut c_void>,
         table: &'r TokenEmbedding<'a>, experts: &'r mut dyn SparkExperts, peer: Option<&'r super::peer::MusePeer<'a>>,
         unit_rows: usize, waves: usize, slots: usize, context: usize, pages: usize,
         local: Vec<super::onboard::OnboardedExperts<'a>>, draft: Option<super::draft::MuseDraft<'a>>,
-        pricing: Option<DraftPricing>, media_binding: super::media::Binding) -> Result<Self> {
+        pricing: Option<DraftPricing>, media_binding: super::media::Binding, packing: crate::shared::prefill_packing::PackingMode, host_prefix_bytes: u64) -> Result<Self> {
         ensure!(draft.is_some() == pricing.is_some(), "Muse drafter and its policy pricing come together");
         // Every Muse layer is MoE; the probe rings the head rank's route ids per layer.
         let head = ranks.last().context("Muse backend without ranks")?.device;
@@ -163,12 +202,102 @@ impl<'r, 'a> MuseBackend<'r, 'a> {
             && (local.is_empty() || local.len() == ranks.len()) && table.vocab() == cfg.vocab_size && table.hidden() == cfg.hidden,
             "Muse backend geometry differs from its ranks, embedding or layers");
         let ring_rows = usize::try_from(cuteafd_loader::placement::families::muse_spark::ring_rows(cfg)?)?;
+        let (packed_row_cap, packed_fallback_reason) = if packing == crate::shared::prefill_packing::PackingMode::Exact {
+            let mut cap = unit_rows;
+            for rank in ranks { cap = cap.min(rank.programs.packed_cap()).min(rank.core.packed_cap()); }
+            let mut reasons = Vec::new();
+            if cap == 0 { reasons.push("coordinator program has no exact_row_cap attestation"); }
+            // As in GLM, grouping/capacity does not attest native EXL3 arithmetic.
+            if !local.is_empty() { reasons.push("onboarded EXL3 TP2/whole backend has no arithmetic-route attestation"); }
+            reasons.push("Spark EXL3 backend has no arithmetic-route attestation");
+            let reason = reasons.join("; ");
+            tracing::info!(reason = %reason, "exact Muse packed prefill disabled; requests run alone");
+            (Some(0), reason)
+        } else { (None, String::new()) };
         Ok(Self { cfg, ranks, streams, table, experts: RefCell::new(experts), peer, library: ranks[0].device.library,
-            profile: RefCell::new([0.0; 2]), media_binding, unit_rows, waves, slots, context, pages, ring_rows,
+            profile: RefCell::new([0.0; 2]), graphs: Vec::new(), graph_enabled: std::cell::Cell::new(false), graph_warming: std::cell::Cell::new(false), media_binding, unit_rows, packed_row_cap, packed_fallback_reason, waves, slots, context, host_prefix_bytes, pages, ring_rows,
             local: RefCell::new(local), draft, pricing, probe: RefCell::new(probe) })
     }
 
+    pub(crate) fn configure_graphs(&mut self, enabled: bool, onboard_layers: usize) -> Result<()> {
+        if enabled {
+            for ((local, rank), &stream) in self.local.borrow_mut().iter_mut().zip(self.ranks).zip(&self.streams) {
+                rank.device.run(|| local.epilogue.initialize_identity(stream))?;
+            }
+            self.graphs = self.ranks.iter().enumerate().map(|(rank, resources)|
+                super::graphs::Graphs::new(resources.device, rank, self.ranks.len(), onboard_layers)).collect::<Result<_>>()?;
+        }
+        self.graph_enabled.set(enabled);
+        if !enabled { return Ok(()); }
+        let Some(layout) = cuteafd_loader::serving_capacity::muse_graphs::layout(self.ranks.len(), onboard_layers) else {
+            tracing::warn!(ranks = self.ranks.len(), onboard_layers,
+                "Muse layout has no graph trace; bootstrap is empty and unpinned");
+            return Ok(());
+        };
+        let bases = (0..self.ranks.len()).map(|rank|
+            cuteafd_loader::serving_capacity::muse_graphs::policy(self.ranks.len(), onboard_layers, rank)
+                .map(|policy| policy.base_bytes)).collect::<Result<Vec<_>, _>>()?;
+        // Before the scheduler exists, page 0 and ring slot 0 are scratch. No
+        // prefix, request or drafter context owns them; live admission overwrites
+        // every visible row before reading it. The table pitch is fixed already.
+        self.graph_warming.set(true);
+        let warmed = (|| -> Result<()> {
+            for entry in cuteafd_loader::serving_capacity::muse_graphs::selected(layout, &bases) {
+                if entry.rows > self.unit_rows || entry.rows > HEAD_ROWS { continue; }
+                let tokens = vec![1; entry.rows];
+                let mut placement = Placement { slot: 0, pages: vec![0], len: 0, media: None };
+                // Initialize shape-specific lazy native state before observing graph growth.
+                self.graph_enabled.set(false);
+                let touched = self.step(&[(&mut placement, &tokens)], cuteafd_transport::ExpertV2SourceKind::Decode);
+                self.graph_enabled.set(true);
+                touched?;
+                self.diagnostic_sync()?;
+                for rank in self.ranks {
+                    crate::shared::decode_graph::device::observe_device(self.library, rank.device.id)?;
+                }
+                if entry.pin { for bank in &self.graphs { bank.pin_rows(entry.rows); } }
+                self.step(&[(&mut placement, &tokens)], cuteafd_transport::ExpertV2SourceKind::Decode)?;
+                self.diagnostic_sync()?;
+            }
+            Ok(())
+        })();
+        self.graph_warming.set(false);
+        warmed
+    }
+
+    fn graph_completed(&self) -> Result<()> {
+        if !self.graphs.iter().any(|bank| bank.needs_boundary()) {
+            for bank in &self.graphs { bank.tick(); }
+            return Ok(());
+        }
+        self.diagnostic_sync()?;
+        // SAFETY: all participating ranks are joined; graphs retain no private allocations.
+        unsafe { crate::shared::decode_graph::device::observe_completed(self.library, |visit| {
+            for bank in &self.graphs { bank.visit(visit)?; }
+            Ok(())
+        }) }
+    }
+
+    pub(super) fn diagnostic_graph_width(&self) -> Option<usize> {
+        self.graph_enabled.get().then(|| self.draft.as_ref().map_or(0, |draft| draft.block - 1))
+    }
+
+    pub(super) fn diagnostic_require_graph_rows(&self, rows: usize) -> Result<()> {
+        ensure!(self.graph_enabled.get() && !self.graphs.is_empty()
+            && self.graphs.iter().all(|bank| bank.retains_rows(rows)),
+            "Muse graph oracle requires retained {rows}-row graphs on every rank; increase GPU_GRAPH_RESERVE");
+        Ok(())
+    }
+
     fn head_rank(&self) -> usize { self.ranks.len() - 1 }
+
+    pub(super) fn diagnostic_sync(&self) -> Result<()> {
+        for (rank, &stream) in self.ranks.iter().zip(&self.streams) {
+            // SAFETY: the backend retains these streams and all their producers.
+            rank.device.run(|| unsafe { self.library.cuda_stream_synchronize(stream) })?;
+        }
+        Ok(())
+    }
 
     fn shutdown(&self) -> Result<()> {
         let result = super::engine::shutdown(&mut **self.experts.borrow_mut(), self.peer, self.ranks, &self.streams);
@@ -216,7 +345,8 @@ impl<'r, 'a> MuseBackend<'r, 'a> {
             ensure!((1..=HEAD_ROWS).contains(&rows), "Muse decode step of {rows} rows (at most {HEAD_ROWS})");
             let described = sequences.iter().map(|(placement, tokens)| StepSequence { slot: placement.slot,
                 start: placement.len, rows: tokens.len(), pages: &placement.pages }).collect::<Vec<_>>();
-            let meta = StepMetadata::build(&described, self.ring_rows, self.slots, self.unit_rows, false)?;
+            let meta = StepMetadata::build(&described, self.ring_rows, self.slots, self.unit_rows, false)?
+                .with_stride(self.ranks[0].step.tables.stride)?;
             let wave = WaveStep { segments: sequences.iter().map(|(placement, tokens)| WaveSegment {
                 request: placement.slot as u64 + 1, rows: tokens.len() }).collect(), kind };
             let media = step_media(sequences.iter().map(|(placement, tokens)|
@@ -226,9 +356,17 @@ impl<'r, 'a> MuseBackend<'r, 'a> {
             let peers = ends.iter_mut().map(|end| end as &mut dyn super::device::PeerExchange).collect();
             let mut experts = self.experts.borrow_mut();
             let mut probe = self.probe.borrow_mut();
+            let cycle = if self.graph_warming.get() {
+                crate::shared::decode_graph::device::Cycle::Other
+            } else if kind == cuteafd_transport::ExpertV2SourceKind::MtpVerify {
+                crate::shared::decode_graph::device::Cycle::Verify
+            } else { crate::shared::decode_graph::device::Cycle::Decode };
+            for bank in &self.graphs { bank.cycle(cycle); }
             let logits = forward::step(self.cfg, self.ranks, &self.streams, self.table, &tokens, &media, &meta, false, wave,
                 &mut **experts, peers, &mut self.local.borrow_mut(), self.draft.as_ref(),
-                probe.as_mut().map(|owner| owner.get_mut()), 0..rows)?;
+                probe.as_mut().map(|owner| owner.get_mut()), 0..rows,
+                if self.graph_enabled.get() { &self.graphs } else { &[] })?;
+            self.graph_completed()?;
             Ok(self.logits(logits, rows))
         })
     }
@@ -258,7 +396,9 @@ impl<'r, 'a> Backend<'a> for MuseBackend<'r, 'a> {
             args.mark_rule(lanes).slots(super::prefix::mark_bytes(self.cfg, self.ranks.len())?))?;
         let layout = family.layout();
         // The host tier copies the registered record pools and mark arenas.
-        let host = args.host_config(layout, self.context, lanes)?.map(|config|
+        let mut admitted = args.clone();
+        admitted.host_cache_bytes = crate::shared::prefix::budget::HostBudget::Bytes(self.host_prefix_bytes);
+        let host = admitted.resolve_host_config(layout, self.context, lanes)?.map(|config|
             CudaCopyEngine::registered_owned(self.library, family.snapshot_owners()).map(|copy| (config, copy)))
             .transpose()?;
         let host_bytes = host.as_ref().map_or(0, |(config, _)| config.bytes);
@@ -297,35 +437,83 @@ impl<'r, 'a> Backend<'a> for MuseBackend<'r, 'a> {
     }
     fn log_table_stats(&self, _phase: &str) {}
 
-    fn prefill_device(&self, placement: &mut Placement, tokens: &[u32], logit_rows: usize, _pool: &RefPagePool)
-        -> Result<Option<DeviceLogits>> {
+    fn packed_limits(&self) -> Option<crate::shared::prefill_packing::Limits> {
+        Some(crate::shared::prefill_packing::Limits {
+            // Exact mode is narrowed by the loaded coordinator/expert attestation.
+            rows: self.unit_rows, chunk_rows: self.unit_rows, max_context: self.context,
+            taps: self.draft.as_ref().map(|_| crate::shared::speculation::dflash::TAP_ROWS),
+        })
+    }
+    fn coordinator_packed_cap(&self) -> Result<Option<usize>> {
+        Ok(self.packed_row_cap)
+    }
+    fn prefill_packed(&self, sequences: &mut [scheduler::PrefillSeq<'_, Placement, DraftState>],
+        _pool: &RefPagePool,
+        on_logits: &mut dyn FnMut(usize, DeviceLogits) -> crate::shared::prefill_packing::MemberOutcome)
+        -> Result<Vec<Result<()>>> {
+        use crate::shared::prefill_packing;
         crate::shared::experts::rtx::pair::submit(|| self.require_live(), || self.shutdown(), || {
-            ensure!(logit_rows <= tokens.len(), "Muse prefill logit rows exceed tokens");
-            if logit_rows > 1 {
-                let output = self.ranks.last().and_then(|rank| rank.prefill_logits.as_ref())
-                    .context("Muse prefill scoring requires --full-prefill-logits at launch")?;
-                ensure!(cuteafd_loader::families::muse_spark::lane::prefill_logits_bytes(logit_rows,
-                    self.cfg.vocab_size)? <= output.buffer.bytes, "Muse prefill scoring exceeds admitted rows");
+            let limits = self.checked_packed_limits()?.context("Muse packing limits")?;
+            let chunks = sequences.iter().map(|s| (s.placement.len, s.tokens.len())).collect::<Vec<_>>();
+            let segments = prefill_packing::plan(&chunks, &limits)?;
+            let mut tokens = Vec::new();
+            let mut packed = Vec::new();
+            for (sequence, &segment) in sequences.iter().zip(&segments) {
+                ensure!(sequence.start == sequence.placement.len && sequence.placement.media.as_ref()
+                    .is_none_or(|media| media.spans().is_empty()), "Muse packed member frontier/media");
+                tokens.extend_from_slice(sequence.tokens);
+                packed.push((super::step::StepSequence { slot: sequence.placement.slot, start: segment.start,
+                    rows: segment.rows, pages: &sequence.placement.pages }, segment));
             }
-            let units = crate::shared::prefill_pipeline::prefill_units(tokens.len(), self.unit_rows, self.waves, 64)?
-                .into_iter().enumerate().map(|(index, rows)| crate::shared::prefill_pipeline::Unit { index, sequence: 0,
-                    segments: Vec::new(), rows, layers: 0..self.cfg.layers, slot: index % self.waves, barrier: false })
-                .collect::<Vec<_>>();
+            let units = vec![crate::shared::prefill_pipeline::Unit { index: 0, sequence: 0, segments: Vec::new(),
+                rows: 0..tokens.len(), layers: 0..self.cfg.layers, slot: 0, barrier: false }];
             let mut ends = self.peer.map(|peer| (0..2).map(|rank| peer.rank(rank)).collect::<Vec<_>>()).unwrap_or_default();
             let peers = ends.iter_mut().map(|end| end as &mut dyn super::device::PeerExchange).collect();
             let mut experts = self.experts.borrow_mut();
             let mut local = self.local.borrow_mut();
-            let call = PrefillCall { request: placement.slot as u64 + 1, slot: placement.slot, start: placement.len, tokens,
-                pages: &placement.pages, ring_rows: self.ring_rows, slots: self.slots, media: placement.media.as_ref(), logit_rows };
-            let mut hooks = MusePrefill::new(self.cfg, self.ranks, self.streams.clone(), self.table, &mut **experts, peers,
-                call, &mut local, self.draft.as_ref(), units.len())?;
+            let call = PrefillCall { packed, request: 0, slot: 0, start: 0, tokens: &tokens, pages: &[],
+                ring_rows: self.ring_rows, slots: self.slots, logit_rows: 0, media: None, scoring: None };
+            let mut hooks = MusePrefill::new(self.cfg, self.ranks, self.streams.clone(), self.table, &mut **experts,
+                peers, call, &mut local, self.draft.as_ref(), 1)?;
+            // Eager launches only: changing segment geometry never captures a graph.
             crate::shared::prefill_pipeline::run_prefill_units(&mut hooks, &units, self.waves)?;
-            let logits = hooks.logits.take();
             drop(hooks);
-            placement.len += tokens.len();
-            if logit_rows == 0 { return Ok(None); }
-            Ok(Some(self.logits(logits.context("Muse prefill scored no rows")?, logit_rows)))
+            for (sequence, segment) in sequences.iter_mut().zip(&segments) {
+                sequence.placement.len = segment.start + segment.rows;
+                if sequence.neural {
+                    let draft = self.draft.as_ref().context("Muse packed drafter not admitted")?;
+                    draft.update_rows(sequence.placement.slot, segment.tap_offset,
+                        segment.start + segment.rows - segment.tap_rows, segment.tap_rows)?;
+                    if !sequence.draft.ready && sequence.draft.valid_from > segment.start { sequence.draft.valid_from = segment.start; }
+                    if segment.start == 0 { sequence.draft.valid_from = 0; }
+                    sequence.draft.ready = true;
+                    sequence.draft.anchor = sequence.next;
+                }
+            }
+            prefill_packing::finish_members(segments.len(), |i| {
+                let rank = &self.ranks[self.head_rank()];
+                let row = segments[i].end_row() - 1;
+                let logits = rank.device.run(|| forward::head(self.cfg, rank, &rank.lane.views,
+                    row..row + 1, self.streams[self.head_rank()]))?;
+                Ok(self.logits(logits, 1))
+            }, on_logits)
         })
+    }
+    fn prefill_device(&self, placement: &mut Placement, tokens: &[u32], logit_rows: usize, _pool: &RefPagePool)
+        -> Result<Option<DeviceLogits>> {
+        match self.prefill_with(placement, tokens, logit_rows, None)? {
+            Some(crate::shared::probe::ScoreLogits::Device(logits)) => Ok(Some(logits)),
+            None => Ok(None),
+            Some(_) => unreachable!("ordinary Muse prefill returns device logits"),
+        }
+    }
+    fn streamed_prefill_scoring(&self) -> bool { true }
+    fn prefill_scoring(&self, placement: &mut Placement, tokens: &[u32], logit_rows: usize,
+        position: usize, probe: &crate::shared::probe::ProbeRef, _pool: &RefPagePool)
+        -> Result<Option<crate::shared::probe::ScoreLogits>> {
+        let legacy = self.ranks.last().is_some_and(|rank| rank.prefill_logits.is_some());
+        self.prefill_with(placement, tokens, logit_rows,
+            (logit_rows > 1 && !legacy).then_some(crate::shared::probe::ScoringRows { probe, position }))
     }
 
     /// Scores every row of every sequence (an anchor and its drafts) from its
@@ -340,11 +528,15 @@ impl<'r, 'a> Backend<'a> for MuseBackend<'r, 'a> {
     fn verify_device_ungraphed(&self, sequences: &mut [(&mut Placement, &[u32])], speculative: bool,
         kind: scheduler::UngraphedKind, _pool: &RefPagePool) -> Result<Option<DeviceLogits>> {
         ensure!(!speculative || self.draft.is_some(), "Muse speculative verify without a drafter");
-        self.verify_rows(sequences, speculative, ungraphed_kind(speculative, kind))
+        let enabled = self.graph_enabled.replace(false);
+        let result = self.verify_rows(sequences, speculative, ungraphed_kind(speculative, kind));
+        self.graph_enabled.set(enabled);
+        result
     }
     fn verify_bucket_rows(&self, rows: usize, _speculative: bool, _diagnostic: bool) -> usize { rows }
-    fn verify_attention_trace(&self, contexts: &[Vec<usize>], rows: usize) -> serde_json::Value {
-        serde_json::json!({"kind": "muse_gqa_swa2048_full", "rows": rows, "contexts": contexts})
+    fn verify_attention_trace(&self, contexts: &[Vec<usize>], rows: usize) -> crate::shared::speculation_trace::Deferred {
+        let contexts = contexts.to_vec();
+        crate::shared::speculation_trace::Deferred::new(move || serde_json::json!({"kind": "muse_gqa_swa2048_full", "rows": rows, "contexts": contexts}))
     }
     fn draft_geometry(&self, _snapshot: &Path, width: usize) -> Result<cuteafd_core::PolicyGeometry> {
         let draft = self.draft.as_ref().context("Muse drafter was not admitted")?;
@@ -371,7 +563,7 @@ impl<'r, 'a> Backend<'a> for MuseBackend<'r, 'a> {
             Ok(())
         })
     }
-    fn draft(&self, sequences: &mut [scheduler::DraftSeq<'_, Placement, DraftState>], timing: &mut scheduler::DraftTiming)
+    fn draft(&self, sequences: &mut [scheduler::DraftSeq<'_, Placement, DraftState>], timing: &mut scheduler::DraftTiming, _selector: &mut crate::shared::token_io::TokenSelector<'_>)
         -> Result<Vec<Vec<u32>>> {
         crate::shared::experts::rtx::pair::submit(|| self.require_live(), || self.shutdown(), || {
             let draft = self.draft.as_ref().context("Muse drafter was not admitted")?;
@@ -447,6 +639,21 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn packed_member_callback_failure_does_not_abort_its_partners() -> Result<()> {
+        use crate::shared::{prefill_packing::finish_members, token_io::DeviceLogits};
+        let mut consumed = Vec::new();
+        let outcomes = finish_members(3, |_| Ok(DeviceLogits {
+            ptr: std::ptr::null(), rows: 1, vocab: 1, stride: 1, stream: std::ptr::null_mut(), greedy: None,
+        }), &mut |member, _| {
+            consumed.push(member);
+            Ok(if member == 1 { Err(anyhow::anyhow!("client cancelled")) } else { Ok(()) })
+        })?;
+        assert_eq!(consumed, [0, 1, 2]);
+        assert!(outcomes[0].is_ok() && outcomes[1].is_err() && outcomes[2].is_ok());
+        Ok(())
+    }
 
     #[test]
     fn step_media_packs_partial_image_and_audio_spans_at_sequence_offsets() -> Result<()> {

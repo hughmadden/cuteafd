@@ -1,6 +1,7 @@
 //! Namespace-required EXL3 startup transaction; GPU owners stay on the worker thread.
 #[cfg(test)]
 mod tests;
+use crate::shared::memory::Tag;
 use super::NativeExpertServiceConfig;
 use crate::shared::{experts::{exl3::Exl3Weights, layer::ExpertLoadBudget}, memory::{
     device::Device, push_consumer, push_exl3::RankPlan, push_initialize,
@@ -23,7 +24,7 @@ pub(super) fn load<'a>(library: &'a NativeLibrary, catalog: &OfficialV41Catalog,
         let host_budget = budgets.iter().map(|b| b.read_scratch_bytes).max().unwrap_or(0);
         let available = library.cuda_allocatable_memory_info()
             .context("query Spark push allocatable memory for admission")?.0;
-        let headroom = super::spark_runtime_headroom()?;
+        let headroom = super::spark_runtime_headroom(config, cuteafd_core::expert_geometry(), plan.layout.bytes())?;
         let peak = admit_peak(plan.layout.bytes(), plan.validation.bytes(), host_budget,
             headroom, available)?;
         tracing::info!(rank = config.rank, resident_bytes = plan.layout.bytes(),
@@ -98,8 +99,8 @@ fn receive<'a>(library: &'a NativeLibrary, plan: RankPlan,
     let device = Device { library, id: library.cuda_get_device()? };
     let joined = (|| -> Result<_> {
         let expected = ExpectedCoverage::from_plan(checked, u32::try_from(rank_id)?)?;
-        let arena = LoadingArena::new(device, plan.layout.clone(), expected)?;
-        let ring = RegisteredRing::new(library, DEFAULT_SLOTS, DEFAULT_SLOT_BYTES)?;
+        let arena = LoadingArena::new(device, plan.layout.clone(), expected, cuteafd_core::memory_layout::ArenaTag::experts("experts/spark-exl3-push"))?;
+        let ring = RegisteredRing::new(library, DEFAULT_SLOTS, DEFAULT_SLOT_BYTES, Tag::staging("experts/spark-push-ring"))?;
         let rank = client.join(JoinArgs { group, token,
             rank: u32::try_from(rank_id)?, ring_fd: ring.fd().as_raw_fd(),
             slots: u32::try_from(ring.slots())?, slot_bytes: u32::try_from(ring.slot_bytes())? })?;

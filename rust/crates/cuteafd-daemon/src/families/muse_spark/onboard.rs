@@ -18,6 +18,7 @@
 use super::experts::CombineTables;
 use crate::shared::experts::{exl3::partial::PartialEpilogue, rtx::{exl3::Exl3Tp2, RtxSelectionPolicy}};
 use crate::shared::memory::device::{Allocation, Device};
+use crate::shared::memory::Tag;
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::{programs::Programs, CuteafdDeviceBuffer as Buffer};
 use cuteafd_loader::families::muse_spark::MuseSparkConfig;
@@ -44,7 +45,7 @@ pub(crate) fn own_bytes(cfg: &MuseSparkConfig, rows: usize) -> usize { rows * cf
 /// The execution loader and push planner use the same admitted arena remainder.
 fn budgets(cfg: &MuseSparkConfig, placement: &Placement, gpus: usize, rows: usize) -> Result<Vec<usize>> {
     let own = own_bytes(cfg, rows);
-    let fixed = 2 * rows * 4 + CombineTables { capacity: rows }.bytes();
+    let fixed = 3 * rows * 4 + CombineTables { capacity: rows }.bytes();
     let peaks = match gpus {
         2 => placement.tp2.context("Muse onboarded pair without a TP2 arena")?.peak_bytes.to_vec(),
         1 => vec![placement.expert_ranges.first().context("Muse onboarded GPU without an expert arena")?.peak_bytes],
@@ -72,17 +73,22 @@ pub(crate) fn push_plan(cfg: &MuseSparkConfig, placement: &Placement, gpus: usiz
 
 /// Loads every GPU's onboarded layers (`layers`, ascending) from the installed
 /// coordinator package (`package`: `rtx-tp2` on a pair, `rtx-tp1` on one GPU).
+/// `modules` carries the package modules startup bound before the measured
+/// pre-weight sample (one entry per device, `None` when nothing was preloaded).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn load<'a>(devices: &[Device<'a>], programs: &[&'a Programs<'a>], cfg: &MuseSparkConfig,
     catalog: &cuteafd_loader::OfficialV41Catalog, package: &std::path::Path, placement: &Placement,
     layers: Vec<usize>, unit_rows: usize,
+    modules: Vec<Option<Vec<crate::shared::experts::exl3::execution::Exl3Modules<'a>>>>,
     pushed: Option<Vec<crate::shared::experts::rtx::push::PushedExperts<'a>>>) -> Result<Vec<OnboardedExperts<'a>>> {
     ensure!(!layers.is_empty() && layers.windows(2).all(|pair| pair[0] < pair[1]), "Muse onboarded layers ascending");
     ensure!(devices.len() == programs.len() && matches!(devices.len(), 1 | 2), "Muse onboarding on one GPU or a pair");
+    ensure!(modules.is_empty() || modules.len() == devices.len(), "Muse preloaded module device count");
     let own = own_bytes(cfg, unit_rows);
     let layout = CombineTables { capacity: unit_rows };
     let budgets = budgets(cfg, placement, devices.len(), unit_rows)?;
     let geometry = cuteafd_core::expert_geometry();
+    let mut modules = modules.into_iter();
     let executors: Vec<Exl3Tp2<'a>> = if devices.len() == 2 {
         let budgets = [budgets[0], budgets[1]];
         let weights = match pushed {
@@ -95,7 +101,8 @@ pub(crate) fn load<'a>(devices: &[Device<'a>], programs: &[&'a Programs<'a>], cf
             None => Exl3Tp2::load_pair_weights([devices[0], devices[1]], catalog, geometry, [package; 2],
                 layers.clone(), unit_rows, budgets, RtxSelectionPolicy::CanonicalDecode)?,
         };
-        weights.iter().map(|weights| weights.execution()).collect::<Result<_>>()?
+        weights.iter().map(|weights| weights.execution_with_modules(modules.next().flatten()))
+            .collect::<Result<_>>()?
     } else {
         let weights = match pushed {
             Some(mut pushed) => {
@@ -106,12 +113,12 @@ pub(crate) fn load<'a>(devices: &[Device<'a>], programs: &[&'a Programs<'a>], cf
             None => Exl3Tp2::load_whole_weights(devices[0], catalog, package, layers.clone(), unit_rows,
                 budgets[0], RtxSelectionPolicy::CanonicalDecode)?,
         };
-        vec![weights.execution()?]
+        vec![weights.execution_with_modules(modules.next().flatten())?]
     };
     executors.into_iter().zip(devices).zip(programs).map(|((executor, &device), programs)| {
-        let _scope = cuteafd_ffi::memory_ledger::scope("experts/muse onboarded partials");
         Ok(OnboardedExperts { epilogue: device.run(|| PartialEpilogue::load(device.library, programs, unit_rows))?,
-            own: Allocation::new(device, own)?, tables: Allocation::new(device, layout.bytes())?, layout,
+            own: Allocation::new(device, own, Tag::workspace("muse/expert-partials"))?,
+            tables: Allocation::new(device, layout.bytes(), Tag::workspace("muse/expert-combine"))?, layout,
             executor, layers: layers.clone(), written: None })
     }).collect()
 }
@@ -127,7 +134,7 @@ impl OnboardedExperts<'_> {
         -> Result<()> {
         if self.written.as_deref() == Some(planes) { return Ok(()); }
         let rows: Vec<u32> = (0..u32::try_from(self.layout.capacity)?).collect();
-        let image = self.layout.image(planes, &super::experts::ReplyPlanView { bf16_rows: &rows, wide_rows: &[], wide_at: 0 })?;
+        let image = self.layout.image(planes, &super::experts::ReplyPlanView { bf16_rows: &rows, wide_rows: &[], wide_at: 0, other_rows: &[], other_at: 0 })?;
         // SAFETY: this GPU's fixed tables; every combine that reads them follows on `stream`.
         unsafe { library.copy_h2d_ordered(self.tables.buffer, &image, stream)?; }
         self.written = Some(planes.to_vec());
@@ -153,10 +160,10 @@ mod tests {
         let layout = CombineTables { capacity: 64 };
         let planes = [0x1000u64, 0x9000];
         let all: Vec<u32> = (0..64).collect();
-        let cached = layout.image(&planes, &ReplyPlanView { bf16_rows: &all, wide_rows: &[], wide_at: 0 })?;
-        let [bf16_table, _, bf16_map, _] = layout.offsets();
+        let cached = layout.image(&planes, &ReplyPlanView { bf16_rows: &all, wide_rows: &[], wide_at: 0, other_rows: &[], other_at: 0 })?;
+        let [bf16_table, _, _, bf16_map, _, _] = layout.offsets();
         for rows in [1usize, 7, 64] {
-            let wave = layout.image(&planes, &ReplyPlanView { bf16_rows: &all[..rows], wide_rows: &[], wide_at: 0 })?;
+            let wave = layout.image(&planes, &ReplyPlanView { bf16_rows: &all[..rows], wide_rows: &[], wide_at: 0, other_rows: &[], other_at: 0 })?;
             assert_eq!(cached[bf16_table..bf16_table + 2 * 8], wave[bf16_table..bf16_table + 2 * 8]);
             assert_eq!(cached[bf16_map..bf16_map + rows * 4], wave[bf16_map..bf16_map + rows * 4]);
         }
@@ -170,7 +177,8 @@ mod tests {
         for rows in [1usize, 5, 64] {
             let plan = cuteafd_transport::PartialReplyPlan { wide: cuteafd_transport::PartialWire::Nvfp4,
                 regions: vec![0; rows] };
-            let (bf16, wide) = crate::shared::experts::exl3::partial::row_maps(&plan);
+            let [bf16, wide, other] = crate::shared::experts::exl3::partial::row_maps(&plan);
+            assert!(other.is_empty());
             assert_eq!(bf16, (0..rows as u32).collect::<Vec<_>>());
             assert!(wide.is_empty());
         }

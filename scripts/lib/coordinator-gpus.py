@@ -84,6 +84,12 @@ class Gpu:
         return min(self.total_mib, self.free_mib + self.reclaim_mib)
 
 
+def context_setting(value: str) -> str:
+    if value == "auto" or (re.fullmatch(r"[1-9][0-9]{0,6}", value) and int(value) <= 1048576):
+        return value
+    raise argparse.ArgumentTypeError("context must be auto or a positive integer in 1..1048576")
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--nvidia-smi", default="nvidia-smi")
@@ -98,10 +104,10 @@ def parse_args() -> argparse.Namespace:
     select.add_argument("--selectors", default="", help="COORDINATOR_GPUS")
     select.add_argument("--mode", choices=("auto", "1", "2"), required=True)
     select.add_argument("--concurrency", type=int, required=True)
-    select.add_argument("--max-context-tokens", type=int, required=True)
+    select.add_argument("--max-context-tokens", type=context_setting, required=True, help="auto or a positive context pin")
     select.add_argument("--retained-turns", type=int, required=True)
     select.add_argument("--kv-pool-size", default="")
-    select.add_argument("--memory-reservation", default="")
+    select.add_argument("--gpu-memory-cap", default="", help="GPU_MEMORY_CAP: per-GPU total ceiling (a size)")
     select.add_argument("--compact-spark", "--compact-spark-tp2", dest="compact_spark",
                         action="store_true",
                         help="single-RTX compact Spark EXL3 layout (TP2 or TP3): "
@@ -233,18 +239,9 @@ def parse_bytes(value: str) -> int:
     return result
 
 
-def reservation_bytes(value: str, total_mib: int) -> int:
-    if value.endswith("%"):
-        try:
-            percent = Decimal(value[:-1])
-        except InvalidOperation as error:
-            raise SelectionError(f"invalid memory reservation: {value}") from error
-        result = int(total_mib * MIB * percent / Decimal(100))
-    else:
-        result = parse_bytes(value)
-    if result <= 0 or result > total_mib * MIB:
-        raise SelectionError(f"memory reservation exceeds device total or rounds to zero: {value}")
-    return result
+def cap_bytes(value: str, total_mib: int) -> int:
+    """GPU_MEMORY_CAP: a size (no percentages), bounded by the device total."""
+    return min(parse_bytes(value), total_mib * MIB)
 
 
 def desired_groups(args: argparse.Namespace) -> int:
@@ -256,11 +253,14 @@ def desired_groups(args: argparse.Namespace) -> int:
                 f"explicit KV pool provides {groups} groups but minimum admission needs {minimum}"
             )
         return groups
-    if args.memory_reservation:
+    if args.gpu_memory_cap:
         return minimum
-    groups = math.ceil(args.max_context_tokens / 512) * args.concurrency
+    if args.max_context_tokens == "auto":
+        return minimum
+    context = int(args.max_context_tokens)
+    groups = math.ceil(context / 512) * args.concurrency
     return max(min(groups, DEFAULT_POOL_TOKENS // 512) + args.concurrency + 2 * args.retained_turns,
-               math.ceil(args.max_context_tokens / 512) + minimum)
+               math.ceil(context / 512) + minimum)
 
 
 def required_mib(role: int, groups: int, minimum_expert_layers: int = 20,
@@ -271,12 +271,12 @@ def required_mib(role: int, groups: int, minimum_expert_layers: int = 20,
     return math.ceil(required / MIB)
 
 
-def fits(gpu: Gpu, role: int, groups: int, reservation: str, minimum_expert_layers: int = 20,
+def fits(gpu: Gpu, role: int, groups: int, cap: str, minimum_expert_layers: int = 20,
          expert_format: str = "native") -> bool:
     required = required_mib(role, groups, minimum_expert_layers, expert_format)
     if gpu.total_mib < required or gpu.effective_free_mib < required:
         return False
-    return not reservation or reservation_bytes(reservation, gpu.total_mib) >= required * MIB
+    return not cap or cap_bytes(cap, gpu.total_mib) >= required * MIB
 
 
 def peer_pairs(tool: str, gpus: list[Gpu], required: bool) -> set[tuple[int, int]]:
@@ -300,21 +300,18 @@ def select(args: argparse.Namespace) -> dict:
     primary = chosen[0]
     mode = str(len(chosen)) if explicit else args.mode
     if args.compact_spark:
-        if mode != "1" or not args.memory_reservation:
+        if mode != "1" or not args.gpu_memory_cap:
             raise SelectionError("compact Spark requires mode 1 and a memory ceiling")
-        if parse_bytes(args.memory_reservation) > 32 * GIB:
+        if parse_bytes(args.gpu_memory_cap) > 32 * GIB:
             raise SelectionError("compact Spark memory ceiling exceeds 32GiB")
     decision = "explicit" if explicit else "forced"
     if mode == "1":
         if args.kv_pool_size:
             parse_bytes(args.kv_pool_size)
-        if args.memory_reservation:
-            # Compact runtime clamps its absolute ceiling to physical total;
-            # a nominal 32GiB board can report slightly less usable VRAM.
-            reservation = args.memory_reservation
-            if args.compact_spark:
-                reservation = str(min(parse_bytes(reservation), primary.total_mib * MIB))
-            reservation_bytes(reservation, primary.total_mib)
+        if args.gpu_memory_cap:
+            # The cap is bounded by the physical total; a nominal 32GiB board
+            # can report slightly less usable VRAM.
+            cap_bytes(args.gpu_memory_cap, primary.total_mib)
         return {"count": 1, "groups": None, "required_mib": None,
                 "gpus": [primary.__dict__ | {"effective_free_mib": primary.effective_free_mib}],
                 "decision": decision}
@@ -330,7 +327,7 @@ def select(args: argparse.Namespace) -> dict:
         unfit = [f"GPU {gpu.index} ({gpu.uuid}) as logical GPU {role} needs {requirements[role]} MiB, "
                  f"has {gpu.effective_free_mib}/{gpu.total_mib} MiB effective-free/total"
                  for role, gpu in enumerate((primary, second))
-                 if not fits(gpu, role, groups, args.memory_reservation, args.minimum_expert_layers,
+                 if not fits(gpu, role, groups, args.gpu_memory_cap, args.minimum_expert_layers,
                              args.expert_format)]
         if unfit:
             raise SelectionError(f"COORDINATOR_GPUS={args.selectors} cannot serve two-RTX V4.1: " + "; ".join(unfit))
@@ -342,13 +339,13 @@ def select(args: argparse.Namespace) -> dict:
                 gpu for gpu in gpus
                 if gpu.uuid != primary.uuid
                 and bidirectional(peers, primary, gpu)
-                and fits(gpu, 1, groups, args.memory_reservation, args.minimum_expert_layers,
+                and fits(gpu, 1, groups, args.gpu_memory_cap, args.minimum_expert_layers,
                          args.expert_format)
             ),
             key=lambda gpu: (gpu.effective_free_mib, gpu.total_mib, -gpu.index),
             reverse=True,
         )
-        dual = fits(primary, 0, groups, args.memory_reservation, args.minimum_expert_layers,
+        dual = fits(primary, 0, groups, args.gpu_memory_cap, args.minimum_expert_layers,
                     args.expert_format) and bool(candidates)
         if args.mode == "2" and not dual:
             raise SelectionError(
@@ -371,7 +368,7 @@ def select(args: argparse.Namespace) -> dict:
 def admit(args: argparse.Namespace) -> None:
     """Each selected GPU holds the plan's fixed owners for its logical device.
 
-    The KV pool sizes itself into what remains, and with Spark ranks so do the
+    The KV pool sizes itself into what remains, and with Spark expert ranks so do the
     RTX-onboarded expert layers; everything else must fit the GPU's free memory
     now. A GPU another job occupies fails here, before any container starts."""
     gpus = inventory(args.nvidia_smi, set(args.reclaim_pid), total_capacity=args.total_capacity)
@@ -384,7 +381,7 @@ def admit(args: argparse.Namespace) -> None:
     try:
         with open(args.deployment) as stream:
             deployment = json.load(stream)
-        flexible = {"kv"} | ({"experts"} if deployment["spark_ranks"] else set())
+        flexible = {"kv"} | ({"experts"} if deployment["spark_expert_world"] else set())
         devices = sorted((device for device in deployment["memory_layout"]["devices"] if device["kind"] == "rtx"),
                          key=lambda device: device["index"])
         required = [sum(item["bytes"] for item in device["items"] if item["category"] not in flexible)

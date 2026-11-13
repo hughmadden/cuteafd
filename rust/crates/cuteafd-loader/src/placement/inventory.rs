@@ -18,6 +18,92 @@ use cuteafd_core::GpuArch;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+/// Only inputs that affect a maintained figure participate in compatibility.
+/// The producing engine commit belongs to evidence, not this identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FigureIdentity<'a> {
+    pub declared_graphs: &'a str,
+    /// The manifest hash includes its kernel object hashes.
+    pub programs_sha256: &'a str,
+    pub native_sha256: &'a str,
+    pub toolchain: &'a str,
+    pub gpu_class: &'a str,
+    pub driver: &'a str,
+    pub layout: &'a str,
+}
+
+impl FigureIdentity<'_> {
+    pub fn stale_parts(&self, current: FigureIdentity<'_>) -> Vec<&'static str> {
+        [
+            ("declared graph set", self.declared_graphs == current.declared_graphs),
+            ("kernel/program hashes", self.programs_sha256 == current.programs_sha256),
+            ("native library", self.native_sha256 == current.native_sha256),
+            ("toolchain", self.toolchain == current.toolchain),
+            ("GPU class", self.gpu_class == current.gpu_class),
+            ("driver", self.driver == current.driver),
+            ("layout", self.layout == current.layout),
+        ].into_iter().filter_map(|(part, equal)| (!equal).then_some(part)).collect()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FigureAttribution {
+    Measured,
+    Estimated { derivation: &'static str },
+}
+
+/// A family-code parameter, never a receipt or an independently proved bound.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MemoryFigure {
+    pub bytes: u64,
+    pub attribution: FigureAttribution,
+    pub evidence: &'static str,
+    pub producing_commit: &'static str,
+    pub identity: FigureIdentity<'static>,
+}
+
+impl MemoryFigure {
+    /// Derive an explicitly estimated layout from a whole measured figure.
+    /// Rounding is integral-byte ceiling, not an automatic safety margin.
+    pub fn scaled(self, numerator: u64, denominator: u64, derivation: &'static str)
+        -> Result<Self, &'static str> {
+        if denominator == 0 || derivation.trim().is_empty() {
+            return Err("invalid maintained memory figure derivation");
+        }
+        let bytes = u128::from(self.bytes).checked_mul(u128::from(numerator))
+            .ok_or("maintained memory figure overflow")?.div_ceil(u128::from(denominator));
+        Ok(Self { bytes: bytes.try_into().map_err(|_| "maintained memory figure overflow")?,
+            attribution: FigureAttribution::Estimated { derivation }, ..self })
+    }
+}
+
+/// Call only for figures consumed by the resolved plan. Unselected alternatives
+/// must not produce recommendations, and compatibility never changes the bytes.
+#[derive(Debug, Clone, Copy)]
+pub struct FigureUse<'a> {
+    pub name: &'a str,
+    pub figure: MemoryFigure,
+    pub current: FigureIdentity<'a>,
+}
+
+pub fn census_recommendation<'a>(figures: impl IntoIterator<Item = FigureUse<'a>>) -> Option<String> {
+    let mut findings = std::collections::BTreeSet::new();
+    for used in figures {
+        let mut reasons = Vec::new();
+        if let FigureAttribution::Estimated { derivation } = used.figure.attribution {
+            reasons.push(format!("estimated, derived from {}: {derivation}", used.figure.evidence));
+        }
+        let stale = used.figure.identity.stale_parts(used.current);
+        if !stale.is_empty() { reasons.push(format!("stale {}", stale.join(", "))); }
+        if !reasons.is_empty() {
+            findings.insert(format!("{} ({}; evidence {})", used.name, reasons.join("; "), used.figure.evidence));
+        }
+    }
+    (!findings.is_empty()).then(|| format!(
+        "census recommended for maintained runtime memory figures: {}; using maintained bytes unchanged",
+        findings.into_iter().collect::<Vec<_>>().join("; ")))
+}
+
 #[path = "spark_inventory.rs"]
 mod spark_inventory;
 pub use spark_inventory::{v41_spark_inventory, QualifiedSparkRuntime, SparkExecutionInventory, SparkInventoryError, SparkLoadInventory, SparkManifestProvenance, SparkMemoryDomains, SparkRankInventory, SparkRuntimeMethod, SparkRuntimeProvenance, SparkRuntimeTerm};
@@ -85,7 +171,7 @@ pub const ARCH_CONTEXTS: &[ArchContext] = &[
 ];
 
 /// The coordinator GPU budget `cuteafd plan` lays out without a device or a
-/// `--coordinator-gpu-budget-gib`: the RTX PRO 6000's CUDA-reported total
+/// `--gpu-memory-cap`: the RTX PRO 6000's CUDA-reported total
 /// (94.97 GiB; the card's nominal 95.5 GiB is not what CUDA hands out).
 pub const PRO_TOTAL_BYTES: u64 = 101_973_491_712;
 
@@ -114,136 +200,10 @@ impl ArchContext {
     }
 }
 
-/// Native code a family's serving process holds on a coordinator GPU at ready,
-/// beyond [`ArchContext::context_bytes`] and outside its tracked allocations
-/// and captured startup graphs: the selected program modules
-/// (`CUDA_MODULE_LOADING=LAZY` loads each function's code on first launch),
-/// the cuBLAS handle, expert-package modules (fp8moe/EXL3 libraries), the
-/// transport's device mappings and the runtime's per-stream bookkeeping.
-/// One definition for both sides: the ready ledger (the `stage: "ready"`
-/// report serve logs at readiness, before any request) splits its untracked
-/// bytes as `context + loaded code + GraphSet::at_ready`, so
-/// `loaded code = untracked at ready - startup graphs - context`. Lazily
-/// captured graphs (V4's attention graphs, any `Lifetime::Growth` set) come
-/// after ready: never in this number, always charged as "graph growth".
-/// Measured per serving configuration (v3-p2 cards, RTX PRO 6000 SM120,
-/// driver 595.91.07, CUDA 13.2, 2026-10-10). The two-RTX `dsv4` entries are
-/// TP2 expert halves (P4), measured at tagged ready on 2026-10-11.
-///
-/// The planner charges `bytes` (with the context) as the GPU's runtime
-/// baseline. The runtime's admission sample already holds part of it (the
-/// modules, an expert package, cuBLAS when a weight load ran a GEMM), so serve
-/// reserves only what is still missing at its sample ([`LoadedCode::pending`]).
-/// Both sides then reach the same ready ledger.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-pub struct LoadedCode {
-    /// Program family: `qwen4`, `mimo` (all MiMo sizes), `dsv4` (Flash and
-    /// Pro), `glmf`.
-    pub family: &'static str,
-    /// Local expert package on this GPU: `exl3`, `fp8` (fp8moe/NVFP4), `none`
-    /// (Spark experts), or `*` (measured not to depend on it).
-    pub experts: &'static str,
-    /// Head-split layout (two coordinator GPUs).
-    pub split: bool,
-    /// 0: lead GPU, 1: the head-split peer.
-    pub rank: u8,
-    pub bytes: u64,
-    pub source: &'static str,
-}
-
-/// The measured table ([`loaded_code`]).
-pub const LOADED_CODE: &[LoadedCode] = &[
-    LoadedCode { family: "qwen4", experts: "exl3", split: false, rank: 0, bytes: 780_221_844,
-        source: "qwen38-exl3-min: untracked 5,936,332,180 - graphs 4,569,694,208 - context 586,416,128" },
-    LoadedCode { family: "qwen4", experts: "fp8", split: false, rank: 0, bytes: 1_089_736_388,
-        source: "qwen38-nvfp4-min: untracked 6,245,846,724 - graphs 4,569,694,208 - context 586,416,128" },
-    LoadedCode { family: "mimo", experts: "*", split: false, rank: 0, bytes: 261_483_520,
-        source: "mimo26-flash-min: untracked 847,899,648 - context 586,416,128" },
-    LoadedCode { family: "mimo", experts: "*", split: true, rank: 0, bytes: 365_259_264,
-        source: "mimo26-flash-max rtx0: untracked 951,675,392 - context 586,416,128" },
-    LoadedCode { family: "mimo", experts: "*", split: true, rank: 1, bytes: 165_460_992,
-        source: "mimo26-flash-max rtx1: untracked 751,877,120 - context 586,416,128" },
-    LoadedCode { family: "dsv4", experts: "*", split: false, rank: 0, bytes: 322_050_368,
-        source: "v4-flash-sim5090 (0 RTX layers): untracked 908,466,496 - context 586,416,128; \
-            v4-flash-min p0 (18 FP8 layers) 309,476,320" },
-    LoadedCode { family: "dsv4", experts: "exl3", split: true, rank: 0, bytes: 1_059_185_592,
-        source: "v4-pro-exl3 TP2 tagged ready rtx0 (b367a34f, 2026-10-11): untracked 1,645,601,720 - context 586,416,128" },
-    LoadedCode { family: "dsv4", experts: "exl3", split: true, rank: 1, bytes: 885_694_212,
-        source: "v4-pro-exl3 TP2 tagged ready rtx1 (b367a34f, 2026-10-11): untracked 1,472,110,340 - context 586,416,128" },
-    LoadedCode { family: "dsv4", experts: "exl3", split: false, rank: 0, bytes: 724_349_124,
-        source: "v4-pro-exl3-min (1 RTX + 4 Sparks, 3 EXL3 layers): untracked 1,310,765,252 - context 586,416,128" },
-    LoadedCode { family: "dsv4", experts: "*", split: true, rank: 0, bytes: 1_007_333_728,
-        source: "v4-flash TP2 tagged ready rtx0 (b367a34f, 2026-10-11): untracked 1,593,749,856 - context 586,416,128" },
-    LoadedCode { family: "dsv4", experts: "*", split: true, rank: 1, bytes: 803_054_544,
-        source: "v4-flash TP2 tagged ready rtx1 (b367a34f, 2026-10-11): untracked 1,389,470,672 - context 586,416,128" },
-    LoadedCode { family: "glmf", experts: "*", split: false, rank: 0, bytes: 436_389_024,
-        source: "glm53f-exl3-min: untracked 2,968,962,208 - graphs 1,946,157,056 - context 586,416,128" },
-    LoadedCode { family: "glmf", experts: "exl3-tp2-local", split: true, rank: 0, bytes: 441_094_988,
-        source: "P6 staged EXL3 TP2 0-Spark startup, 2026-10-12: named program/load/exchange/package/workspace terms; pre-capture 1,027,511,116 - context 586,416,128" },
-    LoadedCode { family: "glmf", experts: "exl3-tp2-local", split: true, rank: 1, bytes: 314_257_228,
-        source: "P6 staged EXL3 TP2 0-Spark startup, 2026-10-12: named second-context/program/load/exchange/package/workspace terms; pre-capture 900,673,356 - context 586,416,128" },
-    LoadedCode { family: "glmf", experts: "*", split: true, rank: 0, bytes: 500_143_488,
-        source: "glm53f-exl3-max rtx0: untracked 3,317,929,344 - graphs 2,231,369,728 - context 586,416,128" },
-    LoadedCode { family: "glmf", experts: "*", split: true, rank: 1, bytes: 215_091_456,
-        source: "glm53f-exl3-max rtx1: untracked 3,085,306,112 - graphs 2,283,798,528 - context 586,416,128" },
-];
-
-/// Physical untracked startup deltas for the P6 EXL3 TP2 / zero-Spark path.
-/// SM120 PRO 6000, CUDA 13.2 LAZY, row128 KDA/output shard/FP8 head, C8,
-/// 4096 prefill, 64 decode; staged probe 2026-10-12, source f5193e78.
-/// Package term includes the route exchange's 524,544 B driver-page reclaim;
-/// it is not resident cubin size (embedded packages total only 2,841,960 B).
-/// Graph capture is measured separately after all expert capacities are primed.
-pub fn glmf_local_tp2_runtime_items(rank: usize) -> Vec<cuteafd_core::memory_layout::Item> {
-    use cuteafd_core::memory_layout::{Basis, Category, Item};
-    assert!(rank < 2, "GLM Flash TP2 has exactly two ranks");
-    let terms = [
-        ("CUDA context", 586_416_128),
-        ("second-rank context", [0, 10_485_760][rank]),
-        ("selected program setup", 12_582_912),
-        ("target-load BLAS and driver state", [185_912_576, 183_725_312][rank]),
-        ("peer exchange mappings and setup", 97_364_992),
-        ("EXL3 and route package driver state", 6_817_612),
-        ("workspace BLAS and driver state", [138_416_896, 3_280_640][rank]),
-    ];
-    terms.into_iter().map(|(group, bytes)| Item::new(Category::Runtime, group, "", bytes, Basis::Calibrated)).collect()
-}
-
-/// GLM Flash startup executable means (SM120 RTX PRO 6000, CUDA driver
-/// 595.91.07, EXL3 K3.25, 64 decode rows, v3-p2 ready ledgers, 2026-10-10).
-/// One GPU: 1,946,157,056 / 13,800; split lead: 2,231,369,728 / 13,800;
-/// split peer: 2,283,798,528 / 13,500. Values retain P2's rounded arithmetic.
-pub const GLMF_GRAPH_BYTES_BY_ROLE: [u64; 3] = [141_027, 161_694, 169_171];
-
-/// GLM owned-phase SM120 executable mean, RTX PRO 6000, EXL3 K4, 2026-10-15.
-/// 49,416 executables/rank used 5,790,236,672 / 5,762,973,696 B on two launches.
-/// This is a phase-class calibration, not a whole-engine budget. Recheck ready
-/// deltas on RTX 5090 or after changing the phase/shape census.
-pub const GLM_OWNED_SM120_GRAPH_BYTES: u64 = 117_000;
-
-/// The table's family key of a program family (`dsv4f`, `mimop2`, ...).
+/// Canonical family of a program prefix (`dsv4f`, `mimop2`, ...).
 pub fn loaded_code_family(program_family: &str) -> &str {
     let base = program_family.trim_end_matches('2');
     if base.starts_with("mimo") { "mimo" } else if base.starts_with("dsv4") { "dsv4" } else { base }
-}
-
-/// The measured loaded code of `program_family` with `experts` on coordinator
-/// `rank` of a (`split`) layout: exact package, then an explicit `*` entry.
-/// Unmeasured packages retain the manifest formula, never another package's calibration.
-pub fn loaded_code(program_family: &str, experts: &str, split: bool, rank: u8) -> Option<&'static LoadedCode> {
-    let family = loaded_code_family(program_family);
-    let at = |c: &&LoadedCode| c.family == family && c.split == split && c.rank == rank;
-    LOADED_CODE.iter().filter(at).find(|c| c.experts == experts)
-        .or_else(|| LOADED_CODE.iter().filter(at).find(|c| c.experts == "*"))
-}
-
-impl LoadedCode {
-    /// The part serve still reserves at an admission sample whose used bytes
-    /// beyond this process's tracked allocations are `untracked_at_sample`
-    /// (`total - free - tracked`; the CUDA context included).
-    pub fn pending(&self, untracked_at_sample: u64, context_bytes: u64) -> u64 {
-        self.bytes.saturating_sub(untracked_at_sample.saturating_sub(context_bytes))
-    }
 }
 
 /// Ready code beyond the CUDA context, shared by offline and live admission.
@@ -263,20 +223,100 @@ impl CodeAllowance {
     }
 }
 
-/// Exact/explicit-wildcard calibration, otherwise cuBLAS plus selected modules
-/// and peer context. Live admission subtracts bytes already in its sample.
-pub fn loaded_code_allowance(program_family: &str, experts: &str, split: bool, rank: u8,
+/// Selected-program code, separate from named BLAS owners in migrated families.
+/// Every family here charges its modules by name and its library storage in
+/// disjoint typed owners; none keeps a mixed residency row.
+pub fn loaded_code_allowance(program_family: &str, _experts: &str, split: bool, _rank: u8,
     arch: &ArchContext, programs: Option<&ProgramSet>) -> CodeAllowance {
-    match loaded_code(program_family, experts, split, rank) {
-        Some(code) => CodeAllowance { bytes: code.bytes, basis: Basis::Calibrated, future_library_bytes: 0 },
-        None => CodeAllowance { bytes: arch.cublas_bytes
-            + programs.map_or(32 * MIB, ProgramSet::module_bytes)
-            + if split { arch.peer_context_bytes } else { 0 }, basis: Basis::Formula,
-            future_library_bytes: arch.cublas_bytes },
+    // Migrated families keep BLAS and driver storage in disjoint typed owners.
+    if matches!(loaded_code_family(program_family), "glmf" | "glmf-k6" | "kimik3" | "qwen4" | "mimo" | "muse" | "step5" | "dsv4") {
+        return CodeAllowance { bytes: if loaded_code_family(program_family) == "step5" {
+            programs.map_or(32 * MIB, ProgramSet::module_bytes)
+        } else {
+            programs.map_or_else(
+                || ProgramSet::from_names(&[program_family], std::iter::empty()).module_bytes(),
+                ProgramSet::module_bytes)
+        },
+            basis: Basis::Estimated, future_library_bytes: 0 };
     }
+    CodeAllowance { bytes: arch.cublas_bytes
+        + programs.map_or(32 * MIB, ProgramSet::module_bytes)
+        + if split { arch.peer_context_bytes } else { 0 }, basis: Basis::Formula,
+        future_library_bytes: arch.cublas_bytes }
 }
 
 pub use cuteafd_core::RuntimeSample;
+
+/// Typed native projection entries, parsed once at an artifact boundary. Other
+/// exporter programs remain opaque so their independent schemas can evolve.
+#[derive(Debug, Clone, Default)]
+pub struct ProgramsManifest {
+    entries: std::collections::BTreeMap<String, ProgramEntry>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ProgramEntry {
+    pub spec: cuteafd_ffi::programs::ProgramSpec,
+}
+
+impl ProgramsManifest {
+    pub fn from_manifest(manifest: &Value) -> anyhow::Result<Self> {
+        use anyhow::{ensure, Context};
+        let programs = manifest["programs"].as_array().context("PROGRAMS.json has no program list")?;
+        let mut entries = std::collections::BTreeMap::new();
+        for entry in programs {
+            let Some(name) = entry["name"].as_str().filter(|name| Self::is_native(name)) else { continue; };
+            let parsed = ProgramEntry::from_manifest(entry).with_context(|| format!("native program {name}"))?;
+            ensure!(entries.insert(name.to_owned(), parsed).is_none(), "duplicate native program {name}");
+        }
+        Ok(Self { entries })
+    }
+
+    /// Reuse an already parsed runtime program table without rereading its manifest.
+    pub fn from_specs<'a>(specs: impl Iterator<Item = &'a cuteafd_ffi::programs::ProgramSpec>)
+        -> anyhow::Result<Self> {
+        let mut entries = std::collections::BTreeMap::new();
+        for spec in specs.filter(|spec| Self::is_native(&spec.name)) {
+            anyhow::ensure!(entries.insert(spec.name.clone(), ProgramEntry { spec: spec.clone() }).is_none(),
+                "duplicate native program {}", spec.name);
+        }
+        Ok(Self { entries })
+    }
+
+    fn is_native(name: &str) -> bool {
+        name.starts_with("draft_bf16_k") || name.starts_with("native_attention_n")
+    }
+
+    pub fn get(&self, name: &str) -> Option<&ProgramEntry> { self.entries.get(name) }
+}
+
+impl ProgramEntry {
+    pub(crate) fn from_manifest(entry: &Value) -> anyhow::Result<Self> {
+        use anyhow::Context;
+        #[derive(Deserialize)]
+        struct Pointer { name: String }
+        #[derive(Deserialize)]
+        struct Scalar { #[serde(rename = "type")] kind: String }
+        #[derive(Deserialize)]
+        struct Entry {
+            name: String,
+            pointers: Vec<Pointer>,
+            scalars: Vec<Scalar>,
+            scratch_bytes_at_capacity: std::collections::HashMap<String, u64>,
+            capacity_rows: u32,
+            geometry: Option<Value>,
+        }
+        let entry: Entry = serde_json::from_value(entry.clone()).context("native projection schema")?;
+        let geometry = entry.geometry.context("native projection geometry missing")?;
+        let scalar_kinds = entry.scalars.into_iter().map(|scalar| match scalar.kind.as_str() {
+            "int32" => Ok(b'i'), "int64" => Ok(b'l'), "float32" => Ok(b'f'),
+            kind => Err(anyhow::anyhow!("unsupported native scalar {kind}")),
+        }).collect::<anyhow::Result<Vec<_>>>()?;
+        Ok(Self { spec: cuteafd_ffi::programs::ProgramSpec { name: entry.name,
+            pointers: entry.pointers.into_iter().map(|pointer| pointer.name).collect(), scalar_kinds,
+            scratch: entry.scratch_bytes_at_capacity, capacity_rows: entry.capacity_rows, geometry } })
+    }
+}
 
 /// The programs a family launches: a prefix filter over the image's program
 /// manifest (`<family>_...` and its head-split `<family>2_...`), not every
@@ -318,7 +358,7 @@ impl ProgramSet {
     /// Native V4.1 projection plans retain a separate aligned arena for each
     /// small-row specialization and the first compiled capacity holding `rows`.
     /// These exports live in V41_FP8_AOT.json, not PROGRAMS.json. Module residency
-    /// still comes from LoadedCode; `scratch` here describes allocation owners.
+    /// is charged separately; `scratch` here describes allocation owners.
     pub fn v41_fp8(manifest: &Value, matrices: &[(u64, u64)], rows: u64, sms: u32)
         -> anyhow::Result<Self> {
         use anyhow::{ensure, Context};
@@ -386,9 +426,13 @@ impl ProgramSet {
             .is_some_and(|prefix| self.families.iter().any(|f| f == prefix))
     }
 
-    /// Module bytes the family's programs take on one device: measured
-    /// 35,651,584 B for a family's selected set (MiMo, 2026-10-09) on SM120;
-    /// a 2 MiB-granular charge per 16 programs bounds the observed sets.
+    /// Offline estimate of the module bytes a family's programs take on one
+    /// device: calibrated on MiMo's selected set (35,651,584 B, SM120,
+    /// 2026-10-09), scaled 2 MiB per 16 programs over an unverified 32 MiB
+    /// base. It prices `plan --layout` only, as `Basis::Estimated`: V4.1's
+    /// selected set measures 83,886,080 B, so this understates it, and serve
+    /// charges the measured pre-weight drop instead
+    /// (`deepseek_v41::admission::runtime_base`).
     pub fn module_bytes(&self) -> u64 {
         (self.names.len() as u64).div_ceil(16).max(1) * 2 * MIB + 32 * MIB
     }
@@ -408,19 +452,131 @@ pub enum Lifetime {
     Growth,
 }
 
-/// One rank's graph executables.
+/// Compatibility of one rank's exact startup executable census. A graph count
+/// is not an identity: all launch keys and the code/device provenance must match.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GraphCensusIdentity {
+    pub declared_graphs: String,
+    pub programs_sha256: String,
+    pub native_sha256: String,
+    pub toolchain: String,
+    pub gpu_class: String,
+    pub driver: String,
+    pub layout: String,
+}
+
+impl GraphCensusIdentity {
+    pub fn validate(&self) -> Result<(), String> {
+        if [&self.declared_graphs, &self.programs_sha256, &self.native_sha256,
+            &self.toolchain, &self.gpu_class, &self.driver, &self.layout]
+            .iter().any(|value| value.trim().is_empty()) {
+            return Err("incomplete startup graph census identity".into());
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GraphCensus {
+    pub identity: GraphCensusIdentity,
+    pub executables: u64,
+    pub bytes: u64,
+    pub evidence: String,
+    pub producing_commit: String,
+}
+
+/// A synchronized capture boundary. Tracked allocations are separate owners;
+/// their change must never be absorbed into executable residency.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GraphMemorySample {
+    pub total: u64,
+    pub free: u64,
+    pub tracked_device: u64,
+    pub tracked_pinned: u64,
+    pub tracked_managed: u64,
+}
+
+impl GraphMemorySample {
+    pub fn retained_since(self, before: Self) -> Result<u64, String> {
+        if self.total != before.total || self.free > self.total || before.free > before.total {
+            return Err("incompatible startup graph memory samples".into());
+        }
+        if self.tracked_pinned != before.tracked_pinned || self.tracked_managed != before.tracked_managed {
+            return Err("mapped or managed storage changed during graph capture; prepare it before sampling".into());
+        }
+        let bytes = i128::from(before.free) - i128::from(self.free)
+            - (i128::from(self.tracked_device) - i128::from(before.tracked_device));
+        u64::try_from(bytes).map_err(|_| "negative startup graph residency after excluding tracked allocations".into())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CapturedGraphRank {
+    pub declared_graphs: String,
+    pub executables: u64,
+    pub bytes: u64,
+}
+
+impl CapturedGraphRank {
+    pub fn measure<K>(rank: u8, declared: &DeclaredGraphSet<K>, actual: &[K],
+        before: GraphMemorySample, after: GraphMemorySample) -> Result<Self, String>
+        where K: std::hash::Hash + Eq + Clone + std::fmt::Debug + Serialize {
+        declared.verify(actual.iter())?;
+        Ok(Self { declared_graphs: declared.fingerprint(rank)?, executables: actual.len() as u64,
+            bytes: after.retained_since(before)? })
+    }
+}
+
+fn estimated_graph_basis() -> Basis { Basis::Estimated }
+
+/// One rank's graph executables. Unqualified historical arithmetic remains an
+/// estimate until an exact compatible census or this process's capture replaces it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GraphRank {
     pub executables: u64,
-    /// Reserved: the captured estimate plus the driver margin.
     pub bytes: u64,
-    /// Of `bytes`, the margin (driver variance, late captures); growth.
+    /// Legacy startup consumers still split a margin into growth; migrated
+    /// startup owners have zero margin. Lazy budgets retain their own lifetime.
     pub margin: u64,
+    #[serde(default = "estimated_graph_basis")]
+    pub basis: Basis,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_charge: Option<super::graph_nodes::GraphNodeCharge>,
 }
 
-/// The decode graph set a family captures, per rank (lead first). The
-/// runtime's warm-up and the planner build it from the same function; bytes
-/// are executables x the arch's bytes per executable, plus a margin.
+impl GraphRank {
+    pub fn estimated(executables: u64, bytes: u64) -> Self {
+        Self { executables, bytes, margin: 0, basis: Basis::Estimated, node_charge: None }
+    }
+
+    /// Historical whole-capture arithmetic is only a fallback estimate. It
+    /// carries no percentage, minimum or maximum-of-samples adjustment.
+    pub fn estimate(executables: u64, observed_bytes: u64, observed_executables: u64) -> Result<Self, String> {
+        if observed_executables == 0 { return Err("empty startup graph observation".into()); }
+        let bytes = (u128::from(executables) * u128::from(observed_bytes))
+            .div_ceil(u128::from(observed_executables));
+        Ok(Self::estimated(executables, bytes.try_into().map_err(|_| "startup graph estimate overflow")?))
+    }
+
+    /// A stale or absent row never becomes calibrated merely because counts
+    /// agree. The fallback is explicit estimate-then-exact, without padding.
+    pub fn from_census(identity: &GraphCensusIdentity, executables: u64,
+        census: &[GraphCensus], estimated_bytes: u64) -> Result<Self, String> {
+        identity.validate()?;
+        let matches: Vec<_> = census.iter().filter(|row|
+            row.identity == *identity && row.executables == executables).collect();
+        match matches.as_slice() {
+            [] => Ok(Self::estimated(executables, estimated_bytes)),
+            [row] if !row.evidence.trim().is_empty() && !row.producing_commit.trim().is_empty() =>
+                Ok(Self { bytes: row.bytes, basis: Basis::Calibrated, ..Self::estimated(executables, 0) }),
+            _ => Err("duplicate or unattributed startup graph census".into()),
+        }
+    }
+}
+
+/// The decode graph set a family captures, per rank (lead first). Exact census
+/// rows or explicit estimates forecast residency; synchronized capture supplies
+/// the live owner. Legacy consumers still retain margins until migrated.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GraphSet {
     pub ranks: Vec<GraphRank>,
@@ -437,6 +593,63 @@ pub struct StartupGraphs<K> {
     pub keys: Vec<K>,
 }
 
+/// An independently declared exact executable-key set. Memory observations and
+/// node counts never participate in its identity. Keys must serialize stable
+/// launch geometry, with no pointer addresses or process-local identifiers.
+#[derive(Debug, Clone)]
+pub struct DeclaredGraphSet<K> {
+    keys: std::collections::HashSet<K>,
+}
+
+impl<K: std::hash::Hash + Eq + Clone + std::fmt::Debug> DeclaredGraphSet<K> {
+    pub fn new(keys: &[K]) -> Result<Self, String> {
+        let declared = keys.iter().cloned().collect::<std::collections::HashSet<_>>();
+        if declared.len() != keys.len() { return Err("duplicate startup graph key".into()); }
+        Ok(Self { keys: declared })
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = &K> { self.keys.iter() }
+
+    pub fn contains(&self, key: &K) -> bool { self.keys.contains(key) }
+    pub fn len(&self) -> usize { self.keys.len() }
+    pub fn is_empty(&self) -> bool { self.keys.is_empty() }
+
+    pub fn verify<'a>(&self, actual: impl IntoIterator<Item = &'a K>) -> Result<(), String>
+        where K: 'a {
+        let mut seen = std::collections::HashSet::new();
+        for key in actual {
+            if !seen.insert(key) || !self.contains(key) {
+                return Err(format!("unexpected or duplicate startup graph key: {key:?}"));
+            }
+        }
+        if seen.len() != self.len() {
+            return Err(format!("startup graph coverage differs: declared {}, captured {}", self.len(), seen.len()));
+        }
+        Ok(())
+    }
+
+    /// Sort the serialized keys and length-frame every entry, so declaration
+    /// order and randomized HashSet iteration do not affect a rank's identity.
+    pub fn fingerprint(&self, rank: u8) -> Result<String, String> where K: Serialize {
+        use sha2::{Digest, Sha256};
+        let mut encoded = self.keys.iter().map(serde_json::to_vec)
+            .collect::<Result<Vec<_>, _>>().map_err(|error| error.to_string())?;
+        encoded.sort_unstable();
+        if encoded.windows(2).any(|pair| pair[0] == pair[1]) {
+            return Err("distinct startup graph keys serialize identically".into());
+        }
+        let mut hash = Sha256::new();
+        hash.update(b"cuteafd-declared-graphs-v1\0");
+        hash.update([rank]);
+        hash.update((encoded.len() as u64).to_le_bytes());
+        for key in encoded {
+            hash.update((key.len() as u64).to_le_bytes());
+            hash.update(key);
+        }
+        Ok(format!("{:x}", hash.finalize()))
+    }
+}
+
 /// A measured V4.1 executable class on one lane/device. bindings counts stable
 /// source/table geometries of this exact row shape, not a padding bucket.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -450,6 +663,23 @@ pub struct V41GraphShape {
 }
 
 impl GraphSet {
+    /// Replace planning estimates with this process's synchronized capture. No
+    /// reserve or count-only match can stand in for the selected executable keys.
+    pub fn captured(&self, declared: &[String], captured: &[CapturedGraphRank]) -> Result<Self, String> {
+        if self.lifetime != Lifetime::Startup || declared.len() != self.ranks.len()
+            || captured.len() != self.ranks.len() {
+            return Err("startup graph capture rank inventory differs from admission".into());
+        }
+        let ranks = self.ranks.iter().zip(declared).zip(captured).map(|((rank, expected), actual)| {
+            if expected.is_empty() || actual.declared_graphs != *expected || actual.executables != rank.executables {
+                return Err("startup graph capture keys differ from admission".into());
+            }
+            Ok(GraphRank { executables: actual.executables, bytes: actual.bytes,
+                margin: 0, basis: Basis::Calibrated, node_charge: rank.node_charge })
+        }).collect::<Result<_, String>>()?;
+        Ok(Self { ranks, lifetime: Lifetime::Startup, shapes: self.shapes })
+    }
+
     /// Couple a family's exact warm keys to the very ledger charged by its
     /// planner. Refuse a growth ledger or a shape-count mismatch at startup.
     pub fn startup<K>(self, keys: Vec<K>) -> Result<StartupGraphs<K>, String> {
@@ -491,14 +721,14 @@ impl GraphSet {
         let ranks = executables.iter().map(|&count| {
             let measured = count.saturating_mul(per_executable);
             let margin = measured.saturating_mul(margin_percent).div_ceil(100).max(minimum_margin);
-            GraphRank { executables: count, bytes: measured.saturating_add(margin), margin }
+            GraphRank { executables: count, bytes: measured.saturating_add(margin), margin, basis: Basis::Estimated, node_charge: None }
         }).collect();
         Self { ranks, lifetime, shapes }
     }
 
     /// A lazily captured set bounded by a byte budget per rank.
     pub fn budget(per_rank: &[u64]) -> Self {
-        Self { ranks: per_rank.iter().map(|&bytes| GraphRank { executables: 0, bytes, margin: bytes }).collect(),
+        Self { ranks: per_rank.iter().map(|&bytes| GraphRank { executables: 0, bytes, margin: bytes, basis: Basis::Exact, node_charge: None }).collect(),
             lifetime: Lifetime::Growth, shapes: 0 }
     }
 
@@ -508,8 +738,7 @@ impl GraphSet {
 
     /// The graph bytes `rank`'s ready ledger holds: the captured estimate of a
     /// startup set, nothing of a growth set (lazy captures happen after ready).
-    /// With the context and [`LoadedCode`] this is the ready ledger's untracked
-    /// total: `untracked = context + loaded code + at_ready`.
+    /// These graph bytes are separate from context, selected modules and BLAS owners.
     pub fn at_ready(&self, rank: usize) -> u64 {
         match (self.lifetime, self.ranks.get(rank)) {
             (Lifetime::Startup, Some(r)) => r.bytes - r.margin,
@@ -527,7 +756,8 @@ impl GraphSet {
     pub fn demand(&self, rank: usize) -> super::Demand {
         use cuteafd_core::memory_layout::ItemLifetime;
         let group = match self.lifetime { Lifetime::Startup => "graphs", Lifetime::Growth => "graph growth" };
-        super::Demand::new(rank as u8, Category::Runtime, group, self.bytes(rank), Basis::Formula)
+        super::Demand::new(rank as u8, Category::Runtime, group, self.bytes(rank),
+            self.ranks.get(rank).map_or(Basis::Estimated, |rank| rank.basis))
             .with_lifetime(match self.lifetime {
                 Lifetime::Startup => ItemLifetime::ReadyResident,
                 Lifetime::Growth => ItemLifetime::PostReadyReserve,
@@ -542,7 +772,7 @@ impl GraphSet {
         [("graphs", self.at_ready(rank), ItemLifetime::ReadyResident),
             (GRAPH_GROWTH, self.growth(rank), ItemLifetime::PostReadyReserve)]
             .into_iter().filter(|(_, bytes, _)| *bytes > 0)
-            .map(|(group, bytes, lifetime)| Item::new(Category::Runtime, group, "", bytes, Basis::Formula)
+            .map(|(group, bytes, lifetime)| Item::new(Category::Runtime, group, "", bytes, self.ranks[rank].basis)
                 .with_lifetime(lifetime)).collect()
     }
 }
@@ -551,11 +781,74 @@ impl GraphSet {
 /// smallest compiled capacity holding `rows`, from its `manifest.json`
 /// (`layouts.<layout>.capacities[].scratch_bytes`), as the runtime's
 /// `Fp8MoeModule::scratch_bytes` returns it. No CUDA.
-pub fn fp8moe_scratch_bytes(manifest: &Value, layout: &str, rows: u64) -> Option<u64> {
-    let capacities = manifest["layouts"][layout]["capacities"].as_array()?;
-    capacities.iter().filter_map(|c| Some((c["capacity"].as_u64()?, c["scratch_bytes"].as_u64()?)))
-        .filter(|&(capacity, _)| capacity >= rows).min_by_key(|&(capacity, _)| capacity)
-        .map(|(_, bytes)| bytes.max(256))
+pub fn fp8moe_scratch_bytes(manifest: &Value, layout: &str, rows: u64)
+    -> Result<Option<u64>, Fp8MoeManifestError> {
+    let invalid = |reason: &str| Fp8MoeManifestError::Contract { layout: layout.into(), reason: reason.into() };
+    let layouts = manifest["layouts"].as_object().ok_or_else(|| invalid("missing layouts object"))?;
+    let Some(info) = layouts.get(layout) else { return Ok(None) };
+    let abi = info["abi_version"].as_u64();
+    if abi != Some(u64::from(cuteafd_ffi::fp8_moe::FP8_MOE_ABI)) {
+        return Err(Fp8MoeManifestError::Abi { layout: layout.into(), found: info["abi_version"].to_string(),
+            expected: cuteafd_ffi::fp8_moe::FP8_MOE_ABI });
+    }
+    let number = |key: &str| -> Result<f32, Fp8MoeManifestError> {
+        let value = info[key].as_f64().ok_or_else(|| invalid(&format!("missing or invalid {key}")))? as f32;
+        if !value.is_finite() { return Err(invalid(&format!("non-finite {key}"))) }
+        Ok(value)
+    };
+    let limit = number("swiglu_limit")?;
+    let alpha = number("swiglu_alpha")?;
+    let beta = number("swiglu_beta")?;
+    if limit < 0.0 || info["projection"].as_str() != Some("bf16") {
+        return Err(invalid("invalid limit or unsupported projection"));
+    }
+    let activation = info["activation"].as_str();
+    let weights = info["weights"].as_str();
+    if !matches!(weights, Some("fp8" | "mxfp4" | "nvfp4" | "nvfp4a4" | "bf16")) {
+        return Err(invalid("unsupported weight storage"));
+    }
+    match activation {
+        Some("silu_bf16_product" | "silu_post_clamp_fp32_product") if alpha == 1.0 && beta == 0.0 => (),
+        Some("swigluoai") if matches!(weights, Some("nvfp4" | "nvfp4a4")) && alpha > 0.0 && limit > 0.0 => (),
+        _ => return Err(invalid("unsupported activation or inconsistent alpha/beta/limit")),
+    }
+    if weights == Some("mxfp4") && activation != Some("silu_bf16_product") {
+        return Err(invalid("MXFP4 requires silu_bf16_product"));
+    }
+    let capacities = info["capacities"].as_array().ok_or_else(|| invalid("missing capacities"))?;
+    let mut scratch = None;
+    let mut previous = 0;
+    if capacities.is_empty() || capacities.len() > 6 { return Err(invalid("expected 1..=6 capacities")) }
+    for entry in capacities {
+        let capacity = entry["capacity"].as_u64().ok_or_else(|| invalid("invalid capacity"))?;
+        let bytes = entry["scratch_bytes"].as_u64().ok_or_else(|| invalid("invalid scratch_bytes"))?;
+        if capacity <= previous || capacity > i32::MAX as u64 { return Err(invalid("capacities must be positive, increasing int32 values")) }
+        previous = capacity;
+        if capacity >= rows && scratch.is_none() { scratch = Some(bytes.max(256)); }
+    }
+    Ok(scratch)
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum Fp8MoeManifestError {
+    #[error("FP8 expert layout {layout} has ABI {found}, expected ABI{expected}; regenerate placement inputs")]
+    Abi { layout: String, found: String, expected: u8 },
+    #[error("FP8 expert layout {layout}: {reason}; regenerate placement inputs")]
+    Contract { layout: String, reason: String },
+    #[error("cannot read FP8 expert manifest {path}: {source}")]
+    Read { path: std::path::PathBuf, #[source] source: std::io::Error },
+    #[error("invalid FP8 expert manifest {path}: {source}; regenerate placement inputs")]
+    Json { path: std::path::PathBuf, #[source] source: serde_json::Error },
+}
+
+/// Only absence is optional; unreadable, malformed or stale packages are errors.
+pub fn fp8moe_manifest(path: &std::path::Path) -> Result<Option<Value>, Fp8MoeManifestError> {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(source) => return Err(Fp8MoeManifestError::Read { path: path.into(), source }),
+    };
+    serde_json::from_slice(&bytes).map(Some).map_err(|source| Fp8MoeManifestError::Json { path: path.into(), source })
 }
 
 /// The `fp8moe` package a coordinator loads for `format` experts of geometry
@@ -563,10 +856,10 @@ pub fn fp8moe_scratch_bytes(manifest: &Value, layout: &str, rows: u64) -> Option
 /// `shared::experts::fp8::package_directory`), under `lib`'s `fp8/` tree, and
 /// its scratch for `rows` rows.
 pub fn fp8moe_package_scratch(lib: &std::path::Path, family: &str,
-    format: crate::formats::fp8_experts::ExpertFormat, rows: u64) -> Option<(String, u64)> {
+    format: crate::formats::fp8_experts::ExpertFormat, rows: u64) -> Result<Option<(String, u64)>, Fp8MoeManifestError> {
     let name = format.package_name(family);
-    let manifest: Value = serde_json::from_slice(&std::fs::read(lib.join("fp8").join(&name).join("manifest.json")).ok()?).ok()?;
-    Some((name, fp8moe_scratch_bytes(&manifest, "tp1", rows)?))
+    let Some(manifest) = fp8moe_manifest(&lib.join("fp8").join(&name).join("manifest.json"))? else { return Ok(None) };
+    Ok(fp8moe_scratch_bytes(&manifest, "tp1", rows)?.map(|bytes| (name, bytes)))
 }
 
 /// Mandatory native W4A4 dense package; missing exports never select W4A16.
@@ -574,9 +867,9 @@ pub fn dense_package_directory(lib: &std::path::Path, geometry: &str) -> std::pa
     lib.join("fp8").join(crate::formats::fp8_experts::ExpertFormat::Nvfp4.package_name(geometry)).join("tp1")
 }
 
-pub fn dense_package_scratch(lib: &std::path::Path, geometry: &str, rows: u64) -> Option<u64> {
+pub fn dense_package_scratch(lib: &std::path::Path, geometry: &str, rows: u64) -> Result<Option<u64>, Fp8MoeManifestError> {
     let directory = dense_package_directory(lib, geometry);
-    let manifest: Value = serde_json::from_slice(&std::fs::read(directory.parent()?.join("manifest.json")).ok()?).ok()?;
+    let Some(manifest) = fp8moe_manifest(&directory.parent().expect("dense package parent").join("manifest.json"))? else { return Ok(None) };
     fp8moe_scratch_bytes(&manifest, "tp1", rows)
 }
 
@@ -603,6 +896,132 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn startup_graph_census_requires_exact_attributed_identity() {
+        let identity = GraphCensusIdentity { declared_graphs: "keys".into(), programs_sha256: "programs".into(),
+            native_sha256: "native".into(), toolchain: "compiler".into(), gpu_class: "sm120/188/96G".into(),
+            driver: "13020".into(), layout: "layout".into() };
+        let census = GraphCensus { identity: identity.clone(), executables: 2, bytes: 101,
+            evidence: "synthetic capture".into(), producing_commit: "producer-A".into() };
+        let used = GraphRank::from_census(&identity, 2, &[census.clone()], 200).unwrap();
+        assert_eq!((used.bytes, used.margin, used.basis), (101, 0, Basis::Calibrated));
+        for field in 0..7 {
+            let mut stale = identity.clone();
+            match field {
+                0 => stale.declared_graphs.push('x'),
+                1 => stale.programs_sha256.push('x'),
+                2 => stale.native_sha256.push('x'),
+                3 => stale.toolchain.push('x'),
+                4 => stale.gpu_class.push('x'),
+                5 => stale.driver.push('x'),
+                _ => stale.layout.push('x'),
+            }
+            assert_eq!(GraphRank::from_census(&stale, 2, &[census.clone()], 200).unwrap(),
+                GraphRank::estimated(2, 200));
+        }
+        assert_eq!(GraphRank::from_census(&identity, 3, &[census.clone()], 200).unwrap(),
+            GraphRank::estimated(3, 200));
+        assert!(GraphRank::from_census(&identity, 2, &[census.clone(), census.clone()], 200).is_err());
+        let mut unattributed = census.clone();
+        unattributed.evidence.clear();
+        assert!(GraphRank::from_census(&identity, 2, &[unattributed], 200).is_err());
+        let mut unattributed = census.clone();
+        unattributed.producing_commit.clear();
+        assert!(GraphRank::from_census(&identity, 2, &[unattributed], 200).is_err());
+        let mut incomplete = identity.clone();
+        incomplete.native_sha256.clear();
+        assert!(GraphRank::from_census(&incomplete, 2, &[], 200).is_err());
+        assert_eq!(serde_json::from_slice::<GraphCensus>(&serde_json::to_vec(&census).unwrap()).unwrap(), census);
+        assert_eq!(GraphRank::estimate(3, 10, 2).unwrap(), GraphRank::estimated(3, 15));
+        assert!(GraphRank::estimate(3, 10, 0).is_err());
+        assert!(GraphRank::estimate(u64::MAX, u64::MAX, 1).is_err());
+    }
+
+    #[test]
+    fn startup_capture_excludes_tracked_storage_and_checks_actual_keys() {
+        let before = GraphMemorySample { total: 1000, free: 900, tracked_device: 100,
+            tracked_pinned: 10, tracked_managed: 0 };
+        let after = GraphMemorySample { free: 600, tracked_device: 300, ..before };
+        assert_eq!(after.retained_since(before).unwrap(), 100);
+        assert_eq!(GraphMemorySample { free: 950, tracked_device: 0, ..before }
+            .retained_since(before).unwrap(), 50);
+        for bad in [GraphMemorySample { total: 1001, ..after },
+            GraphMemorySample { free: 1001, ..after }, GraphMemorySample { tracked_pinned: 11, ..after },
+            GraphMemorySample { tracked_managed: 1, ..after }, GraphMemorySample { free: 950, ..before }] {
+            assert!(bad.retained_since(before).is_err());
+        }
+        let keys = [1u32, 2];
+        let declared = DeclaredGraphSet::new(&keys).unwrap();
+        let captured = CapturedGraphRank::measure(0, &declared, &[2, 1], before, after).unwrap();
+        assert_eq!(captured.bytes, 100);
+        for actual in [vec![1], vec![1, 3], vec![1, 1]] {
+            assert!(CapturedGraphRank::measure(0, &declared, &actual, before, after).is_err());
+        }
+        let estimated = GraphSet { ranks: vec![GraphRank::estimated(2, 10)], shapes: 1, lifetime: Lifetime::Startup };
+        let fingerprints = [declared.fingerprint(0).unwrap()];
+        let measured = estimated.captured(&fingerprints, &[captured.clone()]).unwrap();
+        assert_eq!(measured.ranks[0], GraphRank { executables: 2, bytes: 100, margin: 0, basis: Basis::Calibrated, node_charge: None });
+        assert!(estimated.captured(&["other keys".into()], &[captured.clone()]).is_err());
+        assert!(estimated.captured(&fingerprints, &[]).is_err());
+        assert!(GraphSet::budget(&[10]).captured(&fingerprints, &[captured]).is_err());
+    }
+
+    fn measured_figure() -> MemoryFigure {
+        MemoryFigure { bytes: 101, attribution: FigureAttribution::Measured,
+            evidence: "synthetic census", producing_commit: "producer-A",
+            identity: FigureIdentity { declared_graphs: "declared", programs_sha256: "programs",
+                native_sha256: "native", toolchain: "compiler", gpu_class: "card",
+                driver: "driver", layout: "layout" } }
+    }
+
+    #[test]
+    fn maintained_figures_use_unchanged_bytes_and_ignore_unrelated_producing_commits() {
+        let figure = measured_figure();
+        let used = |figure| FigureUse { name: "selected", figure, current: measured_figure().identity };
+        assert_eq!(census_recommendation([used(figure)]), None);
+        assert_eq!(census_recommendation([used(MemoryFigure { producing_commit: "producer-B", ..figure })]), None);
+        let mut current = figure.identity;
+        for part in 0..7 {
+            match part {
+                0 => current.declared_graphs = "changed",
+                1 => current.programs_sha256 = "changed",
+                2 => current.native_sha256 = "changed",
+                3 => current.toolchain = "changed",
+                4 => current.gpu_class = "changed",
+                5 => current.driver = "changed",
+                _ => current.layout = "changed",
+            }
+            let stale = figure.identity.stale_parts(current);
+            assert_eq!(stale.len(), 1);
+            let message = census_recommendation([FigureUse { current, ..used(figure) }]).unwrap();
+            assert!(message.contains(stale[0]));
+            assert!(message.contains("using maintained bytes unchanged"));
+            assert_eq!(figure.bytes, 101);
+            current = figure.identity;
+        }
+    }
+
+    #[test]
+    fn maintained_figures_aggregate_only_consumed_estimates_and_keep_derivations() {
+        let measured = measured_figure();
+        let estimated = measured.scaled(3, 2, "declared key-count ratio").unwrap();
+        assert_eq!(estimated.bytes, 152);
+        assert_eq!(estimated.identity, measured.identity);
+        assert_eq!(estimated.evidence, measured.evidence);
+        assert!(measured.scaled(1, 0, "ratio").is_err());
+        assert!(measured.scaled(1, 1, "").is_err());
+        assert!(MemoryFigure { bytes: u64::MAX, ..measured }.scaled(2, 1, "ratio").is_err());
+        assert_eq!(census_recommendation([]), None);
+        let used = FigureUse { name: "selected estimate", figure: estimated, current: measured.identity };
+        let message = census_recommendation([used, used]).unwrap();
+        assert_eq!(message.matches("selected estimate").count(), 1);
+        assert!(message.contains("synthetic census"));
+        assert!(message.contains("declared key-count ratio"));
+        // An unconsumed alternative never enters this after-solve aggregation.
+        assert_eq!(census_recommendation([FigureUse { name: "selected measured",
+            figure: measured, current: measured.identity }]), None);
+    }
+
+    #[test]
     fn native_package_names_and_scratch_share_the_format_contract() {
         use crate::formats::fp8_experts::ExpertFormat;
         let dir = tempfile::tempdir().unwrap();
@@ -612,14 +1031,43 @@ mod tests {
             let root = dir.path().join("fp8").join(&name);
             std::fs::create_dir_all(root.join("tp1")).unwrap();
             std::fs::write(root.join("manifest.json"), json!({"layouts":{"tp1":{
-                "capacities":[{"capacity":16,"scratch_bytes":1024}]}}}).to_string()).unwrap();
-            assert_eq!(fp8moe_package_scratch(dir.path(), family, ExpertFormat::Nvfp4, 16),
+                "abi_version":6,"projection":"bf16","activation":"silu_bf16_product","swiglu_limit":0.0,"swiglu_alpha":1.0,"swiglu_beta":0.0,"weights":"fp8","capacities":[{"capacity":16,"scratch_bytes":1024}]}}}).to_string()).unwrap();
+            assert_eq!(fp8moe_package_scratch(dir.path(), family, ExpertFormat::Nvfp4, 16).unwrap(),
                 Some((name, 1024)));
             assert_eq!(dense_package_directory(dir.path(), family), root.join("tp1"));
-            assert!(fp8moe_package_scratch(dir.path(), family, ExpertFormat::Nvfp4, 17).is_none());
+            assert!(fp8moe_package_scratch(dir.path(), family, ExpertFormat::Nvfp4, 17).unwrap().is_none());
             std::fs::remove_file(root.join("manifest.json")).unwrap();
-            assert!(fp8moe_package_scratch(dir.path(), family, ExpertFormat::Nvfp4, 1).is_none());
+            assert!(fp8moe_package_scratch(dir.path(), family, ExpertFormat::Nvfp4, 1).unwrap().is_none());
         }
+    }
+
+    #[test]
+    fn declared_graph_identity_is_order_independent_ranked_and_exact() {
+        let keys = [(0u32, 1u32, 16u32), (1, 4, 32), (2, 64, 256)];
+        let declared = DeclaredGraphSet::new(&keys).unwrap();
+        let reversed = DeclaredGraphSet::new(&keys.into_iter().rev().collect::<Vec<_>>()).unwrap();
+        let fingerprint = declared.fingerprint(0).unwrap();
+        assert_eq!(fingerprint, reversed.fingerprint(0).unwrap());
+        assert_ne!(fingerprint, declared.fingerprint(1).unwrap());
+        declared.verify(keys.iter().rev()).unwrap();
+        assert!(declared.verify(keys[..2].iter()).is_err());
+        assert!(declared.verify(keys.iter().chain([&(3, 1, 16)])).is_err());
+        assert!(declared.verify(keys.iter().chain(keys[..1].iter())).is_err());
+        assert!(DeclaredGraphSet::new(&[keys[0], keys[0]]).is_err());
+        let changed = DeclaredGraphSet::new(&[(0, 1, 16), (1, 4, 32), (2, 64, 512)]).unwrap();
+        assert_ne!(fingerprint, changed.fingerprint(0).unwrap());
+        let empty = DeclaredGraphSet::<u32>::new(&[]).unwrap();
+        assert!(empty.is_empty());
+        empty.verify([].iter()).unwrap();
+        assert_ne!(empty.fingerprint(0).unwrap(), empty.fingerprint(1).unwrap());
+    }
+
+    #[test]
+    fn declared_graph_identity_rejects_lossy_key_serialization() {
+        #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
+        struct Lossy { stable: u32, #[serde(skip)] omitted: u32 }
+        let keys = [Lossy { stable: 1, omitted: 0 }, Lossy { stable: 1, omitted: 1 }];
+        assert!(DeclaredGraphSet::new(&keys).unwrap().fingerprint(0).is_err());
     }
 
     #[test]
@@ -639,7 +1087,7 @@ mod tests {
     }
 
     #[test]
-    fn ready_untracked_is_context_plus_code_plus_startup_graphs() {
+    fn startup_and_lazy_graph_owners_partition_ready_and_growth() {
         // Qwen EXL3 1 RTX, v3-p2 ready ledger: untracked 5,936,332,180 B with 30,380 startup graphs
         // of 4,569,694,208 B. Startup graphs count at ready, their margin is growth; a lazy set
         // counts nothing at ready and its whole budget is growth.
@@ -652,11 +1100,7 @@ mod tests {
             assert_eq!((sum("graphs"), sum(GRAPH_GROWTH)), (set.at_ready(0), set.growth(0)));
         }
         assert_eq!(lazy.at_ready(0), 0);
-        let code = loaded_code("qwen4", "exl3", false, 0).unwrap().bytes;
-        let context = ARCH_CONTEXTS[1].context_bytes;
-        let untracked = 5_936_332_180u64;
-        let planned = context + code + startup.at_ready(0);
-        assert!(planned.abs_diff(untracked) < 4 << 20, "planned {planned} vs ledger {untracked}");
+
     }
 
     #[test]
@@ -665,12 +1109,23 @@ mod tests {
         let programs = ProgramSet::from_names(&["qwen4"], ["qwen4_decode", "other_decode"]);
         assert_eq!(programs.names, ["qwen4_decode"]);
         let allowance = loaded_code_allowance("qwen4", "unmeasured", false, 0, arch, Some(&programs));
-        assert_eq!(allowance.basis, Basis::Formula);
-        assert_eq!(allowance.bytes, arch.cublas_bytes + programs.module_bytes());
+        assert_eq!(allowance.basis, Basis::Estimated);
+        assert_eq!(allowance.bytes, programs.module_bytes());
         assert!(allowance.bytes > 0);
         assert_eq!(allowance.pending(arch.context_bytes, arch.context_bytes), allowance.bytes);
         assert_eq!(allowance.pending(arch.context_bytes + 100, arch.context_bytes), allowance.bytes - 100);
-        assert_eq!(allowance.pending(u64::MAX, arch.context_bytes), arch.cublas_bytes);
+        assert_eq!(allowance.pending(u64::MAX, arch.context_bytes), 0);
+    }
+
+    #[test]
+    fn step5_code_allowance_does_not_duplicate_conditional_vocabulary_handles() {
+        let arch = &ARCH_CONTEXTS[1];
+        let programs = ProgramSet::from_names(&["step5", "step52"], ["step5_norm", "step52_norm"]);
+        for family in ["step5", "step52"] {
+            let allowance = loaded_code_allowance(family, "exl3", true, 0, arch, Some(&programs));
+            assert_eq!(allowance.bytes, programs.module_bytes());
+            assert_eq!(allowance.pending(u64::MAX, arch.context_bytes), 0);
+        }
     }
 
     #[test]
@@ -688,59 +1143,54 @@ mod tests {
             assert_eq!(pending, arch.cublas_bytes);
             assert!(admitted + pending - old_pending >= steady, "rank {rank}");
         }
-        let calibrated = loaded_code_allowance("mimo", "fp8", false, 0, arch, None);
-        assert_eq!(calibrated.pending(u64::MAX, arch.context_bytes), 0);
+        let selected = loaded_code_allowance("mimo", "fp8", false, 0, arch, None);
+        assert_eq!(selected.pending(u64::MAX, arch.context_bytes), 0);
     }
 
     #[test]
-    fn measured_fp8_and_glm_exl3_planner_bytes_do_not_change() {
+    fn migrated_code_estimates_exclude_blas_and_peer_allowances() {
         let arch = &ARCH_CONTEXTS[1];
-        let programs = ProgramSet::from_names(&["glm", "glm2"], ["glm_decode", "glm2_decode"]);
-        for (family, package, split, rank, old_bytes) in [
-            ("mimo", "fp8", false, 0, 261_483_520),
-            ("mimo", "fp8", true, 0, 365_259_264),
-            ("mimo", "fp8", true, 1, 165_460_992),
-            ("qwen4", "fp8", false, 0, 1_089_736_388),
-        ] {
-            let allowance = loaded_code_allowance(family, package, split, rank, arch, Some(&programs));
-            assert_eq!(allowance.basis, Basis::Calibrated);
-            assert_eq!(allowance.bytes, old_bytes);
+        let programs = ProgramSet::from_names(&["mimo", "qwen4", "dsv4f", "glmf", "kimik3"],
+            ["mimo_decode", "qwen4_decode", "dsv4f_decode", "glmf_decode", "kimik3_decode"]);
+        for family in ["mimo", "mimop2", "qwen4", "glmf", "glmf-k6", "kimik3", "muse"] {
+            for package in ["fp8", "exl3", "none", "unmeasured"] {
+                for (split, rank) in [(false, 0), (true, 0), (true, 1)] {
+                    let code = loaded_code_allowance(family, package, split, rank, arch, Some(&programs));
+                    assert_eq!(code.basis, Basis::Estimated);
+                    assert_eq!(code.bytes, programs.module_bytes());
+                    assert_eq!(code.pending(u64::MAX, arch.context_bytes), 0);
+                    let missing = loaded_code_allowance(family, package, split, rank, arch, None);
+                    let empty = ProgramSet::from_names(&[family], std::iter::empty());
+                    let runtime = loaded_code_allowance(family, package, split, rank, arch, Some(&empty));
+                    assert_eq!(missing.bytes, runtime.bytes);
+                    assert_eq!(missing.bytes, 34 * MIB);
+                    assert_eq!(missing.basis, Basis::Estimated);
+                }
+            }
         }
+        // GLM's unrelated conversion/upload residuals and existing formula are unchanged.
         for rank in 0..2 {
-            let allowance = loaded_code_allowance("glm", "exl3", true, rank, arch, Some(&programs));
-            assert_eq!(allowance.basis, Basis::Formula);
-            assert_eq!(arch.context_bytes + allowance.bytes,
-                arch.context_bytes + arch.cublas_bytes + programs.module_bytes() + arch.peer_context_bytes);
+            let code = loaded_code_allowance("glm", "exl3", true, rank, arch, Some(&programs));
+            assert_eq!(code.basis, Basis::Formula);
+            assert_eq!(code.bytes, arch.cublas_bytes + programs.module_bytes() + arch.peer_context_bytes);
         }
     }
 
     #[test]
-    fn loaded_code_keys_family_split_rank_and_experts() {
-        assert_eq!(loaded_code("qwen4", "fp8", false, 0).unwrap().bytes, 1_089_736_388);
-        assert_eq!(loaded_code("qwen4", "exl3", false, 0).unwrap().bytes, 780_221_844);
-        // No arbitrary expert package can donate its calibration.
-        assert!(loaded_code("qwen4", "none", false, 0).is_none());
-        assert_eq!(loaded_code("dsv4p2", "fp8", true, 1).unwrap().bytes, 803_054_544);
-        // An exact package row wins over the family's any-package row, wherever it sits in the table.
-        assert_eq!(loaded_code("dsv4p", "exl3", false, 0).unwrap().bytes, 724_349_124);
-        assert_eq!(loaded_code("dsv4f", "*", false, 0).unwrap().bytes, 322_050_368);
-        assert_eq!(loaded_code("dsv4p", "exl3", true, 1).unwrap().bytes, 885_694_212);
-        assert_eq!(loaded_code("mimop", "none", true, 0).unwrap().bytes, 365_259_264);
-        assert!(loaded_code("glm", "fp8", false, 0).is_none());
-        let code = loaded_code("glmf", "exl3", false, 0).unwrap();
-        assert_eq!(code.pending(586_416_128 + 100, 586_416_128), code.bytes - 100);
-        assert_eq!(code.pending(586_416_128 + (1 << 40), 586_416_128), 0);
-    }
-
-    #[test]
-    fn v4_tp2_code_matches_tagged_ready_untracked_bytes() {
-        let context = ARCH_CONTEXTS[1].context_bytes;
-        for (experts, untracked) in [("*", [1_593_749_856, 1_389_470_672]),
-            ("exl3", [1_645_601_720, 1_472_110_340])] {
-            for (rank, bytes) in untracked.into_iter().enumerate() {
-                let code = loaded_code("dsv4", experts, true, rank as u8).unwrap();
-                assert_eq!(context + code.bytes, bytes);
-                assert!(code.source.contains("tagged ready"));
+    fn v4_charges_selected_modules_not_a_mixed_residency_row() {
+        let arch = &ARCH_CONTEXTS[1];
+        let programs = ProgramSet::from_names(&["dsv4f", "dsv4p"], ["dsv4f_decode", "dsv4p_decode"]);
+        for family in ["dsv4f", "dsv4f2", "dsv4p", "dsv4p2"] {
+            for package in ["*", "exl3", "unmeasured"] {
+                for (split, rank) in [(false, 0), (true, 0), (true, 1)] {
+                    let code = loaded_code_allowance(family, package, split, rank, arch, Some(&programs));
+                    assert_eq!(code.basis, Basis::Estimated);
+                    assert_eq!(code.bytes, programs.module_bytes());
+                    assert_eq!(code.pending(u64::MAX, arch.context_bytes), 0);
+                    let missing = loaded_code_allowance(family, package, split, rank, arch, None);
+                    assert_eq!(missing.bytes, 34 * MIB);
+                    assert_eq!(missing.basis, Basis::Estimated);
+                }
             }
         }
     }
@@ -757,12 +1207,64 @@ mod tests {
 
     #[test]
     fn package_scratch_takes_the_smallest_capacity_at_or_above_rows() {
-        let manifest = json!({"layouts": {"tp1": {"capacities": [
+        let manifest = json!({"layouts": {"tp1": {"abi_version":6,"weights":"fp8","projection":"bf16",
+            "activation":"silu_bf16_product","swiglu_limit":0.0,"swiglu_alpha":1.0,"swiglu_beta":0.0,"capacities": [
             {"capacity": 1, "scratch_bytes": 99328}, {"capacity": 1024, "scratch_bytes": 91839488},
             {"capacity": 4096, "scratch_bytes": 661072896}]}}});
-        assert_eq!(fp8moe_scratch_bytes(&manifest, "tp1", 4096), Some(661072896));
-        assert_eq!(fp8moe_scratch_bytes(&manifest, "tp1", 1000), Some(91839488));
-        assert_eq!(fp8moe_scratch_bytes(&manifest, "tp1", 8192), None);
+        assert_eq!(fp8moe_scratch_bytes(&manifest, "tp1", 4096).unwrap(), Some(661072896));
+        assert_eq!(fp8moe_scratch_bytes(&manifest, "tp1", 1000).unwrap(), Some(91839488));
+        assert_eq!(fp8moe_scratch_bytes(&manifest, "tp1", 8192).unwrap(), None);
+    }
+
+    #[test]
+    fn measured_mimo_flash_manifest_preserves_native_contract_and_scratch() {
+        let manifest: Value = serde_json::from_str(include_str!(
+            "../../tests/fixtures/mimo-flash-min-native-manifest.json")).unwrap();
+        assert_eq!(manifest["layouts"]["tp1"]["weights"], "mxfp4");
+        assert_eq!(fp8moe_scratch_bytes(&manifest, "tp1", 2752).unwrap(), Some(671_354_880));
+        assert_eq!(fp8moe_scratch_bytes(&manifest, "tp1", 4096).unwrap(), Some(671_354_880));
+    }
+
+    #[test]
+    fn native_manifest_rejects_stale_abi_and_invalid_contracts_before_capacity_lookup() {
+        let valid = json!({"layouts":{"tp1":{"abi_version":6,"weights":"nvfp4","projection":"bf16",
+            "activation":"swigluoai","swiglu_limit":7.0,"swiglu_alpha":1.702,"swiglu_beta":1.0,
+            "capacities":[{"capacity":16,"scratch_bytes":128}]}}});
+        assert_eq!(fp8moe_scratch_bytes(&valid, "tp1", 1).unwrap(), Some(256));
+        for version in [Value::Null, json!(5), json!(7), json!("6")] {
+            let mut manifest = valid.clone();
+            manifest["layouts"]["tp1"]["abi_version"] = version;
+            let error = fp8moe_scratch_bytes(&manifest, "tp1", 4096).unwrap_err();
+            assert!(matches!(error, Fp8MoeManifestError::Abi { .. }));
+            assert!(error.to_string().contains("regenerate placement inputs"));
+        }
+        let mut missing = valid.clone();
+        missing["layouts"]["tp1"].as_object_mut().unwrap().remove("abi_version");
+        assert!(matches!(fp8moe_scratch_bytes(&missing, "tp1", 1), Err(Fp8MoeManifestError::Abi { .. })));
+        for (key, value) in [("activation", json!("unknown")), ("projection", json!("fp32")),
+            ("weights", json!("fp8")), ("swiglu_limit", json!(0)), ("swiglu_alpha", json!(-1)),
+            ("swiglu_alpha", json!(1e100)), ("swiglu_beta", Value::Null), ("capacities", json!([])),
+            ("capacities", json!([{"capacity":16,"scratch_bytes":128},{"capacity":1,"scratch_bytes":256}])),
+            ("capacities", json!([{"capacity":16}]))] {
+            let mut manifest = valid.clone();
+            manifest["layouts"]["tp1"][key] = value;
+            assert!(matches!(fp8moe_scratch_bytes(&manifest, "tp1", 4096), Err(Fp8MoeManifestError::Contract { .. })), "{key}");
+        }
+    }
+
+    #[test]
+    fn optional_native_packages_never_hide_stale_or_malformed_metadata() {
+        use crate::formats::fp8_experts::ExpertFormat;
+        let root = tempfile::tempdir().unwrap();
+        let package = root.path().join("fp8").join(ExpertFormat::Nvfp4.package_name("test"));
+        std::fs::create_dir_all(&package).unwrap();
+        for content in ["not json", r#"{"layouts":{"tp1":{"capacities":[{"capacity":16,"scratch_bytes":128}]}}}"#] {
+            std::fs::write(package.join("manifest.json"), content).unwrap();
+            assert!(fp8moe_package_scratch(root.path(), "test", ExpertFormat::Nvfp4, 1).is_err());
+            assert!(dense_package_scratch(root.path(), "test", 1).is_err());
+        }
+        std::fs::remove_file(package.join("manifest.json")).unwrap();
+        assert!(dense_package_scratch(root.path(), "test", 1).unwrap().is_none());
     }
 
     #[test]

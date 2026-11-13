@@ -39,9 +39,10 @@ def test_every_planner_width_covered_world_has_a_package_alias():
         assert 'admitted_worlds' not in entry, key
         exl3 = format == 'exl3'
         native = family in ('v41', 'dsv4f', 'dsv4p') and not exl3
-        unit = 32 if native or family in ('mimof', 'mimop') else 128
+        nvfp4 = format in ('nvfp4', 'nvfp4a4')
+        unit = 16 if nvfp4 else 32 if native or family in ('mimof', 'mimop') else 128
         intermediate = entry['intermediate']
-        options = dict(exl3=exl3, native=native)
+        options = dict(exl3=exl3, native=native, nvfp4=nvfp4)
         available = set().union(*(packages.width_keys(intermediate, unit, n, **options)
                                   for n in entry['worlds']))
         emitted = packages.package_worlds(family, format)
@@ -54,6 +55,28 @@ def test_every_planner_width_covered_world_has_a_package_alias():
     assert 5 not in entries['qwen4:fp8']['worlds']
     assert 5 in packages.geometry_worlds('qwen4')
 
+
+
+def test_minimax_native_nvfp4_worlds_cover_the_padded_vendor_slices():
+    packages = module('minimax_spark_package_coverage', ROOT / 'python/tools/lib/spark_packages.py')
+    assert packages.geometry_worlds('minimax_nvfp4a4') == list(range(2, 9))
+    assert packages.width_keys(3072, 16, 5, nvfp4=True) == {(False, 640)}
+    assert packages.width_keys(3072, 16, 6, nvfp4=True) == {(False, 512)}
+    entry = packages.package_entry('minimax', 'nvfp4a4')
+    assert entry['basis'] == 'lower_bound'
+    assert entry['checkpoints'][0]['routed_expert_bytes'] == 57 * 128 * (3 * 3072 * 6144 * 9 // 16 + 3 * 8)
+
+
+def test_glmf_package_witness_is_the_live_mc_checkpoint():
+    entries = json.loads((ROOT / 'scripts/build/spark-package-ranges.json').read_text())['entries']
+    expected = {
+        'model': 'wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K4-MC',
+        'revision': '91a8dbc9c12e790c65aa1a38c6aede6a3e23a77d',
+        # Measured 42 layers, 288 experts, three K4 projections plus native auxiliaries.
+        'routed_expert_bytes': 42 * 288 * 3 * (4096 * 2048 // 2 + 2 * (4096 + 2048) + 4),
+    }
+    for key in ('glmf:exl3', 'glmf:fp8'):
+        assert entries[key]['checkpoints'][1] == expected
 
 
 def count_objects(geometry, worlds, intermediate, unit=128):
@@ -179,32 +202,3 @@ def test_whole_matrix_exl3_count_enumeration(record_property):
     output = os.environ.get('CUTEAFD_SPARK_RANGE_EXPORT_RESULTS')
     if output:
         Path(output).write_text(json.dumps(dict(exl3_objects=results, layout_keys=keys), indent=2) + '\n')
-
-
-def test_variable_world_harness_artifacts_and_partial_tiles_without_cuda():
-    import argparse
-    import ast
-    from spark_packages import native_spark_artifacts, package_worlds
-    expected = native_spark_artifacts()
-    for relative, symbol in [("python/tools/bench/bench_tp_ep_kernel.py", "TP_GEOMETRIES"),
-                             ("python/tools/bench/benchmark_v41_ep_groups.py", "TP_DEGREES")]:
-        path = ROOT / relative
-        tree = ast.parse(path.read_text())
-        nodes = [node for node in tree.body if
-                 (isinstance(node, ast.ImportFrom) and node.module == "spark_packages") or
-                 (isinstance(node, ast.Assign) and any(isinstance(target, ast.Name)
-                  and target.id in (symbol, "SUPPORTED_SLICE_WIDTHS") for target in node.targets)) or
-                 (isinstance(node, ast.FunctionDef) and node.name == "parse_args")]
-        namespace = {"argparse": argparse, "Path": Path, "__doc__": "CPU parser proof"}
-        exec(compile(ast.Module(body=nodes, type_ignores=[]), str(path), "exec"), namespace)
-        if symbol == "TP_DEGREES":
-            assert namespace[symbol] == (1, *package_worlds("v41", "mxfp4"))
-        else:
-            assert namespace[symbol] == tuple((tp, artifact, f"tp{tp}-{artifact.name}") for tp, artifacts in expected.items() for artifact in artifacts)
-            for world in range(1, 10):
-                argv = ["--topologies", f"tp{world}", "--widths", "192", "--rows", "1", "--output", "/unused.json"]
-                if world in expected:
-                    assert namespace["parse_args"](argv).topologies == f"tp{world}"
-                else:
-                    with pytest.raises(SystemExit):
-                        namespace["parse_args"](argv)

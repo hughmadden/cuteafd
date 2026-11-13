@@ -3,6 +3,11 @@ use super::{product, sum, CacheGeometryError};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 
+/// RTX whole and TP2 executors both retain an F32 routed-output plane.
+pub fn exl3_rtx_output_bytes(rows: u64, hidden: u64) -> Result<u64, CacheGeometryError> {
+    product("EXL3 RTX output", &[rows.max(1), hidden, 4])
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Exl3WorkspaceOwner {
     pub name: String,

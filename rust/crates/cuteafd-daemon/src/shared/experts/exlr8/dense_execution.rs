@@ -1,5 +1,5 @@
 //! Native dense launches over validated checkpoint geometry and borrowed lane storage.
-use super::dense_weights::NativeProjection;
+use cuteafd_loader::plan::exlr8::dense::requests::NativeProjection;
 use anyhow::{Context, Result, ensure};
 use cuteafd_ffi::native_dense::{DenseLinear, Encoding};
 use cuteafd_ffi::native_dense_glue::{Companion, Op};
@@ -7,6 +7,7 @@ use cuteafd_ffi::programs::Programs;
 use cuteafd_ffi::CuteafdDeviceBuffer as Buffer;
 use cuteafd_loader::plan::exlr8::dense::{DenseEncoding, ShardSide};
 use std::{collections::BTreeSet, ffi::c_void};
+use crate::shared::memory::Tag;
 
 pub(crate) const DECODE_ROWS: usize = 64;
 
@@ -150,7 +151,7 @@ impl<'a> ScratchOwner<'a> {
         layout: &cuteafd_loader::plan::exlr8::dense::scratch::LinearScratchLayout) -> Result<Self> {
         use crate::shared::memory::device::Allocation;
         layout.bytes()?;
-        let a = |bytes| Allocation::new(device, bytes);
+        let a = |bytes| Allocation::new(device, bytes, Tag::workspace("experts/exlr8-dense-scratch"));
         let owner = Self { rotated: a(layout.rotated)?, table: a(layout.table)?,
             block_scales: a(layout.block_scales)?, partial: a(layout.partial)?,
             records: layout.records.map(a).transpose()?, acc: a(layout.acc)? };

@@ -18,11 +18,29 @@ impl Fixture {
         self.module.parent().expect("fixture module has a directory")
     }
 
+    /// Hermetic CPU fixture beside this test executable, inside its asserted
+    /// NVMe Cargo target. No task-specific path or shared mutable DSO is used.
+    pub fn build_for_tests() -> Result<Self> {
+        let executable = std::env::current_exe()?;
+        let root = executable.parent().context("test executable has no parent")?
+            .join("native-fixtures");
+        Self::build_in(&root)
+    }
+
     pub fn build() -> Result<Self> {
         let root = PathBuf::from(
             std::env::var_os("CUTEAFD_NATIVE_LIFETIME_FIXTURE_DIR")
                 .context("set CUTEAFD_NATIVE_LIFETIME_FIXTURE_DIR under ~/.cache/cuteafd/builds")?,
         );
+        Self::build_at(root, false)
+    }
+
+    /// Build a test-owned fixture, taking a shared build slot only for compilation.
+    pub fn build_in(root: &std::path::Path) -> Result<Self> {
+        Self::build_at(root.to_path_buf(), true)
+    }
+
+    fn build_at(root: PathBuf, take_build_slot: bool) -> Result<Self> {
         let allowed = PathBuf::from(std::env::var_os("HOME").context("HOME is unset")?)
             .join(".cache/cuteafd/builds")
             .canonicalize()?;
@@ -84,7 +102,16 @@ impl Fixture {
             .arg(directory.join("cuteafd_mxfp4_layouts.h"))
             .status()?;
         anyhow::ensure!(status.success(), "generating CPU fixture MXFP4 layouts failed");
-        let status = Command::new("cc")
+        let compiler = |program: &str| {
+            if take_build_slot {
+                let mut command = Command::new(repo.join("scripts/build/build-slot.sh"));
+                command.arg(program);
+                command
+            } else {
+                Command::new(program)
+            }
+        };
+        let status = compiler("cc")
             .args(["-c", "-fPIC", "-O0", "-Wall", "-Wextra", "-Werror"])
             .arg(fixtures.join("native_library_lifetime.c"))
             .arg("-I")
@@ -95,7 +122,7 @@ impl Fixture {
             .status()?;
         anyhow::ensure!(status.success(), "building CPU lifetime fixture failed");
         // Load-only kernels run the shared CUDA rule on the CPU.
-        let status = Command::new("c++")
+        let status = compiler("c++")
             .args(["-std=c++17", "-c", "-fPIC", "-O1", "-Wall", "-Wextra", "-Werror"])
             .arg(fixtures.join("native_library_kernels.cc"))
             .arg("-o")
@@ -103,7 +130,7 @@ impl Fixture {
             .env("TMPDIR", &directory)
             .status()?;
         anyhow::ensure!(status.success(), "building CPU fixture kernels failed");
-        let status = Command::new("c++")
+        let status = compiler("c++")
             .args(["-shared", "-fPIC"])
             .arg(&c_object)
             .arg(&cc_object)
@@ -112,14 +139,13 @@ impl Fixture {
             .env("TMPDIR", &directory)
             .status()?;
         anyhow::ensure!(status.success(), "linking CPU lifetime fixture failed");
-        Ok(Self {
-            module,
-            events: directory.join("events"),
-        })
+        let events = directory.join("events");
+        fs::write(&events, [])?;
+        Ok(Self { module, events })
     }
 
     /// Configure static package ABI before loading a CPU expert module.
-    pub fn configure_fp8(&self, library: &NativeLibrary, words: &[u32; 16], scratch: &[u64; 6]) -> Result<()> {
+    pub fn configure_fp8(&self, library: &NativeLibrary, words: &[u32; crate::fp8_moe::FP8_MOE_INFO_WORDS], scratch: &[u64; 6]) -> Result<()> {
         // SAFETY: the CPU-only export copies the two fixed-size arrays synchronously.
         unsafe {
             let configure: Symbol<unsafe extern "C" fn(*const u32, *const u64)> =
@@ -161,6 +187,32 @@ impl Fixture {
         Ok(())
     }
 
+    /// Opt-in current-device checking; a rejected free leaves its allocation live.
+    pub fn strict_device_free(&self, library: &NativeLibrary, enabled: bool) -> Result<()> {
+        // SAFETY: the private fixture export updates only its device-free controls.
+        unsafe { library.lib.get::<unsafe extern "C" fn(i32)>(b"fixture_strict_device_free")?(i32::from(enabled)); }
+        Ok(())
+    }
+
+    /// The fake media tower: every free fails, or scratch allocation fails after weights.
+    pub fn media_configure(&self, library: &NativeLibrary, free_fails: bool, fail_after_weights: bool) -> Result<()> {
+        // SAFETY: the private fixture export updates only its media controls.
+        unsafe { library.lib.get::<unsafe extern "C" fn(i32, i32)>(b"fixture_media_configure")?(
+            i32::from(free_fails), i32::from(fail_after_weights)); }
+        Ok(())
+    }
+
+    /// Number of rejected frees and the last (owning device, current device).
+    pub fn device_free_mismatch(&self, library: &NativeLibrary) -> Result<(usize, i32, i32)> {
+        let (mut owner, mut current) = (-1, -1);
+        // SAFETY: the private export writes two live i32 slots synchronously.
+        let count = unsafe {
+            library.lib.get::<unsafe extern "C" fn(*mut i32, *mut i32) -> usize>(b"fixture_device_free_mismatch")?(
+                &mut owner, &mut current)
+        };
+        Ok((count, owner, current))
+    }
+
     pub fn block_first_stream(&self, library: &NativeLibrary, block: bool) -> Result<()> {
         // SAFETY: the CPU fixture owns this mutex-protected injection control.
         unsafe {
@@ -177,8 +229,84 @@ impl Fixture {
             .any(|line| line.ends_with(self.module.to_str().unwrap())))
     }
 
+    pub fn native_initializations(&self, library: &NativeLibrary) -> Result<i32> {
+        // SAFETY: the CPU-only fixture returns its own initialization counter.
+        Ok(unsafe { library.lib.get::<unsafe extern "C" fn() -> i32>(b"fixture_native_initializations")?() })
+    }
+
     pub fn events(&self) -> Result<String> {
         Ok(fs::read_to_string(&self.events)?)
+    }
+
+    /// Reserve untouched virtual device extents per owner and skip copies/zeroes.
+    /// Only allocation/receipt tests may enable this; launching math is unsupported.
+    pub fn extent_only(&self, library: &NativeLibrary) -> Result<()> {
+        // SAFETY: this export belongs to the private CPU fixture and has no arguments.
+        unsafe { library.lib.get::<unsafe extern "C" fn()>(b"fixture_extent_only")?(); }
+        Ok(())
+    }
+
+    /// Allow pair construction while preserving real byte copies; peer launches still fail.
+    pub fn peer_abort_initialization(&self, library: &NativeLibrary) -> Result<()> {
+        // SAFETY: this private fixture export only enables the no-argument initializer.
+        unsafe { library.lib.get::<unsafe extern "C" fn()>(b"fixture_peer_abort_initialization")?(); }
+        Ok(())
+    }
+
+    pub fn mapped_bytes(&self, library: &NativeLibrary) -> Result<usize> {
+        // SAFETY: this private fixture export reads its allocation counter.
+        Ok(unsafe { library.lib.get::<unsafe extern "C" fn() -> usize>(b"fixture_mapped_bytes")?() })
+    }
+
+    pub fn module_path(&self) -> &std::path::Path { &self.module }
+
+    /// Register program ABI metadata; launches fail unless a reply behavior is registered.
+    pub fn register_programs(&self, library: &NativeLibrary, entries: &[serde_json::Value]) -> Result<()> {
+        for (index, entry) in entries.iter().enumerate() {
+            let name = CString::new(entry["name"].as_str().context("fixture program name missing")?)?;
+            let pointers = u32::try_from(entry["pointers"].as_array().context("fixture pointers missing")?.len())?;
+            let kinds = entry["scalars"].as_array().context("fixture scalars missing")?.iter().map(|scalar| {
+                match scalar["type"].as_str() {
+                    Some("int32") => Ok(b'i'), Some("int64") => Ok(b'l'), Some("float32") => Ok(b'f'),
+                    _ => anyhow::bail!("fixture program scalar type missing"),
+                }
+            }).collect::<Result<Vec<_>>>()?;
+            // SAFETY: fixture copies the bounded name/scalar metadata before returning.
+            let status = unsafe {
+                library.lib.get::<unsafe extern "C" fn(u32, *const c_char, u32, *const u8, u32) -> i32>(
+                    b"fixture_register_program")?(u32::try_from(index)?, name.as_ptr(), pointers,
+                        kinds.as_ptr(), u32::try_from(kinds.len())?)
+            };
+            anyhow::ensure!(status == 0, "fixture rejected installed program {index}");
+        }
+        Ok(())
+    }
+
+    /// Attach an explicit readiness check and dispatch marker to a registered reply program.
+    pub fn register_reply(&self, library: &NativeLibrary, index: u32, ready: u32, event: u8) -> Result<()> {
+        // SAFETY: the fixture validates the index and copies these scalar values.
+        let status = unsafe {
+            library.lib.get::<unsafe extern "C" fn(u32, u32, c_char) -> i32>(
+                b"fixture_register_reply")?(index, ready, event as c_char)
+        };
+        anyhow::ensure!(status == 0, "fixture rejected reply program {index}");
+        Ok(())
+    }
+
+    pub fn configure_exl3(&self, library: &NativeLibrary, words: &[u32; 16]) -> Result<()> {
+        // SAFETY: CPU fixture copies this complete fixed-size ABI record synchronously.
+        unsafe { library.lib.get::<unsafe extern "C" fn(*const u32)>(b"fixture_configure_exl3")?(words.as_ptr()); }
+        Ok(())
+    }
+
+    /// Admit a BF16 projection in the allocation-only catalog; launches still fail.
+    pub fn draft_projection(&self, library: &NativeLibrary, index: u32, k: u32, n: u32) -> Result<()> {
+        // SAFETY: the private fixture validates the index and copies only scalar metadata.
+        let status = unsafe {
+            library.lib.get::<unsafe extern "C" fn(u32, u32, u32) -> i32>(b"fixture_draft_projection")?(index, k, n)
+        };
+        anyhow::ensure!(status == 0, "fixture draft projection {index} rejected");
+        Ok(())
     }
 
     /// CPU byte-roundtrip mode; ordinary lifetime fixtures retain deferred uploads.
@@ -187,6 +315,16 @@ impl Fixture {
         unsafe {
             let configure: Symbol<unsafe extern "C" fn()> =
                 library.lib.get(b"fixture_configure_immediate_copies")?;
+            configure();
+        }
+        Ok(())
+    }
+
+    /// Record ready checks only for tests asserting host-wait placement.
+    pub fn trace_stream_queries(&self, library: &NativeLibrary) -> Result<()> {
+        // SAFETY: this export toggles recording in the CPU-only fixture above.
+        unsafe {
+            let configure: Symbol<unsafe extern "C" fn()> = library.lib.get(b"fixture_trace_stream_queries")?;
             configure();
         }
         Ok(())
@@ -212,13 +350,41 @@ impl Fixture {
         Ok(())
     }
 
+    pub fn memory_queries(&self, library: &NativeLibrary) -> Result<usize> {
+        // SAFETY: this export reads a counter from this CPU-only fixture DSO.
+        unsafe {
+            let queries: Symbol<unsafe extern "C" fn() -> usize> = library.lib.get(b"fixture_memory_queries")?;
+            Ok(queries())
+        }
+    }
+
     pub fn configure_memory(&self, library: &NativeLibrary, device: i32, total: usize) -> Result<()> {
+        self.configure_memory_usage(library, device, total, 0)
+    }
+
+    pub fn configure_memory_usage(&self, library: &NativeLibrary, device: i32, total: usize, used: usize) -> Result<()> {
         // SAFETY: this export belongs to the CPU-only fixture loaded above.
         unsafe {
             let configure: Symbol<unsafe extern "C" fn(i32, usize, usize, usize)> =
                 library.lib.get(b"fixture_configure_memory")?;
-            configure(device, total, 0, 0);
+            configure(device, total, used, 0);
         }
+        Ok(())
+    }
+
+    pub fn configure_endpoint_failures(&self, library: &NativeLibrary, view: i32, destroy: i32) -> Result<()> {
+        // SAFETY: this export belongs to the CPU-only fixture loaded above.
+        unsafe {
+            let configure: Symbol<unsafe extern "C" fn(i32, i32)> =
+                library.lib.get(b"fixture_configure_endpoint_failures")?;
+            configure(view, destroy);
+        }
+        Ok(())
+    }
+
+    pub fn configure_capture(&self, library: &NativeLibrary, status: i32) -> Result<()> {
+        // SAFETY: the CPU-only fixture export only updates its local injected status.
+        unsafe { library.lib.get::<unsafe extern "C" fn(i32)>(b"fixture_configure_capture")?(status); }
         Ok(())
     }
 
@@ -239,6 +405,13 @@ impl Fixture {
             .unwrap()
             .ensure(library, 64)?;
         Ok(())
+    }
+
+    pub fn reserve_ordered_upload(&self, library: &NativeLibrary, dst: CuteafdDeviceBuffer,
+        stream: usize) -> Result<()> {
+        // SAFETY: the CPU fixture owns this destination and accepts a synthetic
+        // stream; reservation records no pending copy or consumer.
+        unsafe { library.reserve_h2d_ordered(dst, stream as *mut c_void) }
     }
 
     pub fn finish_ordered_uploads(&self, library: &NativeLibrary) -> Result<()> {
@@ -269,5 +442,69 @@ impl Fixture {
         // SAFETY: the fixture's stream synchronizer accepts a null stream and
         // performs no CUDA work. Only use with this fixture's NativeLibrary.
         unsafe { library.cuda_stream_synchronize(std::ptr::null_mut()) }
+    }
+}
+
+#[cfg(test)]
+mod device_free_tests {
+    use super::*;
+
+    #[test]
+    fn physical_query_restores_device_and_outlives_library() -> Result<()> {
+        let fixture = Fixture::build_for_tests()?;
+        let library = fixture.load()?;
+        fixture.configure_memory(&library, 0, 4096)?;
+        fixture.configure_memory(&library, 1, 8192)?;
+        library.cuda_set_device(0)?;
+        let query = library.physical_memory_query()?;
+        assert_eq!(query.sample(1)?, (8192, 8192));
+        assert_eq!(library.cuda_get_device()?, 0);
+        fixture.configure_memory(&library, 1, 0)?;
+        assert!(query.sample(1).is_err());
+        assert_eq!(library.cuda_get_device()?, 0);
+        fixture.configure_memory(&library, 1, 8192)?;
+        fixture.configure_bind_after(&library, 1)?;
+        assert!(query.sample(1).is_err(), "failed device restoration cannot report success");
+        fixture.configure_bind_after(&library, -1)?;
+        library.cuda_set_device(0)?;
+        drop(library);
+        assert_eq!(query.sample(0)?, (4096, 4096));
+        Ok(())
+    }
+
+    #[test]
+    fn strict_device_free_records_mismatch_and_preserves_the_live_owner() -> Result<()> {
+        let fixture = Fixture::build_for_tests()?;
+        let library = fixture.load()?;
+        // Use private DSO calls, not the process-global allocation ledger.
+        // SAFETY: both exports belong to this fixture and the buffer lives until its matching free.
+        let (allocate, free) = unsafe {
+            (*library.lib.get::<unsafe extern "C" fn(usize, *mut CuteafdDeviceBuffer, u32, *const c_char) -> i32>(b"cuteafd_alloc_device_buffer")?,
+             *library.lib.get::<unsafe extern "C" fn(*mut CuteafdDeviceBuffer) -> i32>(b"cuteafd_free_device_buffer")?)
+        };
+        for strict in [false, true] {
+            fixture.strict_device_free(&library, strict)?;
+            library.cuda_set_device(1)?;
+            let mut buffer = CuteafdDeviceBuffer::default();
+            // SAFETY: this CPU fixture writes a fresh host-backed device buffer.
+            assert_eq!(unsafe { allocate(256, &mut buffer, crate::memory_ledger::MemoryKind::Workspace.as_raw(), c"test/fixture".as_ptr()) }, 0);
+            let pointer = buffer.ptr;
+            library.cuda_set_device(0)?;
+            // SAFETY: the fixture either frees its own buffer or rejects without modifying it.
+            let status = unsafe { free(&mut buffer) };
+            if strict {
+                assert_ne!(status, 0, "wrong-device free must fail");
+                assert_eq!(fixture.device_free_mismatch(&library)?, (1, 1, 0));
+                assert_eq!(buffer.ptr, pointer, "failed free must leave its owner live");
+                library.cuda_set_device(1)?;
+                // SAFETY: the rejected free retained this live allocation; the owning device is current.
+                assert_eq!(unsafe { free(&mut buffer) }, 0);
+            } else {
+                assert_eq!(status, 0, "legacy tests keep permissive frees");
+                assert_eq!(fixture.device_free_mismatch(&library)?, (0, -1, -1));
+            }
+            assert!(buffer.ptr.is_null());
+        }
+        Ok(())
     }
 }

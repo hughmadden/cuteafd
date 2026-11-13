@@ -3,33 +3,6 @@ use anyhow::{ensure, Result};
 
 pub(super) const MAX_DECODE_ROWS: u32 = cuteafd_core::V41_VERIFY_ROWS as u32;
 
-pub(super) const SMALL_CARD_FIXED_ROWS: &str = "1,6,16,24,32,40,43,48";
-static FIXED_SHAPES: std::sync::OnceLock<Vec<u32>> = std::sync::OnceLock::new();
-
-pub(super) fn profile_fixed_shapes(total_bytes: usize, explicit: Option<&str>) -> Result<Option<Vec<u32>>> {
-    if total_bytes > 32usize << 30 { return Ok(None); }
-    let value = explicit.unwrap_or(SMALL_CARD_FIXED_ROWS);
-    if value.is_empty() { return Ok(None); }
-    Ok(Some(validate_fixed_shapes(value.split(',').map(str::parse::<u32>)
-        .collect::<std::result::Result<Vec<_>, _>>()?)?))
-}
-
-/// Startup-only small-card policy. Exact shapes outside the set execute eagerly,
-/// never evicting or recapturing a graph, and never changing causal/cache rows.
-pub(super) fn set_fixed_shapes(shapes: Vec<u32>) -> Result<()> {
-    FIXED_SHAPES.set(validate_fixed_shapes(shapes)?)
-        .map_err(|_| anyhow::anyhow!("target graph policy already set"))
-}
-
-fn validate_fixed_shapes(mut shapes: Vec<u32>) -> Result<Vec<u32>> {
-    ensure!(shapes.contains(&1) && shapes.contains(&6)
-        && shapes.iter().all(|r| (1..=MAX_DECODE_ROWS).contains(r)),
-        "fixed target graph set must include rows 1 and 6 and use decode rows only");
-    shapes.sort_unstable();
-    shapes.dedup();
-    Ok(shapes)
-}
-
 /// Rows of one full prefill chunk. Above the decode bank a live request captures
 /// only this and the 128-row decoder replay, the two large shapes every long
 /// prompt repeats. Unset (tests, tools), every shape keeps capturing.
@@ -47,9 +20,46 @@ pub(super) fn set_prefill_rows(rows: u32) -> Result<()> {
     Ok(())
 }
 
+thread_local! {
+    // Startup owns a dedicated CUDA worker thread. Avoid threading a layout
+    // field through every primitive owner; attach refreshes it before capture.
+    static RANKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+pub(crate) fn ranks() -> usize { RANKS.with(std::cell::Cell::get) }
+fn set_layout(ranks: usize) { RANKS.with(|layout| layout.set(ranks)); }
+
+pub(crate) fn pinned_shape(device: i32, rows: u32) -> bool {
+    let Ok(rank) = usize::try_from(device) else { return false };
+    let Some(list) = cuteafd_loader::serving_capacity::v41_graphs::v41_prewarm(ranks(), rank) else { return false };
+    list.entries.iter().chain(&list.prefill_entries)
+        .any(|entry| entry.rows == rows as usize && entry.pin)
+}
+
 pub(super) fn captures_shape(rows: u32) -> bool {
     large_shape_captured(rows, PREFILL_ROWS.get().copied())
-        && FIXED_SHAPES.get().is_none_or(|shapes| shapes.contains(&rows))
+}
+
+/// Only slot zero serves non-unit prompt, replay and continuation work.
+pub(crate) const PREFILL_PREWARM_SLOTS: [usize; 1] = [0];
+/// The terminal projects the selected last row, not the whole backbone chunk.
+pub(crate) const PREFILL_HEAD_PREWARM_ROWS: [usize; 1] = [1];
+
+/// Nonwindowed prompt/replay paths reach these exact row counts. Streamed
+/// encoder units have offset bindings and deliberately remain eager (#1638).
+pub(crate) fn prefill_prewarm_rows(rank: usize, capacity: usize) -> Vec<usize> {
+    prefill_rows(rank, capacity, PREFILL_ROWS.get().copied())
+}
+
+fn prefill_rows(rank: usize, capacity: usize, chunk: Option<u32>) -> Vec<usize> {
+    cuteafd_loader::serving_capacity::v41_graphs::v41_prefill_rows(ranks(), rank, capacity, chunk.map(|row| row as usize))
+}
+
+/// Records one eager run of a shape the policy would graph but this owner's
+/// bank cannot capture. Every site that chooses eager for that reason reports
+/// through here, so `/v1/stats["graph_missing_variants"]` holds one entry per
+/// variant and the first execution logs one structured warning.
+pub(super) fn note_miss(shape: String, context: impl FnOnce() -> String) {
+    crate::shared::decode_graph::note_eager("deepseek_v41", &shape, context);
 }
 
 fn large_shape_captured(rows: u32, prefill: Option<u32>) -> bool {
@@ -57,8 +67,52 @@ fn large_shape_captured(rows: u32, prefill: Option<u32>) -> bool {
         || prefill.is_none_or(|chunk| rows == chunk)
 }
 
-pub(super) fn fixed_binding_limit() -> Option<usize> {
-    FIXED_SHAPES.get().map(|shapes| shapes.len() * 4)
+fn site_name(name: &'static str) -> &'static str {
+    match name {
+        "window" => "deepseek_v41.window", "compressor" => "deepseek_v41.compressor",
+        "index_selection" => "deepseek_v41.index_selection",
+        "target_head" => "deepseek_v41.target_head", "target_norm" => "deepseek_v41.target_norm",
+        "target_embedding" => "deepseek_v41.target_embedding", "tp2_ffn" => "deepseek_v41.tp2_ffn",
+        "vocabulary_logits" => "deepseek_v41.vocabulary_logits", "vocabulary_greedy" => "deepseek_v41.vocabulary_greedy",
+        "sparse_attention" => "deepseek_v41.sparse_attention", "dual_attention_tail" => "deepseek_v41.dual_attention_tail",
+        "v41.attention.query" => "deepseek_v41.attention.query",
+        "v41.attention.query.tp2_prefix" => "deepseek_v41.attention.query.tp2_prefix",
+        "v41.attention.output" => "deepseek_v41.attention.output",
+        "v41.backbone.shared" => "deepseek_v41.backbone.shared",
+        "v41.router.remote" => "deepseek_v41.router.remote",
+        "v41.router.local" => "deepseek_v41.router.local",
+        "v41.index.query" => "deepseek_v41.index.query", "v41.engram.gate" => "deepseek_v41.engram.gate",
+        "v41.projection.query.rank" => "deepseek_v41.projection.query.rank",
+        "v41.projection.query.gather" => "deepseek_v41.projection.query.gather",
+        "v41.projection.output.rank" => "deepseek_v41.projection.output.rank",
+        "v41.projection.output.gather" => "deepseek_v41.projection.output.gather",
+        "dspark_chain" => "deepseek_v41.dspark_chain",
+        "dspark_cache" => "deepseek_v41.dspark_cache",
+        "dspark_distributed_terminal" => "deepseek_v41.dspark_distributed_terminal",
+        // Empty standalone banks are visited too; they have no serving capture sites.
+        _ => name,
+    }
+}
+
+pub(crate) fn attach(library: &cuteafd_ffi::NativeLibrary, ranks: usize,
+    mut visit: impl FnMut(&mut crate::shared::decode_graph::device::GraphVisitor<'_>) -> Result<()>) -> Result<()> {
+    use crate::shared::decode_graph::device::{Basis, Cycle, Preference, Site};
+    tracing::warn!("V4.1 graph cache uses byte estimates: SM120 node rates are not calibrated");
+    set_layout(ranks);
+    visit(&mut |device, name, spans, bank| {
+        let (base, extra) = cuteafd_loader::placement::graph_reserve::v41_default(ranks, device as usize);
+        let policy = cuteafd_loader::placement::graph_reserve::current(device as usize,
+            false, base, extra).map_err(anyhow::Error::msg)?;
+        bank.attach(library, device, policy.bytes, Site { name: site_name(name), cycle: Cycle::Other,
+            preference: Preference::Adaptive, bootstrap: 2 << 20, basis: Basis::Bytes,
+            spans_devices: spans || ranks > 1 })?;
+        crate::shared::decode_graph::device::set_reserve_policy(device, policy)
+    })
+}
+
+pub(crate) fn cycle(cycle: crate::shared::decode_graph::device::Cycle,
+    mut visit: impl FnMut(&mut crate::shared::decode_graph::device::GraphVisitor<'_>) -> Result<()>) -> Result<()> {
+    visit(&mut |_, _, _, bank| { bank.cycle(cycle); Ok(()) })
 }
 
 #[cfg(test)]
@@ -70,14 +124,83 @@ mod tests {
     use crate::shared::memory::{DeviceAllocation, LoadStream};
 
     #[test]
-    fn small_card_profile_defaults_to_qualified_bank_and_preserves_overrides() {
-        assert_eq!(profile_fixed_shapes(32usize << 30, None).unwrap(),
-            Some(vec![1, 6, 16, 24, 32, 40, 43, 48]));
-        assert_eq!(profile_fixed_shapes(32usize << 30, Some("")).unwrap(), None);
-        assert_eq!(profile_fixed_shapes(32usize << 30, Some("1,6")).unwrap(), Some(vec![1, 6]));
-        assert_eq!(profile_fixed_shapes(96usize << 30, None).unwrap(), None);
-        assert_eq!(profile_fixed_shapes(96usize << 30, Some("1,6")).unwrap(), None);
-        assert!(profile_fixed_shapes(32usize << 30, Some("1,80")).is_err());
+    fn layout_state_is_local_to_the_engine_thread_and_refreshes_on_restart() {
+        std::thread::spawn(|| {
+            assert_eq!(ranks(), 0);
+            set_layout(1);
+            assert_eq!(ranks(), 1);
+            std::thread::spawn(|| assert_eq!(ranks(), 0)).join().unwrap();
+            set_layout(2);
+            assert_eq!(ranks(), 2);
+        }).join().unwrap();
+    }
+
+    #[test]
+    fn compressor_chain_counts_only_the_successful_replay_lookup() {
+        let source = include_str!("v41_compressor.rs");
+        let start = source.find("if crate::shared::memory::chain::active() && self.pending_query.is_none()").unwrap();
+        let end = start + source[start..].find("crate::shared::memory::chain::settle").unwrap();
+        let chain = &source[start..end];
+        // Liveness validation must not count a hit or keep an evicted pointer.
+        assert_eq!(chain.matches("self.selected_graph()").count(), 1);
+        assert_eq!(chain.matches("self.retained_graphs.cached_launch(&(prepared.rows, state.owner))").count(), 1);
+        assert!(chain.find("cached_launch").unwrap() < chain.find("census::dispatch").unwrap());
+        let select = &source[source.find("fn select_graph(").unwrap()..source.find("fn selected_graph(").unwrap()];
+        assert_eq!(select.matches("cached_launch").count(), 1);
+        let selected = &source[source.find("fn selected_graph(").unwrap()..];
+        let selected = &selected[..selected.find("\n    }").unwrap()];
+        assert!(!selected.contains("cached_launch"));
+    }
+
+    #[test]
+    fn startup_prefill_keys_are_reachable_from_slot_zero_and_selected_head_row() {
+        use crate::shared::memory::row_window::RowWindow;
+        // Enumerate the geometry consumed by startup, including a chunk that
+        // coincides with replay and a capacity that excludes the chunk.
+        for (capacity, chunk, expected) in [(2048, 2048, vec![128]),
+            (128, 128, vec![128]), (128, 2048, vec![128])] {
+            let rows = cuteafd_loader::serving_capacity::v41_graphs::v41_prefill_rows(1, 0, capacity, Some(chunk as usize));
+            assert_eq!(rows, expected);
+            let keys: Vec<_> = PREFILL_PREWARM_SLOTS.into_iter().flat_map(|slot| {
+                rows.iter().map(move |&rows| (slot, rows, RowWindow::NONE, false))
+            }).collect();
+            assert!(!keys.is_empty());
+            for (slot, rows, window, attention_decode) in keys {
+                assert_eq!(slot, 0);
+                assert!(!window.is_windowed());
+                assert!(!attention_decode);
+                assert!(rows == 128 || rows == chunk as usize);
+            }
+            let head_keys: Vec<_> = PREFILL_PREWARM_SLOTS.into_iter()
+                .flat_map(|slot| PREFILL_HEAD_PREWARM_ROWS.map(|rows| (slot, rows))).collect();
+            assert_eq!(head_keys, vec![(0, 1)]);
+        }
+        // Tie the enumeration to both live startup implementations rather than
+        // letting a correct policy test hide an unreachable caller inventory.
+        for source in [include_str!("v41_native_serve.rs"), include_str!("v41_native_serve/distributed.rs")] {
+            let at = source.find("for index in ").unwrap();
+            let end = source[at..].find("if let Some(draft)").unwrap() + at;
+            let startup = &source[at..end];
+            assert!(startup.contains("graph_policy::PREFILL_PREWARM_SLOTS"));
+            assert!(startup.contains("&mut prefill_slots.slots[index]"));
+            assert_eq!(source.matches("slot.capture_startup_prefill(").count(), 1);
+        }
+        for source in [include_str!("v41_target_pass.rs"), include_str!("v41_target_pass/distributed.rs")] {
+            let at = source.find("pub(crate) fn capture_startup_prefill").unwrap();
+            let end = source[at..].find("pub(crate) fn capture_startup(").unwrap() + at;
+            let startup = &source[at..end];
+            assert!(startup.contains("select_window(crate::shared::memory::row_window::RowWindow::NONE)?"));
+            if source.contains("resources.head.capture_startup(") {
+                assert!(startup.contains("graph_policy::PREFILL_HEAD_PREWARM_ROWS"));
+            } else {
+                assert!(!startup.contains("head.capture_startup("));
+            }
+            assert!(!startup.contains("head.capture_startup(&rows)"));
+        }
+        let lane = include_str!("v41_backbone_lane.rs");
+        let at = lane.find("pub(crate) fn capture_startup_prefill").unwrap();
+        let end = lane[at..].find("pub(crate) fn startup_prefill_rows").unwrap() + at;
+        assert!(lane[at..end].contains("capture_startup_kind(&[], &[], false, false, local)"));
     }
 
     #[test]
@@ -94,15 +217,6 @@ mod tests {
     }
 
     #[test]
-    fn fixed_shapes_preserve_c1_and_refuse_replacing_large_prefill_slots() {
-        assert_eq!(validate_fixed_shapes(vec![48, 6, 1, 24, 32, 40, 6]).unwrap(),
-            vec![1, 6, 24, 32, 40, 48]);
-        for shapes in [vec![], vec![1], vec![6], vec![1, 6, 0], vec![1, 6, 80]] {
-            assert!(validate_fixed_shapes(shapes).is_err());
-        }
-    }
-
-    #[test]
     fn cuda_row_bank_preserves_decode_handles_over_prefill() -> Result<()> {
         let Some(path) = std::env::var_os("CUTEAFD_LAYER_GRAPH_TEST_LIBRARY") else {
             eprintln!("skip CUDA row bank test: library unset");
@@ -110,10 +224,10 @@ mod tests {
         };
         // SAFETY: this fixture uses the task's native library and owns all buffers.
         let library = unsafe { NativeLibrary::load(path)? };
-        let input = DeviceAllocation::new(&library, 128 * 4)?;
-        let output = DeviceAllocation::new(&library, 128 * 4)?;
+        let input = DeviceAllocation::new(&library, 128 * 4, crate::shared::memory::TEST)?;
+        let output = DeviceAllocation::new(&library, 128 * 4, crate::shared::memory::TEST)?;
         let stream = LoadStream { library: &library, raw: library.cuda_stream_create()? };
-        let mut bank = RowGraphs::new(&library, "fixture", MAX_DECODE_ROWS as usize);
+        let mut bank = RowGraphs::new(&library, "fixture", MAX_DECODE_ROWS as usize, "deepseek_v41");
         let mut handles = BTreeMap::new();
         for (cycle, rows) in (1..=MAX_DECODE_ROWS as usize)
             .chain([80, 128, 2, 6, 96, 3, 48, 64, 56, 63, 64]).enumerate() {
@@ -124,7 +238,7 @@ mod tests {
                 unsafe {
                     library.cuda_graph_begin_capture(stream.raw)?;
                     library.copy_d2d_async(output.buffer, input.buffer, rows * 4, stream.raw)?;
-                    let graph = library.cuda_graph_end_capture(stream.raw)?;
+                    let graph = library.cuda_graph_end_capture_for_test(stream.raw)?;
                     bank.insert(rows, graph)?;
                 }
             }
@@ -159,11 +273,11 @@ mod tests {
             return Ok(());
         };
         let library = unsafe { NativeLibrary::load(path)? };
-        let weights = DeviceAllocation::new(&library, 128 * 4)?;
-        let other = DeviceAllocation::new(&library, 128 * 4)?;
-        let output = DeviceAllocation::new(&library, 128 * 4)?;
+        let weights = DeviceAllocation::new(&library, 128 * 4, crate::shared::memory::TEST)?;
+        let other = DeviceAllocation::new(&library, 128 * 4, crate::shared::memory::TEST)?;
+        let output = DeviceAllocation::new(&library, 128 * 4, crate::shared::memory::TEST)?;
         let stream = LoadStream { library: &library, raw: library.cuda_stream_create()? };
-        let mut bank = LayerGraphs::new(&library, MAX_DECODE_ROWS);
+        let mut bank = LayerGraphs::new(&library, MAX_DECODE_ROWS, "deepseek_v41");
         bank.enable_small_shapes();
         let mut handles = BTreeMap::new();
         for (cycle, rows) in (1..=MAX_DECODE_ROWS).chain([80, 128, 2, 6, 96, 3, 2, 6, 48, 64, 56, 63, 64]).enumerate() {
@@ -173,7 +287,7 @@ mod tests {
                 unsafe {
                     library.cuda_graph_begin_capture(stream.raw)?;
                     library.copy_d2d_async(output.buffer, weights.buffer, rows as usize * 4, stream.raw)?;
-                    let graph = library.cuda_graph_end_capture(stream.raw)?;
+                    let graph = library.cuda_graph_end_capture_for_test(stream.raw)?;
                     bank.insert(0, &weights, rows, graph)?;
                 }
             }
@@ -198,7 +312,7 @@ mod tests {
         unsafe {
             library.cuda_graph_begin_capture(stream.raw)?;
             library.copy_d2d_async(output.buffer, other.buffer, 8, stream.raw)?;
-            let graph = library.cuda_graph_end_capture(stream.raw)?;
+            let graph = library.cuda_graph_end_capture_for_test(stream.raw)?;
             bank.insert(0, &other, 2, graph)?;
         }
         assert!(bank.get_shape(0, &weights, 2).is_none());
@@ -211,6 +325,59 @@ mod tests {
     }
 
     #[test]
+    fn cuda_sealed_prefill_tails_replay_and_cold_shapes_match_eager() -> Result<()> {
+        let Some(path) = std::env::var_os("CUTEAFD_LAYER_GRAPH_TEST_LIBRARY") else {
+            eprintln!("skip CUDA sealed prefill test: library unset");
+            return Ok(());
+        };
+        // SAFETY: the fixture pins its library, buffers and stream until drained.
+        let library = unsafe { NativeLibrary::load(path)? };
+        let bytes = 2752 * 4;
+        let weights = DeviceAllocation::new(&library, bytes, crate::shared::memory::TEST)?;
+        let output = DeviceAllocation::new(&library, bytes, crate::shared::memory::TEST)?;
+        let stream = LoadStream { library: &library, raw: library.cuda_stream_create()? };
+        let mut bank = LayerGraphs::new(&library, MAX_DECODE_ROWS, "deepseek_v41");
+        bank.declare_startup(&[(0, 52), (0, 54)])?;
+        for rows in [52, 54] {
+            // SAFETY: records only real pinned allocations, without execution.
+            unsafe {
+                library.cuda_graph_begin_capture(stream.raw)?;
+                library.copy_d2d_async(output.buffer, weights.buffer, rows * 4, stream.raw)?;
+                let graph = library.cuda_graph_end_capture_for_test(stream.raw)?;
+                bank.insert(0, &weights, rows as u32, graph)?;
+            }
+        }
+        bank.finish_startup()?;
+        let handles = [bank.get_shape(0, &weights, 52), bank.get_shape(0, &weights, 54)];
+        for (cycle, rows) in [54, 52, 54, 52, 128, 2752, 53, 52].into_iter().enumerate() {
+            let input = vec![(cycle + 1) as u8; bytes];
+            let mut expected = vec![0xee; bytes];
+            expected[..rows * 4].copy_from_slice(&input[..rows * 4]);
+            library.copy_h2d(weights.buffer, &input)?;
+            library.copy_h2d(output.buffer, &vec![0xee; bytes])?;
+            assert!(!bank.capture_allowed(0, rows as u32));
+            // SAFETY: every prior iteration drained before reusing this storage.
+            unsafe {
+                if let Some((graph, _)) = bank.get_shape(0, &weights, rows as u32) {
+                    library.cuda_graph_launch(graph, stream.raw)?;
+                } else {
+                    library.copy_d2d_async(output.buffer, weights.buffer, rows * 4, stream.raw)?;
+                }
+                library.cuda_stream_synchronize(stream.raw)?;
+            }
+            let mut actual = vec![0; bytes];
+            library.copy_d2h(&mut actual, output.buffer)?;
+            assert_eq!(actual, expected);
+            assert_eq!([bank.get_shape(0, &weights, 52), bank.get_shape(0, &weights, 54)], handles);
+            assert_eq!(bank.len(), 2);
+        }
+        // SAFETY: all fixture launches drained before bank destruction.
+        unsafe { bank.clear()?; }
+        assert!(!bank.capture_allowed(0, 52));
+        Ok(())
+    }
+
+    #[test]
     fn cuda_layer_graphs_reuse_storage_and_retain_exact_weight_bindings() -> Result<()> {
         let Some(path) = std::env::var_os("CUTEAFD_LAYER_GRAPH_TEST_LIBRARY") else {
             eprintln!("skip CUDA layer graph test: CUTEAFD_LAYER_GRAPH_TEST_LIBRARY unset");
@@ -219,9 +386,9 @@ mod tests {
         let library = unsafe { NativeLibrary::load(path)? };
         // Real CUDA copies isolate graph ownership from SM120 FP8 arithmetic.
         let weights = (0..40)
-            .map(|_| DeviceAllocation::new(&library, 4096 * 4))
+            .map(|_| DeviceAllocation::new(&library, 4096 * 4, crate::shared::memory::TEST))
             .collect::<Result<Vec<_>>>()?;
-        let replacement = DeviceAllocation::new(&library, 4096 * 4)?;
+        let replacement = DeviceAllocation::new(&library, 4096 * 4, crate::shared::memory::TEST)?;
         let streams = (0..2)
             .map(|_| {
                 Ok(LoadStream {
@@ -231,9 +398,9 @@ mod tests {
             })
             .collect::<Result<Vec<_>>>()?;
         let outputs = (0..2)
-            .map(|_| DeviceAllocation::new(&library, 4096 * 4))
+            .map(|_| DeviceAllocation::new(&library, 4096 * 4, crate::shared::memory::TEST))
             .collect::<Result<Vec<_>>>()?;
-        let mut banks = [LayerGraphs::new(&library, MAX_DECODE_ROWS), LayerGraphs::new(&library, MAX_DECODE_ROWS)];
+        let mut banks = [LayerGraphs::new(&library, MAX_DECODE_ROWS, "deepseek_v41"), LayerGraphs::new(&library, MAX_DECODE_ROWS, "deepseek_v41")];
         let mut captures = 0;
         let mut replays = 0;
         for rows in [1u32, 80, 4096] {
@@ -257,7 +424,7 @@ mod tests {
                                     expected.len(),
                                     streams[lane].raw,
                                 )?;
-                                let graph = library.cuda_graph_end_capture(streams[lane].raw)?;
+                                let graph = library.cuda_graph_end_capture_for_test(streams[lane].raw)?;
                                 bank.insert(layer, &weights[layer], rows, graph)?;
                             }
                             captures += 1;
@@ -311,7 +478,7 @@ mod tests {
         unsafe {
             library.cuda_graph_begin_capture(streams[0].raw)?;
             library.copy_d2d_async(outputs[0].buffer, replacement.buffer, 4, streams[0].raw)?;
-            let graph = library.cuda_graph_end_capture(streams[0].raw)?;
+            let graph = library.cuda_graph_end_capture_for_test(streams[0].raw)?;
             bank.insert(0, &replacement, 1, graph)?;
             assert!(bank.get(0, &weights[0]).is_none());
             assert!(bank.get(39, &weights[39]).is_some());

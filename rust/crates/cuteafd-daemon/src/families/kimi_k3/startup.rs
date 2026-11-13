@@ -11,13 +11,58 @@ use cuteafd_loader::{families::kimi_k3::config::KimiK3Config, placement::{Demand
 use std::{net::SocketAddr, path::Path, rc::Rc, sync::Arc};
 const HIDDEN: usize = 7168;
 
+const MEMORY_PHASE_DIAGNOSTIC: &str = "CUTEAFD_DIAG_KIMI_STARTUP_MEMORY";
+
+fn memory_phase_mode(value: Option<&str>) -> Result<bool> {
+    match value {
+        None | Some("off") => Ok(false),
+        Some("pre-capture") => Ok(true),
+        _ => anyhow::bail!("{MEMORY_PHASE_DIAGNOSTIC} must be off or pre-capture"),
+    }
+}
+
+pub(crate) fn memory_phases<'a>(library: &'a cuteafd_ffi::NativeLibrary, devices: &[i32])
+    -> Result<crate::shared::inventory::StartupMemoryPhases<'a>> {
+    let mode = std::env::var(MEMORY_PHASE_DIAGNOSTIC).ok();
+    Ok(crate::shared::inventory::StartupMemoryPhases::new(library, devices, memory_phase_mode(mode.as_deref())?))
+}
+
+fn stop_before_capture(enabled: bool) -> Result<()> {
+    ensure!(!enabled, "KIMI_STARTUP_MEMORY_PRE_CAPTURE_STOP: diagnostic complete; target graphs and Ready were not reached");
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Role { Serve, Golden { skip_routed_experts: bool } }
+
+impl Role {
+    pub(crate) fn skip_routed_experts(self) -> bool {
+        matches!(self, Self::Golden { skip_routed_experts: true })
+    }
+
+    fn validate(self, cfg: &KimiK3Config, peers: usize, draft: bool) -> Result<()> {
+        cfg.validate_attention_role(matches!(self, Self::Golden { .. }))?;
+        if self.skip_routed_experts() {
+            ensure!(peers == 0 && !draft, "Kimi --skip-routed-experts golden requires zero Spark peers and no drafter");
+        } else {
+            ensure!((1..=cuteafd_core::MAX_SPARK_WORLD).contains(&peers),
+                "Kimi startup requires 1..8 real expert ranks outside the skipped-routed golden");
+        }
+        Ok(())
+    }
+}
+
 pub(crate) struct Options<'a, const RANKS: usize = 2> {
+    pub role: Role,
+    pub expert_usage: bool,
+    pub expert_usage_reader: cuteafd_core::expert_usage::Reader,
     pub cache_format: cuteafd_core::MlaCacheFormat,
     pub devices: [i32; RANKS],
+    pub attention: Option<cuteafd_loader::placement::AttentionPlacement>,
     pub native_lib: &'a Path,
+    pub manifest: &'a Path,
     pub peers: Vec<SocketAddr>,
     pub rtx_expert_layers: cuteafd_loader::placement::OnboardSetting,
-    pub spark_budget_gib: Option<f64>,
     /// Lane rows: `waves` prefill units of `rows / waves` each.
     pub rows: usize,
     /// Prefill units in flight (Spark waves outstanding, one return slot each).
@@ -27,19 +72,44 @@ pub(crate) struct Options<'a, const RANKS: usize = 2> {
     pub slots: usize,
     pub marks: usize,
     pub max_context: usize,
+    pub context: cuteafd_loader::placement::planner::Context,
     pub pool_tokens: Option<u64>,
     pub graphs: bool,
+    pub full_prefill_logits: bool,
     pub ffn_mode: cuteafd_ffi::KimiFfnMode,
     pub hosted_layers: Option<Vec<usize>>,
     pub draft: Option<super::draft::Options>,
     /// Exact speculative verify widths given startup graphs; 0 = the drafter's block.
     pub verify_rows: usize,
+    pub prefix: Option<&'a crate::shared::prefix::PrefixArgs>,
 }
 
 pub(crate) struct Loaded<'a> {
     pub engine: Engine<'a>,
     pub admission_free: Vec<u64>,
     pub admitted_bytes: Vec<u64>,
+    pub ownership: Ownership,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub(crate) struct Ownership {
+    pub rtx_expert_layers: usize,
+    pub spark_layers: Vec<usize>,
+    pub inactive_seeded_layers: usize,
+    pub inactive_loaded_layers: usize,
+}
+
+pub(super) fn check_hosted_layers(setting: cuteafd_loader::placement::OnboardSetting,
+    selected: &[usize], seeded: &[usize]) -> Result<usize> {
+    ensure!(seeded.windows(2).all(|pair| pair[0] < pair[1]),
+        "Kimi worker layer subset must be sorted and unique");
+    if setting == cuteafd_loader::placement::OnboardSetting::Auto {
+        ensure!(selected.iter().all(|layer| seeded.binary_search(layer).is_ok()),
+            "Kimi worker layer subset is missing shared placement layers");
+    } else {
+        ensure!(selected == seeded, "Kimi worker layer subset differs from shared placement");
+    }
+    Ok(seeded.len() - selected.len())
 }
 
 /// Run before loading native programs, whose card selection can query the GPU.
@@ -51,15 +121,22 @@ pub(crate) fn preflight(manifest: &Path, native_lib: &Path) -> Result<()> {
 pub(crate) fn load<'a, const RANKS: usize>(library: &'a Arc<cuteafd_ffi::NativeLibrary>,
     programs: &'a cuteafd_ffi::programs::Programs<'a>,
     checkpoint: &cuteafd_loader::plan::Checkpoint, full: &KimiK3Config,
-    cfg: &KimiK3Config, options: Options<'_, RANKS>) -> Result<Loaded<'a>> {
+    cfg: &KimiK3Config, mut options: Options<'_, RANKS>) -> Result<Loaded<'a>> {
     ensure!(matches!(RANKS, 1 | 2), "Kimi startup requires one or two physical devices");
+    full.validate_speculation(options.draft.is_some())?;
+    options.role.validate(full, options.peers.len(), options.draft.is_some())?;
+    let skip_routed_experts = options.role.skip_routed_experts();
+    let mut memory = memory_phases(library, &options.devices)?;
+    memory.sample("context-before-family-modules")?;
+    if RANKS == 2 { options.attention = Some(cuteafd_loader::families::kimi_k3::resolve_attention(options.attention, RANKS)); }
+    check_attention(options.attention, RANKS, options.graphs)?;
     ensure!(options.draft.as_ref().is_none_or(|draft| draft.cache_format == options.cache_format),
         "Kimi target/draft cache records differ");
     let spark_ranks = options.peers.len();
-    ensure!((1..=cuteafd_core::MAX_SPARK_WORLD).contains(&spark_ranks),
-        "Kimi startup requires 1..8 Spark peers");
+    ensure!(spark_ranks <= cuteafd_core::MAX_SPARK_WORLD, "Kimi Spark peer inventory exceeds eight");
     let core = cuteafd_loader::plan::families::kimi::core_inventory(checkpoint)?;
     core.validate_runtime_groups(full)?;
+    let graph_core = cuteafd_loader::serving_capacity::kimi_prewarm::KimiCoreFormat::from_inventory(&core);
     if RANKS == 2 {
         ensure!(crate::shared::peer_split::probed_device(library, options.devices[0], Some(options.devices[1]))?
             == Some(options.devices[1]), "Kimi TP2 requires bidirectional peer access");
@@ -72,9 +149,13 @@ pub(crate) fn load<'a, const RANKS: usize>(library: &'a Arc<cuteafd_ffi::NativeL
     // peer exchange, hop and Spark wave serves one unit.
     let unit = cuteafd_loader::families::kimi_k3::allocation::prefill_shape_with(rows, options.waves,
         options.prefill_rows)?.unit_rows as usize;
-    let native = devices.iter().map(|&device| NativePrograms::load_for_ranks(device, full, programs, options.ffn_mode,
-        options.cache_format, &core, unit, RANKS).map(Rc::new)).collect::<Result<Vec<_>>>()?;
+    let native_exports = devices[0].run(|| super::device::resolve_native_programs(programs, &core, unit, RANKS))?;
+    let native = devices.iter().map(|&device| NativePrograms::load_resolved(device, full, programs, options.ffn_mode,
+        options.cache_format, &core, unit, RANKS, &native_exports).map(Rc::new)).collect::<Result<Vec<_>>>()?;
     let native: [_; RANKS] = native.try_into().map_err(|_| anyhow::anyhow!("Kimi native physical rank inventory"))?;
+    memory.sample("modules-target")?;
+    ensure!(RANKS == 2 || !options.draft.as_ref().is_some_and(|draft| draft.tp2_dflash),
+        "Kimi TP2 DFlash requires two physical coordinator GPUs");
     let draft_layout = options.draft.as_ref().map(|draft| devices[head].run(||
         draft.layout(options.slots, options.max_context, library.sm_count()?))).transpose()?;
     // Resolve native modules before the measured baseline, while retaining their handles.
@@ -83,12 +164,22 @@ pub(crate) fn load<'a, const RANKS: usize>(library: &'a Arc<cuteafd_ffi::NativeL
         Ok([MlaDraft::load(programs, "kimik3", MlaDraftWindow::Full, options.cache_format)?,
             MlaDraft::load(programs, "kimik3", MlaDraftWindow::Sliding4096, options.cache_format)?])
     })).transpose()?;
-    let spark_budget_gib = options.spark_budget_gib.unwrap_or(
-        cuteafd_loader::families::kimi_k3::SPARK_DEFAULT_BUDGET_BYTES as f64 / (1u64 << 30) as f64);
-    ensure!(spark_budget_gib.is_finite() && spark_budget_gib > 0.0
-        && spark_budget_gib < u64::MAX as f64 / (1u64 << 30) as f64,
-        "Kimi --spark-budget-gib must be finite, positive and representable");
-    let catalog = cuteafd_loader::read_expert_catalog(&checkpoint.snapshot)?;
+    memory.sample("modules-draft-mla")?;
+    let _draft_context_modules = if draft_layout.as_ref().is_some_and(|layout| layout.context_split()) {
+        use cuteafd_ffi::mla_draft::{MlaDraftPartial, MlaDraftCombine, MlaDraftWindow};
+        let partials = devices.iter().map(|device| device.run(|| Ok([
+            MlaDraftPartial::load(programs, "kimik3", MlaDraftWindow::Full, options.cache_format)?,
+            MlaDraftPartial::load(programs, "kimik3", MlaDraftWindow::Sliding4096, options.cache_format)?])))
+            .collect::<Result<Vec<_>>>()?;
+        Some((partials, devices[head].run(|| Ok(MlaDraftCombine::load(programs, "kimik3")?))?))
+    } else { None };
+    memory.sample("modules-draft-context")?;
+    // The per-Spark cap (`SPARK_MEMORY_CAP`), else Kimi's estimated complete ceiling.
+    let spark_budget_bytes = cuteafd_core::memory_policy::MemoryPolicy::current()
+        .spark_cap_bytes(cuteafd_loader::families::kimi_k3::SPARK_DEFAULT_BUDGET_BYTES);
+    let (spark_budget, rtx) = if skip_routed_experts { (None, None) } else {
+    let catalog = cuteafd_loader::read_expert_catalog_view(checkpoint.view.as_ref()
+        .context("Kimi startup requires the immutable selected checkpoint view")?)?;
     let routed = cfg.dense.iter().filter(|dense| !**dense).count();
     let onboard = options.rtx_expert_layers.resolve(routed);
     let model = crate::shared::placement::spark_rings(cuteafd_transport::TcpTransportConfig::default().max_frame_bytes)?;
@@ -97,7 +188,7 @@ pub(crate) fn load<'a, const RANKS: usize>(library: &'a Arc<cuteafd_ffi::NativeL
         spark_ranks, prefill_lanes: 1 };
     let spark_budget = cuteafd_loader::placement::SparkBudgetInventory::exl3(&catalog, &working,
         &[cuteafd_core::SparkEndpoint { ring_depth: None, capacity: u32::try_from(unit)?, ingress: cuteafd_core::SparkIngress::Fp8K32, partial_reply_bytes: None }],
-        model, (spark_budget_gib * (1u64 << 30) as f64) as u64,
+        model, spark_budget_bytes,
         cuteafd_loader::families::kimi_k3::spark::reserve_bytes(spark_ranks, options.waves as u64, unit as u64)?)?;
     let rtx = if onboard.layers(routed) == Some(0) { None } else {
         let tiers = catalog.exl3().context("Kimi TP2 experts require EXL3 checkpoint")?.decoder_tiers();
@@ -106,6 +197,8 @@ pub(crate) fn load<'a, const RANKS: usize>(library: &'a Arc<cuteafd_ffi::NativeL
         let mut inventory = admission::plan_rtx_for_ranks(cfg, &catalog, package, unit, routed, RANKS)?;
         inventory.layers = onboard;
         Some(inventory)
+    };
+    (Some(spark_budget), rtx)
     };
     let expert_modules = devices.iter().map(|&device| rtx.as_ref().map(|inventory| {
         use crate::shared::experts::rtx::{exl3::Exl3Tp2, RtxSelectionPolicy};
@@ -116,29 +209,56 @@ pub(crate) fn load<'a, const RANKS: usize>(library: &'a Arc<cuteafd_ffi::NativeL
     }).transpose()).collect::<Result<Vec<_>>>()?;
     let expert_modules: [_; RANKS] = expert_modules.try_into()
         .map_err(|_| anyhow::anyhow!("Kimi expert module physical rank inventory"))?;
+    memory.sample("modules-rtx-experts")?;
+    let context_programs = devices.iter().map(|device|
+        (options.attention == Some(cuteafd_loader::placement::AttentionPlacement::Context))
+            .then(|| device.run(|| super::context::Programs::load_for_config(programs, options.cache_format, full).map(Rc::new)))
+            .transpose()).collect::<Result<Vec<_>>>()?;
+    let context_programs = context_programs.try_into()
+        .map_err(|_| anyhow::anyhow!("Kimi context program rank inventory"))?;
+    memory.sample("modules-context-attention")?;
     let diagnostics = std::env::var("CUTEAFD_PEER_WAIT_DIAGNOSTICS").is_ok_and(|v| v == "1");
     let inventory = RuntimeInventory::measure(library, &options.devices, InventoryPhase::PreWeight, |_| {
         if RANKS == 2 {
-            library.tp2_native_initialize()?;
             library.peer_exchange_initialize()?;
             library.peer_abort_initialize()?;
             if diagnostics { library.peer_diagnostic_initialize()?; }
         }
-        library.v41_compact_reducer()?.require_plane_reduction(spark_ranks as u32)?;
+        if !skip_routed_experts { library.v41_compact_reducer()?.require_plane_reduction(spark_ranks as u32)?; }
         Ok(())
     })?;
+    memory.sample("modules-shared-peer-reducer")?;
     let lane_layouts: [_; RANKS] = native.iter().enumerate().map(|(rank, native)|
         native.lane_layout(full, rank, rows, unit, options.max_context)).collect::<Result<Vec<_>>>()?
         .try_into().map_err(|_| anyhow::anyhow!("Kimi lane physical rank inventory"))?;
+    let context_layout = (options.attention == Some(cuteafd_loader::placement::AttentionPlacement::Context))
+        .then(|| super::context::Programs::layout(programs, options.cache_format,
+            options.max_context, unit, lane_layouts[0].metadata_banks(), full)).transpose()?;
     let lane_layouts = vec![lane_layouts];
     let verify_rows = match options.verify_rows {
         0 => options.draft.as_ref().map(super::draft::Options::verify_rows).transpose()?.unwrap_or(0),
         rows => rows,
     };
-    let graph_set = options.graphs.then(|| if RANKS == 1 {
+    let graph_set = options.graphs.then(|| if let Some(layout) = &context_layout {
+        super::graphs::inventory_with_context(cfg, 1, unit, options.slots, verify_rows, RANKS,
+            |_, _| true, |layer| cfg.attention[layer] == cuteafd_loader::families::kimi_k3::config::KimiAttention::Mla,
+            Some(layout.decode()))
+    } else if RANKS == 1 || options.attention == Some(cuteafd_loader::placement::AttentionPlacement::Heads) {
         super::graphs::inventory_for_ranks(cfg, 1, unit, options.slots, verify_rows, RANKS, |_, _| true)
     } else { super::graphs::owned_inventory(cfg, 1, unit, options.slots, verify_rows) }).transpose()?;
+    // One configured arena per physical device: admission owns it, and the
+    // startup capture boundary measures inside it.
+    let reserve_demands = if graph_set.is_some() {
+        cuteafd_loader::families::kimi_k3::allocation::graph_reserve_demands(graph_core, RANKS)?
+    } else { Vec::new() };
+    let reserves: [u64; RANKS] = std::array::from_fn(|rank|
+        reserve_demands.get(rank).map_or(0, |demand| demand.bytes));
     let mut fixed = if RANKS == 2 { exchange_demands(unit, diagnostics)? } else { vec![] };
+    if core.native_attention_split(RANKS) {
+        for rank in 0..RANKS {
+            fixed.push(core.native_attention_receive_demand(unit, rank as u8, RANKS)?);
+        }
+    }
     if let Some(layout) = &draft_layout {
         fixed.extend(cuteafd_loader::families::kimi_k3::draft_bridge_demands_for_ranks(layout, rows, RANKS)?);
         fixed.push(cuteafd_loader::families::kimi_k3::draft_probe_demand(cfg.layers, cfg.topk, rows.min(64))?);
@@ -150,32 +270,61 @@ pub(crate) fn load<'a, const RANKS: usize>(library: &'a Arc<cuteafd_ffi::NativeL
             }
         }
     }
-    let selected = cuteafd_loader::placement::ProgramSet::from_names(
+    let mut selected = cuteafd_loader::placement::ProgramSet::from_names(
         if core.projections.is_empty() { &["kimik3"][..] } else { &["kimik3", "kimi"][..] }, programs.names());
+    selected.names.extend(native_exports.programs.iter().cloned());
+    selected.names.sort();
+    selected.names.dedup();
     for (rank, sample) in inventory.gpus.iter().enumerate() {
         let pending = crate::shared::inventory::pending_code(library, sample.device, rank, RANKS == 2,
             "kimik3", "exl3", &selected)?;
-        let arch = cuteafd_loader::placement::ArchContext::for_device(sample.arch.parse()?, sample.total_bytes);
-        fixed.push(cuteafd_loader::families::kimi_k3::allocation::code_demand_for_ranks(
-            rank, pending, arch.cublas_bytes, 1, RANKS)?);
+        fixed.push(cuteafd_loader::families::kimi_k3::allocation::code_demand(rank, pending, RANKS)?);
     }
     let gpus = inventory.gpus.iter().map(|sample| {
-        let capacity = cuteafd_ffi::coordinator_gpu_budget().map_or(sample.total_bytes, |b| b.0.min(sample.total_bytes));
-        GpuBudget { capacity_bytes: capacity, headroom_bytes: 2 << 30,
+        GpuBudget { capacity_bytes: sample.total_bytes, reserve_bytes: cuteafd_loader::placement::reserve::gpu("kimi_k3"),
             baseline: cuteafd_loader::placement::Baseline::Measured { free_bytes: sample.free_bytes } }
     }).collect::<Vec<_>>().try_into().map_err(|_| anyhow::anyhow!("Kimi GPU sample count"))?;
-    let mut admitted = admission::admit(admission::Inputs { cfg, core, cache_format: options.cache_format, gpus, devices: options.devices,
-        peer_access: RANKS == 2, spark_ranks, attention: None, requested_pool: options.pool_tokens,
+    let peer_receive = [core.attention_receive_bytes(unit, RANKS)?,
+        core.attention_receive_bytes(unit.min(64), RANKS)?];
+    let mut admitted = admission::admit(admission::Inputs { skip_routed_experts, expert_usage: options.expert_usage_reader.configure(options.expert_usage, false).map_err(anyhow::Error::msg)?, cfg, core,
+        resident_weight_limit: crate::shared::memory::budget::resident_weight_limit(), cache_format: options.cache_format, gpus, devices: options.devices,
+        peer_access: RANKS == 2, spark_ranks, attention: options.attention, context: context_layout, serving_context: options.context, requested_pool: options.pool_tokens,
         state_slots: options.slots, prefix_marks: options.marks, rows, lanes: 1, waves: options.waves,
-        unit_rows: options.prefill_rows, lane_layouts, fixed,
-        startup: graph_set.as_ref().map_or_else(Vec::new, |set|
-            (0..RANKS).map(|rank| super::graphs::demand(&set.inventory, rank)).collect()), pool_bounded: vec![], rtx,
-        spark_budget: Some(spark_budget), draft: draft_layout.clone(), verify_rows })?;
-    let graph_set = admitted.graph_set.take();
-    if let Some(expected) = options.hosted_layers.as_ref() {
-        ensure!(admitted.working_set().spark_layers == *expected,
-            "Kimi worker layer subset differs from shared placement");
+        unit_rows: options.prefill_rows, full_prefill_logits: options.full_prefill_logits, lane_layouts, fixed,
+        startup: reserve_demands, pool_bounded: vec![], rtx,
+        spark_budget, draft: draft_layout.clone(), verify_rows, prefix: options.prefix })?;
+    options.max_context = usize::try_from(options.context.served(admitted.placement.pool_tokens))?;
+    {
+        use sha2::{Digest, Sha256};
+        let hash = |path: &Path| -> Result<String> {
+            let mut file = std::fs::File::open(path)?;
+            let mut digest = Sha256::new();
+            std::io::copy(&mut file, &mut digest)?;
+            Ok(format!("{:x}", digest.finalize()))
+        };
+        cuteafd_ffi::memory_ledger::fault::set_inputs(serde_json::json!({
+            "memory_reconciliation_provenance": {
+                "schema_version": 1, "family": "kimi_k3",
+                "source_commit": env!("CUTEAFD_BUILD_COMMIT"),
+                "source_dirty": env!("CUTEAFD_BUILD_DIRTY"), "toolchain": env!("CUTEAFD_BUILD_TOOLCHAIN"),
+                "native_sha256": hash(options.native_lib)?, "programs_sha256": hash(options.manifest)?,
+                "layout": format!("{RANKS} RTX/{spark_ranks} Sparks; attention/{:?}; context/{}; slots/{}",
+                    options.attention, options.max_context, options.slots),
+                "devices": inventory.gpus, "spark_world": spark_ranks,
+                "onboard_layers": admitted.placement.onboard_layers,
+                "graph_basis": "uncalibrated Kimi byte fallback"
+            }
+        }));
     }
+    memory.sample("admission-resolved")?;
+    let graph_set = admitted.graph_set.take();
+    let spark_layers = admitted.working_set().spark_layers;
+    let inactive_seeded_layers = options.hosted_layers.as_ref().map(|expected|
+        check_hosted_layers(options.rtx_expert_layers, &spark_layers, expected)).transpose()?.unwrap_or(0);
+    // Golden's seed list is only a coverage hint. WorkerSelection loads exactly
+    // the admitted working set, never the inactive hinted layers.
+    let ownership = Ownership { rtx_expert_layers: admitted.placement.onboard_layers,
+        spark_layers, inactive_seeded_layers, inactive_loaded_layers: 0 };
     if let Some(set) = &graph_set {
         super::graphs::check_placement_for_ranks(cfg, &admitted.placement, &set.keys, RANKS)?;
         tracing::info!(executables = set.keys.len(), bytes = ?(0..RANKS)
@@ -183,9 +332,12 @@ pub(crate) fn load<'a, const RANKS: usize>(library: &'a Arc<cuteafd_ffi::NativeL
             reserve = "estimated", "Kimi startup graph inventory");
     }
     tracing::info!(placement = %admitted.placement.summary(), rtx_expert_layers = admitted.placement.onboard_layers,
+        inactive_seeded_layers, inactive_loaded_layers = ownership.inactive_loaded_layers,
         prefix_marks = admitted.mark_selection.slots, marks = %admitted.mark_selection.summary(),
-        spark_budget_gib, reserve = "estimated until W9 census",
+        spark_budget_bytes, reserve = "estimated until W9 census",
         "Kimi admitted TP2 expert ownership");
+    cuteafd_bench::context::ResolvedSettings::placement(&admitted.placement).publish();
+    cuteafd_bench::context::set_resolved("max-context-tokens", &options.max_context.to_string());
     let plan = admitted.execution_plan()?;
     let admission_free = inventory.gpus.iter().map(|sample| sample.free_bytes).collect::<Vec<_>>();
     let admitted_bytes = admitted.placement.items.iter().map(|items| items.iter().map(|item| item.bytes).sum::<u64>())
@@ -195,39 +347,105 @@ pub(crate) fn load<'a, const RANKS: usize>(library: &'a Arc<cuteafd_ffi::NativeL
     let (peer, hops) = if RANKS == 2 {
         let ranks = [0, 1].map(|rank| RankDevice { device: streams[rank].device.id, stream: streams[rank].raw });
         let peer = devices[0].run(|| PeerExchange::new_abortable(library, ranks, 1,
-            exchange_recv_bytes(unit)?, exchange_recv_bytes(unit.min(64))?))?;
+            peer_receive[0], peer_receive[1]))?;
         let mut hops = devices[0].run(|| HopLink::new(library, ranks, plan.hops(), plan.spec(),
             unit.min(64) * plan.spec().row_bytes as usize))?;
         hops.attach_abort([peer.abort_word(0)?.context("Kimi missing abort owner")?,
             peer.abort_word(1)?.context("Kimi missing abort owner")?])?;
-        (Some(peer), Some(hops))
+        (Some(Rc::new(peer)), Some(hops))
     } else { (None, None) };
     let lane_streams: [_; RANKS] = devices.iter().map(|&device| Stream::new(device).map(Rc::new))
         .collect::<Result<Vec<_>>>()?.try_into().map_err(|_| anyhow::anyhow!("Kimi lane stream count"))?;
+    memory.sample("streams-peer-hop")?;
     let draft_layout = admitted.draft_layout().cloned();
+    let recorder = crate::shared::experts::rtx::dense::Recorder::start(
+        !skip_routed_experts && crate::shared::experts::rtx::push::PushPolicy::for_snapshot(&checkpoint.snapshot)?
+            == crate::shared::experts::rtx::push::PushPolicy::Required)?;
     let draft = options.draft.as_ref().zip(draft_layout.as_ref()).map(|(options, layout)|
-        super::draft::NativeDraft::load_for_ranks(&mut admitted, programs, options, lane_streams.to_vec(), layout)).transpose()?;
-    let engine = Engine::load_admitted(library, streams, lane_streams, draft, admitted, checkpoint, native, peer, hops,
-        options.peers.clone(), cuteafd_transport::TcpTransportConfig { timing: cuteafd_transport::protocol_v2_timing_from_env(), ..Default::default() }, expert_modules)?;
-    if let Some(set) = graph_set {
-        let before = RuntimeInventory::measure(library, &options.devices, InventoryPhase::PostLoad, |_| Ok(()))?;
-        engine.warm_graphs(&set.keys)?;
-        let after = RuntimeInventory::measure(library, &options.devices, InventoryPhase::PostLoad, |_| Ok(()))?;
-        for rank in 0..RANKS {
-            let bytes = before.gpus[rank].free_bytes.saturating_sub(after.gpus[rank].free_bytes);
-            let count = set.inventory.ranks[rank].executables;
-            tracing::info!(rank, executables = count, measured_bytes = bytes,
-                bytes_per_executable = bytes.div_ceil(count.max(1)),
-                reserved_bytes = set.inventory.bytes(rank), reserve = "estimated",
-                "Kimi startup graph census");
-            ensure!(bytes <= set.inventory.bytes(rank), "Kimi startup graphs exceed admitted reserve");
+        super::draft::NativeDraft::load_for_ranks(&mut admitted, programs, options, lane_streams.to_vec(), layout,
+            peer.as_ref().map(|peer| ([streams[0].clone(), streams[1].clone()], peer.clone())))).transpose()?;
+    let draft_records = recorder.map(|recorder| recorder.finish()).unwrap_or_default();
+    memory.sample("draft-allocated-and-recorded")?;
+    if memory.enabled() {
+        if let Some(draft) = &draft {
+            let mut census = crate::shared::memory::receipts::Census::default();
+            census.owners(draft.allocation_receipts(
+                cuteafd_loader::placement::planner::CoordinatorDevices::new(&options.devices)?)?);
+            census.normalize(cuteafd_loader::placement::planner::PhaseOrder::DRAFT_THEN_TARGET)?;
+            let roots = census.receipts.iter().filter(|receipt| receipt.allocation.view.is_none()
+                && receipt.allocation.group == "weight arena").collect::<Vec<_>>();
+            tracing::info!(roots = roots.len(), bytes = roots.iter().map(|root| root.allocation.bytes).sum::<u64>(),
+                load_phase = roots.iter().all(|root| root.allocation.lifetime.contains(
+                    cuteafd_loader::placement::planner::Phase::Load,
+                    cuteafd_loader::placement::planner::PhaseOrder::DRAFT_THEN_TARGET)),
+                "Kimi retained draft weight arena census");
         }
     }
-    Ok(Loaded { engine, admission_free, admitted_bytes })
+    let engine = Engine::load_admitted(library, streams, lane_streams, draft, draft_records, admitted, options.expert_usage_reader.clone(), checkpoint, native, context_programs, peer, hops,
+        options.peers.clone(), cuteafd_transport::TcpTransportConfig { timing: cuteafd_transport::protocol_v2_timing_from_env(), ..Default::default() }, expert_modules, &mut memory)?
+        .with_served_context(options.max_context)?;
+    memory.sample("pre-capture")?;
+    stop_before_capture(memory.enabled())?;
+    if let Some(set) = graph_set {
+        let before = engine.graph_free_bytes()?;
+        let capture_started = std::time::Instant::now();
+        // Prewarm reachable decode/verify geometry only; row-window prefill
+        // stays eager and unselected replayable geometry can capture lazily.
+        let prewarm = super::graphs::prewarm_keys(cfg, &set.keys,
+            cuteafd_loader::serving_capacity::kimi_prewarm::kimi_layout(graph_core, RANKS), options.slots, unit);
+        let policies = (0..RANKS).map(|rank| {
+            let (base, tail) = cuteafd_loader::placement::graph_reserve::kimi_default(graph_core, RANKS, rank);
+            cuteafd_loader::placement::graph_reserve::current(rank, false, base, tail)
+        }).collect::<std::result::Result<Vec<_>, _>>()?;
+        let bases = policies.iter().map(|policy| policy.base_bytes).collect::<Vec<_>>();
+        let bootstraps = (0..RANKS).map(|rank|
+            cuteafd_loader::serving_capacity::kimi_prewarm::kimi_bootstrap(RANKS, rank)).collect::<Vec<_>>();
+        let prewarm = super::graphs::fit_prewarm(prewarm,
+            cuteafd_loader::serving_capacity::kimi_prewarm::kimi_layout(graph_core, RANKS), &bases, &bootstraps);
+        tracing::info!(entries = prewarm.len(), attention_entries = prewarm.iter()
+            .filter(|key| matches!(key.op, super::graphs::Op::Attention { .. })).count(),
+            "Kimi selected startup prewarm keys");
+        let warmup = engine.warm_graphs(&prewarm, &reserves)?;
+        let captured = warmup.captured;
+        let capture_elapsed_ms = capture_started.elapsed().as_millis() as u64;
+        let after = engine.graph_free_bytes()?;
+        let census_table = if RANKS == 2 { "GRAPH_CENSUS_TP2" } else { "GRAPH_CENSUS_BYTES" };
+        for rank in 0..RANKS {
+            let first_touch_bytes = before[rank].saturating_sub(warmup.before_capture[rank]);
+            let bytes = warmup.before_capture[rank].saturating_sub(after[rank]);
+            let count = prewarm.iter().filter(|key| key.rank == rank).count() as u64;
+            let reserved = set.inventory.bytes(rank);
+            tracing::info!(rank, first_touch_bytes, owner = "KDA eager first-use storage",
+                "Kimi startup first-touch census (excluded from graph arena)");
+            let charged = crate::shared::decode_graph::device::snapshots().into_iter()
+                .find(|sample| sample.device == options.devices[rank]).map_or(0, |sample| sample.charged);
+            let capture_delta = i128::from(bytes) - i128::from(charged);
+            tracing::info!(rank, executables = count, captured, measured_bytes = bytes,
+                graph_charged_bytes = charged, capture_delta_bytes = %capture_delta, capture_elapsed_ms,
+                bytes_per_executable = bytes.div_ceil(count.max(1)),
+                census_estimate_bytes = reserved, reserve = reserves[rank], reserve_basis = "checked-in layout row",
+                "Kimi startup graph census");
+            if bytes > reserves[rank] {
+                tracing::warn!(rank, executables = count, measured_bytes = bytes, reserve = reserves[rank],
+                    bytes_per_executable = bytes.div_ceil(count.max(1)), census = census_table,
+                    "Kimi startup capture exceeds its graph reserve; update \
+                     cuteafd_loader::serving_capacity::kimi_prewarm with this capture");
+            }
+        }
+    }
+    Ok(Loaded { engine, admission_free, admitted_bytes, ownership })
 }
 
-pub(super) fn code_demand(rank: usize, pending: u64, cublas_bytes: u64, lanes: usize) -> Result<Demand> {
-    cuteafd_loader::families::kimi_k3::allocation::code_demand(rank, pending, cublas_bytes, lanes)
+fn check_attention(attention: Option<cuteafd_loader::placement::AttentionPlacement>, ranks: usize, graphs: bool) -> Result<()> {
+    use cuteafd_loader::placement::AttentionPlacement;
+    if attention == Some(AttentionPlacement::Context) {
+        ensure!(ranks == 2 && graphs, "Kimi context requires two ranks and startup decode graphs");
+    }
+    Ok(())
+}
+
+pub(super) fn code_demand(rank: usize, pending: u64) -> Result<Demand> {
+    cuteafd_loader::families::kimi_k3::allocation::code_demand(rank, pending, 2)
 }
 
 use cuteafd_loader::families::kimi_k3::core::exchange_recv_bytes;
@@ -242,6 +460,75 @@ pub(super) fn exchange_demands(rows: usize, diagnostics: bool) -> Result<Vec<Dem
 mod tests {
     use super::*;
     use cuteafd_loader::families::kimi_k3::core::{CoreInventory,CoreProjection,CoreSplit};
+
+    #[test]
+    fn golden_role_is_explicit_and_skipped_experts_refuse_peers() -> Result<()> {
+        let k3 = cuteafd_loader::plan::testing::kimi_k3_config();
+        let mut k31 = k3.clone();
+        k31["model_type"] = serde_json::json!("kimi_k31");
+        k31["text_config"]["dsa_config"] = serde_json::json!({
+            "dsa_layers":k31["text_config"]["linear_attn_config"]["full_attn_layers"],
+            "index_num_heads":32,"index_head_dim":128,"index_topk":2048,
+            "index_rope_dim":0,"index_k_norm_type":"layernorm","index_topk_freq":1,"index_skip_topk_offset":1});
+        for raw in [k3, k31] {
+            let cfg = KimiK3Config::from_hf(&raw)?;
+            let skipped = Role::Golden { skip_routed_experts: true };
+            skipped.validate(&cfg, 0, false)?;
+            assert!(skipped.validate(&cfg, 1, false).is_err());
+            assert!(skipped.validate(&cfg, 0, true).is_err());
+            assert!(Role::Serve.validate(&cfg, 0, false).is_err());
+            assert!(Role::Golden { skip_routed_experts: false }.validate(&cfg, 0, false).is_err());
+            assert_eq!(Role::Serve.validate(&cfg, 6, false).is_ok(), cfg.dsa.is_none());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn memory_diagnostic_defaults_off_and_stops_before_capture() -> Result<()> {
+        assert!(!memory_phase_mode(None)?);
+        assert!(!memory_phase_mode(Some("off"))?);
+        assert!(memory_phase_mode(Some("pre-capture"))?);
+        for mode in ["", "1", "on", "ready"] { assert!(memory_phase_mode(Some(mode)).is_err()); }
+        stop_before_capture(false)?;
+        let error = stop_before_capture(true).unwrap_err().to_string();
+        assert!(error.starts_with("KIMI_STARTUP_MEMORY_PRE_CAPTURE_STOP"));
+        assert!(error.contains("Ready were not reached"));
+        Ok(())
+    }
+
+    #[test]
+    fn automatic_hosted_hint_may_cover_but_never_omit_selected_layers() -> Result<()> {
+        use cuteafd_loader::placement::OnboardSetting::{Auto, All, Layers};
+        assert_eq!(check_hosted_layers(Auto, &[3, 4], &[2, 3, 4])?, 1);
+        assert!(check_hosted_layers(Auto, &[3, 4], &[2, 3]).is_err());
+        for setting in [Layers(1), All] {
+            assert!(check_hosted_layers(setting, &[3, 4], &[2, 3, 4]).is_err());
+            assert_eq!(check_hosted_layers(setting, &[3, 4], &[3, 4])?, 0);
+        }
+        assert!(check_hosted_layers(Auto, &[3, 4], &[3, 3, 4]).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn context_cannot_fall_back_to_single_rank_or_eager_decode() {
+        use cuteafd_loader::placement::AttentionPlacement;
+        assert!(check_attention(Some(AttentionPlacement::Context), 2, true).is_ok());
+        assert!(check_attention(Some(AttentionPlacement::Context), 1, true).is_err());
+        assert!(check_attention(Some(AttentionPlacement::Context), 2, false).is_err());
+        for mode in [None, Some(AttentionPlacement::Heads), Some(AttentionPlacement::Layers)] {
+            assert!(check_attention(mode, 2, false).is_ok());
+        }
+    }
+
+    #[test]
+    fn native_modules_load_inside_the_shared_measured_baseline() {
+        assert!(include_str!("../../shared/inventory.rs").contains("library.tp2_native_initialize()"));
+        let source = include_str!("startup.rs");
+        let measured = source.split("RuntimeInventory::measure(library, &options.devices, InventoryPhase::PreWeight")
+            .nth(1).unwrap().split("let lane_layouts").next().unwrap();
+        assert!(!measured.contains("tp2_native_initialize"),
+            "the shared inventory preloads native modules; a family copy would load them twice");
+    }
 
     fn projection(stem:&str)->CoreProjection {
         CoreProjection {stem:stem.into(),bits:6,codebook:cuteafd_loader::formats::exl3_storage::Exl3Codebook::Mcg,
@@ -260,7 +547,7 @@ mod tests {
         let stem=format!("{root}.q_proj");
         core.projections.insert(stem.clone(),projection(&stem));
         let error=core.validate_runtime_groups(&cfg).unwrap_err().to_string();
-        assert!(error.contains(&stem) && error.contains("k_proj") && error.contains("whole-group"));
+        assert!(error.contains("validated per-projection") && error.contains(root));
         for leaf in ["k_proj","v_proj","g_proj","o_proj"] {
             let stem=format!("{root}.{leaf}");core.projections.insert(stem.clone(),projection(&stem));
         }

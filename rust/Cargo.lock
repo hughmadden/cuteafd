@@ -720,6 +720,7 @@ dependencies = [
  "clap",
  "cuteafd-api",
  "cuteafd-core",
+ "cuteafd-ffi",
  "cuteafd-loader",
  "cuteafd-transport",
  "futures",
@@ -756,6 +757,7 @@ name = "cuteafd-daemon"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-stream",
  "axum",
  "bincode",
  "bytes",
@@ -771,6 +773,7 @@ dependencies = [
  "cuteafd-usage",
  "io-uring",
  "libc",
+ "reqwest",
  "serde",
  "serde_json",
  "sha2",
@@ -806,6 +809,7 @@ dependencies = [
  "cuteafd-core",
  "libc",
  "libloading",
+ "serde",
  "serde_json",
  "thiserror 1.0.69",
  "tracing",

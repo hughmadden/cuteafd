@@ -128,6 +128,9 @@ release_coordinator_arch_args() {
 }
 
 # Resolve total capacity in bytes, never free memory. Rust owns the default rule.
+# release_coordinator_profile PHYSICAL_BYTES [GPU_MEMORY_CAP]: prints the
+# logical per-GPU cap in bytes (the smaller of the device and the cap) and the
+# default concurrency for it.
 release_coordinator_profile() {
   local registry="${repo_root:?}/rust/crates/cuteafd-core/src/serving_capacity.rs"
   python3 - "$registry" "$1" "${2:-}" <<'PYPROFILE'
@@ -149,15 +152,86 @@ try:
     if not (0 < threshold < 2**64 and 0 < small <= large <= 0xffffffff):
         raise ValueError('invalid capacity registry geometry')
     physical = Decimal(sys.argv[2].strip())
-    budget = Decimal(sys.argv[3]) * 2**30 if sys.argv[3] else physical
-    if not all(value.is_finite() and 1 <= value < 2**64 for value in (physical, budget)):
+    def size(text):
+        match = re.fullmatch(r'([0-9]+(?:\.[0-9]{1,6})?)(B|MB|GB|MiB|GiB)?', text.strip())
+        if match is None:
+            raise ValueError(f'invalid GPU_MEMORY_CAP {text!r}: use B, MB, GB, MiB or GiB')
+        return Decimal(match.group(1)) * {None: 1, 'B': 1, 'MB': 10**6, 'GB': 10**9,
+            'MiB': 2**20, 'GiB': 2**30}[match.group(2)]
+    cap = size(sys.argv[3]) if sys.argv[3] else physical
+    if not all(value.is_finite() and 1 <= value < 2**64 for value in (physical, cap)):
         raise ValueError('GPU capacity must be finite, positive and representable in bytes')
-    logical = min(physical, budget)
-    print(logical / 2**30, small if int(logical) <= threshold else large)
+    logical = int(min(physical, cap))
+    print(logical, small if logical <= threshold else large)
 except (OSError, ValueError, ArithmeticError) as error:
     sys.exit(f'coordinator capacity registry: {error}')
 PYPROFILE
 }
+
+# The one device memory policy (rust/crates/cuteafd-core/src/memory_policy.rs):
+# launch keys and the global cuteafd flags they become, in one order.
+RELEASE_MEMORY_KEYS=(GPU_MEMORY_CAP SPARK_MEMORY_CAP GPU_RESERVE SPARK_RESERVE FAMILY_RESERVE MEMORY_PADDING GRAPH_DISABLE_LOW_MEM GRAPH_NODE_PADDING
+  KV_TARGET_TOKENS KV_MIN_TOKENS KV_MAX_TOKENS)
+release_memory_flag() {
+  case "$1" in
+    GPU_MEMORY_CAP) printf -- --gpu-memory-cap ;; SPARK_MEMORY_CAP) printf -- --spark-memory-cap ;;
+    GPU_RESERVE) printf -- --gpu-reserve ;; SPARK_RESERVE) printf -- --spark-reserve ;;
+    FAMILY_RESERVE) printf -- --family-reserve ;; MEMORY_PADDING) printf -- --memory-padding ;; GRAPH_DISABLE_LOW_MEM) printf -- --graph-disable-low-mem ;; GRAPH_NODE_PADDING) printf -- --graph-node-padding ;; KV_TARGET_TOKENS) printf -- --kv-target-tokens ;;
+    KV_MIN_TOKENS) printf -- --kv-min-tokens ;; KV_MAX_TOKENS) printf -- --kv-max-tokens ;;
+    *) return 1 ;;
+  esac
+}
+# release_validate_memory_value KEY VALUE: sizes take B, MB, GB, MiB or GiB (a
+# bare number is bytes, no percentages); token counts are positive integers.
+release_validate_memory_value() {
+  local key="$1" value="$2" graph_value='[0-9]+([.][0-9]{1,2})?%|[0-9]+'
+  [[ -z "$value" ]] && return 0
+  case "$key" in
+    KV_TARGET_TOKENS|KV_MIN_TOKENS|KV_MAX_TOKENS)
+      [[ "$value" =~ ^[1-9][0-9]*$ ]] || release_die "$key must be a positive token count" ;;
+    GPU_MEMORY_CAP|SPARK_MEMORY_CAP)
+      [[ "$value" =~ ^[0-9]+([.][0-9]{1,6})?(B|MB|GB|MiB|GiB)?$ && "$value" =~ [1-9] ]] ||
+        release_die "$key must be a positive size in B, MB, GB, MiB or GiB" ;;
+    GRAPH_DISABLE_LOW_MEM)
+      local size='[0-9]+([.][0-9]{1,6})?(B|MB|GB|MiB|GiB)?'
+      [[ "$value" =~ ^($size)$ || "$value" =~ ^gpu[0-9]+=($size)(,gpu[0-9]+=($size))*$ ]] ||
+        release_die "$key must be a size or gpuN=size list" ;;
+    GRAPH_NODE_PADDING)
+      [[ "$value" =~ ^($graph_value)$ || "$value" =~ ^rtx=($graph_value),spark=($graph_value)$ || "$value" =~ ^spark=($graph_value),rtx=($graph_value)$ ]] ||
+        release_die "$key must be a percentage, integer bytes/node or rtx=VALUE,spark=VALUE" ;;
+    GPU_RESERVE|SPARK_RESERVE|FAMILY_RESERVE|MEMORY_PADDING)
+      [[ "$value" =~ ^[0-9]+([.][0-9]{1,6})?(B|MB|GB|MiB|GiB)?$ ]] ||
+        release_die "$key must be a size in B, MB, GB, MiB or GiB" ;;
+    *) release_die "unknown memory policy key: $key" ;;
+  esac
+}
+# release_size_bytes SIZE: the byte count of a validated size.
+release_size_bytes() {
+  python3 -c '
+import re, sys
+from decimal import Decimal
+match = re.fullmatch(r"([0-9]+(?:\.[0-9]{1,6})?)(B|MB|GB|MiB|GiB)?", sys.argv[1])
+if match is None: sys.exit(f"invalid size {sys.argv[1]!r}: use B, MB, GB, MiB or GiB")
+print(int(Decimal(match.group(1)) * {None: 1, "B": 1, "MB": 10**6, "GB": 10**9, "MiB": 2**20, "GiB": 2**30}[match.group(2)]))
+' "$1"
+}
+# release_memory_args NAME GETTER [SKIP_KEY...]: fill array NAME with the global
+# flags for every memory policy key GETTER KEY prints non-empty, minus SKIP_KEYs.
+release_memory_args() {
+  local -n release_memory_out="$1"
+  local getter="$2" key value skip
+  shift 2
+  release_memory_out=()
+  for key in "${RELEASE_MEMORY_KEYS[@]}"; do
+    for skip in "$@"; do [[ "$key" != "$skip" ]] || continue 2; done
+    value="$("$getter" "$key")"
+    release_validate_memory_value "$key" "$value"
+    [[ -z "$value" ]] || release_memory_out+=("$(release_memory_flag "$key")" "$value")
+  done
+}
+release_memory_variable() { printf '%s' "${!1:-}"; }
+# release_gib BYTES: the same value in GiB, for GiB-valued flags.
+release_gib() { python3 -c 'import sys; print(int(sys.argv[1]) / 2**30)' "$1"; }
 
 # The worker and coordinator must admit the same live rows, including decoder
 # replay. Fail closed if the Rust registry stops being literal declarations.
@@ -290,10 +364,9 @@ release_need() {
 #   ./run.sh                          preflight, launch, readiness, EXIT teardown
 #   ./stop.sh, release_stop_*         container teardown
 #   ./push-containers.sh              publishing the Spark image from SPARK_0_HOST
-# The standalone NOT-LAUNCH-READY harnesses - scripts/launch/run-tp-ep-native-candidate.sh
-# and wip.sh - are deliberately outside this contract. They keep
-# their own ssh forms (per-host bind addresses, argv rendered into a command string)
-# and are not release-pipeline-verified; they join when integrated, not before.
+# The standalone NOT-LAUNCH-READY harness wip.sh is deliberately outside this
+# contract. It keeps its own ssh forms (per-host bind addresses, argv rendered
+# into a command string) and is not release-pipeline-verified.
 #
 # These are declarations only: nothing here changes behavior until a script calls
 # release_configure_ssh_transport or release_ssh, so a script that keeps its own
@@ -668,7 +741,10 @@ release_profile_docker_args() {
   local -a switches=()
   RELEASE_PROFILE_ARGS=()
   if [[ -z "$profile" && -z "$spark" ]]; then
-    [[ -z "$dir" ]] || release_die "PROFILE_DIR needs PROFILE or PROFILE_SPARK"
+    if [[ -n "$dir" ]]; then
+      [[ "$dir" =~ ^/[A-Za-z0-9._/-]+$ && -f "$dir/observer-context.json" ]] || release_die "PROFILE_DIR needs PROFILE, PROFILE_SPARK or a memory observer"
+      RELEASE_PROFILE_ARGS+=(-v "$dir:$dir" -e "CUTEAFD_PROFILE_DIR=$dir")
+    fi
     return 0
   fi
   if [[ -z "$profile" ]]; then
@@ -962,17 +1038,19 @@ release_known_key() {
   case "$1" in
     FAMILY) return 0 ;; # Optional build family when checkpoint metadata is not local.
     EXLR8_MANIFEST|EXLR8_PREFILL_ACTIVATIONS) return 0 ;; # Published native EXLR8 selection and opt-in prefill numerics.
-    SPECULATOR|SPECULATOR_MODEL_ID|SPECULATOR_MODEL_REVISION|SPECULATOR_DEPTH|SPECULATOR_DRAFTS|SPECULATOR_FP8|SPECULATION_TRACE) return 0 ;;
+    SPECULATOR|SPECULATOR_MODEL_ID|SPECULATOR_MODEL_REVISION|SPECULATOR_DEPTH|DRAFT_LENGTH|SPECULATOR_FP8|SPECULATION_TRACE|TP2_DFLASH) return 0 ;;
     DRAFT_SURVIVAL_LENGTHS|DRAFT_POLICY|DRAFT_ROW_COST) return 0 ;;
     CUDA_MODULE_LOADING) return 0 ;; # V4.1 coordinator CUDA module loading (LAZY or EAGER).
-    GPU_EXPERT_TIER|GPU_EXPERT_TIER_PROFILE) return 0 ;; # V4.1 GPU expert tier and its route profile.
-    MAPPED_SCALE_PRELOAD_GIB|ENGRAM_WARM|FULL_PREFILL_LOGITS|PREFIX_CACHE_MARK_MIB|PREFIX_POINT_BOUNDARIES|API_KEY_FILE|ENABLE_BENCH|CONSOLE_ASSETS|USAGE|GATEWAY) return 0 ;;
-    GLM5_FLASH_KDA_FP8|GLM5_FLASH_FP8_HEAD|GLM5_FLASH_FP8_PREFILL|GLM5_FLASH_KDA_SPLIT|GLM5_FLASH_PREFILL_LANES|GLM5_FLASH_PREFILL_LANE_ROWS|GLM5_FLASH_HEADROOM_GIB|GLM5_FLASH_GRAPH_BUDGET_MIB|GLM5_FLASH_EXL3_WORKER_PATH|GLM5_FLASH_EXL3_ROUTE_DUMP|GLM5_FLASH_EXL3_ROUTE_DUMP_CALLS|GLM5_FLASH_INDEX_CACHE|GLMF_KDA_FP8|GLMF_FP8_HEAD|GLMF_FP8_PREFILL) return 0 ;;
+    SPARK_LANDING|SPARK_REPLY_FORMAT|GPU_EXPERT_TIER|GPU_EXPERT_TIER_PROFILE) return 0 ;; # V4.1 GPU expert tier and its route profile.
+    MAPPED_SCALE_PRELOAD_GIB|ENGRAM_WARM|FULL_PREFILL_LOGITS|PREFIX_CACHE_MARK_MIB|PREFIX_POINT_BOUNDARIES|API_KEY_FILE|ENABLE_BENCH|CONSOLE_ASSETS|USAGE|EXPERT_USAGE|GATEWAY) return 0 ;;
+    GLM5_FLASH_KDA_FP8|GLM5_FLASH_FP8_HEAD|GLM5_FLASH_FP8_PREFILL|GLM5_FLASH_KDA_SPLIT|GLM5_FLASH_PREFILL_LANES|GLM5_FLASH_PREFILL_LANE_ROWS|GLM5_FLASH_EXL3_WORKER_PATH|GLM5_FLASH_EXL3_ROUTE_DUMP|GLM5_FLASH_EXL3_ROUTE_DUMP_CALLS|GLM5_FLASH_INDEX_CACHE|GLMF_KDA_FP8|GLMF_FP8_HEAD|GLMF_FP8_PREFILL) return 0 ;;
     MIMO_PREFIX_DRAFT|MIMO_HOST_CACHE|MIMO_PREFILL_CHUNK_S|MIMO_SNAPSHOT_WAIT) return 0 ;;
-    MIMO_WEIGHT_POLICY|MIMO_FP8_HEAD|MIMO_FP8_O_PROJ|QWEN_FP8_DECODE|QWEN_FP8_HEAD|QWEN_STARTUP_GRAPHS|POOL_TOKENS|PREFIX_PARTIAL|KV_CACHE|SWA_KV_CACHE|DECODE_GRAPHS|EXPERT_INPUT|DECODE_SHARE|L2_PREFETCH|FP8_SCALES|DRAFT_CONTEXT_SLOTS|DRAFT_SEQUENCES|DRAFT_KV_CACHE|SERVED_MODEL_ID|COORDINATOR_GPUS|COORDINATOR_SPLIT|INSTANCE|WIP_INSTANCE|WIP_ROOT|FP8_EXPERT_PREFILL|SPARK_INTAKE|SPARK_STAGING|CONSOLE_TEXT|THERMAL|EXPERT_BACKEND) return 0 ;;
+    CUTEAFD_GLM_BF16|MIMO_WEIGHT_POLICY|MIMO_FP8_HEAD|MIMO_FP8_O_PROJ|QWEN_FP8_DECODE|QWEN_FP8_HEAD|POOL_TOKENS|PREFIX_PARTIAL|KV_CACHE|SWA_KV_CACHE|DECODE_GRAPHS|EXPERT_INPUT|DECODE_SHARE|L2_PREFETCH|FP8_SCALES|DRAFT_CONTEXT_SLOTS|DRAFT_SEQUENCES|DRAFT_KV_CACHE|SERVED_MODEL_ID|COORDINATOR_GPUS|COORDINATOR_SPLIT|INSTANCE|WIP_INSTANCE|WIP_ROOT|FP8_EXPERT_PREFILL|SPARK_INTAKE|SPARK_STAGING|CONSOLE_TEXT|THERMAL|EXPERT_BACKEND) return 0 ;;
     HOST_WAIT|IDLE_PARK_SECONDS) return 0 ;;
-    EXPERT_PARTIAL_BF16_MAX_ROWS|SPARK_REPLY_FORMAT) return 0 ;; # Partial-reply cutoff and shared Spark reply format.
-    VISION|VISION_REPLICAS|AUDIO|EMBEDDING|MEDIA_CACHE_BYTES|CHAT_TEMPLATE_FROM|TP2_ATTENTION|TP2_QUERY_PROJECTION|TP2_OUTPUT_PROJECTION|TP2_DSPARK_EXPERTS) return 0 ;;
+    GPU_GRAPH_RESERVE|GPU_GRAPH_RESERVE_EXTRA|GPU_GRAPH_RESERVE_EXTRA_CAP|SPARK_GRAPH_RESERVE|GRAPH_TRACE) return 0 ;; # Bounded graph cache.
+    GPU_MEMORY_CAP|SPARK_MEMORY_CAP|GPU_RESERVE|SPARK_RESERVE|FAMILY_RESERVE|MEMORY_PADDING|GRAPH_DISABLE_LOW_MEM|GRAPH_NODE_PADDING|KV_TARGET_TOKENS|KV_MIN_TOKENS|KV_MAX_TOKENS) return 0 ;; # One device memory policy (docs/options.md).
+    EXPERT_PARTIAL_BF16_MAX_ROWS|SPARK_PREFILL_REPLY_FORMAT|SPARK_DECODE_REPLY_FORMAT) return 0 ;; # Partial-reply cutoff and shared Spark reply format.
+    VISION|VISION_REPLICAS|AUDIO|EMBEDDING|MEDIA_CACHE_BYTES|CHAT_TEMPLATE_FROM|TP2_ATTENTION|TP2_QUERY_PROJECTION|TP2_OUTPUT_PROJECTION|TP2_DSPARK_EXPERTS|TP2_DFLASH) return 0 ;;
     GLM5_FLASH_DRAFT_HEAD) return 0 ;;
     GLM5_FLASH_DRAFT_LINEAR) return 0 ;;
     GLM5_FLASH_TARGET_HEAD) return 0 ;;
@@ -983,13 +1061,13 @@ release_known_key() {
     GLM5_FLASH_PREFIX_MARKS) return 0 ;;
     GLM5_FLASH_REPLAY_RECORDS) return 0 ;;
     GLM5_FLASH_DECODE_ROWS) return 0 ;;
-    GLM5_FLASH_PREFILL_BATCH|PREFILL_PACKING) return 0 ;;
-    GLM5_FLASH_ROUTE_RING_CHECK|GLM5_FLASH_REMOTE_DRAFTER) return 0 ;;
-    PROBE_DUMP_ROOT|MEDIA_FEATURES_DIR|AUDIO_FEATURES_DIR|ATTENTION_PLACEMENT|ATTENTION_PLAN_ROWS) return 0 ;;
+    PREFILL_PACKING) return 0 ;;
+    GLM5_FLASH_ROUTE_RING_CHECK) return 0 ;;
+    PROBE_DUMP_ROOT|MEDIA_FEATURES_DIR|AUDIO_FEATURES_DIR|CORE_VIEW|ATTENTION_PLACEMENT|ATTENTION_PLAN_ROWS) return 0 ;;
     DECODE_LANES|PREFILL_ROWS|PREFILL_WAVES|PREFILL_SPAN_ROWS) return 0 ;; # Shared prefill units: rows each, units in flight, rows per continuous span (PLAN "Prefill contract").
     PROFILE|PROFILE_DIR|PROFILE_NCU_KERNEL|PROFILE_NCU_COUNT|PROFILE_NCU_SET|PROFILE_NCU_SKIP|PROFILE_NSYS_GPU_METRICS|PROFILE_NSYS_CPU|PROFILE_NSYS_GRAPH_TRACE|PROFILE_EXPERT_INPUT_SAMPLE|PROFILE_EXPERT_ROUTE_WEIGHTS) return 0 ;;
     PROFILE_SPARK|PROFILE_SPARK_RANKS|PROFILE_SPARK_NCU_KERNEL|PROFILE_SPARK_NCU_COUNT|PROFILE_SPARK_NCU_SET|PROFILE_SPARK_NCU_SKIP|PROFILE_SPARK_NSYS_GPU_METRICS) return 0 ;;
-    HTTP_QUEUE_DEPTH|HTTP_QUEUE_WAIT_MS|MODEL_ID|MODEL_VARIANT|MODEL_REVISION|EXPERT_FORMAT|DSPARK_DRAFT_POLICY|DSPARK_DRAFT_LIMIT|V41_FP8_HEAD|RTX_GPUS|RTX_EXPERT_LAYERS|RTX_EXPERT_PEER|COORDINATOR_GPU_HEADROOM_GIB|KV_POOL_TOKENS|KV_POOL_SIZE|HOST_CACHE_BYTES|MEMORY_RESERVATION|MAX_CONTEXT_TOKENS|MAX_OUTPUT_TOKENS|KV_DECODE_RESERVE_CHUNK|KV_RESERVE_DRAIN_BUFFER|KV_EARLY_TERMINATION_MIN_OUTPUT_TOKENS|LOOP_ABORT_RUN|LOOP_ABORT_COPIES|LOOP_FAST_SPAN|LOOP_FAST_COPIES|CONCURRENCY|PREFIX_CACHE_ENTRIES|PREFILL_BATCH_TOKENS|SPARK_DEVICE_BUDGET_BYTES|SPARK_REDUCTION_MIN_ROWS|SPARKINFER_EXL3|SPARK_COUNT|SPARK_TP|SPARK_EP|ADDR|EXPERT_PORT|SPARK_[0-7]_HOST|SPARK_[0-7]_LANE_A|SPARK_[0-7]_LANE_B|CUTEAFD_EXPORT_HOST|WIP_BUILD_SEED|COORDINATOR_DOCKER_DEV|COORDINATOR_DOCKER_INFERENCE|SPARK_EXPERT_DOCKER_DEV|SPARK_EXPERT_DOCKER_INFERENCE|COORDINATOR_GPU_BUDGET_GIB|SPARK_HOSTS)
+    HTTP_QUEUE_DEPTH|HTTP_QUEUE_WAIT_MS|MODEL_ID|MODEL_VARIANT|MODEL_REVISION|EXPERT_FORMAT|V41_FP8_HEAD|RTX_GPUS|RTX_EXPERT_LAYERS|RTX_EXPERT_PEER|KV_POOL_TOKENS|KV_POOL_SIZE|HOST_CACHE_BYTES|MAX_CONTEXT_TOKENS|MAX_OUTPUT_TOKENS|KV_DECODE_RESERVE_CHUNK|KV_RESERVE_DRAIN_BUFFER|KV_EARLY_TERMINATION_MIN_OUTPUT_TOKENS|LOOP_ABORT_RUN|LOOP_ABORT_COPIES|LOOP_FAST_SPAN|LOOP_FAST_COPIES|CONCURRENCY|PREFIX_CACHE_ENTRIES|PREFILL_BATCH_TOKENS|SPARK_REDUCTION_MIN_ROWS|SPARKINFER_EXL3|SPARK_COUNT|ADDR|EXPERT_PORT|SPARK_[0-7]_HOST|SPARK_[0-7]_LANE_A|SPARK_[0-7]_LANE_B|CUTEAFD_EXPORT_HOST|WIP_BUILD_SEED|COORDINATOR_DOCKER_DEV|COORDINATOR_DOCKER_INFERENCE|SPARK_EXPERT_DOCKER_DEV|SPARK_EXPERT_DOCKER_INFERENCE|SPARK_HOSTS)
       return 0
       ;;
     *)
@@ -1039,16 +1117,6 @@ release_spark_host_rows() {
   done
 }
 
-# Optional logical per-GPU ceiling. Validate identically in both launchers
-# before any worker/service changes; an empty key keeps physical admission.
-release_validate_coordinator_gpu_budget() {
-  local value="$1"
-  [[ -z "$value" ]] && return 0
-  [[ "$value" =~ ^[0-9]+([.][0-9]+)?$ ]] &&
-    python3 -c 'import math,sys; n=float(sys.argv[1])*2**30; sys.exit(not (math.isfinite(n) and 1 <= n < 2**64))' "$value" ||
-    release_die "COORDINATOR_GPU_BUDGET_GIB must be finite, positive GiB representable in bytes"
-}
-
 # Load and validate a configuration file.
 #
 # mode defaults to "launch" and keeps the full strict launch contract,
@@ -1063,7 +1131,7 @@ release_validate_coordinator_gpu_budget() {
 # here, is DeepSeek V4.1, the release default; its own validation reports a
 # missing snapshot.
 release_config_family() {
-  local config="$1" model="" revision="" line key value hub dir
+  local config="$1" model="" revision="" attention="original" line key value hub dir
   [[ -f "$config" ]] || { printf 'deepseek_v41\n'; return 0; }
   while IFS= read -r line || [[ -n "$line" ]]; do
     line="$(release_trim "${line%%#*}")"
@@ -1072,16 +1140,23 @@ release_config_family() {
     case "$key" in
       MODEL_ID) model="$value" ;;
       MODEL_REVISION) revision="$value" ;;
+      CORE_VIEW) attention="$value" ;;
     esac
   done < "$config"
   [[ -n "$model" ]] || { printf 'deepseek_v41\n'; return 0; }
   hub="${HF_HOME:-$HOME/.cache/huggingface}/hub"
   dir="$hub/models--${model//\//--}"
   [[ -n "$revision" || ! -f "$dir/refs/main" ]] || revision="$(<"$dir/refs/main")"
+  [[ -z "${2:-}" ]] || attention="$2"
+  local selected_config=config.json
+  case "$attention" in
+    k6-compact) selected_config=config.k6.json ;;
+    k8-compact) selected_config=config.k8.json ;;
+  esac
   local described=""
-  if [[ -n "$revision" && -f "$dir/snapshots/$revision/config.json" ]]; then
+  if [[ -n "$revision" && -f "$dir/snapshots/$revision/$selected_config" ]]; then
     described="$(python3 "$(dirname "${BASH_SOURCE[0]}")/checkpoint-family.py" \
-      "$dir/snapshots/$revision/config.json" 2>/dev/null)" || described=""
+      "$dir/snapshots/$revision/$selected_config" 2>/dev/null)" || described=""
   fi
   # Unrecognized configs stay on the DeepSeek V4.1 path, whose checks name the problem.
   [[ -n "$described" ]] || described=deepseek_v41
@@ -1179,14 +1254,11 @@ release_load_config() {
   TP2_OUTPUT_PROJECTION=off
   # Resolve the implicit default once the actual RTX count is selected.
   TP2_DSPARK_EXPERTS=
-  DSPARK_DRAFT_POLICY=adaptive
-  DSPARK_DRAFT_LIMIT=
+  DRAFT_LENGTH=
   V41_FP8_HEAD=
   RTX_EXPERT_LAYERS=auto
   RTX_GPUS=auto
   COORDINATOR_GPUS=
-  COORDINATOR_GPU_HEADROOM_GIB=8
-  COORDINATOR_GPU_BUDGET_GIB=
   POOL_TOKENS=
   EMBEDDING=gpu
   KV_POOL_TOKENS=
@@ -1194,8 +1266,7 @@ release_load_config() {
   HOST_CACHE_BYTES=auto
   API_KEY_FILE="${API_KEY_FILE:-}"
   ENABLE_BENCH=off
-  MEMORY_RESERVATION=
-  MAX_CONTEXT_TOKENS=1048576
+  MAX_CONTEXT_TOKENS=auto
   MAX_OUTPUT_TOKENS=131072
   KV_DECODE_RESERVE_CHUNK=
   KV_RESERVE_DRAIN_BUFFER=
@@ -1211,7 +1282,7 @@ release_load_config() {
   PREFIX_CACHE_ENTRIES=auto
   PREFILL_BATCH_TOKENS=2048
   RELEASE_PREFILL_EXPLICIT=0
-  SPARK_DEVICE_BUDGET_BYTES=107374182400
+  for release_memory_key in "${RELEASE_MEMORY_KEYS[@]}"; do printf -v "$release_memory_key" '%s' ""; done
   SPARK_REDUCTION_MIN_ROWS=16
   SPARKINFER_EXL3=disable
   if [[ -z "${_release_count_env_saved:-}" ]]; then
@@ -1222,10 +1293,6 @@ release_load_config() {
   SPARK_COUNT=
   RELEASE_SPARK_COUNT_EXPLICIT=0
   SPARK_HOSTS=
-  # Optional explicit replicated expert-group topology. Absent means the legacy
-  # geometry (TP = SPARK_COUNT, EP = 1). See docs/tp-ep-configuration.md.
-  SPARK_TP=
-  SPARK_EP=
   PROFILE=
   PROFILE_DIR=
   PROFILE_NCU_KERNEL=
@@ -1341,10 +1408,8 @@ release_load_config() {
     [[ "$MODEL_VARIANT" != pro || "$EXPERT_FORMAT" == exl3 ]] ||
       release_die "DeepSeek V4 Pro requires EXPERT_FORMAT=exl3"
   fi
-  case "$DSPARK_DRAFT_POLICY" in
-    full|adaptive) ;;
-    *) release_die "DSPARK_DRAFT_POLICY must be full or adaptive" ;;
-  esac
+  [[ -z "$DRAFT_LENGTH" || "$DRAFT_LENGTH" =~ ^[1-9][0-9]*$ ]] ||
+    release_die "DRAFT_LENGTH must be a positive integer"
   case "$SPARKINFER_EXL3" in
     auto|disable|force) ;;
     *) release_die "SPARKINFER_EXL3 must be auto, disable, or force" ;;
@@ -1375,8 +1440,9 @@ release_load_config() {
     ((PREFILL_BATCH_TOKENS >= 80 && PREFILL_BATCH_TOKENS <= 4096)) ||
       release_die "PREFILL_BATCH_TOKENS must be in 80..4096"
   fi
-  [[ "$SPARK_DEVICE_BUDGET_BYTES" =~ ^[1-9][0-9]*$ ]] ||
-    release_die "SPARK_DEVICE_BUDGET_BYTES must be a positive integer"
+  for release_memory_key in "${RELEASE_MEMORY_KEYS[@]}"; do
+    release_validate_memory_value "$release_memory_key" "${!release_memory_key}"
+  done
   [[ "$SPARK_REDUCTION_MIN_ROWS" =~ ^[1-9][0-9]*$ ]] ||
     release_die "SPARK_REDUCTION_MIN_ROWS must be a positive integer"
   [[ "$EXPERT_PORT" =~ ^[0-9]+$ ]] && ((EXPERT_PORT >= 1 && EXPERT_PORT <= 65535)) || release_die "EXPERT_PORT must be in 1..65535"
@@ -1384,11 +1450,9 @@ release_load_config() {
   # container name in the family launcher and the production launcher alike.
   [[ -z "$INSTANCE" || "$INSTANCE" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,40}$ ]] ||
     release_die "INSTANCE must be [A-Za-z0-9_.-]"
-  [[ "$COORDINATOR_GPU_HEADROOM_GIB" =~ ^[0-9]+([.][0-9]+)?$ ]] || release_die "COORDINATOR_GPU_HEADROOM_GIB must be non-negative"
-  release_validate_coordinator_gpu_budget "$COORDINATOR_GPU_BUDGET_GIB"
   [[ -z "$POOL_TOKENS" || "$POOL_TOKENS" == auto || "$POOL_TOKENS" =~ ^[0-9]+$ ]] || release_die "POOL_TOKENS must be auto or a non-negative integer"
   [[ -z "$POOL_TOKENS" || -z "$KV_POOL_SIZE" ]] || release_die "POOL_TOKENS conflicts with KV_POOL_SIZE"
-  for release_integer_name in KV_POOL_TOKENS MAX_CONTEXT_TOKENS KV_DECODE_RESERVE_CHUNK; do
+  for release_integer_name in KV_POOL_TOKENS KV_DECODE_RESERVE_CHUNK; do
     value="${!release_integer_name}"
     [[ -z "$value" || "$value" =~ ^[1-9][0-9]*$ ]] || release_die "$release_integer_name must be a positive integer"
   done
@@ -1398,9 +1462,10 @@ release_load_config() {
     release_die "KV_RESERVE_DRAIN_BUFFER must be a non-negative integer"
   [[ -z "$KV_EARLY_TERMINATION_MIN_OUTPUT_TOKENS" || "$KV_EARLY_TERMINATION_MIN_OUTPUT_TOKENS" =~ ^(-1|[0-9]+)$ ]] ||
     release_die "KV_EARLY_TERMINATION_MIN_OUTPUT_TOKENS must be -1 or a non-negative integer"
+  MAX_CONTEXT_TOKENS="${MAX_CONTEXT_TOKENS:-auto}"
   if [[ "$mode" == launch ]]; then
-    [[ -z "$MAX_CONTEXT_TOKENS" ]] || ((MAX_CONTEXT_TOKENS <= 1048576)) ||
-      release_die "MAX_CONTEXT_TOKENS must be in 1..1048576"
+    [[ "$MAX_CONTEXT_TOKENS" == auto ]] || { [[ "$MAX_CONTEXT_TOKENS" =~ ^[1-9][0-9]{0,6}$ ]] && ((MAX_CONTEXT_TOKENS <= 1048576)); } ||
+      release_die "MAX_CONTEXT_TOKENS must be auto or in 1..1048576"
   fi
   if [[ "$mode" == launch && -n "$KV_POOL_TOKENS" ]]; then
     ((KV_POOL_TOKENS % 64 == 0)) || release_die "KV_POOL_TOKENS must be a multiple of 64"
@@ -1409,8 +1474,6 @@ release_load_config() {
     release_die "KV_POOL_SIZE must use B, MB, GB, MiB or GiB"
   [[ "$HOST_CACHE_BYTES" == auto || "$HOST_CACHE_BYTES" =~ ^[0-9]+([.][0-9]{1,6})?(B|MB|GB|MiB|GiB)?$ ]] ||
     release_die "HOST_CACHE_BYTES must be auto, 0, or a byte size"
-  [[ -z "$MEMORY_RESERVATION" || "$MEMORY_RESERVATION" =~ ^[0-9]+([.][0-9]{1,6})?((B|MB|GB|MiB|GiB)|%)$ ]] ||
-    release_die "MEMORY_RESERVATION must be a byte size or percentage"
   [[ "$ADDR" == *:* ]] || release_die "ADDR must be HOST:PORT"
   [[ -n "$MODEL_ID" && "$MODEL_ID" == */* && "$MODEL_ID" != *[[:space:]]* ]] ||
     release_die "MODEL_ID must be a Hugging Face repository ID"
@@ -1419,9 +1482,7 @@ release_load_config() {
 
   release_validate_tp2_options
   if [[ "$mode" == launch ]]; then
-    release_validate_spark_topology
-
-    [[ "$SPARK_COUNT" =~ ^[0-8]$ ]] || release_die "SPARK_COUNT must be in 0..8"
+    release_validate_spark_count
 
     local missing_b=0 present_b=0 spark_required="$SPARK_COUNT"
     for ((release_i = 0; release_i < spark_required; release_i++)); do
@@ -1470,9 +1531,9 @@ release_load_config() {
 # Stop-only configuration validation.
 #
 # Cleanup launches nothing, so an incomplete or unsupported serving topology
-# must not block it. SPARK_COUNT/SPARK_TP/SPARK_EP are launch topology: stop
-# accepts any non-negative integer count and positive integer degrees, or their
-# absence, and cleans every Spark host the file names. LANE_A/B, GPU layout,
+# must not block it. SPARK_COUNT is launch topology: stop accepts any
+# non-negative integer count, or its absence, and cleans every Spark host the
+# file names. LANE_A/B, GPU layout,
 # model variant/format and EXL3 combination rules are also launch-only. What
 # remains is the safety contract: the parser, known-key, quoting and every
 # value-domain check above already ran, and a named Spark host must be a safe
@@ -1485,10 +1546,6 @@ release_validate_stop_config() {
   local name value
   [[ -z "$SPARK_COUNT" || "$SPARK_COUNT" =~ ^[0-9]+$ ]] ||
     release_die "SPARK_COUNT must be a non-negative integer"
-  [[ -z "$SPARK_TP" || "$SPARK_TP" =~ ^[1-9][0-9]*$ ]] ||
-    release_die "SPARK_TP must be a positive integer"
-  [[ -z "$SPARK_EP" || "$SPARK_EP" =~ ^[1-9][0-9]*$ ]] ||
-    release_die "SPARK_EP must be a positive integer"
   for name in $(compgen -v SPARK_ 2>/dev/null || true); do
     [[ "$name" =~ ^SPARK_[0-9]+_HOST$ ]] || continue
     value="${!name:-}"
@@ -1562,14 +1619,12 @@ release_resolve_local_model_revision() {
   AUDIO="$(release_resolve_audio_mode "$AUDIO" "$model_root/snapshots/$RELEASE_MODEL_REVISION")"
 }
 
-# Two or three Spark ranks without explicit SPARK_TP/SPARK_EP keys form the
-# opt-in compact EXL3 topology (TP2 or TP3), not RTX tensor parallelism. Keep
-# the coordinator ceiling explicit; never raise it to fit. An explicit native
-# replicated topology is never compact and bypasses these rules at every call
-# site through this predicate.
+# Two or three Spark ranks form the compact EXL3 topology (TP2 or TP3), not
+# RTX tensor parallelism. Keep the coordinator ceiling explicit; never raise it
+# to fit.
 release_spark_compact_active() {
   case "$SPARK_COUNT" in
-    2|3) [[ -z "$SPARK_TP" && -z "$SPARK_EP" ]] ;;
+    2|3) return 0 ;;
     *) return 1 ;;
   esac
 }
@@ -1582,18 +1637,6 @@ release_spark_values() {
     printf '%s\n' "${!name}"
   done
 }
-
-# ---------------------------------------------------------------------------
-# Opt-in replicated expert-group topology (SPARK_TP x SPARK_EP = SPARK_COUNT).
-#
-# The default configuration sets neither key and keeps the legacy geometry:
-# every Spark rank is one TP rank of a single replicated group (counts 0/2/4;
-# count 2 without keys is the compact EXL3 TP2 layout, count 3 without keys is
-# the compact EXL3 TP3 layout, and native count 3 requires both keys). Explicit
-# keys are all-or-none and only valid for the approved native official
-# topologies. The rank map is group-major: group = rank / TP and
-# tp_rank = rank % TP.
-# ---------------------------------------------------------------------------
 
 # Release and WIP must advertise the same compiled extra Spark roles. TP4 is
 # built separately; unequal worlds select deduplicated width artifacts.
@@ -1623,70 +1666,8 @@ release_spark_tp_roles_canonical() {
   printf '%s\n' "${selected[@]}" | sort | paste -sd';' -
 }
 
-release_spark_topology_explicit() {
-  [[ -n "$SPARK_TP" || -n "$SPARK_EP" ]]
-}
-
-release_spark_tp() {
-  if [[ -n "$SPARK_TP" ]]; then printf '%s\n' "$SPARK_TP"; else printf '%s\n' "$SPARK_COUNT"; fi
-}
-
-release_spark_ep() {
-  if [[ -n "$SPARK_EP" ]]; then printf '%s\n' "$SPARK_EP"; else printf '1\n'; fi
-}
-
-release_spark_group() {
-  local rank="$1" tp="$2"
-  [[ "$rank" =~ ^[0-9]+$ && "$tp" =~ ^[1-9][0-9]*$ ]] ||
-    release_die "invalid Spark rank/TP for group resolution: rank=$rank tp=$tp"
-  printf '%s\n' "$((rank / tp))"
-}
-
-release_spark_tp_rank() {
-  local rank="$1" tp="$2"
-  [[ "$rank" =~ ^[0-9]+$ && "$tp" =~ ^[1-9][0-9]*$ ]] ||
-    release_die "invalid Spark rank/TP for tp-rank resolution: rank=$rank tp=$tp"
-  printf '%s\n' "$((rank % tp))"
-}
-
-# Print "rank group tp_rank" for every configured physical Spark rank.
-release_spark_rank_map() {
-  local tp rank
-  tp="$(release_spark_tp)"
-  for ((rank = 0; rank < SPARK_COUNT; rank++)); do
-    printf '%s %s %s\n' "$rank" "$(release_spark_group "$rank" "$tp")" "$(release_spark_tp_rank "$rank" "$tp")"
-  done
-}
-
-release_validate_spark_topology() {
-  case "$SPARK_TP" in
-    ""|[1-8]) ;;
-    *) release_die "SPARK_TP must be in 1..8" ;;
-  esac
-  case "$SPARK_EP" in
-    ""|1|2|3) ;;
-    *) release_die "SPARK_EP must be 1, 2, or 3" ;;
-  esac
-  [[ -n "$SPARK_TP" && -n "$SPARK_EP" || -z "$SPARK_TP" && -z "$SPARK_EP" ]] ||
-    release_die "SPARK_TP and SPARK_EP must be set together or omitted together"
-  release_spark_topology_explicit || return 0
-  [[ "$SPARK_COUNT" =~ ^[1-8]$ ]] ||
-    release_die "explicit SPARK_TP/SPARK_EP requires SPARK_COUNT in 1..8"
-  [[ "$EXPERT_FORMAT" == native ]] ||
-    release_die "explicit SPARK_TP/SPARK_EP requires EXPERT_FORMAT=native"
-  [[ "$SPARKINFER_EXL3" == disable ]] ||
-    release_die "explicit SPARK_TP/SPARK_EP requires SPARKINFER_EXL3=disable"
-  ((SPARK_TP * SPARK_EP == SPARK_COUNT)) ||
-    release_die "SPARK_TP(${SPARK_TP}) * SPARK_EP(${SPARK_EP}) must equal SPARK_COUNT(${SPARK_COUNT})"
-  local packages="$(dirname "${BASH_SOURCE[0]}")/../../python/tools/lib/spark_packages.py"
-  python3 -I - "$packages" "$SPARK_TP" "$SPARK_EP" <<'PYTOPOLOGY' || release_die "unsupported native Spark topology TP${SPARK_TP}EP${SPARK_EP}"
-import importlib.util, sys
-spec = importlib.util.spec_from_file_location('spark_packages', sys.argv[1])
-packages = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(packages)
-tp, ep = map(int, sys.argv[2:])
-assert packages.ownership_topology(tp, ep), 'no shared width-class ownership topology'
-PYTOPOLOGY
+release_validate_spark_count() {
+  [[ "$SPARK_COUNT" =~ ^[0-8]$ ]] || release_die "SPARK_COUNT must be in 0..8"
 }
 
 release_hosts_csv() { release_spark_values HOST | paste -sd, -; }
@@ -2156,12 +2137,12 @@ release_resolve_tp2_dspark_experts() {
   local family="$1" rtx_gpus="$2"
   if [[ -z "$TP2_DSPARK_EXPERTS" ]]; then
     TP2_DSPARK_EXPERTS=off
-    if [[ "$family" == deepseek_v41 && "$rtx_gpus" == 2 && "$SPECULATOR" == dspark ]]; then
+    if [[ ( "$family" == deepseek_v41 || "$family" == deepseek_v4 ) && "$rtx_gpus" == 2 && "$SPECULATOR" == dspark ]]; then
       TP2_DSPARK_EXPERTS=on
     fi
   fi
-  [[ "$TP2_DSPARK_EXPERTS" != on || ( "$family" == deepseek_v41 && "$rtx_gpus" == 2 && "$SPECULATOR" == dspark ) ]] ||
-    release_die "TP2_DSPARK_EXPERTS requires V4.1, two selected RTX GPUs and dSpark"
+  [[ "$TP2_DSPARK_EXPERTS" != on || ( ( "$family" == deepseek_v41 || "$family" == deepseek_v4 ) && "$rtx_gpus" == 2 && "$SPECULATOR" == dspark ) ]] ||
+    release_die "TP2_DSPARK_EXPERTS requires V4/V4.1, two selected RTX GPUs and dSpark"
 }
 
 release_tp2_enabled() {

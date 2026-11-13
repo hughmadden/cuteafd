@@ -10,10 +10,12 @@ pub mod deepseek_v4;
 pub mod deepseek_v41;
 pub mod glm5;
 pub mod glm5_flash;
+pub mod kimi;
 pub mod qwen4;
 pub mod qwen3_5;
 pub mod mimo_v2;
 pub mod muse_spark;
+pub mod step5;
 
 use super::{AttentionPlacement, ExecutorModes, FfnMode, LayerMode};
 
@@ -36,8 +38,9 @@ pub const DEEPSEEK_V41: ExecutorModes = ExecutorModes { family: "deepseek_v41", 
 /// `context` is its recorded default (K3, TJ: GLM 5.3 must not replicate KV; pool first
 /// is not C1-gated): at max it admits 2,097,152 tokens against heads' 1,321,216, C8 1.015x,
 /// 8K prefill 1.027x; C1 parity after the per-row-bucket split plans (7689c8c3: 1.043x). A build without the context programs
-/// fails a chosen `context` closed (`glm5::solve_working_set`, #202); `heads` stays an
-/// explicit option.
+/// fails an explicit `context` closed before shared Recipe admission (#202); standard auto
+/// falls back to whole-layer owners, while native EXLR8 fails closed until qualified.
+/// `heads` stays an explicit option.
 pub const GLM5: ExecutorModes = ExecutorModes { family: "glm5",
     modes: &[LayerMode::HeadSplit, LayerMode::ContextSplit, WHOLE0,
         LayerMode::Whole { gpu: 0, ffn: FfnMode::Split },
@@ -45,9 +48,9 @@ pub const GLM5: ExecutorModes = ExecutorModes { family: "glm5",
 /// GLM Flash: every layer split over two GPUs; its MLA layers by heads (latent replicated) or by
 /// context (projections head-split, 256-token units owned by parity; #57), KDA always by heads.
 /// `context` is the recorded default on two GPUs (TJ: no context-scaling KV replicated; pool
-/// first); a build without its programs fails a chosen `context` closed
-/// (`glm5_flash::resolve_attention`, #202), and `heads` stays an explicit option. Owned MLA
-/// layers (`layers`) are an explicit per-layer option with split FFNs; auto stays context.
+/// first); a build without its programs fails an explicit `context` closed
+/// (`glm5_flash::resolve_attention`, #202), and `heads` stays an explicit option. Auto falls
+/// back to owned MLA layers (`layers`) with split FFNs when context recipes are unavailable.
 pub const GLM5_FLASH: ExecutorModes = ExecutorModes { family: "glm5_flash",
     modes: &[LayerMode::HeadSplit, LayerMode::ContextSplit, WHOLE0,
         LayerMode::Whole { gpu: 0, ffn: FfnMode::Split },
@@ -59,17 +62,17 @@ pub const MIMO_V2: ExecutorModes = ExecutorModes { family: "mimo_v2", modes: &[L
 pub const QWEN4: ExecutorModes = ExecutorModes { family: "qwen4", modes: &[WHOLE0, WHOLE1],
     hops: true, attention: AttentionPlacement::Layers };
 
-/// Kimi: TP2 KDA, alternating whole MLA owners and split dense/shared FFNs.
+/// Kimi: TP2 KDA, whole-owned or context-split MLA and split dense/shared FFNs.
 pub const KIMI_K3: ExecutorModes = ExecutorModes { family: "kimi_k3",
     modes: &[LayerMode::HeadSplit,
         LayerMode::Whole { gpu: 0, ffn: FfnMode::Split },
-        LayerMode::Whole { gpu: 1, ffn: FfnMode::Split }],
+        LayerMode::Whole { gpu: 1, ffn: FfnMode::Split }, LayerMode::ContextSplit],
     hops: true, attention: AttentionPlacement::Layers };
 
 /// Step-5: SWA head-split on a pair, alternating whole-owned CSA layers;
 /// one GPU owns every layer. No context-split executor is qualified.
 pub const STEP5: ExecutorModes = ExecutorModes { family: "step5", modes: &[WHOLE0, WHOLE1, LayerMode::HeadSplit],
-    hops: true, attention: AttentionPlacement::Heads };
+    hops: true, attention: AttentionPlacement::Layers };
 
 /// Every family's executor set, for lookups by family name.
 pub const EXECUTORS: [ExecutorModes; 10] = [DEEPSEEK_V4, DEEPSEEK_V41, GLM5, GLM5_FLASH, MIMO_V2, QWEN4,

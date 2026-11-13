@@ -116,7 +116,7 @@ const REFERENCE_MARGIN: f64 = 1.02;
 pub(crate) fn choose_block(policy: &mut DraftPolicy, requests: &[(u64, usize)], width: usize,
     drafted_requests: usize, rows: usize, cold: bool) -> Result<bool> {
     if drafted_requests == 0 || !requests.iter().any(|&(_, room)| room > 0) { return Ok(false); }
-    if cold || policy.draft_mode() != cuteafd_core::DraftMode::Shared { return Ok(true); }
+    if policy.fixed() || cold || policy.draft_mode() != cuteafd_core::DraftMode::Shared { return Ok(true); }
     let actions = [cuteafd_core::DraftAction { width: 0, draft_us: 0. }, cuteafd_core::DraftAction {
         width, draft_us: policy.draft_cost_drafted(false, requests.len(), drafted_requests, width) }];
     let chosen = policy.choose_action(false, requests, &actions, rows)?;
@@ -173,13 +173,19 @@ pub(crate) fn layer_homes(layers: impl IntoIterator<Item = (bool, bool, usize)>,
     read_bytes: impl Fn(usize) -> Result<usize>) -> Result<Vec<LayerHome>> {
     layers.into_iter().enumerate().map(|(layer, (dense, local, tp))| {
         if dense { return Ok(LayerHome::Dense); }
-        ensure!(tp > 0, "layer {layer} has no installed expert ranks");
-        let slice_bytes = match exl3 {
-            Some(manifest) => exl3_slice_bytes(manifest, layer, tp)?,
-            None => read_bytes(layer)? as f64,
-        };
+        let slice_bytes = layer_slice_bytes(exl3, layer, tp, || read_bytes(layer))?;
         Ok(if local { LayerHome::Local { slice_bytes } } else { LayerHome::Remote { slice_bytes } })
     }).collect()
+}
+
+/// Keep EXL3 pricing manifest-first, including TP2 owners without FP8 metadata.
+pub(crate) fn layer_slice_bytes(exl3: Option<&cuteafd_loader::V41Exl3Manifest>, layer: usize,
+    tp: usize, read_bytes: impl FnOnce() -> Result<usize>) -> Result<f64> {
+    ensure!(tp > 0, "layer {layer} has no installed expert ranks");
+    match exl3 {
+        Some(manifest) => exl3_slice_bytes(manifest, layer, tp),
+        None => Ok(read_bytes()? as f64),
+    }
 }
 
 /// GLM Flash's policy geometry from each layer's home, the router's expert
@@ -336,6 +342,7 @@ pub(crate) fn prior(prior: &Prior, history: &DraftHistory, evidence: &DraftEvide
 pub(crate) fn copy_continuation(policy: &DraftPolicy, requests: usize, id: u64, history: &[u32], drafted: &[u32],
     prior: &mut Vec<f64>, room: usize, greedy: bool) -> Option<crate::shared::draft::copy::Continuation> {
     prior.truncate(drafted.len());
+    if policy.fixed() { return None; }
     let calibrated = policy.probabilities(requests, DraftCandidate { id, confidence: prior });
     let continuation = crate::shared::draft::copy::continuation(history, drafted, &calibrated, room, greedy)?;
     prior.truncate(continuation.neural);
@@ -378,6 +385,10 @@ pub(crate) fn select_drafted(policy: &mut DraftPolicy, candidates: &[Candidate<'
         .map(|c| &c.prior[..c.prior.len().min(c.limit).min(positions)]).collect();
     let cores: Vec<DraftCandidate<'_>> = candidates.iter().zip(&confidence)
         .map(|(c, &confidence)| DraftCandidate { id: c.id, confidence }).collect();
+    if let Some(lengths) = fixed_selection(policy, &cores, max_rows) {
+        binding::trace_selection(policy, &cores, width, drafted_requests, max_rows, &lengths);
+        return Selection { lengths, predicted: None };
+    }
     if policy.draft_mode() != cuteafd_core::DraftMode::Shared {
         // The simple rule owns every length: no cold floor, no lone-request reference.
         let mut lengths = policy.select_drafted_within(false, &cores, width, max_rows, drafted_requests).ok().flatten()
@@ -417,6 +428,17 @@ pub(crate) fn select_drafted(policy: &mut DraftPolicy, candidates: &[Candidate<'
     if trim_budget_with_priors(&mut lengths, max_rows, &confidence, |i| candidates[i].id) { predicted = None; }
     binding::trace_selection(policy, &cores, width, drafted_requests, max_rows, &lengths);
     Selection { lengths, predicted }
+}
+
+/// Fixed mode bypasses confidence and prices, retaining the existing row-budget cap.
+pub(crate) fn fixed_selection(policy: &DraftPolicy, candidates: &[DraftCandidate<'_>], rows: usize)
+    -> Option<Vec<usize>> {
+    if !policy.fixed() { return None; }
+    let cap = policy.fixed_length().unwrap_or(policy.geometry().max_positions);
+    let priors: Vec<_> = candidates.iter().map(|c| c.confidence).collect();
+    let mut lengths = priors.iter().map(|p| p.len().min(cap)).collect::<Vec<_>>();
+    trim_budget_with_priors(&mut lengths, rows, &priors, |i| candidates[i].id);
+    Some(lengths)
 }
 
 /// Inputs retained inside a round; expensive diagnostics run only after its
@@ -513,7 +535,7 @@ pub(crate) fn observe_drafted(policy: &mut DraftPolicy, requests: &[Verified<'_>
         draft: (width > 0).then_some(DraftPass { width, requests: drafted_requests }), predicted })
 }
 
-static SNAPSHOT: Mutex<Option<serde_json::Value>> = Mutex::new(None);
+static SNAPSHOT: Mutex<Option<std::sync::Arc<serde_json::Value>>> = Mutex::new(None);
 
 fn publication_due(rounds: u64, last: Option<u64>) -> bool {
     last.is_none_or(|last| rounds < last || rounds.saturating_sub(last) >= 32)
@@ -521,7 +543,18 @@ fn publication_due(rounds: u64, last: Option<u64>) -> bool {
 
 /// The latest published policy state for the serving `stats` payload.
 pub(crate) fn snapshot() -> serde_json::Value {
-    SNAPSHOT.lock().ok().and_then(|slot| slot.clone()).unwrap_or(serde_json::Value::Null)
+    trace_snapshot().0.as_deref().cloned().unwrap_or(serde_json::Value::Null)
+}
+
+/// Cheap owned view for asynchronous trace serialization.
+pub(crate) struct TraceSnapshot(Option<std::sync::Arc<serde_json::Value>>);
+impl serde::Serialize for TraceSnapshot {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.0.as_deref().serialize(serializer)
+    }
+}
+pub(crate) fn trace_snapshot() -> TraceSnapshot {
+    TraceSnapshot(SNAPSHOT.lock().ok().and_then(|slot| slot.clone()))
 }
 
 /// Publish at startup/reset and at most every 32 observed rounds. The policy
@@ -593,7 +626,7 @@ pub(crate) fn publish(policy: &DraftPolicy, observed: u64, skipped: u64, ring: O
             "samples": snapshot.draft[4] },
         "route_ring_check": ring.map(|(layers, mismatched)| serde_json::json!({"layers": layers, "mismatched": mismatched})),
     });
-    if let Ok(mut slot) = SNAPSHOT.lock() { *slot = Some(value); }
+    if let Ok(mut slot) = SNAPSHOT.lock() { *slot = Some(std::sync::Arc::new(value)); }
 }
 
 #[cfg(test)]
@@ -760,7 +793,7 @@ mod tests {
             InstalledExpertVariant, WorkerIdentity, WorkerSelection};
         let identity: WorkerIdentity = serde_json::from_value(serde_json::json!({
             "checkpoint": "0".repeat(64), "geometry": [4096, 288, 8, 2048, 45],
-            "world": 2, "topology": [2, 1], "ownership_wire": false,
+            "world": 2,
         })).unwrap();
         let loaded = WorkerSelection::new(identity, &[3, 4]).unwrap();
         let reports: Vec<_> = (0..2).map(|rank| InstalledExpertGrouping::new(loaded.clone(), rank, 256,
@@ -793,7 +826,7 @@ mod tests {
             InstalledExpertGrouping, InstalledExpertVariant, WorkerIdentity, WorkerSelection};
         let identity: WorkerIdentity = serde_json::from_value(serde_json::json!({
             "checkpoint": "0".repeat(64), "geometry": [4096, 288, 8, 2048, 45],
-            "world": 2, "topology": [2, 1], "ownership_wire": false,
+            "world": 2,
         })).unwrap();
         let loaded = WorkerSelection::new(identity, &[3]).unwrap();
         let report = |rank, bf16_group| {
@@ -826,7 +859,7 @@ mod tests {
             InstalledExpertGrouping, InstalledExpertVariant, WorkerIdentity, WorkerSelection};
         let identity: WorkerIdentity = serde_json::from_value(serde_json::json!({
             "checkpoint": "0".repeat(64), "geometry": [4096, 288, 8, 2048, 45],
-            "world": 6, "topology": [6, 1], "ownership_wire": false,
+            "world": 6,
         })).unwrap();
         let report = |rank, layers: &[usize], bytes| {
             let loaded = WorkerSelection::new(identity.clone(), layers).unwrap();
@@ -851,7 +884,7 @@ mod tests {
     #[test]
     fn glm_and_qwen_layer_prices_remain_bit_identical() -> Result<()> {
         use cuteafd_loader::plan::testing;
-        for family in ["glm", "qwen"] {
+        for family in ["glm", "glmf", "qwen"] {
             let fixture = tempfile::tempdir()?;
             let (config, tensors, first, layers, hidden, intermediate, experts) = if family == "glm" {
                 let mut config = testing::glm5_config();
@@ -864,6 +897,17 @@ mod tests {
                     }
                 }
                 (config, tensors, 1, 2, 6144, 2048, 256)
+            } else if family == "glmf" {
+                let mut config = testing::glm5_flash_config(2);
+                config["quantization_config"] = testing::exl3_compact(4);
+                let mut tensors = Vec::new();
+                for expert in 0..288 {
+                    for (projection, n, k) in [("gate_proj", 2048, 4096), ("up_proj", 2048, 4096),
+                        ("down_proj", 4096, 2048)] {
+                        tensors.extend(testing::exl3(&format!("model.language_model.layers.1.mlp.experts.{expert}.{projection}"), n, k, 4));
+                    }
+                }
+                (config, tensors, 1, 2, 4096, 2048, 288)
             } else {
                 let (tensors, _) = testing::qwen4_exl3(2, 4);
                 (testing::qwen4_config(2), tensors, 0, 2, 2560, 640, 512)
@@ -876,6 +920,9 @@ mod tests {
                         catalog.exl3(), |_| panic!("EXL3 must not query installed FP8 descriptors"))?;
                     let width = (intermediate / 128usize).div_ceil(tp) * 128;
                     let bytes = (3 * (hidden * width * 4 / 8 + hidden * 2 + width * 2)) as f64;
+                    assert_eq!(layer_slice_bytes(catalog.exl3(), first, tp,
+                        || anyhow::bail!("expert backend does not publish installed read-byte metadata"))?, bytes,
+                        "{family} TP{tp} must price the manifest before querying native owners");
                     for (layer, home) in homes.iter().enumerate() {
                         let previous = if layer < first { LayerHome::Dense }
                             else if local { LayerHome::Local { slice_bytes: bytes } }
@@ -894,6 +941,10 @@ mod tests {
                 }
             }
         }
+        let error = layer_slice_bytes(None, 1, 2,
+            || anyhow::bail!("missing installed TP2 descriptor")).unwrap_err();
+        assert_eq!(error.to_string(), "missing installed TP2 descriptor");
+        assert!(layer_slice_bytes(None, 1, 0, || panic!("invalid TP descriptor")).is_err());
         assert!(layer_homes([(false, false, 0)], None, |_| Ok(1)).is_err());
         assert_eq!(layer_homes([(true, false, 0)], None, |_| panic!("dense descriptor"))?, [LayerHome::Dense]);
         Ok(())

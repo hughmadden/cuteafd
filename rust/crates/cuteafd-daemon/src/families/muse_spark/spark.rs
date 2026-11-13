@@ -15,7 +15,7 @@
 //! - `consumed`: after `RankDevice::combine`, the slot's planes are released.
 use super::experts::{wave_request, wire_plan, CombineTables, LandedWave, ReplyPlanView, SparkExperts, Wave, WaveSegment, WaveStep,
     MAX_RANKS, TOPK, WIDTH, WIRE_ROW_BYTES};
-use crate::shared::{experts::staging::RouteStaging, memory::device::{Allocation, Stream}, spark_intake::SparkLink,
+use crate::shared::{experts::staging::RouteStaging, memory::{device::{Allocation, Stream}, Tag}, spark_intake::SparkLink,
     spark_waves::WaveTicket};
 use anyhow::{ensure, Context, Result};
 use cuteafd_loader::families::muse_spark::replies::{Cutoff, ReplyPlan};
@@ -68,12 +68,15 @@ impl Drop for MuseSparkPath<'_> {
 /// The widest wave the path dispatches: `rows` rows of one request with every
 /// row in the wide region (it sizes the slot staging; the response rings come
 /// from the sealed endpoint). Its routes and payload are zero; it is never sent.
-pub(crate) fn bootstrap_request(layer: usize, rows: usize, cutoff: Cutoff)
-    -> Result<cuteafd_transport::ExpertProtocolV2Request> {
-    let routes = (0..rows * TOPK).map(|i| cuteafd_transport::ExpertProtocolV2RouteEntry {
-        row_index: (i / TOPK) as u32, expert_id: 0, gate_weight: 0.0 }).collect();
-    wave_request(layer, 1, ExpertV2SourceKind::Prefill, &[WaveSegment { request: 1, rows }], cutoff, routes,
-        bytes::Bytes::from(vec![0; rows * WIRE_ROW_BYTES]))
+pub(crate) fn bootstrap_shape(rows: usize, cutoff: Cutoff)
+    -> Result<cuteafd_transport::SparkSessionShape> {
+    ensure!((1..=4096).contains(&rows), "Muse session row capacity");
+    let mut shape = cuteafd_transport::SparkSessionShape::new(rows as u32, WIDTH as u32, TOPK as u32,
+        cuteafd_transport::ExpertV2Dtype::Fp8E4m3Ue8m0K32)?;
+    let partial = wire_plan(&ReplyPlan::for_phase(cutoff, &[rows], true))?;
+    shape.response_wire_bytes = cuteafd_transport::EXPERT_PROTOCOL_V2_RESPONSE_HEADER_LEN
+        .checked_add(partial.payload(TOPK, WIDTH)?.3).context("Muse reply capacity overflow")?;
+    Ok(shape)
 }
 
 impl<'a> MuseSparkPath<'a> {
@@ -84,7 +87,7 @@ impl<'a> MuseSparkPath<'a> {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn connect(library_owner: &'a Arc<cuteafd_ffi::NativeLibrary>, stream: Rc<Stream<'a>>,
         world: SparkWorld, peers: Vec<SocketAddr>, config: TcpTransportConfig,
-        cutoff: Cutoff, unit: usize, waves: usize, intake_row_bytes: usize, first_spark_layer: usize) -> Result<Self> {
+        cutoff: Cutoff, unit: usize, waves: usize, intake_row_bytes: usize) -> Result<Self> {
         ensure!(std::ptr::eq(library_owner.as_ref(), stream.device.library),
             "Muse Spark library owner differs from the lane device");
         ensure!(cuteafd_core::expert_geometry() == cuteafd_core::ExpertGeometry::MUSE_SPARK,
@@ -94,8 +97,7 @@ impl<'a> MuseSparkPath<'a> {
         let library = library_owner.as_ref();
         let layout = CombineTables { capacity: unit };
         let tables = {
-            let _scope = cuteafd_ffi::memory_ledger::scope("workspace/muse combine tables");
-            Allocation::new(stream.device, layout.bytes() * waves)?
+            Allocation::new(stream.device, layout.bytes() * waves, Tag::workspace("muse/combine-tables"))?
         };
         let mut link = stream.device.run(|| SparkLink::new_waves(library, world, &peers, u32::try_from(unit)?, config,
             intake_row_bytes, waves, u32::try_from(unit)?))?;
@@ -108,7 +110,7 @@ impl<'a> MuseSparkPath<'a> {
         path.stream.device.run(|| {
             let link = path.link.as_mut().context("Muse Spark link absent")?;
             ensure!(link.world_size() == peers.len(), "Muse Spark transport world differs from its peers");
-            link.bootstrap(&bootstrap_request(first_spark_layer, unit, cutoff)?)?;
+            link.bootstrap(&bootstrap_shape(unit, cutoff)?)?;
             ensure!(link.installed_grouping()?.len() == peers.len(), "Muse bootstrap requires every rank's grouping");
             for slot in 0..waves {
                 let table = Self::slot_tables(&path.tables, layout, slot);
@@ -165,7 +167,8 @@ impl SparkExperts for MuseSparkPath<'_> {
         ensure!(self.in_flight.len() < self.waves, "Muse Spark path has {} waves in flight", self.waves);
         let sequence = self.sequence.checked_add(1).context("Muse Spark request sequence overflow")?;
         let (segments, kind, cutoff) = (step.segments.clone(), step.kind, self.cutoff);
-        let plan = ReplyPlan::new(cutoff, &segments.iter().map(|s| s.rows).collect::<Vec<_>>());
+        let plan = ReplyPlan::for_phase(cutoff, &segments.iter().map(|s| s.rows).collect::<Vec<_>>(),
+            kind == ExpertV2SourceKind::Prefill);
         let payload = wire_plan(&plan)?.payload(TOPK, WIDTH)?.3;
         let layout = RouteStaging::new(rows, TOPK, WIRE_ROW_BYTES)?;
         let stream = self.stream.raw;
@@ -200,9 +203,10 @@ impl SparkExperts for MuseSparkPath<'_> {
             let planes = exchange.partial_reply_addresses(slot)?;
             // The wire layout (`PartialReplyPlan::payload`): the BF16 region, then the
             // wide region at the next region-aligned offset.
-            let wide_at = wire_plan(&plan)?.payload(TOPK, WIDTH)?.1;
+            let payload = wire_plan(&plan)?.layout(TOPK, WIDTH)?;
             let image = layout.image(&planes, &ReplyPlanView { bf16_rows: &plan.bf16_rows,
-                wide_rows: &plan.wide_rows, wide_at })?;
+                wide_rows: &plan.wide_rows, wide_at: payload.offsets[1],
+                other_rows: &plan.other_rows, other_at: payload.offsets[2] })?;
             // SAFETY: the slot's fixed tables on this stream's device; the ordered
             // upload waits for its own previous copy (not compute) and the combine
             // that reads it follows on this stream.
@@ -234,15 +238,22 @@ mod tests {
     fn bootstrap_is_the_widest_all_wide_wave() -> Result<()> {
         let cutoff = Cutoff::new(64, 8)?;
         for rows in [65, 2752, 4096] {
-            let request = bootstrap_request(3, rows, cutoff)?;
-            assert_eq!(request.header.row_count as usize, rows);
-            assert_eq!(request.hidden_payload.len(), rows * WIRE_ROW_BYTES);
-            let plan = request.partial.as_ref().unwrap();
-            assert!(plan.regions.iter().all(|&r| r == 1));
+            let shape = bootstrap_shape(rows, cutoff)?;
+            assert_eq!(shape.row_count as usize, rows);
+            assert_eq!(shape.hidden_payload_bytes as usize, rows * WIRE_ROW_BYTES);
+            let layout = RouteStaging::new(rows, TOPK, WIRE_ROW_BYTES)?;
+            let bytes = vec![0; layout.bytes];
+            let real = wave_request(3, 1, ExpertV2SourceKind::Prefill,
+                &[WaveSegment { request: 1, rows }], cutoff, layout.routes(&bytes)?,
+                bytes::Bytes::copy_from_slice(layout.wire(&bytes)?))?;
+            let real = cuteafd_transport::SparkSessionShape::from_request(&real)?;
+            assert!(shape.request_wire_bytes >= real.request_wire_bytes);
+            assert!(shape.response_wire_bytes >= real.response_wire_bytes);
+            let partial = wire_plan(&ReplyPlan::for_phase(cutoff, &[rows], true))?;
+            assert_eq!(shape.response_wire_bytes,
+                cuteafd_transport::EXPERT_PROTOCOL_V2_RESPONSE_HEADER_LEN + partial.payload(TOPK, WIDTH)?.3);
         }
-        // At or below the cutoff the one segment replies BF16 (still a valid widest wave).
-        assert!(bootstrap_request(3, 64, cutoff)?.partial.unwrap().regions.iter().all(|&r| r == 0));
-        assert!(bootstrap_request(62, 64, cutoff).is_err());
+        assert!(bootstrap_shape(0, cutoff).is_err());
         Ok(())
     }
 

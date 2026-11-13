@@ -82,7 +82,7 @@ pub(crate) struct HeapSnapshot {
     pub arenas: u64,
 }
 
-fn page_size() -> u64 {
+pub(crate) fn page_size() -> u64 {
     static PAGE: OnceLock<u64> = OnceLock::new();
     *PAGE.get_or_init(|| {
         // SAFETY: sysconf(_SC_PAGESIZE) has no preconditions.

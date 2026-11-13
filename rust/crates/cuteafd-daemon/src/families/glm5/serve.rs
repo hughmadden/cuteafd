@@ -62,10 +62,8 @@ pub(crate) struct ServeArgs {
     /// template's Low effort, think block open, a short plan as reasoning).
     #[arg(long, env = "CUTEAFD_GLM_THINKING_OFF", default_value = "empty")]
     pub thinking_off: GlmThinkingOff,
-    /// With --draft: verify exactly this many DFlash2 drafts per step
-    /// (within the rows) instead of the adaptive policy.
-    #[arg(long)]
-    pub draft_fixed: Option<usize>,
+    #[command(flatten)]
+    pub draft_length: crate::shared::draft::length::DraftLength,
     #[command(flatten)]
     pub decode_share: DecodeShareArgs,
     #[command(flatten)]
@@ -111,10 +109,30 @@ fn chat_encoding(snapshot: &std::path::Path, thinking_off: GlmThinkingOff) -> Re
     })
 }
 
+pub(super) fn resolve_serving_capacity(engine_args: &mut super::EngineArgs, max_sequences: usize) {
+    if engine_args.draft_context_slots.is_none() {
+        engine_args.draft_context_slots = Some(cuteafd_loader::families::glm5::draft_representation::serving_draft_context_slots(
+            engine_args.draft_sequences, max_sequences, None));
+    }
+    cuteafd_bench::context::set_resolved("max-sequences", &max_sequences.to_string());
+    cuteafd_bench::context::set_resolved("draft-fp8", if engine_args.draft.is_some() {
+        if engine_args.draft_fp8 == Some(false) { "false" } else { "true" }
+    } else { "unused" });
+    if let Some(slots) = engine_args.draft_context_slots {
+        cuteafd_bench::context::set_resolved("draft-context-slots", &slots.to_string());
+    }
+}
+
 pub(crate) async fn run_serve(mut args: ServeArgs) -> Result<()> {
+    args.draft_length.report_inactive(args.engine.dspark || args.engine.draft.is_some());
+    let view = args.engine.attention.selected_view.clone().map(Ok)
+        .unwrap_or_else(|| args.engine.attention.select(&args.engine.snapshot))?;
+    args.engine.attention.validate_view(&view)?;
+    let cfg = cuteafd_loader::families::glm5::GlmDsaConfig::from_hf(&view.config()?)?;
+    super::validate_selected_attention(&view, &cfg)?;
+    args.engine.attention.selected_view = Some(view);
     let max_sequences = crate::shared::memory::budget::serving_concurrency(
         args.max_sequences, &args.engine.native_lib, args.engine.device)?;
-    let cfg = cuteafd_loader::families::glm5::GlmDsaConfig::read(&args.engine.snapshot)?;
     cuteafd_core::concurrency::validate(cfg.family_id(), max_sequences as u64)?;
     args.prefix.resolve_entries(max_sequences);
     if cuteafd_loader::plan::exlr8::recognizes(&args.engine.snapshot)? {
@@ -122,36 +140,30 @@ pub(crate) async fn run_serve(mut args: ServeArgs) -> Result<()> {
     }
     let api = args.api.load()?;
     let snapshot: PathBuf = args.engine.snapshot.clone();
-    let profile = ModelProfile::new(
+    let mut profile = ModelProfile::new(
         args.model_id.clone().or_else(|| model_id(&snapshot)).context("model id")?,
         chat_encoding(&snapshot, args.thinking_off)?,
     );
+    profile.expert_usage = args.engine.expert_usage_reader.clone();
     let (queue, receive) = mpsc::channel::<NativeRequest>(cuteafd_core::concurrency::queue_depth(max_sequences as u64) as usize);
     let stats = Arc::new(Mutex::new(serde_json::Value::Null));
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
     let mut engine_args = args.engine.clone();
-    if engine_args.draft_context_slots.is_none() {
-        engine_args.draft_context_slots = Some(cuteafd_loader::families::glm5::draft_representation::serving_draft_context_slots(
-            engine_args.draft_sequences, max_sequences, None));
-    }
-    cuteafd_bench::context::set_resolved("max-sequences", &max_sequences.to_string());
-    if let Some(slots) = engine_args.draft_context_slots {
-        cuteafd_bench::context::set_resolved("draft-context-slots", &slots.to_string());
-    }
+    resolve_serving_capacity(&mut engine_args, max_sequences);
     let mut engine_args = super::ResolvedEngineArgs::new(&engine_args)?;
     size_draft_window_marks(&mut engine_args, &args.prefix, max_sequences)?;
     let (worker_stats, max_sequences) = (stats.clone(), max_sequences);
-    let policy = Policy { fixed: args.draft_fixed,
+    let policy = Policy { length: args.draft_length,
         decode_share: args.decode_share };
     let prefix = args.prefix.clone();
-    let hub = console::hub(args.console.console_text, || Ok(console_layout(&args, &profile.id, &cfg, max_sequences)));
+    let layout = console_layout(&args, &profile.id, &cfg, max_sequences, 0);
     let (vision, media_cache_bytes) = (args.vision, args.media_cache_bytes);
     let remote = crate::families::glm5_flash::media::RemoteVision::from_parts(args.vision, args.vision_peers.as_deref(),
         args.encoder_plan_hash.as_deref(), args.encoder_revision.as_deref())?;
     let worker = tokio::task::spawn_blocking(move ||
         serve_loop(engine_args, receive, ready_tx, worker_stats, max_sequences, policy, prefix, vision, media_cache_bytes,
-            remote, args.loop_abort.config()));
-    let (max_context, media) = ready_rx.await.context("engine failed before it was ready")??;
+            remote, layout, args.console.console_text, args.loop_abort.config()));
+    let (max_context, media, hub) = ready_rx.await.context("engine failed before it was ready")??;
     let mut profile = profile;
     if let Some((preparer, health)) = media {
         profile = profile.with_loaded_vision(preparer);
@@ -167,11 +179,12 @@ pub(crate) async fn run_serve(mut args: ServeArgs) -> Result<()> {
     // lazy graphs or loads more code.
     crate::shared::memory_report::log("ready");
     tracing::info!(listen = %args.listen, model = %profile.id, "GLM API is ready");
+    let mut worker = Some(worker);
     tokio::select! {
-        served = axum::serve(listener, api.app(router, hub)
-            .into_make_service_with_connect_info::<std::net::SocketAddr>()) => served?,
-        _ = crate::shared::api::watch_scheduler(worker) => unreachable!(),
+        served = crate::shared::api::serve_http(listener, api.app(router, hub), "glm5") => served?,
+        _ = crate::shared::api::watch_scheduler(&mut worker) => unreachable!(),
     }
+    crate::shared::api::finish_scheduler(&mut worker, "glm5").await?;
     Ok(())
 }
 
@@ -182,14 +195,19 @@ fn size_draft_window_marks(resolved: &mut super::ResolvedEngineArgs, prefix: &Pr
     if args.dspark && prefix.prefix_cache_entries > 0 {
         let layout = cuteafd_loader::placement::families::glm5::ml4_draft_layout(&args.snapshot,
             args.draft_context_slots.unwrap_or(20), args.draft_sequences, args.max_context, 1)?;
-        args.draft_window_marks = prefix.mark_rule(max_sequences)
+        let mut rule = prefix.mark_rule(max_sequences);
+        let attention = cuteafd_loader::placement::attention::parse(&args.attention_placement)
+            .map_err(anyhow::Error::msg)?.unwrap_or(cuteafd_loader::placement::AttentionPlacement::Context);
+        rule.host = cuteafd_loader::families::glm5::host_prefix_enabled(
+            if args.split_device.is_some() { 2 } else { 1 }, attention, rule.host, rule.entries as u64);
+        args.draft_window_marks = rule
             .slots(cuteafd_loader::placement::families::glm5::draft_window_mark_bytes(&layout)?);
     }
     Ok(())
 }
 
 /// What the live console shows for GLM 5.3.
-fn console_layout(args: &ServeArgs, model: &str, cfg: &cuteafd_loader::families::glm5::GlmDsaConfig, max_sequences: usize) -> console::Layout {
+fn console_layout(args: &ServeArgs, model: &str, cfg: &cuteafd_loader::families::glm5::GlmDsaConfig, max_sequences: usize, native: usize) -> console::Layout {
     use console::{Color::*, StepGroup};
     let mut layout = console::Layout::new("glm5", model.into(), args.engine.snapshot.clone());
     let sparks = args.engine.peers.as_deref().map_or(0, |peers| peers.split(',').count());
@@ -201,10 +219,10 @@ fn console_layout(args: &ServeArgs, model: &str, cfg: &cuteafd_loader::families:
         format!("{resolved} split")
     });
     layout.concurrency = max_sequences;
-    let policy = args.draft_fixed.map_or_else(|| "shared resource-priced + agreed copies".to_string(), |n| format!("fixed {n}"));
+    let policy = args.draft_length.label(native);
     layout.speculator = (args.engine.draft.is_some() || args.engine.dspark).then(|| console::Speculator {
         name: if args.engine.dspark { "dSpark" } else { "DFlash2" }.into(),
-        positions: if args.engine.dspark { 4 } else { 8 }, policy });
+        positions: native, policy });
     layout.steps = vec![
         StepGroup::new("Decode step", "host clock", &[("round.cycle", "step", Target),
             ("draft", "DFlash2 draft", Accepted), ("plan", "draft plan + copy windows", Ink),
@@ -220,10 +238,10 @@ fn console_layout(args: &ServeArgs, model: &str, cfg: &cuteafd_loader::families:
     layout
 }
 
-/// A diagnostic fixed DFlash2 count, otherwise shared resource-priced selection.
+/// Neural draft settings and the shared resource-policy binding.
 #[derive(Debug, Clone, Copy)]
 struct Policy {
-    fixed: Option<usize>,
+    length: crate::shared::draft::length::DraftLength,
     decode_share: DecodeShareArgs,
 }
 
@@ -231,9 +249,10 @@ type VisionReady = Option<(Arc<cuteafd_api::openai::media::MediaPreparer>, Optio
 
 #[allow(clippy::too_many_arguments)]
 fn serve_loop(resolved: super::ResolvedEngineArgs, mut receive: mpsc::Receiver<NativeRequest>,
-    ready: tokio::sync::oneshot::Sender<Result<(usize, VisionReady)>>, stats: Arc<Mutex<serde_json::Value>>, max_sequences: usize,
+    ready: tokio::sync::oneshot::Sender<Result<(usize, VisionReady, Arc<cuteafd_api::openai::ConsoleHub>)>>, stats: Arc<Mutex<serde_json::Value>>, max_sequences: usize,
     policy: Policy, prefix: PrefixArgs, vision: cuteafd_loader::plan::MediaMode, media_cache_bytes: Option<u64>,
     remote: Option<crate::families::glm5_flash::media::RemoteVision>,
+    mut layout: console::Layout, console_text: bool,
     loop_abort: crate::shared::loop_abort::LoopAbortConfig) -> Result<()> {
     let args = &resolved.args;
     let opened = match open(args) {
@@ -243,19 +262,29 @@ fn serve_loop(resolved: super::ResolvedEngineArgs, mut receive: mpsc::Receiver<N
             return Ok(());
         }
     };
-    // The tower loads before the LM so its admitted bytes are in the LM's live baseline.
-    let (vision, prefix) = match ml4_media::ReadyVision::load(args, &opened.library, vision, &prefix, media_cache_bytes, remote) {
+    // Retain the early tower allocation receipt for the joint LM recipe.
+    let (mut vision, prefix) = match ml4_media::ReadyVision::load(args, &opened.library, vision, &prefix, media_cache_bytes, remote) {
         Ok(vision) => vision,
         Err(error) => { let _ = ready.send(Err(error)); return Ok(()); }
     };
+    let media_owner = vision.as_ref().and_then(|v| v.device_owner);
+    let media_push = vision.as_mut().map(|v| std::mem::take(&mut v.push)).unwrap_or_default();
     let preparer = vision.as_ref().map(|v| v.preparer.clone());
     let expander = vision.as_ref().map(|v| v.expander);
     let (encoder, bytes) = vision.map_or((ml4_media::Encoder::Off, 0), |v| (v.encoder, v.cache_bytes));
     let health = encoder.health_handle();
     let mut media = MediaAdmission::new(EmbeddingCache::new(bytes), encoder, 16);
     let mut ready = Some(ready);
-    let result = opened.with_resolved_engine(&resolved, |engine, transport, runtime| {
-        anyhow::ensure!(transport.is_some() || engine.skip_routed() || engine.has_tp2(), "serve-glm needs Spark peers, local TP2 or --skip-routed-experts");
+    let result = opened.with_resolved_engine_media(&resolved, media_push.records(), Some((&prefix, max_sequences)), (media_owner, bytes as u64), |engine, transport, runtime| {
+        if probe::streamed_prefill_scoring(engine.cfg.family_id()) {
+            cuteafd_bench::context::set_resolved("prefill-scoring", "streamed");
+        }
+        layout.speculator = engine.drafter.as_ref().map(|draft| console::Speculator {
+            name: if draft.token_only() { "dSpark" } else { "DFlash2" }.into(),
+            positions: draft.cfg.drafts(), policy: policy.length.label(draft.cfg.drafts()) });
+        let mut hub = Some(console::hub(console_text, || Ok(layout)));
+        media_push.commit()?;
+        anyhow::ensure!(transport.is_some() || engine.skip_routed() || engine.has_local(), "serve-glm needs Spark peers, local TP2 or --skip-routed-experts");
         let ranks = args.peers.as_deref().map_or(4, |peers| peers.split(',').count());
         let spark = transport.is_some();
         console::layer_classes(engine.weights.layers.iter().map(|l| console::layer_class(l.dense, spark)).collect());
@@ -263,15 +292,13 @@ fn serve_loop(resolved: super::ResolvedEngineArgs, mut receive: mpsc::Receiver<N
         schedule(engine, &opened, &mut receive, transport, runtime, &stats, max_sequences, policy,
             ranks, &prefix, loop_abort, args.token_io.token_select, &mut media, expander.as_ref(), || {
                 if let Some(ready) = ready.take() {
-                    let _ = ready.send(Ok((engine.max_context, preparer.clone().map(|p| (p, health.clone())))));
+                    let _ = ready.send(Ok((engine.max_context, preparer.clone().map(|p| (p, health.clone())), hub.take().expect("console hub"))));
                 }
             })
     });
-    if let Some(ready) = ready.take() {
-        let _ = ready.send(result.as_ref().map(|_| (args.max_context, preparer.map(|p| (p, health))))
-            .map_err(|e| anyhow::anyhow!("{e:#}")));
-    }
-    result
+    crate::shared::serve::forward_initialization(result, ready.is_some(), "GLM initialization failed", |error| {
+        ready.take().expect("pending readiness").send(Err(error)).map_err(|result| match result { Err(error) => error, Ok(_) => unreachable!("sent an error") })
+    })
 }
 
 /// A prompt ready for prefix-cache admission: its keyed tokens and features.
@@ -461,25 +488,23 @@ impl Trace {
     #[allow(clippy::too_many_arguments)]
     fn cycle(&mut self, id: u64, position: usize, rows: usize, committed: usize, planned: usize, copy: bool,
         draft: Option<&crate::shared::speculation::dflash::Draft>, verify_ms: f64) -> Result<()> {
-        let line = serde_json::json!({"kind": "cycle", "id": id, "position": position, "rows": rows,
-            "committed": committed, "planned": planned, "copy": copy, "verify_ms": verify_ms,
-            "draft": draft.map(|d| &d.tokens), "features": draft.map(|d| &d.features)});
-        self.0.write(&line)?;
+        let line = crate::shared::speculation_trace::record! {kind: "cycle", id: id, position: position, rows: rows,
+            committed: committed, planned: planned, copy: copy, verify_ms: verify_ms,
+            draft: draft.map(|d| d.tokens.clone()), features: draft.map(|d| d.features.clone())};
+        self.0.write(line)?;
         Ok(())
     }
 
     fn done(&mut self, id: u64, prompt_tokens: usize, generated: &[u32]) -> Result<()> {
-        self.0.write(&serde_json::json!({"kind": "done", "id": id, "prompt_tokens": prompt_tokens,
-            "generated": generated}))?;
+        self.0.write(crate::shared::speculation_trace::record! {kind: "done", id: id, prompt_tokens: prompt_tokens,
+            generated: generated.to_vec()})?;
         Ok(())
     }
 }
 
 /// The prefix cache over `engine` (always present: with zero entries it is the page allocator).
-fn prefix_cache<'e, 'a>(engine: &'e GlmEngine<'a>, args: &PrefixArgs, concurrency: usize)
+fn prefix_cache<'e, 'a>(engine: &'e GlmEngine<'a>, args: &PrefixArgs, _concurrency: usize)
     -> Result<(GlmPrefix<'e, 'a>, PrefixCache<CudaCopyEngine<'a>>)> {
-    let args = &args.with_scoring(if engine.full_prefill_logits { engine.prefill_capacity() } else { 64 },
-        engine.prefill_rows, engine.cfg.vocab_size)?;
     let entries = args.prefix_cache_entries;
     let family = GlmPrefix::new(engine, args.prefix_partial == Toggle::On, engine.draft_window_marks)?;
     let template = engine.paged_buffers().iter().find_map(|(records, _)| records.map(|(buffer, _)| buffer))
@@ -495,10 +520,11 @@ fn prefix_cache<'e, 'a>(engine: &'e GlmEngine<'a>, args: &PrefixArgs, concurrenc
     } else if engine.ranks() > 1 {
         // SAFETY of the registration: the engine (and its pools) outlives the cache, which
         // `schedule` drops first.
-        args.host_config(family.layout(), engine.max_context, concurrency)?.map(|config|
+        engine.admitted_host_config.clone().map(|config|
             CudaCopyEngine::registered(engine.library, &family.buffers()).map(|copy| (config, copy))).transpose()?
     } else {
-        args.host_tier(engine.library, template, family.layout(), engine.max_context, concurrency)?
+        engine.admitted_host_config.clone().map(|config|
+            CudaCopyEngine::new(engine.library, template).map(|copy| (config, copy))).transpose()?
     };
     let host_bytes = host.as_ref().map_or(0, |(config, _)| config.bytes);
     let layout = family.layout();
@@ -605,9 +631,15 @@ fn prefill_group(engine: &GlmEngine<'_>, family: &GlmPrefix<'_, '_>,
 #[allow(clippy::too_many_arguments)]
 fn publish(stats: &Mutex<serde_json::Value>, requests: u64, generated: u64, active: usize, prefilling: usize,
     cache: &PrefixCache<CudaCopyEngine<'_>>, reserve: &Reserve, stalled: usize) {
+    if requests > 0 {
+        static FIRST: std::sync::Once = std::sync::Once::new();
+        crate::shared::probe::first_request(&FIRST, requests, || crate::shared::memory_report::reconcile::capture("first_request"));
+    }
+    if active == 0 && prefilling == 0 { cache.refresh_serving_stats(); }
+    let prefix_stats = cache.serving_stats();
     if let Ok(mut stats) = stats.lock() {
         *stats = serde_json::json!({"requests": requests, "generated_tokens": generated, "active": active,
-            "prefilling": prefilling, "prefix_cache": cache.stats(), "kv_reserve": reserve.snapshot(stalled),
+            "prefilling": prefilling, "prefix_cache": prefix_stats, "kv_reserve": reserve.snapshot(stalled),
             "draft_policy": crate::shared::draft::resource::snapshot()});
     }
 }
@@ -636,22 +668,22 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
     let mut free_slots: Vec<usize> = drafter.map_or(Vec::new(), |d| (0..d.slots).rev().collect());
     use crate::shared::draft::{resource, runtime::SharedPolicy};
     let mut shared = drafter.map(|d| {
-        let tp2 = engine.tp2_layers();
+        let tp2 = engine.local_layers();
         let remote = if engine.weights.layers.iter().enumerate().any(|(layer, weights)|
             !weights.dense && !tp2.as_ref().is_some_and(|layers| layers.contains(&layer))) {
             transport.as_ref().context("GLM installed Spark transport missing")?.installed_grouping()?
         } else { Vec::new() };
-        let catalog = cuteafd_loader::read_expert_catalog(&opened.snapshot)?;
+        let catalog = &opened.catalog;
         let homes = resource::layer_homes(engine.weights.layers.iter().enumerate().map(|(layer, weights)| {
             let local = tp2.as_ref().is_some_and(|layers| layers.contains(&layer));
-            (weights.dense, local, if local { 2 } else { remote.len() })
+            (weights.dense, local, if local { engine.ranks() } else { remote.len() })
         }), catalog.exl3(), |layer| engine.draft_weight_read_bytes(layer, &remote))?;
         let geometry = resource::geometry_with_grouping(&homes, engine.cfg.experts, engine.cfg.topk, DECODE_ROWS,
             d.cfg.drafts(), resource::COPY_EXTENSION, |layer, rows| engine.draft_group_rows(layer, rows, &remote))?;
         engine.arm_draft_probe()?;
         let prior = if d.token_only() { resource::Prior::History }
             else { resource::Prior::Selector(d.selector_fit("glm5", false)?) };
-        SharedPolicy::with_geometry(geometry, prior, draft_seed())
+        SharedPolicy::with_length(geometry, prior, draft_seed(), policy.length)
     }).transpose()?;
     let mut active: Vec<Active<'_>> = Vec::new();
     // Decoding requests waiting for KV pages: they keep their slot and pages, skip rounds.
@@ -671,6 +703,11 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
     // GLM's only decode lane (`LaneSupport::One`), polled on this thread.
     let lanes = LaneSet::default();
     // Prefix capacity and all fallible scheduler initialization precede readiness.
+    if crate::shared::inventory::startup_probe_enabled() {
+        let census = engine.allocation_census(&family, &cache, &selector, transport.as_deref())?;
+        let devices = engine.census_physical_devices()?;
+        opened.startup_probe(&devices, "glm/ready", Some(&census), true)?;
+    }
     ready();
     crate::shared::api::run_scheduler(|| {
     loop {
@@ -716,7 +753,7 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
                         let reject = |job: &NativeRequest, message: String| {
                             let _ = job.events.send(Err(NativeFailure::BadRequest(message)));
                         };
-                        if let Err(error) = probe::validate_scoring(&job.probe, engine.full_prefill_logits) {
+                        if let Err(error) = probe::validate_scoring(&job.probe, probe::prefill_scoring_admitted(engine.cfg.family_id(), engine.full_prefill_logits)) {
                             reject(&job, format!("scoring: {error:#}"));
                             continue;
                         }
@@ -822,7 +859,7 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
             job.prefix_cache_source.set(resume, admitted.source.as_ref().is_some_and(|source| source.host));
             probe::admitted(&job.probe, "glm5", &tokens, resume);
             let _ = job.events.send(Ok(InferenceChunk::Ready {
-                system_fingerprint: None,
+                system_fingerprint: Some(opened.view.fingerprint().to_owned()),
                 prompt_usage: PromptUsage { prompt_tokens: tokens.len(), prompt_cache_hit_tokens: resume },
             }));
             if let Some(from) = probe::scoring(&job.probe) {
@@ -830,13 +867,17 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
                 let mut placement = admitted.placement;
                 let mut state = (&mut placement, transport.as_deref_mut());
                 // Diagnostic tails can be smaller than the pipeline's 512-row minimum.
-                let prefill_rows = probe::scoring_prefill_capacity(engine.full_prefill_logits,
-                    engine.prefill_rows, engine.prefill_capacity());
+                let prefill_rows = if engine.full_prefill_logits {
+                    probe::scoring_prefill_capacity(true, engine.prefill_rows, engine.prefill_capacity())
+                } else { engine.prefill_capacity() };
                 let scored = probe::score(&opened.library, &job.probe, &tokens, from, prefill_rows,
-                    DECODE_ROWS, probe::verify_rows(&job.probe), engine.full_prefill_logits, &mut state,
-                    |(placement, transport), chunk, rows| {
+                    DECODE_ROWS, probe::verify_rows(&job.probe), probe::prefill_scoring_admitted(engine.cfg.family_id(), engine.full_prefill_logits), &mut state,
+                    |(placement, transport), chunk, rows, position| {
                         let experts = transport.as_deref_mut().map(|t| (t, runtime));
-                        if rows > 1 {
+                        if rows > 1 && !engine.full_prefill_logits && probe::streamed_prefill_scoring(engine.cfg.family_id()) {
+                            engine.prefill_streamed_scoring(placement, chunk, experts, &request_media,
+                                probe::ScoringRows { probe: &job.probe, position })
+                        } else if rows > 1 {
                             Ok(engine.prefill_scoring_media(placement, chunk, experts, rows, &request_media)?
                                 .map(|values| probe::ScoreLogits::Host { values, vocab: engine.cfg.vocab_size }))
                         } else {
@@ -1072,7 +1113,7 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
             continue;
         }
         let cycle = Instant::now();
-        let Some(finished) = runtime.block_on(lanes.run_one(|lease| decode_round(lease, engine, opened, policy.fixed,
+        let Some(finished) = runtime.block_on(lanes.run_one(|lease| decode_round(lease, engine, opened,
             &mut transport, runtime, &mut phases, &mut active, &mut shared, &mut selector, &family, &mut cache,
             &mut free_slots, &mut trace, cycle)))? else { continue };
         for index in (0..active.len()).rev() {
@@ -1128,7 +1169,7 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
 /// commit is the DFlash2 drafter's context update for the committed rows,
 /// enqueued on the drafter's stream and ordered before its next draft.
 struct DraftContext<'d, 'a> {
-    drafter: Option<&'d crate::shared::speculation::dflash::DflashDrafter<'a>>,
+    drafter: Option<&'d super::drafter::GlmDrafter<'a>>,
     context: Vec<ContextRow>,
 }
 
@@ -1145,7 +1186,7 @@ impl LaneCommit for DraftContext<'_, '_> {
 /// plan, verify on the lane's decode link, select, emit and commit. `None`
 /// when the step failed and its requests were released.
 #[allow(clippy::too_many_arguments)]
-async fn decode_round(lease: LaneLease<'_>, engine: &GlmEngine<'_>, opened: &Opened, fixed: Option<usize>,
+async fn decode_round(lease: LaneLease<'_>, engine: &GlmEngine<'_>, opened: &Opened,
     transport: &mut Option<&mut SparkLink<'_>>, runtime: &tokio::runtime::Runtime, phases: &mut [f64; 8],
     active: &mut Vec<Active<'_>>, shared: &mut Option<crate::shared::draft::runtime::SharedPolicy>,
     selector: &mut TokenSelector<'_>, family: &GlmPrefix<'_, '_>, cache: &mut PrefixCache<CudaCopyEngine<'_>>,
@@ -1165,7 +1206,7 @@ async fn decode_round(lease: LaneLease<'_>, engine: &GlmEngine<'_>, opened: &Ope
     // Skip/block decisions use the same resource prices as post-draft lengths.
     let eligible: Vec<_> = active.iter().zip(&limits).filter(|(a, limit)| a.slot.is_some() && **limit > 0)
         .map(|(a, &limit)| (a.ticket.id(), limit)).take(drafter.map_or(0, |d| d.max_batch_sequences())).collect();
-    let run_draft = if eligible.is_empty() { false } else if fixed.is_some()
+    let run_draft = if eligible.is_empty() { false } else if shared.as_ref().is_some_and(|p| p.policy.fixed())
         || active.iter().any(|a| a.drafts.cold() && eligible.iter().any(|&(id, _)| id == a.ticket.id())) { true } else {
         let shared = shared.as_mut().expect("eligible draft slots have a shared policy");
         let width = drafter.unwrap().cfg.drafts();
@@ -1217,15 +1258,13 @@ async fn decode_round(lease: LaneLease<'_>, engine: &GlmEngine<'_>, opened: &Ope
     }).collect();
     let copies: Vec<_> = active.iter().zip(&drafted).zip(&limits).zip(&mut priors)
         .map(|(((a, draft), &limit), prior)| match (&shared, draft) {
-            (Some(shared), Some(d)) if fixed.is_none() => resource::copy_continuation(&shared.policy, active.len(),
+            (Some(shared), Some(d)) if !shared.policy.fixed() => resource::copy_continuation(&shared.policy, active.len(),
                 a.ticket.id(), &a.history, &d.tokens, prior, limit, a.job.sampling.is_greedy()),
             _ => None,
         }).collect();
     let mut predicted = None;
-    let mut planned = match (fixed, shared.as_mut()) {
-        (Some(fixed), _) => drafted.iter().zip(&limits).map(|(draft, &limit)|
-            draft.as_ref().map_or(0, |d| fixed.min(limit).min(d.tokens.len()))).collect(),
-        (None, Some(shared)) if drafted_width > 0 => {
+    let mut planned = match shared.as_mut() {
+        Some(shared) if drafted_width > 0 => {
             let candidates: Vec<_> = active.iter().zip(&priors).zip(&limits).map(|((a, prior), &limit)|
                 resource::Candidate { id: a.ticket.id(), prior, limit, selector: !token_only, cold: a.drafts.cold() }).collect();
             let selection = resource::select_drafted(&mut shared.policy, &candidates, drafted_width, DECODE_ROWS, drafted_requests);
@@ -1423,6 +1462,16 @@ mod media_tests {
 #[cfg(test)]
 mod lane_tests {
     #[test]
+    fn publish_keeps_reconciliation_but_leaves_graph_inventory_to_http() {
+        let source = include_str!("serve.rs");
+        let publish = source.split_once("\nfn publish(").unwrap().1
+            .split_once("\n/// Weak GLM").unwrap().0;
+        assert!(publish.contains("capture(\"first_request\")"));
+        assert!(!publish.contains("graph_capture_stats"));
+        assert!(include_str!("../../shared/api.rs").contains("profile.stats_diagnostics = Some(crate::shared::probe::graph_capture_stats)"));
+    }
+
+    #[test]
     fn final_chunk_cancellation_parks_before_error_or_missing_head() {
         let source = include_str!("serve.rs");
         let finish = source.split_once(concat!("for (mut p, pre", "filled) in finished {")).unwrap().1
@@ -1461,6 +1510,23 @@ mod draft_tests {
     use super::*;
 
     #[test]
+    fn streamed_scoring_activation_is_specific_to_the_checkpoint_family() -> Result<()> {
+        use cuteafd_loader::families::glm5::GlmDsaConfig;
+        let ml4 = GlmDsaConfig::from_hf(&serde_json::from_str(include_str!(
+            "../../../../cuteafd-loader/src/families/mistral_large4/official-config.json"))?)?;
+        let mut glm = ml4.clone();
+        glm.variant = cuteafd_loader::families::glm5::GlmVariant::Glm;
+        assert_eq!(glm.family_id(), "glm5");
+        assert_eq!(ml4.family_id(), "mistral_large4");
+        assert!(probe::streamed_prefill_scoring(glm.family_id()));
+        assert!(probe::prefill_scoring_admitted(glm.family_id(), false));
+        assert!(probe::streamed_prefill_scoring(ml4.family_id()));
+        assert!(probe::prefill_scoring_admitted(ml4.family_id(), false));
+        assert!(probe::prefill_scoring_admitted(ml4.family_id(), true));
+        Ok(())
+    }
+
+    #[test]
     fn ml4_console_reports_layers_context_and_bundled_dspark() -> Result<()> {
         #[derive(clap::Parser)]
         struct Cli { #[command(flatten)] args: ServeArgs }
@@ -1468,17 +1534,22 @@ mod draft_tests {
         let dir = tempfile::tempdir()?;
         std::fs::write(dir.path().join("config.json"), include_str!(
             "../../../../cuteafd-loader/src/families/mistral_large4/official-config.json"))?;
+        std::fs::write(dir.path().join("params.json"), serde_json::to_vec(&serde_json::json!({
+            "mtp": { "n_layers": 3, "depth": 3, "ragged_attention": "2048,2048,2048",
+                "target_activation_layers": "1,18,36,54,71", "norm_strategy": "eagle",
+                "dspark": { "markov_rank": 512, "head_type": "rnn", "draft_input": "position_specific" } }
+        }))?)?;
         let cfg = cuteafd_loader::families::glm5::GlmDsaConfig::read(dir.path())?;
         for (placement, expected) in [("auto", "context split"), ("layers", "layers split"),
             ("context", "context split"), ("heads", "heads split")] {
             let args = Cli::try_parse_from(["test", "--snapshot", dir.path().to_str().unwrap(),
                 "--native-lib", "/unused", "--manifest", "/unused", "--split-device", "1",
                 "--attention-placement", placement, "--dspark"])?.args;
-            let layout = console_layout(&args, "ml4", &cfg, 16);
+            let layout = console_layout(&args, "ml4", &cfg, 16, 3);
             assert_eq!(layout.split.as_deref(), Some(expected));
             let spec = layout.speculator.unwrap();
             assert_eq!(spec.name, "dSpark");
-            assert_eq!(spec.positions, 4);
+            assert_eq!(spec.positions, 3);
         }
         Ok(())
     }
@@ -1500,22 +1571,35 @@ mod draft_tests {
         std::fs::write(&manifest, r#"{"capacities":{"max_context":1048576}}"#)?;
         let mut census = Vec::new();
         for context in [0usize, 1_048_576] {
+            let context_arg = if context == 0 { "auto".into() } else { context.to_string() };
             let mut args = Cli::try_parse_from(["test", "--snapshot", dir.path().to_str().unwrap(),
                 "--native-lib", "/unused", "--manifest", manifest.to_str().unwrap(),
-                "--max-context", &context.to_string(), "--dspark", "--max-sequences", "16"])?.args;
+                "--max-context-tokens", &context_arg, "--dspark", "--max-sequences", "16",
+                "--host-cache-bytes", "auto"])?.args;
             args.prefix.resolve_entries(args.max_sequences.unwrap());
             let mut resolved = super::super::ResolvedEngineArgs::new(&args.engine)?;
             assert_eq!(resolved.args.max_context, 1_048_576);
-            assert_eq!(resolved.automatic_context, context == 0);
+            assert_eq!(matches!(resolved.context.pin, cuteafd_loader::placement::planner::Pin::Auto), context == 0);
             assert_eq!(args.engine.max_context, context, "CLI auto policy must remain intact");
             // Removing the manifest after resolution proves sizing does not resolve it again.
             std::fs::remove_file(&manifest)?;
             size_draft_window_marks(&mut resolved, &args.prefix, args.max_sequences.unwrap())?;
             assert!(resolved.args.draft_window_marks > 0);
             census.push((resolved.args.max_context, resolved.args.draft_window_marks));
-            let pool_context = crate::shared::context::pool_context("glm5", resolved.args.max_context,
-                resolved.automatic_context, 524_288, 256);
-            if context == 0 { assert_eq!(pool_context?, 524_032); }
+            resolved.args.split_device = Some(1);
+            resolved.args.attention_placement = "heads".into();
+            size_draft_window_marks(&mut resolved, &args.prefix, args.max_sequences.unwrap())?;
+            let layout = cuteafd_loader::placement::families::glm5::ml4_draft_layout(&resolved.args.snapshot,
+                resolved.args.draft_context_slots.unwrap_or(20), resolved.args.draft_sequences,
+                resolved.args.max_context, 1)?;
+            let mut rule = args.prefix.mark_rule(args.max_sequences.unwrap());
+            rule.host = false;
+            assert_eq!(resolved.args.draft_window_marks, rule.slots(
+                cuteafd_loader::placement::families::glm5::draft_window_mark_bytes(&layout)?));
+            assert!(resolved.args.draft_window_marks > census.last().unwrap().1);
+
+            let pool_context = crate::shared::context::pool_context("glm5", resolved.context, 524_288);
+            if context == 0 { assert_eq!(pool_context?, 524_288); }
             else { assert!(pool_context.is_err()); }
             std::fs::write(&manifest, r#"{"capacities":{"max_context":1048576}}"#)?;
         }
@@ -1553,7 +1637,7 @@ mod draft_tests {
     fn installed_reports(bytes: Option<[usize; 2]>, conservative: bool) -> Vec<InstalledExpertGrouping> {
         let identity: WorkerIdentity = serde_json::from_value(serde_json::json!({
             "checkpoint": "0".repeat(64), "geometry": [6144, 256, 8, 2048, 78],
-            "world": 2, "topology": [2, 1], "ownership_wire": false,
+            "world": 2,
         })).unwrap();
         let loaded = WorkerSelection::new(identity, &(3..78).collect::<Vec<_>>()).unwrap();
         (0..2).map(|rank| {

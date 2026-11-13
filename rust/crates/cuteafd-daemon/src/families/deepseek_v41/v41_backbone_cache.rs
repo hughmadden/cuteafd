@@ -226,6 +226,38 @@ impl<'a> BackboneCache<'a> {
         }
         Ok(bank)
     }
+    pub(crate) fn capture_startup_local_producers(&self,
+        windows: &mut [WindowWave<'_, 'a>], sources: &mut [CompressorWave<'_, 'a>], rows: &[usize]) -> Result<()> {
+        ensure!(windows.len() == self.windows.len() && sources.len() == self.sources.len(),
+            "startup producer owner count differs");
+        for (wave, state) in windows.iter_mut().zip(&self.windows) {
+            wave.capture_startup(state.get(), rows)?;
+            crate::shared::decode_graph::device::observe_device(state.device.library, state.device.id)?;
+        }
+        for (wave, state) in sources.iter_mut().zip(&self.sources) {
+            wave.capture_startup(state.get(), rows)?;
+            crate::shared::decode_graph::device::observe_device(state.device.library, state.device.id)?;
+        }
+        Ok(())
+    }
+    pub(crate) fn capture_startup_producers(&self, windows: &mut [DeviceOwner<'a, WindowWave<'_, 'a>>],
+        sources: &mut [DeviceOwner<'a, CompressorWave<'_, 'a>>], rows: &[usize]) -> Result<()> {
+        ensure!(windows.len() == self.windows.len() && sources.len() == self.sources.len(),
+            "startup producer owner count differs");
+        for (wave, state) in windows.iter_mut().zip(&self.windows) {
+            ensure!(wave.device.id == state.device.id, "startup window device differs");
+            let device = wave.device;
+            device.run(|| wave.get_mut().capture_startup(state.get(), rows))?;
+            crate::shared::decode_graph::device::observe_device(device.library, device.id)?;
+        }
+        for (wave, state) in sources.iter_mut().zip(&self.sources) {
+            ensure!(wave.device.id == state.device.id, "startup compressor device differs");
+            let device = wave.device;
+            device.run(|| wave.get_mut().capture_startup(state.get(), rows))?;
+            crate::shared::decode_graph::device::observe_device(device.library, device.id)?;
+        }
+        Ok(())
+    }
     /// Bind fresh producer workspaces to this bank's optional replica owners.
     /// Called separately for each independent lane, before any production.
     pub fn configure_producer_replicas(&self,windows:&mut [DeviceOwner<'a,WindowWave<'_, 'a>>],
@@ -455,15 +487,6 @@ impl<'a> BackboneCache<'a> {
     }
     pub fn stage(&self, lease: CacheLease) -> Result<CacheStage> {
         Ok(self.request(lease)?.phase.stage())
-    }
-    /// Engram advances through encoder replay, while global source ownership
-    /// remains at the cached prefix end. Decoder replay has no Engram work.
-    pub fn history_end(&self, lease: CacheLease) -> Result<u64> {
-        let end = self.committed_end(lease)?;
-        Ok(match self.request(lease)?.phase {
-            CachePhase::EncoderReplay { end, .. } => end,
-            _ => end,
-        })
     }
     /// Whether every request of `work` can append its tokens inside its bound pages; an error
     /// (`SourcePoolExhausted` past the binding) names the first that cannot.

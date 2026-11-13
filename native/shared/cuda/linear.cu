@@ -1,3 +1,5 @@
+#include "memory_failure.h"
+#include "blas_owner.h"
 #include "common.h"
 
 #include <cublas_v2.h>
@@ -887,6 +889,7 @@ cuteafd_status_t ensure_cuda_driver_context() {
   }
   CUcontext context = nullptr;
   if (cuCtxGetCurrent(&context) != CUDA_SUCCESS || context == nullptr) {
+    // Third-party residual: CUDA context storage, not an owned backing.
     if (cudaFree(nullptr) != cudaSuccess ||
         cuCtxGetCurrent(&context) != CUDA_SUCCESS || context == nullptr) {
       return CUTEAFD_STATUS_INTERNAL_ERROR;
@@ -913,6 +916,7 @@ cuteafd_status_t triton_driver_kernel(const char* cubin_path,
     return CUTEAFD_STATUS_INTERNAL_ERROR;
   }
   TritonDriverKernel loaded;
+  // Third-party residual: driver-owned module/code storage, retained by the kernel cache.
   if (cuModuleLoad(&loaded.module, cubin_path) != CUDA_SUCCESS ||
       cuModuleGetFunction(&loaded.function, loaded.module, kernel_name) !=
           CUDA_SUCCESS) {
@@ -926,38 +930,63 @@ cuteafd_status_t triton_driver_kernel(const char* cubin_path,
   return CUTEAFD_STATUS_OK;
 }
 
-void log_blas_handle_created(const char* library) {
-  char thread_name[16] = "unknown";
-  (void)pthread_getname_np(pthread_self(), thread_name, sizeof(thread_name));
-  std::fprintf(stderr,
-               "cuteafd BLAS handle created library=%s thread=%s "
-               "configured_workspace=runtime-default configured_workspace_bytes=unknown\n",
-               library, thread_name);
-}
+constexpr size_t kLinearBlasWorkspace = 4 << 20;
+struct LinearBlas {
+  std::shared_ptr<cuteafd::BlasOwner> owner;
+  std::unordered_map<cudaStream_t, void*> workspaces;
+  ~LinearBlas() {
+    if (!owner) return;
+    int previous = -1;
+    if (cudaGetDevice(&previous) != cudaSuccess || cudaSetDevice(owner->device) != cudaSuccess) return;
+    // Stream handles may already be retired. Drain the device before releasing
+    // addresses retained by graphs; the launch thread outlives those graphs.
+    cudaDeviceSynchronize();
+    for (const auto& entry : workspaces) CUTEAFD_TRACK_FREE(entry.second, cudaFree(entry.second));
+    if (previous != owner->device) cudaSetDevice(previous);
+  }
+};
 
-cuteafd_status_t cublas_handle(cublasHandle_t* out) {
-  if (out == nullptr) {
-    return CUTEAFD_STATUS_INVALID_ARGUMENT;
-  }
+cuteafd_status_t cublas_handle(cublasHandle_t* out, cudaStream_t stream = nullptr,
+                             const char* entry = "cuteafd_cuda_prepare_cublas_handle") {
+  if (!out) return CUTEAFD_STATUS_INVALID_ARGUMENT;
   int device = 0;
-  const cudaError_t device_status = cudaGetDevice(&device);
-  if (device_status != cudaSuccess) {
-    return status_from_cuda(device_status);
-  }
-  // A thread can launch target and remote-drafter work on different devices.
-  static thread_local std::unordered_map<int, cublasHandle_t> handles;
-  auto found = handles.find(device);
-  if (found == handles.end()) {
-    cublasHandle_t handle = nullptr;
-    const cublasStatus_t status = cublasCreate(&handle);
-    if (status != CUBLAS_STATUS_SUCCESS) {
-      return status_from_cublas(status);
+  auto cuda_status = cudaGetDevice(&device);
+  if (cuda_status != cudaSuccess) return status_from_cuda(cuda_status);
+  try {
+    static thread_local std::unordered_map<int, LinearBlas> handles;
+    auto& state = handles[device];
+    auto found = state.workspaces.find(stream);
+    if (!state.owner || found == state.workspaces.end()) {
+      cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
+      cuda_status = cudaStreamIsCapturing(stream, &capture);
+      if (cuda_status != cudaSuccess) return status_from_cuda(cuda_status);
+      if (capture != cudaStreamCaptureStatusNone) {
+        const std::string message = std::string(entry) + ": call prepare_cublas_handle for this thread/device/stream before capture";
+        cuteafd_set_last_error_message(message.c_str());
+        return CUTEAFD_STATUS_CAPTURE_REQUIRES_PREPARE;
+      }
+      auto status = cuteafd::borrow_blas(false, state.owner, "shared/blas/linear");
+      if (status != CUBLAS_STATUS_SUCCESS) return status_from_cublas(status);
+      // Insert first: a host allocation failure must not leak device scratch.
+      auto slot = state.workspaces.emplace(stream, nullptr);
+      cuda_status = CUTEAFD_TRACK_ALLOC("cudaMalloc", &slot.first->second, kLinearBlasWorkspace, 0, CUTEAFD_MEMORY_KIND_WORKSPACE, "shared/blas/linear",
+          cudaMalloc(&slot.first->second, kLinearBlasWorkspace));
+      if (cuda_status != cudaSuccess) {
+        state.workspaces.erase(slot.first);
+        return status_from_cuda(cuda_status);
+      }
+      found = slot.first;
+      std::fprintf(stderr, "blas_workspace device=%d thread_id=%ld stream=%p bytes=%zu ptr=%p\n",
+          device, state.owner->thread_id, static_cast<void*>(stream), kLinearBlasWorkspace, found->second);
     }
-    found = handles.emplace(device, handle).first;
-    log_blas_handle_created("cublas");
+    auto status = cuteafd::bind_blas(state.owner, stream, found->second, kLinearBlasWorkspace,
+        CUBLAS_MATH_DISALLOW_REDUCED_PRECISION_REDUCTION);
+    if (status != CUBLAS_STATUS_SUCCESS) return status_from_cublas(status);
+    *out = state.owner->gemm;
+    return CUTEAFD_STATUS_OK;
+  } catch (const std::bad_alloc&) {
+    return status_from_cublas(CUBLAS_STATUS_ALLOC_FAILED);
   }
-  *out = found->second;
-  return CUTEAFD_STATUS_OK;
 }
 
 cuteafd_status_t validate_linear_args(const float* input, const float* weight, const float* output,
@@ -1081,14 +1110,12 @@ cuteafd_status_t launch_linear_bf16_cublas(const uint16_t* input, const uint16_t
     return CUTEAFD_STATUS_INVALID_ARGUMENT;
   }
   cublasHandle_t handle = nullptr;
-  cuteafd_status_t handle_status = cublas_handle(&handle);
+  cuteafd_status_t handle_status = cublas_handle(&handle, stream,
+      "cuteafd_cuda_linear_bf16_cublas_async");
   if (handle_status != CUTEAFD_STATUS_OK) {
     return handle_status;
   }
-  cublasStatus_t status = cublasSetStream(handle, stream);
-  if (status != CUBLAS_STATUS_SUCCESS) {
-    return status_from_cublas(status);
-  }
+  cublasStatus_t status = CUBLAS_STATUS_SUCCESS;
 
   const float alpha = 1.0f;
   const float beta = 0.0f;
@@ -1133,14 +1160,12 @@ cuteafd_status_t launch_linear_bf16_f32_cublas(
     return CUTEAFD_STATUS_INVALID_ARGUMENT;
   }
   cublasHandle_t handle = nullptr;
-  cuteafd_status_t handle_status = cublas_handle(&handle);
+  cuteafd_status_t handle_status = cublas_handle(&handle, stream,
+      "cuteafd_cuda_linear_bf16_f32_cublas_async");
   if (handle_status != CUTEAFD_STATUS_OK) {
     return handle_status;
   }
-  cublasStatus_t status = cublasSetStream(handle, stream);
-  if (status != CUBLAS_STATUS_SUCCESS) {
-    return status_from_cublas(status);
-  }
+  cublasStatus_t status = CUBLAS_STATUS_SUCCESS;
   const float alpha = 1.0f;
   const float beta = 0.0f;
   status = cublasGemmEx(
@@ -1175,14 +1200,12 @@ cuteafd_status_t launch_linear_bf16_strided_batched_cublas(
     return CUTEAFD_STATUS_INVALID_ARGUMENT;
   }
   cublasHandle_t handle = nullptr;
-  cuteafd_status_t handle_status = cublas_handle(&handle);
+  cuteafd_status_t handle_status = cublas_handle(&handle, stream,
+      "cuteafd_cuda_linear_bf16_strided_batched_cublas_async");
   if (handle_status != CUTEAFD_STATUS_OK) {
     return handle_status;
   }
-  cublasStatus_t status = cublasSetStream(handle, stream);
-  if (status != CUBLAS_STATUS_SUCCESS) {
-    return status_from_cublas(status);
-  }
+  cublasStatus_t status = CUBLAS_STATUS_SUCCESS;
 
   const float alpha = 1.0f;
   const float beta = 0.0f;
@@ -1224,14 +1247,12 @@ cuteafd_status_t launch_matmul_bf16_strided_batched_cublas(
     return CUTEAFD_STATUS_INVALID_ARGUMENT;
   }
   cublasHandle_t handle = nullptr;
-  cuteafd_status_t handle_status = cublas_handle(&handle);
+  cuteafd_status_t handle_status = cublas_handle(&handle, stream,
+      "cuteafd_cuda_matmul_bf16_strided_batched_cublas_async");
   if (handle_status != CUTEAFD_STATUS_OK) {
     return handle_status;
   }
-  cublasStatus_t status = cublasSetStream(handle, stream);
-  if (status != CUBLAS_STATUS_SUCCESS) {
-    return status_from_cublas(status);
-  }
+  cublasStatus_t status = CUBLAS_STATUS_SUCCESS;
 
   const float alpha = 1.0f;
   const float beta = 0.0f;
@@ -1254,6 +1275,15 @@ cuteafd_status_t launch_matmul_bf16_strided_batched_cublas(
 }
 
 }  // namespace
+
+// Only shared-cuBLAS users prepare; unrelated captures must not create a handle.
+extern "C" cuteafd_status_t cuteafd_cuda_prepare_cublas_stream(void* stream) {
+  cublasHandle_t handle = nullptr;
+  return cublas_handle(&handle, reinterpret_cast<cudaStream_t>(stream));
+}
+extern "C" cuteafd_status_t cuteafd_cuda_prepare_cublas_handle() {
+  return cuteafd_cuda_prepare_cublas_stream(nullptr);
+}
 
 extern "C" cuteafd_status_t cuteafd_cuda_graph_update_linear_bf16_node(
     void* cuda_graph, void* cuda_graph_exec, size_t kernel_node_index, cuteafd_device_buffer_t input,

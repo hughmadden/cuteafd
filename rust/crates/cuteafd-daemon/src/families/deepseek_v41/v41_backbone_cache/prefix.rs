@@ -2,6 +2,7 @@
 //! source's carry, copied into a positional mark the prefix engine's arena holds
 //! ([`BackboneMark::BYTES`]), described by plain data ([`BackboneMark`]). Global source rows live
 //! in pages the engine forks; nothing here owns device memory.
+use crate::shared::memory::Tag;
 use super::*;
 use crate::families::deepseek_v41::v41_compressor::COMPRESSOR_PREFIX_BYTES;
 use crate::families::deepseek_v41::v41_window::WINDOW_PREFIX_BYTES;
@@ -35,7 +36,7 @@ impl<'a> BackboneCache<'a> {
         use crate::shared::memory::device::{Allocation, Device};
         let library = self.prefix_stream.library;
         let device = Device { library, id: library.cuda_get_device()? };
-        let mark = Allocation::new(device, BackboneMark::BYTES)?;
+        let mark = Allocation::new(device, BackboneMark::BYTES, Tag::prefix("v41/prefix-marks"))?;
         let meta = self.capture_mark(lease, mark.buffer)?;
         let mut bytes = Vec::new();
         let mut read = |buffer: CuteafdDeviceBuffer| -> Result<()> {
@@ -78,55 +79,6 @@ impl<'a> BackboneCache<'a> {
             })?;
         }
         Ok((meta, bytes))
-    }
-
-    /// Start a fresh request at the complete-group frontier `end` of source pages the prefix
-    /// engine forked and bound, with empty encoder windows at the bounded replay start
-    /// `end - 128`. Decoder windows remain fresh. Replay reads the shared source rows without
-    /// producing them. Returns the replay start.
-    pub fn restore_encoder_prefix(&mut self, lease: CacheLease, end: u64, prompt_end: u64) -> Result<u64> {
-        let request = self.request(lease)?;
-        ensure!(
-            end > 0
-                && end % 2 == 0
-                && end <= prompt_end
-                && prompt_end <= 1048576
-                && request.end == 0
-                && request.version == 0
-                && request.phase == CachePhase::Full
-                && request.publication.is_empty(),
-            "invalid encoder prefix restore frontier"
-        );
-        let start = end.saturating_sub(128);
-        let windows = request.windows;
-        let sources = request.sources;
-        let result = (|| -> Result<()> {
-            for layer in 0..20 {
-                self.windows[layer].begin_encoder_replay(windows[layer], start)?;
-            }
-            for (state, lease) in self.sources.iter_mut().zip(sources) {
-                state.restore_compressed_prefix(lease, end)?;
-            }
-            Ok(())
-        })();
-        if let Err(error) = result {
-            if let Err(cleanup) = self.release(&[lease]) {
-                tracing::error!(%cleanup, "releasing failed encoder prefix restore");
-            }
-            return Err(error);
-        }
-        let request = self.requests[lease.slot]
-            .as_mut()
-            .expect("validated fresh admission");
-        request.end = end;
-        request.phase = CachePhase::EncoderReplay {
-            prefix: end,
-            target: prompt_end,
-            end: start,
-        };
-        request.version = 1;
-        self.committed_end(lease)?;
-        Ok(start)
     }
 
     /// Copy a fully committed request's windows and carry into `mark` (synchronously). Only a
@@ -395,11 +347,11 @@ impl<'a> BackboneCache<'a> {
         }
         Ok(TestSnapshot { mark, meta, sources })
     }
-    fn test_fork(&mut self, lease: CacheLease, saved: &TestSnapshot<'a>, end: Option<u64>) -> Result<()> {
+    fn test_fork(&mut self, lease: CacheLease, saved: &TestSnapshot<'a>) -> Result<()> {
         let library = self.prefix_stream.library;
         let sources = self.request(lease)?.sources;
         for (((state, lease), (rows, pages)), i) in self.sources.iter_mut().zip(sources).zip(&saved.sources).zip(0..) {
-            let rows = end.map_or(*rows, |end| end as usize / state.ratio());
+            let rows = *rows;
             let (bound, _) = state.binding(lease)?;
             let bound = bound.to_vec();
             let device = state.device;
@@ -421,13 +373,13 @@ impl<'a> BackboneCache<'a> {
     }
     pub fn retain_prefix(&mut self, lease: CacheLease, budget: usize) -> Result<TestSnapshot<'a>> {
         ensure!(budget >= BackboneMark::BYTES, "retained backbone tail exceeds budget");
-        let mark = crate::shared::memory::DeviceAllocation::new(self.prefix_stream.library, BackboneMark::BYTES)?;
+        let mark = crate::shared::memory::DeviceAllocation::new(self.prefix_stream.library, BackboneMark::BYTES, Tag::prefix("v41/prefix-marks"))?;
         let meta = self.capture_mark(lease, mark.buffer)?;
         self.test_snapshot(lease, mark, meta)
     }
     pub fn queue_prefix(&mut self, lane: usize, lease: CacheLease, budget: usize) -> Result<()> {
         ensure!(budget >= BackboneMark::BYTES, "retained backbone tail exceeds budget");
-        let mark = crate::shared::memory::DeviceAllocation::new(self.prefix_stream.library, BackboneMark::BYTES)?;
+        let mark = crate::shared::memory::DeviceAllocation::new(self.prefix_stream.library, BackboneMark::BYTES, Tag::prefix("v41/prefix-marks"))?;
         let meta = self.queue_mark(lane, lease, mark.buffer)?;
         self.test_queued[lane] = Some((lease, mark, meta));
         Ok(())
@@ -451,21 +403,15 @@ impl<'a> BackboneCache<'a> {
         aborted
     }
     pub fn restore_prefix(&mut self, lease: CacheLease, saved: &TestSnapshot<'a>) -> Result<()> {
-        self.test_fork(lease, saved, None)?;
+        self.test_fork(lease, saved)?;
         self.restore_mark(lease, &saved.meta, saved.mark.buffer)
     }
     pub fn restore_continuation(&mut self, lease: CacheLease, saved: &TestSnapshot<'a>, prompt_end: u64)
         -> Result<()> {
         ensure!(prompt_end <= 1048576 && prompt_end.saturating_sub(saved.meta.end) >= 128,
             "encoder continuation must cover the final decoder window");
-        self.test_fork(lease, saved, None)?;
+        self.test_fork(lease, saved)?;
         self.restore_encoder_continuation(lease, &saved.meta, saved.mark.buffer, prompt_end)
-    }
-    pub fn restore_encoder_prefix_from(&mut self, lease: CacheLease, saved: &TestSnapshot<'a>, end: u64,
-        prompt_end: u64) -> Result<u64> {
-        ensure!(end <= saved.meta.end && end % 2 == 0, "encoder prefix past the snapshot or unaligned");
-        self.test_fork(lease, saved, Some(end))?;
-        self.restore_encoder_prefix(lease, end, prompt_end)
     }
 }
 

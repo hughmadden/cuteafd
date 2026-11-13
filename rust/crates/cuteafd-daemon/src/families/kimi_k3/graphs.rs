@@ -1,26 +1,153 @@
-//! Exact startup-only rank-local arithmetic graphs. Transport and event joins
-//! remain in the shared layer executor, outside these captured segments.
-use super::block::MixSite;
-use crate::shared::{decode_graph::{GraphBank, GraphDecision, GraphOwner, GraphPolicy},
+//! Rank-local step graphs. Context steps include same-stream device exchange;
+//! ordinary hidden/event joins remain in the shared layer executor.
+//!
+//! Executables are owned by the shared bounded device cache: pinned geometry is
+//! prewarmed once at startup and everything else is captured lazily on the miss
+//! that first needs it, or run eagerly when the controller declines. A step
+//! never refuses for a missing executable.
+use crate::shared::{decode_graph::{device::{Basis, Cycle, Preference, Site}, CacheAttached,
+        CaptureTicket, GraphBank, GraphOwner, GraphPolicy},
     memory::device::Stream};
-use anyhow::{ensure, Result};
+use anyhow::{ensure, Context, Result};
+use cuteafd_ffi::NativeLibrary;
 use cuteafd_loader::{families::kimi_k3::config::{KimiAttention, KimiK3Config},
-    placement::inventory::StartupGraphs};
+    placement::inventory::StartupGraphs,
+    serving_capacity::kimi_prewarm::{kimi_bootstrap, kimi_layout, kimi_selected, KimiCoreFormat, KimiPrewarmLayout, KimiPrewarmOp}};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub(crate) enum Op { Residual(MixSite), Attention { layer: usize, sequences: usize, speculative: bool }, Ffn(usize) }
+pub(crate) enum Op {
+    Attention { layer: usize, speculative: bool },
+    Context { layer: usize, speculative: bool },
+    Ffn(usize),
+}
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct Key { pub lane: usize, pub rank: usize, pub rows: usize, pub op: Op }
+
+/// One line per captured key. The shared cache stores this as the trace shape,
+/// so `scripts/dev/graph-prewarm-from-trace.py` parses these fields.
+impl std::fmt::Debug for Key {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "lane={} rank={} rows={} ", self.lane, self.rank, self.rows)?;
+        match self.op {
+            Op::Attention { layer, speculative } => write!(
+                f, "op=attention layer={layer} spec={}", u8::from(speculative)),
+            Op::Context { layer, speculative } => write!(
+                f, "op=context layer={layer} spec={}", u8::from(speculative)),
+            Op::Ffn(layer) => write!(f, "op=ffn layer={layer}"),
+        }
+    }
+}
+
+impl Op {
+    /// The speculative (verify) variant. FFN keys carry no split.
+    pub(crate) fn speculative(self) -> bool {
+        match self { Self::Attention { speculative, .. } | Self::Context { speculative, .. } => speculative,
+            Self::Ffn(_) => false }
+    }
+}
+
+/// Scoring and diagnostic decode disable optional arithmetic graphs, not the
+/// mandatory Context exchange executable. Context never runs in a row window.
+pub(crate) fn replay_allowed(op: Op, optional: bool, window: bool) -> Result<bool> {
+    if matches!(op, Op::Context { .. }) {
+        ensure!(!window, "Kimi context graph needs its fixed row storage");
+        Ok(true)
+    } else {
+        Ok(optional && !window)
+    }
+}
 
 pub(crate) use cuteafd_loader::families::kimi_k3::allocation::{GRAPH_RESERVE as RESERVE,
     graph_demand as demand};
 use cuteafd_loader::families::kimi_k3::allocation::{graph_rows, verify_graph_rows};
 
-/// An estimated reserve until the first real serving census qualifies its bytes.
-/// The exact same key set is charged by admission and sealed by each binding.
-/// `verify` (the drafter's block, 0 without one) adds every exact verify width
-/// with its speculative single-sequence attention, the C1 verify shape.
+fn geometry(op: Op) -> KimiPrewarmOp {
+    match op {
+        Op::Ffn(_) => KimiPrewarmOp::Ffn,
+        Op::Attention { .. } => KimiPrewarmOp::Attention,
+        Op::Context { .. } => KimiPrewarmOp::Context,
+    }
+}
+
+pub(crate) fn prewarm_selected(layout: &KimiPrewarmLayout, key: Key, pinned: bool) -> bool {
+    kimi_selected(layout, key.rows, key.op.speculative(), geometry(key.op), pinned)
+}
+
+pub(crate) fn pinned(core: KimiCoreFormat, ranks: usize, key: Key) -> bool {
+    prewarm_selected(kimi_layout(core, ranks), key, true)
+}
+
+/// Project observed trace geometries onto the placement's actual sites. No new
+/// prefill/window keys are invented. Sequence layout lives in device metadata.
+pub(crate) fn prewarm_keys(_cfg: &KimiK3Config, inventory: &[Key], layout: &KimiPrewarmLayout,
+    _slots: usize, capacity: usize) -> Vec<Key> {
+    let mut keys = std::collections::HashSet::new();
+    for entry in &layout.entries {
+        if !(1..=64.min(capacity)).contains(&entry.rows) { continue }
+        for &template in inventory {
+            if entry.op.is_none() {
+                if prewarm_selected(layout, template, false) { keys.insert(template); }
+                continue;
+            }
+            let op = match (entry.op.unwrap(), template.op) {
+                (KimiPrewarmOp::Ffn, Op::Ffn(layer)) => Op::Ffn(layer),
+                (KimiPrewarmOp::Context, Op::Context { layer, .. }) =>
+                    Op::Context { layer, speculative: entry.speculative },
+                (KimiPrewarmOp::Attention, Op::Attention { layer, .. }) => {
+                    Op::Attention { layer, speculative: entry.speculative }
+                }
+                _ => continue,
+            };
+            let key = Key { rows: entry.rows, op, ..template };
+            if prewarm_selected(layout, key, false) { keys.insert(key); }
+        }
+    }
+    let mut keys = keys.into_iter().collect::<Vec<_>>();
+    keys.sort_by_cached_key(|key| format!("{key:?}"));
+    keys
+}
+
+/// Fit whole geometries against the admitted prewarm base, never runtime EXTRA.
+/// Measured geometry shares use the same costs that produced the base. Only
+/// unmeasured entries use the provisional per-executable census.
+pub(crate) fn fit_prewarm(keys: Vec<Key>, layout: &KimiPrewarmLayout,
+    bases: &[u64], bootstraps: &[u64]) -> Vec<Key> {
+    let pins = layout.entries.iter().map(|entry| entry.pin).collect::<Vec<_>>();
+    let geometries = layout.entries.iter().map(|entry| KimiPrewarmLayout {
+        core: layout.core, ranks: layout.ranks, layout: layout.layout.clone(), reserve_base_bytes: Vec::new(),
+        reserve_extra_bytes: 0, entries: vec![entry.clone()],
+    }).collect::<Vec<_>>();
+    let matches = |index: usize, key: Key| prewarm_selected(&geometries[index], key, false);
+    let costs = layout.entries.iter().enumerate().map(|(index, entry)| {
+        bases.iter().enumerate().map(|(rank, _)| {
+            entry.capture_bytes.get(rank).copied().flatten().map(|bytes|
+                if keys.iter().any(|key| key.rank == rank && matches(index, *key)) { bytes } else { 0 })
+        }).collect::<Vec<_>>()
+    }).collect::<Vec<_>>();
+    let fits = |selected: &[usize], bases: &[u64]| {
+        bases.iter().enumerate().all(|(rank, base)| {
+            // Bootstrap entries can overlap. Charge each fallback executable
+            // once, while measured trace entries have disjoint exact geometry.
+            let measured = selected.iter().filter_map(|index| costs[*index][rank])
+                .fold(0u64, u64::saturating_add);
+            let unmeasured = keys.iter().filter(|key| key.rank == rank && selected.iter().any(|index|
+                costs[*index][rank].is_none() && matches(*index, **key))).count() as u64;
+            measured.saturating_add(unmeasured.saturating_mul(bootstraps[rank])) <= *base
+        })
+    };
+    let selected = cuteafd_loader::placement::graph_reserve::prewarm_selection(&pins, bases, fits);
+    if selected.len() < layout.entries.len() {
+        tracing::warn!(skipped_entries = layout.entries.len() - selected.len(), base_bytes = ?bases,
+            "Kimi prewarm exceeds base; skipped entries remain runtime misses (pinned set is indivisible)");
+    }
+    keys.into_iter().filter(|key| selected.iter().any(|index| matches(*index, *key))).collect()
+}
+
+/// Every executable the model can need, enumerated from the accepted placement.
+/// Admission charges the graph reserve separately; this set enumerates keys and
+/// validates placement. `verify` (the drafter's block, 0 without one) and `slots` determine every
+/// flattened speculative batch width, including mixed-width multi-request steps.
 pub(crate) fn inventory(cfg: &KimiK3Config, lanes: usize, capacity: usize, slots: usize, verify: usize,
     resident: impl Fn(usize, usize) -> bool) -> Result<StartupGraphs<Key>> {
     inventory_for_ranks(cfg, lanes, capacity, slots, verify, 2, resident)
@@ -28,32 +155,51 @@ pub(crate) fn inventory(cfg: &KimiK3Config, lanes: usize, capacity: usize, slots
 
 pub(crate) fn inventory_for_ranks(cfg: &KimiK3Config, lanes: usize, capacity: usize, slots: usize, verify: usize,
     ranks: usize, resident: impl Fn(usize, usize) -> bool) -> Result<StartupGraphs<Key>> {
+    inventory_with_context(cfg, lanes, capacity, slots, verify, ranks, resident, |_| false, None)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn inventory_with_context(cfg: &KimiK3Config, lanes: usize, capacity: usize, slots: usize,
+    verify: usize, ranks: usize, resident: impl Fn(usize, usize) -> bool, context: impl Fn(usize) -> bool,
+    decode: Option<&cuteafd_loader::families::kimi_k3::context::DecodeBuckets>)
+    -> Result<StartupGraphs<Key>> {
     ensure!(matches!(ranks, 1 | 2) && (1..=2).contains(&lanes) && (1..=4096).contains(&capacity) && (1..=cuteafd_core::concurrency::state_slots(cuteafd_core::concurrency::MAX_CONCURRENCY) as usize).contains(&slots), "Kimi graph lane/row capacity");
     let mut keys = Vec::new();
     for lane in 0..lanes {
         for rank in 0..ranks {
             for rows in graph_rows(verify, capacity) {
                 for layer in 0..cfg.layers {
-                    keys.push(Key { lane, rank, rows, op: Op::Residual(MixSite::Attention(layer)) });
-                    keys.push(Key { lane, rank, rows, op: Op::Residual(MixSite::Ffn(layer)) });
                     keys.push(Key { lane, rank, rows, op: Op::Ffn(layer) });
-                    if resident(rank, layer) {
+                    if resident(rank, layer) && !context(layer) {
+                        let mut attention = |speculative| {
+                            keys.push(Key { lane, rank, rows, op: Op::Attention { layer, speculative } });
+                        };
                         if cuteafd_loader::families::kimi_k3::allocation::GRAPH_ROWS.contains(&rows) {
-                            keys.push(Key { lane, rank, rows, op: Op::Attention { layer, sequences: 1, speculative: false } });
-                            if cfg.attention[layer] == KimiAttention::Kda && (2..=slots).contains(&rows) {
-                                keys.push(Key { lane, rank, rows, op: Op::Attention { layer, sequences: rows, speculative: false } });
-                            }
+                            attention(false);
                         }
-                        if verify_graph_rows(verify, capacity).contains(&rows) {
-                            keys.push(Key { lane, rank, rows, op: Op::Attention { layer, sequences: 1, speculative: true } });
+                        if verify_graph_rows(verify, 1, capacity).contains(&rows) {
+                            // Keep ordinary and speculative keys distinct even
+                            // when they share a plain row bucket.
+                            keys.push(Key { lane, rank, rows, op: Op::Attention { layer, speculative: true } });
                         }
                     }
                 }
-                if rank == ranks - 1 { keys.push(Key { lane, rank, rows, op: Op::Residual(MixSite::Output) }); }
+            }
+            if let Some(decode) = decode {
+                for rows in decode.graph_rows(verify, slots, capacity) {
+                    for layer in (0..cfg.layers).filter(|&layer| context(layer) && resident(rank, layer)) {
+                        for speculative in [false, true] {
+                            if if speculative { verify_graph_rows(verify, slots, capacity).contains(&rows) }
+                                else { decode.plain().contains(&rows) } {
+                                keys.push(Key { lane, rank, rows, op: Op::Context { layer, speculative } });
+                            }
+                        }
+                    }
+                }
             }
         }
     }
-    cuteafd_loader::families::kimi_k3::allocation::graphs_for_ranks(cfg, lanes, capacity, slots, verify, ranks, resident)?
+    cuteafd_loader::families::kimi_k3::allocation::graphs_with_context(cfg, lanes, capacity, slots, verify, ranks, resident, context, decode)?
         .startup(keys).map_err(anyhow::Error::msg)
 }
 
@@ -78,7 +224,14 @@ pub(crate) fn check_placement_for_ranks(cfg: &KimiK3Config, placement: &cuteafd_
     ensure!(matches!(ranks, 1 | 2) && keys.iter().all(|key| key.rank < ranks),
         "Kimi graph physical rank count");
     ensure!(placement.layers.len() == cfg.layers, "Kimi graph placement layer count");
+    let inventory: std::collections::HashSet<_> = keys.iter().copied().collect();
     for key in keys {
+        if let Op::Context { layer, speculative } = key.op {
+            ensure!(ranks == 2 && cfg.attention.get(layer) == Some(&KimiAttention::Mla)
+                && placement.layers.get(layer).is_some_and(|a| a.mode == LayerMode::ContextSplit)
+                && (1..=64).contains(&key.rows) && (!speculative || key.rows >= 2),
+                "Kimi context graph differs from accepted placement");
+        }
         if let Op::Attention { layer, .. } = key.op {
             let mode = placement.layers.get(layer).ok_or_else(|| anyhow::anyhow!("Kimi graph layer"))?.mode;
             ensure!(matches!(mode, LayerMode::HeadSplit)
@@ -90,81 +243,496 @@ pub(crate) fn check_placement_for_ranks(cfg: &KimiK3Config, placement: &cuteafd_
         ensure!(ranks == 2 || matches!(assignment.mode, LayerMode::Whole { gpu: 0, .. }),
             "Kimi single-owner graphs require whole attention residency");
         for rank in 0..ranks {
-            let resident = matches!(assignment.mode, LayerMode::HeadSplit)
+            let resident = matches!(assignment.mode, LayerMode::HeadSplit | LayerMode::ContextSplit)
                 || matches!(assignment.mode, LayerMode::Whole { gpu, .. } if usize::from(gpu) == rank);
             ensure!(keys.iter().any(|key| key.rank == rank && matches!(key.op,
-                Op::Attention { layer: captured, .. } if captured == layer)) == resident,
+                Op::Attention { layer: captured, .. } | Op::Context { layer: captured, .. } if captured == layer)) == resident,
                 "Kimi graph inventory differs from accepted attention residency");
+            if assignment.mode == LayerMode::ContextSplit {
+                for key in keys.iter().filter(|key| key.rank == rank && matches!(key.op,
+                    Op::Context { layer: captured, .. } if captured == layer)) {
+                    let Op::Context { speculative, .. } = key.op else { unreachable!() };
+                    ensure!(inventory.contains(&Key { rank: 1 - rank,
+                        op: Op::Context { layer, speculative }, ..*key }),
+                        "Kimi context peer graph inventory is incomplete");
+                }
+            }
         }
     }
     Ok(())
 }
 
-pub(crate) struct Graphs<'a> { bank: GraphBank<Key, GraphOwner<'a, ()>>, replays: u64 }
+/// One lane's graph bank. Every lane on a physical device attaches to that
+/// device's single bounded cache with the same reserve and basis.
+pub(crate) struct Graphs<'a> {
+    bank: GraphBank<Key, GraphOwner<'a, ()>>,
+    replays: u64,
+    captured: usize,
+    device: i32,
+    spans_devices: bool,
+}
 
 impl<'a> Graphs<'a> {
-    pub(crate) fn capture(stream: &Stream<'a>, keys: &[Key],
-        mut arithmetic: impl FnMut(Key) -> Result<()>) -> Result<Self> {
-        let mut bank = GraphBank::with_policy(GraphPolicy::FixedStartup);
-        bank.warm(keys, |&key| stream.device.run(|| {
-            // SAFETY: startup is exclusive; only rank-local arithmetic enters
-            // capture. The containing LocalLane pins every operand and drains
-            // its exact stream before releasing this bank or its allocations.
-            unsafe { stream.device.library.cuda_graph_begin_capture(stream.raw)?; }
-            let submitted = arithmetic(key);
-            // End even a failed submission, so startup cannot leave capture active.
-            // SAFETY: this ends the matching capture on the same retained stream.
-            let ended = unsafe { stream.device.library.cuda_graph_end_capture(stream.raw) };
-            match (submitted, ended) {
-                (Ok(()), Ok(raw)) => {
-                    // SAFETY: LocalLane retains all captured pointers and drains before drop.
-                    let owner = unsafe { GraphOwner::new(stream.device.library, stream.device.id, raw, ())? };
-                    Ok((owner, None))
-                }
-                (Err(error), Ok(raw)) => {
-                    // SAFETY: the failed startup executable was never launched.
-                    unsafe { stream.device.library.cuda_graph_exec_destroy(raw)?; }
-                    Err(error)
-                }
-                (Err(error), Err(ended)) => Err(error.context(format!("ending failed capture: {ended:#}"))),
-                (Ok(()), Err(error)) => Err(error),
-            }
-        }))?;
-        Ok(Self { bank, replays: 0 })
+    pub(crate) fn new() -> Self {
+        Self { bank: GraphBank::with_family(GraphPolicy::Budgeted { bytes: None }, "kimi_k3"),
+            replays: 0, captured: 0, device: -1, spans_devices: false }
+    }
+
+    /// Attach to `device`'s bounded cache. `bootstrap` is one more capture at the
+    /// family's measured per-executable rate, used until the device is measured.
+    pub(crate) fn attach(&mut self, library: &NativeLibrary, device: i32, ranks: usize,
+        rank: usize, reserve: u64) -> Result<()> {
+        self.device = device;
+        self.spans_devices = ranks > 1;
+        self.bank.attach_device(library, device, reserve, self.site(ranks, rank))
+    }
+
+    fn site(&self, ranks: usize, rank: usize) -> Site {
+        Site { name: "kimi_k3.step", cycle: Cycle::Other, preference: Preference::Adaptive,
+            bootstrap: kimi_bootstrap(ranks, rank), basis: Basis::Bytes,
+            spans_devices: self.spans_devices }
+    }
+
+    #[cfg(test)]
+    fn attach_for_test(&mut self, device: i32, ranks: usize, rank: usize, reserve: u64) -> Result<()> {
+        self.device = device;
+        self.spans_devices = ranks > 1;
+        self.bank.attach_device_for_test(device, reserve, self.site(ranks, rank))
+    }
+
+    pub(crate) fn attached(&self) -> bool { self.bank.cache_attached() }
+
+    /// The physical device this lane's executables live on.
+    pub(crate) fn device(&self) -> i32 { self.device }
+    pub(crate) fn spans_devices(&self) -> bool { self.spans_devices }
+    /// Whether any executable is resident; startup-only reconfiguration and
+    /// state restore run before the first one.
+    pub(crate) fn is_empty(&self) -> bool { self.captured == 0 }
+
+    pub(crate) fn cached(&self, key: &Key) -> bool { self.bank.get(key).is_some() }
+
+    pub(crate) fn cycle(&mut self, cycle: Cycle) { self.bank.cache_cycle(cycle); }
+    pub(crate) fn needs_boundary(&self) -> bool { self.bank.cache_needs_boundary() }
+    pub(crate) fn tick(&mut self) { self.bank.cache_tick(); }
+
+    /// Control surface for the engine's completed-step measurement and eviction.
+    pub(crate) fn owner(&mut self) -> &mut dyn CacheAttached { &mut self.bank }
+
+    /// Drop every executable and this bank's cache records. The caller has
+    /// already drained the lane's stream.
+    pub(crate) fn clear(&mut self) {
+        self.bank.cache_clear_drained();
+        self.captured = 0;
     }
 
     pub(crate) fn replays(&self) -> u64 { self.replays }
 
-    pub(crate) fn launch(&mut self, key: Key, stream: &Stream<'a>) -> Result<bool> {
-        let (decision, owner) = self.bank.enqueue(&key);
-        match decision {
-            GraphDecision::Replay => {
-                let owner = owner.expect("replay has executable");
-                ensure!(owner.device() == stream.device.id, "Kimi graph replay device changed");
-                stream.device.run(|| {
-                    // SAFETY: binding owns immutable capture pointers and this exact stream.
-                    unsafe { stream.device.library.cuda_graph_launch(owner.raw, stream.raw) }
-                })?;
-                self.replays += 1;
+    /// Best-effort startup prewarm of the checked-in pinned geometry. A geometry
+    /// that can never replay inside a lane window is skipped, and a controller
+    /// refusal only leaves that geometry lazy.
+    pub(crate) fn prewarm(&mut self, stream: &Stream<'a>, core: KimiCoreFormat, ranks: usize, keys: &[Key],
+        mut body: impl FnMut(Key) -> Result<()>) -> Result<usize> {
+        let mut captured = 0;
+        for &key in keys {
+            if !prewarm_selected(kimi_layout(core, ranks), key, false) || self.cached(&key) { continue }
+            let pinned = pinned(core, ranks, key);
+            let Some(ticket) = self.bank.cache_ticket(&key, pinned, None) else { continue };
+            if self.capture(stream, key, ticket, &mut || body(key))? { captured += 1; }
+        }
+        Ok(captured)
+    }
+
+    /// Run one step body through the cache: replay a resident executable, else
+    /// capture it, else run the body eagerly.
+    pub(crate) fn graph(&mut self, stream: &Stream<'a>, key: Key, allow_capture: bool,
+        pinned: bool, mut body: impl FnMut() -> Result<()>) -> Result<()> {
+        if let Some(owner) = self.bank.cached_launch(&key) {
+            let (device, raw) = (owner.device(), owner.raw);
+            ensure!(device == stream.device.id, "Kimi graph replay device changed");
+            // SAFETY: the bank owns immutable capture pointers and LocalLane
+            // retains this exact stream until every launch has drained.
+            stream.device.run(|| unsafe { stream.device.library.cuda_graph_launch(raw, stream.raw) })?;
+            self.replays += 1;
+            return Ok(());
+        }
+        if !allow_capture { return body() }
+        let Some(ticket) = self.bank.cache_ticket(&key, pinned, None) else { return body() };
+        // The body is recorded on this lane's stream; on refusal it runs eagerly
+        // instead. Its own nested cache lookups are disabled by the caller, so
+        // the recorded segment is the eager kernel sequence.
+        if !self.capture(stream, key, ticket, &mut body)? { return body() }
+        let owner = self.bank.get(&key).context("inserted Kimi graph")?;
+        let (device, raw) = (owner.device(), owner.raw);
+        ensure!(device == stream.device.id, "Kimi graph captured a foreign device");
+        // SAFETY: just instantiated on this device and not yet launched.
+        stream.device.run(|| unsafe { stream.device.library.cuda_graph_launch(raw, stream.raw) })?;
+        self.replays += 1;
+        Ok(())
+    }
+
+    /// Capture `body` and own the executable. `false` means the capture was
+    /// declined or failed to instantiate: the caller must run the body eagerly.
+    /// The ticket cancels every failed path, including by drop.
+    fn capture(&mut self, stream: &Stream<'a>, key: Key, ticket: CaptureTicket,
+        body: &mut impl FnMut() -> Result<()>) -> Result<bool> {
+        // SAFETY: the lane is the only writer on this persistent stream for the
+        // duration of the step body; every captured pointer is pinned by LocalLane.
+        if let Err(error) = stream.device.run(|| unsafe {
+            stream.device.library.cuda_graph_begin_capture(stream.raw) }) {
+            if self.bank.cache_ticket_failed(ticket, &error) {
+                tracing::warn!(%error, ?key, "Kimi graph capture unavailable; running eagerly");
+            }
+            return Ok(false);
+        }
+        let submitted = body();
+        // SAFETY: ends the matching capture on this same retained stream.
+        let ended = stream.device.run(|| unsafe {
+            stream.device.library.cuda_graph_end_capture_topology(stream.raw) });
+        match (submitted, ended) {
+            (Ok(()), Ok((raw, nodes, width, spans, inspection_error))) => {
+                if let Some(error) = inspection_error {
+                    tracing::warn!(%error, ?key, "Kimi graph topology unknown; capture is not chain reusable");
+                }
+                if !capture_worthwhile(nodes) {
+                    // SAFETY: rejected executables were never launched; body
+                    // recording has not executed any kernel.
+                    unsafe { stream.device.library.cuda_graph_exec_destroy(raw)?; }
+                    anyhow::bail!("Kimi graph segment {key:?} captured {nodes} nodes; expected at least two");
+                }
+                // SAFETY: LocalLane retains every captured pointer and drains this
+                // stream before releasing the owner or its allocations.
+                let owner = match unsafe {
+                    GraphOwner::new(stream.device.library, stream.device.id, raw, ()) } {
+                    Ok(owner) => owner,
+                    Err(error) => {
+                        // SAFETY: the executable was never launched.
+                        unsafe { stream.device.library.cuda_graph_exec_destroy(raw)?; }
+                        return Err(error);
+                    }
+                };
+                crate::shared::decode_graph::census::capture_key("kimi_k3", "decode",
+                    stream.raw as usize, key.rank as i32, Some(key.lane), &key, owner.raw);
+                self.bank.cache_commit(key, owner, ticket, nodes as u64, width,
+                    spans || self.spans_devices);
+                self.captured += 1;
                 Ok(true)
             }
-            GraphDecision::Eager => Ok(false),
-            GraphDecision::Capture => anyhow::bail!("Kimi live submission attempted graph capture"),
+            (Err(error), Ok((raw, ..))) => {
+                self.bank.cache_ticket_failed(ticket, &error);
+                // SAFETY: the failed capture's executable has never launched.
+                unsafe { stream.device.library.cuda_graph_exec_destroy(raw)?; }
+                Err(error)
+            }
+            (Err(error), Err(ended)) => {
+                self.bank.cache_ticket_failed(ticket, &ended);
+                Err(error.context(format!("ending failed Kimi capture: {ended:#}")))
+            }
+            (Ok(()), Err(error)) => {
+                if self.bank.cache_ticket_failed(ticket, &error) {
+                    tracing::warn!(%error, ?key, "Kimi graph instantiation unavailable; running eagerly");
+                }
+                Ok(false)
+            }
         }
     }
 }
 
-pub(crate) fn check_captures(startup: u64, current: u64) -> Result<()> {
-    ensure!(current == startup, "Kimi zero-steady-capture contract: startup={startup}, current={current}");
-    Ok(())
-}
+fn capture_worthwhile(nodes: usize) -> bool { nodes >= 2 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn single_owner_keys_capture_output_without_a_shadow_rank() -> Result<()> {
+    fn no_kimi_key_can_commit_fewer_than_two_nodes() {
+        assert!(!capture_worthwhile(0));
+        assert!(!capture_worthwhile(1));
+        assert!(capture_worthwhile(2));
+        let source = include_str!("graphs.rs").split("#[cfg(test)]\nmod tests").next().unwrap();
+        assert!(source.find("if !capture_worthwhile(nodes)").unwrap()
+            < source.find("self.bank.cache_commit").unwrap());
+        assert!(!source.contains("Residual("));
+        let device = include_str!("device.rs").split("#[cfg(test)]").next().unwrap();
+        let attention = device.split("    pub(crate) fn attention(&mut self").nth(1).unwrap()
+            .split("    /// The recorded attention segment").next().unwrap();
+        assert!(attention.find("residual_body(MixSite::Attention(layer)").unwrap()
+            < attention.find("lane.attention_body(").unwrap());
+        let ffn = device.split("    pub(crate) fn ffn(&mut self").nth(1).unwrap()
+            .split("    fn ffn_body(").next().unwrap();
+        assert!(ffn.contains("if lane.cfg.dense[layer] { lane.residual_body("));
+        // The unfused routed path is gate/up -> Situ -> down, never one launch.
+        let ffi = include_str!("../../../../cuteafd-ffi/src/families/kimi_k3.rs");
+        let ffn = ffi.split("impl<'a> KimiFfn<'a>").nth(1).unwrap()
+            .split("pub struct KimiKdaWeights").next().unwrap();
+        assert!(ffn.contains("self.gate_up.launch("));
+        assert!(ffn.contains("self.situ.launch("));
+        assert!(ffn.contains("self.down.launch("));
+    }
+
+    #[test]
+    fn every_observed_geometry_expands_to_reachable_keys_and_nothing_else() -> Result<()> {
+        use cuteafd_loader::serving_capacity::kimi_prewarm::KimiPrewarmEntry;
+        let cfg = KimiK3Config::from_hf(&cuteafd_loader::plan::testing::kimi_k3_config())?;
+        let layout = KimiPrewarmLayout { core: KimiCoreFormat::K6, ranks: 1, layout: "trace".into(),
+            reserve_base_bytes: vec![1], reserve_extra_bytes: 2 << 20,
+            entries: vec![
+                KimiPrewarmEntry { rows: 20, speculative: true, pin: true,
+                    op: Some(KimiPrewarmOp::Attention), capture_bytes: vec![] },
+                KimiPrewarmEntry { rows: 20, speculative: false, pin: false,
+                    op: Some(KimiPrewarmOp::Ffn), capture_bytes: vec![] },
+            ] };
+        let inventory = inventory_for_ranks(&cfg, 1, 4096, 16, 8, 1, |_, _| true)?;
+        let keys = prewarm_keys(&cfg, &inventory.keys, &layout, 16, 4096);
+        assert!(!keys.is_empty());
+        for entry in &layout.entries {
+            assert!(keys.iter().any(|key| key.rows == entry.rows
+                && key.op.speculative() == entry.speculative
+                && geometry(key.op) == entry.op.unwrap()));
+        }
+        for key in keys {
+            assert!(prewarm_selected(&layout, key, false));
+            assert!(replay_allowed(key.op, true, false)?);
+            assert!(!replay_allowed(key.op, true, true)?);
+        }
+        assert_eq!(prewarm_keys(&cfg, &inventory.keys, &layout, 16, 4096),
+            prewarm_keys(&cfg, &inventory.keys, &layout, 2, 4096));
+        Ok(())
+    }
+
+    #[test]
+    fn context_and_generic_trace_entries_expand_only_their_class() -> Result<()> {
+        use cuteafd_loader::serving_capacity::kimi_prewarm::KimiPrewarmEntry;
+        let cfg = KimiK3Config::from_hf(&cuteafd_loader::plan::testing::kimi_k3_config())?;
+        let layer = cfg.attention.iter().position(|kind| *kind == KimiAttention::Mla).unwrap();
+        let templates = [Op::Context { layer, speculative: false },
+            Op::Attention { layer, speculative: false },
+            Op::Ffn(layer)].map(|op|
+                Key { lane: 0, rank: 0, rows: 1, op });
+        for kind in [KimiPrewarmOp::Context, KimiPrewarmOp::Ffn] {
+            let layout = KimiPrewarmLayout { core: KimiCoreFormat::K6, ranks: 2, layout: "trace".into(),
+                reserve_base_bytes: vec![1], reserve_extra_bytes: 2 << 20,
+                entries: vec![KimiPrewarmEntry { rows: 4, speculative: false, pin: true,
+                    op: Some(kind), capture_bytes: vec![] }] };
+            let keys = prewarm_keys(&cfg, &templates, &layout, 16, 4096);
+            assert_eq!(keys.len(), 1, "only the observed operation class expands");
+            assert_eq!(geometry(keys[0].op), kind);
+            assert_eq!(keys[0].rows, 4);
+            assert!(replay_allowed(keys[0].op, true, false)?);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn prewarm_base_keeps_pins_indivisible_then_takes_a_prefix() {
+        use cuteafd_loader::serving_capacity::kimi_prewarm::KimiPrewarmEntry;
+        let keys = [1, 2, 4].map(|rows| Key { lane: 0, rank: 0, rows, op: Op::Ffn(0) });
+        let layout = KimiPrewarmLayout { core: KimiCoreFormat::K6, ranks: 1, layout: "base-test".into(),
+            reserve_base_bytes: vec![20], reserve_extra_bytes: 2 << 20,
+            entries: [1, 2, 4].map(|rows| KimiPrewarmEntry { rows, speculative: false,
+                pin: rows == 1, op: Some(KimiPrewarmOp::Ffn), capture_bytes: vec![] }).into() };
+        assert!(fit_prewarm(keys.to_vec(), &layout, &[9], &[10]).is_empty());
+        assert_eq!(fit_prewarm(keys.to_vec(), &layout, &[10], &[10]), keys[..1]);
+        assert_eq!(fit_prewarm(keys.to_vec(), &layout, &[20], &[10]), keys[..2]);
+        assert_eq!(fit_prewarm(keys.to_vec(), &layout, &[30], &[10]), keys);
+        assert!(fit_prewarm(keys.to_vec(), &layout, &[0], &[10]).is_empty());
+    }
+
+    #[test]
+    fn prewarm_base_uses_measured_rank_costs_including_zero_and_unmeasured_fallback() {
+        use cuteafd_loader::serving_capacity::kimi_prewarm::KimiPrewarmEntry;
+        let keys = (0..2).flat_map(|rank| [1, 2, 4].map(|rows|
+            Key { lane: 0, rank, rows, op: Op::Ffn(0) })).collect::<Vec<_>>();
+        let mut layout = KimiPrewarmLayout { core: KimiCoreFormat::K6, ranks: 2, layout: "measured".into(),
+            reserve_base_bytes: vec![5, 9], reserve_extra_bytes: 2 << 20,
+            entries: [1, 2, 4].map(|rows| KimiPrewarmEntry { rows, speculative: false,
+                pin: rows == 1, op: Some(KimiPrewarmOp::Ffn),
+                capture_bytes: match rows {
+                    1 => vec![Some(2), Some(7)],
+                    2 => vec![Some(0), Some(1)],
+                    _ => vec![Some(3), Some(1)],
+                } }).into() };
+        assert_eq!(fit_prewarm(keys.clone(), &layout, &[5, 9], &[100, 200]), keys);
+        let prefix = keys.iter().copied().filter(|key| key.rows <= 2).collect::<Vec<_>>();
+        assert_eq!(fit_prewarm(keys.clone(), &layout, &[2, 8], &[100, 200]), prefix);
+        assert!(fit_prewarm(keys.clone(), &layout, &[5, 6], &[100, 200]).is_empty());
+        layout.entries[2].capture_bytes = vec![Some(3), None];
+        assert_eq!(fit_prewarm(keys.clone(), &layout, &[5, 208], &[100, 200]), keys);
+        assert_eq!(fit_prewarm(keys, &layout, &[5, 207], &[100, 200]), prefix);
+    }
+
+    #[test]
+    fn prewarm_base_deduplicates_overlapping_unmeasured_bootstrap_entries() {
+        use cuteafd_loader::serving_capacity::kimi_prewarm::KimiPrewarmEntry;
+        let keys = vec![Key { lane: 0, rank: 0, rows: 4, op: Op::Ffn(0) }];
+        let layout = KimiPrewarmLayout { core: KimiCoreFormat::K6, ranks: 1, layout: "bootstrap".into(),
+            reserve_base_bytes: vec![10], reserve_extra_bytes: 2 << 20,
+            entries: [false, true].map(|speculative| KimiPrewarmEntry { rows: 4,
+                speculative, pin: false, op: None, capture_bytes: vec![] }).into() };
+        assert_eq!(fit_prewarm(keys.clone(), &layout, &[10], &[10]), keys);
+    }
+
+    #[test]
+    fn the_controller_selects_capture_from_the_reserve_and_runs_eagerly_without_one() {
+        use crate::shared::decode_graph::device::Miss;
+        let hot = Key { lane: 0, rank: 0, rows: 1, op: Op::Ffn(0) };
+        // Distinct synthetic devices: the controller is per physical device.
+        let mut graphs = Graphs::new();
+        graphs.attach_for_test(-901, 1, 0, 8 << 20).unwrap();
+        assert!(matches!(graphs.bank.cache_miss(&hot, true, None), Miss::Capture(_)));
+        // A ticket is a reservation, not residency.
+        assert!(graphs.is_empty() && !graphs.cached(&hot));
+        // Zero reserve means every miss runs eagerly.
+        let mut eager = Graphs::new();
+        eager.attach_for_test(-902, 1, 0, 0).unwrap();
+        assert!(matches!(eager.bank.cache_miss(&hot, true, None), Miss::Eager));
+        // No reserve at all also runs eagerly.
+        let mut detached = Graphs::new();
+        assert!(matches!(detached.bank.cache_miss(&hot, true, None), Miss::Eager));
+        // One physical device has one reserve and basis.
+        let mut same = Graphs::new();
+        assert!(same.attach_for_test(-901, 1, 0, 8 << 20).is_ok());
+        let mut other = Graphs::new();
+        assert!(other.attach_for_test(-901, 1, 0, 16 << 20).is_err());
+    }
+
+    #[test]
+    fn context_decode_miss_enqueues_the_same_protocol_as_startup() {
+        let source = include_str!("device.rs");
+        let step = source.split("    fn context_step(").nth(1).unwrap()
+            .split("    pub(crate) fn context_decode(").next().unwrap();
+        assert!(!step.contains("self.graphs"));
+        assert!(step.contains("crate::shared::peer_split::attention::context_decode("));
+        let decode = source.split("    pub(crate) fn context_decode(").nth(1).unwrap()
+            .split("    pub(crate) fn context_attention(").next().unwrap();
+        assert!(decode.contains("self.graph_step(bucket, super::graphs::Op::Context { layer, speculative },\n            |lane| lane.context_step(layer, bucket, speculative))?;"));
+        assert!(!decode.contains("cuda_graph_begin_capture"));
+    }
+
+    #[test]
+    fn context_whole_steps_match_admission_and_capture_each_native_row_bucket() -> Result<()> {
+        use cuteafd_loader::placement::LayerMode;
+        let cfg = KimiK3Config::from_hf(&cuteafd_loader::plan::testing::kimi_k3_config())?;
+        let inputs = super::super::admission::tests::inputs(&cfg);
+        let mut placement = super::super::admission::admit(inputs)?.placement;
+        for (kind, assignment) in cfg.attention.iter().zip(&mut placement.layers) {
+            if *kind == KimiAttention::Mla { assignment.mode = LayerMode::ContextSplit; }
+        }
+        let decode = cuteafd_loader::families::kimi_k3::context::DecodeBuckets::from_manifest(
+            &serde_json::json!({"programs":[{"name":"dense_trellis_k6_trellis_mla_q_a_mcg",
+                "geometry":{"bits":6,"decode_route_thresholds":[8,16,32,48]}}]}))?;
+        for slots in [1, 4, 16] { for capacity in [64, 2752, 4096] { for verify in [0, 8, 64] {
+            let set = inventory_with_context(&cfg, 1, capacity, slots, verify, 2, |_, _| true,
+                |layer| cfg.attention[layer] == KimiAttention::Mla, Some(&decode))?;
+            let unique = set.keys.iter().collect::<std::collections::HashSet<_>>();
+            assert_eq!(unique.len(), set.keys.len());
+            check_placement(&cfg, &placement, &set.keys)?;
+            for rank in 0..2 {
+                assert_eq!(set.inventory.ranks[rank].executables,
+                    set.keys.iter().filter(|key| key.rank == rank).count() as u64);
+            }
+            let layer = cfg.attention.iter().position(|kind| *kind == KimiAttention::Mla).unwrap();
+            assert!(unique.contains(&Key { lane: 0, rank: 0, rows: 16,
+                op: Op::Context { layer, speculative: false } }));
+            assert!(!set.keys.iter().any(|key| matches!(key.op,
+                Op::Attention { layer, .. } if cfg.attention[layer] == KimiAttention::Mla)));
+            for rank in 0..2 {
+                let plain = set.keys.iter().filter(|key| key.rank == rank && matches!(key.op,
+                    Op::Context { layer: captured, speculative: false, .. } if captured == layer)).count();
+                assert_eq!(plain, 7);
+                for rows in [8, 32, 48] {
+                    assert!(!set.keys.iter().any(|key| key.rank == rank && key.rows == rows
+                        && matches!(key.op, Op::Ffn(_)))
+                        || verify_graph_rows(verify, 1, capacity).contains(&rows));
+                }
+            }
+            assert!(!set.keys.iter().any(|key| key.rows > 64 && matches!(key.op, Op::Context { .. })));
+            let missing = set.keys.iter().copied().filter(|key| !(key.rank == 1 && key.rows == 16
+                && matches!(key.op, Op::Context { .. }))).collect::<Vec<_>>();
+            assert!(check_placement(&cfg, &placement, &missing).is_err());
+        }}}
+        assert!(inventory_with_context(&cfg, 1, 64, 16, 0, 1, |_, _| true,
+            |layer| cfg.attention[layer] == KimiAttention::Mla, Some(&decode)).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn mixed_dense_edges_preserve_existing_graph_count_and_trace_selected_variants() -> Result<()> {
+        use cuteafd_loader::families::kimi_k3::context::DecodeBuckets;
+        let cfg = KimiK3Config::from_hf(&cuteafd_loader::plan::testing::kimi_k3_config())?;
+        let manifest = |edges: &[usize]| serde_json::json!({"programs":[{
+            "name":"dense_trellis_k6_trellis_mla_q_a_mcg",
+            "geometry":{"bits":6,"decode_route_thresholds":edges}}]});
+        let existing = DecodeBuckets::from_manifest(&manifest(&[8,16,32,48]))?;
+        let mut mixed = manifest(&[8,16,32,48]);
+        mixed["programs"].as_array_mut().unwrap().push(serde_json::json!({
+            "name":"dense_trellis_k6_trellis_mla_gate_mcg_k8",
+            "geometry":{"bits":8,"decode_route_thresholds":[8,32,48]}}));
+        let union = DecodeBuckets::from_manifest(&mixed)?;
+        let old = DecodeBuckets::from_manifest(&manifest(&[16,32,48]))?;
+        let inventory = |decode: &DecodeBuckets| inventory_with_context(&cfg, 1, 2752, 16, 8, 2,
+            |_, _| true, |layer| cfg.attention[layer] == KimiAttention::Mla, Some(decode));
+        let before = inventory(&existing)?;
+        let after = inventory(&union)?;
+        assert_eq!(before.keys.len(), after.keys.len());
+        let old_set = inventory(&old)?;
+        let context_layers = cfg.attention.iter().filter(|&&kind| kind == KimiAttention::Mla).count();
+        assert_eq!(after.keys.len() - old_set.keys.len(), context_layers * 2);
+        let layer = cfg.attention.iter().position(|kind| *kind == KimiAttention::Mla).unwrap();
+        let ordinary = Key { lane:0, rank:0, rows:8, op:Op::Context { layer, speculative:false } };
+        let speculative = Key { op:Op::Context { layer, speculative:true }, ..ordinary };
+        assert!(after.keys.contains(&ordinary) && after.keys.contains(&speculative));
+        assert!(!old_set.keys.contains(&ordinary) && old_set.keys.contains(&speculative));
+        let layout = kimi_layout(KimiCoreFormat::K6, 2);
+        let warmed = prewarm_keys(&cfg, &after.keys, layout, 16, 2752);
+        assert!(!warmed.contains(&ordinary));
+        assert!(warmed.contains(&speculative));
+        assert!(!pinned(KimiCoreFormat::K6, 2, ordinary));
+        assert_eq!(union.graph_rows(8,16,64), (1..=64).collect::<Vec<_>>());
+        Ok(())
+    }
+
+    #[test]
+    fn context_startup_covers_every_c1_to_c16_mixed_verify_batch() -> Result<()> {
+        let mut cfg = KimiK3Config::from_hf(&cuteafd_loader::plan::testing::kimi_k3_config())?;
+        // One MLA layer is sufficient for the exhaustive row/slot geometry;
+        // the full-family test checks every real layer and graph accounting.
+        cfg.layers = 1;
+        cfg.attention = vec![KimiAttention::Mla];
+        let decode = cuteafd_loader::families::kimi_k3::context::DecodeBuckets::from_manifest(
+            &serde_json::json!({"programs":[{"name":"dense_trellis_k6_trellis_mla_q_a_mcg",
+                "geometry":{"bits":6,"decode_route_thresholds":[8,16,32,48]}}]}))?;
+        for slots in 1..=16 { for verify in 2..=64 {
+            let set = inventory_with_context(&cfg, 1, 2752, slots, verify, 2, |_, _| true,
+                |layer| cfg.attention[layer] == KimiAttention::Mla, Some(&decode))?;
+            let declared = set.keys.iter().copied().collect::<std::collections::HashSet<_>>();
+            for active in 1..=slots {
+                for speculative in [false, true] {
+                    // Independently enumerate the scheduler's flattened batch:
+                    // each active request supplies an anchor and 0..verify-1 drafts.
+                    let reachable = if speculative { active.max(2)..=(active * verify).min(64) }
+                        else { active..=active };
+                    for rows in reachable {
+                        let bucket = decode.dispatch_rows(rows, speculative)?;
+                        for rank in 0..2 {
+                            for layer in (0..cfg.layers).filter(|&layer| cfg.attention[layer] == KimiAttention::Mla) {
+                                assert!(declared.contains(&Key { lane: 0, rank, rows: bucket,
+                                    op: Op::Context { layer, speculative } }),
+                                    "missing Context graph: slots={slots} verify={verify} active={active} rows={rows}");
+                            }
+                        }
+                    }
+                }
+            }
+            for rank in 0..2 {
+                assert_eq!(set.inventory.ranks[rank].executables,
+                    set.keys.iter().filter(|key| key.rank == rank).count() as u64);
+            }
+        }}
+        Ok(())
+    }
+
+    #[test]
+    fn single_owner_keys_have_no_shadow_rank_or_standalone_residual() -> Result<()> {
         let cfg = KimiK3Config::from_hf(&cuteafd_loader::plan::testing::kimi_k3_config())?;
         for capacity in [64, 2752, 4096] {
             let set = inventory_for_ranks(&cfg, 2, capacity, 16, 8, 1, |rank, _| rank == 0)?;
@@ -173,12 +741,8 @@ mod tests {
             assert_eq!(set.inventory.ranks[0].executables, set.keys.len() as u64);
             let unique = set.keys.iter().collect::<std::collections::HashSet<_>>();
             assert_eq!(unique.len(), set.keys.len());
-            for lane in 0..2 { for rows in graph_rows(8, capacity) {
-                assert!(unique.contains(&Key { lane, rank: 0, rows, op: Op::Residual(MixSite::Output) }));
-            }}
             let pair = inventory(&cfg, 2, capacity, 16, 8, |_, _| true)?;
-            let output = set.keys.iter().filter(|key| key.op == Op::Residual(MixSite::Output)).count();
-            assert_eq!(pair.keys.len(), 2 * set.keys.len() - output);
+            assert_eq!(pair.keys.len(), 2 * set.keys.len());
         }
         assert!(inventory_for_ranks(&cfg, 1, 64, 16, 8, 0, |_, _| true).is_err());
         Ok(())
@@ -222,12 +786,10 @@ mod tests {
             assert_eq!(reserve.bytes, admitted.inventory.bytes(rank));
         }
         let layer = cfg.attention.iter().position(|kind| *kind == KimiAttention::Kda).unwrap();
-        for sequences in [1, 16] {
-            assert!(unique.contains(&Key { lane: 1, rank: 1, rows: 16, op: Op::Attention { layer, sequences, speculative: false } }));
-        }
+        assert!(unique.contains(&Key { lane: 1, rank: 1, rows: 16,
+            op: Op::Attention { layer, speculative: false } }));
         let small = inventory(&cfg, 1, 4096, 4, 0, |_, _| true)?;
-        assert!(!small.keys.iter().any(|key| matches!(key.op,
-            Op::Attention { sequences, .. } if sequences > 4)));
+        assert_eq!(small.keys, inventory(&cfg, 1, 4096, 16, 0, |_, _| true)?.keys);
         for (lanes, rows, slots) in [(0, 1, 1), (1, 0, 1), (1, 4097, 1), (1, 1, 0), (1, 1, 161)] {
             assert!(inventory(&cfg, lanes, rows, slots, 0, |_, _| true).is_err());
         }
@@ -237,17 +799,14 @@ mod tests {
         assert_eq!(unique.len(), verify.keys.len());
         for rows in 2..=8 {
             assert!(unique.contains(&Key { lane: 0, rank: 0, rows, op: Op::Ffn(0) }));
-            assert!(unique.contains(&Key { lane: 0, rank: 1, rows, op: Op::Attention { layer, sequences: 1, speculative: true } }));
+            assert!(unique.contains(&Key { lane: 0, rank: 1, rows, op: Op::Attention { layer, speculative: true } }));
         }
-        assert!(!verify.keys.iter().any(|key| matches!(key.op, Op::Attention { speculative: true, sequences, .. } if sequences > 1)));
         assert!(!verify.keys.iter().any(|key| key.rows > 8 && matches!(key.op, Op::Attention { speculative: true, .. })));
         for rank in 0..2 {
             assert_eq!(verify.inventory.ranks[rank].executables,
                 verify.keys.iter().filter(|key| key.rank == rank).count() as u64);
         }
         assert!(verify.keys.len() > small.keys.len());
-        check_captures(19, 19)?;
-        assert!(check_captures(19, 20).is_err());
         Ok(())
     }
 }

@@ -3,6 +3,7 @@ use crate::shared::memory::{device::{Device, DeviceOwner}, HostAllocation, LoadS
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::{CuteafdDeviceBuffer, CuteafdHostBuffer};
 use cuteafd_loader::{OfficialV41Catalog, V41Exl3TensorSlice};
+use crate::shared::memory::Tag;
 
 pub(crate) struct Projection {
     pub name: String,
@@ -65,7 +66,7 @@ pub(crate) fn banks<'a>(device: Device<'a>, lanes: usize, bytes: usize,
     admitted: usize) -> Result<Vec<Vec<HostAllocation<'a>>>> {
     admit_banks(lanes, bytes, admitted)?;
     device.run(|| (0..2).map(|_| (0..lanes)
-        .map(|_| HostAllocation::new(device.library, bytes)).collect()).collect())
+        .map(|_| HostAllocation::new(device.library, bytes, Tag::staging("experts/paired-load"))).collect()).collect())
 }
 
 pub(crate) fn streams<'a>(devices: [Device<'a>; 2]) -> Result<[DeviceOwner<'a, LoadStream<'a>>; 2]> {

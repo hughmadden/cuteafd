@@ -7,6 +7,7 @@ use cuteafd_ffi::{
 };
 use cuteafd_loader::plan::rope::{Recipe, Tables};
 use std::rc::Rc;
+use crate::shared::memory::Tag;
 
 pub(crate) struct Table<'a> {
     pub cos: Allocation<'a>,
@@ -27,6 +28,22 @@ impl<'a> RotaryTables<'a> {
         available: u64,
         reservations: &[u64],
     ) -> Result<Self> {
+        Self::load_with(device, programs, plan, prefix, available, reservations,
+            |_, bytes| Allocation::new(device, bytes, Tag::weights("shared/rotary")))
+    }
+
+    pub fn arena_requests(plan: &Tables, prefix: &str) -> Result<Vec<(String, usize)>> {
+        let mut requests = Vec::new();
+        for (index, recipe) in plan.recipes.iter().enumerate() {
+            let plane = usize::try_from(recipe.allocation_bytes(plan.extent)? / 2)?;
+            for name in ["cos", "sin"] { requests.push((format!("{prefix}rotary.{index}.{name}"), plane)); }
+        }
+        Ok(requests)
+    }
+
+    pub fn load_with(device: Device<'a>, programs: &Programs<'a>, plan: Tables, prefix: &str,
+        available: u64, reservations: &[u64],
+        mut allocate: impl FnMut(&str, usize) -> Result<Allocation<'a>>) -> Result<Self> {
         // Budget and every ABI are checked before the first device allocation.
         plan.check_budget(available, reservations)?;
         for recipe in &plan.recipes {
@@ -47,15 +64,17 @@ impl<'a> RotaryTables<'a> {
             );
         }
         let mut tables = Vec::new();
-        for recipe in &plan.recipes {
+        for (index, recipe) in plan.recipes.iter().enumerate() {
             let program = device.run(|| {
                 programs.program(&format!("{prefix}{}", recipe.program()), &["cos", "sin"])
             })?;
             let plane = usize::try_from(recipe.allocation_bytes(plan.extent)? / 2)?;
             let _scope = cuteafd_ffi::memory_ledger::scope("rotary_tables");
             let table = Table {
-                cos: Allocation::new(device, plane)?,
-                sin: Allocation::new(device, plane)?,
+                cos: crate::shared::memory::weight_arena::checked_weight_allocation(
+                    device, &format!("{prefix}rotary.{index}.cos"), plane, &mut allocate)?,
+                sin: crate::shared::memory::weight_arena::checked_weight_allocation(
+                    device, &format!("{prefix}rotary.{index}.sin"), plane, &mut allocate)?,
             };
             // The stream is created after storage, so error unwinding drains before freeing.
             let stream = Stream::new(device)?;
@@ -85,6 +104,14 @@ impl<'a> RotaryTables<'a> {
         Ok(Self { plan, tables })
     }
 
+    pub(crate) fn inventory(&self, inventory: &mut crate::shared::memory::receipts::Inventory<'_>,
+        prefix: &str) -> Result<()> {
+        for (index, table) in self.tables.iter().enumerate() {
+            table.inventory(inventory, &format!("{prefix}rotary.{index}"))?;
+        }
+        Ok(())
+    }
+
     pub fn get(&self, recipe: Recipe) -> Result<Rc<Table<'a>>> {
         let index = self
             .plan
@@ -97,7 +124,61 @@ impl<'a> RotaryTables<'a> {
 }
 
 impl Table<'_> {
+    pub(crate) fn inventory(&self, inventory: &mut crate::shared::memory::receipts::Inventory<'_>,
+        name: &str) -> Result<()> {
+        self.cos.inventory(inventory, &format!("{name}.cos"))?;
+        self.sin.inventory(inventory, &format!("{name}.sin"))
+    }
+
     pub fn buffers(&self) -> (CuteafdDeviceBuffer, CuteafdDeviceBuffer) {
         (self.cos.buffer, self.sin.buffer)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn rotary_requests_and_retained_table_inventory_use_the_same_planes() -> Result<()> {
+        use crate::shared::memory::{receipts::Inventory, weight_arena::DeviceWeightArena};
+        use cuteafd_core::memory_layout::Category;
+        use cuteafd_loader::{serving_capacity::WeightArenaLayout, placement::planner::{CoordinatorDevices,Lifetime,Phase}};
+        let fixture=cuteafd_ffi::native_library_lifetime_fixture::Fixture::build_for_tests()?;
+        let library=fixture.load()?;
+        fixture.configure_memory(&library,1,1<<30)?;
+        fixture.immediate_copies(&library)?;
+        let device=Device { library:&library,id:1 };
+        let recipe=Recipe::new(32,10000.0,None)?;
+        let plan=Tables::new(3,[recipe,recipe,Recipe::new(64,10000.0,None)?])?;
+        let requests=RotaryTables::arena_requests(&plan,"draft.")?;
+        assert_eq!(requests.len(),4);
+        assert_eq!(requests.iter().map(|(_,bytes)|bytes).sum::<usize>() as u64,plan.allocation_bytes);
+        let arena=DeviceWeightArena::new(device,WeightArenaLayout::new("test/rotary",requests.clone())?, crate::shared::memory::TEST_ARENA)?;
+        let tables=requests.chunks_exact(2).map(|pair| -> Result<_> {
+            let cos=arena.view(&pair[0].0,pair[0].1)?;
+            let sin=arena.view(&pair[1].0,pair[1].1)?;
+            device.run(|| { library.copy_h2d(cos.buffer,&vec![37;cos.buffer.bytes])?;
+                library.copy_h2d(sin.buffer,&vec![91;sin.buffer.bytes]) })?;
+            Ok(Rc::new(Table { cos,sin }))
+        }).collect::<Result<Vec<_>>>()?;
+        let rotary=RotaryTables { plan:plan.clone(),tables };
+        drop(arena);
+        let mut inventory=Inventory::new(CoordinatorDevices::new(&[1])?,"rotary",
+            Lifetime { first:Phase::Load,last:Phase::Growth },Category::Weights,"rotary constants");
+        rotary.inventory(&mut inventory,"draft.")?;
+        assert_eq!(inventory.receipts.iter().filter(|r|r.allocation.view.is_none()).count(),1);
+        assert_eq!(inventory.receipts.iter().filter(|r|r.allocation.view.is_some()).count(),4);
+        let table=rotary.get(recipe)?;
+        let mut bytes=vec![0;table.cos.buffer.bytes];
+        device.run(|| library.copy_d2h(&mut bytes,table.cos.buffer))?;
+        assert!(bytes.iter().all(|&b|b==37));
+        // An absent ABI must refuse before invoking a storage callback.
+        let programs=library.programs()?;
+        let mut called=false;
+        assert!(RotaryTables::load_with(device,&programs,plan,"missing.",1<<30,&[],|_,bytes| {
+            called=true; Allocation::new(device,bytes, crate::shared::memory::TEST)
+        }).is_err());
+        assert!(!called);
+        Ok(())
     }
 }

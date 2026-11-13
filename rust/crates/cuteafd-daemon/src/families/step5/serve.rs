@@ -1,4 +1,4 @@
-//! Eager native target and default-on MTP over the shared scheduler.
+//! Native target, bounded decode sections and default-on MTP over the shared scheduler.
 use super::{admission::{self, RuntimeInputs}, backend::{Inputs, Step5Backend}, cache::CacheRank,
     execution::Execution, transaction::Staging};
 use crate::shared::{inventory::{InventoryPhase, RuntimeInventory}, memory::device::Device,
@@ -7,10 +7,11 @@ use crate::shared::{inventory::{InventoryPhase, RuntimeInventory}, memory::devic
 use anyhow::{ensure, Context, Result};
 use cuteafd_core::{ExpertGeometry, SparkEndpoint, SparkIngress};
 use cuteafd_ffi::NativeLibrary;
-use cuteafd_loader::{placement::{Demand, GpuBudget, Inventory, ProgramSet, SparkWorkingSet},
+use cuteafd_loader::{placement::{GpuBudget, Inventory, ProgramSet, SparkWorkingSet},
     plan::{checkpoint::Checkpoint, families::step5::Config, spec::DraftOwnership}};
 use cuteafd_transport::{expert::SparkWorld, worker_selection::ModelAdmission, TcpTransportConfig};
 use std::{cell::RefCell, net::SocketAddr, path::PathBuf, sync::{Arc, Mutex}};
+use cuteafd_core::memory_layout::ArenaTag;
 
 
 /// The solved arena an onboarded routed set loads into.
@@ -49,7 +50,7 @@ impl OnboardBudget {
                         Exl3Tp2::workspace_bytes_for_selection(package, ExpertGeometry::STEP5.hidden as usize,
                             rows, Exl3RowPolicy::for_geometry(ExpertGeometry::STEP5), RtxSelectionPolicy::CanonicalDecode)?
                     } else {
-                        Fp8MoeTp2::plan(catalog.fp8().context("Step-5 FP8 expert tensors")?, package, rank, rows)?.workspace_bytes
+                        Fp8MoeTp2::plan(catalog.fp8().context("Step-5 FP8 expert tensors")?, package, layers, rank, rows)?.workspace_bytes
                     };
                     resident_budget(peaks[rank], workspace)
                 }).collect::<Result<Vec<_>>>()?;
@@ -65,8 +66,15 @@ fn resident_budget(peak: usize, workspace: usize) -> Result<usize> {
 
 #[derive(Debug, Clone, clap::Args)]
 pub(crate) struct ServeArgs {
+    /// Replay bounded persistent decode/verify sections (prefill remains eager).
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    decode_graphs: bool,
+    #[command(flatten)]
+    pub draft_length: crate::shared::draft::length::DraftLength,
+    #[command(flatten)]
+    pub(crate) attention: crate::cli::CoreViewArgs,
     #[arg(long)]
-    snapshot: PathBuf,
+    pub(crate) snapshot: PathBuf,
     #[arg(long, env = "CUTEAFD_NATIVE_LIB")]
     native_lib: PathBuf,
     #[arg(long, default_value = "/opt/cuteafd/share/PROGRAMS.json")]
@@ -82,7 +90,7 @@ pub(crate) struct ServeArgs {
     /// Immutable target and native predictor KV storage.
     #[arg(long, default_value = "fp8")]
     kv_cache: cuteafd_loader::families::qwen4::Qwen4KvCache,
-    #[arg(long, default_value_t = 1_048_576)]
+    #[arg(long = "max-context-tokens", default_value = "auto", value_parser = crate::shared::context::parse_tokens::<u64>)]
     max_context: u64,
     /// Prefill unit rows (PLAN "Prefill contract"); a prefill call holds
     /// `--prefill-waves` units; zero selects the shared topology shape.
@@ -122,6 +130,10 @@ pub(crate) struct ServeArgs {
     api: crate::shared::api::ApiArgs,
 }
 
+fn opens_expert_sessions(working: &SparkWorkingSet) -> bool {
+    !working.spark_layers.is_empty()
+}
+
 impl ServeArgs {
     fn endpoint(&self, ingress: SparkIngress) -> SparkEndpoint {
         SparkEndpoint { ring_depth: None, capacity: self.prefill_rows, ingress, partial_reply_bytes: None }
@@ -129,11 +141,13 @@ impl ServeArgs {
 
     fn shape(&self) -> Result<cuteafd_loader::serving_capacity::prefill_waves::PrefillPlan> {
         use cuteafd_loader::serving_capacity::prefill_waves::{prefill_shape, PrefillOverrides};
-        Ok(prefill_shape(self.peers.len(), cuteafd_loader::plan::Family::prefill_limits(&cuteafd_loader::plan::families::step5::STEP5), PrefillOverrides {
+        let shape = prefill_shape(self.peers.len(), cuteafd_loader::plan::Family::prefill_limits(&cuteafd_loader::plan::families::step5::STEP5), PrefillOverrides {
             unit_rows: (self.prefill_rows != 0).then_some(u64::from(self.prefill_rows)),
             waves: (self.prefill_waves != 0).then_some(u64::from(self.prefill_waves)),
             span_rows: None, reserve_rows: None,
-        })?)
+        })?;
+        cuteafd_bench::context::ResolvedSettings::prefill(shape).publish();
+        Ok(shape)
     }
 
     fn validate(&self) -> Result<()> {
@@ -143,12 +157,13 @@ impl ServeArgs {
             "Step-5 needs one GPU or two distinct actual GPUs");
         // Transport check only: the checkpoint's own format and the shared
         // width-class ranges decide the world in admission (spark_recipe).
-        ensure!(["exl3", "fp8", "nvfp4"].iter().any(|format|
+        ensure!(self.peers.is_empty() || ["exl3", "fp8", "nvfp4"].iter().any(|format|
             cuteafd_core::tp_units::spark_package_worlds("step5", format).contains(&self.peers.len())),
             "Step-5 requires a shared width-class Spark recipe");
         ensure!(self.peers.iter().enumerate().all(|(i, peer)| !self.peers[..i].contains(peer)),
             "Step-5 Spark peers must be distinct");
-        ensure!((262_144..=1_048_576).contains(&self.max_context), "Step-5 request context must be 256K..=1M");
+        ensure!(self.max_context == 0 || (262_144..=1_048_576).contains(&self.max_context),
+            "Step-5 request context must be automatic or 256K..=1M");
         ensure!(u64::from(self.max_sequences) <= shape.unit_rows,
             "Step-5 sequence capacity exceeds row capacity");
         ensure!(u64::from(self.mtp) < shape.unit_rows,
@@ -251,16 +266,28 @@ fn text_media() -> cuteafd_engine::media::MediaAdmission<scheduler::Prompt, crat
 fn with_backend<T>(args: &ServeArgs,
     run: impl FnOnce(&Step5Backend<'_, '_>, usize) -> Result<T>) -> Result<T> {
     let shape = args.shape()?;
+    let serving_context = cuteafd_loader::placement::planner::Context::resolve(
+        if args.max_context == 0 { 1_048_576 } else { args.max_context }, (args.max_context > 0).then_some(args.max_context));
     let mut resolved = args.clone();
+    resolved.max_context = serving_context.maximum;
     resolved.prefill_rows = u32::try_from(shape.unit_rows)?;
     resolved.prefill_waves = u8::try_from(shape.waves)?;
     let args = &resolved;
     args.validate()?;
     let startup = std::time::Instant::now();
-    let checkpoint = Checkpoint::coordinator(&args.snapshot, false, args.mtp > 0)?;
+    let view = args.attention.selected_view.clone().map(Ok)
+        .unwrap_or_else(|| args.attention.select(&args.snapshot))?;
+    args.attention.validate_view(&view)?;
+    cuteafd_bench::context::set_resolved("core-view", view.mode().name());
+    cuteafd_bench::context::set_resolved("core-view-fingerprint", view.fingerprint());
+    let recipe = if view.mode() == cuteafd_loader::plan::checkpoint::CoreView::Fp8Compact {
+        cuteafd_loader::plan::checkpoint::view::FP8_RECIPE
+    } else { "none" };
+    cuteafd_bench::context::set_resolved("core-fp8-recipe", recipe);
+    let checkpoint = Checkpoint::coordinator_view(&view, false, args.mtp > 0)?;
     let cfg = Config::parse(&checkpoint)?;
     cuteafd_bench::context::set_family(cfg.family_id());
-    let mut catalog = cuteafd_loader::read_expert_catalog(&args.snapshot)?;
+    let mut catalog = cuteafd_loader::read_expert_catalog_view(&view)?;
     catalog.select_draft(DraftOwnership::None)?;
     ensure!(catalog.routed_experts().geometry()? == ExpertGeometry::STEP5, "Step-5 routed geometry mismatch");
     let format = super::experts::StepExperts::from_catalog(&catalog)?;
@@ -278,11 +305,16 @@ fn with_backend<T>(args: &ServeArgs,
         args.prefill_packing, args.prefill_rows as usize)?;
     let selected = cuteafd_core::coordinator_programs::CoordinatorPrograms {
         family: "step5", split_family: args.split_device.map(|_| "step52") };
+    let contract = std::rc::Rc::new(cuteafd_loader::plan::families::step5::coordinator::CoordinatorContract::from_checkpoint(&checkpoint)?);
+    let specs = programs.names().map(|name| programs.spec(name)).collect::<Result<Vec<_>>>()?;
+    let manifest = cuteafd_loader::placement::inventory::ProgramsManifest::from_specs(specs.into_iter())?;
+    let native_selection = std::rc::Rc::new(cuteafd_loader::plan::families::step5::native::NativeSelection::resolve(
+        &contract, &cfg, ids.len(), usize::from(args.mtp), args.prefill_rows as usize, Some(&manifest))?);
     let measured = RuntimeInventory::measure(&library, &ids, InventoryPhase::PreWeight, |id| {
-        programs.load_matching(|name| selected.contains(name))?;
+        programs.load_matching(|name| selected.contains(name)
+            || native_selection.resolved.programs.iter().any(|selected| selected == name))?;
         if let Some(other) = ids.iter().copied().find(|&other| other != id) {
             library.cuda_enable_peer(other)?;
-            library.tp2_native_initialize()?;
             library.peer_exchange_initialize()?;
             library.peer_abort_initialize()?;
             if std::env::var("CUTEAFD_PEER_WAIT_DIAGNOSTICS").as_deref() == Ok("1") {
@@ -291,41 +323,42 @@ fn with_backend<T>(args: &ServeArgs,
         }
         Ok(())
     })?;
-    let selected_programs = ProgramSet::from_names(
+    let mut selected_programs = ProgramSet::from_names(
         cuteafd_loader::plan::families::step5::native::program_prefixes(ids.len() == 2), programs.names());
+    native_selection.augment_programs(&mut selected_programs);
     let pending_code = ids.iter().enumerate().map(|(rank, &id)| crate::shared::inventory::pending_code(
         &library, id, rank, ids.len() == 2, "step5", &format.package_name(), &selected_programs))
         .collect::<Result<Vec<_>>>()?;
-    let headroom = cuteafd_loader::plan::layout::LayoutOptions::default().headroom_bytes;
-    let mut inputs = RuntimeInputs { spark_reply_format: cuteafd_core::SparkReplyFormat::resolve(cuteafd_core::spark_reply::requested(), false), kv_format: args.kv_cache, inventory: Inventory { gpus: measured.baselines(&[]).into_iter()
-        .map(|(capacity_bytes, baseline)| GpuBudget { capacity_bytes, baseline, headroom_bytes: headroom }).collect(),
+    let reserve = cuteafd_loader::placement::reserve::gpu("step5");
+    let graph_layout = cuteafd_loader::serving_capacity::step5_graphs::Step5GraphLayout::resolve(
+        &catalog, &contract, ids.len(), args.peers.len());
+    let mut inputs = RuntimeInputs { graph_layout, decode_graphs: args.decode_graphs, bf16_target_head: crate::shared::target_head::TargetHead::configured().blas_head(true),
+        host: Default::default(), resident_weight_limit: Some(crate::shared::memory::budget::resident_weight_limit()), spark_reply_format: cuteafd_core::SparkReplyFormat::resolve(cuteafd_core::spark_reply::requested().prefill, false), kv_format: args.kv_cache, inventory: Inventory { gpus: measured.baselines(&[]).into_iter()
+        .map(|(capacity_bytes, baseline)| GpuBudget { capacity_bytes, baseline, reserve_bytes: reserve }).collect(),
         spark_ranks: args.peers.len(), peer_access: ids.len() == 2 }, rows: usize::try_from(shape.span_rows)?,
         full_prefill_logits: args.full_prefill_logits,
         waves: usize::from(args.prefill_waves), unit: args.prefill_rows as usize,
-        sequences: usize::from(args.max_sequences), context: args.max_context,
+        sequences: usize::from(args.max_sequences), context: args.max_context, serving_context,
         requested_pool: args.pool_tokens,
         marks: admission::prefix_marks(&args.prefix, usize::from(args.max_sequences)),
-        peer_diagnostics: std::env::var("CUTEAFD_PEER_WAIT_DIAGNOSTICS").as_deref() == Ok("1"), pending_code, startup: vec![],
+        peer_diagnostics: std::env::var("CUTEAFD_PEER_WAIT_DIAGNOSTICS").as_deref() == Ok("1"), pending_code,
         onboard: cuteafd_loader::plan::families::step5::admission::OnboardInputs::new(&catalog,
             Some(&args.manifest), args.prefill_rows as usize, ids.len(), usize::from(args.prefill_waves),
             args.rtx_expert_layers.resolve(catalog.routed_experts().routed_layers()))? };
-    let contract = std::rc::Rc::new(cuteafd_loader::plan::families::step5::coordinator::CoordinatorContract::from_checkpoint(&checkpoint)?);
+    inputs.host = cuteafd_loader::plan::families::step5::admission::HostInputs::from_contract(
+        &contract, &cfg, ids.len(), cuteafd_loader::formats::mapped_preload::host_memory()?,
+        match args.prefix.host_cache_bytes {
+            crate::shared::prefix::budget::HostBudget::Auto => None,
+            crate::shared::prefix::budget::HostBudget::Bytes(bytes) => Some(bytes),
+        }, args.prefix.host_cache_headroom_bytes)?;
     tracing::info!(elapsed_s = startup.elapsed().as_secs_f64(), "Step-5 startup inventory complete");
     let planning = std::time::Instant::now();
-    // The first solve only prices retained startup owners. Validate native ABIs
-    // once, after the final solve selects the ownership used for allocation.
-    let admission = cuteafd_loader::plan::families::step5::admission::admit_mtp_with_contract(
-        &checkpoint, &inputs, usize::from(args.mtp), &contract)?;
-    cuteafd_bench::context::set_rtx_expert_layers(admission.placement.onboard_layers);
-    // Uploads convert on the host and copy synchronously. No transient device
-    // conversion arena exists: each loading phase is bounded by retained owners.
-    inputs.startup = admission.placement.items.iter().enumerate().map(|(rank, items)| {
-        let bytes = items.iter().try_fold(0u64, |sum, item| sum.checked_add(item.bytes))
-            .context("Step-5 loading phase overflow")?;
-        Ok(Demand::new(rank as u8, cuteafd_core::memory_layout::Category::Workspace,
-            "Step-5 retained loading peak", bytes, cuteafd_core::memory_layout::Basis::Exact))
-    }).collect::<Result<Vec<_>>>()?;
-    let (admission, native_plan) = admission::admit_mtp_with_contract(&programs, &checkpoint, &inputs, usize::from(args.mtp), contract)?;
+    // One admission: the contract prices every retained owner, and native ABIs
+    // are validated against the ownership it selected.
+    let (admission, native_plan) = admission::admit_mtp_with_contract(&programs, &checkpoint, &inputs, usize::from(args.mtp), contract, native_selection)?;
+    publish_reconciliation(args, &ids, &admission.solved)?;
+    cuteafd_bench::context::ResolvedSettings::placement(&admission.placement).publish();
+    cuteafd_bench::context::set_resolved("max-context-tokens", &admission.solved.served_context().to_string());
     tracing::info!(elapsed_s = planning.elapsed().as_secs_f64(), total_s = startup.elapsed().as_secs_f64(),
         "Step-5 startup planning complete");
     measured.record("step5", &measured.gpus.iter().map(|g| g.free_bytes).collect::<Vec<_>>());
@@ -339,21 +372,23 @@ fn with_backend<T>(args: &ServeArgs,
         rtx_layers: admission.ownership.onboarded_layers().to_vec(),
         spark_layers: (3..91).filter(|layer| !admission.ownership.onboarded(*layer)).collect(), spark_ranks: args.peers.len(),
         prefill_lanes: 1 };
-    let bootstrap = super::execution::bootstrap_request(inputs.unit_rows(), 1, &format, &spark_working.spark_layers)?;
-    let spark_admission = SparkAdmission::plan(&args.snapshot, ExpertGeometry::STEP5, Some(&catalog), &spark_working, args.peers.len(), None,
-        spark_model(&exports, endpoint, u64::from(args.prefill_waves), clients, config.max_frame_bytes)?)?;
+    let bootstrap = super::execution::bootstrap_shape(inputs.unit_rows(), &format)?;
+    let spark_admission = if !opens_expert_sessions(&spark_working) { None } else { Some(SparkAdmission::plan_view(&view, ExpertGeometry::STEP5, Some(&catalog), &spark_working, args.peers.len(),
+        spark_model(&exports, endpoint, u64::from(args.prefill_waves), clients, config.max_frame_bytes)?, None)?) };
     let available = inputs.inventory.gpus.iter().map(GpuBudget::available).collect::<Vec<_>>();
     let reserves = (0..ids.len()).map(|rank| {
         let native = Execution::serving_admission_with_plan(&programs, &checkpoint, &admission.ownership, rank, inputs.unit_rows(),
             inputs.rows, inputs.logit_rows(), &native_plan)?;
         let mut native = native;
         if rank == usize::from(admission.ownership.execution().spec().head_gpu) {
-            native.workspace = native.workspace.max(
-                cuteafd_loader::plan::families::step5::native::mtp_forecast_workspace(inputs.unit_rows(), usize::from(args.mtp), inputs.kv_format)?);
+            let projection = cuteafd_loader::plan::families::step5::native::native_scratch_bytes(
+                &native_plan.layouts[rank], inputs.unit_rows())?;
+            native.workspace = cuteafd_loader::plan::families::step5::native::with_arena_phase(
+                native.workspace, projection,
+                cuteafd_loader::plan::families::step5::native::mtp_forecast_workspace(inputs.unit_rows(), usize::from(args.mtp), inputs.kv_format)?)?;
         }
         let native = native.check(u64::MAX, &[])?;
-        let total = admission.placement.items[rank].iter().try_fold(0u64, |sum, item| sum.checked_add(item.bytes))
-            .context("Step-5 solved allocation overflow")?;
+        let total = future_allocation_bytes(&admission.placement.items[rank], &inputs.inventory.gpus[rank])?;
         total.checked_sub(native).context("Step-5 native allocation missing from solved ledger")
     }).collect::<Result<Vec<_>>>()?;
     let head_rank = usize::from(admission.ownership.execution().spec().head_gpu);
@@ -365,12 +400,12 @@ fn with_backend<T>(args: &ServeArgs,
             .map(|range| usize::try_from(range.peak_bytes)).transpose()?.map(OnboardBudget::Whole),
     };
     let predictor_budget = if args.mtp > 0 {
-        let own = cuteafd_loader::plan::families::step5::coordinator::RankWeightLayout::mtp_from_contract(
-            &checkpoint, &native_plan.contract, usize::from(args.mtp))?.resident_bytes;
-        let total = admission.placement.items[head_rank].iter().try_fold(0u64, |sum, item| sum.checked_add(item.bytes))
-            .context("Step-5 solved predictor allocation overflow")?;
+        let own = cuteafd_loader::plan::families::step5::coordinator::RankWeightLayout::mtp_weight_charge(
+            &checkpoint, &native_plan.contract, usize::from(args.mtp))?;
+        let total = future_allocation_bytes(&admission.placement.items[head_rank], &inputs.inventory.gpus[head_rank])?;
         Some((available[head_rank], total.checked_sub(own).context("Step-5 predictor absent from ledger")?))
     } else { None };
+    crate::shared::inventory::startup_probe(&library, &ids, "step5/pre-weight", Default::default())?;
     let caches = devices.iter().enumerate().map(|(rank, &device)| Ok(RefCell::new(CacheRank::new(device,
         admission.cache.clone(), rank, inputs.sequences as u64, admission.marks as u64,
         admission.placement.pool_tokens / 64, admission.reservations[rank].total)?)))
@@ -381,6 +416,7 @@ fn with_backend<T>(args: &ServeArgs,
             Staging::bytes_for_sequences(&admission.cache, rank, inputs.sequences)?, inputs.sequences, inputs.unit_rows())
     }).collect::<Result<Vec<_>>>()?;
     let target_input = Inputs::allocate(devices[0], inputs.rows, Inputs::bytes(inputs.rows)?)?;
+    crate::shared::inventory::startup_probe(&library, &ids, "step5/cache-staging-inputs", Default::default())?;
     let tensor = checkpoint.tensors.iter().find(|t| t.meta.name == "model.embed_tokens.weight")
         .context("Step-5 embedding header missing")?;
     let source = EmbedSource::new(&args.snapshot, &tensor.shard, &tensor.meta, cfg.hidden)?;
@@ -392,16 +428,26 @@ fn with_backend<T>(args: &ServeArgs,
     use crate::shared::experts::rtx::{dense, push::{CoordinatorPush, PushPolicy}};
     let native_start = std::time::Instant::now();
     let policy = PushPolicy::for_snapshot(&args.snapshot)?;
-    let load = || TokenEmbedding::load(&library, source.clone(), EmbedPlacement::Gpu, || -> Result<_> {
+    // One arena per coordinator GPU: target operands, trellis cores and, on the
+    // entry rank, the embedding table.
+    let entry = usize::from(ownership.execution().spec().entry_gpu);
+    let weight_arenas = devices.iter().enumerate().map(|(rank, &device)|
+        crate::shared::memory::weight_arena::DeviceWeightArena::new(device,
+            super::weights::target_arena(&native_plan.layouts[rank], Some(&native_plan.contract.rope_tables),
+                device.id, 92, rank == entry)?, ArenaTag::weights("step5/target")))
+        .collect::<Result<Vec<_>>>()?;
+    let load = || TokenEmbedding::load_with(&library, source.clone(), EmbedPlacement::Gpu, || -> Result<_> {
         let native = Execution::load_native_with_plan(&programs, &checkpoint, &ownership, &caches_ref, &stages_ref,
-            inputs.unit_rows(), inputs.rows, inputs.logit_rows(), &available, &reserves, 92, &native_plan)?;
+            inputs.unit_rows(), inputs.rows, inputs.logit_rows(), &available, &reserves, 92, &native_plan, Some(&weight_arenas))?;
+        crate::shared::inventory::startup_probe(&library, &ids, "step5/target-native-loaded", Default::default())?;
         let mtp = predictor_budget.map(|(available, reserved)| native.load_predictor(
             &programs, &checkpoint, &caches[head_rank].borrow(), stages[head_rank].stream.clone(),
             usize::from(args.mtp), inputs.unit_rows(), available, &[reserved])).transpose()?;
+        crate::shared::inventory::startup_probe(&library, &ids, "step5/mtp-loaded", Default::default())?;
         Ok((native, mtp))
-    });
+    }, |name, bytes| crate::shared::memory::weight_arena::weight_allocation(devices[entry], Some(&weight_arenas[entry]), name, bytes, ArenaTag::weights("step5/target")));
     let planned = policy.plan(|| -> Result<_> {
-        ensure!(spark_admission.coordinator_pushes(), "Step-5 Spark admission did not select required push");
+        ensure!(spark_admission.as_ref().is_none_or(|plan| plan.coordinator_pushes()), "Step-5 Spark admission did not select required push");
         let recorder = dense::Recorder::start(true)?.context("dense recorder")?;
         let loaded = load();
         let records = recorder.finish();
@@ -409,28 +455,36 @@ fn with_backend<T>(args: &ServeArgs,
         let (landed, operands, staged, steps, largest, finishes) = records.summary();
         tracing::info!(landed, operands, staged, steps, largest_step_bytes = largest, finishes,
             "Step-5 coordinator dense records planned");
-        let dense = dense::plan_records(&args.snapshot, records.clone(), &devices, args.peers.len())?;
+        let expert_world = if spark_admission.is_some() { args.peers.len() } else { 0 };
+        let dense = dense::plan_records(&args.snapshot, records.clone(), &devices, expert_world)?;
         let experts = if ownership.onboarded_layers().is_empty() { None } else {
             let budget = onboarded_budget.context("Step-5 onboarded layers without a solved expert arena")?;
             let package = budget.package(&format, &args.native_lib)?;
             Some(budget.push_plan(&catalog, &package, ownership.onboarded_layers(), inputs.unit_rows(), devices.len())?)
         };
-        let prepared = CoordinatorPush::prepare(&args.snapshot, Some(&catalog), devices.len(), experts)?;
+        let envelope = inputs.host.push.clone().context("Step-5 admitted push host envelope")?;
+        let prepared = if expert_world == 0 {
+            (CoordinatorPush::prepare_alone_view_admitted(&view, Some(&catalog), devices.len(), experts, envelope)?, None)
+        } else {
+            let (push, streams, ranks) = CoordinatorPush::prepare_view_admitted(&view, Some(&catalog), devices.len(), experts, envelope)?;
+            (push, Some((streams, ranks)))
+        };
         Ok((prepared, loaded, records, dense))
     })?;
     let (coordinator, ranks) = match planned {
-        Some(((push, streams, ranks), loaded, records, dense)) => (Some((push, loaded, records, dense)), Some((streams, ranks))),
+        Some(((push, ranks), loaded, records, dense)) => (Some((push, loaded, records, dense)), ranks),
         None => (None, None),
     };
     tracing::info!(elapsed_s = native_start.elapsed().as_secs_f64(), total_s = startup.elapsed().as_secs_f64(),
         "Step-5 startup native preparation complete");
     let push_start = std::time::Instant::now();
-    let pending = spark_admission.start_with(&args.peers, ranks)?;
-    let (embedding, native, mtp) = crate::shared::placement::load_while_admitting(Some(pending), || {
+    let expert_world = if spark_admission.is_some() { args.peers.len() } else { 0 };
+    let pending = spark_admission.map(|plan| plan.start_with(&args.peers, ranks)).transpose()?;
+    let (embedding, native, mtp) = crate::shared::placement::load_while_admitting(pending, || {
         let ((embedding, (native, mtp)), mut pushed) = match coordinator {
             Some((push, loaded, records, dense)) => {
                 let split = crate::shared::memory::load_timing::Split::start();
-                let (received, ()) = push.receive_with(devices.clone(), Some(&catalog), args.peers.len(), Some(Ok(dense)), || ());
+                let (received, ()) = push.receive_with(devices.clone(), Some(&catalog), expert_world, Some(Ok(dense)), || ());
                 let pushed = policy.committed(received)?;
                 split.log("step5 dense and onboarded expert push");
                 tracing::info!(operands = records.operands.len(), steps = records.steps.len(),
@@ -465,10 +519,28 @@ fn with_backend<T>(args: &ServeArgs,
     })?;
     tracing::info!(elapsed_s = push_start.elapsed().as_secs_f64(), total_s = startup.elapsed().as_secs_f64(),
         "Step-5 startup weight delivery complete");
+    if crate::shared::inventory::startup_probe_enabled() {
+        // Arena receipts exist from Load: one backing per GPU plus a view per owner.
+        use crate::shared::memory::receipts::{Census, Inventory};
+        let coordinator = cuteafd_loader::placement::planner::CoordinatorDevices::new(&ids)?;
+        let mut weights = Inventory::new(coordinator, "step5.target", cuteafd_loader::placement::planner::Lifetime::RESIDENT,
+            cuteafd_core::memory_layout::Category::Weights, "step5 weights");
+        native.inventory(&mut weights)?;
+        if let Some(mtp) = &mtp { mtp.inventory(&mut weights)?; }
+        let mut census = Census::default();
+        census.owners(weights.receipts);
+        census.owners(embedding.allocation_receipts(coordinator, "step5.embedding")?);
+        census.normalize(admission.solved.facts.phase_order)?;
+        crate::shared::inventory::startup_probe(&library, &ids, "step5/weights-loaded",
+            crate::shared::inventory::StartupEvidence { census: Some(&census), ..Default::default() })?;
+    }
     let bind_start = std::time::Instant::now();
-    cuteafd_transport::worker_selection::require_peer_clients(&args.peers, endpoint, clients)?;
-    let world = SparkWorld::canonical(args.peers.len())?;
-    let transport = devices[0].own(|| {
+    if !spark_working.spark_layers.is_empty() {
+        cuteafd_transport::worker_selection::require_peer_clients(&args.peers, endpoint, clients)?;
+    }
+    let transport = if !opens_expert_sessions(&spark_working) { None } else {
+        let world = SparkWorld::canonical(args.peers.len())?;
+        Some(devices[0].own(|| {
         // One return slot per prefill wave.
         let waves = usize::from(args.prefill_waves);
         let mut link = SparkLink::new_waves(&library, world, &args.peers, args.prefill_rows, config, 4096 * 2,
@@ -476,31 +548,83 @@ fn with_backend<T>(args: &ServeArgs,
         link.enable_terminal_ownership(library.clone())?;
         link.bootstrap(&bootstrap)?;
         Ok(link)
-    })?;
+    })?) };
     library.cuda_set_device(args.device)?;
-    let execution = Execution::bind_native(&checkpoint, ownership, native, caches_ref, stages_ref, inputs.rows,
-        Some(transport), 92, 1)?;
+    let mut execution = Execution::bind_native(&checkpoint, ownership, native, caches_ref, stages_ref, inputs.rows,
+        transport, 92, 1)?;
+    execution.configure_graphs(args.decode_graphs, graph_layout)?;
     let backend = Step5Backend::new(&execution, caches.iter().collect(), &embedding, &target_input)?
+        .with_served_context(usize::try_from(admission.solved.served_context())?)?
+        .with_admitted_host(admission.host_cache_bytes, admission.host_geometry)
         .with_full_prefill_logits(args.full_prefill_logits)
         .with_prefill_depth(crate::shared::prefill_depth::PrefillDepth::new(usize::from(args.prefill_waves),
             args.prefill_rows as usize)?)?
         .configure_packing(args.prefill_packing, coordinator_cap)?;
     let backend = if let Some(mtp) = &mtp { backend.with_mtp(mtp) } else { backend };
+    if args.decode_graphs { backend.warm_decode_graphs(graph_layout)?; }
     library.cuda_set_device(args.device)?;
     tracing::info!(elapsed_s = bind_start.elapsed().as_secs_f64(), total_s = startup.elapsed().as_secs_f64(),
         "Step-5 startup native binding complete");
     tracing::info!(rows=inputs.rows, sequences=inputs.sequences, mtp=args.mtp,
         context=backend.geometry().max_context, pool_tokens=admission.placement.pool_tokens,
-        "Step-5 admitted eager target and native predictor depth");
+        "Step-5 admitted target and native predictor depth");
     run(&backend, inputs.sequences)
+}
+
+pub(super) fn future_allocation_bytes(items: &[cuteafd_core::memory_layout::Item], gpu: &GpuBudget) -> Result<u64> {
+    let total = items.iter().try_fold(0u64, |sum, item| sum.checked_add(item.bytes))
+        .context("Step-5 solved allocation overflow")?;
+    // CUDA free already excludes this occupancy; only future owners belong in
+    // native/predictor checks against GpuBudget::available().
+    let sampled = match gpu.baseline {
+        cuteafd_loader::placement::Baseline::Measured { free_bytes } => gpu.capacity_bytes
+            .checked_sub(free_bytes).context("Step-5 sample exceeds physical capacity")?,
+        cuteafd_loader::placement::Baseline::Planned { .. } => 0,
+    };
+    let owners = items.iter().filter(|item| cuteafd_loader::placement::sampled_baseline::is_source(&item.group))
+        .collect::<Vec<_>>();
+    ensure!(owners.len() == usize::from(sampled > 0), "Step-5 sampled owner must appear exactly once");
+    let published = owners.iter().try_fold(0u64, |sum, item| sum.checked_add(item.bytes))
+        .context("Step-5 sampled owner overflow")?;
+    ensure!(published == sampled, "Step-5 sampled owner differs from measured occupancy");
+    total.checked_sub(published).context("Step-5 sampled owner missing from solved ledger")
+}
+
+fn reconciliation_devices(ids: &[i32]) -> Vec<serde_json::Value> {
+    ids.iter().map(|id| serde_json::json!({"device": id})).collect()
+}
+
+pub(super) fn publish_reconciliation(args: &ServeArgs, ids: &[i32],
+    solved: &cuteafd_loader::placement::planner::ResolvedPlan) -> Result<()> {
+    use sha2::{Digest, Sha256};
+    cuteafd_loader::placement::reserve::log_plan(solved, "step5");
+    let hash = |path: &std::path::Path| -> Result<String> {
+        let mut file = std::fs::File::open(path)?;
+        let mut digest = Sha256::new();
+        std::io::copy(&mut file, &mut digest)?;
+        Ok(format!("{:x}", digest.finalize()))
+    };
+    cuteafd_ffi::memory_ledger::fault::set_inputs(serde_json::json!({
+        "memory_reconciliation_provenance": {
+            "schema_version": 1, "family": "step5", "source_commit": env!("CUTEAFD_BUILD_COMMIT"),
+            "source_dirty": env!("CUTEAFD_BUILD_DIRTY"), "toolchain": env!("CUTEAFD_BUILD_TOOLCHAIN"),
+            "native_sha256": hash(&args.native_lib)?, "programs_sha256": hash(&args.manifest)?,
+            "devices": reconciliation_devices(ids),
+            "spark_world": args.peers.len(), "onboard_layers": solved.decisions.onboard_layers,
+            "prefill": solved.decisions.prefill, "context": solved.served_context(),
+            "kv_cache": format!("{:?}", args.kv_cache), "decode_graphs": args.decode_graphs,
+            "graph_basis": "per-device bounded byte basis; layout-specific traced rows, or zero untraced base without pins"
+        }
+    }));
+    Ok(())
 }
 
 fn worker(args: &ServeArgs, receive: &mut tokio::sync::mpsc::Receiver<cuteafd_api::openai::NativeRequest>,
     stats: &Arc<Mutex<serde_json::Value>>, eos: Vec<u32>, initialized: impl FnOnce(usize) -> Result<()>) -> Result<()> {
     with_backend(args, |backend, sequences| {
         let drafts = if args.mtp == 0 { scheduler::Drafts::None }
-            else { scheduler::Drafts::Neural { depth: usize::from(args.mtp), fixed: false } };
-        scheduler::schedule(backend, &args.snapshot, receive, stats, sequences, drafts,
+            else { scheduler::Drafts::Neural { depth: usize::from(args.mtp) } };
+        scheduler::schedule(backend, &args.snapshot, receive, stats, sequences, drafts, args.draft_length,
             eos, args.decode_share, &args.prefix, args.loop_abort.config(), args.token_io.token_select,
             &mut text_media(), None,
             || initialized(backend.geometry().max_context))
@@ -508,8 +632,13 @@ fn worker(args: &ServeArgs, receive: &mut tokio::sync::mpsc::Receiver<cuteafd_ap
 }
 
 pub(crate) async fn run_serve(mut args: ServeArgs) -> Result<()> {
+    args.draft_length.report_inactive(args.mtp > 0);
     use cuteafd_api::openai::{chat::step5::Step5Encoding, ModelEncoding, ModelProfile};
     args.validate()?;
+    let view = args.attention.selected_view.clone().map(Ok)
+        .unwrap_or_else(|| args.attention.select(&args.snapshot))?;
+    args.attention.validate_view(&view)?;
+    args.attention.selected_view = Some(view);
     args.prefix.resolve_entries(usize::from(args.max_sequences));
     let api = args.api.load()?;
     let snapshot = args.snapshot.clone();
@@ -532,11 +661,9 @@ pub(crate) async fn run_serve(mut args: ServeArgs) -> Result<()> {
             if let Some(ready) = ready.take() { let _ = ready.send(Ok(context)); }
             Ok(())
         });
-        if let Some(ready) = ready.take() {
-            let _ = ready.send(Err(anyhow::anyhow!("Step-5 initialization failed: {:#}",
-                result.as_ref().err().context("worker exited before readiness")?)));
-        }
-        result
+        crate::shared::serve::forward_initialization(result, ready.is_some(), "Step-5 initialization failed", |error| {
+            ready.take().expect("pending readiness").send(Err(error)).map_err(|result| match result { Err(error) => error, Ok(_) => unreachable!("sent an error") })
+        })
     });
     let context = ready_rx.await.context("Step-5 worker exited before readiness")??;
     let limits = args.prefix.reserve.limits(context)?;
@@ -547,11 +674,12 @@ pub(crate) async fn run_serve(mut args: ServeArgs) -> Result<()> {
     let listener = tokio::net::TcpListener::bind(&args.listen).await?;
     cuteafd_bench::ready(&listener);
     crate::shared::memory_report::log("ready");
+    let mut handle = Some(handle);
     tokio::select! {
-        served = axum::serve(listener, api.app(router, hub)
-            .into_make_service_with_connect_info::<SocketAddr>()) => served?,
-        _ = crate::shared::api::watch_scheduler(handle) => unreachable!(),
+        served = crate::shared::api::serve_http(listener, api.app(router, hub), "step5") => served?,
+        _ = crate::shared::api::watch_scheduler(&mut handle) => unreachable!(),
     }
+    crate::shared::api::finish_scheduler(&mut handle, "step5").await?;
     Ok(())
 }
 
@@ -565,6 +693,116 @@ mod tests {
             "--native-lib", "/lib.so", "--peers", "127.0.0.1:1,127.0.0.1:2,127.0.0.1:3,127.0.0.1:4"]).unwrap();
         let crate::cli::Commands::ServeStep5(args) = cli.command else { panic!("Step-5 dispatch") };
         args
+    }
+
+    #[test]
+    fn decode_graphs_default_on_and_allow_explicit_off() {
+        assert!(args().decode_graphs);
+        let cli = crate::cli::Cli::try_parse_from(["cuteafd", "serve-step5", "--snapshot", "/m",
+            "--native-lib", "/lib.so", "--peers", "127.0.0.1:1", "--decode-graphs", "false"]).unwrap();
+        let crate::cli::Commands::ServeStep5(args) = cli.command else { panic!("Step-5 dispatch") };
+        assert!(!args.decode_graphs);
+        let cli = crate::cli::Cli::try_parse_from(["cuteafd", "plan", "/m"]).unwrap();
+        let crate::cli::Commands::Plan(args) = cli.command else { panic!("plan dispatch") };
+        assert_eq!(args.step5_decode_graphs, "on");
+        let cli = crate::cli::Cli::try_parse_from(["cuteafd", "plan", "/m", "--step5-decode-graphs", "off"]).unwrap();
+        let crate::cli::Commands::Plan(args) = cli.command else { panic!("plan dispatch") };
+        assert_eq!(args.step5_decode_graphs, "off");
+        assert!(cuteafd_loader::plan::layout::LayoutOptions::default().step5_decode_graphs);
+    }
+
+    #[test]
+    fn future_allocation_excludes_only_the_exact_published_sample() -> Result<()> {
+        use cuteafd_core::memory_layout::{Basis, Category, Item};
+        use cuteafd_loader::placement::Baseline;
+        let gpu = GpuBudget { capacity_bytes: 1000, reserve_bytes: 50,
+            baseline: Baseline::Measured { free_bytes: 800 } };
+        let owner = |bytes| Item::new(Category::Runtime,
+            cuteafd_loader::placement::sampled_baseline::source("Step-5 context and selected modules; pre-weight sample"), "", bytes, Basis::Formula);
+        let future = Item::new(Category::Workspace, "native", "", 600, Basis::Formula);
+        let available = gpu.available();
+        assert_eq!(future_allocation_bytes(&[owner(200), future.clone()], &gpu)?, 600);
+        assert_eq!(gpu.available(), available);
+        assert!(future_allocation_bytes(&[future.clone()], &gpu).is_err());
+        assert!(future_allocation_bytes(&[owner(201), future.clone()], &gpu).is_err());
+        assert!(future_allocation_bytes(&[owner(100), owner(100), future.clone()], &gpu).is_err());
+        let invalid = GpuBudget { baseline: Baseline::Measured { free_bytes: 1001 }, ..gpu };
+        assert!(future_allocation_bytes(&[future.clone()], &invalid).is_err());
+        let planned = GpuBudget { baseline: Baseline::Planned { context_bytes: 200, loaded_bytes: 0 }, ..gpu };
+        assert_eq!(future_allocation_bytes(&[future], &planned)?, 600);
+        Ok(())
+    }
+
+    #[test]
+    fn reconciliation_devices_preserve_tp2_physical_ids_in_rank_order() {
+        let devices = reconciliation_devices(&[1, 3]);
+        assert_eq!(devices, vec![serde_json::json!({"device": 1}), serde_json::json!({"device": 3})]);
+        for (rank, physical) in [1, 3].into_iter().enumerate() {
+            assert_eq!(devices[rank]["device"].as_i64(), Some(physical));
+        }
+        assert_eq!(reconciliation_devices(&[1]), vec![serde_json::json!({"device": 1})]);
+        let source = include_str!("serve.rs").split("#[cfg(test)]").next().unwrap();
+        assert!(source.contains("\"devices\": reconciliation_devices(ids)"));
+        assert!(source.contains("\"spark_world\": args.peers.len()"));
+    }
+
+    #[test]
+    fn reconciliation_is_registered_and_shared_scheduler_samples_after_join() {
+        let serve = include_str!("serve.rs").split("#[cfg(test)]").next().unwrap();
+        assert!(serve.contains("publish_reconciliation(args, &ids, &admission.solved)?"));
+        assert!(serve.contains("\"memory_reconciliation_provenance\""));
+        let scheduler = include_str!("../../shared/qwen/scheduler.rs");
+        assert!(scheduler.contains("crate::shared::probe::first_request(&FIRST"));
+        let execution = include_str!("execution.rs");
+        assert!(execution.contains("collect_lane_results(main.stages.iter().map(|stage| stage.stream.drain()))"));
+        assert!(execution.contains("self.graph_completed()"));
+        assert!(!serve.contains("graph_capture_stats"));
+    }
+
+    #[test]
+    fn graph_prewarm_uses_disposable_state_and_the_joined_execution_path() {
+        let backend = include_str!("backend.rs");
+        let start = backend.find("pub(super) fn warm_decode_graphs(").unwrap();
+        let end = start + backend[start..].find("/// Score retained packed").unwrap();
+        let warm = &backend[start..end];
+        assert!(warm.contains("RefPagePool::new(page_count, 64)"));
+        assert!(warm.contains("reset_sequence(0)?"));
+        assert!(warm.contains("self.execute_inner("));
+        assert!(warm.contains("drop(step)"));
+        assert!(warm.contains("pool.release(&placement.pages)"));
+        assert!(warm.contains("observe_graph_startup()?"));
+        assert!(!warm.contains("publish_wave"));
+        let execution = include_str!("execution.rs");
+        assert!(execution.contains("bank.warming(true)"));
+        assert!(execution.contains("bank.warming(false)"));
+        assert!(include_str!("graphs.rs").contains("Cycle::Other } else { cycle"));
+    }
+
+    #[test]
+    fn serve_retains_selected_view_through_checkpoint_catalog_admission_and_push() {
+        let source = include_str!("serve.rs").split("#[cfg(test)]").next().unwrap();
+        assert!(source.contains("census.normalize(admission.solved.facts.phase_order)?"));
+        assert!(source.contains("args.attention.selected_view = Some(view)"));
+        assert!(source.contains("Checkpoint::coordinator_view(&view"));
+        assert!(source.contains("read_expert_catalog_view(&view)"));
+        assert!(source.contains("SparkAdmission::plan_view(&view"));
+        assert!(source.contains("CoordinatorPush::prepare_alone_view_admitted(&view"));
+        assert!(source.contains("CoordinatorPush::prepare_view_admitted(&view"));
+        assert!(!source.contains("Checkpoint::coordinator(&args.snapshot"));
+        assert!(!source.contains("read_expert_catalog(&args.snapshot"));
+        assert!(!source.contains("CoordinatorPush::prepare_alone_admitted("));
+        assert!(!source.contains("CoordinatorPush::prepare_admitted("));
+    }
+
+    #[test]
+    fn all_native_modules_load_inside_measured_baseline_even_for_tp1() {
+        let source = include_str!("serve.rs");
+        let measured = source.split("let measured = RuntimeInventory::measure").nth(1).unwrap()
+            .split("let mut selected_programs").next().unwrap();
+        assert!(measured.contains("InventoryPhase::PreWeight"));
+        let shared = include_str!("../../shared/inventory.rs");
+        assert!(shared.contains("if phase == InventoryPhase::PreWeight { preload_native_modules(library)?; }"));
+        assert!(shared.contains("library.tp2_native_initialize()"));
     }
 
     #[test]
@@ -661,7 +899,7 @@ mod tests {
         assert_eq!(args.max_context, 262_144);
         assert_eq!(args.pool_tokens, Some(args.max_context));
         let policy = cuteafd_loader::placement::PoolPolicy::resolve(
-            &[96 << 30; 2], args.max_context, args.pool_tokens, 64, false);
+            &[96 << 30; 2], args.max_context, args.pool_tokens, 64);
         policy.validate_explicit()?;
         assert_eq!(policy.compiled_context, args.max_context);
         assert!(args.max_context >= 640 + u64::from(args.mtp));
@@ -703,28 +941,22 @@ mod tests {
         let capacity = placement::inventory::PRO_TOTAL_BYTES;
         let arch = placement::inventory::ArchContext::coordinator(cuteafd_core::GpuArch::Sm120, capacity, None);
         let selected = ProgramSet::from_names(&["step5", "step52"], programs.names());
-        let mut inputs = RuntimeInputs { spark_reply_format: cuteafd_core::SparkReplyFormat::Bf16,
+        let mut inputs = RuntimeInputs { graph_layout: None, decode_graphs: false, bf16_target_head: crate::shared::target_head::TargetHead::configured().blas_head(true),
+            host: Default::default(), resident_weight_limit: None, spark_reply_format: cuteafd_core::SparkReplyFormat::Bf16,
                 kv_format: args.kv_cache,
             inventory: Inventory { gpus: vec![GpuBudget { capacity_bytes: capacity,
                 baseline: Baseline::Measured { free_bytes: capacity - arch.context_bytes },
-                headroom_bytes: LayoutOptions::default().headroom_bytes }; 2], spark_ranks: 6, peer_access: true },
-            rows: 256, waves: 1, unit: 0, full_prefill_logits: false, sequences: 16, context: args.max_context, requested_pool: None,
+                reserve_bytes: 0 }; 2], spark_ranks: 6, peer_access: true },
+            rows: 256, waves: 1, unit: 0, full_prefill_logits: false, sequences: 16, context: args.max_context, serving_context: cuteafd_loader::placement::planner::Context::pinned(args.max_context), requested_pool: None,
             marks: admission::prefix_marks(&args.prefix, 16), peer_diagnostics: false,
             pending_code: (0..2).map(|rank| placement::inventory::loaded_code_allowance(
                 "step5", &format.package_name(), true, rank, &arch, Some(&selected)).bytes).collect(),
-            startup: vec![],
             onboard: cuteafd_loader::plan::families::step5::admission::OnboardInputs::new(&catalog,
                 Some(&args.manifest), 256, 2, 1, args.rtx_expert_layers.resolve(catalog.routed_experts().routed_layers()))?,
         };
         for depth in 1..=3 {
             args.mtp = depth;
             args.validate()?;
-            inputs.startup.clear();
-            let admitted = admission::admit_mtp(&programs, &checkpoint, &inputs, usize::from(depth))?;
-            inputs.startup = admitted.placement.items.iter().enumerate().map(|(rank, items)|
-                Demand::new(rank as u8, cuteafd_core::memory_layout::Category::Workspace,
-                    "Step-5 retained loading peak", items.iter().map(|item| item.bytes).sum(),
-                    cuteafd_core::memory_layout::Basis::Exact)).collect();
             let admitted = admission::admit_mtp(&programs, &checkpoint, &inputs, usize::from(depth))?;
             let endpoint = args.endpoint(format.ingress());
             let clients = admitted.ownership.routed_endpoints()?;
@@ -732,19 +964,22 @@ mod tests {
                 rtx_layers: admitted.ownership.onboarded_layers().to_vec(),
                 spark_layers: (3..91).filter(|layer| !admitted.ownership.onboarded(*layer)).collect(),
                 spark_ranks: 6, prefill_lanes: 1 };
-            SparkAdmission::plan(&args.snapshot, ExpertGeometry::STEP5, Some(&catalog), &working,
-                6, None, spark_model(&exports, endpoint, 1, clients, TcpTransportConfig::default().max_frame_bytes)?)?;
-            super::super::execution::bootstrap_request(inputs.unit_rows(), 1, &format, &working.spark_layers)?;
+            SparkAdmission::plan_view(checkpoint.view.as_ref().context("Step-5 Spark admission requires selected checkpoint view")?, ExpertGeometry::STEP5, Some(&catalog), &working,
+                6, spark_model(&exports, endpoint, 1, clients, TcpTransportConfig::default().max_frame_bytes)?, None)?;
+            super::super::execution::bootstrap_shape(inputs.unit_rows(), &format)?;
             let head_rank = usize::from(admitted.ownership.execution().spec().head_gpu);
             for rank in 0..2 {
                 let mut native = Execution::serving_admission(&programs, &checkpoint,
                     &admitted.ownership, rank, inputs.unit_rows(), inputs.rows, inputs.logit_rows())?;
                 if rank == head_rank {
-                    native.workspace = native.workspace.max(
-                        plan::families::step5::native::mtp_forecast_workspace(inputs.unit_rows(), usize::from(depth), inputs.kv_format)?);
+                    let projection = plan::families::step5::native::native_scratch_bytes(
+                        &plan::families::step5::coordinator::RankWeightLayout::for_execution(
+                            &checkpoint, rank, &admitted.ownership)?, inputs.unit_rows())?;
+                    native.workspace = plan::families::step5::native::with_arena_phase(native.workspace, projection,
+                        plan::families::step5::native::mtp_forecast_workspace(inputs.unit_rows(), usize::from(depth), inputs.kv_format)?)?;
                 }
                 let native = native.check(u64::MAX, &[])?;
-                let total = admitted.placement.items[rank].iter().map(|item| item.bytes).sum::<u64>();
+                let total = future_allocation_bytes(&admitted.placement.items[rank], &inputs.inventory.gpus[rank])?;
                 ensure!(native <= total && total <= inputs.inventory.gpus[rank].available(),
                     "native allocation exceeds solved startup budget at rank {rank}");
             }
@@ -847,7 +1082,8 @@ mod tests {
                     pool.release(&family, &old)?;
                 }
                 let drafts = backend.draft(&mut [scheduler::DraftSeq { placement: &source,
-                    seq: &mut source_draft, depth: 3 }], &mut scheduler::DraftTiming::default())?.remove(0);
+                    seq: &mut source_draft, depth: 3 }], &mut scheduler::DraftTiming::default(), &mut crate::shared::token_io::TokenSelector::new(backend.library(),
+                    crate::shared::token_io::SelectPlacement::Device, backend.geometry().vocab_size, 1)?)?.remove(0);
                 ensure!(drafts.len() == 3, "live MTP did not propose every admitted stage");
                 ensure!(expected == backend.diagnostic_state(&source)?, "draft mutated committed mark at {frontier}");
                 let rows = std::iter::once(tokens[frontier]).chain(drafts).collect::<Vec<_>>();
@@ -1136,7 +1372,7 @@ mod tests {
     fn target_serving_defaults_and_invalid_owners() -> Result<()> {
         let mut args = args();
         args.validate()?;
-        assert_eq!((args.max_context, args.max_sequences, args.mtp), (1_048_576, 16, 3));
+        assert_eq!((args.max_context, args.max_sequences, args.mtp), (0, 16, 3));
         assert_eq!(args.kv_cache, cuteafd_loader::families::qwen4::Qwen4KvCache::Fp8);
         assert_eq!(cuteafd_loader::plan::layout::LayoutOptions::default().step5_kv, args.kv_cache);
         for format in ["bf16", "fp8"] {
@@ -1173,11 +1409,16 @@ mod tests {
             args.peers = (1..=sparks).map(|port| format!("127.0.0.1:{port}").parse())
                 .collect::<std::result::Result<_, _>>()?;
             args.validate()?;
-            let shape = args.shape()?;
+            let (shape, model) = crate::commands::bench::assert_resolved_family_seam("step5",
+                &["max-context-tokens", "pool-tokens", "rtx-expert-layers"], || {
+                    args.prefix.resolve_entries(args.max_sequences as usize);
+                    let shape = args.shape()?;
+                    args.prefill_rows = unit as u32;
+                    let exports = [1, 16, 80, 256, 1024, 4096];
+                    let model = spark_model(&exports, args.endpoint(SparkIngress::Native), waves, 2, TcpTransportConfig::default().max_frame_bytes)?;
+                    Ok((shape, model))
+                })?;
             assert_eq!((shape.unit_rows, shape.waves, shape.span_rows), (unit, waves, span));
-            args.prefill_rows = unit as u32;
-            let exports = [1, 16, 80, 256, 1024, 4096];
-            let model = spark_model(&exports, args.endpoint(SparkIngress::Native), waves, 2, TcpTransportConfig::default().max_frame_bytes)?;
             // One prefill owner at the selected unit's covering export; the k units only buffer I/O.
             assert_eq!(model.executions.prefill, cuteafd_core::PrefillExecution { capacity: unit as u32,
                 compiled_capacity: 4096, unit_rows: unit as u32, buffered_units: waves as u8 });
@@ -1252,6 +1493,56 @@ mod push_admission_tests {
     use super::*;
 
     #[test]
+    fn whole_zero_one_admission_matches_required_push_arena() -> Result<()> {
+        use cuteafd_loader::{placement::Onboard, plan::families::step5::admission::OnboardInputs};
+        use crate::shared::{experts::rtx::push::CoordinatorExperts,
+            memory::push_coordinator::CoordinatorExpertPlan};
+        let root = tempfile::tempdir()?;
+        let snapshot = root.path().join("snapshot");
+        cuteafd_loader::plan::testing::write_step5_exl3_snapshot(&snapshot);
+        let catalog = cuteafd_loader::read_expert_catalog(&snapshot)?;
+        let manifest = root.path().join("PROGRAMS.json");
+        let package = root.path().join("exl3/exl3-step5-k46/rtx-tp1");
+        let rows = 2752;
+        let geometry = ExpertGeometry::STEP5;
+        for capacity in cuteafd_core::Exl3RowPolicy::for_geometry(geometry).capacities(rows)? {
+            let directory = package.join(format!("m{capacity}"));
+            std::fs::create_dir_all(&directory)?;
+            std::fs::write(directory.join("v41_exl3.json"), serde_json::to_vec(&serde_json::json!({
+                "capacity": capacity, "decode_capacity": capacity <= 80, "hidden": geometry.hidden,
+                "intermediate": geometry.intermediate, "experts": geometry.experts, "top_k": geometry.topk,
+                "tile": [64, 128, 64, 128], "output_dtype": "fp32", "activation": "silu_post_clamp",
+                "trellis_lut": {"bytes": 32}, "buffers": {
+                    "scratch": {"allocation": "scratch", "dtype": "f32", "bytes": capacity * 256,
+                        "zero_on_create": false}
+                }
+            }))?)?;
+        }
+        assert!(OnboardInputs::new(&catalog, Some(&manifest), rows, 1, 1, Onboard::Layers(0))?.is_none());
+        assert!(CoordinatorExpertPlan::whole(vec![], 0).is_err());
+        let admitted = OnboardInputs::new(&catalog, Some(&manifest), rows, 1, 1, Onboard::Layers(1))?
+            .context("one whole layer")?;
+        let resident = usize::try_from(admitted.costs[0].whole.resident)?;
+        let peak = resident + usize::try_from(admitted.workspace)?;
+        let push = OnboardBudget::Whole(peak).push_plan(&catalog, &package, &[3], rows, 1)?;
+        let CoordinatorExperts::Whole { owners } = push else { anyhow::bail!("whole push expected") };
+        assert_eq!(owners[0].budget, resident);
+        let residency = catalog.exl3().context("EXL3")?
+            .residency(cuteafd_loader::V41Exl3Layer::Backbone(3), 1, 0)?;
+        let plan = CoordinatorExpertPlan::whole(vec![residency], owners[0].budget)?;
+        assert_eq!(plan.layout.bytes(), resident);
+        // The old BF16 charge missed exactly the observed 22,544,384 bytes.
+        let missing = rows * geometry.hidden as usize * 2;
+        assert_eq!(missing, 22_544_384);
+        let underbudget = OnboardBudget::Whole(peak - missing).push_plan(&catalog, &package, &[3], rows, 1)?;
+        let CoordinatorExperts::Whole { owners } = underbudget else { anyhow::bail!("whole push expected") };
+        let residency = catalog.exl3().context("EXL3")?
+            .residency(cuteafd_loader::V41Exl3Layer::Backbone(3), 1, 0)?;
+        assert!(CoordinatorExpertPlan::whole(vec![residency], owners[0].budget).is_err());
+        Ok(())
+    }
+
+    #[test]
     fn push_resident_budget_never_spends_execution_workspace() -> Result<()> {
         assert_eq!(resident_budget(768, 256)?, 512);
         assert_eq!(resident_budget(256, 256)?, 0);
@@ -1270,5 +1561,20 @@ mod push_admission_tests {
         assert!(matches!(policy.committed::<()>(Err(anyhow::anyhow!("peer failed"))),
             Err(PushStartupError::Delivery(_))));
         assert_eq!(PushPolicy::Mount.plan(|| -> Result<()> { panic!("mounted startup must not plan push") }).unwrap(), None);
+    }
+}
+
+#[cfg(test)]
+mod session_ownership_tests {
+    use super::*;
+
+    #[test]
+    fn onboarded_layers_open_no_session() {
+        let mut working = SparkWorkingSet { rtx_layers: (3..91).collect(), spark_layers: vec![],
+            spark_ranks: 6, prefill_lanes: 1 };
+        assert!(!opens_expert_sessions(&working));
+        working.rtx_layers.pop();
+        working.spark_layers.push(90);
+        assert!(opens_expert_sessions(&working));
     }
 }

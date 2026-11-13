@@ -81,8 +81,7 @@ fn dump_max_group_plan_from_installed_headers() -> Result<()> {
             let path = std::path::PathBuf::from(path);
             let config: serde_json::Value = serde_json::from_slice(&std::fs::read(path.join("config.json"))
                 .with_context(|| format!("drafter config {}", path.display()))?)?;
-            let head = core.get_weight(cuteafd_loader::families::muse_spark::core::HEAD)
-                .map(|head| head.stored_outputs).context("Muse drafter needs the K6 target head")?;
+            let head = core.head_outputs(&cfg);
             let sms = std::env::var("CUTEAFD_PUSH_SMS").ok()
                 .map(|sms| sms.parse::<u64>().context("CUTEAFD_PUSH_SMS")).transpose()?.unwrap_or(188);
             Some(shared::drafter_inventory(&cfg, &config, SEQUENCES, SEQUENCES, head, sms,
@@ -98,23 +97,32 @@ fn dump_max_group_plan_from_installed_headers() -> Result<()> {
         super::startup::Measured { arch: cuteafd_core::GpuArch::Sm120, total_bytes: 101_970_345_984, free_bytes: 101_375_541_248,
             untracked_bytes: 594_804_736 },
     ];
-    let (built, placement) = super::startup::admit(super::startup::Options { cfg: &cfg, core: &core,
-        catalog: &catalog, manifest: &manifest, measured, headroom_bytes: 2 << 30, spark_ranks: SPARKS,
+    let (host_total, host_available) = cuteafd_loader::formats::mapped_preload::host_memory()?;
+    let built = super::startup::admit(super::startup::Options {
+        host: shared::HostInput { total: host_total, available: host_available, reserve: 8 << 30,
+            prefix_bytes: Some(0), prefix_entries: 0, media_bytes: Some(0), device_sampling: true },
+        cfg: &cfg, core: &core,
+        projections: cuteafd_loader::families::muse_spark::weight_layout::projections_with_manifest(
+            &cfg, &core, GPUS, usize::try_from(prefill.unit_rows)?,
+            Some(&cuteafd_loader::placement::inventory::ProgramsManifest::from_manifest(&manifest)?))?,
+        catalog: &catalog, manifest: &manifest, measured, headroom_bytes: cuteafd_loader::placement::reserve::gpu("muse_spark"), spark_ranks: SPARKS,
         prefill, full_prefill_logits: false, slots: SEQUENCES as u64,
         mark_slots: mark.slots(shared::mark_bytes(&cfg, 1) as usize) as u64, max_context: None,
         pool_tokens: None, onboard: Onboard::Auto,
         spark_budget_bytes: cuteafd_loader::plan::DEFAULT_SPARK_BUDGET_BYTES,
         partial_bf16_max_rows: cuteafd_loader::families::muse_spark::replies::DEFAULT_BF16_MAX_ROWS,
-        partial_wide_format: cuteafd_loader::families::muse_spark::replies::WideFormat::Nvfp4,
+        partial_reply_formats: Default::default(),
         local: shared::local_workspace(&catalog, Some(&manifest_path), GPUS, prefill.unit_rows)?,
-        drafter, media: Some(super::media::inventory(&snapshot, MediaMode::Off, MediaMode::Off, 1)?) })?;
+        drafter, media: Some(super::media::inventory(checkpoint.view.as_ref()
+            .context("Muse push dump requires its selected checkpoint view")?, MediaMode::Off, MediaMode::Off, 1)?) })?;
+    let placement = &built.placement;
     let cutoff = cuteafd_loader::families::muse_spark::replies::Cutoff::with_wide(
         cuteafd_loader::families::muse_spark::replies::DEFAULT_BF16_MAX_ROWS,
         cuteafd_loader::families::muse_spark::replies::DEFAULT_BF16_MAX_ROWS,
         cuteafd_loader::families::muse_spark::replies::WideFormat::Nvfp4)?;
-    let spark = super::admission::spark_plan(&placement, prefill, cutoff, SEQUENCES, SPARKS)?;
-    let admission = SparkAdmission::plan(&snapshot, cuteafd_core::ExpertGeometry::MUSE_SPARK,
-        Some(&catalog), &spark.working, SPARKS, None, spark.model.clone())?;
+    let spark = super::admission::spark_plan(placement, prefill, cutoff, SEQUENCES, SPARKS)?;
+    let admission = SparkAdmission::plan_view(checkpoint.view.as_ref().context("Muse Spark admission requires selected checkpoint view")?, cuteafd_core::ExpertGeometry::MUSE_SPARK,
+        Some(&catalog), &spark.working, SPARKS, spark.model.clone(), None)?;
     anyhow::ensure!(admission.coordinator_pushes(), "Muse max planned without a coordinator push group");
     let (layers, assignments) = admission.admitted();
     eprintln!("placement: {}; pool {} tokens; onboard {} RTX expert layers; Spark layers {:?}..={:?}",
@@ -127,7 +135,7 @@ fn dump_max_group_plan_from_installed_headers() -> Result<()> {
         .collect::<Vec<_>>();
     let package = if onboarded.is_empty() { None } else {
         Some(shared::local_package(&catalog, &manifest_path, GPUS, prefill.unit_rows)?.0) };
-    let experts = package.as_ref().map(|package| super::onboard::push_plan(&cfg, &placement, GPUS,
+    let experts = package.as_ref().map(|package| super::onboard::push_plan(&cfg, placement, GPUS,
         &onboarded, usize::try_from(prefill.unit_rows)?, package)).transpose()?;
     let (mut push, streams, coordinator) = CoordinatorPush::prepare(&snapshot, Some(&catalog), GPUS, experts)?;
     let mut plans = Vec::with_capacity(SPARKS);
@@ -145,16 +153,23 @@ fn dump_max_group_plan_from_installed_headers() -> Result<()> {
         .with_context(|| format!("Muse checkpoint lacks {name}"))?;
     let source = EmbedSource::new(&checkpoint.snapshot, &tensor.shard, &tensor.meta, cfg.hidden)?;
     let ((embedding, weights), records) = dense::recording(|| {
-        devices[0].run(|| TokenEmbedding::load(&library, source.clone(),
+        let arenas = devices.iter().enumerate().map(|(rank, &device)| {
+            let layers = built.layouts.iter().map(|per_rank| &per_rank[rank]).collect::<Vec<_>>();
+            crate::shared::memory::weight_arena::DeviceWeightArena::new(device,
+                cuteafd_loader::families::muse_spark::weight_layout::coordinator_arena(
+                    rank, GPUS, &built.global, &layers)?, crate::shared::memory::TEST_ARENA)
+        }).collect::<Result<Vec<_>>>()?;
+        devices[0].run(|| TokenEmbedding::load_with(&library, source.clone(),
             crate::shared::memory::EmbedPlacement::Gpu, || {
                 let mut loaded = Vec::with_capacity(GPUS);
                 for (rank, device) in devices.iter().enumerate() {
                     loaded.push(device.run(|| Ok::<_, anyhow::Error>((
-                        load_rank(*device, &cfg, &checkpoint, &built.layouts, rank)?,
-                        GlobalWeights::load(*device, &checkpoint, &built.global, rank, GPUS)?)))?);
+                        load_rank(*device, &cfg, &checkpoint, &built.layouts, rank, &arenas[rank])?,
+                        GlobalWeights::load(*device, &checkpoint, &built.global, rank, GPUS, &arenas[rank])?)))?);
                 }
                 Ok(loaded)
-            }))
+            }, |name, bytes| crate::shared::memory::weight_arena::weight_allocation(
+                devices[0], Some(&arenas[0]), name, bytes, crate::shared::memory::TEST_ARENA)))
     })?;
     let summary = records.summary();
     eprintln!("coordinator records: class2 {} B in {} operands; class3 {} B in {} steps \

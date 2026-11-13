@@ -88,7 +88,7 @@ pub(crate) fn loader<'a>(library: &'a NativeLibrary, setup: &'a Setup, peers: us
         fp8_scales: crate::shared::fp8_linear::Fp8Scales::Amax, device: 0,
         peers: (1..=peers).map(|device| crate::shared::peer_split::RankDevice { device: device as i32,
             stream: std::ptr::null_mut() }).collect(),
-        dense: std::rc::Rc::new(crate::shared::experts::rtx::dense::DenseLoad::mount(library)), transient: Default::default() }
+        dense: std::rc::Rc::new(crate::shared::experts::rtx::dense::DenseLoad::mount(library)), transient: Default::default(), arenas: Default::default() }
 }
 
 /// Every golden operand through `loader`s (two-GPU head split, then one GPU).
@@ -255,6 +255,42 @@ fn scale_gather_matches_the_host_qkv_expansion() -> Result<()> {
         }
         eprintln!("layer {layer}: gathered qkv scales match the host expansion on one and two GPUs");
     }
+    Ok(())
+}
+
+/// Exercise every target operand selected by the Flash max card before any
+/// hardware turn. Extent-only allocations avoid reading or materializing weights.
+#[test]
+#[ignore = "requires CUTEAFD_PUSH_MIMO Flash snapshot and an NVMe fixture directory"]
+fn installed_flash_checkpoint_formats_plan_all_dense_operands() -> Result<()> {
+    use crate::shared::experts::rtx::dense::{self, DenseLoad};
+    use crate::shared::token_io::{EmbedPlacement, EmbedSource};
+    let snapshot = snapshot().context("set CUTEAFD_PUSH_MIMO to the Flash MOPD snapshot")?;
+    let fixture = cuteafd_ffi::native_library_lifetime_fixture::Fixture::build()?;
+    let library = fixture.load()?;
+    fixture.extent_only(&library)?;
+    for device in 0..2 { fixture.configure_memory(&library, device, 512 << 30)?; }
+    let cfg = MimoV2Config::read(&snapshot)?;
+    let checkpoint = cuteafd_loader::plan::checkpoint::Checkpoint::coordinator(&snapshot, false, true)?;
+    let formats = (0..cfg.layers).map(|layer|
+        (format!("model.layers.{layer}.self_attn.o_proj.weight"), MimoProjectionRepresentation::Bf16)).collect();
+    let setup = Setup { cfg, checkpoint, formats,
+        checkpoint_tp: cuteafd_loader::families::mimo_v2::checkpoint_tp(&snapshot)? };
+    let tensor = setup.checkpoint.tensor_names().find(|&name| name == "model.embed_tokens.weight")
+        .and_then(|name| setup.checkpoint.tensors.iter().find(|tensor| tensor.meta.name == name))
+        .context("Flash embedding headers")?;
+    let source = EmbedSource::new(&snapshot, &tensor.shard, &tensor.meta, setup.cfg.hidden)?;
+    let load = std::rc::Rc::new(DenseLoad::push(&library));
+    let planning = MimoLoader { dense: load.clone(), fp8_head: false, ..loader(&library, &setup, 1) };
+    let (_owners, mut records) = dense::recording(||
+        planning.with_embedding(&setup.cfg, setup.cfg.layers, 0, source, EmbedPlacement::Gpu))?;
+    records.extend(load.sink.as_ref().context("push sink")?.take_all());
+    assert_eq!(records.operands.iter().filter(|operand| operand.lands.iter()
+        .any(|(rect, _)| rect.name.ends_with(".self_attn.o_proj.weight"))).count(), setup.cfg.layers * 2);
+    let devices = [Device { library: &library, id: 0 }, Device { library: &library, id: 1 }];
+    let (plans, _arenas) = dense::plan_records(&snapshot, records, &devices, 4)?;
+    assert_eq!(plans.len(), 2);
+    eprintln!("Flash max: all {} target layers, BF16 head and GPU embedding planned for 4 Sparks + 2 RTX", setup.cfg.layers);
     Ok(())
 }
 

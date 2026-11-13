@@ -11,6 +11,11 @@ pub(crate) struct Regions {
 }
 
 impl Regions {
+    pub(crate) fn allocation_receipts(&self,
+        inventory: &mut crate::shared::memory::receipts::Inventory<'_>, name: &str) -> Result<()> {
+        inventory.host(&format!("{name}.buffers"), &self.buffers)?;
+        inventory.host(&format!("{name}.devices"), &self.devices)
+    }
     pub fn new(buffers: &[CuteafdDeviceBuffer]) -> Result<Self> {
         ensure!(!buffers.is_empty(), "snapshot copy registration is empty");
         let mut buffers = buffers.to_vec();

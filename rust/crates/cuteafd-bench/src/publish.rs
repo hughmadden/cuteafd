@@ -34,6 +34,7 @@ pub fn family_title(family: &str) -> &str {
         "mistral_large4" => "Mistral Large 4",
         "glm5_flash" => "GLM 5.3 Flash",
         "mimo_v2" => "MiMo V2",
+        "muse_spark" => "Muse Spark",
         "qwen4" => "Qwen 3.8",
         "qwen3_5" => "Qwen 3.5 / 3.8 dense",
         "kimi_k3" => "Kimi K3",
@@ -158,9 +159,8 @@ impl MatrixRow {
 /// The table is this matrix resolved against the accepted reports on disk, not
 /// "whatever is newest under `benchmarks/`": a newer report on an archived
 /// layout, a card from an earlier release, or a simulation where no real card
-/// exists cannot take a cell the matrix gives to another card. Every row keeps
-/// at least one measured cell, because the checkpoint and quant that name the
-/// row are report data.
+/// exists cannot take a cell the matrix gives to another card. Rows without
+/// measured cells use the matrix checkpoint until a report can name them.
 #[derive(Debug, Clone)]
 pub struct Matrix {
     pub rows: Vec<MatrixRow>,
@@ -333,12 +333,81 @@ pub fn one_row(family: &str, checkpoint: &str, cells: [Cell; 3]) -> Matrix {
 ///
 /// A re-render that fails is the publisher's error, not a run without that
 /// export: publishing stops rather than leave the stale image in place.
-/// The committed copy of a placed `report.json`: per-row fidelity and probe rows and
-/// the baseline's duplicate fabric counters are measurement scratch (several MB
-/// per report). The verdict is set once, when the report is published from its
-/// full rows (`slim_placed`); a slimmed report keeps it (`quality::bar_met`).
-/// Run directories keep the full report for paired fidelity comparisons.
+/// The committed copy of a placed `report.json` keeps rendered measurements and
+/// audit summaries, not request payloads, pool snapshots, expert histograms or
+/// raw NIC counters.
+/// The verdict is set once from the full rows (`slim_placed`); a slimmed report
+/// keeps it (`quality::bar_met`). Run directories retain the full report.
 pub fn slim(report: &mut Value) {
+    fn expert_usage(value: &mut Value) {
+        match value {
+            Value::Array(values) => values.iter_mut().for_each(expert_usage),
+            Value::Object(object) => {
+                object.remove("expert_usage");
+                object.remove("expert_usage_scope");
+                object.values_mut().for_each(expert_usage);
+            }
+            _ => {}
+        }
+    }
+    fn fabric(phase: &mut Value) {
+        if let Some(ports) = phase.get_mut("ports").and_then(Value::as_array_mut) {
+            for port in ports {
+                // Keep the field for old readers; rates, health and peer attribution
+                // are already computed and are what the SVG and dashboard consume.
+                if let Some(counters) = port.get_mut("counters") {
+                    *counters = serde_json::json!({});
+                }
+            }
+        }
+    }
+    fn record(value: &mut Value) {
+        match value {
+            Value::Array(values) => values.iter_mut().for_each(record),
+            Value::Object(object) => {
+                for key in ["requests", "warm_requests", "cold_response", "completed_response",
+                    "retained_prewarm", "attempted_assistant", "assistant_replay",
+                    "pool_before", "pool_samples", "pool_after", "expert_usage", "expert_usage_scope"] {
+                    object.remove(key);
+                }
+                if let Some(phase) = object.get_mut("fabric") {
+                    fabric(phase);
+                }
+                object.values_mut().for_each(record);
+            }
+            _ => {}
+        }
+    }
+    if let Some(phases) = report.get_mut("fabric").and_then(Value::as_array_mut) {
+        phases.iter_mut().for_each(fabric);
+    }
+    if let Some(panels) = report.get_mut("panels").and_then(Value::as_array_mut) {
+        for panel in panels {
+            let info = matches!(panel["id"].as_str(), Some("hardware" | "configuration"));
+            for key in ["passes", "history", "partial"] {
+                if let Some(records) = panel.get_mut(key) {
+                    record(records);
+                    if info {
+                        let strip = |value: &mut Value| {
+                            if let Some(object) = value.as_object_mut() {
+                                for key in ["hardware", "configuration", "build", "model", "family", "revision"] {
+                                    object.remove(key);
+                                }
+                            }
+                        };
+                        match records {
+                            Value::Array(values) => values.iter_mut().for_each(strip),
+                            value => strip(value),
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if let Some(baseline) = report.get_mut("baseline") {
+        // Baseline measurements are retained, but not nested sweep histograms.
+        expert_usage(baseline);
+    }
     if let Some(baseline) = report.get_mut("baseline").and_then(Value::as_object_mut) {
         baseline.remove("fabric");
         if let Some(checks) = baseline.get_mut("quality").and_then(|q| q.get_mut("checks")).and_then(Value::as_array_mut) {
@@ -438,7 +507,8 @@ fn link(dir: &Path, file: &str) -> String {
 }
 
 /// Family display order.
-const FAMILIES: [&str; 7] = ["deepseek_v41", "deepseek_v4", "glm5", "glm5_flash", "mistral_large4", "mimo_v2", "qwen4"];
+const FAMILIES: [&str; 11] = ["deepseek_v41", "deepseek_v4", "glm5", "glm5_flash", "mistral_large4",
+    "mimo_v2", "qwen4", "kimi_k3", "step5", "muse_spark", "qwen3_5"];
 
 fn without_release_candidate(name: &str) -> &str {
     name.rsplit_once("-rc").filter(|(_, n)| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
@@ -536,7 +606,7 @@ pub enum Resolved<'a> {
 }
 
 /// Resolves every matrix row against `placed`, in matrix order. Fails when a
-/// measured cell has no accepted report, or a row has nothing to name it with.
+/// measured cell has no accepted report.
 pub fn select<'a>(placed: &'a [Placed], matrix: &Matrix) -> Result<Vec<Row<'a>>> {
     let mut rows = Vec::new();
     for row in &matrix.rows {
@@ -557,11 +627,9 @@ pub fn select<'a>(placed: &'a [Placed], matrix: &Matrix) -> Result<Vec<Row<'a>>>
                     under benchmarks/", row.family, row.checkpoint, column.title());
             }
         }
-        let Some(label) = cells.iter().find_map(|cell| match cell {
-            Resolved::Card(p) => Some(checkpoint(&p.report)), _ => None }) else {
-            bail!("{}/{}: no cell publishes a report; drop the row or measure one",
-                row.family, row.checkpoint);
-        };
+        let label = cells.iter().find_map(|cell| match cell {
+            Resolved::Card(p) => Some(checkpoint(&p.report)), _ => None })
+            .unwrap_or_else(|| row.checkpoint.clone());
         rows.push(Row { family: row.family.clone(), label, cells });
     }
     Ok(rows)
@@ -640,14 +708,13 @@ pub fn results(placed: &[Placed], matrix: &Matrix) -> Result<String> {
     }
     let mut out = String::from("<table>\n<tr><th>Model · quant</th><th>5090</th><th>1× RTX</th><th>2× RTX</th></tr>\n");
     for row in &rows {
-        // select() proved the row names a report; the checkpoint and quant that
-        // name the row are that report's data, not the matrix's.
-        let first = row.cells.iter().find_map(|cell| match cell {
-            Resolved::Card(p) => Some(p), _ => None }).expect("select() names a report");
+        let name = row.cells.iter().find_map(|cell| match cell {
+            Resolved::Card(p) => Some(p.report.server.checkpoint()), _ => None })
+            .unwrap_or_else(|| row.label.clone());
         let quant = row.label.rsplit_once(" (").map_or("", |(_, quant)| quant.trim_end_matches(')'));
         out.push_str(&format!("<tr>\n<td width=\"19%\" valign=\"top\"><a href=\"docs/models/{}.md\"><b>{}</b></a>\
             <br><sub>{}</sub><br><sub>{quant}</sub></td>\n", row.family, family_title(&row.family),
-            first.report.server.checkpoint()));
+            crate::render::svg::escape(&name)));
         for cell in &row.cells {
             out.push_str(&grid_cell(cell));
             out.push('\n');
@@ -657,7 +724,7 @@ pub fn results(placed: &[Placed], matrix: &Matrix) -> Result<String> {
     out.push_str("</table>\n\n");
     out.push_str("Each card is one launch of the basic profile: tok/s for C1 decode and concurrent decode with thinking \
         off (each stream its own prompt; earlier cards sent one code prompt to every stream, which shares experts and \
-        drafts and reads higher), cold 8K prefill, logit fidelity against the family golden reference, prefix-cache \
+        drafts and reads higher), cold exactly-8,192-token prefill, logit fidelity against the family golden reference, prefix-cache \
         restore exactness and lossless speculation. Older releases, other profiles and every report: \
         [benchmarks](benchmarks/README.md).\n");
     out.push_str(&retired);
@@ -669,7 +736,7 @@ fn retired_results(placed: &[Placed], entries: &[Retired]) -> Result<String> {
     if entries.is_empty() { return Ok(String::new()); }
     let escape = crate::render::svg::escape;
     let mut out = String::from("\n### Retired\n\nLast Release-smoke cards for retired configurations; no new measurements. \
-        Version labels identify the actual tagged or development build recorded by each report; hover for provenance.\n\n\
+        Version: the release whose card set includes this card; hover for the exact build.\n\n\
         <table>\n<tr><th>Model</th><th>Config</th><th>Version</th><th>Last card</th></tr>\n");
     for entry in entries {
         let p = placed.iter().find(|p| p.dir == entry.report)
@@ -905,6 +972,23 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn release_smoke_families_have_named_publication_pages() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
+        let smoke: Value = serde_json::from_str(
+            &std::fs::read_to_string(root.join("scripts/bench/release-smoke-v5.json")).unwrap()).unwrap();
+        let families: BTreeSet<_> = smoke["entries"].as_array().unwrap().iter()
+            .map(|entry| entry["family"].as_str().unwrap()).collect();
+        assert!(!families.is_empty());
+        for family in families {
+            assert!(FAMILIES.contains(&family), "{family} is missing from FAMILIES");
+            assert_ne!(family_title(family), family, "{family} needs a display title");
+            assert!(root.join("docs/models").join(format!("{family}.md")).is_file(),
+                "{family} needs its publication page");
+        }
+        assert_eq!(family_title("muse_spark"), "Muse Spark");
+    }
+
     /// A publication marker: cell selection reads report data, never a directory name.
     fn marker(p: &mut Placed, name: &str, value: &str) {
         if name == "hardware.class" && value == "5090" {
@@ -1010,9 +1094,35 @@ mod tests {
         assert!(html.contains("n/a<br><sub>no two-GPU split</sub>"), "{html}");
         assert!(!html.contains("pending Hugh"), "{html}");
         assert_eq!(html.matches("<img src=").count(), 1);
-        // A row with no measured cell has nothing to name it.
+        // A row with no measured cell uses the matrix's checkpoint.
         let matrix = v41_row([Cell::pending("a"), Cell::pending("b"), Cell::pending("c")]);
-        assert!(results(&reports, &matrix).unwrap_err().to_string().contains("no cell publishes a report"));
+        let html = results(&reports, &matrix).unwrap();
+        assert!(html.contains("deepseek-ai/DeepSeek-V4.1-Flash"));
+        assert_eq!(html.matches("pending<br>").count(), 3);
+        assert!(!html.contains("<img src="));
+    }
+
+    #[test]
+    fn unmeasured_row_preserves_all_status_reasons() {
+        let matrix = one_row("mistral_large4", "owner/plain-k4<&>", [
+            Cell::na("no fit"), Cell::pending("needs smoke"), Cell::held("quality < threshold")]);
+        let html = results(&[], &matrix).unwrap();
+        assert!(html.contains("owner/plain-k4&lt;&amp;&gt;"));
+        assert!(html.contains("n/a<br><sub>no fit</sub>"));
+        assert!(html.contains("pending<br><sub>needs smoke</sub>"));
+        assert!(html.contains("quality &lt; threshold"));
+        assert!(!html.contains("<img src="));
+    }
+
+    #[test]
+    fn mixed_row_keeps_the_report_checkpoint_label() {
+        let reports = vec![marked("one", 1, None)];
+        let matrix = v41_row([Cell::pending("not measured"), Cell::current(), Cell::na("not supported")]);
+        let rows = select(&reports, &matrix).unwrap();
+        assert_eq!(rows[0].label, checkpoint(&reports[0].report));
+        let html = results(&reports, &matrix).unwrap();
+        assert!(html.contains(&reports[0].report.server.checkpoint()));
+        assert_eq!(html.matches("<img src=").count(), 1);
     }
 
     #[test]
@@ -1262,6 +1372,7 @@ mod tests {
         let matrix = Matrix::parse(&doc.to_string()).unwrap();
         let html = results(&[p.clone()], &matrix).unwrap();
         assert!(html.contains("### Retired"));
+        assert!(html.contains("Version: the release whose card set includes this card; hover for the exact build."));
         assert!(html.contains("old&lt;&amp;"));
         assert!(html.contains("abc123; actual &lt;build&gt;"));
         assert!(html.contains("v3 dev 2026-10-14 &lt;local&gt;</td>"));
@@ -1300,20 +1411,68 @@ mod tests {
         let current = rendered.split_once("\n### Retired").unwrap().0.trim();
         // Once the generated README carries Retired, compare the same main section.
         assert_eq!(current, existing.split_once("\n### Retired").map_or(existing, |(main, _)| main).trim());
-        assert_eq!(matrix.retired.len(), 20);
         let retired = rendered.split_once("\n### Retired").unwrap().1;
-        assert!(!retired.contains("nearest final release"));
+        assert_eq!(retired.matches("<tr><td>").count(), matrix.retired.len());
+        let digits = |s: &str| !s.is_empty() && s.bytes().all(|c| c.is_ascii_digit());
+        let version = |s: &str| -> Option<Vec<String>> {
+            let parts = s.strip_prefix('v')?.split('.').collect::<Vec<_>>();
+            (parts.len() == 3 && parts.iter().all(|part| digits(part)))
+                .then(|| parts.into_iter().map(str::to_owned).collect())
+        };
         for entry in &matrix.retired {
             let report = &placed.iter().find(|p| p.dir == entry.report).unwrap().report;
-            let expected = report.server.build.release.clone()
-                .unwrap_or_else(|| format!("v3 dev {}", &report.created[..10]));
-            assert_eq!(entry.release, expected, "{} must name the actual build", entry.name);
-            assert!(retired.contains(&format!(">{}</td>", crate::render::svg::escape(&expected))));
-            assert!(retired.contains(report.server.build.commit.as_deref().unwrap()));
+            let row = retired.lines().find(|line| line.contains(&format!("href=\"{}\"", link(&entry.report, "card.svg")))).unwrap();
+            assert!(row.contains(&format!(">{}</td>", crate::render::svg::escape(&entry.release))));
+            let provenance = format!("build {}; commit {};", report.server.build.label(),
+                report.server.build.commit.as_deref().unwrap());
+            assert!(row.contains(&format!("title=\"{}", crate::render::svg::escape(&provenance))));
+            if let Some(final_version) = version(&entry.release) {
+                let build = report.server.build.release.as_deref().unwrap();
+                let build_version = version(build.split_once("-rc").map_or(build, |(base, _)| base)).unwrap();
+                assert_eq!(&final_version[..2], &build_version[..2]);
+                let tag = std::process::Command::new("git").arg("-C").arg(&root)
+                    .args(["rev-parse", "--verify", &format!("refs/tags/{}^{{commit}}", entry.release)])
+                    .output().unwrap();
+                assert!(tag.status.success(), "{} must be a shipped tag", entry.release);
+                let commit = String::from_utf8(tag.stdout).unwrap();
+                assert!(Some(commit.trim()) == report.server.build.commit.as_deref()
+                    || build.strip_prefix(&format!("{}-rc", entry.release))
+                        .is_some_and(|suffix| !suffix.is_empty() && suffix.bytes().all(|c| c.is_ascii_digit())),
+                    "{} must belong to {}", entry.name, entry.release);
+            } else {
+                let (major, date) = entry.release.split_once(" dev ").unwrap();
+                assert!(major.strip_prefix('v').is_some_and(digits));
+                let date_parts = date.split('-').collect::<Vec<_>>();
+                assert_eq!(date_parts.iter().map(|part| part.len()).collect::<Vec<_>>(), [4, 2, 2]);
+                assert!(date_parts.iter().all(|part| digits(part)));
+                assert!(report.server.build.release.is_none());
+                assert_eq!(date, &report.created[..10]);
+            }
         }
-        let smoke: crate::smoke::Matrix = serde_json::from_str(&std::fs::read_to_string(
+        let old: crate::smoke::Matrix = serde_json::from_str(&std::fs::read_to_string(
             root.join("scripts/bench/release-smoke-v4.json")).unwrap()).unwrap();
-        assert_eq!(serde_json::to_value(&matrix.retired).unwrap(), serde_json::to_value(&smoke.retired).unwrap());
+        let current: crate::smoke::Matrix = serde_json::from_str(&std::fs::read_to_string(
+            root.join("scripts/bench/release-smoke-v5.json")).unwrap()).unwrap();
+        let pins = |entries: &[Retired]| entries.iter()
+            .map(|entry| (entry.name.clone(), entry.report.clone())).collect::<BTreeMap<_, _>>();
+        let archived_ml4: Vec<_> = old.retired.iter().filter(|entry|
+            matches!(entry.name.as_str(), "ml4-exl3-min" | "ml4-exl3-max")).collect();
+        assert_eq!(archived_ml4.len(), 2);
+        for entry in archived_ml4 {
+            assert_eq!(entry.release, "v5.0.0-rc1");
+            assert!(placed.iter().any(|p| p.dir == entry.report));
+        }
+        let old_pins: BTreeMap<_, _> = pins(&old.retired).into_iter().filter(|(name, _)|
+            !matches!(name.as_str(), "ml4-exl3-min" | "ml4-exl3-max")).collect();
+        let current_pins = pins(&current.retired);
+        let published_pins = pins(&matrix.retired);
+        assert_eq!(published_pins, current_pins);
+        for (name, report) in &old_pins { assert_eq!(published_pins.get(name), Some(report)); }
+        let additions = published_pins.keys().filter(|name| !old_pins.contains_key(*name))
+            .map(String::as_str).collect::<BTreeSet<_>>();
+        assert_eq!(additions, BTreeSet::from(["v41-flash-reference-tp4", "glm53f-exl3-5090",
+            "v4-flash-reference-tp4", "glm53-exlr8-a8-max", "qwen38-27b-bf16-min-nospec",
+            "qwen38-27b-fp8-min-nospec"]));
     }
 
     /// Writes `benchmarks/current-matrix.json` from rows: the real file, re-parsed by the real loader.
@@ -1348,6 +1507,14 @@ mod tests {
         assert!(crate::render::card::card_svg(&p.report).contains("simulated 5090"));
         p.report.server.configuration.settings.last_mut().unwrap().value = Some("NaN".into());
         assert_eq!(coordinator_budget(&p.report), None);
+        // Current servers record the memory policy's cap in bytes; it wins over
+        // the name published reports from before the policy carry.
+        p.report.server.configuration.settings.push(crate::report::Setting {
+            name: "gpu-memory-cap".into(), value: Some((32u64 << 30).to_string()),
+            default: None, source: "cli".into(),
+        });
+        assert_eq!(coordinator_budget(&p.report), Some(32.0));
+        assert!(p.report.server.hardware_line().contains("capped at 32 GiB"), "{}", p.report.server.hardware_line());
     }
 
     #[test]
@@ -1637,17 +1804,28 @@ mod tests {
     }
 
     #[test]
-    fn checked_in_matrix_resolves_every_row_to_a_pinned_pro_card() {
+    fn checked_in_matrix_resolves_pinned_cards_and_explicit_statuses() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
         let placed = scan(&root).unwrap();
         let matrix = Matrix::load(&root.join(MATRIX_FILE)).unwrap();
         let rows = select(&placed, &matrix).unwrap();
         assert_eq!(rows.len(), matrix.rows.len());
-        for row in rows {
-            assert!(matches!(row.cells[0], Resolved::Card(_) | Resolved::Na(_)));
-            // Every published checkpoint has at least one PRO card; other cells say why not.
-            assert!(row.cells[1..].iter().any(|c| matches!(c, Resolved::Card(_))));
-            assert!(row.cells[1..].iter().all(|c| matches!(c, Resolved::Card(_) | Resolved::Na(_))));
+        for (row, source) in rows.iter().zip(&matrix.rows) {
+            for (cell, expected) in row.cells.iter().zip(&source.cells) {
+                match (cell, expected) {
+                    (Resolved::Card(_), Cell { status: Status::Current, .. }) => {},
+                    (Resolved::Pending(reason), Cell { status: Status::Pending, reason: expected, .. })
+                    | (Resolved::Held(reason), Cell { status: Status::Held, reason: expected, .. })
+                    | (Resolved::Na(reason), Cell { status: Status::Na, reason: expected, .. }) => {
+                        assert_eq!(reason, expected);
+                        assert!(!reason.is_empty());
+                    },
+                    _ => panic!("matrix status changed during resolution"),
+                }
+            }
+            if !row.cells.iter().any(|cell| matches!(cell, Resolved::Card(_))) {
+                assert_eq!(row.label, source.checkpoint);
+            }
         }
     }
 
@@ -1790,15 +1968,116 @@ mod tests {
         assert_eq!(std::fs::read_to_string(root.path().join("README.md")).unwrap(), before);
     }
 
+    fn assert_slim_exports_identical(full: Value) -> Value {
+        let before: Report = serde_json::from_value(full.clone()).unwrap();
+        let mut slimmed = full;
+        slim(&mut slimmed);
+        let after: Report = serde_json::from_value(slimmed.clone()).unwrap();
+        let family = before.server.family.as_deref().unwrap_or("unknown");
+        let placed = |report| vec![Placed { dir: PathBuf::from(format!("benchmarks/{family}/rc1")), report }];
+        let full = placed(before.clone());
+        let slimmed_placed = placed(after.clone());
+        let matrix = one_row_of(&full[0]);
+        assert_eq!(results(&full, &matrix).unwrap(), results(&slimmed_placed, &matrix).unwrap());
+        assert_eq!(index(&full), index(&slimmed_placed));
+        let published = BTreeSet::from([full[0].dir.clone()]);
+        let full_family = family_cards(&select(&full, &matrix).unwrap(), &published, family);
+        assert!(!full_family.is_empty(), "oracle must compare the report's family cards");
+        assert_eq!(full_family, family_cards(&select(&slimmed_placed, &matrix).unwrap(), &published, family));
+        let mut exports = vec!["card.svg".to_string(), "report.svg".to_string()];
+        exports.extend(crate::render::report::shown(&before).iter().map(|id| format!("panel-{id}.svg")));
+        for name in exports {
+            assert_eq!(crate::http::export(&before, &name).unwrap(),
+                crate::http::export(&after, &name).unwrap(), "{name}");
+        }
+        assert!(serde_json::to_vec(&slimmed).unwrap().len() < 2_000_000);
+        slimmed
+    }
+
     #[test]
-    fn slim_drops_per_row_records_and_baseline_fabric_only() {
+    fn slim_rc1_shaped_report_preserves_all_publication_exports() {
+        let mut full = serde_json::to_value(crate::sample::full_report()).unwrap();
+        let raw = serde_json::json!({"content": "payload".repeat(100_000)});
+        let point = serde_json::json!({"kind": "cached follow-up", "c": 4, "status": "ok",
+            "aggregate_tok_s": 123.0, "per_request_tok_s": 30.75, "ttft_s": 0.1,
+            "end_to_end_s": 2.0, "requests": [raw.clone()], "pool_samples": [raw.clone()]});
+        full["panels"].as_array_mut().unwrap().push(serde_json::json!({
+            "id": "shared_prefix", "title": "Shared-prefix release guard", "status": "done",
+            "passes": [{"points": [point.clone()], "identical": [point.clone()],
+                "retained": {"bases": [{"cold_response": raw}], "points": [point]},
+                "thermal": {"seconds": 2.0}}]
+        }));
+        assert!(serde_json::to_vec(&full).unwrap().len() > 2_000_000);
+        assert_slim_exports_identical(full);
+    }
+
+    /// Run with CUTEAFD_TEST_SLIM_REPORT pointing at an unmodified run report.
+    #[test]
+    #[ignore = "requires an external full Release smoke report"]
+    fn slim_real_rc1_report_preserves_all_publication_exports() {
+        let path = std::env::var_os("CUTEAFD_TEST_SLIM_REPORT").expect("CUTEAFD_TEST_SLIM_REPORT");
+        let text = std::fs::read_to_string(path).unwrap();
+        let full = serde_json::from_str(&text).unwrap();
+        let slimmed = assert_slim_exports_identical(full);
+        let encoded = serde_json::to_vec(&slimmed).unwrap();
+        eprintln!("RC1 full {} B -> slim {} B; all publication exports byte-identical", text.len(), encoded.len());
+        if let Some(path) = std::env::var_os("CUTEAFD_TEST_SLIM_OUTPUT") {
+            std::fs::write(path, encoded).unwrap();
+        }
+    }
+
+    #[test]
+    fn slim_drops_scratch_but_keeps_measurements_and_audit_summaries() {
         let mut report = serde_json::json!({
             "fabric": [{"name": "decode/code/c1"}],
             "baseline": {"fabric": [{"name": "decode/code/c1"}], "quality": {"status": "pass", "checks": [
                 {"id": "fidelity", "metrics": {"kl": 0.01, "probe": {"rows": [{"position": 0}], "cold": true},
                     "run": {"score": {"kl": 0.01, "records": [{"position": 0}]}}}},
                 {"id": "cache", "metrics": {"restored": 2}}]}}});
+        let scratch = serde_json::json!({
+            "requests": [{"content": "payload"}], "warm_requests": [{}],
+            "cold_response": {}, "completed_response": {}, "retained_prewarm": {},
+            "attempted_assistant": {}, "assistant_replay": {},
+            "pool_before": {}, "pool_samples": [{}], "pool_after": {},
+            "aggregate_tok_s": 123.0, "thermal": {"seconds": 10},
+            "cache_exact": {"status": "pass"}, "expert_usage": {"rows": [1]},
+            "expert_usage_scope": "whole panel pass",
+            "mapped_tables": {"bytes": 12},
+            "fabric": {"ports": [{"counters": {"port_xmit_data": 99}, "sent_bytes": 99,
+                "peers": [{"peer": "spark", "sent_bytes": 90}], "health": {"verdict": "ok"}}]}
+        });
+        report["fabric"][0]["ports"] = scratch["fabric"]["ports"].clone();
+        report["baseline"]["card"] = serde_json::json!({"points": [scratch.clone()]});
+        report["panels"] = serde_json::json!([
+            {"id": "shared_prefix", "passes": [{"points": [scratch.clone()],
+                "retained": {"points": [scratch.clone()]}}], "partial": scratch.clone(), "history": [scratch.clone()]},
+            {"id": "configuration", "passes": [{"configuration": {"settings": []}, "build": {},
+                "model": "duplicate", "thermal": {"seconds": 10}}]},
+            {"id": "hardware", "passes": [{"hardware": {}, "readiness_s": 5}]}
+        ]);
         super::slim(&mut report);
+        let mut expected = scratch;
+        for key in ["requests", "warm_requests", "cold_response", "completed_response", "retained_prewarm",
+            "attempted_assistant", "assistant_replay", "pool_before", "pool_samples", "pool_after",
+            "expert_usage", "expert_usage_scope"] {
+            expected.as_object_mut().unwrap().remove(key);
+        }
+        expected["fabric"]["ports"][0]["counters"] = serde_json::json!({});
+        for path in ["/panels/0/passes/0/points/0", "/panels/0/passes/0/retained/points/0",
+            "/panels/0/partial", "/panels/0/history/0"] {
+            assert_eq!(report.pointer(path).unwrap(), &expected, "{path}");
+        }
+        assert_eq!(report["fabric"][0]["ports"], expected["fabric"]["ports"]);
+        let baseline_point = &report["baseline"]["card"]["points"][0];
+        assert!(baseline_point.get("expert_usage").is_none());
+        assert!(baseline_point.get("expert_usage_scope").is_none());
+        assert_eq!(baseline_point["aggregate_tok_s"], 123.0);
+        assert_eq!(baseline_point["thermal"], expected["thermal"]);
+        assert_eq!(report["panels"][1]["passes"][0], serde_json::json!({"thermal": {"seconds": 10}}));
+        assert_eq!(report["panels"][2]["passes"][0], serde_json::json!({"readiness_s": 5}));
+        let before = report.clone();
+        super::slim(&mut report);
+        assert_eq!(report, before, "slimming is idempotent");
         assert!(report["baseline"].get("fabric").is_none());
         assert_eq!(report["fabric"][0]["name"], "decode/code/c1");
         assert_eq!(report["baseline"]["quality"]["checks"][0]["metrics"]["run"]["score"]["records"], serde_json::json!([]));

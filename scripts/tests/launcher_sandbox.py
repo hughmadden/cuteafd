@@ -2,6 +2,7 @@
 from pathlib import Path
 import json
 import shutil
+import tempfile
 
 _ROOT = None
 _TEMPLATES = {}
@@ -17,18 +18,31 @@ def configure(root):
     _TEMPLATES.clear()
 
 
+def _template_dir():
+    """A fresh directory per template: a copy that fails partway leaves its
+    own debris, never a name the next template would reuse."""
+    return Path(tempfile.mkdtemp(prefix="template-", dir=_ROOT))
+
+
 def copy_input(source, destination):
     """Link a read-only input from a private session copy, not the checkout."""
     source, destination = Path(source), Path(destination)
     if destination.is_dir():
         destination /= source.name
     if source.name == "release-common.sh":
-        copy_launcher_shared_inputs(source.resolve().parents[2], destination.parent.parent.parent)
+        root = source.resolve().parents[2]
+        copy_launcher_shared_inputs(root, destination.parent.parent.parent)
+        # run-family.sh sources the per-family key registries and the attention
+        # validation beside release-common.
+        for shared in ("family-keys.sh", "attention-placement.sh"):
+            staged = destination.parent / shared
+            if not staged.exists():
+                copy_input(root / "scripts" / "lib" / shared, staged)
     if _ROOT is None:
         return shutil.copy(source, destination)
     key = source.resolve()
     if key not in _TEMPLATES:
-        cached = _ROOT / str(len(_TEMPLATES))
+        cached = _template_dir() / source.name
         shutil.copy(source, cached)
         _TEMPLATES[key] = cached
     # A shared dependency may already have been staged before an explicit copy.
@@ -47,9 +61,18 @@ def copy_launcher_shared_inputs(source_root, destination_root):
             copy_input(source, target)
 
 
-def fake_deployment_memory_layout(rtx, ranks, spark_budget_gib=108):
-    """Typed device records shared by process-boundary planner stubs."""
-    budget = int(float(spark_budget_gib) * 2**30)
+def fake_deployment_memory_layout(rtx, ranks, spark_memory_cap=None):
+    """Typed device records shared by process-boundary planner stubs.
+
+    Self-contained: stubs inline it with inspect.getsource. The Spark cap is a
+    launcher memory size (B, MB, GB, MiB or GiB; bare bytes)."""
+    import re
+    from decimal import Decimal
+    budget = 108 << 30
+    if spark_memory_cap:
+        match = re.fullmatch(r"([0-9]+(?:\.[0-9]{1,6})?)(B|MB|GB|MiB|GiB)?", str(spark_memory_cap))
+        scale = {None: 1, "B": 1, "MB": 10**6, "GB": 10**9, "MiB": 2**20, "GiB": 2**30}[match.group(2)]
+        budget = int(Decimal(match.group(1)) * scale)
     return {"devices": [
         {"kind": "rtx", "index": i, "capacity_bytes": 96 << 30,
          "worker_budget_bytes": 0, "items": [{"category": "weights", "bytes": 8 << 30}],
@@ -98,7 +121,7 @@ def copy_tree(source, destination, **kwargs):
         return shutil.copytree(source, destination, **kwargs)
     key = ('tree', Path(source).resolve())
     if key not in _TEMPLATES:
-        cached = _ROOT / str(len(_TEMPLATES))
+        cached = _template_dir() / "tree"
         shutil.copytree(source, cached, **kwargs)
         _TEMPLATES[key] = cached
 

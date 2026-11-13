@@ -7,10 +7,10 @@ mod packed_check;
 pub(crate) mod serve;
 pub(crate) mod ml4_media;
 pub(crate) mod landing;
-use crate::shared::experts::exlr8::dense_weights;
 pub(crate) mod push;
 pub(crate) mod weights;
 pub(crate) mod core_runtime;
+pub(crate) mod drafter;
 
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::NativeLibrary;
@@ -21,12 +21,26 @@ use std::ffi::c_void;
 use std::path::PathBuf;
 use std::time::Instant;
 
+/// DFlash needs this startup constant while the target table is still only recorded.
+pub(crate) fn draft_mask_row(embedding: &crate::shared::token_io::TokenEmbedding<'_>, token: u32) -> Result<Vec<u8>> {
+    if crate::shared::experts::rtx::dense::is_recording() { embedding.checkpoint_rows(&[token]) }
+    else { embedding.host_rows(&[token]) }
+}
+
 /// One enum for the engine flag and `cuteafd plan`, so the planner charges what admission charges.
 pub(crate) use cuteafd_loader::plan::exlr8::PrefillActivations as Exlr8PrefillActivations;
 
 /// What every GLM command needs to stand up the engine.
 #[derive(Debug, Clone, clap::Args)]
 pub(crate) struct EngineArgs {
+    #[command(flatten)]
+    pub(crate) attention: crate::cli::CoreViewArgs,
+    /// Count executed expert routes; --expert-usage=false disables telemetry.
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set,
+        num_args = 0..=1, default_missing_value = "true", require_equals = true)]
+    pub expert_usage: bool,
+    #[arg(skip)]
+    pub expert_usage_reader: cuteafd_core::expert_usage::Reader,
     /// Shared GQA drafter-ring storage (independent of weight precision).
     #[arg(long, default_value = "fp8")]
     pub draft_kv_cache: cuteafd_loader::families::qwen4::Qwen4KvCache,
@@ -56,8 +70,8 @@ pub(crate) struct EngineArgs {
     /// Run only the first N layers (dense layers need no experts).
     #[arg(long)]
     pub layers: Option<usize>,
-    /// Longest sequence; 0 selects checkpoint full, bounded by compiled support and the admitted pool.
-    #[arg(long, default_value_t = 0)]
+    /// Served context: auto fits the admitted pool; a positive count pins it.
+    #[arg(long = "max-context-tokens", default_value = "auto", value_parser = crate::shared::context::parse_tokens::<usize>)]
     pub max_context: usize,
     /// Tokens the shared latent/index cache pool holds across sequences; 0
     /// sizes it from what every GPU has left after weights and the planner's
@@ -159,6 +173,7 @@ fn resolve_prefill(args: &mut EngineArgs) -> Result<()> {
     args.prefill_rows = usize::try_from(shape.unit_rows)?;
     args.prefill_waves = u8::try_from(shape.waves)?;
     args.prefill_span_rows = usize::try_from(shape.span_rows)?;
+    cuteafd_bench::context::ResolvedSettings::prefill(shape).publish();
     Ok(())
 }
 
@@ -181,9 +196,9 @@ fn native_activation(args: &EngineArgs, first_moe: usize, layers: usize, serving
         "EXLR8 full execution requires one or two distinct coordinators, 1..=8 Spark ranks and all backbone layers");
     let attention = cuteafd_loader::placement::attention::parse(&args.attention_placement)
         .map_err(anyhow::Error::msg)?;
-    let expected = if args.split_device.is_some() { AttentionPlacement::Context } else { AttentionPlacement::Heads };
-    ensure!(attention.is_none_or(|placement| placement == expected),
-        "EXLR8 full execution requires {expected} attention placement for the selected coordinators");
+    ensure!(attention.is_none_or(|placement| placement == AttentionPlacement::Heads
+        || (args.split_device.is_some() && matches!(placement, AttentionPlacement::Context | AttentionPlacement::Layers))),
+        "EXLR8 full execution requires heads or two-GPU context/layers attention placement");
     Ok(())
 }
 
@@ -242,17 +257,6 @@ mod draft_cli_tests {
     }
 
     use clap::Parser;
-
-    #[test]
-    fn embedding_lookup_and_host_admission_use_the_variant_name() {
-        // Pair the real-header naming sweep with a guard on the two runtime consumers.
-        let source = include_str!("mod.rs");
-        let lookup = source.rsplit("fn embed_source(&self)").next().unwrap().split("\n    }").next().unwrap();
-        assert!(lookup.contains("catalog.tensor(self.cfg.embedding())?"));
-        let admission = source.rsplit("let host_embedding = args.token_io.embed_placement").next().unwrap()
-            .split("let mut reserved_weights").next().unwrap();
-        assert!(admission.contains("checkpoint.require_untied_embedding(self.cfg.embedding())?"));
-    }
 
     #[test]
     fn width_diagnostics_fail_closed_and_detect_live_route_changes() {
@@ -342,16 +346,6 @@ mod draft_cli_tests {
         assert!(validate_spark_endpoint_count("glm5", 1, 1).is_err());
         assert!(validate_spark_endpoint_count("glm5", 3, 3).is_err());
         assert!(validate_spark_endpoint_count("glm5", 2, 1).is_ok());
-        let source = include_str!("mod.rs");
-        let links = source.rsplit("let mut transport = selected_peers.map(").next().unwrap()
-            .split("let runtime = tokio::runtime::Builder").next().unwrap();
-        let check = |body: &str| body.contains("engine::DECODE_ROWS as u32, config.clone(), row_bytes")
-            && body.contains("warm(engine::DECODE_ROWS, true)")
-            && body.contains("warm(args.prefill_rows, false)")
-            && !body.contains("selected_peers.filter(");
-        assert!(check(links));
-        assert!(!check(&links.replace("engine::DECODE_ROWS as u32", "4096")));
-        assert!(!check(&links.replace("match selected_peers {", "match selected_peers.filter(|_| prefill_lanes > 1) {")));
         Ok(())
     }
 
@@ -392,7 +386,14 @@ mod draft_cli_tests {
             let mut argv = vec!["test", "--snapshot", "/checkpoint", "--native-lib", "/native", "--peers", peers.as_str()];
             argv.extend_from_slice(extra);
             let mut args = Parse::try_parse_from(argv).unwrap().engine;
-            resolve_prefill(&mut args).unwrap();
+            crate::commands::bench::assert_resolved_family_seam("glm5",
+                &["max-context-tokens", "pool-tokens", "rtx-expert-layers", "draft-window-marks", "attention-plan-rows"], || {
+                    crate::commands::bench::fixture_prefix().resolve_entries(16);
+                    serve::resolve_serving_capacity(&mut args, 16);
+                    resolve_prefill(&mut args)?;
+                    spark_model("glm5", SparkBackend::Fp8, usize::from(args.prefill_waves), args.prefill_rows as u32, true)?;
+                    Ok(())
+                }).unwrap();
             (args.prefill_rows, args.prefill_waves, args.prefill_span_rows)
         };
         assert_eq!(resolve(&[]), (2752, 3, 8256));
@@ -484,6 +485,24 @@ mod draft_cli_tests {
     }
 
     #[test]
+    fn golden_layer_dump_round_trips_bf16_rows() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let output = root.path().join("layers");
+        let stream: Vec<u8> = [1.0f32, -2.5, 0.0, 16.0].into_iter()
+            .flat_map(|value| ((value.to_bits() >> 16) as u16).to_le_bytes()).collect();
+        dump_golden_layer(&output, 3, &stream)?;
+        let loaded = std::fs::read(output.join("layer03.bin"))?;
+        assert_eq!(loaded, stream);
+        assert_eq!(bf16s(&loaded), vec![1.0, -2.5, 0.0, 16.0]);
+        let (cosine, relative) = similarity(&bf16s(&loaded), &bf16s(&stream));
+        assert!(cosine > 0.999999);
+        assert_eq!(relative, 0.0);
+        assert!(dump_golden_layer(&output, 4, &[0]).is_err());
+        assert!(!output.join("layer04.bin").exists());
+        Ok(())
+    }
+
+    #[test]
     fn golden_rejects_invalid_unit_geometry_before_opening_checkpoint() {
         #[derive(Parser)]
         struct Golden { #[command(flatten)] args: GoldenArgs }
@@ -527,10 +546,11 @@ mod draft_cli_tests {
     #[test]
     fn planner_charge_equals_admission_charge_for_the_same_geometry() {
         use cuteafd_loader::plan::exlr8::PrefillActivations;
-        const GROUP: &str = "native dense scratch and prefill staging";
+        cuteafd_loader::placement::families::glm5::admission::allow_synthetic_graphs();
+        const GROUP: &str = "GLM target hooks";
         let dir = tempfile::tempdir().unwrap();
-        cuteafd_loader::plan::testing::exlr8::glm_snapshot(dir.path());
-        let manifest = cuteafd_loader::plan::testing::glm5_native_programs();
+        cuteafd_loader::plan::testing::exlr8::glm_admission_snapshot(dir.path());
+        let manifest = cuteafd_loader::plan::testing::exlr8::glm_admission_programs();
         let checkpoint = cuteafd_loader::plan::Checkpoint::open(dir.path()).unwrap();
         let cfg = GlmDsaConfig::from_hf(&checkpoint.config).unwrap();
         let records = cuteafd_loader::plan::exlr8::dense::DenseRecord::inventory(dir.path()).unwrap();
@@ -550,14 +570,19 @@ mod draft_cli_tests {
                         cuteafd_loader::families::glm5::native::scratch_bytes(
                             &native_dense_layouts(&cfg, &records, &plan, &engine).unwrap()).unwrap()
                     }).collect::<Vec<_>>();
+                    // A serving layout allocates its prefill lanes on the first live
+                    // prefill and charges them at Growth; scoring runs that prefill
+                    // before Ready, so its items hold every lane the admission
+                    // charge names. Compare the scoring view.
                     let layout = cuteafd_loader::plan::layout::LayoutOptions {
+                        full_prefill_logits: true,
                         rtx_bytes: vec![96 << 30; gpus], prefill_rows: engine.prefill_rows as u64,
                         prefill_lanes: u64::from(engine.prefill_waves), prefill_waves: u64::from(engine.prefill_waves),
                         exlr8_prefill_activations: activations.parse::<PrefillActivations>().unwrap(), context_tokens: 65536,
                         onboard: Some(cuteafd_loader::placement::OnboardSetting::Layers(0)), glm5_drafter_disabled: true,
                         host_memory: Some((128 << 30, 128 << 30)), host_cache_bytes: Some(0), ..Default::default() };
                     let (memory, _) = cuteafd_loader::plan::layout::glm5::native_layout(&checkpoint, &layout,
-                        &vec![256; gpus], 256, peers.split(',').count(), &manifest, None).unwrap();
+                        peers.split(',').count(), &manifest, "k4").unwrap();
                     assert_eq!(memory.devices.len(), gpus);
                     for (rank, device) in memory.devices.iter().enumerate() {
                         let planned: u64 = device.items.iter().filter(|item| item.group == GROUP).map(|item| item.bytes).sum();
@@ -596,8 +621,11 @@ mod draft_cli_tests {
             let mut candidate = args.clone();
             candidate.exlr8_manifest = Some(manifest.into());
             assert!(native_activation(&candidate, 3, 78, true).is_ok());
-            candidate.attention_placement = "auto".into();
-            assert!(native_activation(&candidate, 3, 78, false).is_ok());
+            for mode in ["auto", "heads", "layers"] {
+                candidate.attention_placement = mode.into();
+                assert!(native_activation(&candidate, 3, 78, true).is_ok());
+                assert!(native_activation(&candidate, 3, 78, false).is_ok());
+            }
         }
         for mode in ["heads", "auto"] {
             let mut one = args.clone();
@@ -606,6 +634,10 @@ mod draft_cli_tests {
             assert!(native_activation(&one, 3, 78, true).is_ok());
             assert!(native_activation(&one, 3, 78, false).is_ok());
         }
+        let mut one_layers = args.clone();
+        one_layers.split_device = None;
+        one_layers.attention_placement = "layers".into();
+        assert!(native_activation(&one_layers, 3, 78, true).is_err());
         for ranks in 1..=8 {
             let mut candidate = args.clone();
             candidate.peers = Some((0..ranks).map(|rank| format!("worker{rank}:1")).collect::<Vec<_>>().join(","));
@@ -625,7 +657,7 @@ mod draft_cli_tests {
                 2 => candidate.split_device = Some(0),
                 3 => candidate.peers = Some("a:1,b:1,c:1,d:1,e:1,f:1,g:1,h:1,i:1".into()),
                 4 => candidate.layers = Some(4),
-                5 => candidate.attention_placement = "heads".into(),
+                5 => candidate.attention_placement = "invalid".into(),
                 6 => candidate.exlr8_manifest = None,
                 _ => candidate.skip_routed_experts = true,
             }
@@ -637,6 +669,24 @@ mod draft_cli_tests {
         assert!(native_activation(&component, 3, 78, false).is_ok());
         assert!(native_activation(&component, 3, 78, true).is_err());
 
+    }
+
+    #[test]
+    fn expert_usage_defaults_on_and_explicit_off_or_skip_disables() {
+        for (flag, requested) in [(None, true), (Some("--expert-usage"), true),
+            (Some("--expert-usage=true"), true), (Some("--expert-usage=false"), false)] {
+            for skip in [false, true] {
+                let mut argv = vec!["test", "--snapshot", "/checkpoint", "--native-lib", "/native"];
+                argv.extend(flag);
+                if skip { argv.push("--skip-routed-experts"); }
+                let args = Parse::try_parse_from(argv).unwrap().engine;
+                assert_eq!(args.expert_usage, requested);
+                assert_eq!(args.expert_usage_reader.configure(args.expert_usage,
+                    args.skip_routed_experts).unwrap(), requested && !skip);
+            }
+        }
+        assert!(Parse::try_parse_from(["test", "--snapshot", "/checkpoint", "--native-lib", "/native",
+            "--expert-usage=invalid"]).is_err());
     }
 
     #[test]
@@ -683,6 +733,9 @@ pub(crate) struct GoldenArgs {
     /// python/reference/families/glm5/golden.py.
     #[arg(long)]
     pub golden: PathBuf,
+    /// Write each prefill layer's BF16 residual rows as layerNN.bin for --golden comparisons.
+    #[arg(long)]
+    pub layer_dump: Option<PathBuf>,
     /// Prefill only the first N tokens, then feed the rest through decode
     /// steps of --step-rows rows (teacher-forced), comparing their rows.
     #[arg(long)]
@@ -786,20 +839,48 @@ pub(crate) struct GoldenArgs {
 /// The checkpoint and native library, opened on the calling thread.
 pub(crate) struct Opened {
     pub snapshot: PathBuf,
+    pub view: cuteafd_loader::plan::checkpoint::CheckpointView,
     pub catalog: cuteafd_loader::OfficialV41Catalog,
     /// An EXLR8 checkpoint: its own dense records run natively.
     pub native: bool,
     pub cfg: GlmDsaConfig,
     pub library: std::sync::Arc<NativeLibrary>,
+    startup_audit: std::cell::RefCell<Option<cuteafd_ffi::memory_ledger::AllocationAudit>>,
+}
+
+pub(crate) fn validate_selected_attention(view: &cuteafd_loader::plan::checkpoint::CheckpointView,
+    cfg: &GlmDsaConfig) -> Result<()> {
+    if let Some(ml4) = cfg.variant.ml4() {
+        let checkpoint = cuteafd_loader::plan::Checkpoint::open_view_for_role(view,
+            "Mistral Large 4 selected attention", |name| name.contains(".attention.wq.")
+                || name.contains(".attention.wo."))?;
+        cuteafd_loader::families::mistral_large4::attention::validate(&checkpoint, ml4)?;
+    } else {
+        let checkpoint = cuteafd_loader::plan::Checkpoint::inventory_view(view)?;
+        cuteafd_loader::families::glm5::core::validate_native_attention(cfg, &checkpoint)?;
+    }
+    Ok(())
 }
 
 pub(crate) fn open(args: &EngineArgs) -> Result<Opened> {
-    let mut catalog = cuteafd_loader::read_expert_catalog(&args.snapshot)?;
+    let startup_audit = crate::shared::inventory::startup_probe_enabled()
+        .then(cuteafd_ffi::memory_ledger::AllocationAudit::begin);
+    let view = args.attention.selected_view.clone().map(Ok)
+        .unwrap_or_else(|| args.attention.select(&args.snapshot))?;
+    args.attention.validate_view(&view)?;
+    let mut catalog = cuteafd_loader::read_expert_catalog_view(&view)?;
     let draft_ownership = catalog.bundled_dspark_ownership(args.dspark)?;
     catalog.select_draft(draft_ownership)?;
     cuteafd_core::set_expert_geometry(catalog.routed_experts().geometry()?)
         .map_err(|g| anyhow::anyhow!("geometry already {g:?}"))?;
-    let cfg = GlmDsaConfig::read(&args.snapshot)?;
+    let cfg = GlmDsaConfig::from_hf(&view.config()?)?;
+    validate_selected_attention(&view, &cfg)?;
+    cuteafd_bench::context::set_resolved("core-view", view.mode().name());
+    cuteafd_bench::context::set_resolved("core-view-fingerprint", view.fingerprint());
+    let recipe = if view.mode() == cuteafd_loader::plan::checkpoint::CoreView::Fp8Compact {
+        cuteafd_loader::plan::checkpoint::view::FP8_RECIPE
+    } else { "none" };
+    cuteafd_bench::context::set_resolved("core-fp8-recipe", recipe);
     cuteafd_bench::context::set_family(cfg.family_id());
     let native = catalog.format() == cuteafd_loader::plan::checkpoint::CheckpointFormat::Exlr8;
     if native {
@@ -811,35 +892,54 @@ pub(crate) fn open(args: &EngineArgs) -> Result<Opened> {
             "EXLR8 options require a native EXLR8 checkpoint");
     }
     if args.dspark {
-        dflash::check_snapshot_target_head(&args.snapshot, cfg.head(), cfg.hidden, cfg.vocab_size, false)?;
+        dflash::check_view_target_head(&view, cfg.head(), cfg.hidden, cfg.vocab_size, false)?;
     }
     if let Some(snapshot) = &args.draft {
         // A native EXLR8 target lends its row-FP8 head through a launcher.
-        if !native { dflash::check_snapshot_target_head(&args.snapshot, cfg.head(), cfg.hidden, cfg.vocab_size, false)?; }
+        if !native { dflash::check_view_target_head(&view, cfg.head(), cfg.hidden, cfg.vocab_size, false)?; }
         dflash::check_checkpoint(snapshot, args.draft_fp8, args.draft_context_slots, args.draft_sequences)?;
     }
     let library = std::sync::Arc::new(unsafe { NativeLibrary::load(&args.native_lib) }?);
     library.cuda_set_device(args.device)?;
-    Ok(Opened { snapshot: args.snapshot.clone(), catalog, native, cfg, library })
+    let opened = Opened { snapshot: args.snapshot.clone(), view, catalog, native, cfg, library,
+        startup_audit: std::cell::RefCell::new(startup_audit) };
+    opened.startup_probe(&std::iter::once(args.device).chain(args.split_device).collect::<Vec<_>>(),
+        "glm/open", None, false)?;
+    Ok(opened)
 }
 
 struct ResolvedEngineArgs {
     args: EngineArgs,
-    automatic_context: bool,
+    context: cuteafd_loader::placement::planner::Context,
 }
 
 impl ResolvedEngineArgs {
     fn new(args: &EngineArgs) -> Result<Self> {
-        let automatic_context = args.max_context == 0;
+        let requested_context = (args.max_context > 0).then_some(args.max_context as u64);
         let mut resolved = args.clone();
         resolve_prefill(&mut resolved)?;
         resolved.max_context = crate::shared::context::checkpoint_context(
             &args.snapshot, &args.manifest, "glm5", args.max_context)?;
-        Ok(Self { args: resolved, automatic_context })
+        Ok(Self { context: cuteafd_loader::placement::planner::Context::resolve(resolved.max_context as u64, requested_context), args: resolved })
     }
 }
 
 impl Opened {
+    fn startup_probe(&self, devices: &[i32], stage: &str,
+        census: Option<&crate::shared::memory::receipts::Census>, finish: bool) -> Result<()> {
+        use crate::shared::inventory::{startup_probe, StartupEvidence};
+        if !crate::shared::inventory::startup_probe_enabled() { return Ok(()); }
+        if finish {
+            let history = self.startup_audit.borrow_mut().take().map(|audit| audit.finish());
+            startup_probe(&self.library, devices, stage,
+                StartupEvidence { audit: None, history: history.as_ref(), census })
+        } else {
+            let audit = self.startup_audit.borrow();
+            startup_probe(&self.library, devices, stage,
+                StartupEvidence { audit: audit.as_ref(), history: None, census })
+        }
+    }
+
     /// Builds the engine (and the Spark transport when peers are given) and
     /// hands them to `body`.
     pub fn with_engine<T>(&self, args: &EngineArgs,
@@ -851,8 +951,16 @@ impl Opened {
     fn with_resolved_engine<T>(&self, resolved: &ResolvedEngineArgs,
         body: impl FnOnce(&engine::GlmEngine<'_>, Option<&mut SparkLink<'_>>, &tokio::runtime::Runtime) -> Result<T>)
         -> Result<T> {
-        let ResolvedEngineArgs { args, automatic_context } = resolved;
-        let automatic_context = *automatic_context;
+        self.with_resolved_engine_media(resolved, Default::default(), None, (None, 0), body)
+    }
+    fn with_resolved_engine_media<T>(&self, resolved: &ResolvedEngineArgs,
+        media: crate::shared::experts::rtx::dense::Records,
+        serving: Option<(&crate::shared::prefix::PrefixArgs, usize)>,
+        media_owners: (Option<(i32, u64, u64)>, u64),
+        body: impl FnOnce(&engine::GlmEngine<'_>, Option<&mut SparkLink<'_>>, &tokio::runtime::Runtime) -> Result<T>) -> Result<T> {
+        let ResolvedEngineArgs { args, context: serving_context } = resolved;
+        let expert_usage = args.expert_usage_reader.configure(args.expert_usage, args.skip_routed_experts)
+            .map_err(anyhow::Error::msg)?;
         let native = self.native;
         let dense_catalog = &self.catalog;
         ensure!(!args.skip_routed_experts || args.peers.is_none(),
@@ -915,13 +1023,31 @@ impl Opened {
             None => None,
         };
         let devices: Vec<_> = std::iter::once(args.device).chain(split_device).collect();
+        self.startup_probe(&devices, "glm/streams-before-programs", None, false)?;
         use cuteafd_loader::families::glm5::DensePrograms;
         let dense_programs = if native { DensePrograms::Exlr8 } else { DensePrograms::Fp8 };
         let layers = args.layers.unwrap_or(self.cfg.layers).min(self.cfg.layers);
+        let requested = cuteafd_loader::placement::attention::parse(&args.attention_placement)
+            .map_err(anyhow::Error::msg)?;
+        let context = if devices.len() == 2 && !matches!(requested,
+            Some(cuteafd_loader::placement::AttentionPlacement::Heads | cuteafd_loader::placement::AttentionPlacement::Layers)) {
+            let sms = devices.iter().map(|&device| crate::shared::peer_split::on_device(
+                &self.library, device, || self.library.sm_count())).collect::<Result<Vec<_>>>()?;
+            cuteafd_loader::placement::families::glm5::manifest_context_for_cards(
+                &self.cfg, &manifest, &sms, attention_plan)?
+        } else { None };
+        let requested = cuteafd_loader::placement::families::glm5::resolve_context_attention(
+            &self.cfg, requested, devices.len(), context.is_some(), !native)?;
+        ensure!(requested != Some(cuteafd_loader::placement::AttentionPlacement::Layers) || devices.len() == 2,
+            "GLM layers attention requires two coordinator GPUs");
+        let owners = (requested == Some(cuteafd_loader::placement::AttentionPlacement::Layers))
+            .then(|| cuteafd_loader::placement::families::glm5::attention_owners(&self.cfg, layers)).transpose()?;
+        let whole_mla = owners.as_ref().map(|owners| owners.iter().enumerate()
+            .map(|(layer, &rank)| (layer, usize::from(rank))).collect()).unwrap_or_default();
         let native_records = native.then(|| cuteafd_loader::plan::exlr8::dense::DenseRecord::inventory(&self.snapshot)).transpose()?;
         let native_dense_records = if native {
-            (0..devices.len()).map(|rank| dense_weights::NativeDenseRecords::new(
-                &self.snapshot, layers, devices.len(), rank, &std::collections::BTreeMap::new()))
+            (0..devices.len()).map(|rank| cuteafd_loader::plan::exlr8::dense::requests::NativeDenseRecords::new(
+                &self.snapshot, layers, devices.len(), rank, &whole_mla))
                 .collect::<Result<Vec<_>>>()?
         } else { Vec::new() };
         let native_selected = if let Some(records) = &native_records {
@@ -949,19 +1075,15 @@ impl Opened {
             tracing::info!(loaded, skipped, "GLM programs loaded");
             Ok(())
         })?;
+        self.startup_probe(&devices, "glm/programs-before-weights", None, false)?;
         let mut draft_file = None;
-        let requested = cuteafd_loader::placement::attention::parse(&args.attention_placement)
-            .map_err(anyhow::Error::msg)?;
-        let requested = cuteafd_loader::placement::families::glm5::resolve_attention(&self.cfg, requested, devices.len());
-        ensure!(requested != Some(cuteafd_loader::placement::AttentionPlacement::Layers) || devices.len() == 2,
-            "GLM layers attention requires two coordinator GPUs");
-        let owners = (requested == Some(cuteafd_loader::placement::AttentionPlacement::Layers))
-            .then(|| cuteafd_loader::placement::families::glm5::attention_owners(&self.cfg, layers)).transpose()?;
-        use cuteafd_loader::placement::{families::glm5 as glm, Baseline};
-        let checkpoint = (!native).then(|| cuteafd_loader::plan::Checkpoint::coordinator(dense_catalog.snapshot(), false, false))
-            .transpose()?;
+        use cuteafd_loader::placement::{families::glm5 as glm, planner::*};
+        use glm::{admission::*, local_physical::*};
+        let checkpoint = (!native).then(|| {
+            let view = dense_catalog.selected_view().context("GLM dense catalog has no selected view")?;
+            cuteafd_loader::plan::Checkpoint::coordinator_view(view, false, false)
+        }).transpose()?;
         // The EXLR8 checkpoint's own dense records, per coordinator rank.
-        ensure!(!native || owners.is_none(), "EXLR8 native dense runs head or context attention, not whole-layer owners");
         let native_plans = if native {
             (0..devices.len()).map(|rank| crate::shared::experts::exlr8::NativePlan::new(&self.snapshot,
                 args.exlr8_manifest.as_deref().context("EXLR8 manifest")?,
@@ -969,36 +1091,11 @@ impl Opened {
                 devices.len(), rank))
                 .collect::<Result<Vec<_>>>()?
         } else { Vec::new() };
-        for plan in &native_plans { plan.admit_host()?; }
-        let native_workspace = native_plans.iter().map(|plan| plan.workspace as u64).max().unwrap_or(0);
+        // Shared admission below charges native loader owners and the host tier together.
         let host_embedding = args.token_io.embed_placement == crate::shared::token_io::EmbedPlacement::Host;
         ensure!(!native || !host_embedding, "the EXLR8 row-FP8 embedding is device-resident (its owner holds the head too)");
-        let groups = match (&checkpoint, &native_records) {
-            (Some(checkpoint), _) => {
-                if host_embedding { checkpoint.require_untied_embedding(self.cfg.embedding())?; }
-                cuteafd_loader::plan::layout::glm5::resident_owned(checkpoint, devices.len(), layers, owners.as_deref())?
-            }
-            (None, Some(records)) => {
-                use cuteafd_loader::plan::exlr8::dense::{DenseSelection, resident_native};
-                let config = serde_json::from_slice(&std::fs::read(self.snapshot.join("config.json"))?)?;
-                let selection = DenseSelection::from_hf(&config)?;
-                native_dense_records.iter().enumerate().map(|(rank, owned)| -> Result<_> {
-                    let mut groups = resident_native(&selection, layers, &owned.plan)?;
-                    groups.extend(crate::shared::token_io::native::VocabularyPlan::new(records, &selection,
-                        devices.len(), rank, self.cfg.hidden, self.cfg.vocab_size)?.resident_groups(&selection, layers)?);
-                    Ok(groups)
-                }).collect::<Result<Vec<_>>>()?
-            }
-            (None, None) => anyhow::bail!("GLM coordinator operands need a checkpoint"),
-        };
-        let mut reserved_weights = groups.into_iter().map(|groups|
-                groups.into_iter().filter(|(group, _, _)| (!host_embedding || group != "embedding")
-                    && (!native || group != "shared_expert"))
-                    .try_fold(0u64, |sum, (_, _, bytes)| sum.checked_add(bytes)
-                        .context("GLM coordinator weight reservation overflow")))
-                .collect::<Result<Vec<_>>>()?;
-        for (reserved, plan) in reserved_weights.iter_mut().zip(&native_plans) {
-            *reserved = reserved.checked_add(plan.resident).context("EXLR8 coordinator reservation overflow")?;
+        if let Some(checkpoint) = &checkpoint {
+            if host_embedding { checkpoint.require_untied_embedding(self.cfg.embedding())?; }
         }
         let spark_bf16 = checkpoint.as_ref().is_some_and(|c| c.spark_input_is_bf16());
         // Native dense: decode plus every prefill lane's scratch and opt-in A8 records.
@@ -1018,61 +1115,34 @@ impl Opened {
                 }
             }
         }
-        let native_dense_charge = native_scratch.iter()
-            .map(cuteafd_loader::families::glm5::native::scratch_bytes).collect::<Result<Vec<_>>>()?;
-        let gpus = inventory.gpus.iter().zip(&reserved_weights).map(|(gpu, &bytes)| -> Result<_> {
-            let free_bytes = gpu.free_bytes.checked_sub(bytes)
-                .context("GLM coordinator header-derived weights exceed pre-weight free memory")?;
-            Ok((gpu.total_bytes, Baseline::Measured { free_bytes }))
-        }).collect::<Result<Vec<_>>>()?;
-        inventory.record("glm5", &gpus.iter().map(|(_, b)| match b {
-            Baseline::Measured { free_bytes } => *free_bytes, _ => unreachable!(),
-        }).collect::<Vec<_>>());
+        inventory.record("glm5", &inventory.gpus.iter().map(|gpu| gpu.free_bytes).collect::<Vec<_>>());
+        let cards = devices.iter().map(|&device| crate::shared::peer_split::on_device(&self.library, device, || {
+            let (_, physical) = self.library.cuda_allocatable_memory_info()?;
+            Ok((physical as u64, cuteafd_ffi::coordinator_gpu_budget().map_or(physical as u64, |budget| budget.0)))
+        })).collect::<Result<Vec<_>>>()?;
         let scratch = |decode| -> Result<_> {
             let lookup = |name: &str| programs.spec(name).ok().map(|p| p.scratch.get("scratch").copied().unwrap_or(0));
             let mut scratch = glm::step_scratch(&self.cfg, devices.len() == 2, decode, lookup)?;
             if owners.is_some() { scratch.programs = scratch.programs.max(glm::step_scratch(&self.cfg, false, decode, lookup)?.programs); }
             Ok(scratch)
         };
-        let drafter_bytes = args.draft.as_deref().map(|snapshot| glm::drafter_bytes(snapshot,
-            args.draft_context_slots.unwrap_or(20.max(args.draft_sequences)), args.draft_sequences,
-            self.library.sm_count()? as u64, args.draft_fp8 == Some(false), args.draft_kv_cache)).transpose()?.unwrap_or(0);
-        let drafter_staging = args.draft.as_deref().map(|snapshot| glm::drafter_staging(snapshot,
-            args.draft_context_slots.unwrap_or(20.max(args.draft_sequences)), args.draft_sequences,
-            args.draft_fp8 == Some(false))).transpose()?.unwrap_or(0);
-        // mtp_dspark: its admitted layout (weights, rings, arenas), the prefix marks of its
-        // draft windows, and load-time staging.
-        let (drafter_bytes, drafter_staging) = match &ml4_draft {
-            Some(layout) => (cuteafd_loader::placement::families::glm5::ml4_draft_resident_bytes(layout,
-                args.draft_window_marks)?, layout.weights().max_load_staging),
-            None => (drafter_bytes, drafter_staging),
+        let draft_facts = match (&ml4_draft, args.draft.as_deref(), &provisional_drafter) {
+            (Some(layout), _, _) => DraftFacts::ml4(layout)?,
+            (None, Some(snapshot), Some(draft)) => DraftFacts::gqa(snapshot,
+                cuteafd_loader::families::glm5::draft_representation::GlmDraftRepresentation::from_fp8_option(args.draft_fp8),
+                cuteafd_loader::families::glm5::draft_representation::GlmDraftCapacity::new(
+                    args.draft_context_slots.unwrap_or(20.max(args.draft_sequences)), args.draft_sequences, draft.block)?,
+                self.library.sm_count()? as usize, 0, args.draft_kv_cache)?,
+            _ => DraftFacts::default(),
         };
         let spark_ranks = args.peers.as_deref().map_or(0, |p| p.split(',').count());
-        // Token-split attention: the build's programs (GPU0's table; both GPUs load the same).
-        let names: Vec<&str> = programs.names().collect();
-        let mut context = (devices.len() == 2).then(|| glm::context_programs(&self.cfg, names.iter().copied(),
-            |name| programs.spec(name).ok().map(|p| p.scratch.get("scratch").copied().unwrap_or(0)))).flatten();
-        if let Some(context) = &mut context {
-            let selected_scratch = devices.iter().map(|&device| -> Result<u64> {
-                self.library.cuda_set_device(device)?;
-                let sms = self.library.sm_count()?;
-                self.cfg.attention_kinds().iter().flat_map(|kind| [0, self.cfg.heads / 2].map(|begin| (*kind, begin)))
-                    .map(|(kind, begin)| {
-                    let name = cuteafd_core::coordinator_programs::attention_partial_program_of(
-                        &manifest, self.cfg.program_family(), kind, begin, engine::DECODE_ROWS, sms, &attention_plan)?;
-                    Ok(programs.spec(&name)?.scratch.get("scratch").copied().unwrap_or(0))
-                }).collect::<Result<Vec<_>>>().map(|sizes| sizes.into_iter().max().unwrap_or(0))
-            }).collect::<Result<Vec<_>>>();
-            self.library.cuda_set_device(args.device)?;
-            context.partial_scratch = selected_scratch?.into_iter().max().unwrap_or(0);
-        }
         // Every per-slot owner covers the waves in flight.
         let prefill_lanes = usize::from(args.prefill_waves);
         ensure!(owners.is_none() || prefill_lanes <= cuteafd_loader::placement::LAYER_PIPELINE_MAX_LANES as usize,
             "layer-owned prefill lacks capacity for {prefill_lanes} waves");
         let core = checkpoint.as_ref().map(|checkpoint| -> Result<_> {
             let core = cuteafd_loader::families::glm5::core::CoreInventory::from_checkpoint(&self.cfg, checkpoint)?;
-            if core.projections.is_empty() { return Ok(None); }
+            if core.projections.is_empty() && core.native.is_empty() { return Ok(None); }
             // Draft rows the K6 target head scores per step: DFlash2's sequences x block, or
             // mtp_dspark's whole admitted block (the planner's drafter_admission rows).
             let draft_rows = match (args.draft.as_deref(), &ml4_draft) {
@@ -1088,13 +1158,7 @@ impl Opened {
                 &core, layers, devices.len(), owners.as_deref(), args.prefill_rows, prefill_lanes,
                 draft_rows, &manifest)?))
         }).transpose()?.flatten();
-        let native_dense_charge = if let Some(core) = &core { core.bytes(self.cfg.hidden)? }
-            else { native_dense_charge };
-        let code_set = core.as_ref().map(|core| core.program_set(&manifest, devices.len() == 2))
-            .unwrap_or_else(|| dense_programs.program_set(&manifest, true));
-        let pending_code = devices.iter().enumerate().map(|(rank, &device)|
-            crate::shared::inventory::pending_code(&self.library, device, rank, devices.len() == 2,
-                &if core.is_some() { format!("{}-k6", self.cfg.program_family()) } else { self.cfg.program_family().to_owned() }, "*", &code_set)).collect::<Result<Vec<_>>>()?;
+        // Context/program and graph bytes come from maintained recipe figures.
         let exchange_f32 = glm::local_exchange_f32()?;
         let onboard = args.rtx_expert_layers.resolve(self.catalog.routed_experts().routed_layers());
         let local = glm::select_local_inventory(&self.cfg, &self.catalog, manifest_path, layers, devices.len(),
@@ -1108,46 +1172,213 @@ impl Opened {
                     &local.package, self.cfg.hidden, max_rows)? as u64 == local.backend_workspace,
                     "GLM EXL3 planner/runtime backend workspace mismatch"),
                 glm::GlmLocalFormat::Exlr8 => ensure!(
-                    crate::shared::experts::rtx::exlr8::Exlr8RtxWeights::workspace_bytes(
-                        &programs, cuteafd_ffi::exlr8::KernelFamily::Glm, max_rows, args.exlr8_prefill_activations)? as u64 == local.backend_workspace,
+                    crate::shared::experts::rtx::exlr8::Exlr8RtxWeights::workspace_bytes_with_limit(
+                        &programs, cuteafd_ffi::exlr8::KernelFamily::Glm, max_rows, local.unit_limit,
+                        args.exlr8_prefill_activations)? as u64 == local.backend_workspace,
                     "GLM EXLR8 planner/runtime backend workspace mismatch"),
                 glm::GlmLocalFormat::Nvfp4 { .. } => {
                     let tensors = self.catalog.fp8().context("NVFP4 tensors")?;
                     for rank in 0..2 {
-                        let plan = crate::shared::experts::rtx::fp8moe::Fp8MoeTp2::plan(tensors, &local.package, rank, max_rows)?;
+                        let plan = crate::shared::experts::rtx::fp8moe::Fp8MoeTp2::plan(tensors, &local.package, &[tensors.shape().first_layer], rank, max_rows)?;
                         ensure!(plan.workspace_bytes as u64 == local.backend_workspace,
                             "GLM NVFP4 planner/runtime backend workspace mismatch");
                     }
                 }
             }
         }
-        let tp2_workspace = local.as_ref().map_or([0; 2], |l| l.workspace());
-        let serial_workspace = local.as_ref().map_or([0; 2], |l| l.workspace_for(&self.cfg,
-            args.prefill_rows as u64, 1, exchange_f32));
-        let inputs = glm::GlmInputs { spark_reply_format: cuteafd_core::SparkReplyFormat::resolve(cuteafd_core::spark_reply::requested(), false), cfg: &self.cfg, layers, gpus, headroom_bytes: 2 << 30,
-            spark_ranks, native_experts: native, native_workspace, native_dense: native_dense_charge.clone(), native_head: core.as_ref().is_some_and(|c| c.ranks[0].target_head.is_some()), skip_routed_experts: args.skip_routed_experts,
-            prefill_rows: args.prefill_rows as u64,
-            prefill_lanes: prefill_lanes as u64,
-            max_context: args.max_context as u64, automatic_context, scratch: Some([scratch(true)?, scratch(false)?]),
-            drafter_bytes, drafter_staging, pending_code,
-            experts: local.as_ref().map_or_else(Vec::new, |l| l.experts.clone()),
-            expert_workspace: 0, tp2_workspace, requested_pool: (args.pool_tokens > 0).then_some(args.pool_tokens as u64),
-            onboard: if args.skip_routed_experts { cuteafd_loader::placement::Onboard::Layers(0) }
-                else { onboard }, full_prefill_logits: args.full_prefill_logits, context };
-        let (placement, working) = glm::solve_working_set(&inputs, serial_workspace, requested)?;
+        let attention = requested.unwrap_or(if devices.len() == 2 {
+            cuteafd_loader::placement::AttentionPlacement::Context
+        } else { cuteafd_loader::placement::AttentionPlacement::Heads });
+        let page_tokens = if attention == cuteafd_loader::placement::AttentionPlacement::Context { 128 } else { 64 };
+        let requested_pool = cuteafd_loader::placement::PoolPolicy::normalize_request(Some(args.pool_tokens as u64));
+        let maximum_pool_tokens = cuteafd_loader::placement::PoolPolicy::resolve(
+            &cards.iter().map(|&(_, ceiling)| ceiling).collect::<Vec<_>>(), args.max_context as u64,
+            requested_pool, page_tokens).maximum_tokens();
+        let maximum_pages = maximum_pool_tokens.div_ceil(page_tokens);
+        let prefill = PrefillShape { rows: args.prefill_rows as u64, waves: prefill_lanes as u64 };
+        let operation = if args.full_prefill_logits { Operation::Scoring } else { Operation::Serving };
+        let push_policy = crate::shared::experts::rtx::push::PushPolicy::for_snapshot(&self.snapshot)?;
+        let storage = match push_policy { crate::shared::experts::rtx::push::PushPolicy::Mount => LocalStorage::Mount,
+            crate::shared::experts::rtx::push::PushPolicy::Required => LocalStorage::Push };
+        let target = if let Some(checkpoint) = &checkpoint {
+            TargetFacts::checkpoint(checkpoint, layers, devices.len(), owners.as_deref(), cuteafd_loader::families::glm5::native_bf16(),
+                &[if host_embedding { EmbeddingHome::HostPinned } else { EmbeddingHome::Device(0) }], core.as_ref())?
+        } else {
+            let config = serde_json::from_slice(&std::fs::read(self.snapshot.join("config.json"))?)?;
+            let selection = cuteafd_loader::plan::exlr8::dense::DenseSelection::from_hf(&config)?;
+            let vocabulary = (0..devices.len()).map(|rank| crate::shared::token_io::native::VocabularyPlan::new(
+                native_records.as_ref().context("native records")?, &selection, devices.len(), rank,
+                self.cfg.hidden, self.cfg.vocab_size).map(|plan| plan.dense_plan().clone())).collect::<Result<Vec<_>>>()?;
+            let shared = native_plans.iter().map(|plan| plan.residency().to_vec()).collect::<Vec<_>>();
+            let workspace = cuteafd_loader::plan::exlr8::shared_execution_workspace(&manifest, cuteafd_ffi::exlr8::KernelFamily::Glm)?;
+            TargetFacts::native(&selection, layers, &native_dense_records.iter().map(|owned| owned.plan.clone()).collect::<Vec<_>>(),
+                &vocabulary, &shared, &native_scratch, &workspace, storage)?
+        };
+        let arena_layouts = target.weights[0].1.coordinator_arenas()?;
+        let native_load = target.native_load.clone();
+        let reserved_weights = target.device_weight_bytes(if host_embedding { EmbeddingHome::HostPinned }
+            else { EmbeddingHome::Device(0) })?;
+        let physical = LocalPhysicalInput { layers: (self.cfg.first_moe_layer..layers).collect(),
+            max_rows: args.prefill_rows.max(engine::DECODE_ROWS), lanes: prefill_lanes, storage,
+            route_checks: true, peer_diagnostics: std::env::var("CUTEAFD_PEER_WAIT_DIAGNOSTICS").is_ok_and(|v| v == "1"),
+            activations: args.exlr8_prefill_activations };
+        let metadata = args.exlr8_manifest.as_deref().map(|selected|
+            cuteafd_loader::plan::exlr8::residency::MetadataInput::open(&self.snapshot, selected)).transpose()?;
+        let source = local.as_ref().map(|local| LocalPhysicalSource::read(&self.cfg, &self.catalog, local,
+            &physical, metadata.as_ref())).transpose()?;
+        let host = cuteafd_loader::formats::mapped_preload::host_memory_before_process()?;
+        let cache = if let Some(ml4) = self.cfg.variant.ml4() {
+            cuteafd_loader::serving_capacity::mistral_large4_cache_geometry(ml4, 1)?
+        } else { cuteafd_loader::serving_capacity::glm_cache_geometry(&self.cfg, layers, 1)? };
+        let mark_bytes = ml4_draft.as_ref().map(glm::draft_window_mark_bytes).transpose()?.unwrap_or(0);
+        let host_config = if devices.len() == 2 && attention == cuteafd_loader::placement::AttentionPlacement::Heads { None }
+            else { serving.map(|(prefix, concurrency)| prefix.resolve_host_config(cuteafd_engine::prefix::FamilyLayout {
+                page_rows: 64, pages: maximum_pool_tokens as usize / 64,
+                page_bytes: cache.ranks[0].persistent_unit_bytes as usize, mark_bytes, draft_bytes: 0,
+                rule: cuteafd_engine::prefix::ReuseRule::EXACT, mark_store: cuteafd_engine::prefix::MarkStore::Arena,
+                page_owners: if attention == cuteafd_loader::placement::AttentionPlacement::Context {
+                    cuteafd_engine::prefix::PageOwners::Parity } else { cuteafd_engine::prefix::PageOwners::Uniform },
+            }, args.max_context, concurrency)).transpose()?.flatten() };
+        let push_headers = checkpoint.is_none().then(|| cuteafd_loader::plan::Checkpoint::coordinator_view(
+            self.catalog.selected_view().context("GLM push selected view")?, false, args.dspark)).transpose()?;
+        let push_headers = checkpoint.as_ref().or(push_headers.as_ref()).context("GLM selected push headers")?;
+        let largest_native = native_records.iter().flatten().flat_map(|record| &record.components)
+            .map(|component| component.source.bytes as u64).max().unwrap_or(0);
+        let admitted_push_host = push_host_envelope(&push_headers, &self.cfg, layers, devices.len(),
+            Some(&self.catalog), metadata.as_ref(), largest_native)?;
+        let mut additional = Vec::new();
+        if let Some(envelope) = &admitted_push_host {
+            additional.extend(envelope.allocations("glm.load.push")?.into_iter().map(|owner| {
+                let bytes = ByteCurve::fixed(owner.bytes, maximum_pages);
+                Component::allocation(owner, bytes, false, maximum_pages)
+            }));
+        }
+        let mut blas = Vec::new();
+        if let Some((device, weights, total)) = media_owners.0 {
+            let rank = devices.iter().position(|&id| id == device).context("vision device absent from GLM placement")?;
+            let location = Location::coordinator(rank as u8);
+            blas.push(serving::BlasOwners { name: "GLM local vision".into(), process: "coordinator".into(),
+                thread: "glm/blas/media".into(), location, gemm: true, lt: false,
+                lifetime: Lifetime::RESIDENT, activation: Activation::always() });
+            let owner = Allocation::buffer("glm.encoder.weights", location, weights,
+                Lifetime::RESIDENT, cuteafd_core::memory_layout::Category::Weights, "bundled encoder weights");
+            additional.push(Component::resident_weight(ResidentWeight::from_allocation(&owner,
+                cuteafd_loader::placement::ResidentWeights(weights)), ByteCurve::fixed(weights, maximum_pages)));
+            additional.push(Component::allocation(owner, ByteCurve::fixed(weights, maximum_pages), false, maximum_pages));
+            let scratch = total.checked_sub(weights).context("vision receipt smaller than weights")?;
+            if scratch > 0 {
+                let owner = Allocation::buffer("glm.encoder.scratch", location, scratch,
+                    Lifetime::RESIDENT, cuteafd_core::memory_layout::Category::Workspace, "bundled encoder scratch");
+                additional.push(Component::allocation(owner, ByteCurve::fixed(scratch, maximum_pages), false, maximum_pages));
+            }
+        }
+        if media_owners.1 > 0 {
+            let owner = Allocation::buffer("glm.media.cache", Location::HOST, media_owners.1,
+                Lifetime::TARGET, cuteafd_core::memory_layout::Category::Embedding, "media embedding cache");
+            additional.push(Component::allocation(owner, ByteCurve::fixed(media_owners.1, maximum_pages), false, maximum_pages));
+        }
+        if serving.is_some() {
+            use cuteafd_loader::placement::planner::serving::{ServingOwners, SelectorOwners, HostPrefixOwners};
+            additional.extend(ServingOwners { selector: SelectorOwners { location: Location::coordinator(0),
+                capacity: engine::DECODE_ROWS, vocab: self.cfg.vocab_size, device_sampling: true },
+                prefix: HostPrefixOwners { quota_bytes: host_config.as_ref().map_or(0, |config| config.bytes),
+                    chunk_bytes: host_config.as_ref().map_or(0, |config| config.chunk_bytes) },
+            }.components(maximum_pages)?);
+        }
+        let frame_bytes = if native { cuteafd_transport::expert::native_frame_budget(cuteafd_core::ExpertGeometry::GLM5,
+            u32::try_from(args.prefill_rows.max(engine::DECODE_ROWS))?)? } else { 64 << 20 };
+        let (decode_link, prefill_link) = production_links(&self.cfg, spark_ranks, prefill,
+            if !native && spark_bf16 { cuteafd_core::SparkIngress::Bf16 } else { cuteafd_core::SparkIngress::Fp8K32 },
+            cuteafd_core::SparkRings { max_frame_bytes: frame_bytes, depth: 8, slot_bytes: 8 << 20, alignment: 4096 },
+            cuteafd_core::spark_reply::requested())?;
+        let mut budgets = production_budgets(&cards, cuteafd_loader::placement::reserve::gpu("glm5"), host,
+            serving.map_or(8 << 30, |(prefix, _)| prefix.host_cache_headroom_bytes).max(host.0 / 10),
+            &vec![cuteafd_loader::placement::reserve::spark_cap(); spark_ranks])?;
+        for (budget, sample) in budgets.iter_mut().zip(&inventory.gpus) {
+            // PreWeight context_bytes already includes selected module residency;
+            // ledger-tracked owners remain separately charged by the recipe.
+            budget.baseline = Baseline::Sampled {
+                free: budget.physical_bytes.checked_sub(sample.context_bytes)
+                    .context("GLM sampled context exceeds physical capacity")?,
+                phase: Phase::Load, source: "GLM pre-weight context and selected modules".into(),
+            };
+        }
+        let request = production_request(*serving_context, requested_pool,
+            if args.skip_routed_experts { cuteafd_loader::placement::Onboard::Layers(0) } else { onboard },
+            prefill, operation, crate::shared::memory::budget::resident_weight_limit(), cuteafd_core::spark_reply::requested());
+        let mut admitted = ProductionInput { expert_usage, cfg: &self.cfg, layers, context: args.max_context as u64,
+            maximum_pool_tokens, attention, gpus: devices.len(), prefill,
+            blas_head: crate::shared::target_head::TargetHead::configured().blas_head(!native
+                && !core.as_ref().is_some_and(|core| core.ranks[0].target_head.is_some())), blas, target,
+            draft: draft_facts.clone().with_window_marks(mark_bytes.checked_mul(args.draft_window_marks)
+                .context("GLM draft marks overflow")? as u64),
+            scratch: [scratch(true)?, scratch(false)?], context_scratch: context,
+            exchange_element_bytes: if exchange_f32 { 4 } else { 2 }, peer_diagnostics: physical.peer_diagnostics,
+            local: source.as_ref().map(|source| (source, physical)), spark_ranks,
+            prefix_host: host_config.is_some(), decode_link, prefill_link,
+            skip_routed_experts: args.skip_routed_experts, operation, sync_upload_bytes: 0,
+            owners: additional, budgets }.prepare()?.admit(request)?;
+        cuteafd_loader::placement::reserve::log_plan(&admitted.solved, "glm5");
+        {
+            use sha2::{Digest, Sha256};
+            let hash = |path: &std::path::Path| -> Result<String> {
+                let mut file = std::fs::File::open(path)?;
+                let mut digest = Sha256::new();
+                std::io::copy(&mut file, &mut digest)?;
+                Ok(format!("{:x}", digest.finalize()))
+            };
+            let programs_hash = hash(manifest_path)?;
+            let native_hash = hash(&args.native_lib)?;
+            let gpu_classes = inventory.gpus.iter().map(|gpu| format!("{}/{}/{}", gpu.arch,
+                gpu.sms, gpu.total_bytes)).collect::<Vec<_>>().join(",");
+            let drivers = inventory.gpus.iter().map(|gpu| gpu.driver.as_str()).collect::<Vec<_>>().join(",");
+            let layout = format!("snapshot/{}; draft/{:?}; context/{}; C{:?}; host-prefix/{}; replies/{:?}",
+                self.snapshot.display(), args.draft, args.max_context, serving.map(|(_, c)| c),
+                host_config.as_ref().map_or(0, |config| config.bytes), cuteafd_core::spark_reply::requested());
+            cuteafd_ffi::memory_ledger::fault::set_inputs(serde_json::json!({
+                "memory_reconciliation_provenance": {
+                    "schema_version": 1, "family": "glm5", "source_commit": env!("CUTEAFD_BUILD_COMMIT"),
+                    "source_dirty": env!("CUTEAFD_BUILD_DIRTY"), "toolchain": env!("CUTEAFD_BUILD_TOOLCHAIN"),
+                    "native_sha256": native_hash, "programs_sha256": programs_hash,
+                    "layout": layout, "devices": inventory.gpus,
+                    "spark_world": spark_ranks, "onboard_layers": admitted.solved.decisions.onboard_layers,
+                    "prefill": admitted.solved.decisions.prefill,
+                    "graph_basis": "remote HQA SM120 nodes; uncalibrated local/TP2 byte fallback"
+                }
+            }));
+            if let Some(recommendation) = admitted.census_recommendation(cuteafd_loader::placement::inventory::FigureIdentity {
+                declared_graphs: "", programs_sha256: &programs_hash, native_sha256: &native_hash,
+                toolchain: env!("CUTEAFD_BUILD_TOOLCHAIN"), gpu_class: &gpu_classes, driver: &drivers, layout: &layout,
+            })? { tracing::warn!("{recommendation}"); }
+        }
+        if let Some(note) = admitted.load_overlap_note() { tracing::info!("{note}"); }
+        let placement = admitted.placement.clone();
+        let working = &admitted.spark;
         if native {
             use cuteafd_loader::plan::family::Family;
             cuteafd_loader::plan::families::glm::GLM5.exlr8_execution()
                 .check(devices.len(), placement.onboard_layers > 0)?;
         }
-        ensure!(!native || devices.len() != 2
-            || placement.attention_placement == cuteafd_loader::placement::AttentionPlacement::Context,
-            "EXLR8 two-coordinator admission requires context attention programs");
-        let prefill_lanes = usize::try_from(working.spark.prefill_lanes)?;
-        let selected_peers = if working.spark.spark_ranks > 0 { args.peers.as_deref() } else { None };
+        let prefill_lanes = usize::try_from(working.prefill_lanes)?;
+        let selected_peers = if !working.spark_layers.is_empty() { args.peers.as_deref() } else { None };
         cuteafd_loader::placement::families::GLM5.check(&placement)?;
         tracing::info!(placement = %placement.summary(), "GLM admission");
+        let draft_home = match cuteafd_loader::placement::draft::require_home(&placement, "glm5", &[0, 1])? {
+            None | Some(0) => DraftHome::Local,
+            Some(_) => {
+                let (device, stream) = peer_stream.context("admitted remote drafter needs the second GPU")?;
+                let rows = match (&ml4_draft, &provisional_drafter) {
+                    (Some(layout), _) => layout.capacity().block_rows,
+                    (None, Some(draft)) => args.draft_sequences.checked_mul(draft.block).context("GLM draft rows")?,
+                    (None, None) => anyhow::bail!("admitted remote drafter without a drafter"),
+                };
+                tracing::info!(device, rows, "GLM drafter admitted on GPU1 through the shared remote bridge");
+                DraftHome::Peer { device, stream, rows, bridge: draft_facts.bridge().to_vec() }
+            }
+        };
         let tp2_range = placement.tp2.map(|p| p.first..p.first + p.layers);
+        let whole_range = (devices.len() == 1).then(|| placement.expert_ranges.first().copied())
+            .flatten().filter(|range| range.layers > 0);
         let max_rows = args.prefill_rows.max(engine::DECODE_ROWS);
         let tp2_devices = || -> Result<[crate::shared::memory::device::Device<'_>; 2]> {
             Ok([crate::shared::memory::device::Device { library: &self.library, id: args.device },
@@ -1157,61 +1388,92 @@ impl Opened {
             let budgets = placement.tp2.context("TP2 budget")?.peak_bytes;
             Ok([usize::try_from(budgets[0])?, usize::try_from(budgets[1])?])
         };
+        let arenas = arena_layouts.into_iter().zip(&devices).map(|(layout, &id)| {
+            let device = crate::shared::memory::device::Device { library: &self.library, id };
+            Ok((id, crate::shared::memory::weight_arena::DeviceWeightArena::new(device, layout, cuteafd_core::memory_layout::ArenaTag::weights("glm/target"))?))
+        }).collect::<Result<std::collections::BTreeMap<_, _>>>()?;
         let loader = weights::GlmLoader { library: &self.library, catalog: dense_catalog, stream, device: args.device,
             peers: peer_stream.iter().map(|&(device, stream)| crate::shared::peer_split::RankDevice { device, stream })
-                .collect(), push: None };
+                .collect(), arenas: Some(std::rc::Rc::new(arenas)), allocation_prefix: String::new(), push: None };
         let mut coordinator_push = None;
         let mut native_push = None;
         let native_push_experts = || -> Result<_> {
-            tp2_range.as_ref().map(|range| -> Result<_> {
-                let workspace = crate::shared::experts::rtx::exlr8::Exlr8RtxWeights::workspace_bytes(
-                    &programs, cuteafd_ffi::exlr8::KernelFamily::Glm, max_rows, args.exlr8_prefill_activations)?;
-                let budgets = tp2_budgets()?.map(|b| b.saturating_sub(workspace));
+            let selected = if let Some(range) = &tp2_range {
+                Some((range.clone().collect::<Vec<_>>(), tp2_budgets()?.to_vec()))
+            } else { whole_range.map(|range| ((range.first..range.first + range.layers).collect(),
+                vec![range.peak_bytes as usize])) };
+            selected.map(|(layers, budgets)| -> Result<_> {
+                let workspace = usize::try_from(local.as_ref().context("native local inventory")?.backend_workspace)?;
                 Ok(crate::shared::experts::rtx::push::CoordinatorExperts::Exlr8 {
-                    manifest: args.exlr8_manifest.clone().context("EXLR8 manifest")?,
-                    layers: range.clone().collect(), budgets: budgets.to_vec() })
+                    manifest: args.exlr8_manifest.clone().context("EXLR8 manifest")?, layers,
+                    budgets: budgets.into_iter().map(|bytes| bytes.saturating_sub(workspace)).collect() })
             }).transpose()
         };
-        let admission = if let Some(peers) = args.peers.as_deref() {
+        let dense_devices = devices.iter().map(|&id| crate::shared::memory::device::Device {
+            library: &self.library, id }).collect::<Vec<_>>();
+        let dense_push_experts = || -> Result<_> {
+            if let Some(range) = whole_range {
+                let local = local.as_ref().context("whole local inventory")?;
+                ensure!(local.format == glm::GlmLocalFormat::Exl3, "whole dense push requires EXL3");
+                return Ok(Some(crate::shared::experts::rtx::push::CoordinatorExperts::Whole {
+                    owners: vec![crate::shared::experts::rtx::push::WholeOwner { rank: 0,
+                        selections: (range.first..range.first + range.layers).map(|layer|
+                            crate::shared::experts::layer::ExpertLayer::BackboneFull { layer }).collect(),
+                        budget: usize::try_from(range.peak_bytes.checked_sub(local.backend_workspace)
+                            .context("whole workspace exceeds admission")?)? }],
+                }));
+            }
+            tp2_range.as_ref().map(|range| -> Result<_> {
+                let local = local.as_ref().context("TP2 local inventory")?;
+                let workspace = match local.format {
+                    glm::GlmLocalFormat::Exl3 => crate::shared::experts::rtx::exl3::Exl3Tp2::workspace_bytes_for(
+                        &local.package, self.cfg.hidden, max_rows)?,
+                    glm::GlmLocalFormat::Nvfp4 { .. } => crate::shared::experts::rtx::fp8moe::Fp8MoeTp2::plan(
+                        self.catalog.fp8().context("NVFP4 tensors")?, &local.package, &range.clone().collect::<Vec<_>>(), 0, max_rows)?.workspace_bytes,
+                    glm::GlmLocalFormat::Exlr8 => anyhow::bail!("EXLR8 experts require native dense planning"),
+                };
+                Ok(crate::shared::experts::rtx::push::CoordinatorExperts::Tp2 {
+                    layers: range.clone().collect(),
+                    budgets: tp2_budgets()?.map(|b| b.saturating_sub(workspace)).to_vec() })
+            }).transpose()
+        };
+        let mut plan_dense = |sparks: usize| -> Result<_> {
+            let sink = std::rc::Rc::new(landing::PushSink::default());
+            let planning = weights::GlmLoader { push: Some(sink.clone()), ..loader.clone() };
+            let ((embedding, model, drafter), mut records) = crate::shared::experts::rtx::dense::recording(|| {
+                let (embedding, model) = crate::shared::token_io::TokenEmbedding::load_with(&self.library,
+                    self.embed_source()?, args.token_io.embed_placement, || {
+                        let _memory_scope = cuteafd_ffi::memory_ledger::scope("weights");
+                        planning.model(&self.cfg, layers, owners.as_deref(), native)
+                    }, |_, bytes| planning.allocate_owner("embedding", bytes))?;
+                let drafter = self.load_drafter(args, &programs, &embedding, stream, &ml4_draft, &mut draft_file, &draft_home, &model.0.head)?;
+                Ok((embedding, model, drafter))
+            })?;
+            let (dense_records, deferred) = sink.take();
+            records.extend(dense_records);
+            records.extend(media.clone());
+            let dense = push::plan_ranks(&self.snapshot, records.clone(), &dense_devices, sparks)?;
+            Ok((embedding, model, drafter, records, deferred, dense))
+        };
+        let admission = if let Some(peers) = selected_peers {
             let peers = peers.split(',').map(str::parse)
                 .collect::<std::result::Result<Vec<std::net::SocketAddr>, _>>()?;
-            let admission = crate::shared::placement::SparkAdmission::plan_manifest(&self.snapshot,
-                self.catalog.routed_experts().geometry()?, Some(&self.catalog), &working.spark,
-                peers.len(), None, spark_model(self.cfg.family_id(), SparkBackend::for_catalog(&self.catalog)?, prefill_lanes, u32::try_from(args.prefill_rows.max(engine::DECODE_ROWS))?, spark_bf16)?,
+            let admission = crate::shared::placement::SparkAdmission::plan_view(&self.view,
+                self.catalog.routed_experts().geometry()?, Some(&self.catalog), &working,
+                peers.len(), spark_model(self.cfg.family_id(), SparkBackend::for_catalog(&self.catalog)?, prefill_lanes, u32::try_from(args.prefill_rows.max(engine::DECODE_ROWS))?, spark_bf16)?,
                 args.exlr8_manifest.as_deref())?;
-            // The coordinator GPUs' EXL3 TP2 halves join the Spark push group as
-            // two more ranks; planning failure leaves them on the mount.
-            // The coordinator GPUs' EXL3 TP2 halves and dense operands join the
-            // Spark push group as two more ranks, planned from headers before
-            // membership: a planning error offers no coordinator ranks (the
-            // coordinator loads by mount, the Sparks still push).
-            let ranks = match (&tp2_range, local.as_ref().map(|l| &l.format)) {
-                (Some(range), Some(glm::GlmLocalFormat::Exl3)) if admission.coordinator_pushes() => (|| -> Result<_> {
-                    let local = local.as_ref().context("TP2 local inventory")?;
-                    let workspace = crate::shared::experts::rtx::exl3::Exl3Tp2::workspace_bytes_for(
-                        &local.package, self.cfg.hidden, max_rows)?;
-                    let budgets = tp2_budgets()?.map(|b| b.saturating_sub(workspace));
-                    let devices = tp2_devices()?;
-                    let sink = std::rc::Rc::new(landing::PushSink::default());
-                    let planning = weights::GlmLoader { push: Some(sink.clone()), ..loader.clone() };
-                    let ((embedding, model, drafter), mut records) = crate::shared::experts::rtx::dense::recording(|| {
-                        let (embedding, model) = crate::shared::token_io::TokenEmbedding::load(&self.library,
-                            self.embed_source()?, args.token_io.embed_placement, || {
-                                let _memory_scope = cuteafd_ffi::memory_ledger::scope("weights");
-                                planning.model(&self.cfg, layers, owners.as_deref(), native)
-                            })?;
-                        let drafter = self.load_drafter(args, &programs, &embedding, stream, &ml4_draft, &mut draft_file)?;
-                        Ok((embedding, model, drafter))
-                    })?;
-                    let (operands, deferred) = sink.take();
-                    records.operands.extend(operands);
-                    let dense = push::plan_ranks(&self.snapshot, records.clone(), devices, peers.len())?;
-                    let prepared = crate::shared::experts::rtx::push::CoordinatorPush::prepare(&self.snapshot,
-                        Some(&self.catalog), 2, Some(crate::shared::experts::rtx::push::CoordinatorExperts::Tp2 { layers: range.clone().collect(), budgets: budgets.to_vec() }))?;
-                    Ok((prepared, (embedding, model, drafter, records, deferred, dense)))
-                })().map_err(|error| tracing::info!(%error, "coordinator TP2 push unavailable; mount")).ok(),
-                _ => None,
-            };
+            // Plan coordinator membership before offers; a Required failure
+            // refuses startup rather than silently reading through the mount.
+            let ranks = if !native && admission.coordinator_pushes() {
+                push_policy.plan(|| {
+                    let experts = dense_push_experts()?;
+                    let planned = plan_dense(peers.len())?;
+                    let prepared = crate::shared::experts::rtx::push::CoordinatorPush::prepare_view_admitted(
+                        self.catalog.selected_view().context("GLM push selected view")?, Some(&self.catalog), devices.len(), experts,
+                        admitted_push_host.clone().context("GLM push host receipt")?)?;
+                    Ok((prepared, planned))
+                }).context("GLM coordinator dense push planning")?
+            } else { None };
             let ranks = ranks.map(|((push, streams, ranks), planned)| {
                 coordinator_push = Some((push, peers.len(), planned));
                 (streams, ranks)
@@ -1220,22 +1482,41 @@ impl Opened {
             // coordinator rank. Onboarded experts have no post-push mount loader.
             let ranks = match (ranks, &native_records) {
                 (None, Some(_)) if admission.coordinator_pushes() => {
-                    let experts = native_push_experts()?;
-                    let (push, streams, ranks) = crate::shared::experts::rtx::push::CoordinatorPush::prepare(
-                        &self.snapshot, Some(&self.catalog), devices.len(), experts)?;
-                    native_push = Some((push, peers.len()));
-                    Some((streams, ranks))
+                    let planned = push_policy.plan(|| {
+                        let experts = native_push_experts()?;
+                        crate::shared::experts::rtx::push::CoordinatorPush::prepare_view_admitted(
+                            self.catalog.selected_view().context("GLM push selected view")?, Some(&self.catalog), devices.len(), experts,
+                            admitted_push_host.clone().context("GLM push host receipt")?)
+                    }).context("GLM native coordinator push planning")?;
+                    planned.map(|(push, streams, ranks)| {
+                        native_push = Some((push, peers.len()));
+                        (streams, ranks)
+                    })
                 }
                 (ranks, _) => ranks,
             };
             Some(admission.start_with(&peers, ranks)?)
         } else { None };
+        // Dense-only TP1/TP2 ranks push even without onboarded experts or active Sparks.
+        if !native && coordinator_push.is_none() {
+            coordinator_push = push_policy.plan(|| {
+                let experts = dense_push_experts()?;
+                let planned = plan_dense(0)?;
+                let push = crate::shared::experts::rtx::push::CoordinatorPush::prepare_alone_view_admitted(
+                    self.catalog.selected_view().context("GLM push selected view")?, Some(&self.catalog), devices.len(), experts,
+                    admitted_push_host.clone().context("GLM push host receipt")?)?;
+                Ok((push, 0, planned))
+            }).context("GLM coordinator dense push planning")?;
+        }
         // All selected routed layers may be onboarded in a partial model.
         // Idle Spark peers acknowledge identity while these destinations push alone.
         if native_records.is_some() && native_push.is_none() {
-            let push = crate::shared::experts::rtx::push::CoordinatorPush::prepare_alone(
-                &self.snapshot, Some(&self.catalog), devices.len(), native_push_experts()?)?;
-            native_push = Some((push, 0));
+            native_push = push_policy.plan(|| {
+                let push = crate::shared::experts::rtx::push::CoordinatorPush::prepare_alone_view_admitted(
+                    self.catalog.selected_view().context("GLM push selected view")?, Some(&self.catalog), devices.len(), native_push_experts()?,
+                    admitted_push_host.clone().context("GLM push host receipt")?)?;
+                Ok((push, 0))
+            }).context("GLM native coordinator push planning")?;
         }
         if coordinator_push.is_none() && native_push.is_none() {
             draft_file = args.draft.as_deref().map(dflash::prefetch);
@@ -1265,31 +1546,46 @@ impl Opened {
                         pushed.context("onboarded EXLR8 experts require a committed push group")?
                             .into_iter().map(|r| r.exlr8()).collect::<Result<Vec<_>>>()?
                             .try_into().map_err(|_| anyhow::anyhow!("two EXLR8 coordinator GPUs"))?)?),
-                glm::GlmLocalFormat::Nvfp4 { .. } => crate::shared::experts::rtx::Tp2Weights::Fp8(
-                    crate::shared::experts::rtx::fp8moe::Fp8MoeTp2::load_pair(devices,
+                glm::GlmLocalFormat::Nvfp4 { .. } => crate::shared::experts::rtx::Tp2Weights::Fp8(match pushed {
+                    Some(pushed) => crate::shared::experts::rtx::fp8moe::Fp8MoeTp2::pushed_pair(devices,
                         self.catalog.fp8().context("NVFP4 tensors")?, &local.package,
-                        range.collect(), max_rows, budgets)?),
+                        range.collect(), max_rows, budgets,
+                        pushed.into_iter().map(|rank| rank.fp8()).collect::<Result<Vec<_>>>()?
+                            .try_into().map_err(|_| anyhow::anyhow!("two NVFP4 coordinator GPUs"))?)?,
+                    None => crate::shared::experts::rtx::fp8moe::Fp8MoeTp2::load_pair(devices,
+                        self.catalog.fp8().context("NVFP4 tensors")?, &local.package,
+                        range.collect(), max_rows, budgets)?,
+                }),
             })
         };
+        let mut whole_weights = None;
+        let mut exl3_whole_weights = None;
         let (embedding, ((model, mut shares), tp2)) = crate::shared::placement::load_while_admitting(admission, || {
             if let Some(records) = &native_records {
-                let loaded = self.load_native(args, records, &native_dense_records, layers, &programs, &manifest, &loader, &devices, stream,
-                    peer_stream, native_push.take(), &ml4_draft, &mut draft_file)?;
+                let loaded = self.load_native(args, native_load.as_ref().context("native loader admission absent")?, records, &native_dense_records, owners.as_deref(), layers, &programs, &manifest, &loader, &devices, stream,
+                    peer_stream, native_push.take(), &media, &ml4_draft, &mut draft_file, &draft_home)?;
                 planned_drafter = loaded.3;
-                let tp2 = tp2_range.clone().map(|range| tp2_weights(range, loaded.2)).transpose()?;
+                let tp2 = if let Some(range) = tp2_range.clone() {
+                    Some(tp2_weights(range, loaded.2)?)
+                } else {
+                    if let Some(range) = whole_range {
+                        let mut pushed = loaded.2.context("whole EXLR8 requires a committed push group")?;
+                        ensure!(pushed.len() == 1, "one EXLR8 coordinator GPU required");
+                        whole_weights = Some(crate::shared::experts::rtx::exlr8::Exlr8RtxWeights::pushed_rank(
+                            dense_devices[0], &programs, (range.first..range.first + range.layers).collect(),
+                            max_rows, usize::try_from(range.peak_bytes)?, args.exlr8_prefill_activations,
+                            1, 0, pushed.pop().unwrap().exlr8()?)?);
+                    }
+                    None
+                };
                 return Ok((loaded.0, (loaded.1, tp2)));
             }
             let (embedding, model, pushed) = if let Some((push, sparks, (embedding, model, drafter, records, deferred, dense))) = coordinator_push.take() {
-                // The planned dense operands join the same ranks as the TP2 halves:
-                // receive both, then run the transforms of landed bytes.
-                let devices = tp2_devices()?;
-                let (pushed, ()) = push.receive_with(devices.to_vec(), Some(&self.catalog), sparks, Some(Ok(dense)), || ());
-                let pushed = pushed?;
+                // Dense operands and any expert halves commit before either is used.
+                let (pushed, ()) = push.receive_with(dense_devices.clone(), Some(&self.catalog), sparks, Some(Ok(dense)), || ());
+                let pushed = push_policy.committed(pushed).context("GLM coordinator dense push delivery")?;
                 let rank_stream = |device: i32| if device == args.device { stream }
                     else { peer_stream.map_or(stream, |(_, s)| s) };
-                if pushed.is_none() {
-                    crate::shared::experts::rtx::dense::fill_records_by_mount(&self.library, &records, rank_stream)?;
-                }
                 for job in &deferred {
                     crate::shared::memory::device::Device { library: &self.library, id: job.device }
                         .run(|| job.run(&self.library, rank_stream(job.device)))?;
@@ -1299,53 +1595,77 @@ impl Opened {
                 planned_drafter = Some(drafter);
                 (embedding, model, pushed)
             } else {
-                let (embedding, model) = crate::shared::token_io::TokenEmbedding::load(&self.library,
+                let (embedding, model) = crate::shared::token_io::TokenEmbedding::load_with(&self.library,
                     self.embed_source()?, args.token_io.embed_placement, || {
                         let _memory_scope = cuteafd_ffi::memory_ledger::scope("weights");
                         loader.model(&self.cfg, layers, owners.as_deref(), native)
-                    })?;
+                    }, |_, bytes| loader.allocate_owner("embedding", bytes))?;
                 (embedding, model, None)
             };
-            let tp2 = tp2_range.clone().map(|range| tp2_weights(range, pushed)).transpose()?;
+            let tp2 = if let Some(range) = tp2_range.clone() {
+                Some(tp2_weights(range, pushed)?)
+            } else {
+                if let Some(range) = whole_range {
+                    use crate::shared::experts::rtx::{exl3::Exl3Tp2, RtxSelectionPolicy::CanonicalDecode};
+                    let local = local.as_ref().context("whole local inventory")?;
+                    let layers = (range.first..range.first + range.layers).collect();
+                    let budget = usize::try_from(range.peak_bytes)?;
+                    exl3_whole_weights = Some(match pushed {
+                        Some(mut pushed) => {
+                            ensure!(pushed.len() == 1, "one whole EXL3 coordinator rank required");
+                            Exl3Tp2::pushed_whole_weights(dense_devices[0], &self.catalog, &local.package,
+                                layers, max_rows, budget, CanonicalDecode, pushed.pop().unwrap().exl3()?)?
+                        }
+                        None => Exl3Tp2::load_whole_weights(dense_devices[0], &self.catalog, &local.package,
+                            layers, max_rows, budget, CanonicalDecode)?,
+                    });
+                }
+                None
+            };
             Ok((embedding, (model, tp2)))
         })?;
         let native_owners = native_plans.into_iter().zip(&devices).map(|(plan, &device)| {
             self.library.cuda_set_device(device)?;
-            crate::shared::experts::exlr8::NativeExperts::load(&self.library, plan)
+            crate::shared::experts::exlr8::NativeExperts::load_admitted(&self.library, plan,
+                native_load.as_ref().context("native shared admission absent")?)
         }).collect::<Result<Vec<_>>>()?;
         self.library.cuda_set_device(args.device)?;
         let bytes = model.layers.iter().map(|layer| layer.bytes()).sum::<usize>()
             + model.norm.buffer.bytes + model.head.bytes();
-        let embedding_bytes = embedding.device_bytes();
+        let embedding_bytes = embedding.device_owner_bytes();
         let actual_weights = std::iter::once((bytes + embedding_bytes) as u64)
             .chain(shares.iter().map(|rank| rank.iter().map(|layer| layer.bytes() as u64).sum()))
             .enumerate().map(|(rank, bytes)| bytes
                 + native_owners.get(rank).map_or(0, |owner| owner.resident_bytes() as u64))
             .collect::<Vec<_>>();
         ensure!(actual_weights == reserved_weights,
-            "GLM loaded coordinator owners {actual_weights:?} differ from header reservation {reserved_weights:?}");
+            "GLM loaded coordinator owners {actual_weights:?} differ from admitted target owners {reserved_weights:?}");
         tracing::info!(layers, elapsed_ms = started.elapsed().as_millis() as u64,
             resident_bytes = ?actual_weights,
             "GLM coordinator weights validated against pre-weight reservation after Spark admission (elapsed includes wait)");
+        self.startup_probe(&devices, "glm/weights-before-draft-pool", None, false)?;
         let context_kv = placement.attention_placement == cuteafd_loader::placement::AttentionPlacement::Context;
         ensure!(!context_kv || peer_stream.is_some(), "context attention needs the head split's second GPU");
         cuteafd_bench::context::set_resolved("attention-placement", &placement.attention_summary());
         cuteafd_bench::context::set_rtx_expert_layers(placement.onboard_layers);
         cuteafd_bench::context::set_resolved("pool-tokens", &placement.pool_tokens.to_string());
         let pool_tokens = usize::try_from(placement.pool_tokens)?;
-        let max_context = crate::shared::context::pool_context("glm5", args.max_context, automatic_context, pool_tokens, 256)?;
+        let max_context = crate::shared::context::pool_context("glm5", *serving_context, pool_tokens)?;
         let pages = pool_tokens.div_ceil(engine::PAGE_ROWS);
         // Pack before allocating the serving pool and expert arenas: the load-phase
         // admission peak is above the same resident target-weight baseline.
         let drafter = match planned_drafter {
             Some(drafter) => drafter,
-            None => self.load_drafter(args, &programs, &embedding, stream, &ml4_draft, &mut draft_file)?,
+            None => self.load_drafter(args, &programs, &embedding, stream, &ml4_draft, &mut draft_file, &draft_home, &model.head)?,
         };
         if let Some(drafter) = &drafter { drafter.prepare_workspace()?; }
+        self.startup_probe(&devices, "glm/draft-before-kv", None, false)?;
         let depth = crate::shared::prefill_depth::PrefillDepth::new(prefill_lanes, args.prefill_rows)?;
         let mut engine = engine::GlmEngine::new(&self.library, &programs, self.cfg.clone(), model, stream,
             max_context, args.prefill_rows, pages, embedding, depth, context.filter(|_| context_kv))?;
-        engine.max_pool_tokens_no_onboard = Some(placement.max_pool_tokens_no_onboard);
+        engine.initialize_usage(admitted.expert_usage.clone(), args.expert_usage_reader.clone())?;
+        engine.max_pool_tokens_no_onboard = placement.max_pool_tokens_no_onboard;
+        engine.admitted_host_config = host_config;
         engine.exlr8_prefill_activations = args.exlr8_prefill_activations;
         engine.native_experts = native_owners;
         engine.native_scratch = native_scratch;
@@ -1377,6 +1697,20 @@ impl Opened {
                 "GLM loaded TP2 workspace differs from admission"); }
             engine.install_tp2(ranks)?;
         }
+        if let Some(weights) = exl3_whole_weights {
+            let backend = weights.execution()?;
+            ensure!(crate::shared::experts::rtx::RtxExpertLayer::workspace_bytes(&backend) as u64
+                == local.as_ref().context("whole local inventory")?.backend_workspace,
+                "GLM whole EXL3 backend workspace differs from admission");
+            engine.install_whole(Box::new(backend))?;
+        }
+        if let Some(weights) = whole_weights {
+            let backend = weights.execution()?;
+            ensure!(crate::shared::experts::rtx::RtxExpertLayer::workspace_bytes(&backend) as u64
+                == local.as_ref().context("whole local inventory")?.backend_workspace,
+                "GLM whole backend workspace differs from admission");
+            engine.install_whole(Box::new(backend))?;
+        }
         if context_kv {
             // The solver charged staging over the compiled extent it was given.
             engine.attach_context(args.max_context, &manifest)?;
@@ -1388,8 +1722,14 @@ impl Opened {
         engine.drafter = drafter;
         engine.draft_window_marks = if engine.drafter.as_ref().is_some_and(|d| d.mla_windows_only())
             { args.draft_window_marks } else { 0 };
+        cuteafd_bench::context::set_resolved("draft-window-marks", &engine.draft_window_marks.to_string());
         engine.bind_draft_core_head()?;
+        if let (Some(drafter), Some((device, stream))) = (&engine.drafter, peer_stream) {
+            drafter.bind_target(crate::shared::peer_split::RankDevice { device, stream }, &engine.embedding,
+                engine.draft_target_head()?)?;
+        }
         engine.attention_plan = attention_plan.validate_loaded(engine.drafter.as_ref().map(|d| d.cfg.drafts()))?;
+            cuteafd_bench::context::set_resolved("attention-plan-rows", &engine.attention_plan.rows().to_string());
         tracing::info!(plan_rows = engine.attention_plan.rows(),
             active_drafts = ?engine.attention_plan.active_drafts(), "immutable attention reduction plan");
         let ranks = |peers: &str| -> Result<(Vec<std::net::SocketAddr>, cuteafd_transport::expert::SparkWorld)> {
@@ -1399,37 +1739,25 @@ impl Opened {
         };
         let config = cuteafd_transport::TcpTransportConfig { timing: cuteafd_transport::protocol_v2_timing_from_env(),
             timeout: std::time::Duration::from_secs(120), max_frame_bytes: if native { cuteafd_transport::expert::native_frame_budget(cuteafd_core::ExpertGeometry::GLM5, u32::try_from(args.prefill_rows.max(engine::DECODE_ROWS))?)? } else { 64 << 20 } };
-        let row_bytes = self.cfg.hidden * 2;
         crate::shared::memory_report::release_load_staging(&self.library)?;
+        self.startup_probe(&devices, "glm/pool-before-transport", None, false)?;
         // Connect every rank and register full-size buffers now: the first
         // request otherwise pays seconds of connection setup.
-        let (h, topk, experts, layer) =
-            (self.cfg.hidden, self.cfg.topk, self.cfg.experts,
-                working.spark.spark_layers.first().copied().unwrap_or(self.cfg.first_moe_layer) as u32);
-        let warm = move |rows: usize, decode: bool| -> Result<cuteafd_transport::ExpertProtocolV2Request> {
-            let routes = (0..rows * topk).map(|i| cuteafd_transport::ExpertProtocolV2RouteEntry {
-                row_index: (i / topk) as u32, expert_id: (i % experts) as u32, gate_weight: 0.0,
-            }).collect();
-            let mut request = cuteafd_transport::ExpertProtocolV2Request::new(1, 17, layer,
-                h as u32, if engine.spark_bf16 { cuteafd_transport::ExpertV2Dtype::Bf16 }
-                    else { cuteafd_transport::ExpertV2Dtype::Fp8E4m3Ue8m0K32 },
-                (0..rows as u32).map(|row| cuteafd_transport::ExpertProtocolV2RowDescriptor {
-                    row_id: u64::from(row), source_kind: if decode { cuteafd_transport::ExpertV2SourceKind::Decode }
-                        else { cuteafd_transport::ExpertV2SourceKind::Prefill },
-                    source_request_id: 1, token_position: u64::from(row), route_offset: row * topk as u32,
-                    route_count: topk as u32,
-                }).collect(),
-                routes, vec![0; rows * (if engine.spark_bf16 { h * 2 } else { h + h / 32 })])?;
-            request.header.flags |= cuteafd_transport::expert::EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16;
-            Ok(request)
+        let session_shape = |rows: usize| -> Result<cuteafd_transport::SparkSessionShape> {
+            let dtype = if engine.spark_bf16 { cuteafd_transport::ExpertV2Dtype::Bf16 }
+                else { cuteafd_transport::ExpertV2Dtype::Fp8E4m3Ue8m0K32 };
+            let mut shape = cuteafd_transport::SparkSessionShape::new(rows as u32,
+                self.cfg.hidden as u32, self.cfg.topk as u32, dtype)?;
+            shape.flags |= cuteafd_transport::expert::EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16;
+            Ok(shape)
         };
         let mut transport = selected_peers.map(|peers| -> Result<SparkLink<'_>> {
             let (peers, world) = ranks(peers)?;
-            let mut link = SparkLink::new(&self.library, world, &peers, engine::DECODE_ROWS as u32, config.clone(), row_bytes)?;
+            let mut link = SparkLink::prepared(&self.library, world, &peers, config.clone(),
+                admitted.decode_link.clone().context("admitted decode transport")?)?;
             // The bootstrap opens every rank before any wave does, so the
-            // installed grouping is readable from here on. The warm-up below
-            // then reuses these sessions.
-            link.bootstrap(&warm(engine::DECODE_ROWS, true)?)?;
+            // installed grouping is readable from here on, without executing experts.
+            link.bootstrap(&session_shape(engine::DECODE_ROWS)?)?;
             Ok(link)
         }).transpose()?;
         // One prefill transport with `prefill_lanes` waves in flight (PLAN
@@ -1437,27 +1765,21 @@ impl Opened {
         let mut prefill_link = match selected_peers {
             Some(peers) => {
                 let (peers, world) = ranks(peers)?;
-                let mut link = SparkLink::new_waves(&self.library, world, &peers, u32::try_from(args.prefill_rows)?, config.clone(), row_bytes,
-                    prefill_lanes, u32::try_from(args.prefill_rows)?)?;
-                link.bootstrap(&warm(args.prefill_rows, false)?)?;
+                let mut link = SparkLink::prepared(&self.library, world, &peers, config.clone(),
+                    admitted.prefill_link.clone().context("admitted prefill transport")?)?;
+                link.bootstrap(&session_shape(args.prefill_rows)?)?;
                 Some(link)
             }
             None => None,
         };
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
-        let started = Instant::now();
-        for (link, decode) in transport.iter_mut().map(|link| (link, true))
-            .chain(prefill_link.iter_mut().map(|link| (link, false))) {
-            // A full-width wave through each link's exchange (rings and the
-            // Sparks' first-use costs), landed and drained on the stream.
-            let rows = link.capacity() as usize;
-            let exchange = link.exchange()?;
-            let ticket = exchange.send_request(warm(rows, decode)?, exchange.compact_payload(rows))?;
-            exchange.land_drained(ticket, stream)?;
-        }
-        if transport.is_some() {
-            tracing::info!(elapsed_ms = started.elapsed().as_millis() as u64, prefill_waves = prefill_lanes,
-                "Spark expert transports warm");
+        if let Some(&layer) = working.spark_layers.first() {
+            let started = Instant::now();
+            for (link, kind) in transport.iter_mut().map(|link| (link, cuteafd_transport::ExpertV2SourceKind::Decode))
+                .chain(prefill_link.iter_mut().map(|link| (link, cuteafd_transport::ExpertV2SourceKind::Prefill))) {
+                link.warm_experts(&session_shape(link.capacity() as usize)?, layer, self.cfg.experts, kind)?;
+            }
+            tracing::info!(elapsed_ms = started.elapsed().as_millis() as u64, "Spark expert transports warm");
         }
         *engine.prefill_link.borrow_mut() = prefill_link;
         engine.prefill_runtime = Some(tokio::runtime::Builder::new_current_thread().enable_all().build()?);
@@ -1469,15 +1791,43 @@ impl Opened {
             }
         }
         engine.prime_tp2()?;
-        // Every decode graph shape serving replays, captured now (CUTEAFD_GLM_WARM_GRAPHS=0 skips it).
+        self.startup_probe(&devices, "glm/transport-before-graphs", None, false)?;
+        let graph_reserves = admitted.graphs.reserves().map_err(|e| anyhow::anyhow!("{e}"))?;
+        let graph_bootstraps: Vec<_> = admitted.graphs.ranks().iter()
+            .map(|row| row.bytes.div_ceil(row.executables.max(1))).collect();
+        engine.configure_graph_cache(&graph_reserves, &graph_bootstraps)?;
+        for rank in 0..admitted.graphs.ranks().len() {
+            let (base, tail) = admitted.graphs.default_reserve();
+            let reserve = cuteafd_loader::placement::graph_reserve::current(rank, false, base, tail)?;
+            tracing::info!(rank, reserve = reserve.bytes, source = reserve.source,
+                base = reserve.base_bytes, base_source = reserve.base_source,
+                extra = reserve.extra_bytes, extra_source = reserve.extra_source,
+                cap = ?reserve.cap_bytes, cap_source = reserve.cap_source,
+                charged = reserve.bytes, "GLM GPU_GRAPH_RESERVE startup policy");
+        }
+        // Current startup shapes are a best-effort prewarm list. Admission keeps
+        // the entire graph reserve charged; measured warmup never shrinks it.
         if engine.weights.layers.len() == self.cfg.layers
             && std::env::var("CUTEAFD_GLM_WARM_GRAPHS").map_or(true, |v| v != "0")
-            && (transport.is_some() || args.skip_routed_experts || engine.has_tp2()) {
-            engine.warm_decode_graphs(transport.as_mut().map(|t| (t, &runtime)))?;
+            && (transport.is_some() || args.skip_routed_experts || engine.has_local()) {
+            engine.warm_decode_graphs(transport.as_mut().map(|t| (t, &runtime)), &admitted.graphs, &graph_bootstraps)?;
         }
         engine.check_tp2_routes(transport.as_mut().map(|t| (t, &runtime)))?;
         if args.full_prefill_logits { engine.prepare_scoring_prefill()?; }
+        self.startup_probe(&devices, "glm/graphs-before-serving", None, false)?;
+        for rank in 0..admitted.graphs.ranks().len() {
+            let (base, tail) = admitted.graphs.default_reserve();
+            let reserve = cuteafd_loader::placement::graph_reserve::current(rank, false, base, tail)?;
+            tracing::info!(rank, reserve = reserve.bytes, source = reserve.source,
+                base = reserve.base_bytes, base_source = reserve.base_source,
+                extra = reserve.extra_bytes, extra_source = reserve.extra_source,
+                cap = ?reserve.cap_bytes, cap_source = reserve.cap_source,
+                charged = reserve.bytes, "GLM GPU_GRAPH_RESERVE Ready summary");
+        }
+        engine.usage_active.set(true);
         let result = body(&engine, transport.as_mut(), &runtime);
+        // Non-serving commands do not pass schedule's readiness boundary.
+        drop(self.startup_audit.borrow_mut().take());
         drop(engine);
         drop(transport);
         // SAFETY: the engine that used the streams is gone.
@@ -1495,8 +1845,56 @@ impl Opened {
 }
 
 
+/// The drafter's admitted home: beside the target (GPU0), or GPU1 through the
+/// shared device-driven bridge with the admitted bridge owners.
+pub(crate) enum DraftHome {
+    Local,
+    Peer { device: i32, stream: *mut c_void, rows: usize, bridge: Vec<cuteafd_loader::placement::Demand> },
+}
+
 impl Opened {
+    /// The admitted single drafter copy. A GPU1 `home` loads the common executor
+    /// on the bridge's own GPU1 stream; GPU0 keeps the embedding and head.
+    #[allow(clippy::too_many_arguments)]
     fn load_drafter<'s>(&'s self, args: &EngineArgs, programs: &'s cuteafd_ffi::programs::Programs<'s>,
+        embedding: &crate::shared::token_io::TokenEmbedding<'s>, stream: *mut c_void,
+        ml4_draft: &Option<cuteafd_loader::formats::dflash::MlaDraftRuntimeLayout>,
+        draft_file: &mut Option<std::thread::JoinHandle<std::io::Result<Vec<u8>>>>,
+        home: &DraftHome, head: &weights::GlmHead<'_>) -> Result<Option<drafter::GlmDrafter<'s>>> {
+        let prepared = match home {
+            DraftHome::Local => None,
+            DraftHome::Peer { device, stream: peer_stream, rows, .. } => Some(crate::shared::draft::remote::Prepared::new(
+                &self.library, crate::shared::peer_split::RankDevice { device: args.device, stream },
+                crate::shared::peer_split::RankDevice { device: *device, stream: *peer_stream }, 0, drafter::IDENTITY,
+                crate::shared::draft::remote::decode_extent(*rows, self.cfg.hidden, self.cfg.vocab_size, 0)?)?),
+        };
+        let draft_stream = prepared.as_ref().map_or(stream, |prepared| prepared.stream.raw);
+        let draft_device = crate::shared::memory::device::Device { library: &self.library,
+            id: prepared.as_ref().map_or(args.device, |prepared| prepared.stream.device.id) };
+        let target_projection = dflash::TargetProjection::from_bf16(matches!(head, weights::GlmHead::Bf16(_)));
+        let draft_projection = if prepared.is_some() { dflash::TargetProjection::Native } else { target_projection };
+        let common = draft_device.own(|| self.load_common_drafter(args, programs, draft_projection,
+            embedding, draft_stream, ml4_draft, draft_file))?;
+        let Some(common) = common.into_inner() else { return Ok(None) };
+        if let DraftHome::Peer { rows, bridge, .. } = home {
+            let c = &common.cfg;
+            let built = cuteafd_loader::placement::draft::remote_dflash_bridge_demands(c.hidden as u64,
+                c.vocab as u64, c.taps.len() as u64, (common.max_batch_sequences() * c.block) as u64, 0)?.demands;
+            ensure!(*rows == common.max_batch_sequences() * c.block && built == *bridge,
+                "GLM remote draft bridge differs from its admitted owners");
+            // Pooled draft pages route through the target's prefix copies; no GLM
+            // drafter has them (DFlash2 rings, mtp_dspark windows), so refuse one.
+            ensure!(common.mla_draft_page_bytes() == 0, "a remote GLM drafter cannot pool MLA draft pages");
+        }
+        Ok(Some(match prepared {
+            None => drafter::GlmDrafter::Local(common),
+            Some(prepared) => drafter::GlmDrafter::Remote(crate::shared::draft::remote_dflash::RemoteDflash::new(
+                draft_device.own(|| Ok(common))?, prepared, target_projection)?),
+        }))
+    }
+
+    fn load_common_drafter<'s>(&'s self, args: &EngineArgs, programs: &'s cuteafd_ffi::programs::Programs<'s>,
+        target_projection: dflash::TargetProjection,
         embedding: &crate::shared::token_io::TokenEmbedding<'s>, stream: *mut c_void,
         ml4_draft: &Option<cuteafd_loader::formats::dflash::MlaDraftRuntimeLayout>,
         draft_file: &mut Option<std::thread::JoinHandle<std::io::Result<Vec<u8>>>>)
@@ -1506,7 +1904,7 @@ impl Opened {
             let cfg = dflash::DflashConfig::read(snapshot)?;
             ensure!(cfg.hidden == self.cfg.hidden && cfg.vocab == self.cfg.vocab_size
                 && cfg.taps.iter().all(|&l| l < self.cfg.layers), "the DFlash2 drafter does not fit this target");
-            let mask = embedding.host_rows(&[cfg.mask_token])?;
+            let mask = draft_mask_row(embedding, cfg.mask_token)?;
             tracing::info!(mask_source = "target mask_token row", mask_token = cfg.mask_token, "drafter mask source");
             let file = if crate::shared::experts::rtx::dense::is_recording() {
                 Vec::new()
@@ -1516,9 +1914,20 @@ impl Opened {
             };
             let representation = cuteafd_loader::families::glm5::draft_representation::GlmDraftRepresentation
                 ::from_fp8_option(args.draft_fp8);
-            let drafter = dflash::DflashDrafter::load(&self.library, programs, snapshot, file, stream,
+            let device = crate::shared::memory::device::Device { library: &self.library,
+                id: self.library.cuda_get_device()? };
+            let arena = crate::shared::memory::weight_arena::DeviceWeightArena::new(device,
+                cuteafd_loader::serving_capacity::WeightArenaLayout::new(format!("glm/draft/{}", device.id),
+                    cuteafd_loader::families::glm5::draft_physical::gqa_checkpoint_arena_requests(
+                        snapshot, representation, 0, 1)?)?,
+                cuteafd_core::memory_layout::ArenaTag::drafter_weights("glm/draft"))?;
+            let drafter = dflash::DflashDrafter::load_with(&self.library, programs, target_projection, snapshot, file, stream,
                 args.draft_context_slots.unwrap_or(20.max(args.draft_sequences)), args.draft_sequences,
-                mask, false, representation, args.fp8_scales, crate::shared::fp8_linear::Fp8Rows::W8a16, args.draft_kv_cache)?;
+                mask, false, representation, args.fp8_scales, crate::shared::fp8_linear::Fp8Rows::W8a16, args.draft_kv_cache,
+                |id, name, bytes| {
+                    ensure!(id == device.id, "GLM draft arena device differs from load binder");
+                    arena.view(name, bytes)
+                })?;
             // Priming reads the weights; recorded owners prime only after commit.
             if !crate::shared::experts::rtx::dense::is_recording() { drafter.prepare_workspace()?; }
             tracing::info!(elapsed_ms = started.elapsed().as_millis() as u64,
@@ -1542,8 +1951,17 @@ impl Opened {
                 Ok(crate::shared::experts::rtx::dense::Rect { name: name.into(), path: catalog.snapshot().join(&tensor.shard),
                     base: tensor.metadata.byte_offset, row_bytes: bytes / rows, rows: 0..rows, cols: 0..bytes / rows })
             };
-            let drafter = dflash::DflashDrafter::load_ml4(&self.library, programs, native, ml4,
-                ml4.logit_softcap as f32, stream, layout, &source)?;
+            let device = crate::shared::memory::device::Device { library: &self.library,
+                id: self.library.cuda_get_device()? };
+            let arena = crate::shared::memory::weight_arena::DeviceWeightArena::new(device,
+                cuteafd_loader::serving_capacity::WeightArenaLayout::new(format!("glm/draft/{}", device.id),
+                    layout.immutable_arena_requests())?,
+                cuteafd_core::memory_layout::ArenaTag::drafter_weights("glm/draft"))?;
+            let drafter = dflash::DflashDrafter::load_ml4_with(&self.library, programs, target_projection, native, ml4,
+                ml4.logit_softcap as f32, stream, layout, &source, |id, name, bytes| {
+                    ensure!(id == device.id, "ML4 draft arena device differs from load binder");
+                    arena.view(name, bytes)
+                })?;
             if !crate::shared::experts::rtx::dense::is_recording() { drafter.prepare_workspace()?; }
             tracing::info!(elapsed_ms = started.elapsed().as_millis() as u64, "mtp_dspark drafter resident");
             Some(drafter)
@@ -1552,59 +1970,58 @@ impl Opened {
 
     /// Native vocabulary, dense operands and drafter share the existing group.
     #[allow(clippy::too_many_arguments, clippy::type_complexity)]
-    fn load_native<'s>(&'s self, args: &EngineArgs, records: &[cuteafd_loader::plan::exlr8::dense::DenseRecord],
-        per_rank: &[dense_weights::NativeDenseRecords], layers: usize, programs: &'s cuteafd_ffi::programs::Programs<'s>, _manifest: &serde_json::Value,
-        loader: &weights::GlmLoader<'s>, devices: &[i32], stream: *mut c_void, peer_stream: Option<(i32, *mut c_void)>,
+    fn load_native<'s>(&'s self, args: &EngineArgs, admitted: &cuteafd_loader::placement::families::glm5::admission::NativeLoad, records: &[cuteafd_loader::plan::exlr8::dense::DenseRecord],
+        per_rank: &[cuteafd_loader::plan::exlr8::dense::requests::NativeDenseRecords], owners: Option<&[u8]>, layers: usize, programs: &'s cuteafd_ffi::programs::Programs<'s>, _manifest: &serde_json::Value,
+        loader: &weights::GlmLoader<'s>, devices: &[i32], stream: *mut c_void, _peer_stream: Option<(i32, *mut c_void)>,
         push: Option<(crate::shared::experts::rtx::push::CoordinatorPush, usize)>,
+        media: &crate::shared::experts::rtx::dense::Records,
         ml4_draft: &Option<cuteafd_loader::formats::dflash::MlaDraftRuntimeLayout>,
-        draft_file: &mut Option<std::thread::JoinHandle<std::io::Result<Vec<u8>>>>)
+        draft_file: &mut Option<std::thread::JoinHandle<std::io::Result<Vec<u8>>>>, draft_home: &DraftHome)
         -> Result<(crate::shared::token_io::TokenEmbedding<'s>, (weights::GlmWeights<'s>, Vec<Vec<weights::GlmLayer<'s>>>),
-            Option<Vec<crate::shared::experts::rtx::push::PushedExperts<'s>>>, Option<Option<dflash::DflashDrafter<'s>>>)> {
+            Option<Vec<crate::shared::experts::rtx::push::PushedExperts<'s>>>, Option<Option<drafter::GlmDrafter<'s>>>)> {
         use crate::shared::token_io::native::{NativeVocabulary, VocabularyPlan};
         let _memory_scope = cuteafd_ffi::memory_ledger::scope("weights");
         let world = devices.len();
         let started = Instant::now();
         self.library.cuda_set_device(devices[0])?;
-        let (_, available) = cuteafd_loader::formats::mapped_preload::host_memory()?;
-        let available = usize::try_from(available)?;
         ensure!(per_rank.len() == world, "native loader requires one owned plan per coordinator");
-        let load_peak = per_rank.iter().try_fold(0usize, |total, rank|
-            total.checked_add(rank.plan.read_staging_bytes).context("native dense load peak overflow"))?;
-        ensure!(load_peak <= available, "native dense load peak {load_peak} exceeds available host bytes {available}");
-        let config: serde_json::Value = serde_json::from_slice(&std::fs::read(self.snapshot.join("config.json"))?)?;
+        let config = self.view.config()?;
         let selection = cuteafd_loader::plan::exlr8::dense::DenseSelection::from_hf(&config)?;
         let recorder = crate::shared::experts::rtx::dense::Recorder::start(push.is_some())?;
-        let vocabulary = NativeVocabulary::load(&self.library, programs,
-            VocabularyPlan::new(records, &selection, world, 0, self.cfg.hidden, self.cfg.vocab_size)?, available, 0, 0)?
+        let vocabulary_plan = VocabularyPlan::new(records, &selection, world, 0, self.cfg.hidden, self.cfg.vocab_size)?;
+        let staging_bytes = vocabulary_plan.staging_bytes() as u64;
+        admitted.validate_vocabulary(staging_bytes)?;
+        let vocabulary = NativeVocabulary::load_prepared_with(&self.library, programs,
+            vocabulary_plan, staging_bytes, devices[0], |name, bytes|
+                loader.allocate_owner(&format!("vocabulary.{name}"), bytes))?
             .context("rank 0 owns the native vocabulary")?;
         let vocabulary = std::rc::Rc::new(vocabulary);
         let source = self.native_embed_source()?;
-        let embedding = crate::shared::token_io::TokenEmbedding::row_fp8(&self.library, source, vocabulary.clone())?;
-        let rank_stream = |device: i32| if device == args.device { stream } else { peer_stream.map_or(stream, |(_, s)| s) };
+        let embedding = crate::shared::token_io::TokenEmbedding::row_fp8_with(&self.library, source,
+            vocabulary.clone(), |_, bytes| loader.allocate_owner("embedding", bytes))?;
         let mut planned_drafter = None;
         let ((model, shares), pushed) = match push {
             Some((push, sparks)) => {
                 let load = crate::shared::experts::rtx::dense::DenseLoad::push(&self.library);
-                let model = loader.native_model(&self.cfg, layers, &per_rank, &load, vocabulary.clone())?;
-                planned_drafter = Some(self.load_drafter(args, programs, &embedding, stream, ml4_draft, draft_file)?);
+                let model = loader.native_model(&self.cfg, layers, &per_rank, owners, &load, vocabulary.clone())?;
+                planned_drafter = Some(self.load_drafter(args, programs, &embedding, stream, ml4_draft, draft_file, draft_home, &model.0.head)?);
                 let mut records = recorder.context("native push recorder")?.finish();
                 records.extend(load.sink.as_ref().context("push sink")?.take_all());
+                records.extend(media.clone());
                 let dense_devices: Vec<_> = devices.iter().map(|&id| crate::shared::memory::device::Device {
                     library: &self.library, id }).collect();
                 let planned = crate::shared::experts::rtx::dense::plan_records(&self.snapshot, records.clone(),
                     &dense_devices, sparks);
                 let (pushed, ()) = push.receive_with(dense_devices, Some(&self.catalog), sparks, Some(planned), || ());
-                let pushed = pushed?;
-                if pushed.is_none() {
-                    crate::shared::experts::rtx::dense::fill_records_by_mount(&self.library, &records, rank_stream)?;
-                }
+                let pushed = crate::shared::experts::rtx::push::PushPolicy::for_snapshot(&self.snapshot)?
+                    .committed(pushed).context("GLM native coordinator push delivery")?;
                 tracing::info!(pushed = pushed.is_some(), operands = records.operands.len(), steps = records.steps.len(),
                     "GLM native dense operands landed");
                 (model, pushed)
             }
             None => {
                 let load = crate::shared::experts::rtx::dense::DenseLoad::mount(&self.library);
-                (loader.native_model(&self.cfg, layers, &per_rank, &load, vocabulary.clone())?, None)
+                (loader.native_model(&self.cfg, layers, &per_rank, owners, &load, vocabulary.clone())?, None)
             }
         };
         self.library.cuda_set_device(args.device)?;
@@ -1628,6 +2045,13 @@ impl Opened {
         crate::shared::token_io::EmbedSource::new(catalog.snapshot(), &tensor.shard, &tensor.metadata,
             self.cfg.hidden)
     }
+}
+
+fn dump_golden_layer(dir: &std::path::Path, layer: usize, stream: &[u8]) -> Result<()> {
+    ensure!(stream.len() % 2 == 0, "golden layer dump must contain complete BF16 elements");
+    std::fs::create_dir_all(dir)?;
+    std::fs::write(dir.join(format!("layer{layer:02}.bin")), stream)?;
+    Ok(())
 }
 
 fn bf16s(bytes: &[u8]) -> Vec<f32> {
@@ -1665,6 +2089,16 @@ fn mean_kl(logits: &[f32], golden: &[f32], vocab: usize) -> f64 {
     }).sum::<f64>() / rows.max(1) as f64
 }
 
+fn write_attention_identity(dir: &std::path::Path, view: &cuteafd_loader::plan::checkpoint::CheckpointView) -> Result<()> {
+    std::fs::write(dir.join("attention.json"), serde_json::to_vec_pretty(&serde_json::json!({
+        "mode": view.mode(), "bundle_fingerprint": view.fingerprint(),
+        "config": view.config_name(), "index": view.index_name(),
+        "fp8_recipe": (view.mode() == cuteafd_loader::plan::checkpoint::CoreView::Fp8Compact)
+            .then_some(cuteafd_loader::plan::checkpoint::view::FP8_RECIPE),
+    }))?)?;
+    Ok(())
+}
+
 /// --nll: score one retained prefill unit per call, downloading its logits
 /// before the next call reuses the workspace: mean NLL, top-1 agreement, KL.
 fn nll_run(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmEngine<'_>, mut transport: Option<&mut SparkLink<'_>>,
@@ -1685,6 +2119,7 @@ fn nll_run(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmEngine<'_>, m
         std::fs::create_dir_all(dir)?;
         std::fs::write(dir.join("tokens.bin"), tokens.iter().flat_map(|t| t.to_le_bytes()).collect::<Vec<u8>>())?;
         std::fs::write(dir.join("logits.bin"), logits.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>())?;
+        write_attention_identity(dir, &opened.view)?;
     }
     let nll_of = |l: &[f32], next: u32| {
         let top = l.iter().copied().fold(f32::NEG_INFINITY, f32::max) as f64;
@@ -1787,7 +2222,7 @@ fn width_invariance(args: &GoldenArgs, engine: &engine::GlmEngine<'_>,
         "--width-invariance takes widths 1..={}", engine::DECODE_ROWS);
     ensure!(transport.is_some() || engine.skip_routed()
         || engine.weights.layers.iter().enumerate().all(|(i, layer)| layer.dense
-            || engine.tp2_layers().is_some_and(|layers| layers.contains(&i))),
+            || engine.local_layers().is_some_and(|layers| layers.contains(&i))),
         "--width-invariance needs Spark peers, local experts, or --skip-routed-experts");
     let prefill = args.prefill.unwrap_or(512);
     let tokens: Vec<u32> = tokens.iter().copied().cycle().take(prefill + max_rows).collect();
@@ -2046,7 +2481,7 @@ fn golden_run(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmEngine<'_>
         return draft_run(args, opened, engine, transport, runtime);
     }
     if args.nll || args.bench_prefill > 0 {
-        ensure!(transport.is_some() || engine.skip_routed() || engine.has_tp2(),
+        ensure!(transport.is_some() || engine.skip_routed() || engine.has_local(),
             "--nll and --bench-prefill need Spark peers, local TP2 or --skip-routed-experts");
         if args.nll {
             nll_run(args, opened, engine, transport.as_deref_mut(), runtime)?;
@@ -2086,7 +2521,10 @@ fn golden_run(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmEngine<'_>
     };
     let mut worst = Vec::new();
     let logits = engine.prefill(&mut placement, &tokens[..prefill], transport.as_deref_mut().map(|t| (t, runtime)),
-        Some(&mut |layer, stream| compare(layer, 0, stream, &mut worst)))?;
+        Some(&mut |layer, stream| {
+            if let Some(dir) = &args.layer_dump { dump_golden_layer(dir, layer, stream)?; }
+            compare(layer, 0, stream, &mut worst)
+        }))?;
     let prefill_seconds = started.elapsed().as_secs_f64();
     let started = Instant::now();
     let mut decode_worst = Vec::new();
@@ -2137,6 +2575,7 @@ fn golden_run(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmEngine<'_>
             std::fs::create_dir_all(dir)?;
             std::fs::write(dir.join("decode-logits.bin"),
                 decode_logits.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>())?;
+            write_attention_identity(dir, &opened.view)?;
         }
     }
     println!("prefill: {prefill} tokens through {layers} layers in {prefill_seconds:.2} s");

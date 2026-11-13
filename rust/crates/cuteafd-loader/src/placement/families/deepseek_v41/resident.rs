@@ -8,8 +8,8 @@ pub const DEFAULT_POOL_TOKENS: u64 = 2 * 1_048_576;
 
 /// One mode parser for checkpoint residency, startup packing and native execution
 /// (`CUTEAFD_V41_FP8_HEAD`): `off` keeps the BF16 head; `draft` adds an E4M3 copy
-/// for dSpark; `all` (default) keeps only the E4M3 copy, for both; `packed` keeps
-/// only the exact 12-bit copy of the BF16 head (`cuteafd_core::packed_head`):
+/// for dSpark; `all` keeps only the E4M3 copy, for both; unset/`auto` selects
+/// `packed`, the exact 12-bit copy of the BF16 head (`cuteafd_core::packed_head`):
 /// target logits read it exactly, dSpark its coarse plane.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Fp8Head { Off, Draft, All, Packed }
@@ -22,13 +22,18 @@ impl Fp8Head {
         match mode {
             "off" | "0" | "bf16" => Self::Off,
             "draft" => Self::Draft,
-            "packed" => Self::Packed,
+            "" | "auto" | "packed" => Self::Packed,
             _ => Self::All,
         }
     }
 
     pub fn configured() -> Self {
         Self::parse(&std::env::var("CUTEAFD_V41_FP8_HEAD").unwrap_or_default())
+    }
+
+    /// Resolved setting shared by planner, execution and benchmark provenance.
+    pub fn setting(self) -> &'static str {
+        match self { Self::Off => "off", Self::Draft => "draft", Self::All => "all", Self::Packed => "packed" }
     }
 
     /// Target logits project through a resident copy (and its scratch), not BF16.
@@ -93,12 +98,17 @@ pub fn packed_expert_bytes(package: &str, experts: u64, hidden: u64, intermediat
 /// Default backbone/dSpark weights, without routed backbone experts. Vision
 /// is admitted separately by the encoder placement. Target embedding lives on RTX0, target normalization
 /// on the decoder (RTX1 under CED), and vocabulary is evenly partitioned
-/// in the default single-copy FP8 representation.
+/// in the default exact packed representation.
 /// dSpark weights stay on the decoder; default experts are full copies there.
 /// Unsupported native format changes return None instead of an exact claim.
 pub fn resident_weights(checkpoint: &Checkpoint, ranks: usize, dspark: bool)
     -> Option<Vec<Vec<Item>>> {
-    resident_headers(&checkpoint.config, checkpoint.tensors.iter().map(|tensor| &tensor.meta), ranks, dspark)
+    resident_weights_for_arch(checkpoint, ranks, dspark, cuteafd_core::GpuArch::Sm120)
+}
+
+pub fn resident_weights_for_arch(checkpoint: &Checkpoint, ranks: usize, dspark: bool,
+    arch: cuteafd_core::GpuArch) -> Option<Vec<Vec<Item>>> {
+    resident_headers_for_arch(&checkpoint.config, checkpoint.tensors.iter().map(|tensor| &tensor.meta), ranks, dspark, arch)
 }
 
 /// The serving catalog and the offline checkpoint enumerate the same source
@@ -106,6 +116,28 @@ pub fn resident_weights(checkpoint: &Checkpoint, ranks: usize, dspark: bool)
 pub fn resident_headers<'a>(config: &serde_json::Value,
     tensors: impl IntoIterator<Item = &'a crate::SafetensorsTensorMetadata>,
     ranks: usize, dspark: bool) -> Option<Vec<Vec<Item>>> {
+    resident_headers_for_arch(config, tensors, ranks, dspark, cuteafd_core::GpuArch::Sm120)
+}
+
+pub fn resident_headers_for_arch<'a>(config: &serde_json::Value,
+    tensors: impl IntoIterator<Item = &'a crate::SafetensorsTensorMetadata>,
+    ranks: usize, dspark: bool, arch: cuteafd_core::GpuArch) -> Option<Vec<Vec<Item>>> {
+    resident_inventory(config, tensors, ranks, dspark, true, arch)
+}
+
+/// Only the drafter's own checkpoint allocations; borrowed target owners are excluded.
+pub fn drafter_weights(checkpoint: &Checkpoint, ranks: usize) -> Option<Vec<Vec<Item>>> {
+    drafter_weights_for_arch(checkpoint, ranks, cuteafd_core::GpuArch::Sm120)
+}
+
+pub fn drafter_weights_for_arch(checkpoint: &Checkpoint, ranks: usize,
+    arch: cuteafd_core::GpuArch) -> Option<Vec<Vec<Item>>> {
+    resident_inventory(&checkpoint.config, checkpoint.tensors.iter().map(|tensor| &tensor.meta), ranks, true, false, arch)
+}
+
+fn resident_inventory<'a>(config: &serde_json::Value,
+    tensors: impl IntoIterator<Item = &'a crate::SafetensorsTensorMetadata>,
+    ranks: usize, dspark: bool, target: bool, arch: cuteafd_core::GpuArch) -> Option<Vec<Vec<Item>>> {
     let config = config.get("text_config").unwrap_or(config);
     let tensors = tensors.into_iter().collect::<Vec<_>>();
     if ![1, 2].contains(&ranks) || config["num_hidden_layers"].as_u64() != Some(40)
@@ -121,6 +153,11 @@ pub fn resident_headers<'a>(config: &serde_json::Value,
         return None;
     }
     let decoder = ranks - 1;
+    // The dense dSpark arena's inter-view alignment, from the same header
+    // recipe the serving loader allocates; charged once beside its payload.
+    let draft_padding = if dspark && tensors.iter().any(|t| t.name.starts_with("mtp.") && !t.name.contains(".ffn.experts.")) {
+        super::weight_layout::draft_layout_from_headers_for_arch(tensors.iter().copied(), arch).ok()?.padding_bytes() as u64
+    } else { 0 };
     let head_mode = Fp8Head::configured();
     let mut totals: Vec<BTreeMap<(Category, String, String), u64>> = vec![BTreeMap::new(); ranks];
     let mut add = |rank: usize, category, group: &str, format: &str, bytes: u64| {
@@ -139,11 +176,12 @@ pub fn resident_headers<'a>(config: &serde_json::Value,
             // every stage. Grouped wo_a uses its stored n*k/groups extent.
             if name.ends_with(".weight") && format.contains("e4m3")
                 && (!name.ends_with(".main_proj.weight") || name == "mtp.0.main_proj.weight") {
-                bytes += tensor.shape.iter().product::<usize>() as u64 / 32;
+                bytes += super::weight_layout::packed_scale_bytes(usize::try_from(tensor.byte_length).ok()?, arch).ok()? as u64;
             }
             add(decoder, Category::Drafter, "dspark-auxiliary", &format, bytes);
             continue;
         }
+        if !target { continue; }
         if name == "head.weight" {
             let (resident, head_format) = head_mode.resident(bytes / ranks as u64);
             for rank in 0..ranks { add(rank, Category::Weights, "lm_head", head_format, resident); }
@@ -172,7 +210,7 @@ pub fn resident_headers<'a>(config: &serde_json::Value,
             else if rest.starts_with("attn.compressor.") { (Category::Weights, "compressor") }
             else { (Category::Weights, "attention") };
         if name.ends_with(".weight") && format.contains("e4m3") {
-            bytes += tensor.shape.iter().product::<usize>() as u64 / 32;
+            bytes += super::weight_layout::packed_scale_bytes(usize::try_from(tensor.byte_length).ok()?, arch).ok()? as u64;
         }
         if ranks == 2 && group == "shared_expert" {
             // Shared TP2 copies retain the packed scales only; checkpoint
@@ -186,6 +224,7 @@ pub fn resident_headers<'a>(config: &serde_json::Value,
         let intermediate = config["moe_intermediate_size"].as_u64()?;
         add(decoder, Category::Drafter, "dspark-experts", "mxfp4-packed", 3 * native_expert_bytes(experts, 5120, intermediate));
     }
+    if draft_padding > 0 { add(decoder, Category::Drafter, "dspark-auxiliary", "arena-padding", draft_padding); }
     Some(totals.into_iter().map(|rank| rank.into_iter().map(|((category, group, format), bytes)|
         Item::new(category, group, format, bytes, Basis::Formula)).collect()).collect())
 }
@@ -195,6 +234,12 @@ pub fn resident_headers<'a>(config: &serde_json::Value,
 pub fn prefix_bytes(entries: u64, dspark: bool, ranks: usize) -> Vec<u64> {
     let slots = if entries == 0 { 0 } else { 2 * entries + 2 };
     prefix_arena_bytes(slots, dspark, ranks)
+}
+
+/// One complete prefix mark: 40 window rings and four compressor carries (the backbone mark)
+/// plus, with dSpark, the three drafter rings. The serving `MarkRule` sizes the arena from it.
+pub const fn prefix_mark_bytes(dspark: bool) -> u64 {
+    40 * (128 * 528 + 8) + 4 * 4096 + if dspark { 3 * 128 * 528 } else { 0 }
 }
 
 pub fn prefix_arena_bytes(slots: u64, dspark: bool, ranks: usize) -> Vec<u64> {
@@ -224,7 +269,7 @@ mod tests {
 
     fn checkpoint(tensors: Vec<crate::plan::checkpoint::CheckpointTensor>) -> Checkpoint {
         Checkpoint {
-            snapshot: Default::default(), quantize_config: None, weight_map: Default::default(),
+            view: None, snapshot: Default::default(), quantize_config: None, weight_map: Default::default(),
             missing_shards: vec![], shard_bytes: 0,
             config: serde_json::json!({"num_hidden_layers":40,"hidden_size":5120}), tensors,
         }
@@ -286,6 +331,85 @@ mod tests {
     }
 
     #[test]
+    fn drafter_weights_exclude_borrowed_target_embedding_head_and_backbone() {
+        use cuteafd_core::DType;
+        let target = vec![tensor("embed.weight", DType::Bf16, &[100], 200),
+            tensor("head.weight", DType::Bf16, &[100], 200),
+            tensor("norm.weight", DType::Bf16, &[10], 20),
+            tensor("layers.0.attn.wq_a.weight", DType::F8E4M3, &[3200], 3200)];
+        let draft = vec![tensor("mtp.0.main_proj.weight", DType::F8E4M3, &[3200], 3200),
+            tensor("mtp.1.main_proj.weight", DType::F8E4M3, &[3200], 3200),
+            tensor("mtp.0.norm.weight", DType::Bf16, &[10], 20)];
+        let mut combined = target.clone();
+        combined.extend(draft.clone());
+        for ranks in [1, 2] {
+            let owned = drafter_weights(&checkpoint(combined.clone()), ranks).unwrap();
+            assert_eq!(owned, drafter_weights(&checkpoint(draft.clone()), ranks).unwrap());
+            let layout = super::super::weight_layout::draft_layout_from_headers(draft.iter().map(|t| &t.meta)).unwrap();
+            assert_eq!(owned[ranks - 1].iter().map(|i| i.bytes).sum::<u64>(), layout.bytes() as u64);
+            assert_eq!(layout.payload_bytes(), 3200 + 100 + 3200 + 20);
+            assert!(owned[..ranks - 1].iter().all(Vec::is_empty));
+            assert!(drafter_weights(&checkpoint(target.clone()), ranks).unwrap().iter().all(Vec::is_empty));
+        }
+    }
+
+    #[test]
+    fn architecture_selected_draft_inventory_equals_its_arena_and_target_scale_grid() {
+        use cuteafd_core::{DType, GpuArch};
+        let dense = vec![
+            tensor("mtp.0.main_proj.weight", DType::F8E4M3, &[32, 32], 1024),
+            tensor("mtp.1.main_proj.weight", DType::F8E4M3, &[32, 32], 1024),
+            tensor("mtp.0.attn.wq_a.weight", DType::F8E4M3, &[32, 64], 2048),
+            tensor("mtp.0.norm.weight", DType::Bf16, &[37], 74),
+        ];
+        let mut headers = dense.clone();
+        headers.push(tensor("layers.0.attn.wq_a.weight", DType::F8E4M3, &[32, 64], 2048));
+        let checkpoint = checkpoint(headers);
+        for arch in [GpuArch::Sm89, GpuArch::Sm120] {
+            let layout = super::super::weight_layout::draft_layout_from_headers_for_arch(
+                dense.iter().map(|t| &t.meta), arch).unwrap();
+            for ranks in [1, 2] {
+                let owned = drafter_weights_for_arch(&checkpoint, ranks, arch).unwrap();
+                assert_eq!(owned[ranks - 1].iter().map(|i| i.bytes).sum::<u64>(), layout.bytes() as u64);
+                assert!(owned[..ranks - 1].iter().all(Vec::is_empty));
+                let target = resident_weights_for_arch(&checkpoint, ranks, false, arch).unwrap();
+                assert_eq!(target[0].iter().map(|i| i.bytes).sum::<u64>(),
+                    2048 + if arch == GpuArch::Sm89 { 2 } else { 64 });
+            }
+        }
+    }
+
+    /// The planner charges exactly the dense dSpark arena the runtime allocates:
+    /// payload, generated packed scales and inter-view alignment, from one
+    /// header recipe. Unaligned extents make any padding split visible here.
+    #[test]
+    fn planned_dspark_dense_residency_equals_the_shared_arena_layout() {
+        use cuteafd_core::DType;
+        let draft = vec![
+            tensor("mtp.0.main_proj.weight", DType::F8E4M3, &[96, 100], 9600),
+            tensor("mtp.1.main_proj.weight", DType::F8E4M3, &[96, 100], 9600),
+            tensor("mtp.0.attn.wq_a.weight", DType::F8E4M3, &[64, 33], 2112),
+            tensor("mtp.0.attn.wq_a.scale", DType::F32, &[2, 2], 16),
+            tensor("mtp.0.norm.weight", DType::Bf16, &[37], 74),
+        ];
+        let layout = super::super::weight_layout::draft_layout_from_headers(draft.iter().map(|t| &t.meta)).unwrap();
+        assert!(layout.padding_bytes() > 0, "fixture must exercise alignment padding");
+        for ranks in [1, 2] {
+            let owned = drafter_weights(&checkpoint(draft.clone()), ranks).unwrap();
+            let auxiliary = owned[ranks - 1].iter().filter(|i| i.group == "dspark-auxiliary").map(|i| i.bytes).sum::<u64>();
+            assert_eq!(auxiliary, layout.bytes() as u64, "ranks={ranks}");
+            let padding = owned[ranks - 1].iter().filter(|i| i.format == "arena-padding").collect::<Vec<_>>();
+            assert_eq!(padding.len(), 1);
+            assert_eq!(padding[0].bytes, layout.padding_bytes() as u64);
+            assert!(owned[..ranks - 1].iter().all(Vec::is_empty));
+        }
+        // No dSpark: no draft arena and no padding owner.
+        let target = vec![tensor("layers.0.attn.wq_a.weight", DType::F8E4M3, &[64, 33], 2112)];
+        let items = resident_weights(&checkpoint(target), 1, true).unwrap();
+        assert!(items[0].iter().all(|i| i.format != "arena-padding"));
+    }
+
+    #[test]
     fn snapshot_and_expert_placement_keep_physical_owners() {
         let (experts, hidden, logical) = (384u64, 5120u64, 576u64);
         let stored = cuteafd_core::mxfp4_layouts::stored_width(hidden as usize, logical as usize).unwrap() as u64;
@@ -321,7 +445,8 @@ mod tests {
         let packed12 = 997_395_712;
         for (text, mode) in [("off", Fp8Head::Off), ("0", Fp8Head::Off),
             ("bf16", Fp8Head::Off), ("draft", Fp8Head::Draft),
-            ("", Fp8Head::All), ("all", Fp8Head::All), ("other", Fp8Head::All),
+            ("", Fp8Head::Packed), ("auto", Fp8Head::Packed),
+            ("all", Fp8Head::All), ("other", Fp8Head::All),
             ("packed", Fp8Head::Packed)] {
             assert_eq!(Fp8Head::parse(text), mode);
             assert_eq!(mode.target(), matches!(mode, Fp8Head::All | Fp8Head::Packed));
@@ -362,7 +487,14 @@ mod tests {
     fn vocabulary_counts_single_fp8_copy_and_explicit_overrides() {
         let source = 129280 * 5120 * 2;
         let packed = 129280 * (5120 + 40 * 4);
-        assert_eq!(Fp8Head::parse("").resident(source), (packed, "fp8-row128"));
+        for text in ["", "auto", "packed"] {
+            let mode = Fp8Head::parse(text);
+            assert_eq!(mode.setting(), "packed");
+            for ranks in [1, 2] {
+                assert_eq!(mode.resident(source / ranks),
+                    (Fp8Head::packed12_bytes(source / ranks), "bf16-packed12"));
+            }
+        }
         assert_eq!(Fp8Head::parse("all").resident(source), (packed, "fp8-row128"));
         assert_eq!(Fp8Head::parse("off").resident(source), (source, "bf16"));
         assert_eq!(Fp8Head::parse("draft").resident(source), (source + packed, "bf16+fp8-row128"));
@@ -380,10 +512,10 @@ mod tests {
             },
         };
         let checkpoint = Checkpoint {
-            snapshot: Default::default(), quantize_config: None, weight_map: Default::default(), missing_shards: vec![], shard_bytes: 0,
+            view: None, snapshot: Default::default(), quantize_config: None, weight_map: Default::default(), missing_shards: vec![], shard_bytes: 0,
             config: serde_json::json!({"num_hidden_layers":40,"hidden_size":5120}),
             tensors: vec![tensor("embed.weight", DType::Bf16, 100, 200),
-                tensor("head.weight", DType::Bf16, 100, 200),
+                tensor("head.weight", DType::Bf16, 129280 * 5120, 1_323_827_200),
                 tensor("norm.weight", DType::Bf16, 10, 20),
                 tensor("layers.0.attn.wq_a.weight", DType::F8E4M3, 3200, 3200),
                 tensor("layers.20.attn.wq_a.weight", DType::F8E4M3, 6400, 6400),
@@ -394,9 +526,10 @@ mod tests {
         let single = resident_weights(&checkpoint, 1, false).unwrap();
         let dual = resident_weights(&checkpoint, 2, false).unwrap();
         let sum = |items: &[Item]| items.iter().map(|i| i.bytes).sum::<u64>();
-        assert_eq!(sum(&single[0]), 200 + 103 + 20 + 3300 + 6600 + 3300 + 100);
-        assert_eq!(sum(&dual[0]), 200 + 51 + 3300 + 1650);
-        assert_eq!(sum(&dual[1]), 51 + 20 + 6600 + 1650);
+        let head = Fp8Head::configured();
+        assert_eq!(sum(&single[0]), 200 + head.resident(1_323_827_200).0 + 20 + 3300 + 6600 + 3300 + 100);
+        assert_eq!(sum(&dual[0]), 200 + head.resident(661_913_600).0 + 3300 + 1650);
+        assert_eq!(sum(&dual[1]), head.resident(661_913_600).0 + 20 + 6600 + 1650);
     }
 }
 

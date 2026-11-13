@@ -36,6 +36,7 @@
 use super::engine::{MimoEngine, MimoPlacement, DECODE_ROWS, PAGE_ROWS, RING_ROWS};
 use super::mtp::HIDDEN_ROWS;
 use crate::shared::memory::device::{Allocation, Device};
+use crate::shared::memory::Tag;
 use anyhow::{ensure, Result};
 use cuteafd_engine::prefix::{BoxError, FamilyLayout, MarkSlot, MarkStore, PrefixFamily, ReuseRule, TailCopy};
 use cuteafd_ffi::CuteafdDeviceBuffer;
@@ -86,7 +87,7 @@ pub(crate) struct MimoPrefix<'e, 'a> {
     draft_metadata: Option<Rc<Allocation<'a>>>,
     draft_offset: usize,
     /// Per rank: the prefix copy stream, fenced against that rank's engine stream (the
-    /// drafter and MTP run on rank 0's).
+    /// TP2 drafter shares both target streams; MTP uses rank 0's).
     copies: crate::shared::prefix::PrefixCopies<'a>,
 }
 
@@ -147,23 +148,24 @@ impl<'e, 'a> MimoPrefix<'e, 'a> {
             // Leave room for speculative writes and the target mark's capture reach.
             let rows = draft_mark_rows(window);
             let row = drafter.kv_cache.plane_record_bytes(drafter.cfg.kv_heads, drafter.cfg.head_dim);
-            for buffer in drafter.context_rings() {
-                states.push(RingState { rank: 0, buffer, row, ring_rows: super::dflash::RING,
-                    rows, offset: offsets[0], draft: true });
-                offsets[0] += super::dflash::RING * row;
+            for (rank, buffer) in drafter.context_rings() {
+                states.push(RingState { rank, buffer, row, ring_rows: super::dflash::RING,
+                    rows, offset: offsets[rank], draft: true });
+                offsets[rank] += super::dflash::RING * row;
             }
             offsets[0] += 8;
             debug_assert_eq!((offsets[0] - draft_offset) as u64,
                 cuteafd_loader::families::mimo_v2::draft_representation::mimo_draft_mark_bytes(
                     drafter.cfg.layers as u64, drafter.cfg.kv_heads as u64, drafter.cfg.head_dim as u64, drafter.kv_cache)?);
-            Some(Rc::new(Allocation::new(Device { library: engine.library, id: engine.kv_layer_on(0, 0).1.device_id }, engine.rings * 8)?))
+            Some(Rc::new(Allocation::new(Device { library: engine.library, id: engine.kv_layer_on(0, 0).1.device_id },
+                engine.rings * 8, Tag::drafter_workspace("mimo/prefix-draft-floors"))?))
         } else { None };
         let mark_bytes: usize = offsets.iter().sum();
         let slots = slots(mark_bytes);
         let arenas = if slots > 0 && mark_bytes > 0 {
             offsets.iter().enumerate().map(|(rank, &bytes)| {
                 let device = Device { library: engine.library, id: engine.kv_layer_on(rank, 0).1.device_id };
-                Allocation::new(device, (slots * bytes).max(256)).map(Rc::new)
+                Allocation::new(device, (slots * bytes).max(256), Tag::prefix("mimo/prefix-marks")).map(Rc::new)
             }).collect::<Result<Vec<_>>>()?
         } else {
             Vec::new()
@@ -189,7 +191,7 @@ impl<'e, 'a> MimoPrefix<'e, 'a> {
     }
 
     fn draft_metadata_offset(&self) -> usize {
-        self.states.iter().filter(|s| s.draft).map(|s| s.ring_rows * s.row).sum::<usize>() + self.draft_offset
+        self.states.iter().filter(|s| s.draft && s.rank == 0).map(|s| s.ring_rows * s.row).sum::<usize>() + self.draft_offset
     }
 
     pub fn mark_bytes(&self) -> usize {
@@ -217,7 +219,7 @@ impl<'e, 'a> MimoPrefix<'e, 'a> {
     pub(super) fn terminal_fixture(engine: &'e MimoEngine<'a>) -> Result<Self> {
         let arenas = (0..engine.ranks()).map(|rank| engine.on(rank, || {
             let device = Device { library: engine.library, id: engine.library.cuda_get_device()? };
-            Allocation::new(device, 4096).map(Rc::new)
+            Allocation::new(device, 4096, crate::shared::memory::TEST).map(Rc::new)
         })).collect::<Result<Vec<_>>>()?;
         Ok(Self { engine, full: Vec::new(), states: Vec::new(),
             rank_mark_bytes: vec![4096; engine.ranks()], mark_bytes: 4096 * engine.ranks(),
@@ -447,8 +449,8 @@ mod tests {
             for format in [Qwen4KvCache::Bf16, Qwen4KvCache::Fp8] {
                 for (heads, dim, ring_rows) in [(1, 64, 1024), (2, 128, 1024), (8, 128, 2048)] {
                     let row = format.plane_record_bytes(heads, dim);
-                    let ring = Allocation::new(device, 3 * ring_rows * row)?;
-                    let arena = Allocation::new(device, ring_rows * row + 32)?;
+                    let ring = Allocation::new(device, 3 * ring_rows * row, crate::shared::memory::TEST)?;
+                    let arena = Allocation::new(device, ring_rows * row + 32, crate::shared::memory::TEST)?;
                     let state = RingState { rank: 0, buffer: ring.buffer, row, ring_rows,
                         rows: ring_rows - 128, offset: 16, draft: true };
                     for len in [1, 63, 64, 65, ring_rows - 1, ring_rows, ring_rows + 1,

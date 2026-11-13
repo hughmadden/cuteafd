@@ -65,6 +65,8 @@ fn efforts_map_onto_the_template_and_thinking_off_prefills_user() {
     assert!(render(json!({"reasoning_effort": "MEDIUM"})).unwrap().contains("Reasoning strength: 32."));
     assert!(render(json!({"reasoning_effort": "max"})).unwrap().contains("Reasoning strength: 512."));
     assert!(render(json!({"reasoning_effort": "bogus"})).unwrap_err().contains("not one of"));
+    let conflict = render(json!({"thinking":{"type":"enabled"},"reasoning_effort":"none"})).unwrap_err();
+    assert!(conflict.contains("thinking is enabled") && conflict.contains("reasoning_effort is \"none\""));
     for extra in [json!({"thinking":"disabled"}), json!({"thinking":{"type":"disabled"}}),
         json!({"reasoning_effort":"none"}), json!({"enable_thinking":false})] {
         assert!(render(extra).unwrap().ends_with("<|start|>assistant to=user<|message|>"));
@@ -176,6 +178,7 @@ fn project(chunks: Vec<OutputChunk>, parser: &MuseOutputParser) -> Projection {
                 arguments = Some((tool_name, first));
             }
             OutputChunk::ToolArgumentsDelta { content } => arguments.as_mut().unwrap().1.push_str(&content),
+            OutputChunk::ToolCallBegin => {}
             other => panic!("unexpected {other:?}"),
         }
     }
@@ -271,4 +274,193 @@ fn content_after_a_call_is_dropped() {
         <|start|>assistant to=user<|message|>after<|eot|>";
     let parsed = parse(text, Some(tools()), &[]);
     assert_eq!((parsed.count, parsed.content.as_str()), (1, ""));
+}
+
+// ------------------------------------------------------- streamed args
+
+mod streamed_args {
+    use super::*;
+
+    /// The assembled arguments of a parse: the `ToolCall` opener's bytes plus
+    /// every `ToolArgumentsDelta`, exactly as a client concatenates them.
+    fn assembled(chunks: &[OutputChunk]) -> String {
+        let mut text = String::new();
+        for chunk in chunks {
+            match chunk {
+                OutputChunk::ToolCall { arguments, .. } => text.push_str(arguments),
+                OutputChunk::ToolArgumentsDelta { content } => text.push_str(content),
+                _ => {}
+            }
+        }
+        text
+    }
+
+    fn parse_streaming(text: &str, streaming: bool) -> (Vec<OutputChunk>, usize) {
+        let mut parser = MuseOutputParser::with_stream_args(MuseParserOptions {
+            tools: Some(tools()), prefilled_user: false, stop_sequences: Vec::new() }, streaming);
+        let mut chunks = Vec::new();
+        for character in text.chars() {
+            chunks.extend(parser.push(&character.to_string()));
+        }
+        chunks.extend(parser.finish());
+        (chunks, parser.tool_calls())
+    }
+
+    /// Every two-way split, including one inside a close tag, must stream the
+    /// same bytes the hold path assembles.
+    fn assert_streamed_matches_hold(shape: &str, text: &str) {
+        let (hold, hold_calls) = parse_streaming(text, false);
+        let (streamed, streamed_calls) = parse_streaming(text, true);
+        assert_eq!((hold_calls, streamed_calls), (1, 1), "{shape}");
+        assert_eq!(assembled(&streamed), assembled(&hold), "{shape}: streamed == held, byte for byte");
+        for split in text.char_indices().map(|(index, _)| index).chain([text.len()]) {
+            let mut parser = MuseOutputParser::with_stream_args(MuseParserOptions {
+                tools: Some(tools()), prefilled_user: false, stop_sequences: Vec::new() }, true);
+            let mut chunks = parser.push(&text[..split]);
+            chunks.extend(parser.push(&text[split..]));
+            chunks.extend(parser.finish());
+            assert_eq!(assembled(&chunks), assembled(&hold), "{shape}: split at {split}");
+        }
+        // A buffering constructor would pass every check above; prove a delta
+        // actually arrives before the call closes.
+        let close = text.find("</atem:function_calls>").expect("the block closes");
+        let mut parser = MuseOutputParser::with_stream_args(MuseParserOptions {
+            tools: Some(tools()), prefilled_user: false, stop_sequences: Vec::new() }, true);
+        let mut saw_delta_before_close = false;
+        for (index, character) in text.char_indices() {
+            let chunks = parser.push(&character.to_string());
+            if index < close
+                && chunks.iter().any(|chunk| matches!(chunk, OutputChunk::ToolArgumentsDelta { .. }))
+            {
+                saw_delta_before_close = true;
+            }
+        }
+        parser.finish();
+        assert!(saw_delta_before_close, "{shape}: a delta must arrive before the call closes");
+    }
+
+    #[test]
+    fn string_parameters_stream_byte_for_byte() {
+        assert_streamed_matches_hold("two strings", concat!(" to=get_weather<|message|><atem:function_calls>\n",
+            "<atem:invoke name=\"get_weather\">\n",
+            "<atem:parameter name=\"city\">Taipei</atem:parameter>\n",
+            "<atem:parameter name=\"detail\">{\"wind\": true}</atem:parameter>\n",
+            "</atem:invoke>\n</atem:function_calls>"));
+    }
+
+    #[test]
+    fn a_chunk_boundary_inside_the_close_tag_does_not_leak() {
+        assert_streamed_matches_hold("split close tag", concat!(" to=get_weather<|message|><atem:function_calls>\n",
+            "<atem:invoke name=\"get_weather\">\n",
+            "<atem:parameter name=\"city\">Oslo</atem:parameter>\n",
+            "</atem:invoke>\n</atem:function_calls>"));
+    }
+
+    /// A typed (non-string) value that spans several pushes is buffered until
+    /// its close tag, so it is typed from the whole value, not a fragment.
+    #[test]
+    fn typed_parameters_spanning_chunks_keep_their_type() {
+        let text = concat!(" to=get_weather<|message|><atem:function_calls>\n",
+            "<atem:invoke name=\"get_weather\">\n",
+            "<atem:parameter name=\"days\">3</atem:parameter>\n",
+            "<atem:parameter name=\"exact\">false</atem:parameter>\n",
+            "</atem:invoke>\n</atem:function_calls>");
+        assert_streamed_matches_hold("typed", text);
+        let (streamed, calls) = parse_streaming(text, true);
+        assert_eq!(calls, 1);
+        assert_eq!(serde_json::from_str::<Value>(&assembled(&streamed)).unwrap(),
+            json!({"days": 3, "exact": false}));
+    }
+
+    /// A duplicated parameter is an error in hold mode; the streamed call is
+    /// counted and left incomplete so the validator rejects it.
+    #[test]
+    fn a_duplicated_parameter_fails_the_streamed_call() {
+        let text = concat!(" to=get_weather<|message|><atem:function_calls>\n",
+            "<atem:invoke name=\"get_weather\">\n",
+            "<atem:parameter name=\"city\">a</atem:parameter>\n",
+            "<atem:parameter name=\"city\">b</atem:parameter>\n",
+            "</atem:invoke>\n</atem:function_calls>");
+        let (hold, hold_calls) = parse_streaming(text, false);
+        assert_eq!(hold_calls, 0);
+        assert!(hold.iter().any(|chunk| matches!(chunk, OutputChunk::Raw { .. })));
+        let (streamed, streamed_calls) = parse_streaming(text, true);
+        assert_eq!(streamed_calls, 1);
+        assert!(serde_json::from_str::<Value>(&assembled(&streamed)).is_err(),
+            "the streamed arguments must stay incomplete");
+    }
+
+    /// A block that never closes is content in hold mode; the streamed call is
+    /// counted and left incomplete.
+    #[test]
+    fn an_unclosed_block_fails_the_streamed_call() {
+        let text = concat!(" to=get_weather<|message|><atem:function_calls>\n",
+            "<atem:invoke name=\"get_weather\">\n",
+            "<atem:parameter name=\"city\">Oslo</atem:parameter>\n",
+            "</atem:invoke>");
+        let (_hold, hold_calls) = parse_streaming(text, false);
+        assert_eq!(hold_calls, 0);
+        let (streamed, streamed_calls) = parse_streaming(text, true);
+        assert_eq!(streamed_calls, 1);
+        assert!(serde_json::from_str::<Value>(&assembled(&streamed)).is_err());
+    }
+
+    /// Trailing text after the block is content in hold mode; the streamed call
+    /// is counted and left incomplete.
+    #[test]
+    fn trailing_text_fails_the_streamed_call() {
+        let text = concat!(" to=get_weather<|message|><atem:function_calls>\n",
+            "<atem:invoke name=\"get_weather\">\n",
+            "<atem:parameter name=\"city\">Oslo</atem:parameter>\n",
+            "</atem:invoke>\n</atem:function_calls> trailing");
+        let (_hold, hold_calls) = parse_streaming(text, false);
+        assert_eq!(hold_calls, 0);
+        let (streamed, streamed_calls) = parse_streaming(text, true);
+        assert_eq!(streamed_calls, 1);
+        assert!(serde_json::from_str::<Value>(&assembled(&streamed)).is_err());
+    }
+
+    /// An unreadable name is never streamed as a call; it comes back as content
+    /// in both modes.
+    #[test]
+    fn an_unreadable_name_streams_no_arguments() {
+        let text = concat!(" to=get_weather<|message|><atem:function_calls>\n",
+            "<atem:invoke name=\"nope\">\n",
+            "<atem:parameter name=\"city\">Oslo</atem:parameter>\n",
+            "</atem:invoke>\n</atem:function_calls>");
+        let (hold, hold_calls) = parse_streaming(text, false);
+        let (streamed, streamed_calls) = parse_streaming(text, true);
+        assert_eq!((hold_calls, streamed_calls), (0, 0));
+        assert_eq!(assembled(&streamed), assembled(&hold));
+        assert_eq!(assembled(&streamed), "");
+    }
+
+    /// Text before a parameter tag is content in hold mode; the streamed call
+    /// must not skip it and emit a valid empty-argument call.
+    #[test]
+    fn text_before_a_parameter_is_not_a_call() {
+        let text = concat!(" to=get_weather<|message|><atem:function_calls>\n",
+            "<atem:invoke name=\"get_weather\">\n",
+            "<atem:parameter>Oslo</atem:parameter>\n",
+            "</atem:invoke>\n</atem:function_calls>");
+        let (hold, hold_calls) = parse_streaming(text, false);
+        assert_eq!(hold_calls, 0);
+        assert!(hold.iter().any(|chunk| matches!(chunk, OutputChunk::Raw { .. })));
+        let (streamed, streamed_calls) = parse_streaming(text, true);
+        assert_eq!(streamed_calls, 1);
+        assert!(serde_json::from_str::<Value>(&assembled(&streamed)).is_err(),
+            "the streamed arguments must stay incomplete");
+    }
+
+    /// Attribute names (keys) are XML-unescaped in both modes.
+    #[test]
+    fn escaped_keys_are_unescaped_in_both_modes() {
+        let text = concat!(" to=get_weather<|message|><atem:function_calls>\n",
+            "<atem:invoke name=\"get_weather\">\n",
+            "<atem:parameter name=\"a&amp;b\">1</atem:parameter>\n",
+            "</atem:invoke>\n</atem:function_calls>");
+        assert_streamed_matches_hold("escaped key", text);
+        let (streamed, _) = parse_streaming(text, true);
+        assert_eq!(serde_json::from_str::<Value>(&assembled(&streamed)).unwrap(), json!({"a&b": 1}));
+    }
 }

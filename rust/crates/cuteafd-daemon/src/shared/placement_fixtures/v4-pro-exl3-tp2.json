@@ -7,7 +7,9 @@
  "manifest": "~/.cache/cuteafd/builds/v3-p4/c1/artifacts/PROGRAMS.json",
  "driver": "13.2",
  "source_revision": "b367a34f4facae3d755df8f334db913c73635c11",
- "source": "C6 2026-10-11 tagged-ready TP2 launch; raw admission_free_bytes includes interim code reservation. Replay removes reserved_code_bytes and applies current LoadedCode::pending to untracked_at_admission_bytes; the observed placement remains unchanged.",
+ "source": "planner-shape replay over the historical C6 2026-10-11 tagged-ready TP2 admission sample (raptor PRO 6000); raw admission_free_bytes includes interim code reservation. Replay removes reserved_code_bytes and applies current LoadedCode::pending to untracked_at_admission_bytes.",
+ "historical_onboard_layers": 10,
+ "note": "617067888 fixed PRO headroom and 44e533146/488dc75c6 page-list/scratch reductions intentionally returned expert budget; 617067888 already recorded Pro TP2 at 12 layers on 2026-10-28. Current onboarding is a CPU planner-shape expectation, not a fresh hardware measurement; historical raw samples and 2M pool remain unchanged.",
  "gpus": [
   {
    "total_bytes": 101973491712,
@@ -27,5 +29,6 @@
   }
  ],
  "pool_tokens": 2097152,
- "onboard_layers": 10
+ "onboard_layers": 13,
+ "pending_regeneration": "https://github.com/tpurtell/cuteafd/issues/1588"
 }

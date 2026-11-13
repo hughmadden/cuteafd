@@ -35,7 +35,7 @@ Preserving the excellence of DS4.1Flash
 PRobably needing some siginificant work to land GLM and DS4 Pro into the same quality of pipeline tier
 
 Then we extend
-GLM 5.3 Flash - zai-org/GLM-5.3-Flash and brandonmusic/GLM-5.3-Flash-tr3-4bpw
+GLM 5.3 Flash - zai-org/GLM-5.3-Flash and wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K4-MC
 Mimo 2.6 Flash - XiaomiMiMo/MiMo-V2-Flash
 Mimo 2.6 Pro - XiaomiMiMo/MiMo-V2.6-Pro-RL
 Qwen 3.8 Flash - Qwen/Qwen3.8-Flash-Next

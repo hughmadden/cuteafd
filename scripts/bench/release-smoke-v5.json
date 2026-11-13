@@ -1,0 +1,1568 @@
+{
+  "build": "REPLACE-ME-v5-rc",
+  "profile": "smoke",
+  "defaults": {
+    "timeout_s": 1200,
+    "run_timeout_s": 1800,
+    "set": {
+      "ENABLE_BENCH": "on",
+      "COORDINATOR_DOCKER_INFERENCE": "ghcr.io/tpurtell/cuteafd-coordinator:REPLACE-ME-v5-rc"
+    },
+    "fabric": true
+  },
+  "entries": [
+    {
+      "name": "v41-flash-5090",
+      "family": "deepseek_v41",
+      "config": "examples/configs/deepseek-v41-mxfp4-min.config",
+      "gpus": [
+        1
+      ],
+      "sparks": [
+        "REPLACE-ME-spark-0",
+        "REPLACE-ME-spark-1",
+        "REPLACE-ME-spark-2",
+        "REPLACE-ME-spark-3"
+      ],
+      "set": {
+        "MODEL_ID": "deepseek-ai/DeepSeek-V4.1-Flash-1017",
+        "MODEL_REVISION": "1bae0e1088993b9b82de08f59de5be5a34e42170",
+        "RTX_GPUS": "1",
+        "COORDINATOR_GPUS": "1",
+        "SPARK_COUNT": "4",
+        "ADDR": "0.0.0.0:8800",
+        "EXPERT_PORT": "20000",
+        "SPECULATOR": "dspark",
+        "GPU_MEMORY_CAP": "31.8GiB",
+        "BENCH_HARDWARE_CLASS": "5090",
+        "SPARK_EXPERT_DOCKER_INFERENCE": "ghcr.io/tpurtell/cuteafd-spark-expert:REPLACE-ME-v5-rc",
+        "SPARK_0_HOST": "REPLACE-ME-spark-0",
+        "SPARK_0_LANE_A": "192.0.2.1",
+        "SPARK_0_LANE_B": "198.51.100.1",
+        "SPARK_1_HOST": "REPLACE-ME-spark-1",
+        "SPARK_1_LANE_A": "192.0.2.2",
+        "SPARK_1_LANE_B": "198.51.100.2",
+        "SPARK_2_HOST": "REPLACE-ME-spark-2",
+        "SPARK_2_LANE_A": "192.0.2.3",
+        "SPARK_2_LANE_B": "198.51.100.3",
+        "SPARK_3_HOST": "REPLACE-ME-spark-3",
+        "SPARK_3_LANE_A": "192.0.2.4",
+        "SPARK_3_LANE_B": "198.51.100.4",
+        "BENCH_SIMULATED": "5090"
+      },
+      "precheck": {
+        "argv": [
+          "sh",
+          "-c",
+          "nvidia-smi --query-gpu=name --format=csv,noheader --id=1 | grep -q 'RTX PRO 6000'"
+        ],
+        "timeout_s": 30,
+        "required": true
+      }
+    },
+    {
+      "name": "v41-flash-min",
+      "family": "deepseek_v41",
+      "config": "examples/configs/deepseek-v41-mxfp4-min.config",
+      "gpus": [
+        1
+      ],
+      "sparks": [
+        "REPLACE-ME-spark-0",
+        "REPLACE-ME-spark-1",
+        "REPLACE-ME-spark-2"
+      ],
+      "set": {
+        "MODEL_ID": "deepseek-ai/DeepSeek-V4.1-Flash-1017",
+        "MODEL_REVISION": "1bae0e1088993b9b82de08f59de5be5a34e42170",
+        "RTX_GPUS": "1",
+        "COORDINATOR_GPUS": "1",
+        "SPARK_COUNT": "3",
+        "ADDR": "0.0.0.0:8801",
+        "EXPERT_PORT": "20200",
+        "SPECULATOR": "dspark",
+        "SPARK_EXPERT_DOCKER_INFERENCE": "ghcr.io/tpurtell/cuteafd-spark-expert:REPLACE-ME-v5-rc",
+        "SPARK_0_HOST": "REPLACE-ME-spark-0",
+        "SPARK_0_LANE_A": "192.0.2.1",
+        "SPARK_0_LANE_B": "198.51.100.1",
+        "SPARK_1_HOST": "REPLACE-ME-spark-1",
+        "SPARK_1_LANE_A": "192.0.2.2",
+        "SPARK_1_LANE_B": "198.51.100.2",
+        "SPARK_2_HOST": "REPLACE-ME-spark-2",
+        "SPARK_2_LANE_A": "192.0.2.3",
+        "SPARK_2_LANE_B": "198.51.100.3"
+      }
+    },
+    {
+      "name": "v41-flash-max",
+      "family": "deepseek_v41",
+      "config": "examples/configs/deepseek-v41-mxfp4-max.config",
+      "gpus": [
+        0,
+        1
+      ],
+      "sparks": [
+        "REPLACE-ME-spark-0",
+        "REPLACE-ME-spark-1",
+        "REPLACE-ME-spark-2",
+        "REPLACE-ME-spark-3",
+        "REPLACE-ME-spark-4",
+        "REPLACE-ME-spark-5"
+      ],
+      "set": {
+        "MODEL_ID": "deepseek-ai/DeepSeek-V4.1-Flash-1017",
+        "MODEL_REVISION": "1bae0e1088993b9b82de08f59de5be5a34e42170",
+        "RTX_GPUS": "2",
+        "COORDINATOR_GPUS": "0,1",
+        "ADDR": "0.0.0.0:8802",
+        "EXPERT_PORT": "20400",
+        "SPECULATOR": "dspark",
+        "SPARK_COUNT": "6",
+        "SPARK_EXPERT_DOCKER_INFERENCE": "ghcr.io/tpurtell/cuteafd-spark-expert:REPLACE-ME-v5-rc",
+        "SPARK_0_HOST": "REPLACE-ME-spark-0",
+        "SPARK_0_LANE_A": "192.0.2.1",
+        "SPARK_0_LANE_B": "198.51.100.1",
+        "SPARK_1_HOST": "REPLACE-ME-spark-1",
+        "SPARK_1_LANE_A": "192.0.2.2",
+        "SPARK_1_LANE_B": "198.51.100.2",
+        "SPARK_2_HOST": "REPLACE-ME-spark-2",
+        "SPARK_2_LANE_A": "192.0.2.3",
+        "SPARK_2_LANE_B": "198.51.100.3",
+        "SPARK_3_HOST": "REPLACE-ME-spark-3",
+        "SPARK_3_LANE_A": "192.0.2.4",
+        "SPARK_3_LANE_B": "198.51.100.4",
+        "SPARK_4_HOST": "REPLACE-ME-spark-4",
+        "SPARK_4_LANE_A": "192.0.2.5",
+        "SPARK_4_LANE_B": "198.51.100.5",
+        "SPARK_5_HOST": "REPLACE-ME-spark-5",
+        "SPARK_5_LANE_A": "192.0.2.6",
+        "SPARK_5_LANE_B": "198.51.100.6"
+      }
+    },
+    {
+      "name": "v41-flash-strided-5090",
+      "family": "deepseek_v41",
+      "config": "examples/configs/v41-flash-strided-min.config",
+      "gpus": [
+        1
+      ],
+      "sparks": [
+        "REPLACE-ME-spark-0",
+        "REPLACE-ME-spark-1",
+        "REPLACE-ME-spark-2",
+        "REPLACE-ME-spark-3"
+      ],
+      "set": {
+        "MODEL_ID": "wrldsuksgo2mars/DeepSeek-V4.1-Flash-1017-StridedPLE",
+        "MODEL_REVISION": "51b3391435c83db9c38e87e114abf7bcfe7fc9c3",
+        "RTX_GPUS": "1",
+        "COORDINATOR_GPUS": "1",
+        "SPARK_COUNT": "4",
+        "ADDR": "0.0.0.0:8803",
+        "EXPERT_PORT": "20600",
+        "SPECULATOR": "dspark",
+        "SPARK_EXPERT_DOCKER_INFERENCE": "ghcr.io/tpurtell/cuteafd-spark-expert:REPLACE-ME-v5-rc",
+        "SPARK_0_HOST": "REPLACE-ME-spark-0",
+        "SPARK_0_LANE_A": "192.0.2.1",
+        "SPARK_0_LANE_B": "198.51.100.1",
+        "SPARK_1_HOST": "REPLACE-ME-spark-1",
+        "SPARK_1_LANE_A": "192.0.2.2",
+        "SPARK_1_LANE_B": "198.51.100.2",
+        "SPARK_2_HOST": "REPLACE-ME-spark-2",
+        "SPARK_2_LANE_A": "192.0.2.3",
+        "SPARK_2_LANE_B": "198.51.100.3",
+        "SPARK_3_HOST": "REPLACE-ME-spark-3",
+        "SPARK_3_LANE_A": "192.0.2.4",
+        "SPARK_3_LANE_B": "198.51.100.4",
+        "GPU_MEMORY_CAP": "31.8GiB",
+        "BENCH_HARDWARE_CLASS": "5090",
+        "BENCH_SIMULATED": "5090"
+      },
+      "precheck": {
+        "argv": [
+          "sh",
+          "-c",
+          "nvidia-smi --query-gpu=name --format=csv,noheader --id=1 | grep -q 'RTX PRO 6000'"
+        ],
+        "timeout_s": 30,
+        "required": true
+      }
+    },
+    {
+      "name": "v41-flash-strided-min",
+      "family": "deepseek_v41",
+      "config": "examples/configs/v41-flash-strided-min.config",
+      "gpus": [
+        1
+      ],
+      "sparks": [
+        "REPLACE-ME-spark-0",
+        "REPLACE-ME-spark-1",
+        "REPLACE-ME-spark-2"
+      ],
+      "set": {
+        "MODEL_ID": "wrldsuksgo2mars/DeepSeek-V4.1-Flash-1017-StridedPLE",
+        "MODEL_REVISION": "51b3391435c83db9c38e87e114abf7bcfe7fc9c3",
+        "RTX_GPUS": "1",
+        "COORDINATOR_GPUS": "1",
+        "SPARK_COUNT": "3",
+        "ADDR": "0.0.0.0:8804",
+        "EXPERT_PORT": "20800",
+        "SPECULATOR": "dspark",
+        "SPARK_EXPERT_DOCKER_INFERENCE": "ghcr.io/tpurtell/cuteafd-spark-expert:REPLACE-ME-v5-rc",
+        "SPARK_0_HOST": "REPLACE-ME-spark-0",
+        "SPARK_0_LANE_A": "192.0.2.1",
+        "SPARK_0_LANE_B": "198.51.100.1",
+        "SPARK_1_HOST": "REPLACE-ME-spark-1",
+        "SPARK_1_LANE_A": "192.0.2.2",
+        "SPARK_1_LANE_B": "198.51.100.2",
+        "SPARK_2_HOST": "REPLACE-ME-spark-2",
+        "SPARK_2_LANE_A": "192.0.2.3",
+        "SPARK_2_LANE_B": "198.51.100.3"
+      }
+    },
+    {
+      "name": "v41-flash-strided-max",
+      "family": "deepseek_v41",
+      "config": "examples/configs/v41-flash-strided-max.config",
+      "gpus": [
+        0,
+        1
+      ],
+      "sparks": [
+        "REPLACE-ME-spark-0",
+        "REPLACE-ME-spark-1",
+        "REPLACE-ME-spark-2",
+        "REPLACE-ME-spark-3",
+        "REPLACE-ME-spark-4",
+        "REPLACE-ME-spark-5"
+      ],
+      "set": {
+        "MODEL_ID": "wrldsuksgo2mars/DeepSeek-V4.1-Flash-1017-StridedPLE",
+        "MODEL_REVISION": "51b3391435c83db9c38e87e114abf7bcfe7fc9c3",
+        "RTX_GPUS": "2",
+        "COORDINATOR_GPUS": "0,1",
+        "ADDR": "0.0.0.0:8805",
+        "EXPERT_PORT": "21000",
+        "SPECULATOR": "dspark",
+        "SPARK_COUNT": "6",
+        "SPARK_EXPERT_DOCKER_INFERENCE": "ghcr.io/tpurtell/cuteafd-spark-expert:REPLACE-ME-v5-rc",
+        "SPARK_0_HOST": "REPLACE-ME-spark-0",
+        "SPARK_0_LANE_A": "192.0.2.1",
+        "SPARK_0_LANE_B": "198.51.100.1",
+        "SPARK_1_HOST": "REPLACE-ME-spark-1",
+        "SPARK_1_LANE_A": "192.0.2.2",
+        "SPARK_1_LANE_B": "198.51.100.2",
+        "SPARK_2_HOST": "REPLACE-ME-spark-2",
+        "SPARK_2_LANE_A": "192.0.2.3",
+        "SPARK_2_LANE_B": "198.51.100.3",
+        "SPARK_3_HOST": "REPLACE-ME-spark-3",
+        "SPARK_3_LANE_A": "192.0.2.4",
+        "SPARK_3_LANE_B": "198.51.100.4",
+        "SPARK_4_HOST": "REPLACE-ME-spark-4",
+        "SPARK_4_LANE_A": "192.0.2.5",
+        "SPARK_4_LANE_B": "198.51.100.5",
+        "SPARK_5_HOST": "REPLACE-ME-spark-5",
+        "SPARK_5_LANE_A": "192.0.2.6",
+        "SPARK_5_LANE_B": "198.51.100.6"
+      }
+    },
+    {
+      "name": "v4-flash-5090",
+      "family": "deepseek_v4",
+      "config": "examples/configs/deepseek-v4-flash-mxfp4-min.config",
+      "gpus": [
+        1
+      ],
+      "sparks": [
+        "REPLACE-ME-spark-0",
+        "REPLACE-ME-spark-1",
+        "REPLACE-ME-spark-2",
+        "REPLACE-ME-spark-3"
+      ],
+      "set": {
+        "RTX_GPUS": "1",
+        "COORDINATOR_GPUS": "1",
+        "SPARK_COUNT": "4",
+        "ADDR": "0.0.0.0:8806",
+        "EXPERT_PORT": "21200",
+        "SPECULATOR": "dspark",
+        "GPU_MEMORY_CAP": "31.8GiB",
+        "EXPERT_BACKEND": "spark",
+        "BENCH_HARDWARE_CLASS": "5090",
+        "SPARK_EXPERT_DOCKER_INFERENCE": "ghcr.io/tpurtell/cuteafd-spark-expert:REPLACE-ME-v5-rc",
+        "MODEL_ID": "deepseek-ai/DeepSeek-V4-Flash-0731",
+        "MODEL_REVISION": "9e165c30e2704aec5d9d593cce3eebd58bbef1cb",
+        "SPARK_0_HOST": "REPLACE-ME-spark-0",
+        "SPARK_0_LANE_A": "192.0.2.1",
+        "SPARK_1_HOST": "REPLACE-ME-spark-1",
+        "SPARK_1_LANE_A": "192.0.2.2",
+        "SPARK_2_HOST": "REPLACE-ME-spark-2",
+        "SPARK_2_LANE_A": "192.0.2.3",
+        "SPARK_3_HOST": "REPLACE-ME-spark-3",
+        "SPARK_3_LANE_A": "192.0.2.4",
+        "BENCH_SIMULATED": "5090"
+      },
+      "precheck": {
+        "argv": [
+          "sh",
+          "-c",
+          "nvidia-smi --query-gpu=name --format=csv,noheader --id=1 | grep -q 'RTX PRO 6000'"
+        ],
+        "timeout_s": 30,
+        "required": true
+      }
+    },
+    {
+      "name": "v4-flash-min",
+      "family": "deepseek_v4",
+      "config": "examples/configs/deepseek-v4-flash-mxfp4-min.config",
+      "gpus": [
+        1
+      ],
+      "sparks": [
+        "REPLACE-ME-spark-0",
+        "REPLACE-ME-spark-1"
+      ],
+      "set": {
+        "RTX_GPUS": "1",
+        "COORDINATOR_GPUS": "1",
+        "SPARK_COUNT": "2",
+        "ADDR": "0.0.0.0:8807",
+        "EXPERT_PORT": "21400",
+        "SPECULATOR": "dspark",
+        "SPARK_EXPERT_DOCKER_INFERENCE": "ghcr.io/tpurtell/cuteafd-spark-expert:REPLACE-ME-v5-rc",
+        "MODEL_ID": "deepseek-ai/DeepSeek-V4-Flash-0731",
+        "MODEL_REVISION": "9e165c30e2704aec5d9d593cce3eebd58bbef1cb",
+        "SPARK_0_HOST": "REPLACE-ME-spark-0",
+        "SPARK_0_LANE_A": "192.0.2.1",
+        "SPARK_1_HOST": "REPLACE-ME-spark-1",
+        "SPARK_1_LANE_A": "192.0.2.2",
+        "EXPERT_BACKEND": "spark"
+      }
+    },
+    {
+      "name": "v4-pro-exl3-max",
+      "family": "deepseek_v4",
+      "config": "examples/configs/deepseek-v4-pro-exl3-max.config",
+      "gpus": [
+        0,
+        1
+      ],
+      "sparks": [
+        "REPLACE-ME-spark-0",
+        "REPLACE-ME-spark-1",
+        "REPLACE-ME-spark-2",
+        "REPLACE-ME-spark-3",
+        "REPLACE-ME-spark-4",
+        "REPLACE-ME-spark-5"
+      ],
+      "set": {
+        "RTX_GPUS": "2",
+        "COORDINATOR_GPUS": "0,1",
+        "SPARK_COUNT": "6",
+        "ADDR": "0.0.0.0:8808",
+        "EXPERT_PORT": "21600",
+        "SPECULATOR": "dspark",
+        "SPARK_EXPERT_DOCKER_INFERENCE": "ghcr.io/tpurtell/cuteafd-spark-expert:REPLACE-ME-v5-rc",
+        "MODEL_ID": "wrldsuksgo2mars/DeepSeek-V4-Pro-0813-EXL3-K2-calibrated-v1",
+        "MODEL_REVISION": "7a63f24905223aff19212d65226be708950823ac",
+        "SPARK_0_HOST": "REPLACE-ME-spark-0",
+        "SPARK_0_LANE_A": "192.0.2.1",
+        "SPARK_1_HOST": "REPLACE-ME-spark-1",
+        "SPARK_1_LANE_A": "192.0.2.2",
+        "SPARK_2_HOST": "REPLACE-ME-spark-2",
+        "SPARK_2_LANE_A": "192.0.2.3",
+        "SPARK_3_HOST": "REPLACE-ME-spark-3",
+        "SPARK_3_LANE_A": "192.0.2.4",
+        "SPARK_4_HOST": "REPLACE-ME-spark-4",
+        "SPARK_4_LANE_A": "192.0.2.5",
+        "SPARK_5_HOST": "REPLACE-ME-spark-5",
+        "SPARK_5_LANE_A": "192.0.2.6",
+        "EXPERT_BACKEND": "spark"
+      }
+    },
+    {
+      "name": "kimi-k3-min",
+      "family": "kimi_k3",
+      "config": "examples/configs/kimi-k3-exl3-k6-min.config",
+      "gpus": [
+        1
+      ],
+      "sparks": [
+        "REPLACE-ME-spark-0",
+        "REPLACE-ME-spark-1",
+        "REPLACE-ME-spark-2",
+        "REPLACE-ME-spark-3",
+        "REPLACE-ME-spark-4",
+        "REPLACE-ME-spark-5"
+      ],
+      "set": {
+        "ADDR": "0.0.0.0:8809",
+        "EXPERT_PORT": "21800",
+        "RTX_GPUS": "1",
+        "COORDINATOR_GPUS": "1",
+        "SPARK_COUNT": "6",
+        "SPARK_EXPERT_DOCKER_INFERENCE": "ghcr.io/tpurtell/cuteafd-spark-expert:REPLACE-ME-v5-rc",
+        "SPARK_MEMORY_CAP": "118111600640",
+        "MODEL_ID": "wrldsuksgo2mars/Kimi-K3-EXL3-K2-Core-K6",
+        "MODEL_REVISION": "1a28050d2954426a43a3db705e53ca120e5f2b47",
+        "SPARK_0_HOST": "REPLACE-ME-spark-0",
+        "SPARK_0_LANE_A": "192.0.2.1",
+        "SPARK_1_HOST": "REPLACE-ME-spark-1",
+        "SPARK_1_LANE_A": "192.0.2.2",
+        "SPARK_2_HOST": "REPLACE-ME-spark-2",
+        "SPARK_2_LANE_A": "192.0.2.3",
+        "SPARK_3_HOST": "REPLACE-ME-spark-3",
+        "SPARK_3_LANE_A": "192.0.2.4",
+        "SPARK_4_HOST": "REPLACE-ME-spark-4",
+        "SPARK_4_LANE_A": "192.0.2.5",
+        "SPARK_5_HOST": "REPLACE-ME-spark-5",
+        "SPARK_5_LANE_A": "192.0.2.6",
+        "EXPERT_BACKEND": "spark"
+      }
+    },
+    {
+      "name": "kimi-k3-max",
+      "family": "kimi_k3",
+      "config": "examples/configs/kimi-k3-exl3-k6-max.config",
+      "gpus": [
+        0,
+        1
+      ],
+      "sparks": [
+        "REPLACE-ME-spark-0",
+        "REPLACE-ME-spark-1",
+        "REPLACE-ME-spark-2",
+        "REPLACE-ME-spark-3",
+        "REPLACE-ME-spark-4",
+        "REPLACE-ME-spark-5"
+      ],
+      "set": {
+        "ADDR": "0.0.0.0:8810",
+        "EXPERT_PORT": "22000",
+        "RTX_GPUS": "2",
+        "COORDINATOR_GPUS": "0,1",
+        "SPARK_COUNT": "6",
+        "SPARK_EXPERT_DOCKER_INFERENCE": "ghcr.io/tpurtell/cuteafd-spark-expert:REPLACE-ME-v5-rc",
+        "MODEL_ID": "wrldsuksgo2mars/Kimi-K3-EXL3-K2-Core-K6",
+        "MODEL_REVISION": "1a28050d2954426a43a3db705e53ca120e5f2b47",
+        "SPARK_0_HOST": "REPLACE-ME-spark-0",
+        "SPARK_0_LANE_A": "192.0.2.1",
+        "SPARK_1_HOST": "REPLACE-ME-spark-1",
+        "SPARK_1_LANE_A": "192.0.2.2",
+        "SPARK_2_HOST": "REPLACE-ME-spark-2",
+        "SPARK_2_LANE_A": "192.0.2.3",
+        "SPARK_3_HOST": "REPLACE-ME-spark-3",
+        "SPARK_3_LANE_A": "192.0.2.4",
+        "SPARK_4_HOST": "REPLACE-ME-spark-4",
+        "SPARK_4_LANE_A": "192.0.2.5",
+        "SPARK_5_HOST": "REPLACE-ME-spark-5",
+        "SPARK_5_LANE_A": "192.0.2.6",
+        "EXPERT_BACKEND": "spark"
+      }
+    },
+    {
+      "name": "glm53-exl3-min",
+      "family": "glm5",
+      "config": "examples/configs/glm53-exl3-min.config",
+      "gpus": [
+        1
+      ],
+      "sparks": [
+        "REPLACE-ME-spark-0",
+        "REPLACE-ME-spark-1",
+        "REPLACE-ME-spark-2",
+        "REPLACE-ME-spark-3"
+      ],
+      "set": {
+        "RTX_GPUS": "1",
+        "COORDINATOR_GPUS": "1",
+        "SPARK_COUNT": "4",
+        "ADDR": "0.0.0.0:8811",
+        "EXPERT_PORT": "22200",
+        "SPECULATOR": "dflash2",
+        "SPARK_EXPERT_DOCKER_INFERENCE": "ghcr.io/tpurtell/cuteafd-spark-expert:REPLACE-ME-v5-rc",
+        "MODEL_ID": "wrldsuksgo2mars/GLM-5.3-EXL3-K4-v1",
+        "MODEL_REVISION": "47af23347db743b4666d952e2eb48f2b01c3fede",
+        "SPARK_0_HOST": "REPLACE-ME-spark-0",
+        "SPARK_0_LANE_A": "192.0.2.1",
+        "SPARK_1_HOST": "REPLACE-ME-spark-1",
+        "SPARK_1_LANE_A": "192.0.2.2",
+        "SPARK_2_HOST": "REPLACE-ME-spark-2",
+        "SPARK_2_LANE_A": "192.0.2.3",
+        "SPARK_3_HOST": "REPLACE-ME-spark-3",
+        "SPARK_3_LANE_A": "192.0.2.4",
+        "EXPERT_BACKEND": "spark"
+      }
+    },
+    {
+      "name": "glm53-exl3-max",
+      "family": "glm5",
+      "config": "examples/configs/glm53-exl3-max.config",
+      "gpus": [
+        0,
+        1
+      ],
+      "sparks": [
+        "REPLACE-ME-spark-0",
+        "REPLACE-ME-spark-1",
+        "REPLACE-ME-spark-2",
+        "REPLACE-ME-spark-3",
+        "REPLACE-ME-spark-4",
+        "REPLACE-ME-spark-5"
+      ],
+      "set": {
+        "ADDR": "0.0.0.0:8812",
+        "EXPERT_PORT": "22400",
+        "RTX_GPUS": "2",
+        "COORDINATOR_GPUS": "0,1",
+        "SPARK_COUNT": "6",
+        "SPARK_EXPERT_DOCKER_INFERENCE": "ghcr.io/tpurtell/cuteafd-spark-expert:REPLACE-ME-v5-rc",
+        "MODEL_ID": "wrldsuksgo2mars/GLM-5.3-EXL3-K4-v1",
+        "MODEL_REVISION": "47af23347db743b4666d952e2eb48f2b01c3fede",
+        "SPARK_0_HOST": "REPLACE-ME-spark-0",
+        "SPARK_0_LANE_A": "192.0.2.1",
+        "SPARK_1_HOST": "REPLACE-ME-spark-1",
+        "SPARK_1_LANE_A": "192.0.2.2",
+        "SPARK_2_HOST": "REPLACE-ME-spark-2",
+        "SPARK_2_LANE_A": "192.0.2.3",
+        "SPARK_3_HOST": "REPLACE-ME-spark-3",
+        "SPARK_3_LANE_A": "192.0.2.4",
+        "SPARK_4_HOST": "REPLACE-ME-spark-4",
+        "SPARK_4_LANE_A": "192.0.2.5",
+        "SPARK_5_HOST": "REPLACE-ME-spark-5",
+        "SPARK_5_LANE_A": "192.0.2.6",
+        "EXPERT_BACKEND": "spark"
+      }
+    },
+    {
+      "name": "glm53-exl3-k6core-min",
+      "family": "glm5",
+      "config": "examples/configs/glm53-exl3-k6core-min.config",
+      "gpus": [
+        1
+      ],
+      "sparks": [
+        "REPLACE-ME-spark-0",
+        "REPLACE-ME-spark-1",
+        "REPLACE-ME-spark-2",
+        "REPLACE-ME-spark-3"
+      ],
+      "set": {
+        "RTX_GPUS": "1",
+        "COORDINATOR_GPUS": "1",
+        "SPARK_COUNT": "4",
+        "ADDR": "0.0.0.0:8813",
+        "EXPERT_PORT": "22600",
+        "SPECULATOR": "dflash2",
+        "SPARK_EXPERT_DOCKER_INFERENCE": "ghcr.io/tpurtell/cuteafd-spark-expert:REPLACE-ME-v5-rc",
+        "MODEL_ID": "wrldsuksgo2mars/GLM-5.3-EXL3-K4-Core-K6",
+        "MODEL_REVISION": "5a4e83a09a11f3145332ed632d28a9894ea88225",
+        "SPARK_0_HOST": "REPLACE-ME-spark-0",
+        "SPARK_0_LANE_A": "192.0.2.1",
+        "SPARK_1_HOST": "REPLACE-ME-spark-1",
+        "SPARK_1_LANE_A": "192.0.2.2",
+        "SPARK_2_HOST": "REPLACE-ME-spark-2",
+        "SPARK_2_LANE_A": "192.0.2.3",
+        "SPARK_3_HOST": "REPLACE-ME-spark-3",
+        "SPARK_3_LANE_A": "192.0.2.4",
+        "EXPERT_BACKEND": "spark"
+      }
+    },
+    {
+      "name": "glm53-exl3-k6core-max",
+      "family": "glm5",
+      "config": "examples/configs/glm53-exl3-k6core-max.config",
+      "gpus": [
+        0,
+        1
+      ],
+      "sparks": [
+        "REPLACE-ME-spark-0",
+        "REPLACE-ME-spark-1",
+        "REPLACE-ME-spark-2",
+        "REPLACE-ME-spark-3",
+        "REPLACE-ME-spark-4",
+        "REPLACE-ME-spark-5"
+      ],
+      "set": {
+        "ADDR": "0.0.0.0:8814",
+        "EXPERT_PORT": "22800",
+        "RTX_GPUS": "2",
+        "COORDINATOR_GPUS": "0,1",
+        "SPARK_COUNT": "6",
+        "SPARK_EXPERT_DOCKER_INFERENCE": "ghcr.io/tpurtell/cuteafd-spark-expert:REPLACE-ME-v5-rc",
+        "MODEL_ID": "wrldsuksgo2mars/GLM-5.3-EXL3-K4-Core-K6",
+        "MODEL_REVISION": "5a4e83a09a11f3145332ed632d28a9894ea88225",
+        "SPARK_0_HOST": "REPLACE-ME-spark-0",
+        "SPARK_0_LANE_A": "192.0.2.1",
+        "SPARK_1_HOST": "REPLACE-ME-spark-1",
+        "SPARK_1_LANE_A": "192.0.2.2",
+        "SPARK_2_HOST": "REPLACE-ME-spark-2",
+        "SPARK_2_LANE_A": "192.0.2.3",
+        "SPARK_3_HOST": "REPLACE-ME-spark-3",
+        "SPARK_3_LANE_A": "192.0.2.4",
+        "SPARK_4_HOST": "REPLACE-ME-spark-4",
+        "SPARK_4_LANE_A": "192.0.2.5",
+        "SPARK_5_HOST": "REPLACE-ME-spark-5",
+        "SPARK_5_LANE_A": "192.0.2.6",
+        "EXPERT_BACKEND": "spark"
+      }
+    },
+    {
+      "name": "glm53-exlr8-min",
+      "config": "examples/configs/glm53-exlr8-min.config",
+      "family": "glm5",
+      "gpus": [
+        1
+      ],
+      "sparks": [
+        "REPLACE-ME-spark-0",
+        "REPLACE-ME-spark-1",
+        "REPLACE-ME-spark-2",
+        "REPLACE-ME-spark-3"
+      ],
+      "set": {
+        "RTX_GPUS": "1",
+        "COORDINATOR_GPUS": "1",
+        "SPARK_COUNT": "4",
+        "ADDR": "0.0.0.0:8815",
+        "EXPERT_PORT": "23000",
+        "SPARK_EXPERT_DOCKER_INFERENCE": "ghcr.io/tpurtell/cuteafd-spark-expert:REPLACE-ME-v5-rc",
+        "MODEL_ID": "kindlingai/glm-5.3-exlr8-k2-k3-k4",
+        "MODEL_REVISION": "a2b599e06c59f2ccb01aaa44e6f182ba21e39f80",
+        "SPARK_0_HOST": "REPLACE-ME-spark-0",
+        "SPARK_0_LANE_A": "192.0.2.1",
+        "SPARK_1_HOST": "REPLACE-ME-spark-1",
+        "SPARK_1_LANE_A": "192.0.2.2",
+        "SPARK_2_HOST": "REPLACE-ME-spark-2",
+        "SPARK_2_LANE_A": "192.0.2.3",
+        "SPARK_3_HOST": "REPLACE-ME-spark-3",
+        "SPARK_3_LANE_A": "192.0.2.4",
+        "EXPERT_BACKEND": "spark"
+      }
+    },
+    {
+      "name": "glm53-exlr8-max",
+      "config": "examples/configs/glm53-exlr8-max.config",
+      "family": "glm5",
+      "gpus": [
+        0,
+        1
+      ],
+      "sparks": [
+        "REPLACE-ME-spark-0",
+        "REPLACE-ME-spark-1",
+        "REPLACE-ME-spark-2",
+        "REPLACE-ME-spark-3",
+        "REPLACE-ME-spark-4",
+        "REPLACE-ME-spark-5"
+      ],
+      "set": {
+        "RTX_GPUS": "2",
+        "COORDINATOR_GPUS": "0,1",
+        "SPARK_COUNT": "6",
+        "ADDR": "0.0.0.0:8816",
+        "EXPERT_PORT": "23200",
+        "SPARK_EXPERT_DOCKER_INFERENCE": "ghcr.io/tpurtell/cuteafd-spark-expert:REPLACE-ME-v5-rc",
+        "MODEL_ID": "kindlingai/glm-5.3-exlr8-k2-k3-k4",
+        "MODEL_REVISION": "a2b599e06c59f2ccb01aaa44e6f182ba21e39f80",
+        "SPARK_0_HOST": "REPLACE-ME-spark-0",
+        "SPARK_0_LANE_A": "192.0.2.1",
+        "SPARK_1_HOST": "REPLACE-ME-spark-1",
+        "SPARK_1_LANE_A": "192.0.2.2",
+        "SPARK_2_HOST": "REPLACE-ME-spark-2",
+        "SPARK_2_LANE_A": "192.0.2.3",
+        "SPARK_3_HOST": "REPLACE-ME-spark-3",
+        "SPARK_3_LANE_A": "192.0.2.4",
+        "SPARK_4_HOST": "REPLACE-ME-spark-4",
+        "SPARK_4_LANE_A": "192.0.2.5",
+        "SPARK_5_HOST": "REPLACE-ME-spark-5",
+        "SPARK_5_LANE_A": "192.0.2.6",
+        "EXPERT_BACKEND": "spark"
+      }
+    },
+    {
+      "name": "glm53f-exl3-k6-5090",
+      "family": "glm5_flash",
+      "config": "examples/configs/glm53-flash-exl3-k6-min.config",
+      "gpus": [
+        1
+      ],
+      "sparks": [
+        "REPLACE-ME-spark-0",
+        "REPLACE-ME-spark-1",
+        "REPLACE-ME-spark-2",
+        "REPLACE-ME-spark-3"
+      ],
+      "set": {
+        "RTX_GPUS": "1",
+        "COORDINATOR_GPUS": "1",
+        "SPARK_COUNT": "4",
+        "ADDR": "0.0.0.0:8817",
+        "EXPERT_PORT": "23400",
+        "SPECULATOR": "dflash2",
+        "SPARK_EXPERT_DOCKER_INFERENCE": "ghcr.io/tpurtell/cuteafd-spark-expert:REPLACE-ME-v5-rc",
+        "MODEL_ID": "wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K4-Core-K6",
+        "MODEL_REVISION": "5d3fffe1df9c4a109bbbdafb60dc19df9fac019d",
+        "SPARK_0_HOST": "REPLACE-ME-spark-0",
+        "SPARK_0_LANE_A": "192.0.2.1",
+        "SPARK_1_HOST": "REPLACE-ME-spark-1",
+        "SPARK_1_LANE_A": "192.0.2.2",
+        "SPARK_2_HOST": "REPLACE-ME-spark-2",
+        "SPARK_2_LANE_A": "192.0.2.3",
+        "SPARK_3_HOST": "REPLACE-ME-spark-3",
+        "SPARK_3_LANE_A": "192.0.2.4",
+        "EXPERT_BACKEND": "spark",
+        "GPU_MEMORY_CAP": "31.8GiB",
+        "BENCH_HARDWARE_CLASS": "5090",
+        "BENCH_SIMULATED": "5090"
+      },
+      "precheck": {
+        "argv": [
+          "sh",
+          "-c",
+          "nvidia-smi --query-gpu=name --format=csv,noheader --id=1 | grep -q 'RTX PRO 6000'"
+        ],
+        "timeout_s": 30,
+        "required": true
+      }
+    },
+    {
+      "name": "glm53f-exl3-k6-min",
+      "family": "glm5_flash",
+      "config": "examples/configs/glm53-flash-exl3-k6-min.config",
+      "gpus": [
+        1
+      ],
+      "sparks": [
+        "REPLACE-ME-spark-0",
+        "REPLACE-ME-spark-1"
+      ],
+      "set": {
+        "RTX_GPUS": "1",
+        "COORDINATOR_GPUS": "1",
+        "SPARK_COUNT": "2",
+        "ADDR": "0.0.0.0:8818",
+        "EXPERT_PORT": "23600",
+        "SPECULATOR": "dflash2",
+        "SPARK_EXPERT_DOCKER_INFERENCE": "ghcr.io/tpurtell/cuteafd-spark-expert:REPLACE-ME-v5-rc",
+        "MODEL_ID": "wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K4-Core-K6",
+        "MODEL_REVISION": "5d3fffe1df9c4a109bbbdafb60dc19df9fac019d",
+        "SPARK_0_HOST": "REPLACE-ME-spark-0",
+        "SPARK_0_LANE_A": "192.0.2.1",
+        "SPARK_1_HOST": "REPLACE-ME-spark-1",
+        "SPARK_1_LANE_A": "192.0.2.2",
+        "EXPERT_BACKEND": "spark"
+      }
+    },
+    {
+      "name": "glm53f-exl3-k6-max",
+      "family": "glm5_flash",
+      "config": "examples/configs/glm53-flash-exl3-k6-max.config",
+      "gpus": [
+        0,
+        1
+      ],
+      "sparks": [],
+      "set": {
+        "RTX_GPUS": "2",
+        "COORDINATOR_GPUS": "0,1",
+        "SPARK_COUNT": "0",
+        "ADDR": "0.0.0.0:8819",
+        "EXPERT_PORT": "23800",
+        "EXPERT_BACKEND": "local",
+        "SPECULATOR": "dflash2",
+        "MODEL_ID": "wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K4-Core-K6",
+        "MODEL_REVISION": "5d3fffe1df9c4a109bbbdafb60dc19df9fac019d"
+      }
+    },
+    {
+      "name": "glm53f-exl3-min",
+      "family": "glm5_flash",
+      "config": "examples/configs/glm53-flash-exl3-min.config",
+      "gpus": [
+        1
+      ],
+      "sparks": [
+        "REPLACE-ME-spark-0",
+        "REPLACE-ME-spark-1"
+      ],
+      "set": {
+        "RTX_GPUS": "1",
+        "COORDINATOR_GPUS": "1",
+        "SPARK_COUNT": "2",
+        "ADDR": "0.0.0.0:8820",
+        "EXPERT_PORT": "24000",
+        "SPECULATOR": "dflash2",
+        "SPARK_EXPERT_DOCKER_INFERENCE": "ghcr.io/tpurtell/cuteafd-spark-expert:REPLACE-ME-v5-rc",
+        "MODEL_ID": "wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K3.25-Core-FP8",
+        "MODEL_REVISION": "d31ebc921f1f098b4a56d37aaccb3cdef4096184",
+        "SPARK_0_HOST": "REPLACE-ME-spark-0",
+        "SPARK_0_LANE_A": "192.0.2.1",
+        "SPARK_1_HOST": "REPLACE-ME-spark-1",
+        "SPARK_1_LANE_A": "192.0.2.2",
+        "EXPERT_BACKEND": "spark"
+      }
+    },
+    {
+      "name": "glm53f-exl3-max",
+      "family": "glm5_flash",
+      "config": "examples/configs/glm53-flash-exl3-max.config",
+      "gpus": [
+        0,
+        1
+      ],
+      "sparks": [],
+      "set": {
+        "RTX_GPUS": "2",
+        "COORDINATOR_GPUS": "0,1",
+        "SPARK_COUNT": "0",
+        "ADDR": "0.0.0.0:8821",
+        "EXPERT_PORT": "24200",
+        "EXPERT_BACKEND": "local",
+        "SPECULATOR": "dflash2",
+        "MODEL_ID": "wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K3.25-Core-FP8",
+        "MODEL_REVISION": "d31ebc921f1f098b4a56d37aaccb3cdef4096184"
+      }
+    },
+    {
+      "name": "glmf-exlr8-k4-5090",
+      "family": "glm5_flash",
+      "config": "examples/configs/glm53-flash-exlr8-k4-min.config",
+      "gpus": [
+        1
+      ],
+      "sparks": [
+        "REPLACE-ME-spark-0",
+        "REPLACE-ME-spark-1",
+        "REPLACE-ME-spark-2",
+        "REPLACE-ME-spark-3"
+      ],
+      "set": {
+        "ADDR": "0.0.0.0:8822",
+        "EXPERT_PORT": "24400",
+        "RTX_GPUS": "1",
+        "COORDINATOR_GPUS": "1",
+        "SPARK_COUNT": "4",
+        "SPARK_EXPERT_DOCKER_INFERENCE": "ghcr.io/tpurtell/cuteafd-spark-expert:REPLACE-ME-v5-rc",
+        "MODEL_ID": "kindlingai/glm-5.3-flash-exlr8-k2-k3-k4",
+        "MODEL_REVISION": "867580abd28d142bb4c56218bb81a752b7dea988",
+        "SPARK_0_HOST": "REPLACE-ME-spark-0",
+        "SPARK_0_LANE_A": "192.0.2.1",
+        "SPARK_1_HOST": "REPLACE-ME-spark-1",
+        "SPARK_1_LANE_A": "192.0.2.2",
+        "SPARK_2_HOST": "REPLACE-ME-spark-2",
+        "SPARK_2_LANE_A": "192.0.2.3",
+        "SPARK_3_HOST": "REPLACE-ME-spark-3",
+        "SPARK_3_LANE_A": "192.0.2.4",
+        "EXPERT_BACKEND": "spark",
+        "GPU_MEMORY_CAP": "31.8GiB",
+        "BENCH_HARDWARE_CLASS": "5090",
+        "BENCH_SIMULATED": "5090"
+      },
+      "precheck": {
+        "argv": [
+          "sh",
+          "-c",
+          "nvidia-smi --query-gpu=name --format=csv,noheader --id=1 | grep -q 'RTX PRO 6000'"
+        ],
+        "timeout_s": 30,
+        "required": true
+      }
+    },
+    {
+      "name": "glmf-exlr8-k4-min",
+      "family": "glm5_flash",
+      "config": "examples/configs/glm53-flash-exlr8-k4-min.config",
+      "gpus": [
+        1
+      ],
+      "sparks": [
+        "REPLACE-ME-spark-0"
+      ],
+      "set": {
+        "ADDR": "0.0.0.0:8823",
+        "EXPERT_PORT": "24600",
+        "RTX_GPUS": "1",
+        "COORDINATOR_GPUS": "1",
+        "SPARK_COUNT": "1",
+        "SPARK_EXPERT_DOCKER_INFERENCE": "ghcr.io/tpurtell/cuteafd-spark-expert:REPLACE-ME-v5-rc",
+        "MODEL_ID": "kindlingai/glm-5.3-flash-exlr8-k2-k3-k4",
+        "MODEL_REVISION": "867580abd28d142bb4c56218bb81a752b7dea988",
+        "SPARK_0_HOST": "REPLACE-ME-spark-0",
+        "SPARK_0_LANE_A": "192.0.2.1",
+        "EXPERT_BACKEND": "spark"
+      }
+    },
+    {
+      "name": "glmf-exlr8-k4-max",
+      "family": "glm5_flash",
+      "config": "examples/configs/glm53-flash-exlr8-k4-max.config",
+      "gpus": [
+        0,
+        1
+      ],
+      "sparks": [],
+      "set": {
+        "ADDR": "0.0.0.0:8824",
+        "EXPERT_PORT": "24800",
+        "RTX_GPUS": "2",
+        "COORDINATOR_GPUS": "0,1",
+        "SPARK_COUNT": "0",
+        "MODEL_ID": "kindlingai/glm-5.3-flash-exlr8-k2-k3-k4",
+        "MODEL_REVISION": "867580abd28d142bb4c56218bb81a752b7dea988",
+        "EXPERT_BACKEND": "local"
+      }
+    },
+    {
+      "name": "mimo26-flash-5090",
+      "family": "mimo_v2",
+      "config": "examples/configs/mimo-v26-flash-mxfp4-min.config",
+      "gpus": [
+        1
+      ],
+      "sparks": [
+        "REPLACE-ME-spark-0",
+        "REPLACE-ME-spark-1",
+        "REPLACE-ME-spark-2",
+        "REPLACE-ME-spark-3"
+      ],
+      "set": {
+        "RTX_GPUS": "1",
+        "COORDINATOR_GPUS": "1",
+        "SPARK_COUNT": "4",
+        "ADDR": "0.0.0.0:8825",
+        "EXPERT_PORT": "25000",
+        "SPECULATOR": "dflash2",
+        "GPU_MEMORY_CAP": "31.8GiB",
+        "EXPERT_BACKEND": "spark",
+        "BENCH_HARDWARE_CLASS": "5090",
+        "SPARK_EXPERT_DOCKER_INFERENCE": "ghcr.io/tpurtell/cuteafd-spark-expert:REPLACE-ME-v5-rc",
+        "MODEL_ID": "XiaomiMiMo/MiMo-V2.6-Flash-MOPD",
+        "MODEL_REVISION": "2479e2d0029eca9a34cc7e7f55a121925f81908e",
+        "SPARK_0_HOST": "REPLACE-ME-spark-0",
+        "SPARK_0_LANE_A": "192.0.2.1",
+        "SPARK_1_HOST": "REPLACE-ME-spark-1",
+        "SPARK_1_LANE_A": "192.0.2.2",
+        "SPARK_2_HOST": "REPLACE-ME-spark-2",
+        "SPARK_2_LANE_A": "192.0.2.3",
+        "SPARK_3_HOST": "REPLACE-ME-spark-3",
+        "SPARK_3_LANE_A": "192.0.2.4",
+        "BENCH_SIMULATED": "5090"
+      },
+      "precheck": {
+        "argv": [
+          "sh",
+          "-c",
+          "nvidia-smi --query-gpu=name --format=csv,noheader --id=1 | grep -q 'RTX PRO 6000'"
+        ],
+        "timeout_s": 30,
+        "required": true
+      }
+    },
+    {
+      "name": "mimo26-flash-min",
+      "family": "mimo_v2",
+      "config": "examples/configs/mimo-v26-flash-mxfp4-min.config",
+      "gpus": [
+        1
+      ],
+      "sparks": [
+        "REPLACE-ME-spark-0",
+        "REPLACE-ME-spark-1"
+      ],
+      "set": {
+        "RTX_GPUS": "1",
+        "COORDINATOR_GPUS": "1",
+        "SPARK_COUNT": "2",
+        "ADDR": "0.0.0.0:8826",
+        "EXPERT_PORT": "25200",
+        "SPECULATOR": "dflash2",
+        "SPARK_EXPERT_DOCKER_INFERENCE": "ghcr.io/tpurtell/cuteafd-spark-expert:REPLACE-ME-v5-rc",
+        "MODEL_ID": "XiaomiMiMo/MiMo-V2.6-Flash-MOPD",
+        "MODEL_REVISION": "2479e2d0029eca9a34cc7e7f55a121925f81908e",
+        "SPARK_0_HOST": "REPLACE-ME-spark-0",
+        "SPARK_0_LANE_A": "192.0.2.1",
+        "SPARK_1_HOST": "REPLACE-ME-spark-1",
+        "SPARK_1_LANE_A": "192.0.2.2",
+        "EXPERT_BACKEND": "spark"
+      }
+    },
+    {
+      "name": "mimo-pro-max",
+      "family": "mimo_v2",
+      "config": "examples/configs/mimo-v26-pro-mxfp4-max.config",
+      "gpus": [
+        0,
+        1
+      ],
+      "sparks": [
+        "REPLACE-ME-spark-0",
+        "REPLACE-ME-spark-1",
+        "REPLACE-ME-spark-2",
+        "REPLACE-ME-spark-3",
+        "REPLACE-ME-spark-4",
+        "REPLACE-ME-spark-5"
+      ],
+      "set": {
+        "RTX_GPUS": "2",
+        "COORDINATOR_GPUS": "0,1",
+        "SPARK_COUNT": "6",
+        "ADDR": "0.0.0.0:8827",
+        "EXPERT_PORT": "25400",
+        "SPECULATOR": "dflash2",
+        "SPARK_EXPERT_DOCKER_INFERENCE": "ghcr.io/tpurtell/cuteafd-spark-expert:REPLACE-ME-v5-rc",
+        "MODEL_ID": "XiaomiMiMo/MiMo-V2.6-Pro-MOPD",
+        "MODEL_REVISION": "adea8e2c5373181e5a973fa1ecb343cb31af214b",
+        "SPARK_0_HOST": "REPLACE-ME-spark-0",
+        "SPARK_0_LANE_A": "192.0.2.1",
+        "SPARK_1_HOST": "REPLACE-ME-spark-1",
+        "SPARK_1_LANE_A": "192.0.2.2",
+        "SPARK_2_HOST": "REPLACE-ME-spark-2",
+        "SPARK_2_LANE_A": "192.0.2.3",
+        "SPARK_3_HOST": "REPLACE-ME-spark-3",
+        "SPARK_3_LANE_A": "192.0.2.4",
+        "SPARK_4_HOST": "REPLACE-ME-spark-4",
+        "SPARK_4_LANE_A": "192.0.2.5",
+        "SPARK_5_HOST": "REPLACE-ME-spark-5",
+        "SPARK_5_LANE_A": "192.0.2.6",
+        "EXPERT_BACKEND": "spark"
+      }
+    },
+    {
+      "name": "step5-exl3-k6core-min",
+      "family": "step5",
+      "config": "examples/configs/step5-exl3-k6core-min.config",
+      "gpus": [
+        1
+      ],
+      "sparks": [
+        "REPLACE-ME-spark-0",
+        "REPLACE-ME-spark-1",
+        "REPLACE-ME-spark-2"
+      ],
+      "set": {
+        "RTX_GPUS": "1",
+        "COORDINATOR_GPUS": "1",
+        "SPARK_COUNT": "3",
+        "ADDR": "0.0.0.0:8828",
+        "EXPERT_PORT": "25600",
+        "SPARK_EXPERT_DOCKER_INFERENCE": "ghcr.io/tpurtell/cuteafd-spark-expert:REPLACE-ME-v5-rc",
+        "MODEL_ID": "wrldsuksgo2mars/Step-5-Preview-EXL3-K4-Core-K6",
+        "MODEL_REVISION": "83d47a384eabc07ea6fcfaac4779b0e5f013ce89",
+        "SPARK_0_HOST": "REPLACE-ME-spark-0",
+        "SPARK_0_LANE_A": "192.0.2.1",
+        "SPARK_1_HOST": "REPLACE-ME-spark-1",
+        "SPARK_1_LANE_A": "192.0.2.2",
+        "SPARK_2_HOST": "REPLACE-ME-spark-2",
+        "SPARK_2_LANE_A": "192.0.2.3",
+        "EXPERT_BACKEND": "spark"
+      }
+    },
+    {
+      "name": "step5-exl3-k6core-max",
+      "family": "step5",
+      "config": "examples/configs/step5-exl3-k6core-max.config",
+      "gpus": [
+        0,
+        1
+      ],
+      "sparks": [
+        "REPLACE-ME-spark-0",
+        "REPLACE-ME-spark-1",
+        "REPLACE-ME-spark-2",
+        "REPLACE-ME-spark-3",
+        "REPLACE-ME-spark-4",
+        "REPLACE-ME-spark-5"
+      ],
+      "set": {
+        "RTX_GPUS": "2",
+        "COORDINATOR_GPUS": "0,1",
+        "SPARK_COUNT": "6",
+        "ADDR": "0.0.0.0:8829",
+        "EXPERT_PORT": "25800",
+        "SPARK_EXPERT_DOCKER_INFERENCE": "ghcr.io/tpurtell/cuteafd-spark-expert:REPLACE-ME-v5-rc",
+        "MODEL_ID": "wrldsuksgo2mars/Step-5-Preview-EXL3-K4-Core-K6",
+        "MODEL_REVISION": "83d47a384eabc07ea6fcfaac4779b0e5f013ce89",
+        "SPARK_0_HOST": "REPLACE-ME-spark-0",
+        "SPARK_0_LANE_A": "192.0.2.1",
+        "SPARK_1_HOST": "REPLACE-ME-spark-1",
+        "SPARK_1_LANE_A": "192.0.2.2",
+        "SPARK_2_HOST": "REPLACE-ME-spark-2",
+        "SPARK_2_LANE_A": "192.0.2.3",
+        "SPARK_3_HOST": "REPLACE-ME-spark-3",
+        "SPARK_3_LANE_A": "192.0.2.4",
+        "SPARK_4_HOST": "REPLACE-ME-spark-4",
+        "SPARK_4_LANE_A": "192.0.2.5",
+        "SPARK_5_HOST": "REPLACE-ME-spark-5",
+        "SPARK_5_LANE_A": "192.0.2.6",
+        "EXPERT_BACKEND": "spark"
+      }
+    },
+    {
+      "family": "muse_spark",
+      "config": "examples/configs/muse-spark-exl3-min.config",
+      "set": {
+        "MODEL_ID": "wrldsuksgo2mars/Muse-Spark-Open-EXL3-K4-Core-K6",
+        "MODEL_REVISION": "89998fb177acd9a862ac8bd4fb79bfd50e940c97",
+        "RTX_GPUS": "1",
+        "COORDINATOR_GPUS": "1",
+        "SPARK_COUNT": "4",
+        "ADDR": "0.0.0.0:8830",
+        "EXPERT_PORT": "26000",
+        "SPARK_0_HOST": "REPLACE-ME-spark-0",
+        "SPARK_0_LANE_A": "192.0.2.1",
+        "SPARK_1_HOST": "REPLACE-ME-spark-1",
+        "SPARK_1_LANE_A": "192.0.2.2",
+        "SPARK_2_HOST": "REPLACE-ME-spark-2",
+        "SPARK_2_LANE_A": "192.0.2.3",
+        "SPARK_3_HOST": "REPLACE-ME-spark-3",
+        "SPARK_3_LANE_A": "192.0.2.4",
+        "SPARK_EXPERT_DOCKER_INFERENCE": "ghcr.io/tpurtell/cuteafd-spark-expert:REPLACE-ME-v5-rc",
+        "EXPERT_BACKEND": "spark"
+      },
+      "name": "muse-spark-exl3-min",
+      "gpus": [
+        1
+      ],
+      "sparks": [
+        "REPLACE-ME-spark-0",
+        "REPLACE-ME-spark-1",
+        "REPLACE-ME-spark-2",
+        "REPLACE-ME-spark-3"
+      ]
+    },
+    {
+      "family": "muse_spark",
+      "config": "examples/configs/muse-spark-exl3-max.config",
+      "set": {
+        "MODEL_ID": "wrldsuksgo2mars/Muse-Spark-Open-EXL3-K4-Core-K6",
+        "MODEL_REVISION": "89998fb177acd9a862ac8bd4fb79bfd50e940c97",
+        "RTX_GPUS": "2",
+        "COORDINATOR_GPUS": "0,1",
+        "SPARK_COUNT": "6",
+        "ADDR": "0.0.0.0:8831",
+        "EXPERT_PORT": "26200",
+        "SPARK_0_HOST": "REPLACE-ME-spark-0",
+        "SPARK_0_LANE_A": "192.0.2.1",
+        "SPARK_1_HOST": "REPLACE-ME-spark-1",
+        "SPARK_1_LANE_A": "192.0.2.2",
+        "SPARK_2_HOST": "REPLACE-ME-spark-2",
+        "SPARK_2_LANE_A": "192.0.2.3",
+        "SPARK_3_HOST": "REPLACE-ME-spark-3",
+        "SPARK_3_LANE_A": "192.0.2.4",
+        "SPARK_4_HOST": "REPLACE-ME-spark-4",
+        "SPARK_4_LANE_A": "192.0.2.5",
+        "SPARK_5_HOST": "REPLACE-ME-spark-5",
+        "SPARK_5_LANE_A": "192.0.2.6",
+        "SPARK_EXPERT_DOCKER_INFERENCE": "ghcr.io/tpurtell/cuteafd-spark-expert:REPLACE-ME-v5-rc",
+        "EXPERT_BACKEND": "spark"
+      },
+      "name": "muse-spark-exl3-max",
+      "gpus": [
+        0,
+        1
+      ],
+      "sparks": [
+        "REPLACE-ME-spark-0",
+        "REPLACE-ME-spark-1",
+        "REPLACE-ME-spark-2",
+        "REPLACE-ME-spark-3",
+        "REPLACE-ME-spark-4",
+        "REPLACE-ME-spark-5"
+      ]
+    },
+    {
+      "name": "ml4-exl3-min",
+      "family": "mistral_large4",
+      "config": "examples/configs/mistral-large4-exl3-k4-min.config",
+      "gpus": [
+        1
+      ],
+      "sparks": [
+        "REPLACE-ME-spark-0",
+        "REPLACE-ME-spark-1",
+        "REPLACE-ME-spark-2",
+        "REPLACE-ME-spark-3",
+        "REPLACE-ME-spark-4"
+      ],
+      "set": {
+        "ADDR": "0.0.0.0:8832",
+        "EXPERT_PORT": "26400",
+        "COORDINATOR_GPUS": "1",
+        "RTX_GPUS": "1",
+        "SPARK_COUNT": "5",
+        "SPARK_EXPERT_DOCKER_INFERENCE": "ghcr.io/tpurtell/cuteafd-spark-expert:REPLACE-ME-v5-rc",
+        "MODEL_ID": "wrldsuksgo2mars/Mistral-Large-4-EXL3-K4",
+        "MODEL_REVISION": "9c354cee78cd6feddb057549b8edde6e3b319822",
+        "SPARK_0_HOST": "REPLACE-ME-spark-0",
+        "SPARK_0_LANE_A": "192.0.2.1",
+        "SPARK_1_HOST": "REPLACE-ME-spark-1",
+        "SPARK_1_LANE_A": "192.0.2.2",
+        "SPARK_2_HOST": "REPLACE-ME-spark-2",
+        "SPARK_2_LANE_A": "192.0.2.3",
+        "SPARK_3_HOST": "REPLACE-ME-spark-3",
+        "SPARK_3_LANE_A": "192.0.2.4",
+        "SPARK_4_HOST": "REPLACE-ME-spark-4",
+        "SPARK_4_LANE_A": "192.0.2.5",
+        "EXPERT_BACKEND": "spark"
+      }
+    },
+    {
+      "name": "ml4-exl3-max",
+      "family": "mistral_large4",
+      "config": "examples/configs/mistral-large4-exl3-k4-max.config",
+      "gpus": [
+        0,
+        1
+      ],
+      "sparks": [
+        "REPLACE-ME-spark-0",
+        "REPLACE-ME-spark-1",
+        "REPLACE-ME-spark-2",
+        "REPLACE-ME-spark-3",
+        "REPLACE-ME-spark-4",
+        "REPLACE-ME-spark-5"
+      ],
+      "set": {
+        "ADDR": "0.0.0.0:8833",
+        "EXPERT_PORT": "26600",
+        "COORDINATOR_GPUS": "0,1",
+        "RTX_GPUS": "2",
+        "SPARK_COUNT": "6",
+        "SPARK_EXPERT_DOCKER_INFERENCE": "ghcr.io/tpurtell/cuteafd-spark-expert:REPLACE-ME-v5-rc",
+        "MODEL_ID": "wrldsuksgo2mars/Mistral-Large-4-EXL3-K4",
+        "MODEL_REVISION": "9c354cee78cd6feddb057549b8edde6e3b319822",
+        "SPARK_0_HOST": "REPLACE-ME-spark-0",
+        "SPARK_0_LANE_A": "192.0.2.1",
+        "SPARK_1_HOST": "REPLACE-ME-spark-1",
+        "SPARK_1_LANE_A": "192.0.2.2",
+        "SPARK_2_HOST": "REPLACE-ME-spark-2",
+        "SPARK_2_LANE_A": "192.0.2.3",
+        "SPARK_3_HOST": "REPLACE-ME-spark-3",
+        "SPARK_3_LANE_A": "192.0.2.4",
+        "SPARK_4_HOST": "REPLACE-ME-spark-4",
+        "SPARK_4_LANE_A": "192.0.2.5",
+        "SPARK_5_HOST": "REPLACE-ME-spark-5",
+        "SPARK_5_LANE_A": "192.0.2.6",
+        "EXPERT_BACKEND": "spark"
+      }
+    },
+    {
+      "name": "qwen38-exl3-5090",
+      "family": "qwen4",
+      "config": "examples/configs/qwen38-exl3-min.config",
+      "gpus": [
+        1
+      ],
+      "sparks": [
+        "REPLACE-ME-spark-0",
+        "REPLACE-ME-spark-1",
+        "REPLACE-ME-spark-2",
+        "REPLACE-ME-spark-3"
+      ],
+      "set": {
+        "RTX_GPUS": "1",
+        "COORDINATOR_GPUS": "1",
+        "SPARK_COUNT": "4",
+        "ADDR": "0.0.0.0:8834",
+        "EXPERT_PORT": "26800",
+        "EXPERT_BACKEND": "spark",
+        "SPECULATOR": "mtp",
+        "GPU_MEMORY_CAP": "31.8GiB",
+        "BENCH_HARDWARE_CLASS": "5090",
+        "SPARK_EXPERT_DOCKER_INFERENCE": "ghcr.io/tpurtell/cuteafd-spark-expert:REPLACE-ME-v5-rc",
+        "MODEL_ID": "wrldsuksgo2mars/Qwen3.8-Flash-Next-EXL3-K4.25-PLE-FP8-v1",
+        "MODEL_REVISION": "888306bd3996d6317758c07df50622829259ad17",
+        "SPARK_0_HOST": "REPLACE-ME-spark-0",
+        "SPARK_0_LANE_A": "192.0.2.1",
+        "SPARK_1_HOST": "REPLACE-ME-spark-1",
+        "SPARK_1_LANE_A": "192.0.2.2",
+        "SPARK_2_HOST": "REPLACE-ME-spark-2",
+        "SPARK_2_LANE_A": "192.0.2.3",
+        "SPARK_3_HOST": "REPLACE-ME-spark-3",
+        "SPARK_3_LANE_A": "192.0.2.4",
+        "BENCH_SIMULATED": "5090"
+      },
+      "precheck": {
+        "argv": [
+          "sh",
+          "-c",
+          "nvidia-smi --query-gpu=name --format=csv,noheader --id=1 | grep -q 'RTX PRO 6000'"
+        ],
+        "timeout_s": 30,
+        "required": true
+      }
+    },
+    {
+      "name": "qwen38-exl3-min",
+      "family": "qwen4",
+      "config": "examples/configs/qwen38-exl3-min.config",
+      "gpus": [
+        1
+      ],
+      "sparks": [],
+      "set": {
+        "RTX_GPUS": "1",
+        "COORDINATOR_GPUS": "1",
+        "SPARK_COUNT": "0",
+        "ADDR": "0.0.0.0:8835",
+        "EXPERT_PORT": "27000",
+        "EXPERT_BACKEND": "local",
+        "SPECULATOR": "mtp",
+        "MODEL_ID": "wrldsuksgo2mars/Qwen3.8-Flash-Next-EXL3-K4.25-PLE-FP8-v1",
+        "MODEL_REVISION": "888306bd3996d6317758c07df50622829259ad17"
+      }
+    },
+    {
+      "name": "qwen35-9b-bf16-min",
+      "config": "examples/configs/qwen35-9b-bf16-min.config",
+      "family": "qwen3_5",
+      "gpus": [
+        1
+      ],
+      "sparks": [],
+      "set": {
+        "RTX_GPUS": "1",
+        "COORDINATOR_GPUS": "1",
+        "SPARK_COUNT": "0",
+        "SPECULATOR": "off",
+        "ADDR": "0.0.0.0:8836",
+        "MODEL_ID": "Qwen/Qwen3.5-9B",
+        "MODEL_REVISION": "c202236235762e1c871ad0ccb60c8ee5ba337b9a",
+        "EXPERT_BACKEND": "local"
+      }
+    },
+    {
+      "name": "qwen38-27b-bf16-min",
+      "config": "examples/configs/qwen38-27b-bf16-min.config",
+      "family": "qwen3_5",
+      "gpus": [
+        1
+      ],
+      "sparks": [],
+      "set": {
+        "RTX_GPUS": "1",
+        "COORDINATOR_GPUS": "1",
+        "SPARK_COUNT": "0",
+        "ADDR": "0.0.0.0:8837",
+        "SPECULATOR": "dspark",
+        "MODEL_ID": "Qwen/Qwen3.8-27B",
+        "MODEL_REVISION": "1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0",
+        "EXPERT_BACKEND": "local"
+      }
+    },
+    {
+      "name": "qwen38-27b-fp8-min",
+      "config": "examples/configs/qwen38-27b-fp8-min.config",
+      "family": "qwen3_5",
+      "gpus": [
+        1
+      ],
+      "sparks": [],
+      "set": {
+        "RTX_GPUS": "1",
+        "COORDINATOR_GPUS": "1",
+        "SPARK_COUNT": "0",
+        "ADDR": "0.0.0.0:8838",
+        "SPECULATOR": "dspark",
+        "MODEL_ID": "Qwen/Qwen3.8-27B-FP8",
+        "MODEL_REVISION": "017b9c7af6b5689d5dd426a76e0bc077eb5ca20a",
+        "EXPERT_BACKEND": "local"
+      }
+    }
+  ],
+  "retired": [
+    {
+      "name": "glm53-nvfp4-max",
+      "config": "examples/configs/glm53-nvfp4-max.config",
+      "report": "benchmarks/glm5/2026-10-15-smoke-glm-5-3-nvfp4-2rtx-6spark-glm53-nvfp4-max",
+      "release": "v3 dev 2026-10-15",
+      "release_note": "Untagged v3 development build; date is the smoke report date."
+    },
+    {
+      "name": "glm53f-nvfp4-max",
+      "config": "examples/configs/glm53-flash-nvfp4-max.config",
+      "report": "benchmarks/glm5_flash/2026-10-14-smoke-glm-5-3-flash-nvfp4-2rtx-2spark-glm53f-nvfp4-max",
+      "release": "v3 dev 2026-10-14",
+      "release_note": "Untagged v3 development build; date is the smoke report date."
+    },
+    {
+      "name": "glm53f-tr3-max",
+      "config": "examples/configs/glm53-flash-tr3-max.config",
+      "report": "benchmarks/glm5_flash/2026-10-14-smoke-glm-5-3-flash-tr3-4bpw-2rtx-2spark-glm53f-tr3-max",
+      "release": "v3 dev 2026-10-14",
+      "release_note": "Untagged v3 development build; date is the smoke report date."
+    },
+    {
+      "name": "mimo-pro-min",
+      "config": "examples/configs/mimo-v26-pro-mxfp4-min.config",
+      "report": "benchmarks/mimo_v2/2026-10-14-smoke-mimo-v2-6-pro-mopd-1rtx-6spark-mimo-pro-min",
+      "release": "v3 dev 2026-10-14",
+      "release_note": "Untagged v3 development build; date is the smoke report date."
+    },
+    {
+      "name": "mimo26-flash-max",
+      "config": "examples/configs/mimo-v26-flash-mxfp4-max.config",
+      "report": "benchmarks/mimo_v2/2026-10-14-smoke-mimo-v2-6-flash-mopd-2rtx-4spark-mimo26-flash-max",
+      "release": "v3 dev 2026-10-14",
+      "release_note": "Untagged v3 development build; date is the smoke report date."
+    },
+    {
+      "name": "qwen38-exl3-max",
+      "config": "examples/configs/qwen38-exl3-min.config",
+      "report": "benchmarks/qwen4/2026-10-14-smoke-qwen3-8-flash-next-exl3-k4-25-ple-fp8-v1-2rtx-qwen38-exl3-max",
+      "release": "v3 dev 2026-10-14",
+      "release_note": "Untagged v3 development build; date is the smoke report date."
+    },
+    {
+      "name": "qwen38-nvfp4-max",
+      "config": "examples/configs/qwen38-nvfp4-min.config",
+      "report": "benchmarks/qwen4/2026-10-14-smoke-qwen3-8-flash-next-nvfp4-2rtx-qwen38-nvfp4-max",
+      "release": "v3 dev 2026-10-14",
+      "release_note": "Untagged v3 development build; date is the smoke report date."
+    },
+    {
+      "name": "v4-flash-max",
+      "config": "examples/configs/deepseek-v4-flash-mxfp4-max.config",
+      "report": "benchmarks/deepseek_v4/2026-10-14-smoke-deepseek-v4-flash-0731-2rtx-4spark-v4-flash-max",
+      "release": "v3 dev 2026-10-14",
+      "release_note": "Untagged v3 development build; date is the smoke report date."
+    },
+    {
+      "name": "v4-pro-exl3-min",
+      "config": "examples/configs/deepseek-v4-pro-exl3-min.config",
+      "report": "benchmarks/deepseek_v4/2026-10-14-smoke-deepseek-v4-pro-0813-exl3-k2-calibrated-v1-1rtx-4spark-v4-pro-exl3-min",
+      "release": "v3 dev 2026-10-14",
+      "release_note": "Untagged v3 development build; date is the smoke report date."
+    },
+    {
+      "name": "glm53f-fp8-min",
+      "config": "examples/configs/glm53-flash-fp8-min.config",
+      "report": "benchmarks/glm5_flash/2026-10-14-smoke-glm-5-3-flash-1rtx-4spark-glm53f-fp8-min",
+      "release": "v3 dev 2026-10-14",
+      "release_note": "Untagged v3 development build; date is the smoke report date."
+    },
+    {
+      "name": "glm53f-fp8-max",
+      "config": "examples/configs/glm53-flash-fp8-max.config",
+      "report": "benchmarks/glm5_flash/2026-10-14-smoke-glm-5-3-flash-2rtx-4spark-glm53f-fp8-max",
+      "release": "v3 dev 2026-10-14",
+      "release_note": "Untagged v3 development build; date is the smoke report date."
+    },
+    {
+      "name": "qwen38-nvfp4-min",
+      "config": "examples/configs/qwen38-nvfp4-min.config",
+      "report": "benchmarks/qwen4/2026-10-18-smoke-qwen3-8-flash-next-nvfp4-1rtx-2spark-qwen38-nvfp4-min",
+      "release": "v3.0.0-rc5",
+      "release_note": "Tagged build recorded by the report."
+    },
+    {
+      "name": "qwen38-nvfp4-5090",
+      "config": "examples/configs/qwen38-nvfp4-min.config",
+      "report": "benchmarks/qwen4/2026-10-18-smoke-qwen3-8-flash-next-nvfp4-1rtx-2spark-qwen38-nvfp4-5090",
+      "release": "v3.0.0-rc4",
+      "release_note": "Tagged build recorded by the report."
+    },
+    {
+      "name": "glm53f-exl3-v1",
+      "config": "examples/configs/glm53-flash-exl3-min.config",
+      "report": "benchmarks/glm5_flash/2026-10-18-smoke-glm-5-3-flash-exl3-k3-25-v1-1rtx-2spark-glm53f-exl3-5090",
+      "release": "v3.0.0-rc5",
+      "release_note": "Tagged build recorded by the report."
+    },
+    {
+      "name": "glm53-nvfp4-min",
+      "config": "examples/configs/glm53-nvfp4-min.config",
+      "report": "benchmarks/glm5/2026-10-30-smoke-glm-5-3-nvfp4-1rtx-4spark-glm53-nvfp4-min",
+      "release": "v4.0.0-rc1",
+      "release_note": "Release-candidate build recorded by the report. NVFP4 cards retired in v5 (TJ 2026-10-31)."
+    },
+    {
+      "name": "glm53f-nvfp4-min",
+      "config": "examples/configs/glm53-flash-nvfp4-min.config",
+      "report": "benchmarks/glm5_flash/2026-10-30-smoke-glm-5-3-flash-nvfp4-1rtx-2spark-glm53f-nvfp4-min",
+      "release": "v4.0.0-rc1",
+      "release_note": "Release-candidate build recorded by the report. NVFP4 cards retired in v5 (TJ 2026-10-31)."
+    },
+    {
+      "name": "glm53f-nvfp4-5090",
+      "config": "examples/configs/glm53-flash-nvfp4-min.config",
+      "report": "benchmarks/glm5_flash/2026-10-30-smoke-glm-5-3-flash-nvfp4-1rtx-2spark-glm53f-nvfp4-5090",
+      "release": "v4.0.0-rc1",
+      "release_note": "Release-candidate build recorded by the report. NVFP4 cards retired in v5 (TJ 2026-10-31)."
+    },
+    {
+      "name": "glm53f-tr3-min",
+      "config": "examples/configs/glm53-flash-exl3-min.config",
+      "report": "benchmarks/glm5_flash/2026-10-31-smoke-glm-5-3-flash-tr3-4bpw-1rtx-2spark-glm53f-tr3-min",
+      "release": "v4.1.0-rc1",
+      "release_note": "Release-candidate build recorded by the report. Retired in v5 (TJ 2026-11-02)."
+    },
+    {
+      "name": "glm53f-tr3-5090",
+      "config": "examples/configs/glm53-flash-exl3-min.config",
+      "report": "benchmarks/glm5_flash/2026-10-31-smoke-glm-5-3-flash-tr3-4bpw-1rtx-2spark-glm53f-tr3-5090",
+      "release": "v4.1.0-rc1",
+      "release_note": "Release-candidate build recorded by the report. Retired in v5 (TJ 2026-11-02)."
+    },
+    {
+      "name": "step5-fp8-max",
+      "config": "examples/configs/step5-fp8-max.config",
+      "report": "benchmarks/step5/2026-10-30-smoke-step-5-preview-2rtx-6spark-step5-fp8-max",
+      "release": "v4.0.0-rc2",
+      "release_note": "Step-5 FP8 retired in v5 (TJ 2026-10-31)"
+    },
+    {
+      "name": "step5-nvfp4-min",
+      "config": "examples/configs/step5-nvfp4-min.config",
+      "report": "benchmarks/step5/2026-10-30-smoke-step-5-preview-nvfp4-1rtx-4spark-step5-nvfp4-min",
+      "release": "v4.0.0-rc2",
+      "release_note": "Release-candidate build recorded by the report. NVFP4 cards retired in v5 (TJ 2026-10-31)."
+    },
+    {
+      "name": "v41-flash-reference-tp4",
+      "config": "examples/configs/deepseek-v41-mxfp4-min.config",
+      "report": "benchmarks/deepseek_v41/2026-10-31-smoke-deepseek-v4-1-flash-1017-1rtx-4spark-v41-flash-reference-tp4",
+      "release": "v4.1.0-rc1",
+      "release_note": "Build recorded by the last published Release-smoke report. Retired from the approved v5 card set (2026-11-10)."
+    },
+    {
+      "name": "glm53f-exl3-5090",
+      "config": "examples/configs/glm53-flash-exl3-min.config",
+      "report": "benchmarks/glm5_flash/2026-10-31-smoke-glm-5-3-flash-exl3-k3-25-core-fp8-1rtx-2spark-glm53f-exl3-5090",
+      "release": "v4.1.0-rc1",
+      "release_note": "Build recorded by the last published Release-smoke report. Retired from the approved v5 card set (2026-11-10)."
+    },
+    {
+      "name": "v4-flash-reference-tp4",
+      "config": "examples/configs/deepseek-v4-flash-mxfp4-min.config",
+      "report": "benchmarks/deepseek_v4/2026-10-30-smoke-deepseek-v4-flash-0731-1rtx-4spark-v4-flash-reference-tp4",
+      "release": "v4.0.0-rc1",
+      "release_note": "Build recorded by the last published Release-smoke report. Retired from the approved v5 card set (2026-11-10)."
+    },
+    {
+      "name": "glm53-exlr8-a8-max",
+      "config": "examples/configs/glm53-exlr8-max.config",
+      "report": "benchmarks/glm5/2026-10-30-smoke-glm-5-3-exlr8-k2-k3-k4-2rtx-6spark-glm53-exlr8-a8-max",
+      "release": "v4.0.0-rc2",
+      "release_note": "Build recorded by the last published Release-smoke report. Retired from the approved v5 card set (2026-11-10)."
+    },
+    {
+      "name": "qwen38-27b-bf16-min-nospec",
+      "config": "examples/configs/qwen38-27b-bf16-min.config",
+      "report": "benchmarks/qwen3_5/2026-10-30-smoke-qwen3-8-27b-1rtx-qwen38-27b-bf16-min-nospec",
+      "release": "v4.0.0-rc2",
+      "release_note": "Build recorded by the last published Release-smoke report. Retired from the approved v5 card set (2026-11-10)."
+    },
+    {
+      "name": "qwen38-27b-fp8-min-nospec",
+      "config": "examples/configs/qwen38-27b-fp8-min.config",
+      "report": "benchmarks/qwen3_5/2026-10-30-smoke-qwen3-8-27b-fp8-1rtx-qwen38-27b-fp8-min-nospec",
+      "release": "v4.0.0-rc2",
+      "release_note": "Build recorded by the last published Release-smoke report. Retired from the approved v5 card set (2026-11-10)."
+    }
+  ]
+}

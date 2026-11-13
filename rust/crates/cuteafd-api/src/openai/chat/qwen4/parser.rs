@@ -45,6 +45,7 @@ use serde_json::Value;
 
 use crate::openai::chat::glm5::parser::GlmStop;
 use crate::openai::chat::glm5::TextParser;
+use crate::openai::chat::stream_args::{ArgStream, held_prefix, json_string_contents, name_is_readable};
 
 pub const THINK_OPEN: &str = "<think>";
 pub const THINK_CLOSE: &str = "</think>";
@@ -101,6 +102,11 @@ struct Call {
     text: String,
     /// Whitespace held before the opening tag, kept with a lost call's text.
     before: String,
+    /// The value's leading newline has been consumed (streaming only).
+    value_leading: bool,
+    /// The current value repeats a key already read: it is consumed but not
+    /// emitted, so the first value is kept (streaming only).
+    skip_value: bool,
 }
 
 #[derive(Debug)]
@@ -114,6 +120,12 @@ pub struct QwenOutputParser {
     content_started: bool,
     held_whitespace: String,
     stop: Option<GlmStop>,
+    /// Emit tool-call argument deltas as they arrive instead of holding the
+    /// whole call until it closes (on for streamed requests).
+    stream_args: ArgStream,
+    /// The open call's `ToolCall` was emitted to the client: a call that turns
+    /// out unreadable has already been streamed and cannot be retracted.
+    streamed: bool,
 }
 
 impl QwenOutputParser {
@@ -121,12 +133,24 @@ impl QwenOutputParser {
         Self::with_turn_markers(options, &STOP_MARKERS)
     }
 
+    /// [`Self::new`] with the streaming knob set explicitly, so tests and the
+    /// router can enable it without touching process env.
+    pub fn with_stream_args(options: QwenParserOptions, stream_args: bool) -> Self {
+        Self::with_turn_markers_and_stream_args(options, &STOP_MARKERS, stream_args)
+    }
+
     /// The XML call grammar is shared; each checkpoint owns its turn stops.
-    pub fn with_turn_markers(mut options: QwenParserOptions, turn_markers: &'static [&'static str]) -> Self {
+    pub fn with_turn_markers(options: QwenParserOptions, turn_markers: &'static [&'static str]) -> Self {
+        Self::with_turn_markers_and_stream_args(options, turn_markers, false)
+    }
+
+    pub(crate) fn with_turn_markers_and_stream_args(mut options: QwenParserOptions,
+        turn_markers: &'static [&'static str], stream_args: bool) -> Self {
         options.stop_sequences.retain(|sequence| !sequence.is_empty());
         let mode = if options.thinking { Mode::Reasoning } else { Mode::Content };
         Self { options, turn_markers, mode, pending: String::new(), call: None, calls: 0,
-            content_started: false, held_whitespace: String::new(), stop: None }
+            content_started: false, held_whitespace: String::new(), stop: None,
+            stream_args: ArgStream::new(stream_args), streamed: false }
     }
 
     /// Consume generated text; returns the chunks it completes.
@@ -168,10 +192,10 @@ impl QwenOutputParser {
         match self.mode {
             Mode::Reasoning | Mode::Content => self.step_text(finishing, out),
             Mode::Function => self.step_function(),
-            Mode::Name => self.step_name(),
+            Mode::Name => self.step_name(out),
             Mode::Arguments => self.step_arguments(),
             Mode::Key => self.step_key(),
-            Mode::Value => self.step_value(),
+            Mode::Value => self.step_value(out),
             Mode::CallEnd => self.step_call_end(out),
             Mode::Skip => self.step_skip(),
             Mode::Lost(reason) => self.step_lost(reason, out),
@@ -289,7 +313,7 @@ impl QwenOutputParser {
     }
 
     /// Read the function name up to `>`.
-    fn step_name(&mut self) -> bool {
+    fn step_name(&mut self, out: &mut Vec<OutputChunk>) -> bool {
         let Some(end) = self.pending.find('>') else { return false; };
         let name = self.pending[..end].trim().to_owned();
         self.take(end + 1);
@@ -297,7 +321,15 @@ impl QwenOutputParser {
             self.mode = Mode::Lost(if name.is_empty() { "empty call" } else { "markup in the name" });
             return true;
         }
-        self.call.as_mut().expect("a call is open").name = name;
+        self.call.as_mut().expect("a call is open").name = name.clone();
+        // Name check before emitting: a call with an unreadable name is never
+        // streamed as a tool call (it is returned as content on loss).
+        if self.stream_args.enabled() && name_is_readable(&name, None) {
+            self.stream_args.begin(out);
+            self.stream_args.call(&name, out);
+            self.stream_args.delta("{", out);
+            self.streamed = true;
+        }
         self.mode = Mode::Arguments;
         true
     }
@@ -336,36 +368,116 @@ impl QwenOutputParser {
             self.mode = Mode::Lost("unreadable argument key");
             return true;
         }
-        self.call.as_mut().expect("a call is open").key = Some(key);
+        let call = self.call.as_mut().expect("a call is open");
+        call.key = Some(key);
+        call.value_leading = false;
+        call.skip_value = false;
         self.mode = Mode::Value;
         true
     }
 
     /// Read a value up to `</parameter>`; one leading and one trailing newline
     /// are stripped, then the value is typed by the tool schema.
-    fn step_value(&mut self) -> bool {
+    ///
+    /// When streaming, a string value is emitted as it arrives (minus the
+    /// stripped newlines); a non-string value is typed at its close, so it is
+    /// emitted whole.
+    fn step_value(&mut self, out: &mut Vec<OutputChunk>) -> bool {
+        let (name, key) = {
+            let call = self.call.as_ref().expect("a call is open");
+            (call.name.clone(), call.key.clone().expect("a key precedes its value"))
+        };
+        let string = value_is_string(&self.options, &name, &key);
+        if self.streamed && string {
+            if self.pending.is_empty() { return false; }
+            if !self.call.as_ref().expect("a call is open").value_leading {
+                // A repeated key keeps its first value: the duplicate is
+                // consumed but never emitted, so the streamed bytes stay a
+                // JSON object without duplicate keys.
+                let duplicate = self.call.as_ref().expect("a call is open")
+                    .arguments.iter().any(|(existing, _)| *existing == key);
+                if duplicate {
+                    self.call.as_mut().expect("a call is open").skip_value = true;
+                } else {
+                    let index = self.call.as_ref().expect("a call is open").arguments.len();
+                    if index > 0 { self.stream_args.delta(",", out); }
+                    let label = format!("{}:\"", serde_json::to_string(&key).expect("string key"));
+                    self.stream_args.delta(&label, out);
+                }
+                if self.pending.starts_with('\n') { self.take(1); }
+                self.call.as_mut().expect("a call is open").value_leading = true;
+            }
+            let skip = self.call.as_ref().expect("a call is open").skip_value;
+            if let Some(end) = self.pending.find(PARAMETER_END) {
+                let raw: String = self.pending[..end].to_owned();
+                self.take(end + PARAMETER_END.len());
+                let raw = raw.strip_suffix('\n').unwrap_or(&raw);
+                if !skip {
+                    let escaped = json_string_contents(raw);
+                    self.stream_args.delta(&escaped, out);
+                    self.stream_args.delta("\"", out);
+                }
+                let text = format!("{}:{}", serde_json::to_string(&key).expect("string key"),
+                    serde_json::to_string(&Value::String(raw.to_owned())).expect("JSON value"));
+                let call = self.call.as_mut().expect("a call is open");
+                if skip {
+                    tracing::warn!(tool = %call.name, key = %key,
+                        "Qwen tool call argument repeated; the first value is kept");
+                } else {
+                    call.arguments.push((key, text));
+                }
+                self.mode = Mode::Arguments;
+                return true;
+            }
+            // Emit all but a suffix that may be the stripped trailing newline
+            // or the start of the close tag: a chunk boundary inside
+            // `</parameter>` must not leak the tag prefix into the value, and a
+            // trailing newline must wait for the close that decides whether it
+            // is stripped.
+            let hold = held_prefix(&self.pending, PARAMETER_END)
+                .max(held_prefix(&self.pending, "\n</parameter>"));
+            let emit = self.pending.len() - hold;
+            if emit == 0 { return false; }
+            let fragment = self.take(emit);
+            if !skip {
+                let escaped = json_string_contents(&fragment);
+                self.stream_args.delta(&escaped, out);
+            }
+            return true;
+        }
         let Some(end) = self.pending.find(PARAMETER_END) else { return false; };
         let raw: String = self.pending[..end].to_owned();
         self.take(end + PARAMETER_END.len());
         let raw = raw.strip_prefix('\n').unwrap_or(&raw);
         let raw = raw.strip_suffix('\n').unwrap_or(raw);
-        let (name, key) = {
-            let call = self.call.as_mut().expect("a call is open");
-            let key = call.key.take().expect("a key precedes its value");
-            (call.name.clone(), key)
-        };
-        let value = if value_is_string(&self.options, &name, &key) { Value::String(raw.to_owned()) }
-            else { typed_value(raw) };
+        let value = if string { Value::String(raw.to_owned()) } else { typed_value(raw) };
         let text = format!("{}:{}", serde_json::to_string(&key).expect("string key"),
             serde_json::to_string(&value).expect("JSON value"));
+        let duplicate = self.call.as_ref().expect("a call is open")
+            .arguments.iter().any(|(existing, _)| *existing == key);
+        if self.streamed && !duplicate {
+            let index = self.call.as_ref().expect("a call is open").arguments.len();
+            if index > 0 { self.stream_args.delta(",", out); }
+            self.stream_args.delta(&text, out);
+        }
         let call = self.call.as_mut().expect("a call is open");
-        match call.arguments.iter_mut().find(|(existing, _)| *existing == key) {
-            Some(argument) => {
+        if duplicate {
+            if self.streamed {
+                // Streaming cannot retract a value already sent: the first
+                // value is kept.
+                tracing::warn!(tool = %call.name, key = %key,
+                    "Qwen tool call argument repeated; the first value is kept");
+            } else {
+                // The hold path keeps the last value, in the place of its
+                // first, as standard JSON does.
                 tracing::warn!(tool = %call.name, key = %key,
                     "Qwen tool call argument repeated; the last value is kept");
-                argument.1 = text;
+                if let Some(argument) = call.arguments.iter_mut().find(|(existing, _)| *existing == key) {
+                    argument.1 = text;
+                }
             }
-            None => call.arguments.push((key, text)),
+        } else {
+            call.arguments.push((key, text));
         }
         self.mode = Mode::Arguments;
         true
@@ -413,23 +525,39 @@ impl QwenOutputParser {
 
     /// Return a call that cannot be read as content, from its opening tag
     /// (after the whitespace that preceded it), and log it.
+    ///
+    /// A call that was already streamed cannot be retracted: it is counted so
+    /// the finish is `tool_calls`, and the validator rejects its assembled
+    /// arguments with a clean 400/SSE error rather than a 500.
     fn lose(&mut self, reason: &'static str, out: &mut Vec<OutputChunk>) {
         let call = self.call.take().expect("a call is open");
-        tracing::warn!(reason, text = %excerpt(&call.text), "Qwen tool call returned as content");
-        self.held_whitespace = call.before;
-        self.emit_content(&call.text, out);
+        if std::mem::take(&mut self.streamed) {
+            self.calls += 1;
+            tracing::warn!(reason, text = %excerpt(&call.text),
+                "Qwen tool call streamed, then found unreadable");
+        } else {
+            tracing::warn!(reason, text = %excerpt(&call.text), "Qwen tool call returned as content");
+            self.held_whitespace = call.before;
+            self.emit_content(&call.text, out);
+        }
         self.mode = Mode::Content;
     }
 
     /// The call closed: send it, a comma before each argument but the first.
     fn release(&mut self, out: &mut Vec<OutputChunk>) {
         let call = self.call.take().expect("a call is open");
-        out.push(OutputChunk::ToolCall { tool_name: call.name, arguments: "{".into() });
-        for (index, (_, text)) in call.arguments.into_iter().enumerate() {
-            let text = if index > 0 { format!(",{text}") } else { text };
-            out.push(arguments(text));
+        if self.streamed {
+            // The deltas were emitted as they arrived; only the close is owed.
+            self.stream_args.delta("}", out);
+            self.streamed = false;
+        } else {
+            out.push(OutputChunk::ToolCall { tool_name: call.name, arguments: "{".into() });
+            for (index, (_, text)) in call.arguments.into_iter().enumerate() {
+                let text = if index > 0 { format!(",{text}") } else { text };
+                out.push(arguments(text));
+            }
+            out.push(arguments("}".into()));
         }
-        out.push(arguments("}".into()));
         self.calls += 1;
         self.mode = Mode::Content;
     }
@@ -443,17 +571,6 @@ impl TextParser for QwenOutputParser {
 }
 
 fn arguments(content: String) -> OutputChunk { OutputChunk::ToolArgumentsDelta { content } }
-
-/// Length of the longest suffix of `text` that is a proper prefix of `marker`.
-fn held_prefix(text: &str, marker: &str) -> usize {
-    let longest = text.len().min(marker.len().saturating_sub(1));
-    (1..=longest).rev()
-        .find(|length| {
-            let start = text.len() - length;
-            text.is_char_boundary(start) && marker.starts_with(&text[start..])
-        })
-        .unwrap_or(0)
-}
 
 /// The earliest of `tags` in `text`: (index, tag).
 fn first_of(text: &str, tags: &[&'static str]) -> Option<(usize, &'static str)> {

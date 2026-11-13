@@ -42,6 +42,10 @@ Set CUTEAFD_WIP_FP8_MOE_BF16_FAMILIES=mimo to add BF16-input Spark siblings
 for selected FAMILY:fp8 packages. This does not change serving defaults.
 Set CUTEAFD_WIP_AUDIO_AOT=ON to build the optional audio tower on both SM120
 and SM121. Audio serving remains separately opt-in.
+AOT exports come from the host's export cache (~/.cache/cuteafd/export-cache,
+keyed by what each export read); CUTEAFD_WIP_EXPORT_CACHE=off exports everything.
+CUTEAFD_WIP_EXPORT_LINEINFO=ON keeps Triton/CuTe DSL source line info for
+source-level profiling (SASS-level profiling needs neither).
 --dry-run prints the resolved hosts, role plan and build invocations without
 touching Docker, SSH or any container.
 
@@ -137,7 +141,7 @@ export CUTEAFD_EXPORT_HOST
 # Resolve once for direct builds too; explicit card/environment scopes win,
 # including an empty expert list or Spark role override.
 wip_scopes="$(python3 "$repo_root/scripts/lib/wip_aot_scopes.py" --config "$config" \
-  --set "SPARK_COUNT=$SPARK_COUNT" --set "SPARK_TP=$SPARK_TP" --set "RTX_GPUS=$RTX_GPUS")" ||
+  --set "SPARK_COUNT=$SPARK_COUNT" --set "RTX_GPUS=$RTX_GPUS")" ||
   release_die "could not derive WIP AOT scopes from $config"
 wip_scope_summary=()
 while IFS='=' read -r key value; do
@@ -209,7 +213,7 @@ done
 wip_container_hosts=("${wip_hosts[@]}")
 ((wip_seed_serves)) || wip_container_hosts=("$seed_host" "${wip_hosts[@]}")
 
-# Opt-in replicated-group Spark expert roles for the WIP slot. Shared slots
+# Opt-in Spark expert roles for the WIP slot. Shared slots
 # derive coverage from the release role configuration; an explicit empty
 # override keeps the legacy TP4-only escape hatch.
 wip_spark_tp_roles="$(release_spark_tp_roles_canonical \
@@ -227,9 +231,9 @@ if ((dry_run)); then
   echo "  Spark hosts (${#wip_hosts[@]}): $(IFS=,; echo "${wip_hosts[*]}")"
   echo "  seed host: $seed_host ($( ((wip_seed_serves)) && echo serving || echo build-only), transfer ${CUTEAFD_WIP_SEED_TRANSFER:-auto}${WIP_SEED_ADDR:+ via $WIP_SEED_ADDR})"
   echo "  Spark targets (${#wip_target_hosts[@]}): $(IFS=,; echo "${wip_target_hosts[*]}")"
-  echo "  topology: tp=$(release_spark_tp) ep=$(release_spark_ep) explicit=$(release_spark_topology_explicit && echo 1 || echo 0)"
   echo "  V41 Spark expert roles: ${wip_spark_tp_roles:-<legacy TP4 only>}"
   echo "  EXL3 AOT: ${CUTEAFD_WIP_EXL3_AOT:-ON}; NVFP4 AOT: ${CUTEAFD_WIP_NVFP4_AOT:-ON}"
+  echo "  V4.1 AOT: ${CUTEAFD_WIP_V41_AOT:-OFF}; vision attention AOT: ${CUTEAFD_WIP_VISION_ATTENTION_AOT:-OFF}"
   echo "  Audio AOT: $audio_aot"
   echo "  FP8 BF16-input siblings: ${bf16_families:-<none>}"
   echo "  EXLR8 AOT: ${CUTEAFD_WIP_EXLR8_AOT:-OFF}"
@@ -865,8 +869,8 @@ if [[ "$source_revision" != *dirty* && "$source_revision" != unknown && -z "$fro
       printf 'host-isa coordinator %s spark grace\n' "$wip_coordinator_host_isa"
       printf 'spark-tp-roles %s\nbf16 %s\naudio %s\n' "$wip_spark_tp_roles" "$bf16_families" "$audio_aot"
       for key in EXL3_AOT NVFP4_AOT DSV4_MAX_CONTEXT DSV4_AOT GLM_AOT CONTEXT_SPLIT_AOT MIMO_AOT MIMO_GEOMETRIES \
-        GLMF_AOT GLMF_WIDE_DECODE_ROWS QWEN4_AOT QWEN_DENSE_AOT STEP5_AOT KIMIK3_AOT ML4_AOT COORDINATOR_EXPERT_FAMILIES EXPERT_FAMILIES GENERIC_SPARK_COUNTS \
-        VISION_ATTENTION_AOT CARGO_FEATURES; do
+        GLMF_AOT GLMF_WIDE_DECODE_ROWS QWEN4_AOT QWEN_DENSE_AOT STEP5_AOT KIMIK3_AOT ML4_AOT MINIMAX_AOT COORDINATOR_EXPERT_FAMILIES EXPERT_FAMILIES GENERIC_SPARK_COUNTS \
+        VISION_ATTENTION_AOT V41_AOT SM89_REPLY_AOT CARGO_FEATURES; do
         [[ "$key" != KIMIK3_AOT || "${CUTEAFD_WIP_KIMIK3_AOT:-OFF}" != OFF ]] || continue
         [[ "$key" != ML4_AOT || "${CUTEAFD_WIP_ML4_AOT:-OFF}" != OFF ]] || continue
         local_name="CUTEAFD_WIP_$key"
@@ -1188,11 +1192,15 @@ fi
 # native_store_has HOST ROOT OUTPUT: the per-instance store holds a complete entry
 # for the key the rust phase recorded.
 native_store_has() {
-  local probe='read -r scope key <"$1/output/$2/.native-cache-key" && test -f "$1/cache/native-store/$scope/$key/COMPLETE"'
+  local probe
+  probe="$(cat "$repo_root/scripts/build/wip-native-store.sh")"'
+read -r scope key <"$1/output/$2/.native-cache-key" &&
+  wip_native_store_valid "$1/cache/native-store/$scope/$key" "$1/output/$2/.native-cache-required"
+'
   if [[ -z "$1" ]]; then
-    bash -c "$probe" native-store "$2" "$3" 2>/dev/null
+    bash -c "$probe" native-store "$2" "$3"
   else
-    ssh -o BatchMode=yes "$1" bash -c "$(printf '%q' "$probe")" native-store "$2" "$3" 2>/dev/null
+    ssh -o BatchMode=yes "$1" bash -c "$(printf '%q' "$probe")" native-store "$2" "$3"
   fi
 }
 
@@ -1211,6 +1219,26 @@ wip_coordinator_export_modes() {
     remote) printf 'remote wait-remote\n' ;;
     *) release_die "CUTEAFD_WIP_COORDINATOR_EXPORT must be auto, remote or capped" ;;
   esac
+}
+
+# wip_cached_exports BUILD...: the native phase with every AOT export required
+# to come from the export cache (scripts/build/export-cache.py exits 3 before an
+# exporter would start). CMake and host C++ run; no export touches a GPU. On a
+# miss Ninja keeps the restored outputs and the caller takes the export turn.
+wip_cached_exports() {
+  [[ "${CUTEAFD_BUILD_CACHES:-on}" != off && "${CUTEAFD_WIP_EXPORT_CACHE:-on}" == on ]] || return 1
+  local started=$SECONDS status=0 log
+  log="$(mktemp "${TMPDIR:-/tmp}/wip-cached-exports.XXXXXXXX")"
+  "$@" >"$log" 2>&1 || status=$?
+  echo "WIP cached exports: $(grep -oE '^export cache [a-z-]+' "$log" | sort | uniq -c | awk '{printf "%s %s, ", $4, $1}')"
+  if ((status == 0)); then
+    rm -f "$log"
+    echo "WIP phase cached-exports: $((SECONDS - started))s"
+    return 0
+  fi
+  grep -h 'export cache required-hit-missed' "$log" | head -3 >&2 || true
+  echo "WIP cached exports: not every export is cached (exit $status, log $log); taking the export turn" >&2
+  return 1
 }
 
 # wip_remote_export: the native key's entry from CUTEAFD_EXPORT_HOST, through
@@ -1268,8 +1296,19 @@ wip_capped_export_on() (
   # container's /wip and cache mounts.
   local -a build env_args=() command=()
   eval "build=($CUTEAFD_CAPPED_BUILD)"
-  local i=2
-  while [[ "${build[i]:-}" == -e ]]; do env_args+=(-e "${build[i + 1]}"); i=$((i + 2)); done
+  local i line
+  # The WIP container's own cache plan (export cache, Triton/XDG/torch caches,
+  # compiler caches): --volumes-from brings its mounts, not its environment.
+  local image_env
+  image_env="$(docker image inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$COORDINATOR_DOCKER_DEV")"
+  while IFS= read -r line; do
+    [[ -n "$line" ]] && ! grep -qxF -- "$line" <<<"$image_env" && env_args+=(-e "$line")
+  done < <(docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$coordinator_container")
+  for ((i = 2; i < ${#build[@]}; i++)); do
+    [[ "${build[i]}" == -e ]] && env_args+=(-e "${build[i + 1]}")
+  done
+  i=2
+  while [[ "${build[i]:-}" == -e ]]; do i=$((i + 2)); done
   command=("${build[@]:i + 1}")
   ((${#command[@]})) || return 75
   local id status=0 gpu_args name="${coordinator_container}-export-$$"
@@ -1332,12 +1371,14 @@ build_coordinator() {
   fi
   local -a coordinator_build=(docker exec \
     "${cache_env[@]}" \
-    -e "CUTEAFD_WIP_DEV_IMAGE_ID=$image_id" -e "CUTEAFD_WIP_NATIVE_CACHE=${CUTEAFD_WIP_NATIVE_CACHE:-on}" \
+    -e "CUTEAFD_WIP_DEV_IMAGE_ID=$image_id" -e "CUTEAFD_WIP_NATIVE_CACHE=${CUTEAFD_WIP_NATIVE_CACHE:-on}" -e "CUTEAFD_WIP_EXPORT_CACHE=${CUTEAFD_WIP_EXPORT_CACHE:-on}" -e "CUTEAFD_WIP_EXPORT_LINEINFO=${CUTEAFD_WIP_EXPORT_LINEINFO:-OFF}" \
     -e "CUTEAFD_WIP_HOST_ISA=${wip_coordinator_host_isa:-${CUTEAFD_WIP_HOST_ISA:-}}" \
     -e "CUTEAFD_WIP_CARGO_FEATURES=${wip_cargo_features:-}" \
     -e CUTEAFD_WIP_EXPORT_LOCKS=off -e "CUTEAFD_EXPORT_JOBS=${CUTEAFD_EXPORT_JOBS:-}" -e "CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS:-}" -e "RUST_TEST_THREADS=${RUST_TEST_THREADS:-}" -e "CMAKE_BUILD_PARALLEL_LEVEL=${CMAKE_BUILD_PARALLEL_LEVEL:-}" \
     -e "CUTEAFD_WIP_EXL3_AOT=${CUTEAFD_WIP_EXL3_AOT:-ON}" \
-    -e "CUTEAFD_WIP_VISION_ATTENTION_AOT=${CUTEAFD_WIP_VISION_ATTENTION_AOT:-}" \
+    -e "CUTEAFD_WIP_VISION_ATTENTION_AOT=${CUTEAFD_WIP_VISION_ATTENTION_AOT:-OFF}" \
+    -e "CUTEAFD_WIP_SM89_REPLY_AOT=${CUTEAFD_WIP_SM89_REPLY_AOT:-OFF}" \
+    -e "CUTEAFD_WIP_V41_AOT=${CUTEAFD_WIP_V41_AOT:-OFF}" \
     -e "CUTEAFD_WIP_NVFP4_AOT=${CUTEAFD_WIP_NVFP4_AOT:-ON}" \
     -e "CUTEAFD_WIP_AUDIO_AOT=$audio_aot" \
     -e "CUTEAFD_WIP_DSV4_MAX_CONTEXT=${CUTEAFD_WIP_DSV4_MAX_CONTEXT:-1048576}" \
@@ -1354,6 +1395,7 @@ build_coordinator() {
     -e "CUTEAFD_WIP_KIMIK3_AOT=${CUTEAFD_WIP_KIMIK3_AOT:-OFF}" \
     -e "CUTEAFD_WIP_MUSE_AOT=${CUTEAFD_WIP_MUSE_AOT:-OFF}" \
     -e "CUTEAFD_WIP_ML4_AOT=${CUTEAFD_WIP_ML4_AOT:-OFF}" \
+    -e "CUTEAFD_WIP_MINIMAX_AOT=${CUTEAFD_WIP_MINIMAX_AOT:-OFF}" \
     ${wip_exlr8_env[@]+"${wip_exlr8_env[@]}"} \
     -e "CUTEAFD_WIP_EXPERT_FAMILIES=${CUTEAFD_WIP_COORDINATOR_EXPERT_FAMILIES:-${CUTEAFD_WIP_EXPERT_FAMILIES:-}}" \
     -e "CUTEAFD_WIP_GENERIC_SPARK_COUNTS=${CUTEAFD_WIP_GENERIC_SPARK_COUNTS:-}" \
@@ -1406,6 +1448,9 @@ build_coordinator() {
       "${coordinator_build[@]}" native || native_status=$?
     fi
     ((native_status == 0)) || release_die "coordinator WIP native phase failed (exit $native_status)"
+
+  elif wip_cached_exports docker exec -e CUTEAFD_EXPORT_CACHE_REQUIRE_HIT=1 "${coordinator_build[@]:2}" native; then
+    echo "WIP coordinator export: every export restored from the export cache, no GPU turn"
   else
     # Remote first when configured; otherwise take one bounded fair GPU turn.
     # The seed lease and Cargo slot are already released before this phase.
@@ -1475,7 +1520,7 @@ build_expert() (
   # The role list and build-scope opt-ins travel inside a single quoted remote
   # command so a `tp2;tp3` value is never split by the remote shell.
   local build_command
-  build_command="docker exec -e 'CUTEAFD_WIP_DEV_IMAGE_ID=$image_id' -e 'CUTEAFD_WIP_NATIVE_CACHE=${CUTEAFD_WIP_NATIVE_CACHE:-on}' -e 'CUTEAFD_EXPORT_JOBS=${CUTEAFD_EXPORT_JOBS:-}' -e 'CUTEAFD_EXPORT_HOST_CONTEXTS=${CUTEAFD_EXPORT_HOST_CONTEXTS:-}' -e 'CUTEAFD_EXPORT_WORKER_RAM_MIB=${CUTEAFD_EXPORT_WORKER_RAM_MIB:-}' -e 'CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS:-}' -e 'RUST_TEST_THREADS=${RUST_TEST_THREADS:-}' -e 'CMAKE_BUILD_PARALLEL_LEVEL=${CMAKE_BUILD_PARALLEL_LEVEL:-}' -e 'CUTEAFD_BUILD_CACHES=${CUTEAFD_BUILD_CACHES:-on}' -e 'CUTEAFD_SCCACHE_CUDA=$cuda_cache' -e 'CUTEAFD_KACHE=$cache_wrapper' -e 'CUTEAFD_WIP_SPARK_TP_ROLES=$wip_spark_tp_roles' -e 'CUTEAFD_WIP_EXPERT_FAMILIES=${CUTEAFD_WIP_EXPERT_FAMILIES:-}' -e 'CUTEAFD_WIP_GENERIC_SPARK_COUNTS=${CUTEAFD_WIP_GENERIC_SPARK_COUNTS:-}' -e 'CUTEAFD_WIP_FP8_MOE_BF16_FAMILIES=$bf16_families' -e 'CUTEAFD_WIP_EXL3_AOT=${CUTEAFD_WIP_EXL3_AOT:-ON}' -e 'CUTEAFD_WIP_NVFP4_AOT=${CUTEAFD_WIP_NVFP4_AOT:-ON}' -e 'CUTEAFD_WIP_AUDIO_AOT=$audio_aot'${wip_exlr8_env[1]:+ -e '${wip_exlr8_env[1]}' -e 'CUTEAFD_WIP_EXLR8_FAMILIES=${CUTEAFD_WIP_EXLR8_FAMILIES}'} '$spark_container' timeout --kill-after=30 7200 /wip/source/scripts/build/build-wip-artifacts.sh /wip/source expert 121 /wip/build/expert /wip/output/expert"
+  build_command="docker exec -e 'CUTEAFD_WIP_DEV_IMAGE_ID=$image_id' -e 'CUTEAFD_WIP_NATIVE_CACHE=${CUTEAFD_WIP_NATIVE_CACHE:-on}' -e 'CUTEAFD_WIP_EXPORT_CACHE=${CUTEAFD_WIP_EXPORT_CACHE:-on}' -e 'CUTEAFD_WIP_EXPORT_LINEINFO=${CUTEAFD_WIP_EXPORT_LINEINFO:-OFF}' -e 'CUTEAFD_EXPORT_JOBS=${CUTEAFD_EXPORT_JOBS:-}' -e 'CUTEAFD_EXPORT_HOST_CONTEXTS=${CUTEAFD_EXPORT_HOST_CONTEXTS:-}' -e 'CUTEAFD_EXPORT_WORKER_RAM_MIB=${CUTEAFD_EXPORT_WORKER_RAM_MIB:-}' -e 'CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS:-}' -e 'RUST_TEST_THREADS=${RUST_TEST_THREADS:-}' -e 'CMAKE_BUILD_PARALLEL_LEVEL=${CMAKE_BUILD_PARALLEL_LEVEL:-}' -e 'CUTEAFD_BUILD_CACHES=${CUTEAFD_BUILD_CACHES:-on}' -e 'CUTEAFD_SCCACHE_CUDA=$cuda_cache' -e 'CUTEAFD_KACHE=$cache_wrapper' -e 'CUTEAFD_WIP_SPARK_TP_ROLES=$wip_spark_tp_roles' -e 'CUTEAFD_WIP_EXPERT_FAMILIES=${CUTEAFD_WIP_EXPERT_FAMILIES:-}' -e 'CUTEAFD_WIP_GENERIC_SPARK_COUNTS=${CUTEAFD_WIP_GENERIC_SPARK_COUNTS:-}' -e 'CUTEAFD_WIP_FP8_MOE_BF16_FAMILIES=$bf16_families' -e 'CUTEAFD_WIP_EXL3_AOT=${CUTEAFD_WIP_EXL3_AOT:-ON}' -e 'CUTEAFD_WIP_NVFP4_AOT=${CUTEAFD_WIP_NVFP4_AOT:-ON}' -e 'CUTEAFD_WIP_V41_AOT=${CUTEAFD_WIP_V41_AOT:-OFF}' -e 'CUTEAFD_WIP_VISION_ATTENTION_AOT=${CUTEAFD_WIP_VISION_ATTENTION_AOT:-OFF}' -e 'CUTEAFD_WIP_AUDIO_AOT=$audio_aot'${wip_exlr8_env[1]:+ -e '${wip_exlr8_env[1]}' -e 'CUTEAFD_WIP_EXLR8_FAMILIES=${CUTEAFD_WIP_EXLR8_FAMILIES}'} '$spark_container' timeout --kill-after=30 7200 /wip/source/scripts/build/build-wip-artifacts.sh /wip/source expert 121 /wip/build/expert /wip/output/expert"
   timeout --kill-after=30 7260 ssh -o BatchMode=yes "$seed_host" "$build_command rust" ||
     release_die "Spark WIP Rust phase on $seed_host failed (exit $?)"
   local seed_root
@@ -1489,6 +1534,9 @@ build_expert() (
     echo "WIP Spark export: native cache hit, no export turn"
     timeout --kill-after=30 7260 ssh -o BatchMode=yes "$seed_host" "$restore_command" ||
       release_die "Spark WIP native restore on $seed_host failed"
+  elif wip_cached_exports timeout --kill-after=30 7260 ssh -o BatchMode=yes "$seed_host" \
+      "${build_command/docker exec /docker exec -e CUTEAFD_EXPORT_CACHE_REQUIRE_HIT=1 } native"; then
+    echo "WIP Spark export: every export restored from the export cache, no export turn"
   else
     # The seed's CPU lease admits other builds; its GPU export is one at a time.
     wip_seed_export_turn
@@ -1509,7 +1557,12 @@ build_expert() (
   fi
   native_store_sync "$seed_host" "$seed_root" aarch64 expert publish
   native_store_nest "$seed_host" aarch64 "$seed_root" expert publish
-  timeout --kill-after=30 300 ssh -o BatchMode=yes "$seed_host" docker exec -e "CUTEAFD_WIP_BUILD_KEY=${wip_expert_key:-}" ${wip_exlr8_env[@]+"${wip_exlr8_env[@]}"} "$spark_container" \
+  # ssh joins argv into one remote shell string: quote values such as
+  # CUTEAFD_WIP_EXLR8_FAMILIES=glm;glmf so the remote shell keeps them whole.
+  local exlr8_remote=()
+  local arg
+  for arg in ${wip_exlr8_env[@]+"${wip_exlr8_env[@]}"}; do exlr8_remote+=("$(printf '%q' "$arg")"); done
+  timeout --kill-after=30 300 ssh -o BatchMode=yes "$seed_host" docker exec -e "CUTEAFD_WIP_BUILD_KEY=${wip_expert_key:-}" ${exlr8_remote[@]+"${exlr8_remote[@]}"} "$spark_container" \
     /wip/source/scripts/build/finalize-wip-slot.sh \
     /wip/source spark-expert "$slot" /wip/output/expert \
     "$SPARK_EXPERT_DOCKER_DEV" "$image_id" "$(printf '%q' "$image_layers")"

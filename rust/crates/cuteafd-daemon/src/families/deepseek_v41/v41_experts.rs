@@ -42,7 +42,7 @@ impl ExpertExecution<'_, '_> {
         shared: &mut dspark::DsparkSharedFfn<'_, '_>,
         rows: u32,
     ) -> Result<()> {
-        unsafe { self.enqueue_draft_ffn_on(router, shared, rows, self.stream.raw) }
+        unsafe { self.enqueue_draft_ffn_on(router, shared, rows, self.stream()) }
     }
     /// Containing owner must drain the supplied stream before releasing scratch.
     pub(super) unsafe fn enqueue_draft_ffn_on(
@@ -94,7 +94,7 @@ impl ExpertExecution<'_, '_> {
             .as_ref()
             .context("shared FFN requires coordinator output")?
             .buffer;
-        let launched = unsafe { shared.enqueue(self.hidden.buffer, output, rows, self.stream.raw) };
+        let launched = unsafe { shared.enqueue(self.hidden.buffer, output, rows, self.stream()) };
         let drained = self.synchronize();
         launched.and(drained)
     }
@@ -117,7 +117,7 @@ impl ExpertExecution<'_, '_> {
             rows > 0 && rows <= self.kernel.info().capacity_rows,
             "invalid router rows"
         );
-        let launched = unsafe { router.enqueue(self.inputs(), rows as usize, self.stream.raw) };
+        let launched = unsafe { router.enqueue(self.inputs(), rows as usize, self.stream()) };
         let drained = self.synchronize();
         launched.and(drained)
     }

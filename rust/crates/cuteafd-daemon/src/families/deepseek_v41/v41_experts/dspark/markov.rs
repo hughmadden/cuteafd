@@ -1,6 +1,7 @@
 use crate::shared::decode_graph::{fatal_drain, BindingGraphs};
 use super::DsparkWeights;
-use crate::shared::memory::{DeviceAllocation, LoadStream};
+use crate::shared::memory::Tag;
+use crate::shared::memory::{DeviceAllocation};
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::{CuteafdDeviceBuffer, V41VocabularyProjection};
 use std::ffi::c_void;
@@ -17,7 +18,7 @@ const GEMM_ROWS: usize = 2;
 /// Returned views are valid until this owner is reused; preserve embeddings for
 /// the final confidence projection before advancing to the next draft position.
 pub(crate) struct DsparkMarkov<'weights, 'library> {
-    stream: LoadStream<'library>,
+    standalone: &'weights crate::shared::memory::StandaloneStream<'library>,
     kernel: V41VocabularyProjection<'library>,
     _workspace: DeviceAllocation<'library>,
     tokens: DeviceAllocation<'library>,
@@ -42,23 +43,20 @@ impl<'library> DsparkWeights<'library> {
         let library = self.library;
         self.tensor("mtp.2.markov_head.embed.weight")?;
         self.tensor("mtp.2.markov_head.head.weight")?;
-        let workspace = DeviceAllocation::new(library, V41VocabularyProjection::WORKSPACE_BYTES)?;
+        let workspace = DeviceAllocation::new(library, V41VocabularyProjection::WORKSPACE_BYTES, Tag::drafter_workspace("v41/draft-markov"))?;
         let kernel = unsafe { library.v41_dspark_markov(workspace.buffer)? };
         let rows = capacity.max(GEMM_ROWS);
-        let embedding = DeviceAllocation::new(library, rows * 512)?;
+        let embedding = DeviceAllocation::new(library, rows * 512, Tag::drafter_workspace("v41/draft-markov"))?;
         library.cuda_zero_bytes(embedding.buffer, rows * 512)?;
         Ok(DsparkMarkov {
             kernel,
             _workspace: workspace,
-            stream: LoadStream {
-                library,
-                raw: library.cuda_stream_create()?,
-            },
-            tokens: DeviceAllocation::new(library, capacity * 4)?,
+            standalone: &self.standalone,
+            tokens: DeviceAllocation::new(library, capacity * 4, Tag::drafter_workspace("v41/draft-markov"))?,
             embedding,
-            logits: DeviceAllocation::new(library, rows * 129280 * 4)?,
+            logits: DeviceAllocation::new(library, rows * 129280 * 4, Tag::drafter_workspace("v41/draft-markov"))?,
             weights: self,
-            graph: BindingGraphs::new(library)?,
+            graph: BindingGraphs::new(library, "dspark_markov")?,
             capacity,
             ready_rows: None,
         })
@@ -85,12 +83,12 @@ impl DsparkMarkov<'_, '_> {
         Ok(())
     }
     unsafe fn enqueue(&self, rows: usize) -> Result<()> {
-        unsafe { self.enqueue_on(rows, self.stream.raw) }
+        unsafe { self.enqueue_on(rows, self.standalone.get()?.raw) }
     }
     pub(super) unsafe fn enqueue_on(&self, rows: usize, stream: *mut c_void) -> Result<()> {
         self.validate_rows(rows)?;
         unsafe {
-            self.stream.library.cuda_embedding_lookup_bf16_async(
+            self.standalone.device.library.cuda_embedding_lookup_bf16_async(
                 self.weights.tensor("mtp.2.markov_head.embed.weight")?,
                 self.tokens.buffer,
                 self.embedding.buffer,
@@ -115,7 +113,7 @@ impl DsparkMarkov<'_, '_> {
         [self.embedding.buffer, self.logits.buffer]
     }
     fn synchronize(&self) -> Result<()> {
-        unsafe { self.stream.library.cuda_stream_synchronize(self.stream.raw) }
+        self.standalone.drain()
     }
     /// # Safety
     /// Owned token IDs must be initialized and less than 129280; producer work
@@ -131,49 +129,17 @@ impl DsparkMarkov<'_, '_> {
         self.output()
     }
     /// # Safety
-    /// Same input contract as execute; warms the launch before graph capture.
-    pub unsafe fn capture(&mut self, rows: usize) -> Result<()> {
-        ensure!(self.graph.is_none(), "markov graph already captured");
-        unsafe {
-            self.execute(rows)?;
-        }
-        self.ready_rows = None;
-        unsafe {
-            self.stream
-                .library
-                .cuda_graph_begin_capture(self.stream.raw)?;
-        }
-        let launch = unsafe { self.enqueue(rows) };
-        let capture = unsafe { self.stream.library.cuda_graph_end_capture(self.stream.raw) };
-        match (launch, capture) {
-            (Ok(()), Ok(graph)) => {
-                // SAFETY: wave pins captured storage through drained teardown.
-                unsafe { self.graph.insert(rows, graph)?; }
-                Ok(())
-            }
-            (Err(error), Ok(graph)) => {
-                if let Err(cleanup) = unsafe { self.stream.library.cuda_graph_exec_destroy(graph) }
-                {
-                    tracing::error!(%cleanup, "destroying failed markov capture");
-                }
-                Err(error)
-            }
-            (Err(error), Err(_)) | (Ok(()), Err(error)) => Err(error),
-        }
-    }
-    /// # Safety
     /// Same input contract as execute; rows must match the captured shape.
     pub unsafe fn replay(&mut self, rows: usize) -> Result<[CuteafdDeviceBuffer; 2]> {
         self.ready_rows = None;
-        let (graph, captured_rows) = self.graph.get().context("markov graph is not captured")?;
-        ensure!(
-            rows == captured_rows,
-            "markov replay shape differs from capture"
-        );
+        let Some(graph) = self.graph.cached_launch(&rows) else {
+            // SAFETY: replay and eager execution have the same input contract.
+            return unsafe { self.execute(rows) };
+        };
         unsafe {
-            self.stream
+            self.standalone.device
                 .library
-                .cuda_graph_launch(graph, self.stream.raw)?;
+                .cuda_graph_launch(graph, self.standalone.get()?.raw)?;
         }
         self.synchronize()?;
         self.ready_rows = Some(rows);
@@ -202,5 +168,12 @@ impl Drop for DsparkMarkov<'_, '_> {
         fatal_drain(self.synchronize(), "dSpark markov");
         // SAFETY: owning stream has drained before executable retirement.
         fatal_drain(unsafe { self.graph.clear() }, "dSpark markov graphs");
+    }
+}
+
+impl DsparkMarkov<'_, '_> {
+    pub(crate) fn visit_graph_banks(&mut self, f: &mut super::chain::GraphVisitor<'_>) -> Result<()> {
+        f(self.standalone.device.id, "dspark_markov", false, &mut self.graph)?;
+        Ok(())
     }
 }

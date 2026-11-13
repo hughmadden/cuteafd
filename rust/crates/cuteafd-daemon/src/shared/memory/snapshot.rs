@@ -2,6 +2,7 @@
 use super::*;
 use anyhow::{ensure, Context};
 use std::{cell::RefCell, rc::Rc};
+use crate::shared::memory::Tag;
 
 /// Stream destruction drains before the queued source/storage owners are dropped.
 pub(crate) struct SnapshotCopies<'a, T> {
@@ -39,10 +40,17 @@ impl<'a> SnapshotPool<'a> {
         ensure!(bytes > 0 && slots > 0, "empty snapshot arena");
         let stride = bytes.checked_add(255).context("snapshot stride overflow")? / 256 * 256;
         let allocation = DeviceAllocation::new(library,
-            stride.checked_mul(slots).context("snapshot arena overflow")?)?;
+            stride.checked_mul(slots).context("snapshot arena overflow")?, Tag::prefix("shared/prefix-snapshots"))?;
         Ok(Self(Rc::new(Arena { allocation, stride, free: RefCell::new((0..slots).rev().collect()) })))
     }
     pub fn device_bytes(&self) -> usize { self.0.allocation.buffer.bytes }
+    pub(crate) fn allocation_receipts(&self, inventory: &mut super::receipts::Inventory<'_>,
+        name: &str) -> Result<()> {
+        inventory.backed_device(name, self.0.allocation.buffer, self.0.allocation.buffer)?;
+        let free = self.0.free.try_borrow()?;
+        inventory.host(&format!("{name}.free"), &free)?;
+        Ok(())
+    }
     pub fn take(&self, bytes: usize) -> Result<SnapshotStorage<'a>> {
         ensure!(bytes > 0 && bytes <= self.0.stride, "snapshot exceeds arena slot");
         let slot = self.0.free.borrow_mut().pop().context("snapshot arena exhausted")?;
@@ -61,10 +69,17 @@ pub(crate) struct SnapshotStorage<'a> {
     pooled: Option<(SnapshotPool<'a>, usize)>,
 }
 impl<'a> SnapshotStorage<'a> {
+    pub(crate) fn allocation_receipts(&self, inventory: &mut super::receipts::Inventory<'_>,
+        name: &str) -> Result<()> {
+        let backing = self.pooled.as_ref().map(|(pool, _)| pool.0.allocation.buffer)
+            .or_else(|| self._owned.as_ref().map(|owner| owner.buffer))
+            .context("snapshot storage has no actual owner")?;
+        inventory.backed_device(name, self.buffer, backing)
+    }
     pub fn new(library: &'a NativeLibrary, bytes: usize, pool: Option<&SnapshotPool<'a>>) -> Result<Self> {
         let _memory_scope = cuteafd_ffi::memory_ledger::scope("prefix/snapshot");
         if let Some(pool) = pool { return pool.take(bytes); }
-        let owned = DeviceAllocation::new(library, bytes)?;
+        let owned = DeviceAllocation::new(library, bytes, Tag::prefix("shared/prefix-snapshot"))?;
         Ok(Self { buffer: owned.buffer, _owned: Some(owned), pooled: None })
     }
 }
@@ -77,6 +92,34 @@ impl Drop for SnapshotStorage<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn snapshot_census_charges_shared_backing_once_without_native_work() -> Result<()> {
+        use cuteafd_core::memory_layout::Category;
+        use cuteafd_loader::placement::planner::{CoordinatorDevices, Lifetime, Location};
+        let (_directory, fixture) = super::super::cpu_stream_fixture()?;
+        let library = fixture.load()?;
+        let pool = SnapshotPool::new(&library, 513, 3)?;
+        let first = pool.take(513)?;
+        let second = pool.take(129)?;
+        let before = fixture.events()?;
+        let physical = [0];
+        let mut inventory = super::super::receipts::Inventory::new(CoordinatorDevices::new(&physical)?,
+            "fixture", Lifetime::TARGET, Category::Prefix, "snapshot");
+        pool.allocation_receipts(&mut inventory, "pool")?;
+        first.allocation_receipts(&mut inventory, "first")?;
+        second.allocation_receipts(&mut inventory, "second")?;
+        let owners: Vec<_> = inventory.receipts.iter().filter(|r|
+            r.allocation.location == Location::coordinator(0) && r.allocation.view.is_none()).collect();
+        assert_eq!(owners.len(), 1);
+        assert_eq!(owners[0].allocation.bytes, pool.device_bytes() as u64);
+        for (name, actual) in [("first", first.buffer), ("second", second.buffer)] {
+            let receipt = inventory.receipts.iter().find(|r| r.allocation.id == format!("fixture.{name}")).unwrap();
+            assert_eq!((receipt.address, receipt.allocation.bytes), (actual.ptr as u64, actual.bytes as u64));
+            assert_eq!(receipt.allocation.view.as_ref().unwrap().offset, actual.ptr as u64 - owners[0].address);
+        }
+        assert_eq!(fixture.events()?, before);
+        Ok(())
+    }
     #[test]
     #[ignore = "requires CUTEAFD_NATIVE_LIB and CUDA"]
     fn native_snapshot_arena_reuses_only_released_slots() -> Result<()> {

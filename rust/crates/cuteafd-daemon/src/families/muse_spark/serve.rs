@@ -10,9 +10,12 @@ use crate::shared::inventory::{InventoryPhase, RuntimeInventory};
 use anyhow::{ensure, Context, Result};
 use cuteafd_loader::families::muse_spark::{core::CoreInventory, MuseSparkConfig};
 use std::{net::SocketAddr, path::PathBuf, sync::Arc};
+use cuteafd_core::memory_layout::ArenaTag;
 
 #[derive(Debug, Clone, clap::Args)]
 pub(crate) struct ServeArgs {
+    #[command(flatten)]
+    pub(crate) attention: crate::cli::CoreViewArgs,
     #[arg(long)] pub snapshot: PathBuf,
     #[arg(long, env = "CUTEAFD_NATIVE_LIB")] pub native_lib: PathBuf,
     #[arg(long, default_value = "/opt/cuteafd/share/PROGRAMS.json")] pub manifest: PathBuf,
@@ -20,17 +23,18 @@ pub(crate) struct ServeArgs {
     /// pair (attention heads halve), as every family's launcher passes them.
     #[arg(long, default_value_t = 0)] pub device: i32,
     #[arg(long)] pub split_device: Option<i32>,
+    /// Bounded decode/verify graph replay; prefill and diagnostics stay eager.
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    pub decode_graphs: bool,
     /// Spark expert ranks: every expert's intermediate is sliced across them (TP),
     /// each replying per-expert partials the coordinator combines.
     #[arg(long, value_delimiter = ',')] pub peers: Vec<SocketAddr>,
     /// Auto admission grows beyond the selected context floor while memory allows.
     #[arg(long)] pub pool_tokens: Option<u64>,
-    /// API ceiling and compiled extent; unset takes the checkpoint's 1M with the
-    /// pool deciding the admitted context.
-    #[arg(long)] pub max_context: Option<u64>,
+    /// Served context: auto fits the admitted pool, bounded by the checkpoint maximum; a number pins it.
+    #[arg(long = "max-context-tokens", value_parser = crate::shared::context::parse_tokens::<u64>)]
+    pub max_context: Option<u64>,
     #[arg(long, default_value = "auto")] pub rtx_expert_layers: cuteafd_loader::placement::Onboard,
-    /// Complete per-rank Spark allocation ceiling, estimated until the first worker census.
-    #[arg(long)] pub spark_budget_gib: Option<f64>,
     #[arg(long, default_value = "0.0.0.0:8000")] pub listen: String,
     #[arg(long, default_value_t = 16, value_parser = clap::value_parser!(u8).range(1..=64))]
     pub max_sequences: u8,
@@ -47,14 +51,19 @@ pub(crate) struct ServeArgs {
     /// Opt in to a DFlash2 drafter snapshot (RadixArk/Muse-Spark-Open-DFlash2); it runs
     /// beside the target head and reads the target's exact head (softcap and multiplier).
     #[arg(long)] pub draft: Option<PathBuf>,
+    /// Split DFlash attention/FFN across the active RTX pair; opt-in until qualified.
+    #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
+    pub tp2_dflash: bool,
     /// Fixed draft depth; absent lets the shared policy choose up to the drafter's block.
-    #[arg(long, requires = "draft", value_parser = clap::value_parser!(u8).range(1..=15))]
-    pub draft_fixed: Option<u8>,
+    #[command(flatten)]
+    pub draft_length: crate::shared::draft::length::DraftLength,
     /// The drafter's ring storage (independent of weight precision).
     #[arg(long, default_value = "fp8")]
     pub draft_kv_cache: cuteafd_loader::families::qwen4::Qwen4KvCache,
     /// Prefill unit rows, at most 4096; unset follows the shared wave policy.
     #[arg(long)] pub prefill_rows: Option<usize>,
+    #[arg(long, default_value = "unrestricted")]
+    pub prefill_packing: crate::shared::prefill_packing::PackingMode,
     /// Admit all-row prefill logits for fidelity scoring before KV sizing.
     #[arg(long)] pub full_prefill_logits: bool,
     /// Prefill units in flight on the one Spark transport; unset follows the shared policy.
@@ -78,21 +87,25 @@ impl ServeArgs {
 
     pub(super) fn prefill(&self) -> Result<cuteafd_loader::serving_capacity::prefill_waves::PrefillPlan> {
         use cuteafd_loader::serving_capacity::prefill_waves::{prefill_shape, PrefillOverrides};
-        Ok(prefill_shape(self.peers.len(), cuteafd_loader::plan::Family::prefill_limits(
+        let plan = prefill_shape(self.peers.len(), cuteafd_loader::plan::Family::prefill_limits(
             &cuteafd_loader::plan::families::muse_spark::MUSE_SPARK), PrefillOverrides {
             unit_rows: self.prefill_rows.map(|rows| rows as u64),
             waves: self.prefill_waves.map(u64::from), span_rows: None, reserve_rows: None,
-        })?)
+        })?;
+        cuteafd_bench::context::ResolvedSettings::prefill(plan).publish();
+        Ok(plan)
     }
 
     fn spark_budget_bytes(&self) -> u64 {
-        self.spark_budget_gib.map_or(cuteafd_loader::plan::DEFAULT_SPARK_BUDGET_BYTES,
-            |gib| (gib * (1u64 << 30) as f64) as u64)
+        cuteafd_core::memory_policy::MemoryPolicy::current()
+            .spark_cap_bytes(cuteafd_loader::plan::DEFAULT_SPARK_BUDGET_BYTES)
     }
 
     pub(super) fn validate(&self) -> Result<()> {
         cuteafd_core::concurrency::validate("muse_spark", u64::from(self.max_sequences))?;
         let devices = self.devices();
+        ensure!(!self.tp2_dflash || (devices.len() == 2 && self.draft.is_some()),
+            "Muse TP2 DFlash requires --split-device and --draft");
         cuteafd_loader::placement::families::muse_spark::executor(devices.len())?;
         ensure!(devices.iter().all(|&device| device >= 0)
             && devices.iter().collect::<std::collections::HashSet<_>>().len() == devices.len(),
@@ -100,13 +113,10 @@ impl ServeArgs {
         let distinct = self.peers.iter().collect::<std::collections::HashSet<_>>().len();
         // Every Spark world the shared package range data gives the checkpoint's width.
         let worlds = cuteafd_loader::plan::experts::spark_worlds(cuteafd_loader::plan::families::muse_spark::PACKAGE, 4096);
-        ensure!(worlds.contains(&self.peers.len()) && distinct == self.peers.len(),
+        ensure!((self.peers.is_empty() || worlds.contains(&self.peers.len())) && distinct == self.peers.len(),
             "Muse Spark serves its EXL3 TP experts on {worlds:?} distinct Spark endpoints, not {}", self.peers.len());
-        ensure!(self.max_context.is_none_or(|context| (1..=1 << 20).contains(&context)),
+        ensure!(self.max_context.is_none_or(|context| context == 0 || (1..=1 << 20).contains(&context)),
             "Muse Spark context exceeds the checkpoint's 1M extent");
-        ensure!(self.spark_budget_gib.is_none_or(|gib| gib.is_finite() && gib > 0.0
-            && gib < u64::MAX as f64 / (1u64 << 30) as f64),
-            "Muse Spark requires a finite positive --spark-budget-gib");
         self.prefill()?;
         for (name, mode, peers, hash, revision) in [
             ("vision", self.vision, &self.vision_peers, &self.encoder_plan_hash, &self.encoder_revision),
@@ -127,8 +137,8 @@ impl ServeArgs {
                 "Muse {name} encoder revision cannot be empty");
         }
         ensure!(self.audio_peers.len() <= 1, "Muse audio admits one encoder owner");
-        // A request's widest step is a verify (anchor plus drafts, at most the 64-row
-        // rollback step); the cutoff must keep it BF16, so decode and verify stay lossless.
+        // Admission uses the cutoff to bound each decode/verify segment, so it
+        // must cover the widest step even when a phase encoding is explicit.
         cuteafd_loader::families::muse_spark::replies::Cutoff::new(self.expert_partial_bf16_max_rows,
             cuteafd_loader::families::muse_spark::replies::DEFAULT_BF16_MAX_ROWS)?;
         ensure!(self.prefix.prefix_partial == crate::shared::prefix::Toggle::Off,
@@ -138,70 +148,151 @@ impl ServeArgs {
 }
 
 /// Bring the engine up and hand `run` the backend and its admitted sequences.
-fn with_backend<T>(args: &ServeArgs, run: impl FnOnce(&super::backend::MuseBackend<'_, '_>, usize, super::media::Ready) -> Result<T>)
+pub(super) fn with_backend<T>(args: &ServeArgs, run: impl FnOnce(&super::backend::MuseBackend<'_, '_>, usize, super::media::Ready) -> Result<T>)
     -> Result<T> {
     ensure!(args.token_io.embed_placement == crate::shared::token_io::EmbedPlacement::Gpu,
         "Muse Spark keeps its embedding on the entry GPU");
     cuteafd_core::set_expert_geometry(cuteafd_core::ExpertGeometry::MUSE_SPARK)
         .map_err(|_| anyhow::anyhow!("Muse Spark serving needs an isolated process"))?;
-    let checkpoint = cuteafd_loader::plan::Checkpoint::coordinator(&args.snapshot, false, false)?;
+    let view = args.attention.selected_view.clone().map(Ok)
+        .unwrap_or_else(|| args.attention.select(&args.snapshot))?;
+    args.attention.validate_view(&view)?;
+    let checkpoint = cuteafd_loader::plan::Checkpoint::coordinator_view(&view, false, false)?;
     let cfg = MuseSparkConfig::from_hf(&checkpoint.config)?;
     cfg.release_geometry()?;
     cuteafd_bench::context::set_family(cfg.family_id());
+    let mode = match view.mode() {
+        cuteafd_loader::plan::checkpoint::CoreView::Original => "original",
+        cuteafd_loader::plan::checkpoint::CoreView::K6Compact => "k6-compact", cuteafd_loader::plan::checkpoint::CoreView::K8Compact => "k8-compact",
+        cuteafd_loader::plan::checkpoint::CoreView::Fp8Compact => "fp8-compact",
+    };
+    let recipe = if view.mode() == cuteafd_loader::plan::checkpoint::CoreView::Fp8Compact {
+        cuteafd_loader::plan::checkpoint::view::FP8_RECIPE
+    } else { "none" };
+    cuteafd_bench::context::set_resolved("core-view", mode);
+    cuteafd_bench::context::set_resolved("core-view-fingerprint", view.fingerprint());
+    cuteafd_bench::context::set_resolved("core-fp8-recipe", recipe);
+    tracing::info!(core_view = mode, bundle = view.fingerprint(), fp8_recipe = recipe,
+        "selected immutable Muse attention bundle");
     let core = CoreInventory::from_checkpoint(&cfg, &checkpoint)?;
     let device_ids = args.devices();
     let gpus = device_ids.len();
     let manifest = startup::preflight(&args.manifest, gpus)?;
-    let catalog = cuteafd_loader::read_expert_catalog(&args.snapshot)?;
+    let catalog = cuteafd_loader::read_expert_catalog_view(&view)?;
     // SAFETY: every native owner drops on this worker before the library.
     let library = Arc::new(unsafe { cuteafd_ffi::NativeLibrary::load(&args.native_lib)? });
-    let inventory = RuntimeInventory::measure(&library, &device_ids, InventoryPhase::PreWeight, |_| Ok(()))?;
-    let (built, placement) = startup::admit(startup::Options { cfg: &cfg, core: &core, catalog: &catalog,
-        manifest: &manifest,
-        measured: inventory.gpus.iter().map(|sample| Ok(startup::Measured { arch: sample.arch.parse()?,
-            total_bytes: sample.total_bytes, free_bytes: sample.free_bytes,
-            untracked_bytes: sample.context_bytes })).collect::<Result<_>>()?,
-        headroom_bytes: 2 << 30, spark_ranks: args.peers.len(), prefill: args.prefill()?,
+    let devices = device_ids.iter().map(|&id| crate::shared::memory::device::Device { library: &library, id })
+        .collect::<Vec<_>>();
+    let programs = devices.iter().map(|device| device.run(|| library.programs()?.with_manifest(&args.manifest)))
+        .collect::<Result<Vec<_>>>()?;
+    let native_manifest = if core.native.is_empty() { None } else {
+        let specs = programs[0].names().map(|name| programs[0].spec(name)).collect::<Result<Vec<_>>>()?;
+        Some(cuteafd_loader::placement::inventory::ProgramsManifest::from_specs(specs.into_iter())?)
+    };
+    let prefill = args.prefill()?;
+    let projections = cuteafd_loader::families::muse_spark::weight_layout::projections_with_manifest(
+        &cfg, &core, gpus, prefill.unit_rows as usize, native_manifest.as_ref())?;
+    // #1554: every module this rank can run is bound before the measured
+    // pre-weight sample. The native manifest is empty on the HQA target, so the
+    // projection loop that used to live in the sample closure loaded nothing and
+    // the family, rotary, K6 and EXL3 package kernels all arrived afterwards,
+    // showing up as unattributed growth at Ready. The native loader caches
+    // modules per device: binding here costs no further module memory later and
+    // the expert packages stay retained for onboarding.
+    let local_package = cuteafd_loader::placement::families::muse_spark::local_package(
+        &catalog, &args.manifest, gpus, prefill.unit_rows);
+    // A missing package is only fatal when the solve onboards layers; the
+    // admission edge below reports it with its own error.
+    let package_path = match args.rtx_expert_layers {
+        // No onboarding means no expert package: never bind modules the rank cannot launch.
+        cuteafd_loader::placement::Onboard::Layers(0) => None,
+        _ => local_package.as_ref().ok().map(|(path, _)| path.clone()),
+    };
+    let expert_modules = preload_modules(&devices, &programs, &projections, prefill.unit_rows,
+        package_path.as_deref())?;
+    let inventory = RuntimeInventory::measure(&library, &device_ids, InventoryPhase::PreWeight,
+        |_| Ok(()))?;
+    crate::shared::inventory::startup_probe(&library, &device_ids, "muse-preweight", Default::default())?;
+    let (host_total, host_available) = cuteafd_loader::formats::mapped_preload::host_memory()?;
+    let built = startup::admit(startup::Options { host: cuteafd_loader::placement::families::muse_spark::HostInput {
+        total: host_total, available: host_available, reserve: args.prefix.host_cache_headroom_bytes,
+        prefix_bytes: match args.prefix.host_cache_bytes {
+            crate::shared::prefix::budget::HostBudget::Auto => None,
+            crate::shared::prefix::budget::HostBudget::Bytes(bytes) => Some(bytes) },
+        prefix_entries: args.prefix.prefix_cache_entries as u64, media_bytes: args.media_cache_bytes,
+        device_sampling: args.token_io.token_select == crate::shared::token_io::SelectPlacement::Device }, cfg: &cfg, core: &core, catalog: &catalog,
+        manifest: &manifest, projections,
+        measured: inventory.gpus.iter().map(|sample| Ok(startup::Measured { arch: sample.arch.parse()?, total_bytes: sample.total_bytes,
+            free_bytes: sample.free_bytes, untracked_bytes: sample.context_bytes })).collect::<Result<_>>()?,
+        headroom_bytes: cuteafd_loader::placement::reserve::gpu("muse_spark"), spark_ranks: args.peers.len(), prefill: args.prefill()?,
         full_prefill_logits: args.full_prefill_logits, slots: u64::from(args.max_sequences),
         mark_slots: args.prefix.mark_rule(usize::from(args.max_sequences))
             .slots(cuteafd_loader::placement::families::muse_spark::mark_bytes(&cfg, 1) as usize) as u64,
-        max_context: args.max_context,
+        max_context: args.max_context.filter(|&tokens| tokens > 0),
         pool_tokens: args.pool_tokens.filter(|&tokens| tokens > 0), onboard: args.rtx_expert_layers,
         spark_budget_bytes: args.spark_budget_bytes(),
         partial_bf16_max_rows: args.expert_partial_bf16_max_rows,
-        partial_wide_format: cuteafd_core::SparkReplyFormat::resolve(cuteafd_core::spark_reply::requested(), true).into(),
+        partial_reply_formats: cuteafd_core::spark_reply::requested(),
         local: cuteafd_loader::placement::families::muse_spark::local_workspace(&catalog,
             Some(&args.manifest), gpus, args.prefill()?.unit_rows)?,
         drafter: args.draft.as_deref().map(|snapshot| -> Result<_> {
             let config: serde_json::Value = serde_json::from_slice(&std::fs::read(snapshot.join("config.json"))
                 .with_context(|| format!("Muse drafter config {}", snapshot.display()))?)?;
-            let head = core.get_weight(cuteafd_loader::families::muse_spark::core::HEAD)
-                .map(|head| head.stored_outputs).context("Muse drafter needs the K6 target head")?;
+            let head = core.head_outputs(&cfg);
             let head_device = crate::shared::memory::device::Device { library: &library,
                 id: *device_ids.last().context("Muse devices")? };
             let sms = head_device.run(|| library.sm_count())?;
-            cuteafd_loader::placement::families::muse_spark::drafter_inventory(&cfg, &config,
+            let drafter = cuteafd_loader::placement::families::muse_spark::drafter_inventory(&cfg, &config,
                 usize::from(args.max_sequences), usize::from(args.max_sequences), head, sms as u64,
-                args.draft_kv_cache)
-        }).transpose()?, media: Some(super::media::inventory(&args.snapshot,
+                args.draft_kv_cache)?;
+            if args.tp2_dflash {
+                let sms = devices.iter().map(|device| device.run(|| library.sm_count()).map(|sms| sms as u64))
+                    .collect::<Result<Vec<_>>>()?;
+                drafter.with_tp2(snapshot, &sms, args.draft_kv_cache)
+            } else { Ok(drafter) }
+        }).transpose()?, media: Some(super::media::inventory(&view,
             args.vision, args.audio, args.vision_peers.len().max(1))?) })?;
+    tracing::info!(solve_us = built.solve_us, "Muse shared admission solve");
+    let placement = &built.placement;
+    {
+        use sha2::{Digest, Sha256};
+        let hash = |path: &std::path::Path| -> Result<String> {
+            let mut file = std::fs::File::open(path)?;
+            let mut digest = Sha256::new();
+            std::io::copy(&mut file, &mut digest)?;
+            Ok(format!("{:x}", digest.finalize()))
+        };
+        let policies = (0..gpus).map(|rank|
+            cuteafd_loader::serving_capacity::muse_graphs::policy(gpus, placement.onboard_layers, rank)).collect::<Result<Vec<_>, _>>()?;
+        cuteafd_ffi::memory_ledger::fault::set_inputs(serde_json::json!({
+            "memory_reconciliation_provenance": {
+                "schema_version": 1, "family": "muse_spark",
+                "source_commit": env!("CUTEAFD_BUILD_COMMIT"), "source_dirty": env!("CUTEAFD_BUILD_DIRTY"),
+                "toolchain": env!("CUTEAFD_BUILD_TOOLCHAIN"),
+                "native_sha256": hash(library.loaded_path())?, "programs_sha256": hash(&args.manifest)?,
+                "layout": format!("snapshot/{}; draft/{:?}; ranks/{}; sparks/{}; C{}; pool/{}",
+                    args.snapshot.display(), args.draft, gpus, args.peers.len(), args.max_sequences, placement.pool_tokens),
+                "devices": inventory.gpus, "spark_world": args.peers.len(),
+                "onboard_layers": built.solved.decisions.onboard_layers,
+                "prefill": built.solved.decisions.prefill,
+                "graph_basis": { "basis": "bytes", "enabled": args.decode_graphs, "reserve_policy": policies }
+            }
+        }));
+    }
+    cuteafd_bench::context::ResolvedSettings::placement(placement).publish();
+    cuteafd_bench::context::set_resolved("max-context-tokens", &cuteafd_loader::placement::planner::Context::resolve(cfg.max_position as u64, args.max_context).served(placement.pool_tokens).to_string());
     tracing::info!(placement = %placement.summary(), rtx_expert_layers = placement.onboard_layers,
         pool_tokens = placement.pool_tokens, k6_programs = built.projections.iter().map(|r| r.programs.len()).sum::<usize>(),
         "Muse Spark admitted TP experts with coordinator-combined partials");
-    let media = super::media::Ready::load(args, &library, built.media.as_ref().context("Muse media admission missing")?)?;
-    let prefill = args.prefill()?;
-    let cutoff = cuteafd_loader::families::muse_spark::replies::Cutoff::with_wide(args.expert_partial_bf16_max_rows,
-        cuteafd_loader::families::muse_spark::replies::DEFAULT_BF16_MAX_ROWS, cuteafd_core::SparkReplyFormat::resolve(cuteafd_core::spark_reply::requested(), true).into())?;
+    let mut media = super::media::Ready::load(args, &view, &library, &built.media, built.host)?;
+    let cutoff = cuteafd_loader::families::muse_spark::replies::Cutoff::with_formats(args.expert_partial_bf16_max_rows,
+        cuteafd_loader::families::muse_spark::replies::DEFAULT_BF16_MAX_ROWS, cuteafd_core::spark_reply::requested())?;
     let sequences = usize::from(args.max_sequences);
-    let spark = super::admission::spark_plan(&placement, prefill, cutoff, sequences, args.peers.len())?;
-    let admission_plan = crate::shared::placement::SparkAdmission::plan(&args.snapshot,
-        cuteafd_core::ExpertGeometry::MUSE_SPARK, Some(&catalog), &spark.working, args.peers.len(), None,
-        spark.model.clone())?;
-    let devices = device_ids.iter().map(|&id| crate::shared::memory::device::Device { library: &library, id })
-        .collect::<Vec<_>>();
-    let programs = devices.iter().map(|device| device.run(|| library.programs()?.with_manifest(&args.manifest)))
-        .collect::<Result<Vec<_>>>()?;
-    let context = args.max_context.unwrap_or(cfg.max_position as u64);
+    let spark = super::admission::spark_plan(placement, prefill, cutoff, sequences, args.peers.len())?;
+    let admission_plan = crate::shared::placement::SparkAdmission::plan_view(&view,
+        cuteafd_core::ExpertGeometry::MUSE_SPARK, Some(&catalog), &spark.working, args.peers.len(),
+        spark.model.clone(), None)?;
+    let context = cuteafd_loader::placement::planner::Context::resolve(cfg.max_position as u64, args.max_context).served(placement.pool_tokens);
     // The BF16 token embedding on the entry GPU (single residency; rank 1 gathers over
     // peer access), filled in the background while the layers load.
     let name = "model.language_model.embed_tokens.weight";
@@ -214,21 +305,18 @@ fn with_backend<T>(args: &ServeArgs, run: impl FnOnce(&super::backend::MuseBacke
     let onboarded = placement.layers.iter().enumerate().filter_map(|(layer, assignment)| matches!(assignment.experts,
         cuteafd_loader::placement::ExpertHome::RtxTp2 | cuteafd_loader::placement::ExpertHome::RtxWhole { .. })
         .then_some(layer)).collect::<Vec<_>>();
-    let package = if onboarded.is_empty() { None } else {
-        Some(cuteafd_loader::placement::families::muse_spark::local_package(&catalog, &args.manifest, gpus,
-            prefill.unit_rows)?.0)
-    };
+    let package = if onboarded.is_empty() { None } else { Some(local_package?.0) };
     let program_refs = programs.iter().collect::<Vec<_>>();
     use crate::shared::experts::rtx::{dense, push::{CoordinatorPush, PushPolicy}};
     let policy = PushPolicy::for_snapshot(&args.snapshot)?;
     let prepared = policy.plan(|| {
-        let experts = package.as_ref().map(|package| super::onboard::push_plan(&cfg, &placement,
+        let experts = package.as_ref().map(|package| super::onboard::push_plan(&cfg, placement,
             gpus, &onboarded, usize::try_from(prefill.unit_rows)?, package)).transpose()?;
         if admission_plan.coordinator_pushes() {
-            let (push, streams, ranks) = CoordinatorPush::prepare(&args.snapshot, Some(&catalog), gpus, experts)?;
+            let (push, streams, ranks) = CoordinatorPush::prepare_view_admitted(&view, Some(&catalog), gpus, experts, built.push.clone())?;
             Ok((push, Some((streams, ranks)), args.peers.len()))
         } else {
-            Ok((CoordinatorPush::prepare_alone(&args.snapshot, Some(&catalog), gpus, experts)?, None, 0))
+            Ok((CoordinatorPush::prepare_alone_view_admitted(&view, Some(&catalog), gpus, experts, built.push.clone())?, None, 0))
         }
     })?;
     let (push, coordinator, push_sparks) = match prepared {
@@ -238,29 +326,50 @@ fn with_backend<T>(args: &ServeArgs, run: impl FnOnce(&super::backend::MuseBacke
     let admission = admission_plan.start_with(&args.peers, coordinator)?;
     let streams = devices.iter().map(|&device| crate::shared::memory::device::Stream::new(device).map(std::rc::Rc::new))
         .collect::<Result<Vec<_>>>()?;
+    let peer = (gpus == 2).then(|| -> Result<_> {
+        let sizes = super::peer::slot_sizes(cfg.hidden, cfg.expert_hidden, cfg.topk,
+            usize::try_from(prefill.unit_rows)?, !onboarded.is_empty())?;
+        super::peer::MusePeer::new(&library, [0, 1].map(|rank|
+            crate::shared::peer_split::RankDevice { device: devices[rank].id, stream: streams[rank].raw }),
+            sizes, super::peer::decode_peer_bytes(cfg.hidden, cfg.expert_hidden, cfg.topk, !onboarded.is_empty())?)
+    }).transpose()?;
     let (embedding, ranks, local, draft) = crate::shared::placement::load_while_admitting(Some(admission), || {
         let load = || -> Result<_> {
-            let (embedding, ranks) = devices[0].run(|| crate::shared::token_io::TokenEmbedding::load(&library, source.clone(),
+            let arenas = devices.iter().enumerate().map(|(rank, &device)| {
+                let layers = built.layouts.iter().map(|per_rank| &per_rank[rank]).collect::<Vec<_>>();
+                crate::shared::memory::weight_arena::DeviceWeightArena::new(device,
+                    cuteafd_loader::families::muse_spark::weight_layout::coordinator_arena(
+                        rank, gpus, &built.global, &layers)?, ArenaTag::weights("muse/target"))
+            }).collect::<Result<Vec<_>>>()?;
+            let (embedding, ranks) = devices[0].run(|| crate::shared::token_io::TokenEmbedding::load_with(&library, source.clone(),
                 crate::shared::memory::EmbedPlacement::Gpu, || {
                     devices.iter().zip(&programs).enumerate().map(|(rank, (&device, programs))|
                         super::engine::RankResources::load(device, programs, super::engine::RankLoad { cfg: &cfg,
-                            checkpoint: &checkpoint, built: &built, placement: &placement, rank, slots: sequences as u64,
+                            checkpoint: &checkpoint, built: &built, placement, rank, stream: streams[rank].raw, slots: sequences as u64, arena: &arenas[rank],
                             unit_rows: usize::try_from(prefill.unit_rows)?, waves: usize::try_from(prefill.waves)?, context }))
                         .collect::<Result<Vec<_>>>()
-                }))?;
-            // Admission charges the drafter beside the head; it joins that GPU's
-            // dense rank before the one target/expert push group is planned.
+                }, |name, bytes| crate::shared::memory::weight_arena::weight_allocation(
+                    devices[0], Some(&arenas[0]), name, bytes, ArenaTag::weights("muse/target"))))?;
+            // Admission names the drafter's home; it joins that GPU's dense
+            // rank before the one target/expert push group is planned.
             let draft = match (args.draft.as_deref(), &built.drafter) {
-                (Some(snapshot), Some(admitted)) => Some(super::draft::MuseDraft::load(
-                    programs.last().context("Muse head programs")?, &cfg, ranks.last().context("Muse head rank")?,
-                    streams.last().context("Muse head stream")?.raw, snapshot, &embedding, admitted, args.draft_kv_cache)?),
+                (Some(snapshot), Some(admitted)) => {
+                    let home = usize::from(built.draft_home.context("Muse drafter admission names no home")?);
+                    Some(super::draft::MuseDraft::load(
+                        programs.get(home).context("Muse drafter programs")?, &cfg,
+                        ranks.get(home).context("Muse drafter rank")?,
+                        streams.get(home).context("Muse drafter stream")?.raw, snapshot, &embedding, admitted,
+                        args.draft_kv_cache, if args.tp2_dflash { Some(peer.as_ref().context("Muse TP2 draft peer")?.shared()) }
+                            else { None })?)
+                }
                 (None, None) => None,
                 _ => anyhow::bail!("Muse drafter admission differs from --draft"),
             };
             Ok((embedding, ranks, draft))
         };
-        let ((embedding, ranks, draft), records) = if push.is_some() { dense::recording(load)? }
+        let ((embedding, ranks, draft), mut records) = if push.is_some() { dense::recording(load)? }
             else { (load()?, dense::Records::default()) };
+        records.extend(media.push.records());
         let pushed = match push {
             Some(push) => {
                 let summary = records.summary();
@@ -273,14 +382,15 @@ fn with_backend<T>(args: &ServeArgs, run: impl FnOnce(&super::backend::MuseBacke
             }
             None => None,
         };
+        std::mem::take(&mut media.push).commit()?;
         let local = match &package {
             None => {
                 ensure!(pushed.as_ref().is_none_or(|ranks| ranks.iter().all(|rank| rank.len() == 0)),
                     "Muse received unselected onboarded experts");
                 Vec::new()
             }
-            Some(package) => super::onboard::load(&devices, &program_refs, &cfg, &catalog, package, &placement,
-                onboarded.clone(), usize::try_from(prefill.unit_rows)?, pushed)?,
+            Some(package) => super::onboard::load(&devices, &program_refs, &cfg, &catalog, package, placement,
+                onboarded.clone(), usize::try_from(prefill.unit_rows)?, expert_modules, pushed)?,
         };
         Ok((embedding, ranks, local, draft))
     })?;
@@ -289,7 +399,8 @@ fn with_backend<T>(args: &ServeArgs, run: impl FnOnce(&super::backend::MuseBacke
         sequences, args.peers.len())?;
     let mut engine = super::engine::MuseEngine::connect(&library, &cfg, &ranks, streams, args.peers.clone(),
         super::engine::LinkPlan { spark, cutoff, unit_rows: usize::try_from(prefill.unit_rows)?,
-            waves: usize::try_from(prefill.waves)?, intake_row_bytes }, !local.is_empty())?;
+            waves: usize::try_from(prefill.waves)?, intake_row_bytes }, peer)?;
+    if let Some(draft) = &draft { draft.prepare_workspace()?; }
     tracing::info!(ranks = engine.ranks.len(), peer = engine.peer.is_some(), vocab = embedding.vocab(),
         placement = %placement.summary(), pool_tokens = placement.pool_tokens, "Muse Spark brought up");
     // The admitted context: the pool clamps an automatic one.
@@ -300,14 +411,84 @@ fn with_backend<T>(args: &ServeArgs, run: impl FnOnce(&super::backend::MuseBacke
         catalog.exl3().context("Muse draft pricing needs EXL3 headers")?, &onboarded, gpus, engine.link.world_size()?,
         engine.link.installed_grouping()?)).transpose()?;
     tracing::info!(drafter = ?args.draft, onboarded = onboarded.len(), "Muse Spark drafter");
-    let backend = super::backend::MuseBackend::new(&cfg, &ranks, streams, &embedding, &mut engine.link,
+    let draft_receipts = if crate::shared::inventory::startup_probe_enabled() {
+        draft.as_ref().map(|draft| draft.drafter.allocation_receipts(
+            cuteafd_loader::placement::planner::CoordinatorDevices::new(&device_ids)?, "muse.drafter"))
+            .transpose()?.unwrap_or_default()
+    } else { Vec::new() };
+    let mut backend = super::backend::MuseBackend::new(&cfg, &ranks, streams, &embedding, &mut engine.link,
         engine.peer.as_ref(), usize::try_from(prefill.unit_rows)?, usize::try_from(prefill.waves)?, sequences,
-        served_context, pages, local, draft, pricing, super::media::Binding::from_snapshot(&args.snapshot, cfg.vocab_size)?)?;
+        served_context, pages, local, draft, pricing, super::media::Binding::from_view(&view, cfg.vocab_size)?, args.prefill_packing, built.host.prefix_bytes)?;
+    backend.configure_graphs(args.decode_graphs, placement.onboard_layers)?;
+    let weight_census = if crate::shared::inventory::startup_probe_enabled() {
+        use cuteafd_loader::placement::planner::{CoordinatorDevices, Lifetime, PhaseOrder};
+        use crate::shared::memory::receipts::{Census, Inventory};
+        let devices = CoordinatorDevices::new(&device_ids)?;
+        let mut owners = Inventory::new(devices, "muse.target", Lifetime::RESIDENT,
+            cuteafd_core::memory_layout::Category::Weights, "Muse target weights");
+        for (rank, resources) in ranks.iter().enumerate() {
+            let mut rank_owners = Inventory::new(devices, &format!("muse.target.rank{rank}"), Lifetime::RESIDENT,
+                cuteafd_core::memory_layout::Category::Weights, "Muse target weights");
+            resources.globals.inventory(&mut rank_owners)?;
+            for (layer, weights) in resources.layers.iter().enumerate() {
+                weights.inventory(&mut rank_owners, &format!("layers.{layer}"))?;
+            }
+            owners.receipts.extend(rank_owners.receipts);
+        }
+        let mut census = Census::default();
+        census.owners(owners.receipts);
+        census.owners(embedding.allocation_receipts(devices, "muse.target.embedding")?);
+        census.owners(draft_receipts);
+        census.normalize(PhaseOrder::TARGET_THEN_DRAFT)?;
+        tracing::info!("Muse startup named census covers target weights and drafter; other owners remain in native-live records");
+        Some(census)
+    } else { None };
+    crate::shared::inventory::startup_probe(&library, &device_ids, "muse-backend-ready",
+        crate::shared::inventory::StartupEvidence { census: weight_census.as_ref(), ..Default::default() })?;
     // Engine teardown may block while joining exchange workers; preserve the
     // original scheduler error before any backend or native owners unwind.
     // Scheduler-owned selection, cache copies and timing live beside the target head.
     ranks.last().context("Muse scheduler head rank")?.device
         .run(|| run(&backend, sequences, media)).inspect_err(log_worker_error)
+}
+
+/// Every module family a Muse coordinator rank can run, bound before the
+/// measured pre-weight sample (#1554): the required programs, the shared rotary
+/// table builder, the K6 and native projection programs, and — when the layout
+/// may onboard expert layers — the retained EXL3 package capacities onboarding
+/// reuses. The native loader caches modules per device, so these bindings are
+/// the process's whole module footprint and none of them reload later.
+fn preload_modules<'a>(devices: &[crate::shared::memory::device::Device<'a>],
+    programs: &[cuteafd_ffi::programs::Programs<'a>],
+    projections: &[cuteafd_loader::families::muse_spark::weight_layout::RankProjections],
+    unit_rows: u64, package: Option<&std::path::Path>)
+    -> Result<Vec<Option<Vec<crate::shared::experts::exl3::execution::Exl3Modules<'a>>>>> {
+    use crate::shared::experts::rtx::{exl3::Exl3Tp2, RtxSelectionPolicy};
+    let ranks = devices.len();
+    ensure!(programs.len() == ranks && projections.len() == ranks, "Muse preload device count");
+    for (rank, device) in devices.iter().enumerate() {
+        let rank_programs = programs.get(rank).context("Muse preload programs")?;
+        let admitted = projections.get(rank).context("Muse preload projections")?;
+        device.run(|| {
+            for (name, pointers) in super::programs::required(ranks)? {
+                rank_programs.program(&name, pointers)?;
+            }
+            rank_programs.program(super::programs::ROPE_TABLES, &["cos", "sin"])?;
+            super::core::CorePrograms::preload(rank_programs, *device, admitted)
+        }).with_context(|| format!("Muse module preload on GPU {}", device.id))?;
+    }
+    let Some(package) = package else { return Ok(Vec::new()); };
+    let rows = usize::try_from(unit_rows)?;
+    devices.iter().map(|device| {
+        let modules = if ranks == 2 {
+            Exl3Tp2::preload_tp2_modules(*device, package, rows, cuteafd_core::expert_geometry(),
+                RtxSelectionPolicy::CanonicalDecode)?
+        } else {
+            Exl3Tp2::preload_whole_modules(*device, package, rows, cuteafd_core::expert_geometry(),
+                RtxSelectionPolicy::CanonicalDecode)?
+        };
+        Ok(Some(modules))
+    }).collect()
 }
 
 fn log_worker_error(error: &anyhow::Error) {
@@ -319,26 +500,33 @@ fn worker(args: &ServeArgs, receive: &mut tokio::sync::mpsc::Receiver<cuteafd_ap
     initialized: impl FnOnce(super::media::ApiReady) -> Result<()>) -> Result<()> {
     use crate::shared::qwen::scheduler::{self, Backend as _};
     with_backend(args, |backend, sequences, ready| {
-        let super::media::Ready { encoder, image, audio, cache_bytes, prefix } = ready;
+        let super::media::Ready { encoder, image, audio, cache_bytes, prefix, .. } = ready;
         let api = super::media::ApiReady { context: backend.geometry().max_context, image, audio,
             image_health: encoder.health_handle_for(false), audio_health: encoder.health_handle_for(true) };
         let mut media = cuteafd_engine::media::MediaAdmission::new(cuteafd_engine::media::EmbeddingCache::new(cache_bytes),
             encoder, 16);
-        let drafts = match (&args.draft, args.draft_fixed) {
-            (None, _) => scheduler::Drafts::None,
-            (Some(_), Some(depth)) => scheduler::Drafts::Neural { depth: usize::from(depth), fixed: true },
-            (Some(snapshot), None) => scheduler::Drafts::Neural {
-                depth: crate::shared::speculation::dflash::DflashConfig::read(snapshot)?.drafts(), fixed: false },
+        let drafts = match &args.draft {
+            None => scheduler::Drafts::None,
+            Some(snapshot) => scheduler::Drafts::Neural {
+                depth: crate::shared::speculation::dflash::DflashConfig::read(snapshot)?.drafts() },
         };
-        scheduler::schedule(backend, &args.snapshot, receive, stats, sequences, drafts, eos,
+        scheduler::schedule(backend, &args.snapshot, receive, stats, sequences, drafts, args.draft_length, eos,
             args.decode_share, &prefix, args.loop_abort.config(), args.token_io.token_select, &mut media, None,
-            || initialized(api))
+            || {
+                crate::shared::inventory::startup_probe(backend.library(), &args.devices(), "muse-scheduler-ready", Default::default())?;
+                initialized(api)
+            })
     })
 }
 
 pub(crate) async fn run(mut args: ServeArgs) -> Result<()> {
+    args.draft_length.report_inactive(args.draft.is_some());
     use cuteafd_api::openai::{chat::muse::MuseEncoding, ModelEncoding, ModelProfile};
     args.validate()?;
+    let view = args.attention.selected_view.clone().map(Ok)
+        .unwrap_or_else(|| args.attention.select(&args.snapshot))?;
+    args.attention.validate_view(&view)?;
+    args.attention.selected_view = Some(view);
     args.prefix.resolve_entries(usize::from(args.max_sequences));
     let api = args.api.load()?;
     let snapshot = args.snapshot.clone();
@@ -362,11 +550,9 @@ pub(crate) async fn run(mut args: ServeArgs) -> Result<()> {
             if let Some(ready) = ready.take() { let _ = ready.send(Ok(context)); }
             Ok(())
         });
-        if let Some(ready) = ready.take() {
-            let _ = ready.send(Err(anyhow::anyhow!("Muse Spark initialization failed: {:#}",
-                result.as_ref().err().context("worker exited before readiness")?)));
-        }
-        result
+        crate::shared::serve::forward_initialization(result, ready.is_some(), "Muse Spark initialization failed", |error| {
+            ready.take().expect("pending readiness").send(Err(error)).map_err(|result| match result { Err(error) => error, Ok(_) => unreachable!("sent an error") })
+        })
     });
     let ready = ready_rx.await.context("Muse Spark worker exited before readiness")??;
     let limits = args.prefix.reserve.limits(ready.context)?;
@@ -378,11 +564,12 @@ pub(crate) async fn run(mut args: ServeArgs) -> Result<()> {
     let listener = tokio::net::TcpListener::bind(&args.listen).await?;
     cuteafd_bench::ready(&listener);
     crate::shared::memory_report::log("ready");
+    let mut handle = Some(handle);
     tokio::select! {
-        served = axum::serve(listener, api.app(router, hub)
-            .into_make_service_with_connect_info::<SocketAddr>()) => served?,
-        _ = crate::shared::api::watch_scheduler(handle) => unreachable!(),
+        served = crate::shared::api::serve_http(listener, api.app(router, hub), "muse_spark") => served?,
+        _ = crate::shared::api::watch_scheduler(&mut handle) => unreachable!(),
     }
+    crate::shared::api::finish_scheduler(&mut handle, "muse_spark").await?;
     Ok(())
 }
 
@@ -392,6 +579,22 @@ mod tests {
     use clap::Parser;
 
     const PEERS: &str = "127.0.0.1:1,127.0.0.1:2,127.0.0.1:3,127.0.0.1:4,127.0.0.1:5,127.0.0.1:6";
+
+    #[test]
+    fn tp2_dflash_requires_a_drafter_and_two_distinct_devices() -> Result<()> {
+        let mut a = args(&["--peers", PEERS])?;
+        assert!(!a.tp2_dflash);
+        a.tp2_dflash = true;
+        assert!(a.validate().is_err());
+        a.draft = Some("/draft".into());
+        assert!(a.validate().is_err());
+        a.split_device = Some(1);
+        a.validate()?;
+        a.tp2_dflash = false;
+        a.split_device = None;
+        a.validate()?;
+        Ok(())
+    }
 
     #[test]
     fn worker_error_logs_full_chain_before_owner_teardown() {
@@ -464,7 +667,7 @@ mod tests {
     fn live_tp2_one_token_forward_and_selection() -> Result<()> {
         use crate::shared::{qwen::scheduler::Backend as _, token_io::{RowSelect, SelectBatch, SelectPlacement, TokenSelector}};
         let mut args = args(&["--split-device", "1", "--rtx-expert-layers", "0",
-            "--pool-tokens", "16384", "--max-context", "8192", "--max-sequences", "1"])?;
+            "--pool-tokens", "16384", "--max-context-tokens", "8192", "--max-sequences", "1"])?;
         args.snapshot = std::env::var("CUTEAFD_GOLDEN_SNAPSHOT")?.into();
         args.native_lib = std::env::var("CUTEAFD_NATIVE_LIB")?.into();
         args.manifest = std::env::var("CUTEAFD_PROGRAM_MANIFEST")?.into();
@@ -563,14 +766,16 @@ mod tests {
         assert_eq!(defaults.pool_tokens, None);
         assert_eq!(defaults.rtx_expert_layers, cuteafd_loader::placement::Onboard::Auto);
         assert_eq!(defaults.max_sequences, 16);
+        assert!(defaults.decode_graphs);
+        assert!(!args(&["--peers", PEERS, "--decode-graphs", "false"])?.decode_graphs);
         assert_eq!(defaults.vision, cuteafd_loader::plan::MediaMode::Auto);
         assert_eq!(defaults.audio, cuteafd_loader::plan::MediaMode::Auto);
         assert!(defaults.vision_peers.is_empty() && defaults.audio_peers.is_empty());
         assert_eq!(defaults.spark_budget_bytes(), cuteafd_loader::plan::DEFAULT_SPARK_BUDGET_BYTES);
         assert_eq!(defaults.expert_partial_bf16_max_rows, 64);
         assert_eq!(cuteafd_core::SparkReplyFormat::resolve(None, true), cuteafd_core::SparkReplyFormat::Nvfp4);
-        assert!(args(&["--peers", PEERS, "--spark-reply-format", "fp8"]).is_ok());
-        assert!(args(&["--peers", PEERS, "--spark-reply-format", "bf16"]).is_ok());
+        assert!(args(&["--peers", PEERS, "--spark-prefill-reply-format", "fp8"]).is_ok());
+        assert!(args(&["--peers", PEERS, "--spark-prefill-reply-format", "bf16"]).is_ok());
         args(&["--peers", PEERS, "--expert-partial-bf16-max-rows", "4096"])?.validate()?;
         let single = args(&["--peers", PEERS, "--device", "1"])?;
         single.validate()?;
@@ -648,6 +853,14 @@ mod tests {
     }
 
     #[test]
+    fn packing_defaults_to_unrestricted_and_exact_remains_explicit() -> Result<()> {
+        use crate::shared::prefill_packing::PackingMode;
+        assert_eq!(args(&["--peers", PEERS])?.prefill_packing, PackingMode::Unrestricted);
+        assert_eq!(args(&["--peers", PEERS, "--prefill-packing", "exact"])?.prefill_packing, PackingMode::Exact);
+        Ok(())
+    }
+
+    #[test]
     fn prefill_shape_is_the_planners() -> Result<()> {
         let shape = args(&["--peers", PEERS])?.prefill()?;
         let planned = cuteafd_loader::serving_capacity::prefill_waves::prefill_shape(6,
@@ -660,7 +873,7 @@ mod tests {
 
     #[test]
     fn unsupported_layouts_refuse_before_any_device_access() -> Result<()> {
-        assert!(args(&[])?.validate().is_err(), "experts need Spark ranks");
+        args(&[])?.validate()?;
         let nine = (1..=9).map(|n| format!("127.0.0.1:{n}")).collect::<Vec<_>>().join(",");
         // Worlds 5, 7 and 8 come from the shared range data (#941).
         for world in [5, 7, 8] {
@@ -669,11 +882,10 @@ mod tests {
         }
         for extra in [vec!["--peers", nine.as_str()], vec!["--peers", "127.0.0.1:1,127.0.0.1:1"],
             vec!["--peers", PEERS, "--device", "1", "--split-device", "1"], vec!["--peers", PEERS, "--split-device", "0"],
-            vec!["--peers", PEERS, "--max-context", "1048577"], vec!["--peers", PEERS, "--max-context", "0"],
-            vec!["--peers", PEERS, "--spark-budget-gib", "0"], vec!["--peers", PEERS, "--spark-budget-gib", "NaN"],
+            vec!["--peers", PEERS, "--max-context-tokens", "1048577"], vec!["--peers", PEERS, "--max-context-tokens", "0"],
             vec!["--peers", PEERS, "--prefill-rows", "4097"], vec!["--peers", PEERS, "--prefix-partial", "on"],
             vec!["--peers", PEERS, "--expert-partial-bf16-max-rows", "8"]] {
-            assert!(args(&extra)?.validate().is_err(), "{extra:?}");
+            assert!(args(&extra).is_err() || args(&extra)?.validate().is_err(), "{extra:?}");
         }
         assert!(args(&["--peers", PEERS, "--max-sequences", "65"]).is_err());
         Ok(())

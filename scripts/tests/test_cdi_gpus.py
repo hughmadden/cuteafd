@@ -70,6 +70,11 @@ def test_wsl_all_only_spec_maps_single_gpu_host(tmp_path, monkeypatch):
         cdi.cdi_gpu_args('0,1', [spec])
 
 
+def test_specs_override_the_system_paths(spec, monkeypatch):
+    monkeypatch.setenv('CUTEAFD_CDI_SPECS', str(spec))
+    assert cdi.cdi_gpu_args('GPU-abc-123') == ['--device', 'nvidia.com/gpu=GPU-abc-123']
+
+
 def test_per_gpu_spec_keeps_exact_names(spec, monkeypatch):
     monkeypatch.setenv('CUTEAFD_CDI_GPU_COUNT', '1')
     assert cdi.cdi_gpu_args('0', [spec]) == ['--device', 'nvidia.com/gpu=0']

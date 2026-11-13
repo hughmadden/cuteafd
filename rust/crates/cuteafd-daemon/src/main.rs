@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{CommandFactory, FromArgMatches};
 use serde::Serialize;
 use std::io::IsTerminal;
@@ -66,16 +66,52 @@ fn serve_media(command: &mut Commands) -> Option<ServeMedia<'_>> {
     }
 }
 
+/// Every qualified serve/golden entry stores the bundle before media or engine setup.
+fn command_attention(command: &mut Commands) -> Option<(&std::path::Path, &mut cli::CoreViewArgs)> {
+    match command {
+        Commands::ServeGlmf(args) => Some((&args.engine.snapshot, &mut args.engine.attention)),
+        Commands::GlmfGolden(args) => Some((&args.engine.snapshot, &mut args.engine.attention)),
+        Commands::ServeGlm(args) => Some((&args.engine.snapshot, &mut args.engine.attention)),
+        Commands::GlmGolden(args) => Some((&args.engine.snapshot, &mut args.engine.attention)),
+        Commands::ServeKimi(args) => Some((&args.snapshot, &mut args.attention)),
+        Commands::KimiGolden(args) => Some((&args.snapshot, &mut args.attention)),
+        Commands::ServeStep5(args) => Some((&args.snapshot, &mut args.attention)),
+        Commands::Step5Golden(args) => Some((&args.snapshot, &mut args.attention)),
+        Commands::ServeMuse(args) => Some((&args.snapshot, &mut args.attention)),
+        Commands::MuseGolden(args) => Some((&args.engine.snapshot, &mut args.engine.attention)),
+        _ => None,
+    }
+}
+
+fn select_command_attention(command: &mut Commands,
+    selected: Option<cuteafd_loader::plan::checkpoint::CheckpointView>) -> Result<()> {
+    if let Some((snapshot, attention)) = command_attention(command) {
+        let view = selected.map(Ok).unwrap_or_else(|| attention.select(snapshot))?;
+        attention.validate_view(&view)?;
+        attention.selected_view = Some(view);
+    }
+    Ok(())
+}
+
 fn resolve_serve_media(command: &mut Commands, vision: cuteafd_loader::plan::MediaMode,
     audio: cuteafd_loader::plan::MediaMode) -> Result<(cuteafd_loader::plan::MediaMode, cuteafd_loader::plan::MediaMode)> {
     use cuteafd_loader::plan::MediaMode;
+    // Once selected, a missing view is an error, never permission to reopen defaults.
+    let selected = command_attention(command).map(|(_, attention)| {
+        attention.selected_view.as_ref().context("media requires its selected checkpoint view")?.config()
+    }).transpose()?;
     let Some(options) = serve_media(command) else {
         anyhow::ensure!(matches!(audio, MediaMode::Auto | MediaMode::Off),
             "explicit audio placement requires a media-capable serve command");
         return Ok((vision, MediaMode::Off));
     };
+    let config = match selected {
+        Some(config) => config,
+        None if vision != MediaMode::Off || audio != MediaMode::Off =>
+            cuteafd_loader::read_json_file(&options.snapshot.join("config.json"))?,
+        None => serde_json::Value::Null,
+    };
     let vision = if vision == MediaMode::Off { vision } else {
-        let config: serde_json::Value = cuteafd_loader::read_json_file(&options.snapshot.join("config.json"))?;
         match config.get("vision_config").filter(|value| !value.is_null()) {
             Some(config) => {
                 anyhow::ensure!(config.is_object(), "vision_config must be an object");
@@ -85,7 +121,7 @@ fn resolve_serve_media(command: &mut Commands, vision: cuteafd_loader::plan::Med
             None => anyhow::bail!("checkpoint has no bundled vision tower"),
         }
     };
-    let audio = cuteafd_loader::plan::resolve_audio(audio, options.snapshot)?;
+    let audio = cuteafd_loader::plan::resolve_audio_config(audio, options.snapshot, &config)?;
     anyhow::ensure!(options.audio.is_some() || audio == MediaMode::Off,
         "this serve command has no bundled audio execution owner");
     *options.vision = vision;
@@ -163,8 +199,20 @@ mod media_defaults_tests {
 
     fn media_command(name: &str, snapshot: &std::path::Path) -> super::Commands {
         use clap::Parser;
-        super::cli::Cli::try_parse_from(["cuteafd", name, "--snapshot", snapshot.to_str().unwrap(),
-            "--native-lib", "/native.so"]).unwrap().command
+        let mut command = super::cli::Cli::try_parse_from(["cuteafd", name, "--snapshot", snapshot.to_str().unwrap(),
+            "--native-lib", "/native.so"]).unwrap().command;
+        super::select_command_attention(&mut command, None).unwrap();
+        command
+    }
+
+    #[test]
+    fn core_views_have_explicit_cli_and_no_old_flags() -> anyhow::Result<()> {
+        use clap::Parser;
+        for view in ["original", "k6-compact", "k8-compact", "fp8-compact"] {
+            super::cli::Cli::try_parse_from(["cuteafd", "plan", "/not-read", "--core-view", view])?;
+        }
+        assert!(super::cli::Cli::try_parse_from(["cuteafd", "plan", "/not-read", "--core-view", "compact"]).is_err());
+        Ok(())
     }
 
     #[test]
@@ -255,7 +303,14 @@ fn main() -> Result<()> {
         .init();
     tracing::info!("{host_isa}");
     tracing::info!("{malloc}");
-    tokio::runtime::Builder::new_multi_thread().enable_all().build()?.block_on(run())
+    let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
+    let result = shared::memory_report::finish(runtime.block_on(run()));
+    shared::decode_graph::device::shutdown_traces();
+    shared::speculation_trace::shutdown();
+    cuteafd_ffi::memory_ledger::fault::shutdown();
+    // Blocking CUDA workers cannot be cancelled; a stuck peer must not hang exit.
+    runtime.shutdown_timeout(std::time::Duration::from_secs(1));
+    result
 }
 
 async fn run() -> Result<()> {
@@ -263,32 +318,49 @@ async fn run() -> Result<()> {
     let parse = |matches: clap::ArgMatches| {
 
         match Cli::from_arg_matches(&matches) {
-            Ok(cli) => (cli.command, matches, cli.coordinator_gpu_budget_gib, cli.vision, cli.audio, cli.max_image_tokens, cli.image_url_fetch,
-                cuteafd_transport::wait_policy::WaitPolicy { wait: cli.host_wait,
-                    idle_park: std::time::Duration::from_secs_f64(cli.idle_park_seconds) }, cli.spark_reply_format),
+            Ok(mut cli) => {
+                cli::resolve_tp2_dflash(&mut cli.command, &matches);
+                (cli.command, matches, cli.memory, cli.vision, cli.audio, cli.max_image_tokens, cli.image_url_fetch,
+                    cuteafd_transport::wait_policy::WaitPolicy { wait: cli.host_wait,
+                        idle_park: std::time::Duration::from_secs_f64(cli.idle_park_seconds) }, cuteafd_core::spark_reply::SparkReplyFormats {
+                            prefill: cli.spark_prefill_reply_format, decode: cli.spark_decode_reply_format },
+                    cli.coordinator_weight_budget_gib, cli.graph_disable_low_mem)
+            },
             Err(error) => error.exit(),
         }
     };
-    let (command, matches, initial_budget, initial_vision, initial_audio, initial_image_cap, initial_fetch, initial_wait, initial_reply) =
+    let (command, matches, initial_budget, initial_vision, initial_audio, initial_image_cap, initial_fetch, initial_wait, initial_reply, initial_weight_budget, initial_graph_floor) =
         parse(Cli::command().get_matches());
-    for replacement in cli::deprecated_budget_flags(std::env::args()) {
-        eprintln!("warning: deprecated coordinator budget flag; use {replacement}");
-    }
+    let mut selected_view = None;
     // `serve` and `golden` pick the family and stand for its own command.
-    let (mut command, matches, family_budget, family_vision, family_audio, family_image_cap, family_fetch, wait_policy, family_reply) = match command {
-        Commands::Serve(args) => match commands::family::argv(commands::family::Kind::Serve, args)? {
-            Some(argv) => parse(Cli::command().get_matches_from(argv)),
+    let (mut command, matches, family_budget, family_vision, family_audio, family_image_cap, family_fetch, wait_policy, family_reply, family_weight_budget, family_graph_floor) = match command {
+        Commands::Serve(args) => match commands::family::resolve(commands::family::Kind::Serve, args)? {
+            Some(resolved) => { selected_view = resolved.view; parse(Cli::command().get_matches_from(resolved.argv)) },
             None => return Ok(()),
         },
-        Commands::Golden(args) => match commands::family::argv(commands::family::Kind::Golden, args)? {
-            Some(argv) => parse(Cli::command().get_matches_from(argv)),
+        Commands::Golden(args) => match commands::family::resolve(commands::family::Kind::Golden, args)? {
+            Some(resolved) => { selected_view = resolved.view; parse(Cli::command().get_matches_from(resolved.argv)) },
             None => return Ok(()),
         },
         command => (command, matches, initial_budget, initial_vision, initial_audio, initial_image_cap, initial_fetch,
-            initial_wait, initial_reply),
+            initial_wait, initial_reply, initial_weight_budget, initial_graph_floor.clone()),
     };
-    cuteafd_core::spark_reply::set_requested(family_reply.or(initial_reply)).map_err(anyhow::Error::msg)?;
-    // Read by the coordinator and every Spark worker from the same key.
+    if let Some((role, directory)) = shared::memory_report::dump_location(&matches) {
+        let host = std::env::var("CUTEAFD_PROFILE_HOST").unwrap_or_else(|_| {
+            std::env::var("HOSTNAME").map(|name| format!("container {name}")).unwrap_or_else(|_| "unknown".into())
+        });
+        if let Err(error) = cuteafd_ffi::memory_ledger::fault::initialize(&directory, &host, &role) {
+            tracing::error!(%error, directory = %directory.display(), "memory failure dump unavailable: cannot preopen spool");
+        }
+    } else if matches.subcommand_name().is_some_and(|name| name == "expertd-native" || name.starts_with("serve")) {
+        tracing::warn!("memory failure dump unavailable: no configured instance usage directory or profile output directory");
+    }
+    select_command_attention(&mut command, selected_view)?;
+    cuteafd_core::spark_reply::set_requested(cuteafd_core::spark_reply::SparkReplyFormats {
+        prefill: family_reply.prefill.or(initial_reply.prefill),
+        decode: family_reply.decode.or(initial_reply.decode),
+    }).map_err(anyhow::Error::msg)?;
+    // Read by the coordinator and every Spark worker from the same keys.
     cuteafd_transport::wait_policy::set_wait_policy(wait_policy)?;
     if let Some((_, options)) = matches.subcommand() {
         if let Ok(Some(path)) = options.try_get_one::<std::path::PathBuf>("native_lib") {
@@ -302,10 +374,12 @@ async fn run() -> Result<()> {
     };
     // GLM 5.3 Flash: automatic vision serves text when the checkpoint's own chat template cannot
     // mark images. Planner-resolved peers are an explicit placement and keep serving's refusal.
-    let vision = match &command {
-        Commands::ServeGlmf(args) if args.vision_peers.is_none() => {
-            let (vision, note) = families::glm5_flash::serve::auto_vision(vision, &args.engine.snapshot,
-                args.chat_template_from.as_deref())?;
+    let vision = match &mut command {
+        Commands::ServeGlmf(args) => {
+            let view = args.engine.attention.selected_view.as_ref().context("selected Flash view")?;
+            let (vision, note) = if args.vision_peers.is_none() {
+                families::glm5_flash::serve::auto_vision_view(vision, &view, args.chat_template_from.as_deref())?
+            } else { (vision, None) };
             if let Some(note) = note { tracing::warn!("{note}"); }
             vision
         }
@@ -324,21 +398,39 @@ async fn run() -> Result<()> {
     cuteafd_api::openai::media::set_preparation_policy(
         family_image_cap.or(initial_image_cap).unwrap_or(4096) as usize,
         family_fetch.or(initial_fetch).unwrap_or(cuteafd_api::openai::media::ImageUrlFetch::Public))?;
-    let coordinator_budget_gib = family_budget.or(initial_budget);
+    let weight_budget_gib = family_weight_budget.or(initial_weight_budget);
     if let Commands::Plan(args) = &mut command {
-        args.coordinator_gpu_budget_gib = coordinator_budget_gib;
-    } else if let Some(gib) = coordinator_budget_gib {
+        args.coordinator_weight_budget_gib = weight_budget_gib.unwrap_or(80.0);
+    } else if let Some(gib) = weight_budget_gib {
+        let bytes = cuteafd_loader::plan::budget_bytes("--coordinator-weight-budget-gib", gib)?;
+        shared::memory::budget::set_resident_weight_limit(cuteafd_loader::placement::ResidentWeights(bytes))?;
+    }
+    let memory = family_budget.or(initial_budget);
+    let policy = memory.policy();
+    policy.validate()?;
+    if let Commands::Plan(args) = &mut command {
+        args.memory = memory;
+    } else if let Some(cap) = policy.gpu_cap {
         anyhow::ensure!(matches!(&command, Commands::ServeNative(_) | Commands::ServeMimo(_)
             | Commands::ServeQwen4(_) | Commands::ServeQwen35(_) | Commands::ServeKimi(_) | Commands::ServeStep5(_) | Commands::ServeMuse(_) | Commands::ServeGlmf(_) | Commands::ServeGlm(_)
             | Commands::ServeDsv4(_) | Commands::V41Golden(_) | Commands::Dsv4Golden(_) | Commands::GlmGolden(_)
-            | Commands::MimoGolden(_) | Commands::GlmfGolden(_) | Commands::Qwen4Golden(_) | Commands::Qwen35Golden(_) | Commands::Step5Golden(_) | Commands::KimiGolden(_)),
-            "--coordinator-gpu-budget-gib applies only to coordinator serve/golden and plan commands");
-        let budget = cuteafd_core::serving_capacity::GpuMemoryBudget::from_gib(gib)?;
-        cuteafd_ffi::set_coordinator_gpu_budget(budget.0)?;
-        tracing::info!(gib, bytes = budget.0, "installed per-GPU coordinator memory budget; SM count and L2 unchanged");
+            | Commands::MimoGolden(_) | Commands::GlmfGolden(_) | Commands::Qwen4Golden(_) | Commands::Qwen35Golden(_) | Commands::Step5Golden(_) | Commands::KimiGolden(_) | Commands::MuseGolden(_)),
+            "--gpu-memory-cap applies only to coordinator serve/golden and plan commands");
+        cuteafd_ffi::set_coordinator_gpu_budget(cap)?;
+        tracing::info!(bytes = cap, "installed per-GPU memory cap; SM count and L2 unchanged");
     }
+    policy.install().map_err(anyhow::Error::msg)?;
+    // Resolve the environment only after generic serve/golden's family reparse:
+    // an environment fallback must not overwrite an explicit outer CLI value.
+    let graph_floor = family_graph_floor.or(initial_graph_floor).or(
+        std::env::var("CUTEAFD_GRAPH_DISABLE_LOW_MEM").map(Some).or_else(|error| match error {
+            std::env::VarError::NotPresent => Ok(None),
+            error => Err(error),
+        })?);
+    shared::decode_graph::device::set_physical_floor(graph_floor.clone())?;
+    shared::memory_report::register_inputs(&matches, &policy, weight_budget_gib);
     // A serve command's resolved options, for the server's benchmark reports.
-    commands::bench::capture(&matches, coordinator_budget_gib)?;
+    commands::bench::capture(&matches, memory, graph_floor.as_deref())?;
     // Memory ledger reports for the long-running roles (device use by category).
     match &command {
         Commands::Expertd(_) => {
@@ -375,6 +467,7 @@ async fn run() -> Result<()> {
         Commands::ServeKimi(args) => families::kimi_k3::serve::run(args).await,
         Commands::ServeStep5(args) => families::step5::serve::run_serve(args).await,
         Commands::ServeMuse(args) => families::muse_spark::serve::run(args).await,
+        Commands::MuseGolden(args) => families::muse_spark::packed_check::run(args).await,
         Commands::ServeQwen35(args) => families::qwen3_5::serve::run_serve(args).await,
         Commands::ServeQwen4(args) => families::qwen4::serve::run_serve(args).await,
         Commands::ServeGlmf(args) => families::glm5_flash::serve::run_serve(args).await,

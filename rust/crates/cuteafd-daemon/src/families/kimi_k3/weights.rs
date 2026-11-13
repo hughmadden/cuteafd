@@ -4,7 +4,7 @@
 use crate::shared::{memory::device::{Allocation, Device}, placement::layers::AttentionShare};
 use anyhow::{ensure, Context, Result};
 use cuteafd_core::{DType, memory_layout::{Basis, Category}};
-use cuteafd_ffi::{CuteafdDeviceBuffer, KimiKdaWeights, KimiMlaWeights};
+use cuteafd_ffi::{CuteafdDeviceBuffer, KimiIndexWeights, KimiKdaWeights, KimiMlaWeights};
 use cuteafd_loader::{families::kimi_k3::{config::{KimiAttention, KimiK3Config}, kda, mla,
     w8::{self, ResidualWeightSite}}, formats::mla::MlaOperand, kda::{KdaOperand, KdaTensor}, placement::{Demand, LayerMode}, LoadedTensor};
 use std::collections::BTreeMap;
@@ -33,6 +33,13 @@ pub(crate) struct GlobalLayout {
 }
 
 impl GlobalLayout {
+    pub(crate) fn shared_layout(&self) -> cuteafd_loader::families::kimi_k3::weight_layout::GlobalLayout {
+        cuteafd_loader::families::kimi_k3::weight_layout::GlobalLayout {
+            rank: self.rank, hidden: self.hidden, vocab: self.vocab, operands: self.operands.clone(),
+            core_head: self.core_head.as_ref().map(CoreWeightLayout::shared_layout),
+        }
+    }
+
     pub(crate) fn pair(cfg: &KimiK3Config) -> Result<[Self; 2]> {
         Self::pair_with_core(cfg, &CoreInventory::default())
     }
@@ -52,9 +59,12 @@ impl GlobalLayout {
     }
 
     pub(crate) fn demand(&self) -> Result<Demand> {
-        Ok(Demand::new(self.rank as u8, Category::Weights, "Kimi global weights", self.bytes()? as u64, Basis::Exact))
+        let bytes = self.bytes()? as u64;
+        Ok(Demand::new(self.rank as u8, Category::Weights, "Kimi global weights", bytes, Basis::Exact)
+            .with_resident_weights(cuteafd_loader::placement::ResidentWeights(bytes)))
     }
 
+    #[cfg(test)]
     pub(crate) fn pack(&self, cfg: &KimiK3Config, mut read: impl FnMut(&str) -> Result<LoadedTensor>) -> Result<PackedGlobal> {
         ensure!(self.rank < 2, "Kimi global rank outside admission");
         let whole = self.rank == 0 && self.operands.contains_key("output.norm");
@@ -93,6 +103,7 @@ impl GlobalLayout {
         Ok(packed)
     }
 
+    #[cfg(test)]
     fn check(&self, packed: &PackedGlobal) -> Result<()> {
         ensure!(packed.rank == self.rank && packed.operands.len() == self.operands.len()
             && self.operands.iter().all(|(name, bytes)| packed.operands.get(name).is_some_and(|data| data.len() == *bytes)),
@@ -101,22 +112,9 @@ impl GlobalLayout {
         if let (Some(layout),Some(head))=(&self.core_head,&packed.core_head) {layout.check(head)?;}
         Ok(())
     }
-
-    pub(super) fn upload<'a>(&self, device: Device<'a>, packed: PackedGlobal) -> Result<GlobalWeights<'a>> {
-        self.check(&packed)?;
-        let operands = packed.operands.into_iter().map(|(name, bytes)| {
-            let _scope = cuteafd_ffi::memory_ledger::scope("weights/kimi global weights");
-            let allocation = Allocation::new(device, bytes.len())?;
-            ensure!(allocation.buffer.bytes == bytes.len() && allocation.buffer.device_id == device.id,
-                "Kimi global allocation differs from admitted extent/device");
-            device.run(|| device.library.copy_h2d(allocation.buffer, &bytes))?;
-            Ok((name, allocation))
-        }).collect::<Result<_>>()?;
-        let core_head=packed.core_head.map(|head|self.core_head.as_ref().unwrap().upload(device,head)).transpose()?;
-        Ok(GlobalWeights { operands, core_head })
-    }
 }
 
+#[cfg(test)]
 pub(crate) struct PackedGlobal {
     rank: usize,
     operands: BTreeMap<&'static str, Vec<u8>>,
@@ -153,9 +151,20 @@ pub(crate) struct LayerLayout {
     operands: BTreeMap<&'static str, usize>,
     pub(crate) attention: AttentionShare,
     core: BTreeMap<&'static str, CoreWeightLayout>,
+    pub(crate) native: BTreeMap<&'static str, cuteafd_loader::formats::native_attention::NativeLayout>,
 }
 
 impl LayerLayout {
+    pub(crate) fn shared_layout(&self) -> cuteafd_loader::families::kimi_k3::weight_layout::LayerLayout {
+        use cuteafd_loader::families::kimi_k3::weight_layout::WeightAttention;
+        cuteafd_loader::families::kimi_k3::weight_layout::LayerLayout {
+            operands: self.operands.clone(), native: self.native.clone(),
+            attention: match self.attention { AttentionShare::Absent => WeightAttention::Absent,
+                AttentionShare::Whole => WeightAttention::Whole, AttentionShare::Split => WeightAttention::Split },
+            core: self.core.iter().map(|(&name, layout)| (name, layout.shared_layout())).collect(),
+        }
+    }
+
     pub(crate) fn pair(cfg: &KimiK3Config, layer: usize, mode: LayerMode) -> Result<[Self; 2]> {
         Self::pair_with_core(cfg, layer, mode, &CoreInventory::default())
     }
@@ -168,6 +177,7 @@ impl LayerLayout {
         use cuteafd_loader::families::kimi_k3::weight_layout::{LayerLayout as Shared, WeightAttention};
         Ok(Shared::ranks_with_core(cfg, layer, mode, inventory, ranks)?.into_iter().map(|layout| Self {
             operands: layout.operands,
+            native: layout.native,
             attention: match layout.attention { WeightAttention::Absent => AttentionShare::Absent,
                 WeightAttention::Whole => AttentionShare::Whole, WeightAttention::Split => AttentionShare::Split },
             core: layout.core.into_iter().map(|(name, layout)| (name, CoreWeightLayout::from_shared(layout))).collect(),
@@ -177,20 +187,24 @@ impl LayerLayout {
     pub(crate) fn core_layouts(&self) -> impl Iterator<Item=&CoreWeightLayout> { self.core.values() }
 
     pub(crate) fn bytes(&self) -> Result<usize> {
-        self.operands.values().copied().chain(self.core.values().map(|layout| layout.bytes))
-            .try_fold(0usize, |n, size| n.checked_add(size).context("Kimi layer admission extent overflow"))
+        let base = self.operands.values().copied().chain(self.core.values().map(|layout| layout.bytes))
+            .try_fold(0usize, |n, size| n.checked_add(size).context("Kimi layer admission extent overflow"))?;
+        self.native.values().try_fold(base, |sum, layout| sum.checked_add(usize::try_from(layout.bytes()?)?)
+            .context("Kimi native attention extent overflow"))
     }
 
     pub(super) fn attention_bytes(&self) -> Result<usize> {
-        self.operands.iter().filter(|(name, _)| name.starts_with("mla.") || name.starts_with("kda."))
+        let base = self.operands.iter().filter(|(name, _)| name.starts_with("mla.") || name.starts_with("kda."))
             .map(|(_, bytes)| *bytes).chain(self.core.iter().filter(|(name, _)|
                 name.starts_with("mla.") || name.starts_with("kda.")).map(|(_, layout)| layout.bytes))
-            .try_fold(0usize, |n, bytes| n.checked_add(bytes).context("Kimi attention extent overflow"))
+            .try_fold(0usize, |n, bytes| n.checked_add(bytes).context("Kimi attention extent overflow"))?;
+        self.native.values().try_fold(base, |sum, layout| sum.checked_add(usize::try_from(layout.bytes()?)?)
+            .context("Kimi native attention extent overflow"))
     }
 
     fn check(&self, packed: &PackedLayer) -> Result<()> {
         ensure!(self.attention == packed.attention && self.operands.len() == packed.operands.len()
-            && self.core.len() == packed.core.len(),
+            && self.core.len() == packed.core.len() && self.native.len() == packed.native.len(),
             "Kimi packed operand inventory differs from native admission");
         for (name, bytes) in &self.operands {
             ensure!(packed.operands.get(name).is_some_and(|data| data.len() == *bytes),
@@ -198,6 +212,11 @@ impl LayerLayout {
         }
         for (name, layout) in &self.core {
             layout.check(packed.core.get(name).context("Kimi packed core operand absent")?)?;
+        }
+        for (name, layout) in &self.native {
+            ensure!(!layout.fp8, "Kimi FP8 attention uses the recorded conversion path");
+            ensure!(packed.native.get(name).is_some_and(|bytes| bytes.len() as u64 == layout.bytes().unwrap_or(0)),
+                "Kimi packed native attention {name} differs from admission");
         }
         Ok(())
     }
@@ -214,11 +233,12 @@ pub(crate) struct PackedLayer {
     operands: BTreeMap<&'static str, Vec<u8>>,
     attention: AttentionShare,
     core: BTreeMap<&'static str, LoadedDenseTrellis>,
+    native: BTreeMap<&'static str, Vec<u8>>,
 }
 
 impl PackedLayer {
     pub(crate) fn bytes(&self) -> Result<usize> {
-        self.operands.values().map(Vec::len).chain(self.core.values().map(|loaded|
+        self.operands.values().chain(self.native.values()).map(Vec::len).chain(self.core.values().map(|loaded|
             loaded.shard.payload.len() + loaded.shard.suh.len() + loaded.shard.svh.len()))
             .try_fold(0usize, |total, bytes| total.checked_add(bytes).context("Kimi packed layer size overflow"))
     }
@@ -241,7 +261,7 @@ impl PackedLayer {
         let kind = cfg.attention[layer];
         let shares = layouts.iter().map(|layout| layout.attention).collect::<Vec<_>>();
         let mut pair = shares.iter().map(|&attention| Self {
-            operands: BTreeMap::new(), attention, core: BTreeMap::new() }).collect::<Vec<_>>();
+            operands: BTreeMap::new(), attention, core: BTreeMap::new(), native: BTreeMap::new() }).collect::<Vec<_>>();
         let all_owners = (0..ranks).collect::<Vec<_>>();
         for (site, score, norm) in [
             (ResidualWeightSite::Attention(layer), "attention.score", "attention.norm"),
@@ -328,6 +348,20 @@ impl PackedLayer {
             KimiAttention::Mla => {
                 let owners: Vec<_> = shares.iter().enumerate().filter(|(_, share)| share.present())
                     .map(|(rank, _)| rank).collect();
+                if cfg.dsa.is_some() {
+                    use cuteafd_loader::families::kimi_k3::dsa::{load_native, IndexerOperand};
+                    for operand in [IndexerOperand::Query, IndexerOperand::Norm, IndexerOperand::Bias] {
+                        let tensor = load_native(cfg, layer, operand, &mut read)?;
+                        for &owner in &owners {
+                            pair[owner].operands.insert(operand.arena_name(), tensor.bytes.clone());
+                        }
+                    }
+                    let mut kw = load_native(cfg, layer, IndexerOperand::Key, &mut read)?.bytes;
+                    kw.extend_from_slice(&load_native(cfg, layer, IndexerOperand::Heads, &mut read)?.bytes);
+                    for &owner in &owners {
+                        pair[owner].operands.insert("mla.indexer.kw", kw.clone());
+                    }
+                }
                 for (operand, name) in [(MlaOperand::QkvA, "mla.qkv_a"), (MlaOperand::QNorm, "mla.q_norm"),
                     (MlaOperand::KvNorm, "mla.kv_norm"), (MlaOperand::QB, "mla.q_b"), (MlaOperand::Uk, "mla.uk"),
                     (MlaOperand::Uv, "mla.uv"), (MlaOperand::Gate, "mla.gate"), (MlaOperand::Output, "mla.output")] {
@@ -392,7 +426,12 @@ fn pack_projection_pair(layouts: &[LayerLayout], packed: &mut [PackedLayer], nam
                         row[rank * share..(rank + 1) * share].iter().copied()).collect()
                 }
             };
-            packed[owner].operands.insert(name, bytes);
+            if let Some(layout) = layouts[owner].native.get(name) {
+                ensure!(!layout.fp8, "Kimi FP8 attention uses the recorded conversion path");
+                packed[owner].native.insert(name, bytes);
+            } else {
+                packed[owner].operands.insert(name, bytes);
+            }
         }
     }
     Ok(())
@@ -411,6 +450,7 @@ pub(crate) struct LayerWeights<'a> {
     operands: BTreeMap<&'static str, Allocation<'a>>,
     pub(crate) attention: AttentionShare,
     core: BTreeMap<&'static str, CoreWeights<'a>>,
+    pub(crate) native: BTreeMap<&'static str, crate::shared::native_attention::NativeAttentionWeights<'a>>,
 }
 
 impl<'a> LayerWeights<'a> {
@@ -418,26 +458,10 @@ impl<'a> LayerWeights<'a> {
         ensure!(self.operands.values().chain(self.core.values().flat_map(|weights|
             [&weights.payload, &weights.suh, &weights.svh])).all(|allocation| allocation.device.id == device.id
             && std::ptr::eq(allocation.device.library, device.library)), "Kimi layer weight owner differs from lane device");
+        ensure!(self.native.values().all(|weight| weight.values.buffer.device_id == device.id
+            && weight.scales.as_ref().is_none_or(|scales| scales.buffer.device_id == device.id)),
+            "Kimi native attention owner differs from lane device");
         Ok(())
-    }
-
-    /// `charged_bytes` is the exact weight demand accepted by shared startup
-    /// admission, not available CUDA bytes or an independent family budget.
-    /// Uploads are synchronous; no queued work can outlive error cleanup here.
-    pub(crate) fn upload(device: Device<'a>, packed: PackedLayer, layout: &LayerLayout,
-        charged_bytes: usize) -> Result<Self> {
-        layout.check(&packed)?;
-        ensure!(layout.bytes()? == charged_bytes, "Kimi layer layout differs from admitted weight bytes");
-        let operands = packed.operands.into_iter().map(|(name, bytes)| {
-            ensure!(!bytes.is_empty(), "Kimi operand {name} is empty");
-            let _scope = cuteafd_ffi::memory_ledger::scope("weights/kimi layer weights");
-            let allocation = Allocation::new(device, bytes.len())?;
-            device.run(|| device.library.copy_h2d(allocation.buffer, &bytes))?;
-            Ok((name, allocation))
-        }).collect::<Result<_>>()?;
-        let core = packed.core.into_iter().map(|(name, loaded)|
-            Ok((name, layout.core[name].upload(device, loaded)?))).collect::<Result<_>>()?;
-        Ok(Self { operands, attention: packed.attention, core })
     }
 
     pub(crate) fn buffer(&self, name: &str) -> Result<CuteafdDeviceBuffer> {
@@ -454,6 +478,13 @@ impl<'a> LayerWeights<'a> {
         Ok(KimiKdaWeights { input: self.buffer("kda.input")?, forget: self.buffer("kda.forget")?,
             convolution: self.buffer("kda.conv")?, a_log: self.buffer("kda.a_log")?,
             dt_bias: self.buffer("kda.dt_bias")?, norm: self.buffer("kda.norm")?, output: self.buffer("kda.output")? })
+    }
+
+    pub(crate) fn indexer(&self) -> Result<KimiIndexWeights> {
+        ensure!(self.attention.present(), "Kimi indexer weights absent on this nonowner");
+        Ok(KimiIndexWeights { query: self.buffer("mla.indexer.q")?,
+            key_heads: self.buffer("mla.indexer.kw")?, norm: self.buffer("mla.indexer.norm")?,
+            bias: self.buffer("mla.indexer.bias")? })
     }
 
     pub(crate) fn mla(&self) -> Result<KimiMlaWeights> {
@@ -518,7 +549,7 @@ mod tests {
         let directory = tempfile::tempdir()?;
         std::fs::write(directory.path().join("weights.safetensors"), [9, 8, 7, 0x80, 0x3f, 0, 0x40])?;
         let name = "language_model.model.norm.weight";
-        let mut checkpoint = Checkpoint { snapshot: directory.path().into(), config: serde_json::json!({}),
+        let mut checkpoint = Checkpoint { view: None, snapshot: directory.path().into(), config: serde_json::json!({}),
             quantize_config: None, weight_map: BTreeMap::from([(name.into(), "weights.safetensors".into())]),
             tensors: vec![CheckpointTensor { shard: "weights.safetensors".into(),
                 meta: cuteafd_loader::SafetensorsTensorMetadata { name: name.into(), dtype: DType::Bf16,
@@ -562,6 +593,7 @@ mod tests {
             assert_eq!(demand.category, Category::Weights);
             assert_eq!(demand.basis, Basis::Exact);
             assert_eq!(demand.bytes, layout.bytes()? as u64);
+            assert_eq!(demand.resident_weights.0, demand.bytes);
             if rank == 1 {
                 let scores = packed.operands["output.score"].chunks_exact(4)
                     .map(|bytes| f32::from_le_bytes(bytes.try_into().unwrap())).collect::<Vec<_>>();
@@ -628,6 +660,51 @@ mod tests {
             }
         }
         for layer in [0, 2, 5, 7, usize::MAX] { assert!(routed_owner(&cfg, layer).is_err()); }
+        Ok(())
+    }
+
+    #[test]
+    fn k31_indexer_native_bytes_follow_every_attention_owner() -> Result<()> {
+        use cuteafd_loader::families::kimi_k3::{config::KimiDsaConfig, dsa::IndexerOperand};
+        let mut cfg = cfg();
+        cfg.dsa = Some(KimiDsaConfig { heads: 2, head_dim: 4, topk: 2 });
+        for mode in [LayerMode::HeadSplit, LayerMode::ContextSplit,
+            LayerMode::Whole { gpu: 1, ffn: FfnMode::Split }] {
+            let packed = PackedLayer::pair(&cfg, 3, mode, |name| {
+                if name.contains(".indexer.") {
+                    let (_, shape) = IndexerOperand::ALL.into_iter().map(|op| op.specification(&cfg, 3).unwrap())
+                        .find(|(key, _)| key == name).unwrap();
+                    let mut value = tensor("test.weight")?;
+                    value.info.name = name.into();
+                    value.info.shape = shape.clone();
+                    value.bytes = (0..shape.iter().product::<usize>() as u16).flat_map(u16::to_le_bytes).collect();
+                    value.info.byte_length = value.bytes.len() as u64;
+                    Ok(value)
+                } else { tensor(name) }
+            })?;
+            for rank in &packed {
+                for operand in [IndexerOperand::Query, IndexerOperand::Norm, IndexerOperand::Bias] {
+                    assert_eq!(rank.operands.contains_key(operand.arena_name()), rank.attention.present());
+                    if rank.attention.present() {
+                        let (_, shape) = operand.specification(&cfg, 3)?;
+                        let expected: Vec<u8> = (0..shape.iter().product::<usize>() as u16).flat_map(u16::to_le_bytes).collect();
+                        assert_eq!(rank.operands[operand.arena_name()], expected);
+                    }
+                }
+                assert!(!rank.operands.contains_key("mla.indexer.k"));
+                assert!(!rank.operands.contains_key("mla.indexer.weights"));
+                assert_eq!(rank.operands.contains_key("mla.indexer.kw"), rank.attention.present());
+                if rank.attention.present() {
+                    let mut expected = Vec::new();
+                    for operand in [IndexerOperand::Key, IndexerOperand::Heads] {
+                        let (_, shape) = operand.specification(&cfg, 3)?;
+                        expected.extend((0..shape.iter().product::<usize>() as u16).flat_map(u16::to_le_bytes));
+                    }
+                    assert_eq!(rank.operands["mla.indexer.kw"], expected);
+                    assert_eq!(expected.len(), (cfg.dsa.unwrap().head_dim + cfg.dsa.unwrap().heads) * cfg.hidden * 2);
+                }
+            }
+        }
         Ok(())
     }
 
@@ -737,7 +814,11 @@ mod tests {
         let pair = PackedLayer::pair(&cfg, 3, LayerMode::HeadSplit, tensor)?;
         assert!(pair.iter().all(|rank| rank.attention == AttentionShare::Split));
         assert_eq!(pair[0].operands["mla.q_b"].len(), 6 * 3 * 2);
-        assert!(PackedLayer::pair(&cfg, 3, LayerMode::ContextSplit, |_| unreachable!()).is_err());
+        let context = PackedLayer::pair(&cfg, 3, LayerMode::ContextSplit, tensor)?;
+        for (heads, context) in pair.iter().zip(&context) {
+            assert_eq!(context.attention, AttentionShare::Split);
+            assert_eq!(heads.operands, context.operands);
+        }
         assert!(PackedLayer::pair(&cfg, 3, LayerMode::Whole { gpu: 0, ffn: FfnMode::Owner },
             |_| unreachable!()).is_err());
         assert!(PackedLayer::pair(&cfg, 0, LayerMode::Whole { gpu: 0, ffn: FfnMode::Split },
@@ -777,7 +858,7 @@ mod core_owner_tests {
     }
 
     fn inventory(layer: usize, leaves: &[(&str, [usize; 2])]) -> CoreInventory {
-        CoreInventory { projections: leaves.iter().map(|(leaf, shape)| {
+        CoreInventory { selected_core_view: None, largest_selected_dense_bytes: None, native: BTreeMap::new(), projections: leaves.iter().map(|(leaf, shape)| {
             let stem = format!("language_model.model.layers.{layer}.{leaf}");
             let projection = CoreProjection { stem: stem.clone(), bits: 6, codebook: Exl3Codebook::Mul1,
                 shape: *shape, stored_outputs: shape[0], split: cuteafd_loader::families::kimi_k3::core::split(&stem).unwrap(),
@@ -977,7 +1058,7 @@ mod core_owner_tests {
     fn native_head_is_terminal_only_and_packs_no_bf16_shadow() -> Result<()> {
         let mut cfg=fixture_config();cfg.vocab_size=128;
         let stem="language_model.lm_head".to_owned();
-        let core=CoreInventory{projections:BTreeMap::from([(stem.clone(),CoreProjection{
+        let core=CoreInventory { selected_core_view: None, largest_selected_dense_bytes: None, native: BTreeMap::new(), projections:BTreeMap::from([(stem.clone(),CoreProjection{
             stem,bits:6,codebook:Exl3Codebook::Mul1,shape:[cfg.vocab_size,cfg.hidden],
             stored_outputs:cfg.vocab_size,split:CoreSplit::Whole,source_bytes:0})])};
         let baseline=GlobalLayout::pair(&cfg)?;
@@ -1005,7 +1086,7 @@ mod core_owner_tests {
         let mut cfg = fixture_config();
         cfg.vocab_size = 128;
         let stem = "language_model.lm_head".to_owned();
-        let core = CoreInventory { projections: BTreeMap::from([(stem.clone(), CoreProjection {
+        let core = CoreInventory { selected_core_view: None, largest_selected_dense_bytes: None, native: BTreeMap::new(), projections: BTreeMap::from([(stem.clone(), CoreProjection {
             stem, bits: 6, codebook: Exl3Codebook::Mul1, shape: [cfg.vocab_size, cfg.hidden],
             stored_outputs: cfg.vocab_size, split: CoreSplit::Whole, source_bytes: 0,
         })]) };
@@ -1055,7 +1136,7 @@ mod core_owner_tests {
         let core = inventory(1, &[("block_sparse_moe.shared_experts.gate_proj", [256, 256])]);
         let layouts = LayerLayout::pair_with_core(&cfg, 1, LayerMode::HeadSplit, &core)?;
         let mut packed: [PackedLayer; 2] = std::array::from_fn(|rank| PackedLayer { operands: BTreeMap::new(),
-            core: BTreeMap::new(), attention: layouts[rank].attention });
+            core: BTreeMap::new(), native: BTreeMap::new(), attention: layouts[rank].attention });
         let stem = "language_model.model.layers.1.block_sparse_moe.shared_experts.gate_proj";
         let mut names = Vec::new();
         pack_projection_pair(&layouts, &mut packed, "ffn.gate", stem, [256, 256], TrellisSide::Output,

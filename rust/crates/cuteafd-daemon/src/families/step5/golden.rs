@@ -7,7 +7,7 @@ use super::{
     transaction::{Staging, Step},
 };
 use crate::shared::{
-    memory::device::{Allocation, Device},
+    memory::{device::{Allocation, Device}, Tag},
     golden_scores::{select_scored_rows, scored_nll, scored_kl},
     placement::{spark_rings, SparkAdmission},
     spark_intake::SparkLink,
@@ -35,24 +35,33 @@ const FP8_REVISION: &str = "364b3b03fed2477aa0953fe855a2c4c8c48ee3cc";
 const NVFP4_REVISION: &str = "bc246cc2848e17b37f377eda8fd825c5b3018d1f";
 /// wrldsuksgo2mars/Step-5-Preview-EXL3-K4-Core-K6, immutable published revision.
 const EXL3_REVISION: &str = "83d47a384eabc07ea6fcfaac4779b0e5f013ce89";
+const HQA_REVISION: &str = "61f9275e7f604cb11a5ae9a64a07ff1c600174b7";
 const BF16_REVISION: &str = "7734b7ffac118d70d8398bfa3eb0fab007eb45b1";
 
 #[derive(Debug, Clone, clap::Args)]
 pub(crate) struct GoldenArgs {
+    #[command(flatten)]
+    pub(crate) attention: crate::cli::CoreViewArgs,
     /// Same immutable target KV storage as serving.
     #[arg(long, default_value = "fp8")]
     kv_cache: cuteafd_loader::families::qwen4::Qwen4KvCache,
     #[arg(long)]
-    snapshot: PathBuf,
+    pub(crate) snapshot: PathBuf,
     #[arg(long, env = "CUTEAFD_NATIVE_LIB")]
     native_lib: Option<PathBuf>,
     #[arg(long, default_value = "/opt/cuteafd/share/PROGRAMS.json")]
     manifest: PathBuf,
     /// Pinned official reference export containing meta.json and windows/ID/layerNN.bin.
-    #[arg(long)]
-    golden: PathBuf,
-    #[arg(long)]
-    window: String,
+    #[arg(long, required_unless_present = "graph_oracle")]
+    golden: Option<PathBuf>,
+    #[arg(long, required_unless_present = "graph_oracle")]
+    window: Option<String>,
+    /// Compare every target logit bit with eager, capture and replay from one restored prompt.
+    #[arg(long, requires = "split_device", conflicts_with_all = ["golden", "window", "nll",
+        "prefix_state", "fp8_diagnostic_reference", "compare_layers", "compare_final_norm",
+        "save_logits", "dump_residuals", "dump_layers", "dump_layer0", "poison_scratch",
+        "prefill", "prefill_units", "prefill_waves"])]
+    graph_oracle: bool,
     #[arg(long, value_delimiter = ',')]
     peers: Vec<SocketAddr>,
     /// Last target layer, inclusive; logits require the complete target through layer 91.
@@ -115,7 +124,7 @@ fn diagnostic_selection(args: &GoldenArgs) -> Result<()> {
         && args.save_logits.is_none() && args.dump_residuals.is_none() && !args.compare_final_norm),
         "layer-zero dump requires --last-layer 0, no peers, scoring, or full-target diagnostics");
     ensure!(args.last_layer != 0 || args.dump_layer0.is_some(), "layer zero requires --dump-layer0");
-    ensure!(args.split_device.is_none() || args.dump_layer0.is_some() || (args.nll && args.last_layer == 91),
+    ensure!(args.split_device.is_none() || args.dump_layer0.is_some() || ((args.nll || args.graph_oracle) && args.last_layer == 91),
         "shared execution requires full NLL or layer-zero diagnostic");
     let writes = args.save_logits.is_some() || args.dump_residuals.is_some();
     ensure!(!writes || (args.nll && args.last_layer == 91 && !args.prefix_state),
@@ -136,7 +145,8 @@ fn write_f32(path: PathBuf, values: &[f32], rows: usize, width: usize) -> Result
 
 #[allow(clippy::too_many_arguments)]
 fn save_diagnostics(
-    args: &GoldenArgs, tokens: &[u32], positions: &[usize], vocab: usize,
+    args: &GoldenArgs, view: &cuteafd_loader::plan::checkpoint::CheckpointView,
+    tokens: &[u32], positions: &[usize], vocab: usize,
     logits: &[f32], normalized: Option<&[f32]>,
     mut residual: impl FnMut(usize) -> Result<Vec<f32>>,
 ) -> Result<()> {
@@ -145,11 +155,23 @@ fn save_diagnostics(
     ensure!(!tokens.is_empty() && tokens.iter().all(|&t| (t as usize) < vocab)
         && !positions.is_empty() && positions.iter().all(|&p| p > 0 && p < tokens.len())
         && positions.windows(2).all(|p| p[0] < p[1]), "diagnostic token/scored positions mismatch");
+    let identity = serde_json::json!({
+        "core_view": view.mode(), "view_fingerprint": view.fingerprint(),
+    });
     let token_bytes = tokens.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>();
     if let Some(dir) = &args.save_logits {
         std::fs::create_dir_all(dir)?;
+        let meta = dir.join("logits.meta.json");
+        if meta.exists() { std::fs::remove_file(&meta)?; }
         write_f32(dir.join("logits.bin"), logits, tokens.len(), vocab)?;
         std::fs::write(dir.join("tokens.bin"), &token_bytes)?;
+        std::fs::write(meta, serde_json::to_vec_pretty(&serde_json::json!({
+            "schema": "cuteafd.step5.logits/1", "checkpoint": identity,
+            "window": args.window, "kv_cache": args.kv_cache,
+            "rows": tokens.len(), "width": vocab, "dtype": "F32", "byte_order": "little",
+            "logits": "logits.bin", "tokens": "tokens.bin", "token_dtype": "U32",
+            "scored_target_positions": positions, "logits_row_target_offset": 1, "complete": true
+        }))?)?;
     }
     if let Some(dir) = &args.dump_residuals {
         let normalized = normalized.context("residual dump requires final normalized head input")?;
@@ -165,7 +187,8 @@ fn save_diagnostics(
         std::fs::write(dir.join("positions.bin"), (0..tokens.len() as u32)
             .flat_map(u32::to_le_bytes).collect::<Vec<_>>())?;
         std::fs::write(meta, serde_json::to_vec_pretty(&serde_json::json!({
-            "schema": "cuteafd.step5.residuals/1", "window": args.window, "kv_cache": args.kv_cache,
+            "schema": "cuteafd.step5.residuals/1", "checkpoint": identity,
+            "window": args.window, "kv_cache": args.kv_cache,
             "rows": tokens.len(), "width": H, "dtype": "F32", "byte_order": "little",
             "positions": "positions.bin", "position_dtype": "U32", "tokens": "tokens.bin",
             "layers": args.dump_layers, "layer_pattern": "layerNN.bin",
@@ -305,15 +328,15 @@ fn hidden_metrics(actual: &[f32], expected: &[f32]) -> Result<(f64, f64)> {
 }
 
 fn reference(args: &GoldenArgs, vocab: usize) -> Result<Reference> {
+    let golden = args.golden.as_ref().context("--golden required outside graph oracle")?;
+    let window = args.window.as_deref().context("--window required outside graph oracle")?;
     ensure!(
-        !args.window.is_empty()
-            && args
-                .window
-                .bytes()
+        !window.is_empty()
+            && window.bytes()
                 .all(|c| c.is_ascii_alphanumeric() || b"-_".contains(&c)),
         "invalid golden window id"
     );
-    let meta: Value = serde_json::from_slice(&std::fs::read(args.golden.join("meta.json"))?)?;
+    let meta: Value = serde_json::from_slice(&std::fs::read(golden.join("meta.json"))?)?;
     reference_identity(&meta, args.fp8_diagnostic_reference)?;
     let tokenizer = format!(
         "{:x}",
@@ -323,9 +346,9 @@ fn reference(args: &GoldenArgs, vocab: usize) -> Result<Reference> {
         meta["snapshot_identity"]["tokenizer_sha256"] == tokenizer,
         "reference tokenizer differs from target"
     );
-    let folder = args.golden.join("windows").join(&args.window);
+    let folder = golden.join("windows").join(&window);
     let entry = meta["windows"].as_array().context("golden windows")?
-        .iter().find(|w| w["id"] == args.window && w["path"] == format!("windows/{}", args.window))
+        .iter().find(|w| w["id"] == window && w["path"] == format!("windows/{}", window))
         .context("window missing from reference inventory")?;
     let bytes = std::fs::read(folder.join("tokens.bin"))?;
     ensure!(
@@ -358,8 +381,8 @@ fn reference(args: &GoldenArgs, vocab: usize) -> Result<Reference> {
     let final_norm = args.compare_final_norm.then(||
         hidden_file(folder.join("final_norm.bin"), tokens.len(), rows)).transpose()?;
     if args.fp8_diagnostic_reference && (args.compare_final_norm || args.compare_layers.iter().any(|l| (88..=90).contains(l))) {
-        let tail: Value = serde_json::from_slice(&std::fs::read(args.golden.join("tail-diagnostic.json"))?)?;
-        let source_sha = format!("{:x}", Sha256::digest(std::fs::read(args.golden.join("meta.json"))?));
+        let tail: Value = serde_json::from_slice(&std::fs::read(golden.join("tail-diagnostic.json"))?)?;
+        let source_sha = format!("{:x}", Sha256::digest(std::fs::read(golden.join("meta.json"))?));
         ensure!(tail["schema"] == "cuteafd.step5.tail-diagnostic/1" && tail["diagnostic_only"] == true
             && tail["source_meta_sha256"] == source_sha && tail["original_layer91_byte_exact"] == true,
             "tail continuation provenance missing or mismatched");
@@ -368,7 +391,7 @@ fn reference(args: &GoldenArgs, vocab: usize) -> Result<Reference> {
             .chain(args.compare_final_norm.then_some("final_norm.bin".into()));
         for file in files {
             let sha = format!("{:x}", Sha256::digest(std::fs::read(folder.join(&file))?));
-            ensure!(tail["files"][format!("windows/{}/{file}", args.window)] == sha,
+            ensure!(tail["files"][format!("windows/{}/{file}", window)] == sha,
                 "tail diagnostic payload digest differs: {file}");
         }
     }
@@ -454,11 +477,12 @@ pub(super) fn request(
     Ok(request)
 }
 
-fn expert_admission(args: &GoldenArgs, rows: usize, layers: &[usize])
+fn expert_admission(args: &GoldenArgs, view: &cuteafd_loader::plan::checkpoint::CheckpointView,
+    rows: usize, layers: &[usize])
     -> Result<(SparkWorld, TcpTransportConfig, super::experts::StepExperts)> {
     let world = SparkWorld::canonical(args.peers.len())?;
     let packages = PathBuf::from(std::env::var("CUTEAFD_GOLDEN_SPARK_PACKAGES")?);
-    let catalog = cuteafd_loader::read_expert_catalog(&args.snapshot)?;
+    let catalog = cuteafd_loader::read_expert_catalog_view(view)?;
     let format = super::experts::StepExperts::from_catalog(&catalog)?;
     let metadata: Value = serde_json::from_slice(&std::fs::read(
         format.package_manifest(&packages.join("lib"))?)?)?;
@@ -480,8 +504,8 @@ fn expert_admission(args: &GoldenArgs, rows: usize, layers: &[usize])
     };
     let unit = args.prefill_units.unwrap_or(rows);
     let config = TcpTransportConfig::default();
-    SparkAdmission::plan(
-        &args.snapshot,
+    SparkAdmission::plan_view(
+        view,
         ExpertGeometry::STEP5,
         Some(&catalog),
         &cuteafd_loader::placement::SparkWorkingSet {
@@ -491,10 +515,10 @@ fn expert_admission(args: &GoldenArgs, rows: usize, layers: &[usize])
             prefill_lanes: 1,
         },
         args.peers.len(),
-        None,
         super::serve::spark_model(&exports,
             SparkEndpoint { ring_depth: None, capacity: u32::try_from(unit)?, ingress: format.ingress(), partial_reply_bytes: None },
             u64::from(args.prefill_waves), 1, config.max_frame_bytes)?,
+        None,
     )?
     .select(&args.peers)?;
     cuteafd_transport::worker_selection::require_peer_clients(&args.peers,
@@ -502,9 +526,10 @@ fn expert_admission(args: &GoldenArgs, rows: usize, layers: &[usize])
     Ok((world, config, format))
 }
 
-fn link<'a>(device: Device<'a>, args: &GoldenArgs, rows: usize, layers: &[usize]) -> Result<RefCell<SparkLink<'a>>> {
-    let (world, config, format) = expert_admission(args, rows, layers)?;
-    let warm = super::execution::bootstrap_request(rows, 17, &format, layers)?;
+fn link<'a>(device: Device<'a>, args: &GoldenArgs,
+    view: &cuteafd_loader::plan::checkpoint::CheckpointView, rows: usize, layers: &[usize]) -> Result<RefCell<SparkLink<'a>>> {
+    let (world, config, format) = expert_admission(args, view, rows, layers)?;
+    let warm = super::execution::bootstrap_shape(rows, &format)?;
     // The widest wave sizes every rank's rings and the exchange staging.
     let mut link = SparkLink::new_waves(device.library, world, &args.peers, u32::try_from(rows)?, config, H * 2, 1, u32::try_from(rows)?)?;
     link.bootstrap(&warm)?;
@@ -643,7 +668,7 @@ pub(super) fn split_ownership_lanes(cfg: &Config, rows: usize, lanes: u64)
         rows: rows as u64, lanes, entry_gpu: 0, head_gpu: 0, terminal: TerminalHome::AttentionOwner };
     let placement = cuteafd_loader::placement::Placement { expert_tier: None, pool_tokens: 0, pool_limits: PoolLimits(vec![]),
         attention_placement: AttentionPlacement::Layers, attention_by_kind: vec![], peer_row_bytes: 0,
-        onboard_layers: 0, max_pool_tokens_no_onboard: 0, layers: modes.iter().map(|&mode| LayerAssignment { mode, experts: ExpertHome::Spark }).collect(),
+        onboard_layers: 0, max_pool_tokens_no_onboard: None, layers: modes.iter().map(|&mode| LayerAssignment { mode, experts: ExpertHome::Spark }).collect(),
         movables: vec![], expert_ranges: vec![], residual: residual_homes(&modes, &spec)?,
         hops: plan_hops(&modes, &spec)?, tp2: None, items: vec![] };
     cuteafd_loader::plan::families::step5::ownership::ExecutionOwnership::new(cfg, 2, LayerExecutionPlan::new(&placement, spec)?)
@@ -695,6 +720,7 @@ fn layer0_run(args: &GoldenArgs, checkpoint: &Checkpoint, cfg: &Config, referenc
     // SAFETY: sealed runner library outlives every program, stream and allocation.
     let library = unsafe { cuteafd_ffi::NativeLibrary::load(args.native_lib.as_ref().context("--native-lib required")?)? };
     library.cuda_set_device(args.device)?;
+    crate::shared::inventory::preload_native_modules(&library)?;
     let programs = library.programs()?.with_manifest(&args.manifest)?;
     let pages = (rows as u64).div_ceil(64) + 1;
     let config = PrefixConfig { entries: 0, mark_slots: 0, keep_logits: false, min_tokens: 1 };
@@ -708,7 +734,10 @@ fn layer0_run(args: &GoldenArgs, checkpoint: &Checkpoint, cfg: &Config, referenc
         let mut cache_bytes = [0; 2];
         let mut stage_bytes = [0; 2];
         for rank in 0..2 {
-            available[rank] = devices[rank].run(|| library.cuda_memory_info())?.0 as u64;
+            available[rank] = devices[rank].run(|| {
+                crate::shared::inventory::preload_native_modules(&library)?;
+                library.cuda_memory_info()
+            })?.0 as u64;
             cache_bytes[rank] = layout.ranks[rank].bytes + layout.geometry.ranks[rank].persistent_unit_bytes * pages;
             stage_bytes[rank] = Staging::bytes(&layout, rank)? as u64;
             let hops = cuteafd_loader::placement::hop_buffer_bytes(ownership.execution().hops(), &ownership.execution().spec(), 2)
@@ -727,7 +756,7 @@ fn layer0_run(args: &GoldenArgs, checkpoint: &Checkpoint, cfg: &Config, referenc
         let mut placement = pool.borrow_mut().admit_cold(&family, 1, 1, |pages| Placement { pages, sequence: 0, committed: 0 })?.placement;
         let execution = Execution::load_count(&programs, checkpoint, ownership, vec![&caches[0], &caches[1]],
             vec![&stages[0], &stages[1]], rows, available.to_vec(), reservations.to_vec(), None, 1, 17)?;
-        let input = Allocation::new(devices[0], rows * H * 4)?;
+        let input = Allocation::new(devices[0], rows * H * 4, Tag::workspace("step5/golden-input"))?;
         devices[0].run(|| library.copy_h2d(input.buffer, &embedding_rows(checkpoint, &reference.tokens, cfg.vocab)?))?;
         let mut step = Step::begin(vec![&caches[0], &caches[1]], vec![&stages[0], &stages[1]], &pool, &mut placement, rows)?;
         execution.enqueue_layer0(&mut step, &input, directory)?;
@@ -752,7 +781,7 @@ fn layer0_run(args: &GoldenArgs, checkpoint: &Checkpoint, cfg: &Config, referenc
         let pool = RefCell::new(PrefixCache::<StubCopyEngine, Frontier>::new(family.layout(), config, None)?);
         let mut placement = pool.borrow_mut().admit_cold(&family, 1, 1, |pages| Placement { pages, sequence: 0, committed: 0 })?.placement;
         let mut chain = TargetChain::load(device, &programs, checkpoint, 1, rows, available, &[reserved], args.kv_cache)?;
-        let input = Allocation::new(device, rows * H * 4)?;
+        let input = Allocation::new(device, rows * H * 4, Tag::workspace("step5/golden-input"))?;
         library.copy_h2d(input.buffer, &embedding_rows(checkpoint, &reference.tokens, cfg.vocab)?)?;
         let mut step = Step::begin(vec![&cache], vec![&staging], &pool, &mut placement, rows)?;
         chain.enqueue_step(&mut step, 0, &input, None)?;
@@ -776,6 +805,23 @@ fn layer0_run(args: &GoldenArgs, checkpoint: &Checkpoint, cfg: &Config, referenc
     Ok(())
 }
 
+fn selected_programs(programs: &cuteafd_ffi::programs::Programs<'_>, checkpoint: &Checkpoint,
+    cfg: &Config, ranks: usize, rows: usize, ownership: Option<&cuteafd_loader::plan::families::step5::ownership::ExecutionOwnership>)
+    -> Result<(cuteafd_loader::placement::ProgramSet, cuteafd_loader::plan::families::step5::native::NativeSelection)> {
+    use cuteafd_loader::plan::families::step5::{coordinator::{CoordinatorContract, RankWeightLayout}, native};
+    let contract = CoordinatorContract::from_checkpoint(checkpoint)?;
+    let specs = programs.names().map(|name| programs.spec(name)).collect::<Result<Vec<_>>>()?;
+    let manifest = cuteafd_loader::placement::inventory::ProgramsManifest::from_specs(specs.into_iter())?;
+    let selection = native::NativeSelection::resolve(&contract, cfg, ranks, 0, rows, Some(&manifest))?;
+    for rank in 0..ranks {
+        let layout = RankWeightLayout::from_contract(&contract, cfg, rank, ranks, ownership)?;
+        selection.validate_layout(&layout, rows)?;
+    }
+    let mut selected = cuteafd_loader::placement::ProgramSet::from_names(native::program_prefixes(ranks == 2), programs.names());
+    selection.augment_programs(&mut selected);
+    Ok((selected, selection))
+}
+
 fn split_run(args: &GoldenArgs, checkpoint: &Checkpoint, cfg: &Config,
     reference: Reference, layers: &[usize], format: &super::experts::StepExperts) -> Result<()> {
     use super::execution::Execution;
@@ -783,7 +829,7 @@ fn split_run(args: &GoldenArgs, checkpoint: &Checkpoint, cfg: &Config,
     use std::sync::Arc;
     let peer_device = args.split_device.context("Step-5 split device")?;
     ensure!(args.device >= 0 && peer_device >= 0 && args.device != peer_device
-        && args.nll && args.last_layer == 91 && !args.prefix_state,
+        && (args.nll || args.graph_oracle) && args.last_layer == 91 && !args.prefix_state,
         "Step-5 shared golden requires distinct devices and complete cold target");
     let rows = reference.tokens.len();
     // Prefill units: units of `unit` rows, `waves` in flight; else one whole step.
@@ -804,16 +850,26 @@ fn split_run(args: &GoldenArgs, checkpoint: &Checkpoint, cfg: &Config,
         && reference.hidden.is_empty()),
         "Step-5 golden prefill units compare logits, not retained per-layer hidden states");
     let ownership = split_ownership_lanes(cfg, unit, waves as u64)?;
-    let layout = Step5CacheLayout::for_execution(cfg, &ownership, rows as u64, 0, rows as u64, rows as u64, args.kv_cache)?;
+    // Full summary stride exercises the production batched CSA attention graph ABI.
+    let context = if args.graph_oracle { cfg.max_context } else { rows as u64 };
+    let slots = u64::from(args.graph_oracle);
+    let layout = Step5CacheLayout::for_execution(cfg, &ownership, context, 0, rows as u64, rows as u64, args.kv_cache)?;
     if args.check_headers { println!("Step-5 shared headers/reference validated: rows={rows} ranks=2; no CUDA or numerical qualification"); return Ok(()); }
     cuteafd_core::set_expert_geometry(ExpertGeometry::STEP5)
         .map_err(|_| anyhow::anyhow!("Step-5 golden requires an isolated process"))?;
     // SAFETY: sealed runner library outlives every allocation, transport and program.
     let library = Arc::new(unsafe { cuteafd_ffi::NativeLibrary::load(args.native_lib.as_ref().context("--native-lib required")?)? });
     library.cuda_set_device(args.device)?;
+    crate::shared::inventory::preload_native_modules(&library)?;
     let devices = [args.device, peer_device].map(|id| Device { library: &library, id });
     let programs = library.programs()?.with_manifest(&args.manifest)?;
-    let selected = cuteafd_loader::placement::ProgramSet::from_names(&["step5", "step52"], programs.names());
+    let (selected, _native_selection) = selected_programs(&programs, checkpoint, cfg, 2, unit, Some(&ownership))?;
+    for device in &devices {
+        device.run(|| {
+            programs.load_matching(|name| selected.names.iter().any(|selected| selected == name))?;
+            crate::shared::inventory::preload_native_modules(&library)
+        })?;
+    }
     let head_rank = ownership.execution().spec().head_gpu as usize;
     let pages = (rows as u64).div_ceil(64) + 1;
     let mut available = [0u64; 2];
@@ -822,13 +878,18 @@ fn split_run(args: &GoldenArgs, checkpoint: &Checkpoint, cfg: &Config,
     let mut staging_bytes = [0u64; 2];
     let mut reservations = [0u64; 2];
     for rank in 0..2 {
-        available[rank] = devices[rank].run(|| library.cuda_memory_info()).map(|(free, _)| free as u64)?;
+        available[rank] = devices[rank].run(|| {
+                crate::shared::inventory::preload_native_modules(&library)?;
+                library.cuda_memory_info()
+            }).map(|(free, _)| free as u64)?;
         let admission = Execution::serving_admission(&programs, checkpoint, &ownership, rank, unit, rows, rows)?;
         chain_bytes[rank] = admission.check( u64::MAX, &[])?;
-        cache_bytes[rank] = Some(layout.ranks[rank].bytes)
-            .and_then(|active| layout.geometry.ranks[rank].persistent_unit_bytes.checked_mul(pages)
-                .and_then(|pages| active.checked_add(pages)))
-            .context("Step-5 shared cache overflow")?;
+        cache_bytes[rank] = super::cache::Reservation::new(&layout, rank, 1, slots, pages, usize::MAX)?.total as u64;
+        let graph_reserve = if args.graph_oracle {
+            let reserve = cuteafd_loader::placement::graph_reserve::current(rank, false, 0, 0)?.bytes;
+            ensure!(reserve > 0, "Step-5 graph oracle requires explicit nonzero graph reserve on rank {rank}");
+            reserve
+        } else { 0 };
         staging_bytes[rank] = Staging::bytes(&layout, rank)? as u64;
         let pending = crate::shared::inventory::pending_code(&library, devices[rank].id, rank, true, "step5", &format.package_name(), &selected)?;
         let hops = cuteafd_loader::placement::hop_buffer_bytes(ownership.execution().hops(), &ownership.execution().spec(), 2)
@@ -838,7 +899,7 @@ fn split_run(args: &GoldenArgs, checkpoint: &Checkpoint, cfg: &Config,
         let peer = ((8 * unit * H * 4) as u64 + (2 << 20))
             .checked_add(hops[rank]).context("Step-5 private peer/hop overflow")?;
         let input = if rank == 0 { (rows * H * 6) as u64 } else { 0 };
-        reservations[rank] = [cache_bytes[rank], staging_bytes[rank], peer, input, pending,
+        reservations[rank] = [cache_bytes[rank], staging_bytes[rank], peer, input, pending, graph_reserve,
             2u64 << 30, 2u64 << 30].into_iter().try_fold(0u64, |n, bytes| n.checked_add(bytes))
             .context("Step-5 shared reservation overflow")?;
         let total = chain_bytes[rank].checked_add(reservations[rank]).context("Step-5 shared admission overflow")?;
@@ -847,16 +908,17 @@ fn split_run(args: &GoldenArgs, checkpoint: &Checkpoint, cfg: &Config,
             staging_bytes=staging_bytes[rank], peer, pending, total, available=available[rank], "Step-5 shared golden admission");
     }
     let started = std::time::Instant::now();
-    let caches = [RefCell::new(CacheRank::new(devices[0], layout.clone(), 0, 1, 0, pages, cache_bytes[0] as usize)?),
-        RefCell::new(CacheRank::new(devices[1], layout, 1, 1, 0, pages, cache_bytes[1] as usize)?)];
+    let caches = [RefCell::new(CacheRank::new(devices[0], layout.clone(), 0, 1, slots, pages, cache_bytes[0] as usize)?),
+        RefCell::new(CacheRank::new(devices[1], layout, 1, 1, slots, pages, cache_bytes[1] as usize)?)];
     let stages = [Staging::new_for_units(devices[0], &programs, &caches[0].borrow(), staging_bytes[0] as usize, 1, unit)?,
         Staging::new_for_units(devices[1], &programs, &caches[1].borrow(), staging_bytes[1] as usize, 1, unit)?];
-    let (world, config, format) = expert_admission(args, rows, layers)?;
+    let (world, config, format) = expert_admission(args,
+        checkpoint.view.as_ref().context("Step-5 golden requires its selected checkpoint view")?, rows, layers)?;
     let transport = devices[0].own(|| {
         let mut link = SparkLink::new_waves(&library, world, &args.peers, unit as u32,
             config, H * 2, waves, unit as u32)?;
         link.enable_terminal_ownership(library.clone())?;
-        link.bootstrap(&super::execution::bootstrap_request(unit, 17, &format, layers)?)?;
+        link.bootstrap(&super::execution::bootstrap_shape(unit, &format)?)?;
         Ok(link)
     })?;
     let family = Step5Prefix::new(vec![&caches[0], &caches[1]])?;
@@ -864,16 +926,23 @@ fn split_run(args: &GoldenArgs, checkpoint: &Checkpoint, cfg: &Config,
         entries: 0, mark_slots: 0, keep_logits: false, min_tokens: 1 }, None)?);
     let mut placement = pool.borrow_mut().admit_cold(&family, 1, 1,
         |pages| Placement { pages, sequence: 0, committed: 0 })?.placement;
-    let execution = Execution::load_units(&programs, checkpoint, ownership, vec![&caches[0], &caches[1]],
+    let mut execution = Execution::load_units(&programs, checkpoint, ownership, vec![&caches[0], &caches[1]],
         vec![&stages[0], &stages[1]], unit, rows, available.to_vec(), reservations.to_vec(), Some(transport), 17)?;
     if args.poison_scratch { execution.poison_scratch_between_layers(); }
     let retained_layers = reference.hidden.iter().map(|(layer, _)| *layer).chain(args.dump_layers.iter().copied())
         .collect::<Vec<_>>();
     execution.retain_diagnostic_outputs(&retained_layers)?;
     let embeddings = embedding_rows(checkpoint, &reference.tokens, cfg.vocab)?;
-    let input = Allocation::new(devices[0], rows * H * 4)?;
+    let input = Allocation::new(devices[0], rows * H * 4, Tag::workspace("step5/golden-input"))?;
     devices[0].run(|| library.copy_h2d(input.buffer, &embeddings))?;
     tracing::info!(seconds=started.elapsed().as_secs_f64(), "Step-5 shared readiness");
+    if args.graph_oracle {
+        execution.configure_graphs(true, None)?;
+        graph_oracle(&execution, &caches, &stages, &pool, &mut placement, &input,
+            checkpoint, cfg, &reference.tokens)?;
+        pool.borrow_mut().release(&family, &placement.pages)?;
+        return Ok(());
+    }
     let mut step = Step::begin(vec![&caches[0], &caches[1]], vec![&stages[0], &stages[1]], &pool, &mut placement, rows)?;
     if args.prefill_units.is_some() {
         let units = crate::shared::prefill_pipeline::prefill_units(rows, unit, waves, 64)?.into_iter().enumerate()
@@ -899,7 +968,8 @@ fn split_run(args: &GoldenArgs, checkpoint: &Checkpoint, cfg: &Config,
         let actual = head.logits(output)?;
         let normalized = (args.dump_residuals.is_some() || reference.final_norm.is_some())
             .then(|| head.normalized()).transpose()?;
-        save_diagnostics(args, &reference.tokens, &reference.positions, cfg.vocab,
+        save_diagnostics(args, checkpoint.view.as_ref().context("Step-5 golden requires its selected checkpoint view")?,
+            &reference.tokens, &reference.positions, cfg.vocab,
             &actual, normalized.as_deref(), |layer| execution.diagnostic_output(layer))?;
         if let Some(expected) = &reference.final_norm {
             let (cosine, relative_l2) = hidden_metrics(normalized.as_deref().context("final norm inspection")?, &expected)?;
@@ -920,6 +990,91 @@ fn split_run(args: &GoldenArgs, checkpoint: &Checkpoint, cfg: &Config,
     Ok(())
 }
 
+fn same_logit_bits(left: &[f32], right: &[f32]) -> bool {
+    left.len() == right.len() && left.iter().zip(right).all(|(a, b)|
+        a.is_finite() && b.is_finite() && a.to_bits() == b.to_bits())
+}
+
+/// Every arm restores one committed page-aligned prompt into the same sequence
+/// and mark slot. Continuations are never published, including capture first-touch.
+#[allow(clippy::too_many_arguments)]
+fn graph_oracle<'e, 'a>(execution: &super::execution::Execution<'e, 'a>,
+    caches: &[RefCell<CacheRank<'a>>; 2], stages: &[Staging<'a>; 2],
+    pool: &RefCell<PrefixCache<StubCopyEngine, Frontier>>, placement: &mut Placement,
+    input: &Allocation<'a>, checkpoint: &Checkpoint, cfg: &Config, tokens: &[u32]) -> Result<()> {
+    use crate::shared::decode_graph::device::{self, Cycle};
+    const PROMPT: usize = 64;
+    const MAX_ROWS: usize = 64;
+    ensure!(tokens.len() >= PROMPT + MAX_ROWS, "Step-5 graph oracle token extent");
+    let device = stages[0].stream.device;
+    let upload = |tokens: &[u32]| -> Result<()> {
+        let embeddings = embedding_rows(checkpoint, tokens, cfg.vocab)?;
+        device.run(|| device.library.copy_h2d(input.buffer, &embeddings))
+    };
+    upload(&tokens[..PROMPT])?;
+    let mut prompt = Step::begin(caches.iter().collect(), stages.iter().collect(), pool, placement, PROMPT)?;
+    execution.without_graphs(|| execution.enqueue(&mut prompt, input, ExpertV2SourceKind::Prefill))?;
+    prompt.publish(PROMPT)?;
+    ensure!(placement.committed == PROMPT, "Step-5 graph oracle prompt publication");
+    for cache in caches { cache.borrow_mut().capture(0, 0, PROMPT as u64)?; }
+    let head_rank = execution.ownership().execution().spec().head_gpu as usize;
+    let counters = |id, cycle| -> Result<device::Counters> {
+        let snapshot = device::snapshots().into_iter().find(|snapshot| snapshot.device == id)
+            .context("Step-5 graph oracle missing rank controller")?;
+        ensure!(snapshot.reserve > 0 && snapshot.charged <= snapshot.reserve,
+            "Step-5 graph oracle rank {id} exceeded its admitted reserve");
+        Ok(snapshot.cycles.get(&cycle).copied().unwrap_or_default())
+    };
+    for (rows, kind, cycle) in [(1, ExpertV2SourceKind::Decode, Cycle::Decode),
+        (2, ExpertV2SourceKind::MtpVerify, Cycle::Verify),
+        (4, ExpertV2SourceKind::MtpVerify, Cycle::Verify),
+        (MAX_ROWS, ExpertV2SourceKind::MtpVerify, Cycle::Verify)] {
+        let mut outputs: Vec<Vec<f32>> = Vec::new();
+        let mut captured = Vec::new();
+        // First-touch eagerly initializes modules/workspaces before the capture
+        // arm. It is compared too, but never counted as evidence of graph replay.
+        for arm in ["eager", "first_touch", "capture", "replay"] {
+            for cache in caches { cache.borrow_mut().restore(0, 0, PROMPT as u64)?; }
+            upload(&tokens[PROMPT..PROMPT + rows])?;
+            let before = execution.retained_graph_rows(rows)?.into_iter()
+                .map(|(id, retained)| Ok((id, retained, counters(id, cycle)?)))
+                .collect::<Result<Vec<_>>>()?;
+            let mut step = Step::begin(caches.iter().collect(), stages.iter().collect(), pool, placement, rows)?;
+            if arm == "eager" {
+                execution.without_graphs(|| execution.enqueue(&mut step, input, kind))?;
+            } else { execution.enqueue(&mut step, input, kind)?; }
+            let (_, output) = execution.terminal_output()?;
+            let logits = execution.head()?.device_logits_on(output, rows, &stages[head_rank].stream)?
+                .to_host(device.library)?;
+            ensure!(logits.len() == rows * cfg.vocab && logits.iter().all(|v| v.is_finite()),
+                "Step-5 graph oracle invalid logits: {arm}, rows={rows}");
+            drop(step);
+            ensure!(placement.committed == PROMPT, "Step-5 graph oracle continuation published state");
+            if let Some(eager) = outputs.first() {
+                ensure!(same_logit_bits(eager, &logits),
+                    "Step-5 graph oracle every-row logits differ: {arm}, rows={rows}");
+            }
+            outputs.push(logits);
+            let after = execution.retained_graph_rows(rows)?;
+            for ((id, retained), (old_id, old_retained, old)) in after.iter().zip(before) {
+                ensure!(*id == old_id, "Step-5 graph oracle rank order changed");
+                let now = counters(*id, cycle)?;
+                if arm == "capture" {
+                    ensure!(*retained > 0 && *retained > old_retained && now.captures > old.captures,
+                        "Step-5 graph oracle did not retain native graphs on rank {id}, rows={rows}");
+                    captured.push((*id, *retained));
+                } else if arm == "replay" {
+                    ensure!(*retained == old_retained && now.captures == old.captures
+                        && now.hits.saturating_sub(old.hits) >= *retained as u64,
+                        "Step-5 graph oracle did not replay every retained section on rank {id}, rows={rows}");
+                }
+            }
+        }
+        println!("Step-5 graph oracle: rows={rows} cycle={cycle:?} ranks={captured:?}; eager/first-touch/capture/replay every logit float-bit identical");
+    }
+    Ok(())
+}
+
 fn checkpoint_identity(revision: Option<&str>, format: &super::experts::StepExperts,
     fp8_diagnostic: bool) -> Result<()> {
     use super::experts::StepExperts;
@@ -927,7 +1082,8 @@ fn checkpoint_identity(revision: Option<&str>, format: &super::experts::StepExpe
     let pinned = match format {
         StepExperts::Native(ExpertFormat::Fp8Block128) => revision == Some(FP8_REVISION),
         StepExperts::Native(ExpertFormat::Nvfp4) => revision == Some(NVFP4_REVISION),
-        StepExperts::Exl3(tiers) => tiers == &[4, 6] && revision == Some(EXL3_REVISION),
+        StepExperts::Exl3(tiers) => tiers == &[4, 6]
+            && matches!(revision, Some(EXL3_REVISION | HQA_REVISION)),
         StepExperts::Native(_) => false,
     };
     ensure!(pinned, "Step-5 golden requires a matching pinned FP8, NVFP4 or EXL3 K4/K6 revision and expert headers");
@@ -946,20 +1102,27 @@ async fn on_engine_thread(work: impl FnOnce() -> Result<()> + Send + 'static) ->
 }
 
 fn run(args: GoldenArgs) -> Result<()> {
+    let view = args.attention.selected_view.clone().map(Ok)
+        .unwrap_or_else(|| args.attention.select(&args.snapshot))?;
+    args.attention.validate_view(&view)?;
     diagnostic_selection(&args)?;
     let layers = if args.dump_layer0.is_some() { vec![] } else { selected_layers()? };
     if args.dump_layer0.is_none() {
         selection(args.last_layer, args.peers.len(), &layers, args.nll)?;
         // The world comes from the planner's fit for this checkpoint, not a fixed list.
-        cuteafd_loader::plan::families::step5::spark_world_admitted(&args.snapshot, &args.manifest, args.peers.len())?;
+        cuteafd_loader::plan::families::step5::spark_world_admitted_view(&view, &args.manifest, args.peers.len())?;
     }
-    let catalog = cuteafd_loader::read_expert_catalog(&args.snapshot)?;
+    let catalog = cuteafd_loader::read_expert_catalog_view(&view)?;
     let format = super::experts::StepExperts::from_catalog(&catalog)?;
     checkpoint_identity(args.snapshot.file_name().and_then(|s| s.to_str()), &format,
         args.fp8_diagnostic_reference)?;
-    let checkpoint = Checkpoint::coordinator(&args.snapshot, false, false)?;
+    let checkpoint = Checkpoint::coordinator_view(&view, false, false)?;
     let cfg = Config::parse(&checkpoint)?;
-    let reference = reference(&args, cfg.vocab)?;
+    let reference = if args.graph_oracle {
+        ensure!(cfg.vocab > 0, "Step-5 graph oracle empty vocabulary");
+        Reference { tokens: (0..128).map(|n| ((n * 7919 + 17) % cfg.vocab) as u32).collect(),
+            expected: vec![], positions: vec![], hidden: vec![], final_norm: None }
+    } else { reference(&args, cfg.vocab)? };
     if args.dump_layer0.is_some() { return layer0_run(&args, &checkpoint, &cfg, reference); }
     if args.split_device.is_some() { return split_run(&args, &checkpoint, &cfg, reference, &layers, &format); }
     let Reference { tokens, expected, positions, hidden, final_norm } = reference;
@@ -981,12 +1144,14 @@ fn run(args: GoldenArgs) -> Result<()> {
         )?
     };
     library.cuda_set_device(args.device)?;
+    crate::shared::inventory::preload_native_modules(&library)?;
     let device = Device {
         library: &library,
         id: args.device,
     };
     let programs = library.programs()?.with_manifest(&args.manifest)?;
-    let selected = cuteafd_loader::placement::ProgramSet::from_names(&["step5"], programs.names());
+    let (selected, _native_selection) = selected_programs(&programs, &checkpoint, &cfg, 1, rows, None)?;
+    programs.load_matching(|name| selected.names.iter().any(|selected| selected == name))?;
     let pending = crate::shared::inventory::pending_code(
         &library,
         args.device,
@@ -1044,7 +1209,7 @@ fn run(args: GoldenArgs) -> Result<()> {
         "Step-5 cold prefix admission"
     );
     let started = std::time::Instant::now();
-    let link = device.run(|| link(device, &args, rows, &layers))?;
+    let link = device.run(|| link(device, &args, &view, rows, &layers))?;
     let (remaining, _) = library.cuda_memory_info()?;
     let owners = chain_bytes + head_bytes + cache_bytes + staging_bytes + input_bytes + pending + (2u64 << 30);
     ensure!(
@@ -1081,7 +1246,7 @@ fn run(args: GoldenArgs) -> Result<()> {
         &[head_bytes, cache_bytes, staging_bytes, input_bytes, reserve], args.kv_cache)?;
     let head = head_plan.map(|plan| TargetHeadOwner::load(device, &programs, &checkpoint, plan,
         available, &[chain_bytes, cache_bytes, staging_bytes, input_bytes, reserve])).transpose()?;
-    let input = Allocation::new(device, rows * H * 4)?;
+    let input = Allocation::new(device, rows * H * 4, Tag::workspace("step5/golden-input"))?;
     library.copy_h2d(
         input.buffer,
         &embedding_rows(&checkpoint, &tokens, cfg.vocab)?,
@@ -1120,7 +1285,7 @@ fn run(args: GoldenArgs) -> Result<()> {
         let actual = head.logits(chain.output(91)?)?;
         let normalized = (args.dump_residuals.is_some() || final_norm.is_some())
             .then(|| head.normalized()).transpose()?;
-        save_diagnostics(&args, &tokens, &positions, cfg.vocab, &actual,
+        save_diagnostics(&args, &view, &tokens, &positions, cfg.vocab, &actual,
             normalized.as_deref(), |layer| {
                 Ok(read_buffer(device, chain.output(layer)?)?.chunks_exact(4)
                     .map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect())
@@ -1163,6 +1328,48 @@ mod tests {
         ].into_iter().chain(flags.iter().copied()))?;
         let crate::cli::Commands::Step5Golden(args) = cli.command else { unreachable!() };
         Ok(args)
+    }
+
+    #[test]
+    fn graph_oracle_cli_needs_no_ignored_reference_arguments() -> Result<()> {
+        use clap::Parser;
+        let base = ["cuteafd", "step5-golden", "--snapshot", "/snapshot", "--last-layer", "91"];
+        for flags in [vec![], vec!["--golden", "/reference"], vec!["--window", "code-1"]] {
+            assert!(crate::cli::Cli::try_parse_from(base.into_iter().chain(flags)).is_err());
+        }
+        let oracle = ["--graph-oracle", "--split-device", "1"];
+        let cli = crate::cli::Cli::try_parse_from(base.into_iter().chain(oracle))?;
+        let crate::cli::Commands::Step5Golden(args) = cli.command else { unreachable!() };
+        assert!(args.graph_oracle && args.golden.is_none() && args.window.is_none());
+        diagnostic_selection(&args)?;
+        for ignored in [vec!["--golden", "/reference"], vec!["--window", "code-1"],
+            vec!["--nll"], vec!["--prefill", "128"], vec!["--poison-scratch"]] {
+            assert!(crate::cli::Cli::try_parse_from(base.into_iter().chain(oracle).chain(ignored)).is_err());
+        }
+        assert!(crate::cli::Cli::try_parse_from(base.into_iter().chain(["--graph-oracle"])).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn graph_oracle_compares_float_bits_and_rejects_nonfinite_rows() {
+        assert!(same_logit_bits(&[0., -0., 3.], &[0., -0., 3.]));
+        assert!(!same_logit_bits(&[0.], &[-0.]));
+        assert!(!same_logit_bits(&[1.], &[f32::from_bits(1f32.to_bits() + 1)]));
+        assert!(!same_logit_bits(&[f32::NAN], &[f32::NAN]));
+        assert!(!same_logit_bits(&[f32::INFINITY], &[f32::INFINITY]));
+        assert!(!same_logit_bits(&[1.], &[1., 2.]));
+    }
+
+    #[test]
+    fn golden_retains_selected_view_through_fit_and_spark_admission() {
+        let source = include_str!("golden.rs").split("#[cfg(test)]").next().unwrap();
+        assert!(source.contains("Checkpoint::coordinator_view(&view"));
+        assert!(source.contains("spark_world_admitted_view(&view"));
+        assert!(source.contains("read_expert_catalog_view(&view)"));
+        assert!(source.contains("SparkAdmission::plan_view("));
+        assert!(!source.contains("Checkpoint::coordinator(&args.snapshot"));
+        assert!(!source.contains("read_expert_catalog(&args.snapshot"));
+        assert!(!source.contains("spark_world_admitted(&args.snapshot"));
     }
 
     #[test]
@@ -1251,13 +1458,29 @@ mod tests {
         Ok(())
     }
 
+    fn diagnostic_view(root: &std::path::Path, mode: cuteafd_loader::plan::checkpoint::CoreView)
+        -> Result<cuteafd_loader::plan::checkpoint::CheckpointView> {
+        cuteafd_loader::plan::testing::write_mc_snapshot(root, &serde_json::json!({}), &[],
+            &std::collections::BTreeMap::from([("lm_head.weight".into(), vec![128,128])]));
+        cuteafd_loader::plan::checkpoint::CheckpointView::select(root, mode)
+    }
+
     #[test]
     fn diagnostic_files_preserve_full_rows_bits_positions_and_head_input() -> Result<()> {
-        for format in [cuteafd_loader::families::qwen4::Qwen4KvCache::Bf16,
-            cuteafd_loader::families::qwen4::Qwen4KvCache::Fp8] {
+        use cuteafd_loader::plan::checkpoint::CoreView;
+        for (mode, format) in [CoreView::Original, CoreView::K6Compact].into_iter().flat_map(|mode|
+            [cuteafd_loader::families::qwen4::Qwen4KvCache::Bf16,
+             cuteafd_loader::families::qwen4::Qwen4KvCache::Fp8].map(|format| (mode, format))) {
             let root = tempfile::tempdir()?;
             let mut args = diagnostic_args(&["--nll", "--dump-residuals", "/unused", "--dump-layers", "0,91"])?;
             args.kv_cache = format;
+            let view = diagnostic_view(root.path(), mode)?;
+            let other_mode = if mode == CoreView::Original { CoreView::K6Compact } else { CoreView::Original };
+            let other = diagnostic_view(root.path(), other_mode)?;
+            assert_ne!(view.fingerprint(), other.fingerprint());
+            // Diagnostics bind the frozen selection, not metadata reopened at write time.
+            std::fs::remove_file(root.path().join("config.json"))?;
+            std::fs::remove_file(root.path().join("config.k6.json"))?;
             let logits_dir = root.path().join("logits");
             let residual_dir = root.path().join("residuals");
             args.save_logits = Some(logits_dir.clone());
@@ -1267,7 +1490,7 @@ mod tests {
             let logits = [-0.0f32, 1., -2., 3., 4., 5., 6., 7., 8.];
             let norm = vec![0.5f32; tokens.len() * H];
             let mut requested = vec![];
-            save_diagnostics(&args, &tokens, &positions, 3, &logits, Some(&norm), |layer| {
+            save_diagnostics(&args, &view, &tokens, &positions, 3, &logits, Some(&norm), |layer| {
                 requested.push(layer);
                 Ok(vec![layer as f32; tokens.len() * H])
             })?;
@@ -1282,9 +1505,18 @@ mod tests {
                 assert_eq!(std::fs::read(residual_dir.join(file))?,
                     vec![value; tokens.len() * H].iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>());
             }
+            let identity = serde_json::json!({"core_view":mode, "view_fingerprint":view.fingerprint()});
+            let logits_meta: Value = serde_json::from_slice(&std::fs::read(logits_dir.join("logits.meta.json"))?)?;
+            assert_eq!(logits_meta, serde_json::json!({
+                "schema":"cuteafd.step5.logits/1", "checkpoint":identity,
+                "window":"code-1", "kv_cache":format.to_string(), "rows":3, "width":3,
+                "dtype":"F32", "byte_order":"little", "tokens":"tokens.bin", "token_dtype":"U32",
+                "logits":"logits.bin", "scored_target_positions":[1,2], "logits_row_target_offset":1, "complete":true
+            }));
             let meta: Value = serde_json::from_slice(&std::fs::read(residual_dir.join("meta.json"))?)?;
             assert_eq!(meta, serde_json::json!({
-                "schema":"cuteafd.step5.residuals/1", "window":"code-1", "kv_cache":format.to_string(), "rows":3, "width":H,
+                "schema":"cuteafd.step5.residuals/1", "checkpoint":identity,
+                "window":"code-1", "kv_cache":format.to_string(), "rows":3, "width":H,
                 "dtype":"F32", "byte_order":"little", "positions":"positions.bin", "position_dtype":"U32",
                 "tokens":"tokens.bin", "layers":[0,91], "layer_pattern":"layerNN.bin",
                 "final_norm":"final_norm.bin", "final_norm_source_dtype":"BF16",
@@ -1305,24 +1537,25 @@ mod tests {
         let root = tempfile::tempdir()?;
         let mut args = diagnostic_args(&["--nll", "--dump-residuals", "/unused", "--dump-layers", "0"])?;
         args.dump_residuals = Some(root.path().into());
+        let view = diagnostic_view(root.path(), cuteafd_loader::plan::checkpoint::CoreView::Original)?;
         let norm = vec![1f32; 2 * H];
         for bad in [vec![1.; H], vec![f32::NAN; 2 * H], vec![f32::INFINITY; 2 * H]] {
             std::fs::write(root.path().join("meta.json"), b"stale")?;
-            assert!(save_diagnostics(&args, &[0, 1], &[1], 2, &[0.; 4], Some(&norm),
+            assert!(save_diagnostics(&args, &view, &[0, 1], &[1], 2, &[0.; 4], Some(&norm),
                 |_| Ok(bad.clone())).is_err());
             assert!(!root.path().join("meta.json").exists());
         }
-        assert!(save_diagnostics(&args, &[0, 1], &[1], 2, &[0.; 4], None,
+        assert!(save_diagnostics(&args, &view, &[0, 1], &[1], 2, &[0.; 4], None,
             |_| Ok(norm.clone())).is_err());
         for positions in [vec![], vec![0], vec![2], vec![1, 1]] {
-            assert!(save_diagnostics(&args, &[0, 1], &positions, 2, &[0.; 4], Some(&norm),
+            assert!(save_diagnostics(&args, &view, &[0, 1], &positions, 2, &[0.; 4], Some(&norm),
                 |_| Ok(norm.clone())).is_err());
         }
         args.dump_residuals = None;
         args.dump_layers.clear();
         args.save_logits = Some(root.path().join("logits"));
         for bad in [vec![0.; 3], vec![f32::NAN; 4]] {
-            assert!(save_diagnostics(&args, &[0, 1], &[1], 2, &bad, None,
+            assert!(save_diagnostics(&args, &view, &[0, 1], &[1], 2, &bad, None,
                 |_| unreachable!()).is_err());
         }
         Ok(())
@@ -1464,12 +1697,14 @@ mod tests {
             .collect::<Vec<_>>();
         std::fs::write(folder.join("layer87.bin"), &bytes)?;
         let mut args = GoldenArgs {
+            attention: Default::default(),
             kv_cache: cuteafd_loader::families::qwen4::Qwen4KvCache::Bf16,
             snapshot: root.path().into(),
             native_lib: None,
             manifest: PathBuf::new(),
-            golden,
-            window: "code-1".into(),
+            golden: Some(golden),
+            window: Some("code-1".into()),
+            graph_oracle: false,
             peers: vec![],
             last_layer: 87,
             prefill: Some(1),
@@ -1495,9 +1730,9 @@ mod tests {
         args.prefill = Some(3);
         assert!(reference(&args, 3).is_err());
         args.prefill = Some(1);
-        args.window = "../code-1".into();
+        args.window = Some("../code-1".into());
         assert!(reference(&args, 3).is_err());
-        args.window = "code-1".into();
+        args.window = Some("code-1".into());
         std::fs::write(folder.join("layer87.bin"), &bytes[..bytes.len() - 4])?;
         assert!(reference(&args, 3).is_err());
         let mut nonfinite = bytes.clone();
@@ -1529,8 +1764,9 @@ mod tests {
             .flat_map(f32::to_le_bytes).collect::<Vec<_>>();
         std::fs::write(folder.join("logits.bin"), &logits)?;
         let mut args = GoldenArgs {
+            attention: Default::default(),
             kv_cache: cuteafd_loader::families::qwen4::Qwen4KvCache::Bf16, snapshot: root.path().into(), native_lib: None,
-            manifest: PathBuf::new(), golden: golden.clone(), window: "code-1".into(),
+            manifest: PathBuf::new(), golden: Some(golden.clone()), window: Some("code-1".into()), graph_oracle: false,
             peers: vec![], last_layer: 91, prefill: None, device: 0, split_device: None,  poison_scratch: false, check_headers: true, nll: true, prefix_state: false,
             fp8_diagnostic_reference: false, compare_layers: vec![], compare_final_norm: false,
             save_logits: None, dump_residuals: None, dump_layers: vec![], dump_layer0: None,
@@ -1587,6 +1823,7 @@ mod tests {
         checkpoint_identity(Some(FP8_REVISION), &native(ExpertFormat::Fp8Block128), true)?;
         checkpoint_identity(Some(NVFP4_REVISION), &native(ExpertFormat::Nvfp4), false)?;
         checkpoint_identity(Some(EXL3_REVISION), &StepExperts::Exl3(vec![4, 6]), false)?;
+        checkpoint_identity(Some(HQA_REVISION), &StepExperts::Exl3(vec![4, 6]), false)?;
         for (revision, format, diagnostic) in [
             (Some(FP8_REVISION), native(ExpertFormat::Nvfp4), false),
             (Some(NVFP4_REVISION), native(ExpertFormat::Fp8Block128), false),
@@ -1597,6 +1834,8 @@ mod tests {
             // Only the published revision and matching expert tiers qualify.
             (Some("0123456789abcdef0123456789abcdef01234567"), StepExperts::Exl3(vec![4, 6]), false),
             (Some(EXL3_REVISION), StepExperts::Exl3(vec![4, 6]), true),
+            (Some(HQA_REVISION), StepExperts::Exl3(vec![4, 6]), true),
+            (Some(HQA_REVISION), StepExperts::Exl3(vec![3, 4]), false),
             (Some(EXL3_REVISION), StepExperts::Exl3(vec![3, 4]), false),
             (None, StepExperts::Exl3(vec![4, 6]), false),
         ] {

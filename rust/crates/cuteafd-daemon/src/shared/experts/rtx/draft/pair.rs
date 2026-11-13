@@ -24,6 +24,7 @@ use cuteafd_ffi::{
     peer_exchange::PeerPlane, CuteafdDeviceBuffer, NativeLibrary, V41ExpertInputQuantizer,
     V41PeerCopy, V41RouteReducer,
 };
+use crate::shared::memory::Tag;
 use std::{cell::Cell, ffi::c_void, rc::Rc};
 
 /// Ranks of a pushing pair's flag exchange.
@@ -107,14 +108,14 @@ impl<'a> Pair<'a> {
             ready: Event::new(owner)?,
             done: Event::new(peer)?,
             ranks,
-            wire: Allocation::new(owner, wire)?,
+            wire: Allocation::new(owner, wire, Tag::drafter_workspace("experts/draft-pair"))?,
             peer_inputs: [
-                Allocation::new(peer, wire)?,
-                Allocation::new(peer, ids)?,
-                Allocation::new(peer, weights)?,
+                Allocation::new(peer, wire, Tag::transport("experts/draft-pair"))?,
+                Allocation::new(peer, ids, Tag::transport("experts/draft-pair"))?,
+                Allocation::new(peer, weights, Tag::transport("experts/draft-pair"))?,
             ],
-            peer_output: Allocation::new(owner, rows * layout.route_bytes())?,
-            output: Allocation::new(owner, rows * layout.geometry.row_bytes() as usize)?,
+            peer_output: Allocation::new(owner, rows * layout.route_bytes(), Tag::transport("experts/draft-pair"))?,
+            output: Allocation::new(owner, rows * layout.geometry.row_bytes() as usize, Tag::drafter_workspace("experts/draft-pair"))?,
             copy,
             quantizer,
             reducer,

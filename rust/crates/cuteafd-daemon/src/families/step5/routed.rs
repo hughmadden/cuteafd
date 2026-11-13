@@ -1,4 +1,5 @@
 //! Native router/shared expert bindings with transport-neutral wave boundaries.
+use crate::shared::memory::weight_arena::DeviceWeightArena;
 use super::scratch::{self, Arena, Plane};
 use super::weights::load_operand;
 use crate::shared::{
@@ -331,7 +332,7 @@ struct RoutedWeights<'a> {
 }
 
 pub(super) struct RoutedFfn<'a> {
-    stream: Stream<'a>,
+    stream: std::rc::Rc<crate::shared::memory::StandaloneStream<'a>>,
     planes: Vec<Plane<'a>>,
     native_scratch: Option<std::rc::Rc<super::native::NativeScratch<'a>>>,
     admission: Admission,
@@ -344,6 +345,12 @@ impl<'a> RoutedFfn<'a> {
         cuteafd_loader::plan::families::step5::native::plane_bytes(&self.admission.planes).expect("admitted planes")
     }
 
+    pub(super) fn inventory(&self, inventory: &mut crate::shared::memory::receipts::Inventory<'_>,
+        prefix: &str) -> Result<()> {
+        let weights = &self.immutable;
+        let native = weights.native.iter().flat_map(|(linears, _)| linears).collect::<Vec<_>>();
+        super::native::inventory_owner(inventory, prefix, weights.weights.iter().map(Some), &native)
+    }
 
     pub fn load(
         device: Device<'a>,
@@ -363,7 +370,7 @@ impl<'a> RoutedFfn<'a> {
         plan: RoutedPlan,
         arena: Option<(&Arena<'a>, usize)>,
     ) -> Result<Self> {
-        Self::load_shared(device, programs, checkpoint, layer, plan, arena, None)
+        Self::load_shared(device, programs, checkpoint, layer, plan, arena, None, None)
     }
 
     /// `native_scratch` is the rank's shared projection scratch (native shared FFNs).
@@ -375,6 +382,7 @@ impl<'a> RoutedFfn<'a> {
         plan: RoutedPlan,
         arena: Option<(&Arena<'a>, usize)>,
         native_scratch: Option<std::rc::Rc<super::native::NativeScratch<'a>>>,
+        weights_arena: Option<&DeviceWeightArena<'a>>,
     ) -> Result<Self> {
         ensure!(layer == plan.layer, "Step-5 routed plan layer mismatch");
         let native_set = plan.native.is_some();
@@ -393,11 +401,11 @@ impl<'a> RoutedFfn<'a> {
             None => None,
             Some(names) => {
                 let mut core = super::native::NativeLayer::load(device, programs, checkpoint, &plan.layout,
-                    plan.admission.rows, |name| names.iter().any(|n| n == name))?;
+                    plan.admission.rows, |name| names.iter().any(|n| n == name), weights_arena)?;
                 scratch_out = Some(match native_scratch {
                     Some(scratch) => scratch,
                     None => std::rc::Rc::new(super::native::NativeScratch::allocate(device,
-                        &core.scratch_layout(plan.admission.rows)?.context("native shared scratch")?)?),
+                        &core.scratch_layout(plan.admission.rows)?.context("native shared scratch")?, crate::shared::memory::Tag::workspace("step5/shared-projection"))?),
                 });
                 let mut take = |name: &str| -> Result<super::native::NativeLinear<'a>> {
                     std::rc::Rc::try_unwrap(core.linears.remove(name).context("native shared operand")?)
@@ -412,7 +420,7 @@ impl<'a> RoutedFfn<'a> {
         let weights = plan
             .weights
             .iter()
-            .map(|w| load_operand(device, checkpoint, &plan.layout, w))
+            .map(|w| load_operand(device, checkpoint, &plan.layout, w, weights_arena))
             .collect::<Result<Vec<_>>>()?;
         Self::workspace(device, plan.admission, std::rc::Rc::new(RoutedWeights {
             weights, programs: resolved, epsilon: plan.epsilon, layer,
@@ -431,11 +439,12 @@ impl<'a> RoutedFfn<'a> {
 
     fn workspace(device: Device<'a>, admission: Admission,
         immutable: std::rc::Rc<RoutedWeights<'a>>, arena: Option<(&Arena<'a>, usize)>) -> Result<Self> {
-        let _scope = cuteafd_ffi::memory_ledger::scope("step5_routed_workspace");
+        let _scope = cuteafd_ffi::memory_ledger::scope("workspace/step5-routed");
         let spans = cuteafd_loader::plan::families::step5::native::routed_layout(admission.rows,
             admission.span, admission.full)?;
-        let planes = scratch::region_planes(device, &spans, arena)?;
-        let stream = Stream::new(device)?;
+        let planes = scratch::region_planes(device, &spans, arena,
+            crate::shared::memory::Tag::workspace("step5/routed-scratch"))?;
+        let stream = scratch::standalone(device, arena);
         Ok(Self { stream, planes, native_scratch: None, admission, immutable, unit: std::cell::Cell::new(0) })
     }
     pub fn validate_live_weights(&self, device: Device<'_>) -> Result<()> {
@@ -700,7 +709,7 @@ mod tests {
         let owner = RoutedFfn::load(device, &programs, &checkpoint, 3, plan)?;
         let lane = owner.new_lane()?;
         ensure!(std::rc::Rc::ptr_eq(&owner.immutable, &lane.immutable)
-            && owner.stream.raw != lane.stream.raw
+            && owner.stream.get()?.raw != lane.stream.get()?.raw
             && owner.planes.iter().zip(&lane.planes).all(|(a, b)|
                 a.buffer.ptr != b.buffer.ptr && a.buffer.bytes == b.buffer.bytes),
             "Step-5 lane immutable/private storage identities");
@@ -731,5 +740,12 @@ mod tests {
         assert!(Admission::new(1, &[], one.bytes, &[1]).is_err());
         assert!(Admission::new(1, &[], u64::MAX, &[u64::MAX]).is_err());
         Ok(())
+    }
+}
+
+impl Drop for RoutedFfn<'_> {
+    fn drop(&mut self) {
+        // The arena retains the lazy stream beyond this owner's planes; drain first.
+        crate::shared::decode_graph::fatal_drain(self.stream.drain(), "Step-5 routed standalone");
     }
 }

@@ -1,4 +1,104 @@
 use super::*;
+
+fn check_arenas(inventory: &WeightInventory) -> Result<()> {
+    let arenas = inventory.coordinator_arenas()?;
+    let components = inventory.components(1)?;
+    assert_eq!(arenas.len(), inventory.ranks);
+    for (rank, arena) in arenas.iter().enumerate() {
+        let owners = inventory.owners.iter().filter(|owner|
+            owner.allocation.location == Location::coordinator(rank as u8)
+                && !owner.allocation.id.contains(".shared.layer.")).collect::<Vec<_>>();
+        assert_eq!(arena.views().len(), owners.len());
+        let mut regions = arena.views().values().copied().collect::<Vec<_>>();
+        regions.sort_by_key(|view| view.offset());
+        let mut end = 0;
+        for view in regions {
+            assert_eq!(view.offset() % 256, 0);
+            assert!(view.offset() >= end);
+            end = view.offset() + view.bytes();
+        }
+        assert_eq!(end, arena.bytes());
+        let roots = components.iter().filter_map(|component| match &component.kind {
+            ComponentKind::Allocation { template, .. } if template.location == Location::coordinator(rank as u8)
+                && template.view.is_none() => Some(template), _ => None,
+        }).collect::<Vec<_>>();
+        assert_eq!(roots.len(), 1, "no legacy payload allocations beside target root");
+        assert_eq!((roots[0].id.as_str(), roots[0].bytes), (arena.id(), arena.bytes() as u64));
+        let tails = components.iter().filter_map(|component| match &component.kind {
+            ComponentKind::AllocationGranularity(owner) if owner.location == Location::coordinator(rank as u8)
+                => Some(owner), _ => None,
+        }).collect::<Vec<_>>();
+        assert_eq!(tails.len(), 1);
+        assert_eq!(tails[0].backings.len(), 1);
+        assert_eq!(tails[0].backings[0].backing, arena.id());
+        assert_eq!(tails[0].backings[0].requests, [arena.bytes() as u64]);
+        for owner in owners {
+            assert_eq!(arena.view(&owner.allocation.id).unwrap().bytes() as u64, owner.allocation.bytes);
+            assert_eq!(owner.allocation.lifetime, Lifetime::RESIDENT);
+            let alias = components.iter().find_map(|component| match &component.kind {
+                ComponentKind::Allocation { template, .. } if template.id == owner.allocation.id => Some(template), _ => None,
+            }).unwrap();
+            assert_eq!(alias.view.as_ref().unwrap().backing, arena.id());
+        }
+        let weights = components.iter().filter_map(|component| match &component.kind {
+            ComponentKind::ResidentWeight(owner) if owner.id == arena.id() => Some(owner.weights.0), _ => None,
+        }).sum::<u64>();
+        assert_eq!(weights, arena.payload_bytes() as u64);
+    }
+    for owner in inventory.owners.iter().filter(|owner| owner.allocation.location == Location::PINNED) {
+        let allocation = components.iter().find_map(|component| match &component.kind {
+            ComponentKind::Allocation { template, .. } if template.id == owner.allocation.id => Some(template), _ => None,
+        }).unwrap();
+        assert_eq!(allocation, &owner.allocation);
+    }
+    Ok(())
+}
+
+#[test]
+fn coordinator_arenas_preserve_selected_rank_operands_and_exclude_transients() -> Result<()> {
+    let (config, tensors) = testing::glm5_compact_weights();
+    let (core_config, core_tensors) = core_checkpoint(256, true);
+    for (config, tensors) in [(&config, &tensors), (&core_config, &core_tensors)] {
+        for ranks in [1, 2] {
+            for owners in [None, Some([1u8, 0].as_slice())] {
+                if ranks == 1 && owners.is_some() { continue; }
+                for bf16 in [false, true] {
+                    for home in [EmbeddingHome::Device(0), EmbeddingHome::HostPinned] {
+                        check_arenas(&ordinary(config, tensors, ranks, owners, bf16, home))?;
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn native_attention_mount_separates_native_and_converted_read_owners() -> Result<()> {
+    use crate::{formats::{native_attention::NativeLayout, trellis_core::CoreSplit},
+        shared::dense_read::{MountLoad, STEP_BYTES}};
+    let mut layout = NativeLayout { stem: "o_proj".into(), shape: [6144, 8192],
+        fp8: false, rank: 0, ranks: 2, split: CoreSplit::Input };
+    let bf16 = native_attention_mount(&layout, [6144, 16384], false)?;
+    assert_eq!(bf16, MountLoad { pinned_source: STEP_BYTES as u64,
+        full_row_cache: (2 * STEP_BYTES) as u64, pinned_tables: 0 });
+    layout.fp8 = true;
+    let fp8 = native_attention_mount(&layout, [6144, 16384], false)?;
+    assert_eq!(fp8, bf16);
+    let converted = native_attention_mount(&layout, [6144, 16384], true)?;
+    assert!(converted.pinned_source <= STEP_BYTES as u64);
+    assert_eq!(converted.full_row_cache, 2 * converted.pinned_source);
+    assert!(converted.pinned_tables > 0);
+    let inventory = WeightInventory { ranks: 2, owners: vec![], core_loading: Default::default(),
+        kv_b_loading: Default::default(), row_loading: Default::default(), attention_mount: converted };
+    let components = inventory.loading_components(1)?;
+    assert_eq!(components.len(), 3);
+    for owner in converted.allocations("glm.load.native_attention") {
+        assert!(owner.id.starts_with("glm.load.native_attention."));
+        assert_eq!(owner.lifetime, Lifetime { first: Phase::Load, last: Phase::Load });
+    }
+    Ok(())
+}
 use crate::plan::exlr8::dense::{
     DenseAxis, DenseComponent, DenseEncoding, DenseExecution, DenseOwnership, DenseRange,
     DenseRecord, KvBGeometry, ShardSide,
@@ -40,6 +140,26 @@ fn core_checkpoint(vocab: usize, core_head: bool) -> (serde_json::Value, Vec<Ten
             }
         }).collect();
     (config, tensors)
+}
+
+
+#[test]
+fn bf16_target_keeps_attention_indexer_dense_and_shared_owners_native() -> Result<()> {
+    let (config, tensors) = testing::glm5_compact_weights();
+    let tensors = tensors.into_iter().filter(|tensor| !tensor.0.ends_with("_scale_inv"))
+        .map(|(name, dtype, shape)| (name, if dtype == "F8_E4M3" { "BF16" } else { dtype }, shape))
+        .collect::<Vec<_>>();
+    for ranks in [1, 2] {
+        let inventory = ordinary(&config, &tensors, ranks, None, true, EmbeddingHome::Device(0));
+        assert!(inventory.owners.iter().all(|owner| !owner.format.contains("fp8")));
+        for group in ["attention", "indexer", "dense", "shared_expert"] {
+            assert!(inventory.owners.iter().any(|owner| owner.group == group && owner.format == "bf16"), "{group}");
+        }
+        check_arenas(&inventory)?;
+        let explicit = ordinary(&config, &tensors, ranks, None, false, EmbeddingHome::Device(0));
+        assert!(explicit.owners.iter().any(|owner| owner.group == "dense" && owner.format.contains("fp8")));
+    }
+    Ok(())
 }
 
 fn bytes(inventory: &WeightInventory, suffix: &str) -> u64 {
@@ -85,15 +205,17 @@ fn checkpoint_owners_match_loader_floors_splits_and_pinned_embedding() {
     );
     assert!(inventory.components(0).is_err());
     let components = inventory.components(16).unwrap();
-    assert_eq!(components.len(), 2 * inventory.owners.len());
+    check_arenas(&inventory).unwrap();
     let resources: Vec<_> = components.iter().filter_map(|component| {
         if let ComponentKind::ResidentWeight(owner) = &component.kind { Some(owner) } else { None }
     }).collect();
-    assert_eq!(resources.len(), inventory.owners.len());
-    for (resource, physical) in resources.iter().zip(&inventory.owners) {
-        assert_eq!(resource.id, physical.allocation.id);
-        assert_eq!(resource.location, physical.allocation.location);
-        assert_eq!(resource.weights.0, physical.allocation.bytes);
+    assert_eq!(resources.len(), inventory.ranks + 1);
+    for location in [Location::PINNED, Location::coordinator(0), Location::coordinator(1)] {
+        let payload = inventory.owners.iter().filter(|owner| owner.allocation.location == location)
+            .map(|owner| owner.allocation.bytes).sum::<u64>();
+        let resources = resources.iter().filter(|owner| owner.location == location).collect::<Vec<_>>();
+        assert_eq!(resources.len(), 1);
+        assert_eq!(resources[0].weights.0, payload);
     }
 
     // ModelOpt conversion splits request exact small grids, not landing's floor.
@@ -651,6 +773,8 @@ fn native_owner_groups_compose_once_and_refuse_without_mutation() {
         separate.extend_native(&selection, 2, &vocabulary.iter().collect::<Vec<_>>()).unwrap();
         let expected = census(&whole);
         assert_eq!(census(&separate), expected);
+        check_arenas(&separate).unwrap();
+        assert_eq!(separate.coordinator_arenas().unwrap(), whole.coordinator_arenas().unwrap());
         assert_eq!(separate.resident_groups().unwrap(), whole.resident_groups().unwrap());
         assert_eq!(separate.owners.iter().filter(|owner|
             owner.allocation.id == "glm.weights.embedding").count(), 1);

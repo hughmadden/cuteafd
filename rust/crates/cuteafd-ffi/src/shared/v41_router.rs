@@ -98,7 +98,28 @@ impl V41Router<'_> {
                 stream,
             )
         };
-        ensure!(status == 0, "native router CUDA status {status}");
+        self._library.status_to_result("native router", status)?;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod draft_failure_tests {
+    use super::*;
+    #[test]
+    fn router_native_failure_is_tagged_but_host_guards_are_not() -> Result<()> {
+        let library = crate::tests::draft_failure_library()?;
+        unsafe extern "C" fn launch(_: *const u16, _: *const u16, _: *const f32, _: *const f32,
+            _: *const u8, _: *mut f32, _: *mut u32, _: *mut f32, _: i32, _: i32, _: *mut c_void) -> i32 { 98 }
+        let router = V41Router { _library: &library, launch };
+        let b = CuteafdDeviceBuffer { ptr: std::ptr::NonNull::<u16>::dangling().as_ptr().cast(),
+            bytes: 4 << 20, device_id: 0, flags: 0 };
+        // SAFETY: the injected entry point never dereferences synthetic buffers.
+        unsafe {
+            crate::tests::assert_draft_native_failure(router.launch(b, b, b, b, None, b, b, b, 1, 128, std::ptr::null_mut()));
+            let error = router.launch(b, b, b, b, None, b, b, b, 0, 128, std::ptr::null_mut()).unwrap_err();
+            assert!(error.downcast_ref::<crate::NativeStatusError>().is_none());
+        }
         Ok(())
     }
 }

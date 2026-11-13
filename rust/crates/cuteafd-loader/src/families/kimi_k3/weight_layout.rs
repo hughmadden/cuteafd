@@ -1,10 +1,21 @@
 //! Packed device weight extents shared by checkpoint admission and runtime owners.
 use crate::formats::trellis_core::CoreWeightLayout;
 use super::{config::{KimiAttention, KimiK3Config}, core::CoreInventory, kda};
-use crate::{placement::{Demand, LayerMode}, formats::dense_trellis::TrellisSide};
+use crate::{placement::{Demand, LayerMode, ResidentWeights}, formats::dense_trellis::TrellisSide};
 use anyhow::{ensure, Context, Result};
 use cuteafd_core::memory_layout::{Basis, Category};
 use std::collections::BTreeMap;
+
+/// One physical request per coordinator rank. Views are stable across mount
+/// and push loads and include ordinary operands, K6 planes and native attention.
+pub fn coordinator_arena(rank: usize, global: &GlobalLayout, layers: &[&LayerLayout])
+    -> Result<crate::serving_capacity::WeightArenaLayout> {
+    let mut tensors = global.arena_tensors()?;
+    for (layer, layout) in layers.iter().enumerate() {
+        tensors.extend(layout.arena_tensors(&format!("layers.{layer}"))?);
+    }
+    crate::serving_capacity::WeightArenaLayout::new(format!("kimi/coordinator/{rank}"), tensors)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WeightAttention { Absent, Whole, Split }
@@ -37,6 +48,12 @@ pub struct GlobalLayout {
     pub operands: BTreeMap<&'static str, usize>, pub core_head: Option<CoreWeightLayout>,
 }
 impl GlobalLayout {
+    pub fn arena_tensors(&self) -> Result<Vec<(String, usize)>> {
+        let mut tensors = self.operands.iter().map(|(name, bytes)| (format!("global.{name}"), *bytes)).collect::<Vec<_>>();
+        if let Some(head) = &self.core_head { tensors.extend(head.arena_tensors("global.head")?); }
+        Ok(tensors)
+    }
+
     pub fn ranks_with_core(cfg: &KimiK3Config, inventory: &CoreInventory, ranks: usize) -> Result<Vec<Self>> {
         ensure!(matches!(ranks, 1 | 2), "Kimi global rank count");
         let [mut entry, terminal] = Self::pair_with_core(cfg, inventory)?;
@@ -72,8 +89,15 @@ impl GlobalLayout {
             .context("Kimi global weight extent overflow"))
     }
 
+    pub fn allocation_extents(&self) -> Vec<u64> {
+        self.operands.values().map(|&bytes| bytes as u64)
+            .chain(self.core_head.iter().flat_map(CoreWeightLayout::allocation_extents)).collect()
+    }
+
     pub fn demand(&self) -> Result<Demand> {
-        Ok(Demand::new(self.rank as u8, Category::Weights, "Kimi global weights", self.bytes()? as u64, Basis::Exact))
+        let bytes = self.bytes()? as u64;
+        Ok(Demand::new(self.rank as u8, Category::Weights, "Kimi global weights", bytes, Basis::Exact)
+            .with_resident_weights(ResidentWeights(bytes)))
     }
 
 }
@@ -82,8 +106,25 @@ pub struct LayerLayout {
     pub operands: BTreeMap<&'static str, usize>,
     pub attention: WeightAttention,
     pub core: BTreeMap<&'static str, CoreWeightLayout>,
+    pub native: BTreeMap<&'static str, crate::formats::native_attention::NativeLayout>,
 }
 impl LayerLayout {
+    pub fn arena_tensors(&self, prefix: &str) -> Result<Vec<(String, usize)>> {
+        let mut tensors = self.operands.iter().map(|(name, bytes)| (format!("{prefix}.{name}"), *bytes)).collect::<Vec<_>>();
+        for (name, layout) in &self.core { tensors.extend(layout.arena_tensors(&format!("{prefix}.{name}"))?); }
+        for (name, layout) in &self.native {
+            let [n, k] = layout.shape;
+            let values = n.checked_mul(k).and_then(|v| v.checked_mul(if layout.fp8 { 1 } else { 2 }))
+                .context("Kimi native arena extent overflow")?.max(256);
+            tensors.push((format!("{prefix}.{name}.values"), values));
+            if layout.fp8 {
+                let scales = usize::try_from(layout.bytes()?)?.checked_sub(values).context("Kimi native arena scales")?;
+                tensors.push((format!("{prefix}.{name}.scales"), scales));
+            }
+        }
+        Ok(tensors)
+    }
+
     pub fn pair(cfg: &KimiK3Config, layer: usize, mode: LayerMode) -> Result<[Self; 2]> {
         Ok(Self::ranks(cfg, layer, mode, 2)?.try_into().expect("two rank layouts"))
     }
@@ -92,7 +133,6 @@ impl LayerLayout {
         let kind = *cfg.attention.get(layer).context("Kimi attention layer out of range")?;
         ensure!(cfg.layers == cfg.attention.len() && cfg.dense.len() == cfg.layers,
             "Kimi dense/attention inventories differ");
-        ensure!(mode != LayerMode::ContextSplit, "Kimi context attention has no query/LSE exchange ABI");
         ensure!(ranks == 1 || !matches!(mode, LayerMode::Whole { ffn: crate::placement::FfnMode::Owner, .. }),
             "Kimi FFNs require TP2 intermediate slices");
         ensure!(ranks != 1 || matches!(mode, LayerMode::Whole { gpu: 0, ffn: crate::placement::FfnMode::Owner }),
@@ -105,7 +145,7 @@ impl LayerLayout {
         ensure!(intermediate > 0 && intermediate % ranks == 0, "Kimi FFN intermediate does not divide TP2");
         let local = intermediate / ranks;
         let sum = |a: usize, b: usize| a.checked_add(b).context("Kimi weight extent overflow");
-        let mut pair = shares.into_iter().map(|attention| Self { operands: BTreeMap::new(), attention, core: BTreeMap::new() }).collect::<Vec<_>>();
+        let mut pair = shares.into_iter().map(|attention| Self { operands: BTreeMap::new(), attention, core: BTreeMap::new(), native: BTreeMap::new() }).collect::<Vec<_>>();
         for (index, rank) in pair.iter_mut().enumerate() {
             for name in ["attention.score", "ffn.score"] { rank.insert(name, &[cfg.hidden, 4])?; }
             for name in ["attention.norm", "ffn.norm"] { rank.insert(name, &[cfg.hidden, 2])?; }
@@ -143,6 +183,12 @@ impl LayerLayout {
                     rank.insert("mla.uv", &[heads, cfg.v_head_dim, cfg.kv_lora_rank, 2])?;
                     rank.insert("mla.gate", &[heads, cfg.v_head_dim, cfg.hidden, 2])?;
                     rank.insert("mla.output", &[cfg.hidden, heads, cfg.v_head_dim, 2])?;
+                    if let Some(index) = cfg.dsa {
+                        rank.insert("mla.indexer.q", &[index.heads, index.head_dim, cfg.q_lora_rank, 2])?;
+                        rank.insert("mla.indexer.kw", &[sum(index.head_dim, index.heads)?, cfg.hidden, 2])?;
+                        rank.insert("mla.indexer.norm", &[index.head_dim, 2])?;
+                        rank.insert("mla.indexer.bias", &[index.head_dim, 2])?;
+                    }
                 }
                 KimiAttention::Mla => {}
             }
@@ -233,7 +279,14 @@ impl LayerLayout {
         } else {
             let [mut n, mut k] = shape;
             match side { TrellisSide::Output => n /= ranks, TrellisSide::Input => k /= ranks }
-            self.insert(name, &[n, k, 2])?;
+            if let Some(projection) = inventory.native.get(stem) {
+                ensure!(projection.shape == shape, "Kimi {stem} native inventory differs from layer geometry");
+                self.native.insert(name, crate::formats::native_attention::NativeLayout {
+                    stem: stem.into(), shape: [n, k], fp8: projection.fp8,
+                    rank, ranks, split: projection.split });
+            } else {
+                self.insert(name, &[n, k, 2])?;
+            }
         }
         Ok(())
     }
@@ -244,15 +297,34 @@ impl LayerLayout {
     }
 
     pub fn bytes(&self) -> Result<usize> {
-        self.operands.values().copied().chain(self.core.values().map(|layout| layout.bytes))
-            .try_fold(0usize, |n, size| n.checked_add(size).context("Kimi layer admission extent overflow"))
+        let base = self.operands.values().copied().chain(self.core.values().map(|layout| layout.bytes))
+            .try_fold(0usize, |n, size| n.checked_add(size).context("Kimi layer admission extent overflow"))?;
+        self.native.values().try_fold(base, |sum, layout| sum.checked_add(usize::try_from(layout.bytes()?)?)
+            .context("Kimi native attention extent overflow"))
+    }
+
+    /// None selects every physical owner; Some partitions the same requests
+    /// into attention and non-attention logical planner groups, without aliases.
+    pub fn allocation_extents(&self, attention: Option<bool>) -> Result<Vec<u64>> {
+        let selected = |name: &&str| attention.is_none_or(|wanted|
+            wanted == (name.starts_with("mla.") || name.starts_with("kda.")));
+        let mut requests = self.operands.iter().filter(|(name, _)| selected(name))
+            .map(|(_, &bytes)| bytes as u64)
+            .chain(self.core.iter().filter(|(name, _)| selected(name))
+                .flat_map(|(_, layout)| layout.allocation_extents())).collect::<Vec<_>>();
+        for (name, layout) in &self.native {
+            if selected(name) { requests.extend(layout.allocation_extents()?); }
+        }
+        Ok(requests)
     }
 
     pub fn attention_bytes(&self) -> Result<usize> {
-        self.operands.iter().filter(|(name, _)| name.starts_with("mla.") || name.starts_with("kda."))
+        let base = self.operands.iter().filter(|(name, _)| name.starts_with("mla.") || name.starts_with("kda."))
             .map(|(_, bytes)| *bytes).chain(self.core.iter().filter(|(name, _)|
                 name.starts_with("mla.") || name.starts_with("kda.")).map(|(_, layout)| layout.bytes))
-            .try_fold(0usize, |n, bytes| n.checked_add(bytes).context("Kimi attention extent overflow"))
+            .try_fold(0usize, |n, bytes| n.checked_add(bytes).context("Kimi attention extent overflow"))?;
+        self.native.values().try_fold(base, |sum, layout| sum.checked_add(usize::try_from(layout.bytes()?)?)
+            .context("Kimi native attention extent overflow"))
     }
 
 }
@@ -266,6 +338,51 @@ fn extent(dimensions: &[usize]) -> Result<usize> {
 mod tests {
     use super::*;
     use crate::placement::FfnMode;
+
+    #[test]
+    fn physical_weight_requests_partition_exact_payloads_for_bf16_k6_and_native_attention() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        crate::plan::testing::write_kimi_core_snapshot(dir.path(), false);
+        let checkpoint = crate::plan::checkpoint::Checkpoint::open(dir.path())?;
+        let cfg = KimiK3Config::from_hf(&checkpoint.config)?;
+        let core = crate::plan::families::kimi::core_inventory(&checkpoint)?;
+        for inventory in [&CoreInventory::default(), &core] {
+            for ranks in [1, 2] {
+                for global in GlobalLayout::ranks_with_core(&cfg, inventory, ranks)? {
+                    assert_eq!(global.allocation_extents().iter().sum::<u64>(), global.bytes()? as u64);
+                }
+                let modes = if ranks == 1 { vec![LayerMode::Whole { gpu: 0, ffn: FfnMode::Owner }] }
+                    else { vec![LayerMode::HeadSplit, LayerMode::ContextSplit,
+                        LayerMode::Whole { gpu: 0, ffn: FfnMode::Split }, LayerMode::Whole { gpu: 1, ffn: FfnMode::Split }] };
+                for mode in modes {
+                    for layer in 0..cfg.layers {
+                        if ranks == 2 && cfg.attention[layer] == KimiAttention::Kda && mode != LayerMode::HeadSplit {
+                            assert!(LayerLayout::ranks_with_core(&cfg, layer, mode, inventory, ranks).is_err());
+                            continue;
+                        }
+                        for mut layout in LayerLayout::ranks_with_core(&cfg, layer, mode, inventory, ranks)? {
+                            // Both native storage variants use the same physical partition.
+                            for fp8 in [false, true] {
+                                layout.native.insert("mla.test", crate::formats::native_attention::NativeLayout {
+                                    stem: "test".into(), shape: [256, 512], fp8, rank: 0, ranks: 1,
+                                    split: crate::formats::trellis_core::CoreSplit::Whole,
+                                });
+                                let mut all = layout.allocation_extents(None)?;
+                                let mut attention = layout.allocation_extents(Some(true))?;
+                                assert_eq!(all.iter().sum::<u64>(), layout.bytes()? as u64);
+                                assert_eq!(attention.iter().sum::<u64>(), layout.attention_bytes()? as u64);
+                                attention.extend(layout.allocation_extents(Some(false))?);
+                                all.sort_unstable();
+                                attention.sort_unstable();
+                                assert_eq!(all, attention);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
 
     #[test]
     fn one_rank_owns_full_attention_ffns_and_all_routed_frontends() -> Result<()> {
@@ -294,6 +411,44 @@ mod tests {
         assert!(globals[0].operands.contains_key("embedding") && globals[0].operands.contains_key("head"));
         assert!(LayerLayout::ranks(&cfg, 0, LayerMode::HeadSplit, 1).is_err());
         assert!(LayerLayout::ranks(&cfg, 0, mode, 0).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn coordinator_arenas_cover_final_tp1_and_tp2_operands_once() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        crate::plan::testing::write_kimi_core_snapshot(dir.path(), false);
+        let checkpoint = crate::plan::checkpoint::Checkpoint::open(dir.path())?;
+        let cfg = KimiK3Config::from_hf(&checkpoint.config)?;
+        let core = crate::plan::families::kimi::core_inventory(&checkpoint)?;
+        for ranks in [1, 2] {
+            let global = GlobalLayout::ranks_with_core(&cfg, &core, ranks)?;
+            let layers = (0..cfg.layers).map(|layer| LayerLayout::ranks_with_core(&cfg, layer,
+                if ranks == 1 { LayerMode::Whole { gpu: 0, ffn: FfnMode::Owner } } else { LayerMode::HeadSplit },
+                &core, ranks)).collect::<Result<Vec<_>>>()?;
+            for rank in 0..ranks {
+                let local = layers.iter().map(|ranks| &ranks[rank]).collect::<Vec<_>>();
+                let arena = coordinator_arena(rank, &global[rank], &local)?;
+                let expected = local.iter().try_fold(global[rank].bytes()?, |sum, layer|
+                    sum.checked_add(layer.bytes()?).context("fixture arena overflow"))?;
+                assert_eq!(arena.payload_bytes(), expected);
+                assert_eq!(arena.bytes(), expected + arena.padding_bytes());
+                let mut views = arena.views().values().copied().collect::<Vec<_>>();
+                views.sort_by_key(|view| view.offset());
+                let mut end = 0;
+                for view in views {
+                    assert_eq!(view.offset() % 256, 0);
+                    assert!(view.offset() >= end);
+                    end = view.offset() + view.bytes();
+                }
+                assert_eq!(end, arena.bytes());
+                assert!(arena.views().keys().all(|key| !key.contains("staging") && !key.contains("temporary")));
+                if global[rank].core_head.is_some() {
+                    assert!(arena.view("global.head.trellis").is_some());
+                    assert!(arena.view("global.head").is_none());
+                }
+            }
+        }
         Ok(())
     }
 

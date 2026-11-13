@@ -44,7 +44,7 @@ def export_input_quantizer(output_dir: Path, manifest: dict) -> None:
 
 
 # Roles served by the SM121 Spark expert family. `spark` is the historical TP4
-# shard; `spark_tp2`/`spark_tp3`/`spark_tp6` are the replicated-group TP shards.
+# shard; `spark_tp2`/`spark_tp3`/`spark_tp6` are the Spark TP shards.
 # The degree is a plan-time role property, never derived from live rows.
 SPARK_ROLES = ("spark", "spark_tp2", "spark_tp3", "spark_tp6", "spark_tp8")
 SPARK_TP_DEGREES = {"spark": 4, "spark_tp2": 2, "spark_tp3": 3, "spark_tp6": 6, "spark_tp8": 8}

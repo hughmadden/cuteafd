@@ -1,19 +1,27 @@
 # Mistral Large 4
 
-`mistralai/Mistral-Large-4-1T-A52B` (official FP8 block-128) is served as an
-EXL3 quant, `wrldsuksgo2mars/Mistral-Large-4-EXL3-K4-Core-K6`: K4 routed experts
-on five or six Sparks (with RTX onboarding) and a native K6 dense core
-(attention, dense and shared FFN, vocabulary head) on the RTX cards. The
-published revision is `03c80aebaa483d55760703ae5bc0c9734c9d67d6`;
-qualification continues, with no release card yet. WIP examples:
-[min, 1 RTX + 5 Sparks](../../examples/configs/mistral-large4-exl3-k4-core-k6-min.config)
-and [max, 2 RTX + 6 Sparks](../../examples/configs/mistral-large4-exl3-k4-core-k6-max.config).
-Gate cards `ml4-exl3-min` and `ml4-exl3-max` in
-`scripts/bench/kits/gate/matrix-ml4.json` use these recipes. TP2 expert
-onboarding, official-reference image fidelity, exact prefix restores and
-lossless speculation have passed on hardware. On two GPUs, `auto` selects
-`context` after correctness and interleaved throughput qualification;
-explicit `layers` remains available.
+[`wrldsuksgo2mars/Mistral-Large-4-EXL3-K4`](https://huggingface.co/wrldsuksgo2mars/Mistral-Large-4-EXL3-K4)
+serves `mistralai/Mistral-Large-4-1T-A52B` with EXL3 K4 routed experts and
+the original mixed FP8/BF16 vendor core. Revision
+`9c354cee78cd6feddb057549b8edde6e3b319822` is a plain checkpoint, not MC;
+only `CORE_VIEW=original` is supported. New WIP examples:
+[min, 1 RTX + 5 Sparks](../../examples/configs/mistral-large4-exl3-k4-min.config)
+and [max, 2 RTX + 6 Sparks](../../examples/configs/mistral-large4-exl3-k4-max.config).
+These preserve the earlier layouts and bundled dSpark; the new checkpoint
+has no benchmark cards yet. They require an engine with MC `CORE_VIEW` support
+(dev after #1778; first release after v5.0.0); v5.0.0 and the image tags
+retained from the earlier configs cannot run these recipes.
+
+Core-K6 was retired on 2026-11-12; its v5 cards remain archived in the changelog.
+
+## Original mixed-precision core
+
+`wrldsuksgo2mars/Mistral-Large-4-EXL3-K4` is a plain checkpoint, not MC.
+Its complete original mixed-precision core is restored, including native E4M3
+`wq`/`wo` and F32 block-128 `qscale_weight`; routed experts remain EXL3 K4.
+Only `CORE_VIEW=original` is accepted. Compact trellis views and load-time FP8
+conversion refuse: an FP8-origin core is not requantized.
+TP2 output reductions retain F32 partials, add ranks in order and narrow once.
 
 ## How it runs
 
@@ -31,8 +39,8 @@ names.
   layer 35's latent pages and keep no KV of their own.
 - **DSA indexer:** only on the 44 `full` layers; `shared` layers reuse the last
   full layer's top-k. The query is `wq_b(LayerNorm(h))` with its own query
-  scale. `wq_b` runs in whichever form the checkpoint ships: the K6 core, or
-  the official FP8 block-128 weight through `ml4_index_q` (never
+  scale. `wq_b` runs as the original FP8 block-128 weight through
+  `ml4_index_q` (never
   re-quantized). Ties at the top-k cutoff go to the lower key id, as in the
   reference.
 - **Router and head:** a softmax top-4 of 128 experts, renormalized. The head
@@ -62,7 +70,7 @@ names.
   36, 54 and 71, and uses an RNN Markov head. It defaults on at its native
   depth of three draft tokens after the lossless, exact-restore and
   delivered-tok/s gates passed on hardware. `SPECULATOR=off` disables it;
-  there is no separate drafter checkpoint; `SPECULATOR_DRAFTS` can fix the draft count for policy experiments.
+  there is no separate drafter checkpoint; `DRAFT_LENGTH` can fix the draft count for policy experiments.
 - **Prefix cache:** snapshots carry each layer's records at their own size,
   and none for latent readers, whose pages belong to their source layer.
 - **Vision:** the officially bundled Pixtral tower and projector run resident on an RTX or remotely on a planner-selected Spark, with checkpoint-native image preprocessing and row markers.
@@ -74,3 +82,9 @@ names.
   The fidelity goldens use it (`golden.py`).
 - `ops.py`: op-level references, bit-exact against the official modules.
 - `trace.py`: the per-layer engine golden that `cuteafd glm-golden` compares.
+
+## Changelog
+
+| Version | Date | Change | Basic eval |
+| --- | --- | --- | --- |
+| v5 | 2026-11-10 | Published benchmarks | <a href="../../benchmarks/mistral_large4/2026-11-10-smoke-mistral-large-4-exl3-k4-core-k6-1rtx-5spark-ml4-exl3-min/report.svg"><img src="../../benchmarks/mistral_large4/2026-11-10-smoke-mistral-large-4-exl3-k4-core-k6-1rtx-5spark-ml4-exl3-min/card.svg" width="360" alt="Mistral-Large-4-EXL3-K4-Core-K6 (exl3-k4) (1× RTX)"></a> <a href="../../benchmarks/mistral_large4/2026-11-10-smoke-mistral-large-4-exl3-k4-core-k6-2rtx-6spark-ml4-exl3-max/report.svg"><img src="../../benchmarks/mistral_large4/2026-11-10-smoke-mistral-large-4-exl3-k4-core-k6-2rtx-6spark-ml4-exl3-max/card.svg" width="360" alt="Mistral-Large-4-EXL3-K4-Core-K6 (exl3-k4) (2× RTX)"></a> |

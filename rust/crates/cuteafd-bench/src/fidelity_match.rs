@@ -23,7 +23,10 @@ pub const PUBLICATIONS: &[Publication] = &[
     Publication { root: "Qwen/Qwen3.5-9B", siblings: &["Qwen/Qwen3.5-9B"], revision: dataset::QWEN35_9B_REVISION, config: dataset::QWEN35_9B_CONFIG },
     Publication { root: "Qwen/Qwen3.8-27B", siblings: &["Qwen/Qwen3.8-27B", "Qwen/Qwen3.8-27B-FP8"], revision: dataset::QWEN38_27B_REVISION, config: dataset::QWEN38_27B_CONFIG },
     Publication { root: "moonshotai/Kimi-K3", siblings: &["moonshotai/Kimi-K3"], revision: dataset::KIMI_K3_REVISION, config: dataset::KIMI_K3_CONFIG },
+    Publication { root: "moonshotai/Kimi-K3.1-Pro", siblings: &["moonshotai/Kimi-K3.1-Pro"], revision: dataset::KIMI_K31_REVISION, config: dataset::KIMI_K31_CONFIG },
     Publication { root: "meta-models/Muse-Spark-Open-816B-A42B", siblings: &["meta-models/Muse-Spark-Open-816B-A42B"], revision: dataset::MUSE_SPARK_REVISION, config: dataset::MUSE_SPARK_CONFIG },
+    // Official native NVFP4/MXFP8 release; MiniMax publishes no BF16 master.
+    Publication { root: "MiniMaxAI/MiniMax-M3.1-Flash", siblings: &["MiniMaxAI/MiniMax-M3.1-Flash"], revision: dataset::MINIMAX_M3_REVISION, config: dataset::MINIMAX_M3_CONFIG },
     // Official FP8 block-128 release; Mistral publishes no BF16 master.
     Publication { root: "mistralai/Mistral-Large-4-1T-A52B", siblings: &["mistralai/Mistral-Large-4-1T-A52B"], revision: dataset::MISTRAL_LARGE4_REVISION, config: dataset::MISTRAL_LARGE4_CONFIG },
     Publication { root: "stepfun-ai/Step-5-Preview-BF16", siblings: &["stepfun-ai/Step-5-Preview-BF16", "stepfun-ai/Step-5-Preview", "stepfun-ai/Step-5-Preview-NVFP4"], revision: dataset::STEP5_REVISION, config: dataset::STEP5_CONFIG },
@@ -44,6 +47,8 @@ pub const OFFICIAL_ROOTS: &[(&str, &[&str])] = &[
     ("Qwen/Qwen3.8-27B", &["Qwen/Qwen3.8-27B", "Qwen/Qwen3.8-27B-FP8"]),
     ("meta-models/Muse-Spark-Open-816B-A42B", &["meta-models/Muse-Spark-Open-816B-A42B"]),
     ("mistralai/Mistral-Large-4-1T-A52B", &["mistralai/Mistral-Large-4-1T-A52B"]),
+    ("MiniMaxAI/MiniMax-M3.1-Flash", &["MiniMaxAI/MiniMax-M3.1-Flash"]),
+    ("moonshotai/Kimi-K3.1-Pro", &["moonshotai/Kimi-K3.1-Pro"]),
 ];
 
 pub fn official_root(model: &str) -> Option<&'static str> {
@@ -141,7 +146,7 @@ fn check_kind(snapshot: &Path) -> Result<()> {
     use cuteafd_loader::plan::{checkpoint::{read_json, Checkpoint}, family};
     let path = snapshot.join("config.json");
     if !path.exists() { return Ok(()); }
-    let checkpoint = Checkpoint { snapshot: snapshot.into(), config: read_json(&path)?,
+    let checkpoint = Checkpoint { view: None, snapshot: snapshot.into(), config: read_json(&path)?,
         quantize_config: None, weight_map: Default::default(), tensors: Vec::new(), missing_shards: Vec::new(), shard_bytes: 0 };
     ensure!(!family::registry().iter().any(|f| matches!(f.id(), "dflash2" | "dspark") && f.detect(&checkpoint)),
         "drafter checkpoint");
@@ -341,6 +346,27 @@ mod tests {
     }
 
     #[test]
+    fn kimi_k31_root_and_quant_resolve_independently_of_kimi_k3() {
+        let root = "moonshotai/Kimi-K3.1-Pro";
+        assert_eq!(official_root(root), Some(root));
+        let tmp = tempfile::tempdir().unwrap();
+        add(tmp.path(), root, "base_model: moonshotai/Kimi-K3");
+        let reference = resolve_in(root, None, tmp.path()).unwrap();
+        assert_eq!((reference.reference_root.as_str(), reference.revision.as_str(), reference.config.as_str()),
+            (root, dataset::KIMI_K31_REVISION, dataset::KIMI_K31_CONFIG));
+        assert_eq!(reference.resolved_chain, vec![vec![root.to_string()]]);
+        let quant = add(tmp.path(), "test/kimi-k31-quant", "base_model: moonshotai/Kimi-K3.1-Pro\nbase_model_relation: quantized");
+        let reference = resolve_in("test/kimi-k31-quant", Some(&quant), tmp.path()).unwrap();
+        assert_eq!(reference.reference_match, "base_model");
+        assert_eq!((reference.reference_root.as_str(), reference.revision.as_str(), reference.config.as_str()),
+            (root, dataset::KIMI_K31_REVISION, dataset::KIMI_K31_CONFIG));
+        assert_eq!(reference.resolved_chain, vec![vec!["test/kimi-k31-quant".to_string(), root.to_string()]]);
+        assert!(resolve_in("someone/Kimi-K3.1-Pro-EXL3", None, tmp.path()).is_err());
+        assert_eq!(official("moonshotai/Kimi-K3").unwrap().config, dataset::KIMI_K3_CONFIG);
+        assert_ne!(dataset::KIMI_K31_CONFIG, dataset::KIMI_K3_CONFIG);
+    }
+
+    #[test]
     fn muse_root_and_card_quant_resolve_to_bf16_root_reference() {
         let tmp = tempfile::tempdir().unwrap();
         let root = "meta-models/Muse-Spark-Open-816B-A42B";
@@ -372,6 +398,25 @@ mod tests {
         assert_eq!((r.reference_root.as_str(), r.revision.as_str(), r.config.as_str()),
             (root, dataset::MISTRAL_LARGE4_REVISION, dataset::MISTRAL_LARGE4_CONFIG));
         assert!(resolve_in("someone/Mistral-Large-4-1T-A52B-EXL3", None, tmp.path()).is_err());
+    }
+
+    #[test]
+    fn minimax_root_and_card_quant_resolve_to_official_native_reference() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = "MiniMaxAI/MiniMax-M3.1-Flash";
+        add(tmp.path(), root, "license: other");
+        assert_eq!(official_root(root), Some(root));
+        let official = resolve_in(root, None, tmp.path()).unwrap();
+        assert_eq!(official.reference_root, root);
+        assert_eq!((official.revision.as_str(), official.config.as_str()),
+            (dataset::MINIMAX_M3_REVISION, dataset::MINIMAX_M3_CONFIG));
+        let quant = add(tmp.path(), "test/minimax-quant", "base_model: MiniMaxAI/MiniMax-M3.1-Flash\nbase_model_relation: quantized");
+        let r = resolve_in("test/minimax-quant", Some(&quant), tmp.path()).unwrap();
+        assert_eq!(r.reference_match, "base_model");
+        assert_eq!((r.reference_root.as_str(), r.revision.as_str(), r.config.as_str()),
+            (root, dataset::MINIMAX_M3_REVISION, dataset::MINIMAX_M3_CONFIG));
+        assert!(resolve_in("someone/MiniMax-M3.1-Flash-EXL3", None, tmp.path()).is_err());
+        assert!(official_root("MiniMaxAI/MiniMax-M3.1-Flash-BF16").is_none());
     }
 
     #[test]

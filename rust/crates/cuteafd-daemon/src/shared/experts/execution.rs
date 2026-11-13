@@ -127,7 +127,7 @@ struct NativeWidthState<'library> {
 /// Upstream producers and transport must obey this owner's stream/lifetime contract.
 pub(crate) struct ExpertExecution<'weights, 'library> {
     // Destroy stream before allocations; Drop drains and destroys the graph first.
-    pub(crate) stream: LoadStream<'library>,
+    pub(crate) stream: Option<LoadStream<'library>>,
     pub(crate) _weights: &'weights ExpertWeights<'library>,
     library: &'library NativeLibrary,
     pub(crate) kernel: V41ExpertKernel<'library>,
@@ -146,16 +146,12 @@ pub(crate) struct ExpertExecution<'weights, 'library> {
     route_staging: Vec<crate::shared::memory::HostAllocation<'library>>,
     compact_reducer: Option<V41CompactReducer<'library>>,
     compact_output: Option<DeviceAllocation<'library>>,
-    reply_codec: Option<super::reply::ReplyCodec<'library>>,
+    native_reply: Option<super::reply::NativeReply<'library>>,
     output: Option<DeviceAllocation<'library>>,
     pub(crate) shared: Option<DeviceAllocation<'library>>,
     slots: [*mut c_void; 44],
     graph: Option<(*mut c_void, u32, bool, u32, u32)>,
     alternate_widths: Vec<NativeWidthState<'library>>,
-    /// Replicated-group index this worker owns; set once at startup for an
-    /// explicit `TP×EP` topology, `None` for every legacy path. The group is
-    /// independent of the resident layer, so rebinding a layer never changes it.
-    native_group: Option<u8>,
     /// Mapped requests return queued; the owner emits each reply after its unit fence.
     deferred: bool,
     pending: timing::PendingUnits<'library>,
@@ -237,6 +233,16 @@ impl<'library> ExpertWeights<'library> {
         live: u32,
         available_device_bytes: usize,
     ) -> Result<ExpertExecution<'_, 'library>> {
+        self.execution_mode(compiled, live, available_device_bytes, true)
+    }
+    /// Composed execution uses only its caller's stream; scratch initialization
+    /// drains a load-only stream before returning any workspace.
+    pub(crate) fn execution_external(&self, compiled: u32, live: u32, available: usize)
+        -> Result<ExpertExecution<'_, 'library>> {
+        self.execution_mode(compiled, live, available, false)
+    }
+    fn execution_mode(&self, compiled: u32, live: u32, available_device_bytes: usize,
+        own_stream: bool) -> Result<ExpertExecution<'_, 'library>> {
         validate_capacity(compiled, live)?;
         let library = self.buffers[0].library;
         let reduction_plan = native_reduction_plan(self.layer, library, compiled, self.is_nvfp4())?;
@@ -248,8 +254,8 @@ impl<'library> ExpertWeights<'library> {
         let kernel = self.layer.select_kernel(library, compiled, self.is_nvfp4())?;
         let reducer = library.v41_route_reducer()?;
         // Role-gated, DEBUG-only diagnostics. The same routed breakdown is
-        // available for the replicated Spark TP2/TP3 shards (roles 5/6), whose
-        // compact output and reducer buffers are already allocated.
+        // available for the Spark TP2/TP3 shards (roles 5/6), whose compact
+        // output and reducer buffers are already allocated.
         let timing = if compact_output_role(kernel.info().role)
             && tracing::enabled!(target: "cuteafd::expert_timing", tracing::Level::DEBUG)
         {
@@ -257,20 +263,20 @@ impl<'library> ExpertWeights<'library> {
         } else {
             None
         };
-        let scratch = DeviceAllocation::named(library, budget.scratch_bytes, "experts/workspace/main_scratch")?;
-        let hidden = DeviceAllocation::named(library, budget.hidden_bytes, "experts/workspace/hidden")?;
-        let ids = DeviceAllocation::named(library, budget.routing_bytes / 2, "experts/workspace/routes")?;
-        let routing = DeviceAllocation::named(library, budget.routing_bytes / 2, "experts/workspace/routes")?;
+        let scratch = DeviceAllocation::new(library, budget.scratch_bytes, crate::shared::memory::tag(crate::shared::memory::MemoryKind::Workspace, "experts/workspace/main_scratch"))?;
+        let hidden = DeviceAllocation::new(library, budget.hidden_bytes, crate::shared::memory::tag(crate::shared::memory::MemoryKind::Workspace, "experts/workspace/hidden"))?;
+        let ids = DeviceAllocation::new(library, budget.routing_bytes / 2, crate::shared::memory::tag(crate::shared::memory::MemoryKind::Workspace, "experts/workspace/routes"))?;
+        let routing = DeviceAllocation::new(library, budget.routing_bytes / 2, crate::shared::memory::tag(crate::shared::memory::MemoryKind::Workspace, "experts/workspace/routes"))?;
         let output = if kernel.info().role == 0 {
-            Some(DeviceAllocation::named(library, budget.hidden_bytes, "experts/workspace/hidden")?)
+            Some(DeviceAllocation::new(library, budget.hidden_bytes, crate::shared::memory::tag(crate::shared::memory::MemoryKind::Workspace, "experts/workspace/hidden"))?)
         } else {
             None
         };
         let compact_output = if compact_output_role(kernel.info().role) {
-            Some(DeviceAllocation::named(
+            Some(DeviceAllocation::new(
                 library,
                 budget.output_and_shared_bytes,
-                "experts/workspace/compact_output",
+                crate::shared::memory::Tag::workspace("experts/workspace/compact_output"),
             )?)
         } else {
             None
@@ -281,7 +287,7 @@ impl<'library> ExpertWeights<'library> {
             None
         };
         let shared = if kernel.info().role == 0 {
-            Some(DeviceAllocation::named(library, budget.hidden_bytes, "experts/workspace/hidden")?)
+            Some(DeviceAllocation::new(library, budget.hidden_bytes, crate::shared::memory::tag(crate::shared::memory::MemoryKind::Workspace, "experts/workspace/hidden"))?)
         } else {
             None
         };
@@ -313,9 +319,9 @@ impl<'library> ExpertWeights<'library> {
                 decode_kernel.info().input_dtype == kernel.info().input_dtype,
                 "decode and grouped expert input formats differ"
             );
-            let decode_scratch = DeviceAllocation::named(library, scratch_bytes, if planned_capacity == 1 {
+            let decode_scratch = DeviceAllocation::new(library, scratch_bytes, crate::shared::memory::Tag::workspace(if planned_capacity == 1 {
                 "experts/workspace/serial_scratch"
-            } else { "experts/workspace/grouped_decode_scratch" })?;
+            } else { "experts/workspace/grouped_decode_scratch" }))?;
             let mut decode_slots = slots;
             unsafe {
                 decode_kernel.bind_scratch(
@@ -344,9 +350,10 @@ impl<'library> ExpertWeights<'library> {
         let decode = prepare_small(1, budget.decode_scratch_bytes)?;
         let grouped = if budget.small_scratch_bytes > 0 { grouped_decode_rows(self.layer, library, compiled, self.is_nvfp4())? } else { compiled };
         let small = prepare_small(grouped, budget.small_scratch_bytes)?;
-        let route_staging = (0..1).map(|_| crate::shared::memory::HostAllocation::named(library,
-            budget.routing_bytes, "experts/workspace/route_staging" )).collect::<Result<Vec<_>>>()?;
-        let reply_codec = if compact_output_role(kernel.info().role) { Some(super::reply::ReplyCodec::load(library)?) } else { None };
+        let route_staging = (0..1).map(|_| crate::shared::memory::HostAllocation::new(library,
+            budget.routing_bytes, crate::shared::memory::tag(crate::shared::memory::MemoryKind::Workspace, "experts/workspace/route_staging"))).collect::<Result<Vec<_>>>()?;
+        let native_reply = if compact_output_role(kernel.info().role) { Some(super::reply::NativeReply::load(library)?) } else { None };
+        let stream = if own_stream { Some(stream) } else { drop(stream); None };
         Ok(ExpertExecution {
             stream,
             _weights: self,
@@ -361,7 +368,7 @@ impl<'library> ExpertWeights<'library> {
             worker_timing: None,
             compact_reducer,
             compact_output,
-            reply_codec,
+            native_reply,
             scratch,
             hidden,
             ids,
@@ -373,7 +380,6 @@ impl<'library> ExpertWeights<'library> {
             pending: timing::PendingUnits::new(library, 1)?,
             graph: None,
             alternate_widths: Vec::new(),
-            native_group: None,
             live_capacity: live,
             budget,
         })
@@ -385,32 +391,13 @@ impl<'weights, 'library> ExpertExecution<'weights, 'library> {
         Ok(())
     }
 
-    /// Bind this worker to its replicated group before serving. Called once at
-    /// startup; every remote request for this worker must then carry the native
-    /// ownership contract and is unpacked for exactly this group.
-    pub(crate) fn install_native_group(&mut self, group: Option<u8>) -> Result<()> {
-        ensure!(
-            self.graph.is_none(),
-            "cannot install a replicated group on a captured expert graph"
-        );
-        ensure!(
-            self.native_group.is_none(),
-            "replicated expert group already installed"
-        );
-        ensure!(
-            group.map_or(true, |group| group < 3),
-            "replicated expert group index out of range"
-        );
-        self.native_group = group;
-        Ok(())
-    }
     fn add_width(&mut self, weights: &'weights ExpertWeights<'library>, compiled: u32) -> Result<()> {
         let prepare = |rows, name| -> Result<DecodeExecution<'library>> {
             let kernel = weights.layer.select_kernel(self.library, rows, weights.is_nvfp4())?;
             ensure!(kernel.info().input_dtype == self.kernel.info().input_dtype,
                 "native width states have different input formats");
-            let scratch = DeviceAllocation::named(self.library,
-                usize::try_from(kernel.info().scratch_bytes)?, name)?;
+            let scratch = DeviceAllocation::new(self.library,
+                usize::try_from(kernel.info().scratch_bytes)?, crate::shared::memory::Tag::workspace(name))?;
             let mut slots = self.slots;
             // SAFETY: the new state owns its scratch; all retained states share
             // the same admitted I/O and execute serially on this owner's stream.
@@ -420,8 +407,8 @@ impl<'weights, 'library> ExpertExecution<'weights, 'library> {
             weights.bind(&kernel, &mut slots)?;
             // SAFETY: initialization is drained before publishing this state.
             let initialized = unsafe { kernel.initialize_scratch(scratch.buffer.ptr,
-                scratch.buffer.bytes as u64, self.stream.raw) };
-            let drained = unsafe { self.library.cuda_stream_synchronize(self.stream.raw) };
+                scratch.buffer.bytes as u64, self.stream()) };
+            let drained = unsafe { self.library.cuda_stream_synchronize(self.stream()) };
             if drained.is_err() { self.library.quarantine_module_after_failed_drain(); }
             initialized.and(drained)?;
             Ok(DecodeExecution { kernel, scratch, slots })
@@ -478,7 +465,7 @@ impl<'weights, 'library> ExpertExecution<'weights, 'library> {
         self.budget
     }
     pub fn stream(&self) -> *mut c_void {
-        self.stream.raw
+        self.stream.as_ref().expect("expert worker owns its execution stream").raw
     }
     /// Borrowed hidden in the native kernel's input format, I32 route IDs and
     /// FP32 route weights; never free these views. dSpark always uses BF16.
@@ -595,8 +582,8 @@ impl<'weights, 'library> ExpertExecution<'weights, 'library> {
             .context("native route staging overflow")?;
         self.route_staging.clear();
         for _ in 0..units {
-            self.route_staging.push(crate::shared::memory::HostAllocation::named(self.library,
-                bytes, "experts/workspace/route_staging")?);
+            self.route_staging.push(crate::shared::memory::HostAllocation::new(self.library,
+                bytes, crate::shared::memory::tag(crate::shared::memory::MemoryKind::Workspace, "experts/workspace/route_staging"))?);
         }
         self.deferred = true;
         Ok(())
@@ -618,11 +605,15 @@ impl<'weights, 'library> ExpertExecution<'weights, 'library> {
     /// Whether every request queued on this execution's stream has completed.
     pub(crate) fn stream_idle(&self) -> Result<bool> {
         // SAFETY: the owned stream is live for the worker's lifetime.
-        unsafe { self.library.cuda_stream_query(self.stream.raw) }
+        unsafe { self.library.cuda_stream_query(self.stream()) }
     }
 
     pub fn synchronize(&self) -> Result<()> {
-        unsafe { self.library.cuda_stream_synchronize(self.stream.raw) }
+        match &self.stream {
+            // SAFETY: the worker retains its stream through completion.
+            Some(stream) => unsafe { self.library.cuda_stream_synchronize(stream.raw) },
+            None => Ok(()),
+        }
     }
 
     /// # Safety
@@ -632,7 +623,7 @@ impl<'weights, 'library> ExpertExecution<'weights, 'library> {
     /// Initialize shared BF16 output too if requested. External readers/writers must
     /// finish before storage is reused; all operations belong to this GPU worker.
     pub unsafe fn launch(&mut self, rows: u32, include_shared: bool) -> Result<()> {
-        unsafe { self.launch_on(rows, include_shared, self.stream.raw) }
+        unsafe { self.launch_on(rows, include_shared, self.stream()) }
     }
     pub(crate) unsafe fn launch_on(
         &mut self,
@@ -649,7 +640,7 @@ impl<'weights, 'library> ExpertExecution<'weights, 'library> {
     /// initialized wire rows on this execution's device, and the transport
     /// retains that storage until the stream work that reads it completes.
     pub(crate) unsafe fn launch_hidden(&mut self, rows: u32, hidden: *mut c_void) -> Result<()> {
-        unsafe { self.launch_hidden_on(rows, false, self.stream.raw, Some(hidden)) }
+        unsafe { self.launch_hidden_on(rows, false, self.stream(), Some(hidden)) }
     }
     unsafe fn launch_hidden_on(
         &mut self,
@@ -696,47 +687,13 @@ impl<'weights, 'library> ExpertExecution<'weights, 'library> {
         Ok(())
     }
     /// # Safety
-    /// Same initialized-buffer and ordering contract as launch; captures fixed rows
-    /// and shared-output participation. Input values may change between replays.
-    pub unsafe fn capture(&mut self, rows: u32, include_shared: bool) -> Result<()> {
-        ensure!(
-            self.graph.is_none(),
-            "expert execution already has a captured graph"
-        );
-        unsafe {
-            self.launch(rows, include_shared)?;
-        }
-        self.synchronize()?;
-        unsafe {
-            self.library.cuda_graph_begin_capture(self.stream.raw)?;
-        }
-        let launch = unsafe { self.launch(rows, include_shared) };
-        // End capture on both paths so an error cannot leave the stream capturing.
-        let captured = unsafe { self.library.cuda_graph_end_capture(self.stream.raw) };
-        match (launch, captured) {
-            (Ok(()), Ok(graph)) => {
-                self.graph = Some((graph, rows, include_shared, self.kernel.info().role,
-                    self.kernel.info().logical_intermediate));
-                Ok(())
-            }
-            (Err(error), Ok(graph)) => {
-                unsafe {
-                    self.library.cuda_graph_exec_destroy(graph)?;
-                }
-                Err(error)
-            }
-            (Err(error), Err(_)) => Err(error),
-            (Ok(()), Err(error)) => Err(error),
-        }
-    }
-    /// # Safety
     /// The captured rows' inputs (and optional shared output) must satisfy launch's
     /// contract, with writes ordered before replay and reads ordered after it.
     pub unsafe fn replay(&mut self) -> Result<()> {
         let (graph, _, _, role, width) = self.graph.context("expert graph has not been captured")?;
         ensure!(role == self.kernel.info().role && width == self.kernel.info().logical_intermediate,
             "captured expert graph belongs to a different width state");
-        unsafe { self.library.cuda_graph_launch(graph, self.stream.raw) }
+        unsafe { self.library.cuda_graph_launch(graph, self.stream()) }
     }
 }
 impl Drop for ExpertExecution<'_, '_> {
@@ -876,7 +833,7 @@ impl ExpertExecution<'_, '_> {
     ) -> Result<()> {
         let layer = match self._weights.layer {
             ExpertLayer::Backbone { layer, .. }
-            | ExpertLayer::BackboneReplicatedTp { layer, .. } => layer,
+            | ExpertLayer::BackboneSparkTp { layer, .. } => layer,
             _ => anyhow::bail!("backbone requests cannot execute on RTX dSpark weights"),
         };
         ensure!(
@@ -893,21 +850,7 @@ impl ExpertExecution<'_, '_> {
             exchange.partials.len() >= bytes,
             "host exchange is too small"
         );
-        // The admission contract and the resident shard must agree: a
-        // topology-bound worker unpacks exactly its own group's routes and masks
-        // every other route to the kernel's unassigned sentinel, while a legacy
-        // worker rejects an ownership-encoded request outright.
-        match (self.native_group, request.is_native_group()) {
-            (Some(group), true) => request.copy_native_group_routes_into(
-                &mut exchange.ids,
-                &mut exchange.routing,
-                group,
-            )?,
-            (None, false) => request.copy_routes_into(&mut exchange.ids, &mut exchange.routing)?,
-            _ => anyhow::bail!(
-                "replicated expert group admission differs from this worker's bound topology"
-            ),
-        }
+        request.copy_routes_into(&mut exchange.ids, &mut exchange.routing)?;
         let started = self.timing.as_ref().map(|_| std::time::Instant::now());
         // Supported hosts and CUDA use the checkpoint/wire little-endian byte order.
         ensure!(
@@ -935,7 +878,7 @@ impl ExpertExecution<'_, '_> {
         let mut in_frame = None;
         let uploaded = (|| -> Result<()> { unsafe {
             // The unit's pace starts before its input copies (#762).
-            self.pending.arrive(self.stream.raw)?;
+            self.pending.arrive(self.stream())?;
             match hidden_view.filter(|view| view.bytes >= hidden_bytes) {
                 // The kernel reads the rows from its input pointer exactly as
                 // it would read the resident copy, and the transport retains
@@ -945,27 +888,27 @@ impl ExpertExecution<'_, '_> {
                 Some(view) if view.ptr as usize % 16 == 0 && view.device_id == device =>
                     in_frame = Some(view.ptr),
                 Some(view) => self.library.copy_d2d_async(self.hidden.buffer,
-                    CuteafdDeviceBuffer { bytes: hidden_bytes, ..view }, hidden_bytes, self.stream.raw)?,
-                None => self.library.copy_h2d_async(self.hidden.buffer, request.hidden(), self.stream.raw)?,
+                    CuteafdDeviceBuffer { bytes: hidden_bytes, ..view }, hidden_bytes, self.stream())?,
+                None => self.library.copy_h2d_async(self.hidden.buffer, request.hidden(), self.stream())?,
             }
             let mut ids = self.route_staging[stage].buffer; ids.bytes = routes * 4;
             let mut weights = self.route_staging[stage].buffer;
             weights.ptr = weights.ptr.cast::<u8>().add(routes * 4).cast(); weights.bytes = routes * 4;
             self.library.copy_host_buffers_h2d_batch_async(
                 &[self.ids.buffer, self.routing.buffer], &[ids, weights],
-                &[routes * 4, routes * 4], self.stream.raw)?;
+                &[routes * 4, routes * 4], self.stream())?;
             Ok(())
         } })();
         if let Err(error) = uploaded { self.synchronize()?; return Err(error); }
         let uploaded_us = started.map(|t| t.elapsed().as_micros() as u64);
         if let Some(timing) = &self.timing {
             unsafe {
-                timing.record(0, self.stream.raw)?;
+                timing.record(0, self.stream())?;
             }
         }
         // SAFETY: this worker retains events, inputs and stream through the barrier below.
         unsafe {
-            if let Some(timing) = &self.worker_timing { timing.record(0, self.stream.raw)?; }
+            if let Some(timing) = &self.worker_timing { timing.record(0, self.stream())?; }
             match in_frame {
                 Some(hidden) => self.launch_hidden(request.rows(), hidden)?,
                 None => self.launch(request.rows(), false)?,
@@ -973,7 +916,7 @@ impl ExpertExecution<'_, '_> {
         }
         if let Some(timing) = &self.timing {
             unsafe {
-                timing.record(1, self.stream.raw)?;
+                timing.record(1, self.stream())?;
             }
         }
         let compressed = request.output_dtype() != cuteafd_transport::ExpertV2Dtype::Bf16;
@@ -983,38 +926,54 @@ impl ExpertExecution<'_, '_> {
             .as_ref()
             .context("missing compact output")?
             .buffer);
-        unsafe {
-            let reducer = self.compact_reducer.as_ref().context("missing compact reducer")?;
-            let (kernel, slots, _) = self.execution_state(request.rows())?;
-            match kernel.output_kind() {
-                cuteafd_ffi::V41ExpertOutputKind::Fp32Tokens =>
-                    reducer.compact_tokens(slots[41].cast(), output.ptr.cast(), request.rows(), self.stream.raw)?,
-                cuteafd_ffi::V41ExpertOutputKind::Bf16Routes =>
-                    reducer.compact_bf16_routes(slots[41].cast(), output.ptr.cast(), request.rows(), self.stream.raw)?,
-                cuteafd_ffi::V41ExpertOutputKind::Fp32Routes =>
-                    reducer.compact(self.route_partials(request.rows())?.ptr.cast(),
-                        output.ptr.cast(), request.rows(), self.stream.raw)?,
-            }
-        }
         if compressed {
-            // SAFETY: BF16 scratch and mapped destination live through the unit fence below.
-            unsafe { self.reply_codec.as_ref().context("missing reply codec")?.quantize(request,
-                output, destination.context("missing compressed destination")?, request.rows() as usize, self.stream.raw)?; }
+            let (kernel, slots, scratch) = self.execution_state(request.rows())?;
+            let kind = kernel.output_kind();
+            let (routes, element_bytes) = match kind {
+                cuteafd_ffi::V41ExpertOutputKind::Fp32Tokens => (1, 4),
+                cuteafd_ffi::V41ExpertOutputKind::Fp32Routes => (kernel.info().topk as usize, 4),
+                cuteafd_ffi::V41ExpertOutputKind::Bf16Routes => (kernel.info().topk as usize, 2),
+            };
+            let source = CuteafdDeviceBuffer {
+                ptr: slots[41],
+                bytes: request.rows() as usize * routes * cuteafd_core::expert_geometry().hidden as usize * element_bytes,
+                device_id: scratch.buffer.device_id,
+                flags: 0,
+            };
+            // SAFETY: raw native output and mapped destination remain live through
+            // this unit's fence. The fused launch replaces compact+quantize only.
+            unsafe { self.native_reply.as_ref().context("missing native reply")?.launch(
+                request, kind, source, destination.context("missing compressed destination")?, self.stream())?; }
+        } else {
+            // SAFETY: existing BF16 default keeps the original reducer and rounding.
+            unsafe {
+                let reducer = self.compact_reducer.as_ref().context("missing compact reducer")?;
+                let (kernel, slots, _) = self.execution_state(request.rows())?;
+                match kernel.output_kind() {
+                    cuteafd_ffi::V41ExpertOutputKind::Fp32Tokens =>
+                        reducer.compact_tokens(slots[41].cast(), output.ptr.cast(), request.rows(), self.stream())?,
+                    cuteafd_ffi::V41ExpertOutputKind::Bf16Routes =>
+                        reducer.compact_bf16_routes(slots[41].cast(), output.ptr.cast(), request.rows(), self.stream())?,
+                    cuteafd_ffi::V41ExpertOutputKind::Fp32Routes =>
+                        reducer.compact(self.route_partials(request.rows())?.ptr.cast(),
+                            output.ptr.cast(), request.rows(), self.stream())?,
+                }
+            }
         }
         if let Some(timing) = &self.timing {
             unsafe {
-                timing.record(2, self.stream.raw)?;
+                timing.record(2, self.stream())?;
             }
         }
         // SAFETY: the reducer and kernel precede this end event on the owned stream.
         unsafe {
-            if let Some(timing) = &self.worker_timing { timing.record(1, self.stream.raw)?; }
+            if let Some(timing) = &self.worker_timing { timing.record(1, self.stream())?; }
         }
         // This unit's fence releases its mapped I/O independently of later
         // requests already queued on the same stream.
         if self.deferred && destination.is_some() {
             // SAFETY: all copies, math and output writes precede this unit fence.
-            unsafe { self.pending.record((request.request_id(), request.layer(), request.rows(), executor_id), self.stream.raw)?; }
+            unsafe { self.pending.record((request.request_id(), request.layer(), request.rows(), executor_id), self.stream())?; }
             return Ok(());
         }
         self.synchronize()?;
@@ -1031,8 +990,6 @@ impl ExpertExecution<'_, '_> {
             let (kernel_us, compact_us) = unsafe { timing.elapsed_us()? };
             let mut histogram = vec![0u32; cuteafd_core::expert_geometry().experts as usize];
             for &expert in &exchange.ids[..routes] {
-                // Ownership-masked routes carry the out-of-range sentinel and
-                // are not real expert work.
                 if let Some(slot) = histogram.get_mut(expert as usize) {
                     *slot += 1;
                 }
@@ -1120,7 +1077,7 @@ mod timing_role_tests {
         }
     }
 
-    /// A pure TP6EP1 worker must allocate the compact output buffer and load
+    /// A TP6 worker must allocate the compact output buffer and load
     /// the compact reducer exactly like the other Spark shard families; a
     /// missing role 7 would silently fall back to the uncompacted path.
     #[test]

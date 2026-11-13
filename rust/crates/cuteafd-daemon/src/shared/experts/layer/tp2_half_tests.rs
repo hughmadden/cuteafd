@@ -14,7 +14,10 @@ pub(crate) fn expert_fixture_in(parent: Option<&std::path::Path>) -> Result<(tem
     let dir = match parent { Some(parent) => tempfile::tempdir_in(parent)?, None => tempfile::tempdir()? };
     let snapshot = dir.path().canonicalize()?;
     cuteafd_loader::plan::testing::write_v41_snapshot(&snapshot);
-    cuteafd_loader::plan::testing::write_v41_workspaces(&snapshot);
+    let programs = cuteafd_loader::plan::testing::write_v41_workspaces(&snapshot);
+    // The selected workspace manifest must carry its program inventory even
+    // when the fixture needs no optional compressed tier-reply capability.
+    std::fs::write(programs, serde_json::to_vec(&serde_json::json!({"programs": []}))?)?;
     let catalog = cuteafd_loader::read_official_v41_role_catalog(&snapshot, "experts",
         |name| name.contains(".ffn.experts."))?;
     ensure!(catalog.mxfp4_scale_codes(), "the official fixture uses coded scales");
@@ -137,14 +140,20 @@ fn dspark_tp2_recipes_land_each_gpu_on_the_charged_halves() -> Result<()> {
     assert_eq!((stages, experts, shape.hidden, shape.intermediate), (3, 128, 5120, 2304));
     let half = shape.intermediate / 2;
     // The planner's charges (cuteafd plan --layout): GPU0's half is its own
-    // item; GPU1's is what splitting moves out of the whole drafter's weights.
+    // item; GPU1's routed-expert owner loses the other half when split.
     let snapshot = catalog.snapshot().to_path_buf();
     let whole_plan = planned_bytes(&snapshot, false, Default::default())?;
     let split_plan = planned_bytes(&snapshot, true, Default::default())?;
     let charge = group_bytes(&split_plan, 0, "dSpark TP2 expert half");
     let (whole_planes, _) = fake_planes(1, 0, 1, shape.intermediate)?;
     let whole_resident = (stages * experts * whole_planes.iter().sum::<usize>()) as u64;
-    assert_eq!(group_bytes(&whole_plan, 1, "dSpark weights") - group_bytes(&split_plan, 1, "dSpark weights"),
+    // Each independently coded half retains its own scale bases, so moving
+    // GPU0's half out saves slightly less than that half's resident extent.
+    assert_eq!(charge, 3_506_405_376, "the three-stage TP2 expert half charge");
+    assert_eq!(whole_resident - charge, 3_504_439_296, "GPU1's original net weight reduction");
+    assert_eq!(group_bytes(&whole_plan, 1, "dSpark experts"), whole_resident);
+    assert_eq!(group_bytes(&split_plan, 1, "dSpark experts"), charge);
+    assert_eq!(group_bytes(&whole_plan, 1, "dSpark experts") - group_bytes(&split_plan, 1, "dSpark experts"),
         whole_resident - charge, "GPU1 keeps one half of the drafter's experts");
     let whole_sources = (0..stages).map(|stage| -> Result<u64> {
         let rects = native_expert_rects(&catalog, V41ExpertSelection::Dspark { stage, expert: 0 })?;

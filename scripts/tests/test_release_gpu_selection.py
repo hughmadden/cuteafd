@@ -80,6 +80,16 @@ class ReleaseGpuSelectionTest(unittest.TestCase):
                 env=os.environ.copy(),
             )
 
+    def test_auto_context_sizes_only_minimum_screening_groups(self) -> None:
+        result = self.invoke(extra=("--max-context-tokens", "auto"))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)["groups"], 80)
+        for value in ("0", "01", "-1", "+1", "1048577", "18446744073709551617"):
+            with self.subTest(value=value):
+                invalid = self.invoke(extra=("--max-context-tokens", value))
+                self.assertNotEqual(invalid.returncode, 0)
+                self.assertNotIn("Traceback", invalid.stderr)
+
     def test_auto_selects_ordered_pair_for_default_pool(self) -> None:
         result = self.invoke()
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -107,9 +117,10 @@ class ReleaseGpuSelectionTest(unittest.TestCase):
         result = self.invoke(mode="1", extra=("--kv-pool-size", "1B"))
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(json.loads(result.stdout)["count"], 1)
-        invalid = self.invoke(mode="1", extra=("--memory-reservation", "101%"))
+        # GPU_MEMORY_CAP is a size; percentages are not accepted.
+        invalid = self.invoke(mode="1", extra=("--gpu-memory-cap", "90%"))
         self.assertEqual(invalid.returncode, 2)
-        self.assertIn("exceeds device total", invalid.stderr)
+        self.assertIn("invalid", invalid.stderr)
 
     def test_only_named_replacement_process_memory_is_reclaimable(self) -> None:
         without_reclaim = self.invoke(secondary_free=1_000)
@@ -122,15 +133,19 @@ class ReleaseGpuSelectionTest(unittest.TestCase):
         self.assertEqual(selected["gpus"][1]["reclaim_mib"], 96_500)
         self.assertEqual(selected["gpus"][1]["effective_free_mib"], 97_500)
 
-    def test_explicit_small_pool_changes_feasibility_but_reservation_is_a_ceiling(self) -> None:
+    def test_explicit_small_pool_changes_feasibility_but_the_cap_is_a_ceiling(self) -> None:
         explicit = self.invoke(
             primary_free=94_000,
             secondary_free=94_000,
             extra=("--kv-pool-size", "1GiB"),
         )
         self.assertEqual(json.loads(explicit.stdout)["count"], 2)
-        reservation = self.invoke(extra=("--memory-reservation", "90%"))
-        self.assertEqual(json.loads(reservation.stdout)["count"], 1)
+        capped = self.invoke(extra=("--gpu-memory-cap", "86GiB"))
+        self.assertEqual(json.loads(capped.stdout)["count"], 1)
+        # A cap above the device is bounded by the device: it never adds capacity.
+        above = self.invoke(primary_free=94_000, secondary_free=94_000,
+                            extra=("--kv-pool-size", "1GiB", "--gpu-memory-cap", "1000GiB"))
+        self.assertEqual(json.loads(above.stdout)["count"], 2)
 
 
 if __name__ == "__main__":

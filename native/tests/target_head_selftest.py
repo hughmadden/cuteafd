@@ -36,7 +36,7 @@ def bind(path, invariant=False):
         lib.cuteafd_vocabulary_head_launch_tensor_op = lib.cuteafd_vocabulary_head_launch_tensor_invariant
     sig = {
         "cuteafd_vocab_head_rows": ([P, P, P, C.c_int32, C.c_int32, C.c_int32, P], C.c_int32),
-        "cuteafd_vocabulary_head_create_vocab": ([P, C.c_uint64, C.c_int32, C.c_int32, C.c_int32, C.POINTER(P)],
+        "cuteafd_vocabulary_head_create_vocab": ([P, C.c_uint64, C.c_int32, C.c_int32, C.c_int32, C.c_int32, C.POINTER(P)],
                                                  C.c_int32),
         "cuteafd_vocabulary_head_launch_width": ([P, P, P, P, C.c_int32, P], C.c_int32),
         "cuteafd_vocabulary_head_launch_tensor_op": ([P, P, P, P, C.c_int32, P], C.c_int32),
@@ -99,7 +99,12 @@ def check(lib, snapshot, rows_list, runs, row_sweep=False, invariant=False, part
     workspace = torch.empty(4 << 20, device="cuda", dtype=torch.uint8)
     handle = P()
     assert lib.cuteafd_vocabulary_head_create_vocab(workspace.data_ptr(), workspace.numel(), width, max_rows, vocab,
-                                                    C.byref(handle)) == 0
+                                                    0, C.byref(handle)) == 0
+    tensor_workspace = torch.empty_like(workspace)
+    tensor_handle = P()
+    assert lib.cuteafd_vocabulary_head_create_vocab(
+        tensor_workspace.data_ptr(), tensor_workspace.numel(), width, max_rows, vocab,
+        int(invariant), C.byref(tensor_handle)) == 0
     out = torch.empty(max_rows, vocab, device="cuda")
     stream = torch.cuda.current_stream().cuda_stream
     few_ok = width % 256 == 0 and 8 * width * 2 <= 99 * 1024
@@ -109,7 +114,7 @@ def check(lib, snapshot, rows_list, runs, row_sweep=False, invariant=False, part
             status = lib.cuteafd_vocabulary_head_launch_width(handle, x.data_ptr(), weight.data_ptr(), out.data_ptr(),
                                                               rows, stream)
         elif route == "tensor":
-            status = lib.cuteafd_vocabulary_head_launch_tensor_op(handle, x.data_ptr(), weight.data_ptr(),
+            status = lib.cuteafd_vocabulary_head_launch_tensor_op(tensor_handle, x.data_ptr(), weight.data_ptr(),
                                                                   out.data_ptr(), rows, stream)
         else:
             status = lib.cuteafd_vocab_head_rows(x.data_ptr(), weight.data_ptr(), out.data_ptr(), rows, width, vocab,
@@ -147,7 +152,7 @@ def check(lib, snapshot, rows_list, runs, row_sweep=False, invariant=False, part
             for r in range(64):
                 xr = x[r:r + 1]
                 status = (lib.cuteafd_vocabulary_head_launch_width if route == "pedantic"
-                          else lib.cuteafd_vocabulary_head_launch_tensor_op)(handle, xr.data_ptr(), weight.data_ptr(),
+                          else lib.cuteafd_vocabulary_head_launch_tensor_op)(handle if route == "pedantic" else tensor_handle, xr.data_ptr(), weight.data_ptr(),
                                                                               alone[r:r + 1].data_ptr(), 1, stream)
                 assert status == 0
             worst_lp, worst_inv, worst_k = 0.0, 0.0, 0
@@ -173,7 +178,7 @@ def check(lib, snapshot, rows_list, runs, row_sweep=False, invariant=False, part
         for capacity in (1, 16, 64, 128, 4096, 65536):
             other = P()
             assert lib.cuteafd_vocabulary_head_create_vocab(
-                workspace.data_ptr(), workspace.numel(), width, capacity, vocab, C.byref(other)) == 0
+                workspace.data_ptr(), workspace.numel(), width, capacity, vocab, 1, C.byref(other)) == 0
             try:
                 k = min(capacity, 64)
                 assert lib.cuteafd_vocabulary_head_launch_tensor_op(
@@ -193,7 +198,7 @@ def check(lib, snapshot, rows_list, runs, row_sweep=False, invariant=False, part
             graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph, stream=capture_stream):
                 assert lib.cuteafd_vocabulary_head_launch_tensor_op(
-                    handle, x.data_ptr(), weight.data_ptr(), out.data_ptr(), k,
+                    tensor_handle, x.data_ptr(), weight.data_ptr(), out.data_ptr(), k,
                     capture_stream.cuda_stream) == 0
             graphs.append((k, graph))
         for k, graph in graphs:
@@ -213,6 +218,7 @@ def check(lib, snapshot, rows_list, runs, row_sweep=False, invariant=False, part
             single, burst = timed(lambda: launch(route, rows), runs)
             cells.append(f"{single:8.3f} / {burst:6.3f}")
         print(f"  {rows:4d} " + "  ".join(cells))
+    assert lib.cuteafd_v41_markov_destroy(tensor_handle) == 0
     assert lib.cuteafd_v41_markov_destroy(handle) == 0
     del weight, out, ref, ref_log
     torch.cuda.empty_cache()

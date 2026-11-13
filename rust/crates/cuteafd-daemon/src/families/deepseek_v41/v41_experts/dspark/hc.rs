@@ -18,12 +18,13 @@ impl<'library> DsparkWeights<'library> {
             format!("mtp.{stage}.hc_{kind}_base"),
             format!("mtp.{stage}.{kind}_norm.weight"),
         ];
-        HcSublayer::new(
+        HcSublayer::standalone(
             self.library,
             &self.auxiliary,
             names,
             capacity,
             budget,
+            self.standalone.clone(),
         )
     }
 }

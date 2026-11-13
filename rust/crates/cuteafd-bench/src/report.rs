@@ -135,8 +135,12 @@ impl ServerInfo {
         if small { &[1, 4, 8] } else { &[1, 4, 8, 16] }
     }
 
+    /// The per-GPU cap in GiB: `gpu-memory-cap` (bytes); published reports
+    /// from before the memory policy recorded `coordinator-gpu-budget-gib`.
     pub fn coordinator_budget(&self) -> Option<f64> {
-        self.setting("coordinator-gpu-budget-gib")?.parse::<f64>().ok()
+        self.setting("gpu-memory-cap").and_then(|bytes| bytes.parse::<u64>().ok())
+            .map(|bytes| bytes as f64 / (1u64 << 30) as f64)
+            .or_else(|| self.setting("coordinator-gpu-budget-gib")?.parse::<f64>().ok())
             .filter(|gib| gib.is_finite() && *gib > 0.0)
     }
 
@@ -451,8 +455,11 @@ pub struct FabricPort {
     pub subnets: Vec<String>,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Configuration {
+    /// Effective selection: no speculation, adaptive, or fixed N before row caps.
+    #[serde(default = "adaptive_draft")]
+    pub draft: String,
     /// Renderer capability; absent preserves requests to older servers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub supports_thinking_off: Option<bool>,
@@ -473,7 +480,20 @@ pub struct Configuration {
     pub settings: Vec<Setting>,
 }
 
+fn adaptive_draft() -> String { "adaptive".into() }
+
+impl Default for Configuration {
+    fn default() -> Self {
+        Self { draft: adaptive_draft(), supports_thinking_off: None, snapshot: None, quant: Vec::new(),
+            speculator: None, layout: None, mapped_placement: None, settings: Vec::new() }
+    }
+}
+
 impl Configuration {
+    pub fn draft_mode(&self) -> &str {
+        if self.speculator.is_none() { "no speculation" } else { &self.draft }
+    }
+
     pub fn supports_thinking_off(&self) -> bool { self.supports_thinking_off != Some(false) }
 
     pub fn thinking_label(&self) -> &'static str {
@@ -501,7 +521,7 @@ pub struct Setting {
     pub value: Option<String>,
     #[serde(default)]
     pub default: Option<String>,
-    /// `default`, `cli`, `env`, or `resolved` (decided at admission).
+    /// `default` (launch default), `cli`, `env`, `resolved`, or `unresolved`.
     pub source: String,
 }
 
@@ -577,6 +597,12 @@ pub struct BasicCard {
     pub concurrency: Vec<ConcurrentRate>,
     #[serde(default)]
     pub prefill: Option<PrefillRate>,
+    /// Development-only 3 execution units + 40 rows; never rendered on cards.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefill_tail: Option<PrefillRate>,
+    /// Diagnostic points that could not be sized; never represented as a rate.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub skipped_prefill: Vec<SkippedPrefill>,
     /// Server tokens per reference token from the corpus warm-up fit.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt_token_ratio: Option<f64>,
@@ -586,6 +612,13 @@ pub struct BasicCard {
     /// The serving capacity the numbers were measured under.
     #[serde(default)]
     pub capacity: Option<Capacity>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SkippedPrefill {
+    pub label: String,
+    pub requested_tokens: u64,
+    pub reason: String,
 }
 
 /// KV pool, request and context limits, host prefix cache.
@@ -780,12 +813,23 @@ pub struct ConcurrentTiming {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PrefillRate {
+    #[serde(default)]
+    pub requested_tokens: u64,
     pub prompt_tokens: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shape: Option<PrefillShape>,
     /// Median prompt tokens per second of time to first token.
     pub tok_s: f64,
     pub ttft_s: f64,
     #[serde(default)]
     pub runs: Vec<StreamTiming>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct PrefillShape {
+    pub unit_rows: u64,
+    pub full_units: u64,
+    pub tail_rows: u64,
 }
 
 /// One streamed request as the client saw it.

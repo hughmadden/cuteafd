@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Memory | cuteafd</title>
+<link rel="stylesheet" href="/assets/cuteafd-ui.css">
+<style>
+:root { --mem-blue:#3987e5; --mem-group-0:#3987e5; --mem-group-1:#d95926; --mem-group-2:#199e70; --mem-group-3:#c98500; --mem-group-4:#d55181; --mem-group-5:#008300; --mem-group-6:#9085e9; }
+:root[data-theme="light"] { --mem-group-0:#2a78d6; --mem-group-1:#eb6834; --mem-group-2:#159569; --mem-group-3:#bd8100; --mem-group-4:#cc608b; --mem-group-5:#008300; --mem-group-6:#6250d6; }
+:root[data-theme="light"] { color-scheme:light; --bg:#f5f6f8; --panel:#fcfcfb; --panel-2:#edf0f4; --well:#e8edf2; --line:#d9dfe7; --line-2:#9aa7b8; --ink:#172030; --ink-2:#435167; --muted:#59677a; --mem-blue:#2a78d6; --mem-orange:#eb6834; --mem-aqua:#1baf7a; }
+.app { max-width:1500px; margin:0 auto; padding:22px 28px 40px; }
+button,select { background:var(--panel-2); color:var(--ink); border:1px solid var(--line-2); border-radius:5px; padding:6px 9px; } button:hover { background:var(--well); } button:focus-visible { outline:2px solid var(--ink); outline-offset:2px; }
+h1 { font-size:27px; letter-spacing:-.6px; margin:22px 0 8px; } h2 { font-size:17px; margin:0; } h3 { font:14px var(--mono); margin:0 0 12px; }
+p { color:var(--ink-2); } .intro { max-width:840px; } .panel { padding:20px; margin-top:20px; }
+.section-head,.controls { min-width:0; display:flex; align-items:center; gap:12px; flex-wrap:wrap; } .section-head>* { min-width:0; overflow-wrap:anywhere; } #graphs { min-width:0; } .section-head { justify-content:space-between; margin-bottom:12px; } .hint { font:11px/1.6 var(--mono); color:var(--ink-2); }
+#notice { margin:16px 0; font:12px var(--mono); } .domain-bars { display:flex; gap:20px; overflow-x:auto; padding:10px 0; align-items:flex-start; } .domain { flex:1 0 125px; min-width:125px; max-width:240px; }
+.domain svg { width:100%; height:455px; overflow:visible; } .domain p { margin:5px 0; } .capacity { font:11px var(--mono); display:block; }
+.domain-select { display:block; font:14px var(--mono); margin-bottom:10px; } .detail-panel { border-top:1px solid var(--line); padding-top:16px; } #owner-detail { display:grid; grid-template-columns:repeat(auto-fit,minmax(min(100%,350px),1fr)); gap:10px 22px; } .owner-detail { display:grid; grid-template-columns:minmax(0,1fr) auto; gap:6px 14px; text-align:left; min-width:0; padding:10px; } .owner-detail span { overflow-wrap:anywhere; } .owner-detail strong { font:11px var(--mono); } .owner-detail svg { grid-column:1/-1; width:100%; height:12px; }
+.segment { cursor:help; stroke:var(--panel); stroke-width:.7px; } .segment:focus,.segment.active { outline:none; stroke:var(--ink); stroke-width:3px; } .dim,.segment.dim + .segment-label { opacity:.24; } .segment-label { font:9px var(--mono); font-weight:600; pointer-events:none; } .legend-controls { display:flex; align-items:center; gap:8px; padding:14px 0; border-top:1px solid var(--line); font:12px var(--mono); } .legend-controls input { accent-color:var(--mem-blue); }
+.legend { display:grid; grid-template-columns:repeat(auto-fit,minmax(min(100%,230px),1fr)); flex-wrap:wrap; gap:8px; padding:16px 0 6px; border-top:1px solid var(--line); }
+.legend-group { min-width:0; } .legend-group h3 { text-transform:uppercase; margin:8px 0; } .legend button { display:flex; width:100%; overflow-wrap:anywhere; gap:8px; align-items:center; text-align:left; font:12px var(--mono); min-height:36px; } .swatch { width:20px; height:20px; flex-shrink:0; } .legend button.active { outline:2px solid var(--ink); }
+.grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(min(100%,330px),1fr)); gap:16px; } .card { border:1px solid var(--line); border-radius:8px; padding:16px; min-width:0; }
+.metric { padding:10px 0; border-top:1px solid var(--line); } .metric-head { display:flex; flex-wrap:wrap; justify-content:space-between; align-items:baseline; gap:12px; font:12px var(--mono); } .metric-head strong { color:var(--ink); font-weight:500; } .metric svg { width:100%; height:48px; display:block; margin-top:7px; cursor:crosshair; } .sparkline { fill:none; stroke:var(--mem-blue); stroke-width:2; } .spark-dot { fill:var(--mem-blue); stroke:var(--panel); stroke-width:2; }
+.table-scroll { overflow:auto; max-height:420px; margin-top:12px; } table { border-collapse:collapse; width:100%; font:11px/1.6 var(--mono); font-variant-numeric:tabular-nums; } caption { text-align:left; color:var(--ink-2); padding:8px 0; } th,td { text-align:right; padding:8px; border-bottom:1px solid var(--line); } th:first-child,td:first-child { text-align:left; } th { color:var(--ink-2); } td.key { min-width:150px; max-width:320px; overflow-wrap:anywhere; } .heat { display:flex; align-items:flex-end; gap:1px; height:30px; min-width:100px; } .heat i { flex:1; min-width:1px; background:var(--mem-blue); }
+#tooltip { position:fixed; z-index:100; max-width:min(620px,calc(100vw - 32px)); max-height:60vh; overflow:auto; pointer-events:none; white-space:pre-line; overflow-wrap:anywhere; font:12px/1.6 var(--mono); padding:10px 12px; border:1px solid var(--line-2); border-radius:6px; background:var(--panel-2); color:var(--ink); box-shadow:0 5px 24px #0006; }
+@media(max-width:600px) { .app { padding:14px 16px 28px; } .panel { padding:14px; } .domain-bars { gap:12px; } button,select { background:var(--panel-2); color:var(--ink); border:1px solid var(--line-2); border-radius:5px; padding:6px 9px; } button:hover { background:var(--well); } button:focus-visible { outline:2px solid var(--ink); outline-offset:2px; }
+h1 { font-size:23px; } }
+@media(forced-colors:active) { .segment { stroke:CanvasText; } .sparkline { stroke:CanvasText; } .heat i { background:CanvasText; } }
+</style>
+</head>
+<body>
+<main class="app" id="app">
+<header id="header"></header>
+<div class="intro"><h1>Where memory goes</h1><p>Accepted reservations beside the owners using them. Observe a rolling five-minute window while this page is open; no telemetry is stored. Only your bar-display preference is remembered.</p></div>
+<div class="controls"><button id="pause" type="button">Pause</button><label>Appearance <select id="theme"><option value="dark">Dark</option><option value="light">Light</option></select></label><span class="hint" id="window">Waiting for the first sample</span></div>
+<p class="hint" id="fixture-note"></p>
+<p id="notice" role="status">Connecting to memory telemetry...</p>
+<section class="panel"><div class="section-head"><h2>Reservations</h2><span class="hint" id="reservation-scale">Each bar uses its own capacity scale</span></div>
+<p class="hint">Accepted serving-growth owners, including lazy reserves, not current occupancy. Blank space is unreserved capacity, not necessarily free RAM. Main bars fold incidental owners only below both 0.2% and 16 MiB into Other small; graph, workspace, transport and padding stay named. Expanded detail never folds owners. Hues identify groups, shades identify owners; subtle textures separate related shades; hover or focus to inspect exact bytes.</p>
+<div id="reservations" class="domain-bars"></div><label class="legend-controls"><input id="hide-weights" type="checkbox"> Hide weights <span class="hint">Rescale each bar to its remaining owners; exact accounting stays unchanged.</span></label><div id="legend" class="legend" aria-label="Reservation categories"></div>
+<div class="detail-panel"><div class="section-head"><h3>Beyond weights &amp; KV</h3><label>Domain <select id="detail-domain" aria-label="Detail domain"></select></label></div><p id="detail-summary" class="hint"></p><div id="owner-detail"></div></div>
+<details><summary>Exact reservation owners</summary><div class="table-scroll"><table><caption>Named owners are counted once; physical budgets combine shared memory domains.</caption><thead><tr><th>Domain / owner</th><th>Category</th><th>Bytes</th></tr></thead><tbody id="owners"></tbody></table></div></details>
+</section>
+<section class="panel"><div class="section-head"><h2>Live usage</h2><span class="hint">One scale per metric; current value and limit are explicit</span></div><p class="hint">KV page occupancy is shared unless per-GPU counters are present. Cache marks may alias KV pages: do not add them. Reconciliation is a named stage sample, not live device accounting. Spark launch-relative values are diagnostic only (#1568).</p><div id="live" class="grid"></div></section>
+<section class="panel"><div class="section-head"><h2>Graph cache</h2><span class="hint">Admitted base + bounded extra; arena is measured usage. Counter rates are sample deltas.</span></div><div id="graphs"></div></section>
+</main>
+<div id="tooltip" role="tooltip" hidden></div>
+<script src="/assets/cuteafd-ui.js"></script><script src="/assets/memory.js"></script>
+</body></html>

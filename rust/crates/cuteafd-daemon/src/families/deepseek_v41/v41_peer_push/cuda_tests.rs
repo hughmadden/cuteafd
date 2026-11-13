@@ -62,9 +62,9 @@ fn hop_push_matches_pull() -> Result<()> {
     let mut pulled = DirectInputHop::new(devices[0], devices[1], spec)?;
     let mut pushed = DirectInputHop::new(devices[0], devices[1], spec)?;
     pushed.enable_push(lane_bytes_with(LANE_ROWS, spec.row_bytes as usize, None)?)?;
-    let residual = Allocation::new(devices[0], LANE_ROWS * 40960)?;
-    let pre = Allocation::new(devices[0], LANE_ROWS * 16)?;
-    let inputs = [Allocation::new(devices[1], LANE_ROWS * 40960)?, Allocation::new(devices[1], LANE_ROWS * 16)?];
+    let residual = Allocation::new(devices[0], LANE_ROWS * 40960, crate::shared::memory::TEST)?;
+    let pre = Allocation::new(devices[0], LANE_ROWS * 16, crate::shared::memory::TEST)?;
+    let inputs = [Allocation::new(devices[1], LANE_ROWS * 40960, crate::shared::memory::TEST)?, Allocation::new(devices[1], LANE_ROWS * 16, crate::shared::memory::TEST)?];
     let chain = ordered_chain(&library)?;
     let runtime = tokio::runtime::Builder::new_current_thread().build()?;
     for rows in ROWS {
@@ -99,8 +99,8 @@ fn routed_owner_reduce_push_matches_pull() -> Result<()> {
     let devices = [Device { library: &library, id: 0 }, Device { library: &library, id: 1 }];
     let geometry = cuteafd_core::ExpertGeometry::DEEPSEEK_V41;
     let (hidden, topk) = (geometry.hidden as usize, geometry.topk as usize);
-    let planes = [Allocation::new(devices[0], LANE_ROWS * hidden * topk * 4)?,
-        Allocation::new(devices[1], LANE_ROWS * hidden * topk * 4)?];
+    let planes = [Allocation::new(devices[0], LANE_ROWS * hidden * topk * 4, crate::shared::memory::TEST)?,
+        Allocation::new(devices[1], LANE_ROWS * hidden * topk * 4, crate::shared::memory::TEST)?];
     let producers = [Stream::new(devices[0])?, Stream::new(devices[1])?];
     let chain = ordered_chain(&library)?;
     let runtime = tokio::runtime::Builder::new_current_thread().build()?;
@@ -152,10 +152,10 @@ fn shared_partial_push_matches_pull() -> Result<()> {
         let mut pushed = PeerTransfer::new(devices[remote], devices[destination])?;
         pushed.enable_push(Box::new(FlagRoute::new(&library, [remote as i32, destination as i32],
             lane_bytes_with(LANE_ROWS, 10240, None)?)?));
-        let partial = Allocation::new(devices[remote], LANE_ROWS * 10240)?;
-        let local = Allocation::new(devices[destination], LANE_ROWS * 10240)?;
-        let mut staging = Allocation::new(devices[destination], LANE_ROWS * 10240)?;
-        let output = Allocation::new(devices[destination], LANE_ROWS * 10240)?;
+        let partial = Allocation::new(devices[remote], LANE_ROWS * 10240, crate::shared::memory::TEST)?;
+        let local = Allocation::new(devices[destination], LANE_ROWS * 10240, crate::shared::memory::TEST)?;
+        let mut staging = Allocation::new(devices[destination], LANE_ROWS * 10240, crate::shared::memory::TEST)?;
+        let output = Allocation::new(devices[destination], LANE_ROWS * 10240, crate::shared::memory::TEST)?;
         let producers = [Stream::new(devices[remote])?, Stream::new(devices[destination])?];
         let mut ready = Event::new(devices[destination])?;
         for rows in ROWS {
@@ -198,11 +198,11 @@ fn head_push_matches_pull() -> Result<()> {
     let copy = devices[0].run(|| library.v41_peer_copy())?;
     let merge_copy = devices[1].run(|| library.v41_peer_copy())?;
     let streams = [Stream::new(devices[0])?, Stream::new(devices[1])?];
-    let normalized = Allocation::new(devices[1], capacity * 10240)?;
-    let input = Allocation::new(devices[0], capacity * 10240)?;
-    let winners = [Allocation::new(devices[0], capacity * 8)?, Allocation::new(devices[1], capacity * 8)?];
-    let remote = Allocation::new(devices[1], capacity * 8)?;
-    let merged = Allocation::new(devices[1], capacity * 8)?;
+    let normalized = Allocation::new(devices[1], capacity * 10240, crate::shared::memory::TEST)?;
+    let input = Allocation::new(devices[0], capacity * 10240, crate::shared::memory::TEST)?;
+    let winners = [Allocation::new(devices[0], capacity * 8, crate::shared::memory::TEST)?, Allocation::new(devices[1], capacity * 8, crate::shared::memory::TEST)?];
+    let remote = Allocation::new(devices[1], capacity * 8, crate::shared::memory::TEST)?;
+    let merged = Allocation::new(devices[1], capacity * 8, crate::shared::memory::TEST)?;
     let slice = |buffer: CuteafdDeviceBuffer, offset: usize, bytes: usize| CuteafdDeviceBuffer {
         ptr: unsafe { buffer.ptr.cast::<u8>().add(offset).cast() }, bytes, ..buffer };
     for rows in ROWS.into_iter().filter(|&rows| rows <= capacity) {

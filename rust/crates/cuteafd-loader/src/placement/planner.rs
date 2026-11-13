@@ -1,7 +1,8 @@
 //! Pure, phase-aware allocation planning. Recipes describe one legal candidate;
 //! policy, exact pins and allocation reconciliation belong here, not in families.
 use super::{LayerMode, ResidentWeights};
-use cuteafd_core::{SparkReplyFormat, memory_layout::{Basis, Category, Item}};
+use cuteafd_core::{spark_reply::SparkReplyFormats, memory_layout::{Basis, Behaviour, Category, Item, MemoryKind, DRIVER_PAGE_TABLES_GROUP}};
+pub use cuteafd_core::memory_layout::DriverPageTableModel;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use thiserror::Error;
@@ -14,6 +15,19 @@ pub enum Phase {
     Warmup,
     Ready,
     Growth,
+}
+
+impl std::fmt::Display for Phase {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Load => "checkpoint loading",
+            Self::PostTargetKv => "target KV allocation",
+            Self::DraftLoad => "draft loading",
+            Self::Warmup => "decode warm-up",
+            Self::Ready => "ready",
+            Self::Growth => "post-ready growth",
+        })
+    }
 }
 
 /// A family's real allocation chronology, not the declaration order of Phase.
@@ -137,6 +151,111 @@ impl<'a> CoordinatorDevices<'a> {
     pub fn location(self, physical: i32) -> Result<Location, Refusal> {
         Ok(Location::coordinator(self.logical_rank(physical)?))
     }
+
+    /// Translate a complete planner allocation inventory exactly once. Locations
+    /// and tensor names remain logical; shared expert backing IDs name CUDA ordinals.
+    /// Runtime receipts already contain physical IDs and must not pass through this.
+    pub fn remap_weight_arenas(self, allocations: &[Allocation]) -> Result<Vec<Allocation>, Refusal> {
+        let mut names = BTreeMap::new();
+        for allocation in allocations.iter().filter(|a| a.view.is_none()
+            && a.category == Category::Experts && a.group == "weight arena"
+            && a.id.starts_with("experts.")) {
+            let invalid = || Refusal::InvalidFact(format!("invalid logical expert arena {}", allocation.id));
+            let (prefix, identity) = allocation.id.rsplit_once(".gpu.").ok_or_else(invalid)?;
+            let (ordinal, selection) = identity.split_once('.').ok_or_else(invalid)?;
+            let Device::Coordinator(rank) = allocation.location.device else { return Err(invalid()); };
+            if allocation.location.domain != Domain::Device || prefix == "experts."
+                || ordinal != rank.to_string() || selection.len() != 64
+                || !selection.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)) {
+                return Err(invalid());
+            }
+            let id = format!("{prefix}.gpu.{}.{selection}", self.physical_device(rank)?);
+            if names.insert(allocation.id.as_str(), id).is_some() {
+                return Err(Refusal::InvalidFact(format!("duplicate expert arena {}", allocation.id)));
+            }
+        }
+        let draft_prefixes = ["qwen3_5/dspark/gpu", "glm/draft/", "glm5_flash/draft/", "kimi/draft/"];
+        for allocation in allocations.iter().filter(|a| a.view.is_none()
+            && a.group == "weight arena" && MemoryKind::ALL.into_iter().any(|kind|
+                kind.behaviour() == Behaviour::Immutable && kind.category() == a.category)) {
+            let Some(prefix) = draft_prefixes.into_iter().find(|prefix| allocation.id.starts_with(prefix))
+                else { continue; };
+            let Device::Coordinator(rank) = allocation.location.device else {
+                return Err(Refusal::InvalidFact(format!("invalid logical draft arena {}", allocation.id)));
+            };
+            if allocation.location.domain != Domain::Device
+                || allocation.id.strip_prefix(prefix) != Some(rank.to_string().as_str()) {
+                return Err(Refusal::InvalidFact(format!("invalid logical draft arena {}", allocation.id)));
+            }
+            if names.insert(allocation.id.as_str(), format!("{prefix}{}", self.physical_device(rank)?)).is_some() {
+                return Err(Refusal::InvalidFact(format!("duplicate draft arena {}", allocation.id)));
+            }
+        }
+        let mut ids = BTreeSet::new();
+        allocations.iter().map(|allocation| {
+            let mut mapped = allocation.clone();
+            if let Some(id) = names.get(allocation.id.as_str()) { mapped.id = id.clone(); }
+            if let Some(view) = &mut mapped.view {
+                if let Some(id) = names.get(view.backing.as_str()) { view.backing = id.clone(); }
+                else if view.backing.starts_with("experts.")
+                    || draft_prefixes.iter().any(|prefix| view.backing.starts_with(prefix)) {
+                    return Err(Refusal::InvalidFact(format!("missing weight backing for {}", allocation.id)));
+                }
+            }
+            if !ids.insert(mapped.id.clone()) {
+                return Err(Refusal::InvalidFact(format!("duplicate remapped owner {}", mapped.id)));
+            }
+            Ok(mapped)
+        }).collect()
+    }
+
+    /// Preserve the selected plan, capacities and chronology while translating
+    /// backing identities in every owner scope, including derived-owner references.
+    pub fn remap_plan_weight_arenas(self, plan: &ResolvedPlan) -> Result<ResolvedPlan, Refusal> {
+        validate(&plan.facts, &plan.budgets)?;
+        let allocations = plan.facts.allocations.iter().chain(&plan.facts.deferred)
+            .chain(plan.facts.sequential.iter().flat_map(|group| &group.members)).cloned().collect::<Vec<_>>();
+        let mapped = self.remap_weight_arenas(&allocations)?;
+        let names = allocations.iter().zip(&mapped).filter(|(old, new)| old.id != new.id)
+            .map(|(old, new)| (old.id.as_str(), new.id.as_str())).collect::<BTreeMap<_, _>>();
+        let mut out = plan.clone();
+        for owner in &mut out.facts.resident_weights {
+            if let Some(id) = names.get(owner.id.as_str()) { owner.id = (*id).into(); }
+        }
+        for mapping in &mut out.facts.driver_page_tables {
+            if let Some(id) = names.get(mapping.backing.as_str()) { mapping.backing = (*id).into(); }
+        }
+        for owner in &mut out.facts.allocation_granularity {
+            for backing in &mut owner.backings {
+                if let Some(id) = names.get(backing.backing.as_str()) { backing.backing = (*id).into(); }
+            }
+        }
+        for (owner, mapped) in out.facts.allocations.iter_mut().chain(&mut out.facts.deferred)
+            .chain(out.facts.sequential.iter_mut().flat_map(|group| &mut group.members)).zip(mapped) {
+            *owner = mapped;
+        }
+        validate(&out.facts, &out.budgets)?;
+        Ok(out)
+    }
+
+    pub fn reconcile(self, plan: &ResolvedPlan, phase: Phase, receipts: &[Receipt]) -> Result<(), Refusal> {
+        reconcile(&self.remap_plan_weight_arenas(plan)?, phase, receipts)
+    }
+
+    pub fn reconcile_history(self, plan: &ResolvedPlan, phase: Phase,
+        observations: &[Observation]) -> Result<(), Refusal> {
+        reconcile_history(&self.remap_plan_weight_arenas(plan)?, phase, observations)
+    }
+
+    pub fn reconcile_events(self, plan: &ResolvedPlan, phase: Phase,
+        events: &[OwnerEvent], views: &[Observation]) -> Result<(), Refusal> {
+        self.reconcile_startup(plan, phase, events, views, &[])
+    }
+
+    pub fn reconcile_startup(self, plan: &ResolvedPlan, phase: Phase, events: &[OwnerEvent],
+        views: &[Observation], reservations: &[ReservationReceipt]) -> Result<(), Refusal> {
+        reconcile_startup(&self.remap_plan_weight_arenas(plan)?, phase, events, views, reservations)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -154,17 +273,38 @@ pub struct PrefillShape {
     pub rows: u64,
     pub waves: u64,
 }
+/// Compiled model extent and the user's context requirement are independent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Context {
+    pub maximum: u64,
+    pub pin: Pin<u64>,
+}
+impl Context {
+    pub fn resolve(maximum: u64, requested: Option<u64>) -> Self {
+        Self { maximum, pin: requested.filter(|&tokens| tokens > 0).map_or(Pin::Auto, Pin::Exact) }
+    }
+    pub fn automatic(maximum: u64) -> Self { Self { maximum, pin: Pin::Auto } }
+    pub fn pinned(tokens: u64) -> Self { Self { maximum: tokens, pin: Pin::Exact(tokens) } }
+    pub fn required(self) -> u64 { match self.pin { Pin::Auto => 0, Pin::Exact(tokens) => tokens } }
+    pub fn served(self, pool: u64) -> u64 {
+        match self.pin { Pin::Auto => self.maximum.min(pool), Pin::Exact(tokens) => tokens }
+    }
+}
+impl From<u64> for Context {
+    fn from(tokens: u64) -> Self { Self::pinned(tokens) }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Request {
-    pub context: u64,
+    pub context: Context,
     pub pool: Pin<u64>,
     pub onboard: Pin<u64>,
     pub prefill: Pin<PrefillShape>,
     pub operation: Operation,
     /// Retained checkpoint weights per coordinator, independent of memory budgets.
     pub resident_weight_limit: Option<ResidentWeights>,
-    /// An explicit format must match the immutable family contract.
-    pub spark_reply_format: Option<SparkReplyFormat>,
+    /// Each explicit phase format must match the immutable family contract.
+    pub spark_reply_formats: SparkReplyFormats,
 }
 
 /// The physical witness stays independent of a logical memory ceiling.
@@ -188,8 +328,11 @@ pub struct Budget {
     /// in the same budget. A location must belong to exactly one budget.
     pub locations: Vec<Location>,
     pub physical_bytes: u64,
+    /// The device cap (`GPU_MEMORY_CAP` / `SPARK_MEMORY_CAP`); never above physical.
     pub logical_bytes: u64,
     pub baseline: Baseline,
+    /// The named reserve kept free inside the cap (devices: `placement::reserve`;
+    /// host RAM: the host headroom).
     pub headroom: u64,
 }
 impl Budget {
@@ -304,10 +447,14 @@ pub struct Decisions {
     pub onboard_layers: Vec<Vec<usize>>,
     pub expert_homes: BTreeMap<usize, ExpertDestination>,
     pub embedding: Option<EmbeddingHome>,
+    pub draft_home: Option<u8>,
+    pub head_home: Option<u8>,
+    pub intake_home: Option<u8>,
+    pub encoder: Option<usize>,
     pub prefill: PrefillShape,
     pub lanes: u64,
     /// Resolved at preparation; None means this contract has no Spark link.
-    pub spark_reply_format: Option<SparkReplyFormat>,
+    pub spark_reply_formats: Option<SparkReplyFormats>,
 }
 impl Decisions {
     fn onboard(&self) -> u64 {
@@ -397,10 +544,49 @@ pub struct Facts {
     pub sequential: Vec<Sequential>,
     pub reservations: Vec<Reservation>,
     pub allowances: Vec<Allowance>,
+    /// Keep derivation identity when a solved ledger is used to prepare again.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub driver_page_tables: Vec<DriverPageTable>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allocation_granularity: Vec<AllocationGranularity>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DriverPageTable {
+    pub model: DriverPageTableModel,
+    pub location: Location,
+    pub lifetime: Lifetime,
+    pub backing: String,
+    /// Physical backing extent, not a reservation, view or driver allocation.
+    pub mapped_bytes: u64,
+}
+impl DriverPageTable {
+    pub fn bytes(&self) -> u64 { self.model.bytes(self.mapped_bytes) }
+    pub fn source(&self) -> String {
+        format!("{} ({})", self.backing, self.model.source())
+    }
+}
+
+/// SM120 driver 13020: Portable|Mapped allocation and Portable registration,
+/// 1/4/16/32 GiB on both RTX PRO 6000s, 2026-11-07 owner probe. Exact slope
+/// 1/512, zero intercept and residuals; cudaMalloc control had no extra charge.
+/// Fractional bytes round only once per backing, never once per pool page.
+pub fn driver_page_table_bytes(mapped_bytes: u64) -> u64 {
+    DriverPageTableModel::Sm120Portable.bytes(mapped_bytes)
 }
 
 mod contract;
 mod search;
+mod residency;
+pub use residency::{ResidencyRange, solve_residency};
+mod granularity;
+pub use granularity::{AllocationGranularity, GranularityBacking, GranularityEvidence,
+    ALLOCATION_GRANULARITY_GROUP, SM120_ALLOCATION_GRANULARITY_BYTES, SM120_SHARED_REQUEST_BYTES,
+    allocation_granularity_forecast, allocation_granularity_component, cuda_stream_slab_bytes,
+    exact_owner_tail, first_independent_pages, fixed_request_tails, independent_backing_slack,
+    independent_request, sm120_request_backing, weight_arena_components,
+    weight_arena_extent_components};
+pub mod native_attention;
 pub mod serving;
 pub use contract::{
     Activation, ByteCurve, BytePiece, Choice, Component, ComponentKind, Contract, Requires,
@@ -424,20 +610,30 @@ pub struct PhaseBudget {
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResolvedPlan {
+    /// Rejected earlier encoder choices at the admitted pool and onboarding.
+    pub encoder_diagnostics: Vec<(String, u64)>,
     pub request: Request,
     pub decisions: Decisions,
     pub pool_tokens: u64,
+    pub pool_page_rows: u64,
     pub budgets: Vec<Budget>,
     pub facts: Facts,
     pub phases: Vec<PhaseBudget>,
 }
 impl ResolvedPlan {
+    pub fn served_context(&self) -> u64 { self.request.context.served(self.pool_tokens) }
+
     pub fn items(&self, location: Location) -> Result<Vec<Item>, Refusal> {
+        self.items_at(location, Phase::Ready)
+    }
+
+    /// Project admitted owners at a completed phase, including lazy serving growth.
+    pub fn items_at(&self, location: Location, phase: Phase) -> Result<Vec<Item>, Refusal> {
         let mut groups = BTreeMap::new();
         for allocation in &self.facts.allocations {
             if allocation.location != location
                 || allocation.view.is_some()
-                || !allocation.lifetime.contains(Phase::Ready, self.facts.phase_order)
+                || !allocation.lifetime.contains(phase, self.facts.phase_order)
             {
                 continue;
             }
@@ -448,16 +644,60 @@ impl ResolvedPlan {
                 .checked_add(allocation.bytes)
                 .ok_or(Refusal::Overflow("layout items"))?;
         }
-        Ok(groups
+        let mut items: Vec<_> = groups
             .into_iter()
             .map(|((group, category), bytes)| Item::new(category, group, "", bytes, Basis::Exact))
-            .collect())
+            .collect();
+        items.extend(self.facts.allowances.iter().filter(|allowance|
+            allowance.location == location
+                && allowance.bytes != 0
+                && allowance.lifetime.contains(phase, self.facts.phase_order))
+            .map(|allowance| Item::new(Category::Runtime, &allowance.source, "", allowance.bytes,
+                if allowance.assumed { Basis::Estimated } else { Basis::Calibrated })));
+        items.extend(self.facts.driver_page_tables.iter().filter(|mapping|
+            mapping.location == location && mapping.lifetime.contains(phase, self.facts.phase_order))
+            .map(|mapping| Item::new(Category::Runtime, DRIVER_PAGE_TABLES_GROUP, mapping.source(), mapping.bytes(), Basis::Calibrated)));
+        for owner in self.facts.allocation_granularity.iter().filter(|owner|
+            owner.location == location && owner.lifetime.contains(phase, self.facts.phase_order)) {
+            // Arena tails inherit the root's kind. Legacy request groups keep
+            // their aggregate forecast: small requests share driver blocks.
+            let category = if let [backing] = owner.backings.as_slice() {
+                let root = self.facts.allocations.iter().chain(&self.facts.deferred)
+                    .find(|root| root.id == backing.backing)
+                    .ok_or_else(|| Refusal::InvalidFact(format!("missing tail backing {}", backing.backing)))?;
+                if root.view.is_none() && root.group == "weight arena" { root.category } else { Category::Runtime }
+            } else { Category::Runtime };
+            items.push(Item::new(category, ALLOCATION_GRANULARITY_GROUP,
+                owner.source(), owner.bytes()?, owner.basis()));
+        }
+        Ok(items)
+    }
+    /// Complete physical reservation projection for the dashboard only. Unlike
+    /// readiness items, this includes future owners and startup pool/peak forms.
+    /// Keep items_at unchanged: admission/log/receipt callers rely on its scope.
+    pub fn reservation_items_at(&self, location: Location, phase: Phase) -> Result<Vec<Item>, Refusal> {
+        let mut items = self.items_at(location, phase)?;
+        items.extend(self.facts.deferred.iter().filter(|owner|
+            owner.location == location && owner.view.is_none()
+                && owner.lifetime.contains(phase, self.facts.phase_order))
+            .map(|owner| Item::new(owner.category, format!("deferred: {}", owner.group),
+                &owner.dtype, owner.bytes, Basis::Exact)));
+        items.extend(self.facts.reservations.iter().filter(|owner|
+            owner.location == location && owner.lifetime.contains(phase, self.facts.phase_order))
+            .map(|owner| Item::new(Category::Workspace, format!("reservation: {}", owner.id),
+                &owner.source, owner.bytes, Basis::Formula)));
+        items.extend(self.facts.sequential.iter().filter(|group|
+            group.members.first().is_some_and(|owner| owner.location == location
+                && owner.lifetime.contains(phase, self.facts.phase_order)))
+            .map(|group| Item::new(Category::Workspace, format!("sequential peak: {}", group.id),
+                "maximum member, not sum", group.peak(), Basis::Exact)));
+        Ok(items)
     }
     pub fn remaining(&self, budget: &str, phase: Phase) -> Option<u64> {
         self.phases
             .iter()
             .find(|row| row.budget == budget && row.phase == phase)
-            .map(|row| row.available - row.owned - row.opaque)
+            .map(|row| row.available.saturating_sub(row.owned).saturating_sub(row.opaque))
     }
 }
 
@@ -469,12 +709,16 @@ pub enum Refusal {
     InvalidPin(&'static str),
     #[error("pool pin {tokens} is not aligned to {page_rows} rows")]
     MisalignedPool { tokens: u64, page_rows: u64 },
-    #[error("pool {tokens} cannot hold selected context {context}")]
+    #[error("pool {tokens} cannot hold selected context {context}; pass a lower explicit context no greater than {tokens} tokens")]
     PoolBelowContext { tokens: u64, context: u64 },
+    #[error("selected context {context} cannot fit: maximum feasible pool is {tokens} tokens; limiting constraint: {limiting}; pass a lower explicit context no greater than {tokens} tokens (or add memory if zero)")]
+    FullContextShortfall { context: u64, tokens: u64, limiting: Box<Refusal> },
     #[error("no supported candidate satisfies the exact pins")]
     PinConflict,
     #[error("no supported candidate")]
     Unsupported,
+    #[error("{family} lacks the {executor} executor; tracked in #{issue}")]
+    MissingExecutor { family: &'static str, executor: &'static str, issue: u32 },
     #[error("missing selected export {export} for {geometry} at context {context}: {detail}")]
     MissingExport {
         export: String,
@@ -482,7 +726,7 @@ pub enum Refusal {
         context: u64,
         detail: String,
     },
-    #[error("{budget} at {phase:?} needs {required} bytes, has {available}; owners {owners:?}")]
+    #[error("memory budget '{budget}' during {phase} needs {required} bytes, has {available} bytes available; owners {owners:?}")]
     Capacity {
         budget: String,
         phase: Phase,
@@ -538,6 +782,8 @@ fn validate(facts: &Facts, budgets: &[Budget]) -> Result<(), Refusal> {
             .any(|a| !locations.contains(&a.location))
         || facts.resident_weights.iter().any(|w| !locations.contains(&w.location))
         || facts.reservations.iter().any(|r| !locations.contains(&r.location))
+        || facts.driver_page_tables.iter().any(|mapping| !locations.contains(&mapping.location))
+        || facts.allocation_granularity.iter().any(|owner| !locations.contains(&owner.location))
     {
         return Err(Refusal::InvalidFact(
             "allocation outside memory budgets".into(),
@@ -635,6 +881,35 @@ fn validate_owners(facts: &Facts) -> Result<(), Refusal> {
             return Err(Refusal::InvalidFact("invalid opaque allowance".into()));
         }
     }
+    let mut mapped = BTreeSet::new();
+    for mapping in &facts.driver_page_tables {
+        let backing = ids.get(&mapping.backing).filter(|owner| owner.view.is_none())
+            .map(|owner| (owner.location, owner.bytes, owner.lifetime))
+            .or_else(|| facts.sequential.iter().find(|group| group.id == mapping.backing)
+                .map(|group| (group.members[0].location, group.peak(), group.members[0].lifetime)));
+        let backing_location = match (mapping.model, mapping.location) {
+            (DriverPageTableModel::Sm120Portable,
+                Location { device: Device::Coordinator(_), domain: Domain::Device }) => Some(Location::PINNED),
+            (DriverPageTableModel::Sm121Arena,
+                location @ Location { device: Device::Spark(_), domain: Domain::Managed })
+                if ids.get(&mapping.backing).is_some_and(|owner| owner.category == Category::Experts) => Some(location),
+            _ => None,
+        };
+        if backing_location.is_none()
+            || !mapped.insert((mapping.location, mapping.backing.as_str()))
+            || backing != backing_location.map(|location| (location, mapping.mapped_bytes, mapping.lifetime))
+        {
+            return Err(Refusal::InvalidFact(format!("invalid driver page-table backing {}", mapping.backing)));
+        }
+    }
+    let mut granular_backings = BTreeSet::new();
+    let mut granular_ids = BTreeSet::new();
+    for owner in &facts.allocation_granularity {
+        if !granular_ids.insert(&owner.id) {
+            return Err(Refusal::InvalidFact("duplicate cudaMalloc granularity owner".into()));
+        }
+        owner.validate_backings(facts, &mut granular_backings)?;
+    }
     Ok(())
 }
 
@@ -651,9 +926,18 @@ fn resident_weight_totals(facts: &Facts, gpus: usize) -> Result<Vec<ResidentWeig
     Ok(totals)
 }
 
-pub fn evaluate(facts: &Facts, budgets: &[Budget]) -> Result<Vec<PhaseBudget>, Refusal> {
+/// Ledger rows plus every capacity veto they raise, in budget/phase order.
+/// `evaluate` refuses the first; a caller reporting a physical event that has
+/// already succeeded (a startup graph capture) logs them all instead (#1605).
+pub struct Assessment {
+    pub rows: Vec<PhaseBudget>,
+    pub over_budget: Vec<Refusal>,
+}
+
+pub fn assess(facts: &Facts, budgets: &[Budget]) -> Result<Assessment, Refusal> {
     validate(facts, budgets)?;
     let mut rows = Vec::new();
+    let mut over_budget = Vec::new();
     for budget in budgets {
         let available = budget.available()?;
         for &phase in facts.phase_order.phases() {
@@ -695,33 +979,26 @@ pub fn evaluate(facts: &Facts, budgets: &[Budget]) -> Result<Vec<PhaseBudget>, R
                     n.checked_add(a.bytes)
                         .ok_or(Refusal::Overflow("phase allowances"))
                 })?;
+            let opaque = facts.driver_page_tables.iter()
+                .filter(|mapping| mapping.lifetime.contains(phase, facts.phase_order)
+                    && budget.locations.contains(&mapping.location))
+                .try_fold(opaque, |n, mapping| n.checked_add(mapping.bytes())
+                    .ok_or(Refusal::Overflow("driver page tables")))?;
+            let opaque = facts.allocation_granularity.iter()
+                .filter(|owner| owner.lifetime.contains(phase, facts.phase_order)
+                    && budget.locations.contains(&owner.location))
+                .try_fold(opaque, |sum, owner| sum.checked_add(owner.bytes()?)
+                    .ok_or(Refusal::Overflow("allocation granularity")))?;
             let required = owned
                 .checked_add(opaque)
                 .ok_or(Refusal::Overflow("phase peak"))?;
             if required > available {
-                return Err(Refusal::Capacity {
+                over_budget.push(Refusal::Capacity {
                     budget: budget.id.clone(),
                     phase,
                     required,
                     available,
-                    owners: owners
-                        .iter()
-                        .map(|a| a.id.clone())
-                        .chain(
-                            facts
-                                .sequential
-                                .iter()
-                                .filter(|g| {
-                                    g.members[0].lifetime.contains(phase, facts.phase_order)
-                                        && budget.locations.contains(&g.members[0].location)
-                                })
-                                .map(|g| g.id.clone()),
-                        )
-                        .chain(facts.reservations.iter()
-                            .filter(|r| r.lifetime.contains(phase, facts.phase_order)
-                                && budget.locations.contains(&r.location))
-                            .map(|r| r.id.clone()))
-                        .collect(),
+                    owners: phase_owners(facts, budget, phase),
                 });
             }
             rows.push(PhaseBudget {
@@ -733,7 +1010,32 @@ pub fn evaluate(facts: &Facts, budgets: &[Budget]) -> Result<Vec<PhaseBudget>, R
             });
         }
     }
-    Ok(rows)
+    Ok(Assessment { rows, over_budget })
+}
+
+/// The owners active in one budget at one phase, in declaration order.
+fn phase_owners(facts: &Facts, budget: &Budget, phase: Phase) -> Vec<String> {
+    facts.allocations.iter().chain(&facts.deferred)
+        .filter(|a| a.view.is_none() && a.lifetime.contains(phase, facts.phase_order)
+            && budget.locations.contains(&a.location))
+        .map(|a| a.id.clone())
+        .chain(facts.sequential.iter()
+            .filter(|g| g.members[0].lifetime.contains(phase, facts.phase_order)
+                && budget.locations.contains(&g.members[0].location))
+            .map(|g| g.id.clone()))
+        .chain(facts.reservations.iter()
+            .filter(|r| r.lifetime.contains(phase, facts.phase_order)
+                && budget.locations.contains(&r.location))
+            .map(|r| r.id.clone()))
+        .collect()
+}
+
+pub fn evaluate(facts: &Facts, budgets: &[Budget]) -> Result<Vec<PhaseBudget>, Refusal> {
+    let assessment = assess(facts, budgets)?;
+    match assessment.over_budget.into_iter().next() {
+        Some(refusal) => Err(refusal),
+        None => Ok(assessment.rows),
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -817,7 +1119,8 @@ pub fn reconcile_legacy_mla_events(
     events: &[OwnerEvent],
 ) -> Result<(), Refusal> {
     if !facts.phase_order.at_or_before(phase, Phase::Warmup) || !facts.deferred.is_empty()
-        || !facts.allowances.is_empty() || !facts.reservations.is_empty() {
+        || !facts.allowances.is_empty() || !facts.reservations.is_empty() || !facts.driver_page_tables.is_empty()
+        || !facts.allocation_granularity.is_empty() {
         return Err(Refusal::InvalidFact(
             "legacy MLA bridge only checks startup owners".into(),
         ));

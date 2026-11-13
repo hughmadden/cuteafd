@@ -15,7 +15,7 @@ fn snapshot(all: bool) -> tempfile::TempDir {
 }
 
 fn with_layout(ranks: usize, budget: Option<u64>) -> PlanOptions {
-    PlanOptions { placement: ExpertPlacement::from_spark_ranks(ranks), spark_budget_bytes: budget,
+    PlanOptions { attention_placement: Some(crate::placement::AttentionPlacement::Layers), placement: ExpertPlacement::from_spark_ranks(ranks), spark_budget_bytes: budget,
         layout: Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)), rtx_bytes: vec![crate::placement::inventory::PRO_TOTAL_BYTES; 2],
             // The text card retains device snapshots; host spilling is disabled.
             host_cache_bytes: Some(0), spark_allocation_budget_bytes: budget, ..Default::default() }), ..Default::default() }
@@ -26,14 +26,14 @@ fn installed_inventory(root: &std::path::Path, spark: bool) -> std::path::PathBu
 }
 
 #[test]
-fn shared_catalog_rejects_the_same_unindexed_headers_as_standalone() {
+fn shared_catalog_rejects_the_same_missing_indexed_headers_as_standalone() {
     let dir = snapshot(false);
     let path = dir.path().join("model-00000.safetensors");
     testing::write_safetensors(&path, &[t("unindexed.weight", "BF16", &[2])]);
     let input = PlanInput::open(dir.path()).unwrap();
     let cached = format!("{:#}", input.expert_catalog().unwrap_err());
     let standalone = format!("{:#}", crate::read_expert_catalog(dir.path()).unwrap_err());
-    assert!(cached.contains("index/header tensor count mismatch"), "{cached}");
+    assert!(cached.contains("missing from shard"), "{cached}");
     assert_eq!(cached, standalone);
 }
 
@@ -97,23 +97,116 @@ fn complete_checkpoint_preserves_recipe_refusals_at_every_spark_count() {
 }
 
 #[test]
+fn zero_spark_reports_the_missing_local_executor_without_slicing_world_zero() {
+    let dir = snapshot(true);
+    let input = testing::BudgetedPlanInput::open(dir.path()).unwrap();
+    let report = input.plan(&with_layout(0, None)).unwrap();
+    assert!(!report.executable() && !report.wip_launchable());
+    assert!(report.solver_placement.is_none());
+    let refusal = crate::placement::families::kimi::LOCAL_ONLY_REFUSAL.to_string();
+    assert!(report.hints.iter().any(|hint| hint.what.contains(&refusal)), "{:?}", report.hints);
+    assert!(!report.hints.iter().any(|hint| hint.what.contains("geometry-invalid")), "{:?}", report.hints);
+}
+
+#[test]
 fn single_owner_header_plan_never_synthesizes_a_peer_or_half_experts() {
     use crate::placement::{ExpertHome, FfnMode, LayerMode};
     let dir = snapshot(true);
     let input = testing::BudgetedPlanInput::open(dir.path()).unwrap();
     let mut options = with_layout(6, Some(110 << 30));
+    // One owner runs whole MLA layers; an explicit `layers` pin needs the pair.
+    options.attention_placement = None;
+    // This BF16 geometry fixture needs an explicit weight cap above the native text owners.
+    options.coordinator_budget_bytes = 192 << 30;
     let layout = options.layout.as_mut().unwrap();
     layout.rtx_bytes = vec![192 << 30];
     layout.head_split = false;
     let report = input.plan(&options).unwrap();
     let placed = report.solver_placement.as_ref().unwrap_or_else(|| panic!("{:?}", report.hints));
     assert_eq!(placed.items.len(), 1);
+    assert!(placed.items[0].iter().any(|item| item.group == crate::placement::planner::ALLOCATION_GRANULARITY_GROUP
+        && item.bytes > 0 && item.basis == cuteafd_core::memory_layout::Basis::Estimated));
     assert!(placed.layers.iter().all(|layer| layer.mode == LayerMode::Whole { gpu: 0, ffn: FfnMode::Owner }));
     assert!(placed.layers.iter().all(|layer| matches!(layer.experts,
         ExpertHome::Dense | ExpertHome::Spark | ExpertHome::RtxWhole { gpu: 0 })));
     assert!(placed.tp2.is_none());
     assert_eq!(report.memory_layout.as_ref().unwrap().devices.iter()
         .filter(|device| device.kind == cuteafd_core::memory_layout::DeviceKind::Rtx).count(), 1);
+}
+
+#[test]
+fn header_and_installed_min_plans_share_one_arena_backing_and_tail() -> Result<()> {
+    use crate::{families::kimi_k3::weight_layout::{coordinator_arena, GlobalLayout, LayerLayout},
+        placement::{planner::{allocation_granularity_forecast, ALLOCATION_GRANULARITY_GROUP},
+            FfnMode, LayerMode, OnboardSetting}};
+    use cuteafd_core::memory_layout::Basis;
+    let dir = snapshot(true);
+    let input = testing::BudgetedPlanInput::open(dir.path())?;
+    let model = Model::open(&Checkpoint::open(dir.path())?)?;
+    let globals = GlobalLayout::ranks_with_core(model.cfg(), &model.core, 1)?;
+    let layers = (0..model.cfg().layers).map(|layer| LayerLayout::ranks_with_core(model.cfg(), layer,
+        LayerMode::Whole { gpu: 0, ffn: FfnMode::Owner }, &model.core, 1)).collect::<Result<Vec<_>>>()?;
+    let arena = coordinator_arena(0, &globals[0], &layers.iter().map(|pair| &pair[0]).collect::<Vec<_>>())?;
+    assert_eq!(arena.payload_bytes(), 113_509_532_032);
+    assert_eq!(arena.padding_bytes(), 8832);
+    let expected = allocation_granularity_forecast(&[arena.bytes() as u64])?;
+    assert!(expected > 0);
+    let package = tempfile::tempdir()?;
+    let manifest = installed_inventory(package.path(), false);
+    let mut options = with_layout(6, Some(192 << 30));
+    options.attention_placement = None;
+    options.coordinator_budget_bytes = 192 << 30;
+    let layout = options.layout.as_mut().unwrap();
+    layout.rtx_bytes = vec![192 << 30];
+    layout.head_split = false;
+    layout.context_tokens = 262_144;
+    layout.pool_tokens = Some(262_144);
+    layout.prefix_slots = Some(1);
+    layout.onboard = Some(OnboardSetting::Layers(0));
+    let mut charges = Vec::new();
+    for installed in [false, true] {
+        options.layout.as_mut().unwrap().workspace_manifest = installed.then(|| manifest.clone());
+        let report = input.plan(&options)?;
+        let placed = report.solver_placement.as_ref().unwrap_or_else(|| panic!("installed={installed}: {:?}", report.hints));
+        // One named tail per fixed single-request device owner: the arena, the
+        // KDA state/marks, and on an installed layout the lane buffers and code.
+        let owners = placed.items[0].iter().filter(|item| item.group == ALLOCATION_GRANULARITY_GROUP).collect::<Vec<_>>();
+        assert!(owners.iter().all(|item| item.basis == Basis::Estimated && item.bytes > 0),
+            "installed={installed}: {:?}", owners.iter().map(|item| item.bytes).collect::<Vec<_>>());
+        let tail = owners.iter().find(|item| item.bytes == expected)
+            .unwrap_or_else(|| panic!("installed={installed}: missing weight arena tail {expected}"));
+        let roots = placed.items[0].iter().filter(|item| item.group == "weight arena").collect::<Vec<_>>();
+        assert_eq!(roots.len(), 1);
+        assert_eq!(roots[0].bytes, arena.bytes() as u64);
+        assert!(!placed.items[0].iter().any(|item| item.group == "kimi arena padding"
+            || item.group == "Kimi global weights" || item.group == "layers" || item.group.starts_with("Kimi layer ")));
+        charges.push((roots[0].bytes, tail.bytes));
+    }
+    assert_eq!(charges[0], charges[1], "the arena request inventory must not depend on PROGRAMS.json");
+    Ok(())
+}
+
+#[test]
+fn single_owner_header_plan_refuses_mandatory_weights_above_default_cap() {
+    use crate::placement::{PlacementError, ResidentWeights};
+    let dir = snapshot(true);
+    let input = testing::BudgetedPlanInput::open(dir.path()).unwrap();
+    let mut options = with_layout(6, Some(110 << 30));
+    // One owner runs whole MLA layers; an explicit `layers` pin needs the pair.
+    options.attention_placement = None;
+    assert_eq!(options.coordinator_budget_bytes, ResidentWeights::DEFAULT_LIMIT.0);
+    let layout = options.layout.as_mut().unwrap();
+    layout.rtx_bytes = vec![192 << 30];
+    layout.head_split = false;
+    let report = input.plan(&options).unwrap();
+    // The resident-weight cap charges B, including exact inter-view padding, but not its driver tail.
+    let refusal = PlacementError::ResidentWeightLimit { gpu: 0, required: 113_509_532_032 + 8832,
+        limit: ResidentWeights::DEFAULT_LIMIT.0 };
+    assert!(!report.fits && !report.placement_supported);
+    assert!(report.solver_placement.is_none());
+    assert!(report.hints.iter().any(|hint| hint.what == format!("Kimi K3 coordinator admission refused: {refusal}")),
+        "{:?}", report.hints);
+    assert!(report.memory_layout.unwrap().devices.is_empty());
 }
 
 #[test]
@@ -296,16 +389,22 @@ fn planned_headers_supply_range_geometry_without_claiming_fit() {
 }
 
 #[test]
-fn context_refuses_the_missing_executor_instead_of_claiming_fit() {
+fn auto_pair_requires_context_programs_but_explicit_layers_does_not() {
     let dir = snapshot(false);
     let mut options = with_layout(6, None);
     options.attention_placement = Some(crate::placement::AttentionPlacement::Context);
     let report = testing::plan(dir.path(), &options).unwrap();
     assert!(!report.placement_supported && !report.fits && !report.executable());
-    let reason = report.config_error.as_deref().unwrap();
-    assert!(reason.contains("kimi_k3") && reason.contains("context")
-        && reason.contains("executor not implemented"), "{reason}");
-    assert!(report.memory_layout.is_none());
+    assert!(report.hints.iter().any(|h| h.what.contains("Kimi context program admission refused")
+        && h.how.contains("kimik3_mla_partial") && h.how.contains("kimik3_lse_combine2")), "{:?}", report.hints);
+    options.attention_placement = None;
+    let report = testing::plan(dir.path(), &options).unwrap();
+    assert_eq!(report.attention_placement, crate::placement::AttentionPlacement::Context);
+    assert!(report.hints.iter().any(|h| h.what.contains("context program")));
+    options.attention_placement = Some(crate::placement::AttentionPlacement::Layers);
+    let report = testing::plan(dir.path(), &options).unwrap();
+    assert_eq!(report.attention_placement, crate::placement::AttentionPlacement::Layers);
+    assert!(!report.hints.iter().any(|h| h.what.contains("context program")));
 }
 
 #[test]
@@ -414,14 +513,18 @@ fn max_card_jointly_selects_tp2_layers_marks_and_complete_spark_budget() {
     assert_eq!(rtx.len(), 2);
     for gpu in &rtx {
         assert!(category(gpu, Category::Experts) > 0);
-        assert_eq!(category(gpu, Category::Reserved), 2 * super::GIB);
+        // The Kimi family reserve constant is 0: no reserved item.
+        assert_eq!(category(gpu, Category::Reserved), crate::placement::reserve::gpu("kimi_k3"));
     }
     assert_eq!(category(rtx[0], Category::Experts), category(rtx[1], Category::Experts));
     // Numeric overrides are strict, never silently increased to satisfy the workers.
     options.layout.as_mut().unwrap().onboard = Some(crate::placement::OnboardSetting::Layers(0));
     let refused = input.plan(&options).unwrap();
     assert!(!refused.fits);
-    assert!(refused.hints.iter().any(|hint| hint.what.contains("explicit --rtx-expert-layers 0")));
+    // The shared planner names the budget the pin cannot fit instead of the old
+    // minimum-layers message: an explicit 0 still refuses rather than clamping.
+    assert!(refused.hints.iter().any(|hint| hint.what.contains("memory budget 'spark0'")
+        && hint.what.contains("available")), "{:#?}", refused.hints);
     // An impossible Spark ceiling must refuse instead of shrinking the 1M extent.
     options.layout.as_mut().unwrap().onboard = None;
     options.spark_budget_bytes = Some(1);
@@ -494,7 +597,14 @@ fn cache_geometry_preserves_actual_physical_owners_and_mla_copies() {
         assert_eq!(cache.ranks[0], cache.ranks[1]);
         assert_eq!(cache.ranks[0].retained_mark_bytes, 224_686_080);
     }
-    assert!(model.cache_geometry(CacheOptions { coordinator_ranks: 2,
+    let context = model.cache_geometry(CacheOptions { coordinator_ranks: 2,
+        attention_placement: Some(AttentionPlacement::Context), ..Default::default() }).unwrap().unwrap();
+    let auto = model.cache_geometry(CacheOptions { coordinator_ranks: 2, ..Default::default() }).unwrap().unwrap();
+    assert_eq!(auto, context);
+    assert_eq!(context.placement, KvPlacement::PartitionedContext);
+    assert_eq!(context.ranks[0].persistent_unit_bytes, single.ranks[0].persistent_unit_bytes / 2);
+    assert_eq!(context.ranks[0], context.ranks[1]);
+    assert!(model.cache_geometry(CacheOptions { coordinator_ranks: 1,
         attention_placement: Some(AttentionPlacement::Context), ..Default::default() }).is_err());
 }
 
@@ -624,13 +734,21 @@ fn core_header_validation_rejects_wrong_bits_keep_list_and_duplicate_bf16() {
 }
 
 #[test]
-fn header_native_k6_core_is_admitted_by_default() -> Result<()> {
+fn header_native_k4_k6_k8_core_is_admitted_by_default() -> Result<()> {
     let dir=tempfile::tempdir()?;
     testing::write_kimi_core_snapshot(dir.path(),false);
-    let checkpoint=Checkpoint::open(dir.path())?;
+    for bits in [4, 6, 8] {
+    let mut checkpoint=Checkpoint::open(dir.path())?;
+    for tensor in &mut checkpoint.tensors {
+        if tensor.meta.name.ends_with(".trellis") && !tensor.meta.name.contains(".experts.") {
+            tensor.meta.shape[2] = 16 * bits;
+            tensor.meta.byte_length = tensor.meta.byte_length / 6 * bits as u64;
+        }
+    }
     let mut model=Model::open(&checkpoint)?;
     model.configure().map_err(anyhow::Error::msg)?;
     assert!(model.native_serving_admission());
+    assert!(model.core.projections.values().all(|p| p.bits == bits));
     for (stem,projection) in &model.core.projections {
         let members=checkpoint.tensors.iter().filter(|t|format::split_stem(&t.meta.name).0==stem)
             .cloned().collect::<Vec<_>>();
@@ -640,18 +758,18 @@ fn header_native_k6_core_is_admitted_by_default() -> Result<()> {
         model.accepts(&role,stem,&mut operand).map_err(anyhow::Error::msg)?;
         assert_eq!(operand.logical,[projection.stored_outputs,projection.shape[1]]);
     }
+    }
     Ok(())
 }
 
 #[test]
-fn default_context_follows_the_checkpoint_core() -> Result<()> {
-    use crate::families::kimi_k3::{default_context, COMPILED_CONTEXT, DEFAULT_CONTEXT};
+fn automatic_context_uses_model_maximum_for_every_core() -> Result<()> {
     let k6 = tempfile::tempdir()?;
     testing::write_kimi_core_snapshot(k6.path(), false);
     let bf16 = snapshot(false);
-    for (dir, expected) in [(k6.path(), COMPILED_CONTEXT), (bf16.path(), DEFAULT_CONTEXT)] {
+    for dir in [k6.path(), bf16.path()] {
         let checkpoint = Checkpoint::open(dir)?;
-        assert_eq!(default_context(&Model::open(&checkpoint)?.core), expected);
+        let expected = Model::open(&checkpoint)?.cfg.max_position;
         // The planner's unset context selects the same extent; an explicit one wins.
         let report = testing::plan(dir, &PlanOptions { placement: ExpertPlacement::Sparks { ranks: 6 },
             layout: Some(plan::layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)), rtx_bytes: vec![96 << 30; 2], ..Default::default() }), ..Default::default() })?;
@@ -663,5 +781,145 @@ fn default_context_follows_the_checkpoint_core() -> Result<()> {
         let notes = explicit.memory_layout.as_ref().map(|m| m.notes.join("\n")).unwrap_or_default();
         assert!(notes.contains("Kimi API max context: 262144 tokens"), "{notes}");
     }
+    Ok(())
+}
+
+#[test]
+fn k6_max_context_plan_charges_parity_pool_and_each_shared_allocation() -> Result<()> {
+    use crate::{families::kimi_k3::{context::{self, ContextLayout}, core::CoreSplit},
+        placement::{AttentionPlacement, LayerMode}};
+    use cuteafd_core::{MlaCacheFormat, memory_layout::{Category, DeviceKind}};
+    let dir = tempfile::tempdir()?;
+    testing::write_kimi_core_snapshot(dir.path(), true);
+    let checkpoint = Checkpoint::open(dir.path())?;
+    let model = Model::open(&checkpoint)?;
+    let package = tempfile::tempdir()?;
+    let path = installed_inventory(package.path(), false);
+    let mut manifest: Value = serde_json::from_slice(&std::fs::read(&path)?)?;
+    context::add_manifest_programs(&mut manifest);
+    let mut policies = std::collections::BTreeMap::new();
+    for p in model.core.projections.values() {
+        for world in [1, 2] {
+            let (mut n, mut k) = (p.stored_outputs, p.shape[1]);
+            let side = if world == 1 || p.split != CoreSplit::Input { 1 } else { 2 };
+            if world == 2 && p.split != CoreSplit::Whole {
+                if side == 1 { n /= 2; } else { k /= 2; }
+            }
+            let book = match p.codebook {
+                crate::formats::exl3_storage::Exl3Codebook::Mcg => "mcg",
+                crate::formats::exl3_storage::Exl3Codebook::Mul1 => "mul1",
+            };
+            policies.insert((k, n, side, book), serde_json::json!({"input_features":k,
+                "output_features":n,"sharded_side":side,"codebook":book}));
+        }
+    }
+    manifest["families"] = serde_json::json!({"dense_trellis_k6":{"abi_version":1,
+        "row_policies":policies.into_values().collect::<Vec<_>>()}});
+    for capacity in [64, 4096] {
+        let mut names = vec![format!("kda_core_h48_m{capacity}")];
+        for heads in [48, 96] { for stride in [576, 640] { for cache in ["", "_fp8"] {
+            names.push(format!("mla_rank_norm_h{heads}_kv{stride}{cache}_m{capacity}"));
+        } } }
+        manifest["programs"].as_array_mut().unwrap().extend(names.into_iter().map(|name|
+            serde_json::json!({"name":name,"scratch_bytes_at_capacity":{"scratch":256}})));
+    }
+    std::fs::write(&path, manifest.to_string())?;
+    let input = testing::BudgetedPlanInput::open(dir.path())?;
+    let mut options = with_layout(6, Some(110 << 30));
+    let layout = options.layout.as_mut().unwrap();
+    layout.workspace_manifest = Some(path);
+    layout.context_tokens = 262_144;
+    layout.pool_tokens = Some(2_097_152);
+    layout.target_pool_tokens = 2_097_152;
+    layout.mla_kv = MlaCacheFormat::Fp8;
+    layout.prefix_slots = Some(1);
+    options.attention_placement = None;
+    let auto = input.plan(&options)?;
+    assert_eq!(auto.attention_placement, AttentionPlacement::Context);
+    options.attention_placement = Some(AttentionPlacement::Layers);
+    let layers = input.plan(&options)?;
+    assert_eq!(layers.attention_placement, AttentionPlacement::Layers);
+    options.attention_placement = Some(AttentionPlacement::Context);
+    let report = input.plan(&options)?;
+    let placed = report.solver_placement.as_ref().unwrap_or_else(|| panic!("{:?}", report.hints));
+    assert_eq!(report.attention_placement, AttentionPlacement::Context);
+    assert_eq!(report.memory_layout, auto.memory_layout);
+    assert_eq!(report.solver_placement, auto.solver_placement);
+    assert_eq!(placed.pool_tokens, layers.solver_placement.as_ref().unwrap().pool_tokens);
+    assert_eq!(placed.pool_tokens, 2_097_152);
+    assert!(placed.onboard_layers > 0);
+    for (layer, assignment) in placed.layers.iter().enumerate() {
+        assert_eq!(assignment.mode, if model.cfg.attention[layer] == KimiAttention::Mla {
+            LayerMode::ContextSplit } else { LayerMode::HeadSplit });
+    }
+    let expected = ContextLayout::from_manifest(&manifest, MlaCacheFormat::Fp8, 262_144,
+        report.prefill_unit_rows.unwrap() as usize, report.prefill_waves.unwrap() as usize)?.buffers();
+    let demands = expected.demands()?;
+    let memory = report.memory_layout.as_ref().unwrap();
+    for device in memory.devices.iter().filter(|d| d.kind == DeviceKind::Rtx) {
+        for demand in demands.iter().filter(|d| u32::from(d.gpu) == device.index) {
+            assert_eq!(device.items.iter().filter(|i| i.group == demand.group).map(|i| i.bytes).sum::<u64>(), demand.bytes);
+        }
+        let kv = device.items.iter().filter(|i| i.category == Category::Kv && i.group == "records")
+            .map(|i| i.bytes).sum::<u64>();
+        assert_eq!(kv, placed.pool_tokens * model.cfg.mla_layers() as u64 * MlaCacheFormat::Fp8.record_bytes() as u64 / 2);
+    }
+    assert!(memory.notes.iter().any(|n| n.contains("configured 262144 tokens = 343932928 B")
+        && n.contains("compiled cap 1048576 tokens = 1375731712 B")), "{:?}", memory.notes);
+    Ok(())
+}
+
+#[test]
+fn k31_native_indexer_headers_are_required_and_never_core_quantized() -> Result<()> {
+    use crate::families::kimi_k3::{config::{tests::k31_config, KimiK3Config}, weight_layout::LayerLayout};
+    let dir = snapshot(false);
+    let cfg = k31_config();
+    std::fs::write(dir.path().join("config.json"), cfg.to_string())?;
+    let path = dir.path().join("model.safetensors.index.json");
+    let mut index: Value = serde_json::from_slice(&std::fs::read(&path)?)?;
+    let parsed = KimiK3Config::from_hf(&cfg)?;
+    let mut headers = Vec::new();
+    for (layer, kind) in parsed.attention.iter().enumerate() {
+        if *kind != KimiAttention::Mla { continue; }
+        let root = format!("language_model.model.layers.{layer}.self_attn.indexer");
+        for (leaf,shape) in [("wq_b.weight",vec![4096,1536]),("wk.weight",vec![128,7168]),
+            ("weights_proj.weight",vec![32,7168]),("k_norm.weight",vec![128]),("k_norm.bias",vec![128])] {
+            let name = format!("{root}.{leaf}");
+            index["weight_map"][&name] = serde_json::json!("indexers.safetensors");
+            headers.push(t(name, "BF16", &shape));
+        }
+    }
+    testing::write_safetensors(&dir.path().join("indexers.safetensors"), &headers);
+    std::fs::write(&path,index.to_string())?;
+    let checkpoint = Checkpoint::open(dir.path())?;
+    assert!(KIMI_K3.detect(&checkpoint));
+    let model = Model::open(&checkpoint)?;
+    assert!(!model.native_serving_admission());
+    assert_eq!(model.spec.layers.iter().filter(|layer| matches!(layer.attention, AttentionKind::MlaDsa { indexer: true })).count(), 24);
+    assert!(model.core.projections.is_empty());
+    let index_bytes = 24 * (4096*1536 + 128*7168 + 32*7168 + 2*128) * 2;
+    assert_eq!(model.bytes.get(&Component::Indexer), Some(&(index_bytes as u64)));
+    assert_eq!(model.mla[3].replicated - 30_281_728, (index_bytes / 24) as u64);
+
+    let base = KimiK3Config::from_hf(&config())?;
+    for mode in [crate::placement::LayerMode::HeadSplit, crate::placement::LayerMode::ContextSplit] {
+        let layouts = LayerLayout::pair(&parsed, 3, mode)?;
+        let original = LayerLayout::pair(&base, 3, mode)?;
+        let bytes = (4096*1536 + 128*7168 + 32*7168 + 2*128)*2;
+        for rank in 0..2 {
+            assert_eq!(layouts[rank].bytes()? - original[rank].bytes()?, bytes);
+            let arena = crate::serving_capacity::WeightArenaLayout::new("indexer fixture",
+                layouts[rank].arena_tensors("layers.3")?)?;
+            assert!(arena.view("layers.3.mla.indexer.q").is_some());
+        }
+    }
+    let options = crate::serving_capacity::CacheOptions {
+        coordinator_ranks: 2, attention_placement: Some(crate::placement::AttentionPlacement::Context),
+        mla_kv: cuteafd_core::MlaCacheFormat::Bf16, ..Default::default() };
+    let cache = model.cache_geometry(options)?.unwrap();
+    for rank in cache.ranks { assert_eq!(rank.persistent_unit_bytes, (24*64*(576*2/2+128+4)) as u64); }
+    headers.pop();
+    testing::write_safetensors(&dir.path().join("indexers.safetensors"), &headers);
+    assert!(Checkpoint::open(dir.path()).is_err());
     Ok(())
 }

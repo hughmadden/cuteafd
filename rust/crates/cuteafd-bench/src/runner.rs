@@ -423,6 +423,7 @@ impl Bench {
                 "eta_s": a.eta_s, "elapsed_s": a.started.elapsed().as_secs_f64()})),
             "readiness_s": crate::context::readiness_s(),
             "full_prefill_logits": crate::fidelity_dataset::prefill_admitted(&crate::context::get().settings),
+            "draft": crate::context::get().draft_mode(),
             "snapshot": crate::context::get().snapshot,
             "settings": crate::context::get().settings,
             "fingerprint": fingerprint,
@@ -720,18 +721,23 @@ impl Bench {
                 self.begin(active, panel.id(), estimate, remaining, total, pass, planned.passes, progress);
                 let ctx = Ctx { client: &client, info: &info, baseline: baseline.as_ref(), rates, progress, pass,
                     history: &earlier, max_context, max_output, lossless_set, lossless_dump, context_load };
-                let table_before = panels::common::mapped_counters(&client);
+                let counters_before = panels::common::phase_counters(&client);
                 let thermal_mark = client.thermal_mark();
                 let fabric_mark = client.fabric_mark();
                 let outcome = panel.run(&ctx);
                 let fabric = client.fabric_since(fabric_mark, &format!("{}/pass{pass}", panel.id()), false);
                 let thermal = client.thermal_since(thermal_mark);
-                let table_after = panels::common::mapped_counters(&client);
+                let counters_after = panels::common::phase_counters(&client);
                 remaining -= estimate;
                 let mut r = report.lock().expect("report lock");
                 match outcome {
                     Ok(mut value) => {
-                        let tables = panels::common::mapped_interval(&table_before, &table_after);
+                        let tables = panels::common::mapped_interval(&counters_before.mapped_tables, &counters_after.mapped_tables);
+                        if let Some(usage) = panels::common::expert_usage_interval(
+                            counters_before.expert_usage.as_ref(), counters_after.expert_usage.as_ref()) {
+                            value["expert_usage"] = usage;
+                            value["expert_usage_scope"] = json!("whole panel pass, including panel-internal priming; approximate snapshot boundaries");
+                        }
                         if !tables.is_empty() {
                             value["mapped_tables"] = json!(tables);
                             value["mapped_tables_scope"] = json!("whole panel pass, including panel-internal priming");
@@ -760,6 +766,11 @@ impl Bench {
                         r.panels[index].partial = None;
                     }
                     Err(error) => {
+                        // Fast failures may finish between ticker updates. Persist their
+                        // last evidence synchronously before saving the failed panel.
+                        if let Some(partial) = progress.get().partial {
+                            Self::apply_partial(&mut r, progress, panel.id(), &partial);
+                        }
                         if error.downcast_ref::<crate::client::Cancelled>().is_some() || self.stopping.get().is_some() {
                             if let Some(reason) = self.interrupted() { r.panels[index].error = Some(reason); }
                             r.panels[index].status = PanelStatus::Cancelled;
@@ -815,17 +826,20 @@ impl Bench {
     /// Fold a pass's partial into the shared report. A baseline partial never replaces the
     /// final baseline: the ticker can deliver one after `run_plan` installed the result.
     /// Call with the report lock held, so the check and the write are atomic against the install.
-    fn apply_partial(r: &mut Report, progress: &Progress, panel: &str, partial: &Value) {
+    fn apply_partial(r: &mut Report, progress: &Progress, panel: &str, partial: &Value) -> bool {
         if panel == "baseline" {
             if progress.baseline_final() {
-                return;
+                return false;
             }
             if let Ok(b) = serde_json::from_value::<Baseline>(partial.clone()) {
                 r.baseline = Some(b);
+                return true;
             }
-        } else if let Some(p) = r.panels.iter_mut().find(|p| p.id == panel) {
+        } else if let Some(p) = r.panels.iter_mut().find(|p| p.id == panel && p.status == PanelStatus::Running) {
             p.partial = Some(partial.clone());
+            return true;
         }
+        false
     }
 
     /// Once a second while a run is active: progress, ETA, the live strip, partial results.
@@ -889,10 +903,11 @@ impl Bench {
             if state.revision != revision {
                 revision = state.revision;
                 if let Some(partial) = state.partial {
-                    if let Ok(mut r) = report.lock() {
-                        Self::apply_partial(&mut r, progress, &plan.panel, &partial);
+                    let applied = report.lock().is_ok_and(|mut r|
+                        Self::apply_partial(&mut r, progress, &plan.panel, &partial));
+                    if applied {
+                        self.emit(json!({"type": "partial", "run": plan.run, "panel": plan.panel, "value": partial}));
                     }
-                    self.emit(json!({"type": "partial", "run": plan.run, "panel": plan.panel, "value": partial}));
                 }
             }
             std::thread::sleep(Duration::from_millis(1000));
@@ -921,6 +936,22 @@ mod tests {
         progress.finish_baseline();
         super::Bench::apply_partial(&mut report, &progress, "baseline", &partial);
         assert_eq!(report.baseline.as_ref().unwrap().quality.checks.len(), final_checks);
+    }
+
+    #[test]
+    fn terminal_panels_reject_stale_ticker_partials() {
+        use crate::report::PanelStatus;
+        let mut report = crate::sample::report(false);
+        let progress = crate::panels::Progress::default();
+        let id = report.panels[0].id.clone();
+        let final_record = serde_json::json!({"points": [{"status": "failed", "reason": "HTTP 400"}]});
+        report.panels[0].status = PanelStatus::Running;
+        assert!(super::Bench::apply_partial(&mut report, &progress, &id, &final_record));
+        for status in [PanelStatus::Failed, PanelStatus::Done, PanelStatus::Cancelled] {
+            report.panels[0].status = status;
+            assert!(!super::Bench::apply_partial(&mut report, &progress, &id, &serde_json::json!({"points": []})));
+            assert_eq!(report.panels[0].partial.as_ref(), Some(&final_record));
+        }
     }
 
     #[test]

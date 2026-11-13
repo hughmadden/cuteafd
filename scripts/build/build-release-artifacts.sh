@@ -11,6 +11,16 @@ source_dir="$(realpath "$1")"
 role="$2"
 cuda_arch="$3"
 output_dir="$(realpath -m "$4")"
+mkdir -p "$output_dir"
+export CUTEAFD_EXPORT_CACHE_STATS="${CUTEAFD_EXPORT_CACHE_STATS:-$output_dir/EXPORT_CACHE_STATS.jsonl}"
+: >"$CUTEAFD_EXPORT_CACHE_STATS"
+if [[ -z "${CUTEAFD_EXPORT_CACHE:-}" || "$CUTEAFD_EXPORT_CACHE" == off ]]; then
+  printf '%s\n' '{"event":"bypassed","layer":"invocation","reason":"cache disabled"}' >>"$CUTEAFD_EXPORT_CACHE_STATS"
+elif [[ "${CUTEAFD_EXPORT_IMAGE_ID:-}" != sha256:* ]]; then
+  printf '%s\n' '{"event":"bypassed","layer":"invocation","reason":"missing or invalid CUTEAFD_EXPORT_IMAGE_ID"}' >>"$CUTEAFD_EXPORT_CACHE_STATS"
+  echo "release export cache requires the admitted compiler image ID (CUTEAFD_EXPORT_IMAGE_ID)" >&2
+  exit 2
+fi
 # Where the writable build root is created. Unset keeps the historical in-container
 # /tmp scratch; build.sh relocates it to a unique per-task path on the host, mounted
 # at the identical path in the container, so a release build never depends on how
@@ -71,7 +81,7 @@ case "$role" in
     exit 2
     ;;
 esac
-# Opt-in replicated-group Spark expert roles. Empty is the default and keeps
+# Opt-in Spark expert roles. Empty is the default and keeps
 # the historical Spark TP4 shard (and every release default) byte-identical.
 # Release images carry the audio tower: AUDIO=auto serves it for qualified checkpoints.
 audio_aot="${CUTEAFD_RELEASE_AUDIO_AOT:-ON}"
@@ -217,6 +227,8 @@ echo "Host ISA targets: ${host_isas[*]} (base ${host_isas[0]})"
 cargo_feature_args=()
 if [[ "$role" == coordinator ]]; then
   coordinator_features="${CUTEAFD_RELEASE_COORDINATOR_FEATURES:-}"
+  [[ ! " ${coordinator_features//,/ } " =~ \ dev- ]] ||
+    { echo "release coordinator features may not include dev-* hooks: $coordinator_features" >&2; exit 2; }
   [[ -z "$coordinator_features" ]] || cargo_feature_args=(--features "$coordinator_features")
 fi
 host_isa_jobs=()
@@ -235,6 +247,7 @@ cmake \
   -B "$build_root/native" \
   -G Ninja \
   -DCMAKE_BUILD_TYPE=Release \
+  -DCUTEAFD_BUILD_KIND=release \
   -DCUTEAFD_ENABLE_CUDA=ON \
   -DCUTEAFD_ENABLE_VISION_ATTENTION_AOT="${CUTEAFD_RELEASE_VISION_ATTENTION_AOT:-ON}" \
   -DCUTEAFD_ENABLE_AUDIO_AOT="$audio_aot" \
@@ -261,6 +274,7 @@ cmake \
   -DCUTEAFD_ENABLE_KIMIK3_AOT="$( [[ "$role" == coordinator ]] && echo "${CUTEAFD_RELEASE_KIMIK3_AOT:-OFF}" || echo OFF)" \
   -DCUTEAFD_ENABLE_MUSE_AOT="$( [[ "$role" == coordinator ]] && echo "${CUTEAFD_RELEASE_MUSE_AOT:-OFF}" || echo OFF)" \
   -DCUTEAFD_ENABLE_ML4_AOT="$( [[ "$role" == coordinator ]] && echo "${CUTEAFD_RELEASE_ML4_AOT:-OFF}" || echo OFF)" \
+  -DCUTEAFD_ENABLE_MINIMAX_AOT="$( [[ "$role" == coordinator ]] && echo "${CUTEAFD_RELEASE_MINIMAX_AOT:-OFF}" || echo OFF)" \
   -DCUTEAFD_ENABLE_EXLR8_AOT="${CUTEAFD_RELEASE_EXLR8_AOT:-OFF}" \
   -DCUTEAFD_EXLR8_FAMILIES="${CUTEAFD_RELEASE_EXLR8_FAMILIES:-}" \
   -DCUTEAFD_ENABLE_V41_ATTENTION_AOT="$coordinator_aot" \
@@ -444,3 +458,4 @@ test -s "$output_dir/SPARKINFER_SHA256SUMS"
 test -s "$output_dir/XGRAMMAR_PROVENANCE.json"
 test -s "$output_dir/XGRAMMAR_LICENSE"
 test -s "$output_dir/XGRAMMAR_SHA256SUMS"
+python3 "$source_dir/scripts/build/export-cache.py" stats "$CUTEAFD_EXPORT_CACHE_STATS"

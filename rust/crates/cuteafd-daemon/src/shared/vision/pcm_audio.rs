@@ -53,8 +53,29 @@ impl PcmTowerSpec {
         }
         Ok(Self { plan, native })
     }
-    pub fn required_bytes(&self) -> Result<u64> {
-        Ok(self.plan.required_bytes(self.native.max_samples as usize)?)
+    pub(super) fn push_reads(&self) -> impl Iterator<Item = &cuteafd_loader::media::audio_tower::AudioTensorRead> {
+        self.plan.reads().values()
+    }
+    pub(super) fn prepare(&self, library: &Path, device: i32, admitted: u64) -> Result<PcmTower> {
+        if admitted < self.required_bytes(library)? {
+            return Err(VisionError::Unsupported("PCM admission below requirement".into()));
+        }
+        let native = NativePcmAudio::prepare(library, &self.native, device, admitted, cuteafd_ffi::memory_ledger::MediaTags::new("media/pcm-audio"))?;
+        self.check_ledger(&native)?;
+        Ok(PcmTower { native })
+    }
+    pub fn required_bytes(&self, library: &Path) -> Result<u64> {
+        let ledger = NativePcmAudio::required(library, &self.native)?;
+        let required = self.plan.required_bytes(self.native.max_samples as usize)?;
+        if ledger.weights != self.plan.weight_bytes()
+            || ledger.scratch != scratch_bytes(self.native.max_samples as usize)?
+            || ledger.device_allocations != 2
+        {
+            return Err(VisionError::Unsupported(
+                "PCM native requirement differs from admitted plan".into(),
+            ));
+        }
+        Ok(required)
     }
     pub fn native_spec(&self) -> &PcmSpec {
         &self.native
@@ -64,14 +85,18 @@ impl PcmTowerSpec {
     }
     /// Load on the shared media owner's CUDA thread after planner admission.
     pub fn load(&self, library: &Path, device: i32, admitted: u64) -> Result<PcmTower> {
-        let required = self.required_bytes()?;
+        let required = self.required_bytes(library)?;
         if admitted < required {
             return Err(VisionError::Unsupported(format!(
                 "PCM admission {admitted} < {required}"
             )));
         }
         let weights = self.plan.read_weights(self.plan.weight_bytes())?;
-        let native = NativePcmAudio::load(library, &self.native, device, admitted, &weights)?;
+        let native = NativePcmAudio::load(library, &self.native, device, admitted, &weights, cuteafd_ffi::memory_ledger::MediaTags::new("media/pcm-audio"))?;
+        self.check_ledger(&native)?;
+        Ok(PcmTower { native })
+    }
+    fn check_ledger(&self, native: &NativePcmAudio) -> Result<()> {
         let ledger = native.ledger()?;
         if ledger.weights != self.plan.weight_bytes()
             || ledger.scratch != scratch_bytes(self.native.max_samples as usize)?
@@ -81,13 +106,15 @@ impl PcmTowerSpec {
                 "PCM ledger differs from admitted plan".into(),
             ));
         }
-        Ok(PcmTower { native })
+        Ok(())
     }
 }
 pub struct PcmTower {
     native: NativePcmAudio,
 }
 impl PcmTower {
+    pub(super) fn weight_arena(&self) -> Result<usize> { Ok(self.native.weight_arena()?) }
+    pub(super) fn commit_weights(&mut self) -> Result<()> { Ok(self.native.commit_weights()?) }
     pub fn encode(&mut self, pcm: &[f32]) -> Result<Vec<u16>> {
         Ok(self.native.encode(pcm)?)
     }

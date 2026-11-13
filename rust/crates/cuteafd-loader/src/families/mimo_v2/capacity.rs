@@ -3,15 +3,22 @@
 //! CUDA module, graph, transport, expert and external-drafter reservations are
 //! supplied by the runtime, where their selected implementations are known.
 use super::resident::{MimoResidentLayout, MimoResidentOptions};
+use super::weight_arena::MimoArenaLayouts;
 use super::{MimoKvFormats, MimoV2Config, MimoWorkspaceLayout, MimoWorkspaceOptions};
 use crate::plan::checkpoint::Checkpoint;
-use crate::serving_capacity::{mimo_cache_geometry, CacheGeometryError};
+use crate::placement::planner::{allocation_granularity_forecast, independent_backing_slack, Lifetime};
+use crate::serving_capacity::{mimo_cache_geometry, CacheGeometryError, WeightArenaLayout,
+    MIMO_RING_ROWS};
 use cuteafd_core::serving_capacity::{
     CapacityProfile, ContextLimits, DeviceCosts, MemoryReservation,
 };
 
 #[derive(Debug, Clone)]
 pub struct MimoRankRuntime {
+    /// Independently retired immutable sets, e.g. the selected DFlash arena.
+    pub weight_arenas: Vec<MimoWeightArena>,
+    /// Retained arena bytes plus checkpoint weights in `additional`.
+    pub resident_weights: crate::placement::ResidentWeights,
     pub device: u32,
     /// Every workspace that can remain live together: prefill lanes and decode.
     /// Native scratch comes from the selected manifest, not a guessed headroom.
@@ -40,6 +47,8 @@ pub struct MimoCapacityOptions {
 
 #[derive(Debug, Clone)]
 pub struct MimoCapacityProfiles {
+    pub weight_arenas: Vec<Vec<MimoWeightArena>>,
+    pub resident_weights: Vec<crate::placement::ResidentWeights>,
     /// Fixed-only admission before any target weight allocation.
     pub loading: Vec<DeviceCosts>,
     /// Actual target storage after KV/peer attachment, before drafter packing,
@@ -50,6 +59,27 @@ pub struct MimoCapacityProfiles {
     pub post_target_kv: Vec<DeviceCosts>,
     /// Persistent admission, including the selected logical KV pool.
     pub steady: CapacityProfile,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MimoWeightArena {
+    pub layout: WeightArenaLayout,
+    pub kind: cuteafd_core::memory_layout::MemoryKind,
+    pub lifetime: Lifetime,
+}
+
+impl MimoWeightArena {
+    /// Reporting rows mirror the physical root and its one derived tail.
+    /// The planner uses the shared arena component constructor instead.
+    pub fn reservations(&self) -> Result<Vec<MemoryReservation>, CacheGeometryError> {
+        let bytes = self.layout.bytes() as u64;
+        let tail = allocation_granularity_forecast(&[bytes])
+            .map_err(|error| CacheGeometryError::ResidentTensor {
+                name: self.layout.id().into(), what: error.to_string(),
+            })?;
+        Ok(vec![MemoryReservation { name: self.layout.id().into(), bytes },
+            MemoryReservation { name: format!("{}.tail", self.layout.id()), bytes: tail }])
+    }
 }
 
 fn product(label: &'static str, dims: &[u64]) -> Result<u64, CacheGeometryError> {
@@ -93,6 +123,16 @@ pub fn mimo_capacity_profiles(
         });
     }
     let resident = MimoResidentLayout::new(checkpoint, cfg, &resident_options)?;
+    let layouts = MimoArenaLayouts::new(checkpoint, &resident)
+        .map_err(|error| CacheGeometryError::ResidentTensor {
+            name: "MiMo weight arenas".into(), what: error.to_string(),
+        })?;
+    let mut weight_arenas = layouts.target.into_iter().map(|layout| layout.into_iter()
+        .map(|layout| MimoWeightArena { layout, kind: cuteafd_core::memory_layout::MemoryKind::Weights, lifetime: Lifetime::RESIDENT }).collect::<Vec<_>>())
+        .collect::<Vec<_>>();
+    if let Some(layout) = layouts.mtp {
+        weight_arenas[0].push(MimoWeightArena { layout, kind: cuteafd_core::memory_layout::MemoryKind::DrafterWeights, lifetime: Lifetime::RESIDENT });
+    }
     let cache = mimo_cache_geometry(
         cfg,
         resident_options.layers,
@@ -100,17 +140,18 @@ pub fn mimo_capacity_profiles(
         options.kv_cache,
         resident_options.native_mtp_layers,
     )?;
+    let target_cache = mimo_cache_geometry(
+        cfg,
+        resident_options.layers,
+        resident_options.coordinator_ranks,
+        options.kv_cache,
+        0,
+    )?;
     let before_kv_state = if resident_options.native_mtp_layers > 0 {
         // MTP stage rings/hidden history and fixed buffers are allocated in
         // with_engine before target KV, interleaved with MTP weight loads.
         // Derive their exact increment from the shared cache description.
-        let target = mimo_cache_geometry(
-            cfg,
-            resident_options.layers,
-            resident_options.coordinator_ranks,
-            options.kv_cache,
-            0,
-        )?;
+        let target = &target_cache;
         let active = cache.ranks[0]
             .active_state_per_sequence_bytes
             .checked_sub(target.ranks[0].active_state_per_sequence_bytes)
@@ -147,7 +188,9 @@ pub fn mimo_capacity_profiles(
             });
         }
         let storage = cache.ranks[rank];
-        let mut loading_costs = resident.ranks[rank].clone();
+        let target_weights = weight_arenas[rank].iter().map(MimoWeightArena::reservations)
+            .collect::<Result<Vec<_>, _>>()?.into_iter().flatten().collect::<Vec<_>>();
+        let mut loading_costs = target_weights.clone();
         if rank == 0 {
             reserve(
                 &mut loading_costs,
@@ -173,32 +216,66 @@ pub fn mimo_capacity_profiles(
             device: runtime.device,
             reservations: loading_costs,
             pool_unit_bytes: 0,
+            reserve_bytes: 0,
         });
-        let mut costs = resident.ranks[rank].clone();
-        reserve(
-            &mut costs,
-            "state.active_rings",
-            product(
-                "MiMo active rings",
-                &[options.rings, storage.active_state_per_sequence_bytes],
-            )?,
-        );
+        let mut costs = target_weights;
+        let ring_bytes = product(
+            "MiMo active rings",
+            &[options.rings, storage.active_state_per_sequence_bytes],
+        )?;
+        reserve(&mut costs, "state.active_rings", ring_bytes);
+        // The runtime keeps one ring buffer per sliding layer, one per MTP
+        // stage and one hidden-history ring, each rounded on its own. Charge
+        // those backings' SM120 slack beside the payload they belong to.
+        let swa = cfg.attention[..resident_options.layers].iter()
+            .filter(|attention| **attention == super::MimoAttention::Sliding).count() as u64;
+        let mut ring_requests = Vec::new();
+        if swa > 0 {
+            let total = target_cache.ranks[rank].active_state_per_sequence_bytes;
+            if total % swa != 0 {
+                return Err(CacheGeometryError::Unsupported {
+                    family: "mimo_v2",
+                    what: "target SWA rings do not split over the sliding layers",
+                });
+            }
+            ring_requests.extend(std::iter::repeat_n(
+                options.rings.checked_mul(total / swa)
+                    .ok_or(CacheGeometryError::Overflow("MiMo target ring backing"))?,
+                swa as usize));
+        }
+        // The MTP stage rings and the hidden-history ring live on the lead
+        // rank, matching `mimo_cache_geometry`'s rank-0 addition.
+        if rank == 0 && resident_options.native_mtp_layers > 0 {
+            let record = cfg.record_bytes(super::MimoAttention::Sliding, options.kv_cache) as u64;
+            let stage = product("MiMo MTP stage ring",
+                &[options.rings, MIMO_RING_ROWS, record])?;
+            ring_requests.extend(std::iter::repeat_n(stage,
+                resident_options.native_mtp_layers));
+            ring_requests.push(product("MiMo MTP hidden ring",
+                &[options.rings, MIMO_RING_ROWS, cfg.hidden as u64, 2])?);
+        }
+        let tail = independent_backing_slack(ring_requests).map_err(|error|
+            CacheGeometryError::ResidentTensor { name: "state.active_rings".into(),
+                what: error.to_string() })?;
+        reserve(&mut costs, "state.active_rings.tail", tail);
         reserve(&mut costs, "state.fixed", storage.fixed_state_bytes);
         post_target_kv.push(DeviceCosts {
             device: runtime.device,
             reservations: costs.clone(),
             pool_unit_bytes: storage.persistent_unit_bytes,
+            reserve_bytes: 0,
         });
         if options.mark_slots > 0 && mark_bytes > 0 {
-            reserve(
-                &mut costs,
-                "prefix.exact_mark_arena",
-                product(
-                    "MiMo retained marks",
-                    &[options.mark_slots, storage.retained_mark_bytes],
-                )?
-                .max(256),
-            );
+            let marks = product(
+                "MiMo retained marks",
+                &[options.mark_slots, storage.retained_mark_bytes],
+            )?.max(256);
+            reserve(&mut costs, "prefix.exact_mark_arena", marks);
+            // One device mark arena backing per rank, rounded independently.
+            let tail = independent_backing_slack([marks]).map_err(|error|
+                CacheGeometryError::ResidentTensor { name: "prefix.exact_mark_arena".into(),
+                    what: error.to_string() })?;
+            reserve(&mut costs, "prefix.exact_mark_arena.tail", tail);
         }
         reserve(
             &mut costs,
@@ -231,7 +308,8 @@ pub fn mimo_capacity_profiles(
             costs.extend(kv_shadow.workspace_reservations(name, &layout, *workspace)?);
             // The allocator uses max(256, pages * table_rows * 4). Reserving
             // the fixed minimum plus its linear term is safe at every pool
-            // size, overcounting by at most 256 bytes per workspace.
+            // size, overcounting by at most the zero-page minimum (256 bytes
+            // for decode, waves * 256 bytes for prefill).
             let table_rows = if workspace.decode { workspace.rows } else { workspace.waves };
             unit_bytes = add(
                 "MiMo workspace pool tables",
@@ -241,6 +319,9 @@ pub fn mimo_capacity_profiles(
         }
         costs.extend(kv_shadow.reservation());
         costs.extend(runtime.additional.iter().cloned());
+        for arena in &runtime.weight_arenas {
+            costs.extend(arena.reservations()?);
+        }
         costs
             .iter()
             .try_fold(0u64, |n, reservation| n.checked_add(reservation.bytes))
@@ -249,9 +330,21 @@ pub fn mimo_capacity_profiles(
             device: runtime.device,
             reservations: costs,
             pool_unit_bytes: unit_bytes,
+            reserve_bytes: 0,
         });
     }
+    let resident_weights = weight_arenas.iter().zip(&options.ranks).map(|(owners, runtime)| {
+        let bytes = owners.iter().try_fold(runtime.resident_weights.0, |sum, owner|
+            sum.checked_add(owner.layout.bytes() as u64))
+            .ok_or(CacheGeometryError::Overflow("MiMo checkpoint resident weights"))?;
+        Ok(crate::placement::ResidentWeights(bytes))
+    }).collect::<Result<Vec<_>, CacheGeometryError>>()?;
+    for (arenas, runtime) in weight_arenas.iter_mut().zip(&options.ranks) {
+        arenas.extend(runtime.weight_arenas.iter().cloned());
+    }
     Ok(MimoCapacityProfiles {
+        weight_arenas,
+        resident_weights,
         loading,
         post_target_kv,
         steady: CapacityProfile {
@@ -303,6 +396,8 @@ mod tests {
             host_prefix_bytes: 64 << 30,
             ranks: (0..ranks)
                 .map(|rank| MimoRankRuntime {
+                    weight_arenas: vec![],
+                    resident_weights: Default::default(),
                     // Rank0 need not be physical device0.
                     device: (1 - rank) as u32,
                     additional: vec![MemoryReservation {
@@ -384,11 +479,11 @@ mod tests {
             assert!(profile.devices[0]
                 .reservations
                 .iter()
-                .any(|r| r.name == "lm_head.bf16"));
+                .any(|r| r.name == "mimo.target.rank0"));
             assert!(profile.devices[1]
                 .reservations
                 .iter()
-                .all(|r| r.name != "lm_head.bf16"));
+                .all(|r| r.name != "mimo.target.rank0"));
             assert_eq!(profile.host_prefix_bytes, 64 << 30);
             let arena = |rank: usize| {
                 profile.devices[rank]
@@ -405,12 +500,9 @@ mod tests {
                 .iter()
                 .all(|d| d.reservations.iter().all(|r| r.name != "loading.temporary")));
             assert!(phases.loading.iter().all(|d| d.pool_unit_bytes == 0));
-            let loading_extra = phases.loading[0]
-                .reservations
-                .iter()
-                .find(|r| r.name == "loading.temporary")
-                .unwrap();
-            assert_eq!(loading_extra.bytes, 4096 * 8192 * 2);
+            assert!(phases.loading.iter().all(|device| device.reservations.iter()
+                .all(|reservation| reservation.name != "loading.temporary")),
+                "native BF16 column shares land directly in final owners");
             for phase in &phases.post_target_kv {
                 assert_eq!(phase.pool_unit_bytes, 64 * 720);
                 assert!(phase
@@ -524,6 +616,68 @@ mod tests {
                 predicted - actual_workspaces - records <= 2 * 256,
                 "pages={pages}"
             );
+        }
+    }
+
+    #[test]
+    fn flash_and_pro_workspace_owners_match_runtime_layout_at_live_shapes() {
+        use crate::families::mimo_v2::workspace::MimoPrefillKvShadowPlan;
+        use crate::plan::testing::{mimo_pro_config, mimo_pro_tensors};
+        for pro in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            write_snapshot(dir.path(), &if pro { mimo_pro_config() } else { mimo_flash_config() },
+                &if pro { mimo_pro_tensors() } else { mimo_flash_tensors() }, Some(if pro { 8 } else { 1 }));
+            let checkpoint = Checkpoint::open(dir.path()).unwrap();
+            let cfg = MimoV2Config::from_hf(&checkpoint.config).unwrap();
+            for ranks in [1, 2] {
+                for (rows, waves) in [(2048, 4), (2752, 3), (4096, 2)] {
+                    let mut options = options(ranks);
+                    for (rank, runtime) in options.ranks.iter_mut().enumerate() {
+                        runtime.workspaces = super::super::admission::workspace_options(
+                            &cfg, ranks, rank, rows as usize, options.max_context_tokens as usize,
+                            waves as usize, true, super::super::MimoExpertInput::Fp8,
+                            options.kv_cache, 0, MimoPrefillOutput::LastRow, false,
+                            |_| Ok(16 << 20)).unwrap();
+                    }
+                    let mut resident = weights(ranks);
+                    resident.checkpoint_tp = if pro { 8 } else { 1 };
+                    let profile = mimo_capacity_profiles(&checkpoint, &cfg, resident, &options).unwrap().steady;
+                    let cache = crate::serving_capacity::mimo_cache_geometry(&cfg, 2, ranks, options.kv_cache, 0).unwrap();
+                    for rank in 0..ranks {
+                        let admitted = &profile.devices[rank];
+                        let fixed = admitted.reservations.iter().filter(|r|
+                            r.name.starts_with("prefill.") || r.name.starts_with("decode.") || r.name == "state.prefill_kv_wide")
+                            .map(|r| r.bytes).sum::<u64>();
+                        let records = cache.ranks[rank].persistent_unit_bytes + cache.ranks[rank].pool_metadata_unit_bytes;
+                        let table_unit = admitted.pool_unit_bytes - records;
+                        for pages in [0, 1, 7, 64, 4096, 16384] {
+                            let mut shadow = MimoPrefillKvShadowPlan::default();
+                            let mut runtime = Vec::new();
+                            let mut minimums = 0;
+                            let mut tables = 0;
+                            for (name, shape) in &options.ranks[rank].workspaces {
+                                let layout = MimoWorkspaceLayout::new(&cfg, MimoWorkspaceOptions { pool_pages: pages, ..*shape }).unwrap();
+                                let zero = MimoWorkspaceLayout::new(&cfg, *shape).unwrap();
+                                minimums += zero.page_table;
+                                tables += layout.page_table;
+                                runtime.extend(shadow.workspace_reservations(name, &layout, *shape).unwrap());
+                            }
+                            runtime.extend(shadow.reservation());
+                            let actual = runtime.iter().map(|r| r.bytes).sum::<u64>();
+                            // The affine receipt retains each zero-page table minimum.
+                            let placeholder_overlap = minimums + pages * table_unit - tables;
+                            assert_eq!(fixed + pages * table_unit, actual + placeholder_overlap,
+                                "pro={pro} ranks={ranks} rank={rank} rows={rows} waves={waves} pages={pages}");
+                            assert!(placeholder_overlap <= minimums);
+                            assert_eq!(runtime.iter().filter(|r| r.name == "state.prefill_kv_wide").count(), 1);
+                            for owner in runtime.iter().filter(|r| !r.name.ends_with(".page_table")) {
+                                let receipt = admitted.reservations.iter().find(|r| r.name == owner.name).unwrap();
+                                assert_eq!(receipt.bytes, owner.bytes, "{}", owner.name);
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 

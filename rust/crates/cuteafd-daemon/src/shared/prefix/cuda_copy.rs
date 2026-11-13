@@ -3,12 +3,14 @@
 //! a nonblocking event probe per stream. Registered allocations route each copy
 //! to its owning GPU; the engine keeps those owners alive until its queues drain.
 use anyhow::{ensure, Context, Result};
+use cuteafd_ffi::memory_ledger::{self, MeasuredOwner, Space};
 use cuteafd_ffi::{CopyMechanism, CudaRuntime, CuteafdDeviceBuffer, CuteafdHostBuffer, NativeLibrary};
 use cuteafd_hostcache::copy::{CopyEngine, DeviceRange, Event, Stream};
 use cuteafd_hostcache::pool::{HostChunk, HostRange, PinnedMemory};
 use std::collections::VecDeque;
 use std::ffi::c_void;
 use std::time::{Duration, Instant};
+use crate::shared::memory::Tag;
 
 mod regions;
 use regions::Regions;
@@ -97,6 +99,14 @@ pub(crate) trait SnapshotOwner {
     fn snapshot_buffers(&self) -> Result<Vec<CuteafdDeviceBuffer>>;
 }
 
+/// Device bytes a mapped host pool reserved, sampled around its chunk loop.
+struct HostMapping {
+    /// Free bytes per registered GPU before the first chunk was mapped.
+    before: Vec<(i32, usize)>,
+    /// Measured owner published once every chunk succeeded.
+    owner: Option<MeasuredOwner>,
+}
+
 pub(crate) struct CudaCopyEngine<'a> {
     library: &'a NativeLibrary,
     template: CuteafdDeviceBuffer,
@@ -104,6 +114,7 @@ pub(crate) struct CudaCopyEngine<'a> {
     chunks: Vec<Option<CuteafdHostBuffer>>,
     /// Two logical queues, with one physical queue per registered device.
     streams: Vec<[StreamState<'a>; 2]>,
+    mapping: Option<HostMapping>,
     next_event: u64,
     started: Instant,
     runtime: Option<CudaRuntime>,
@@ -120,6 +131,24 @@ pub(crate) struct CudaCopyEngine<'a> {
 }
 
 impl<'a> CudaCopyEngine<'a> {
+    /// Registrations and retained references borrow named device owners; do not charge them twice.
+    pub(crate) fn allocation_receipts(&self,
+        inventory: &mut crate::shared::memory::receipts::Inventory<'_>, name: &str) -> Result<()> {
+        for (index, buffer) in self.chunks.iter().enumerate() {
+            if let Some(buffer) = buffer { inventory.pinned(&format!("{name}.chunk.{index}"), *buffer)?; }
+        }
+        inventory.host(&format!("{name}.chunks"), &self.chunks)?;
+        inventory.host(&format!("{name}.streams"), &self.streams)?;
+        inventory.host(&format!("{name}.batch_dsts"), &self.batch_dsts)?;
+        inventory.host(&format!("{name}.batch_srcs"), &self.batch_srcs)?;
+        inventory.host(&format!("{name}.batch_sizes"), &self.batch_sizes)?;
+        inventory.host(&format!("{name}.ordered"), &self.ordered)?;
+        inventory.host(&format!("{name}.routed"), &self.routed)?;
+        inventory.host(&format!("{name}.owners"), &self.owners)?;
+        inventory.host(&format!("{name}.retained"), &self.retained)?;
+        if let Some(regions) = &self.regions { regions.allocation_receipts(inventory, &format!("{name}.regions"))?; }
+        Ok(())
+    }
     /// Legacy single-stream-device mode. Peer-addressed ranges retain their
     /// existing behavior; registered families select the allocation owner.
     pub fn new(library: &'a NativeLibrary, template: CuteafdDeviceBuffer) -> Result<Self> {
@@ -172,9 +201,28 @@ impl<'a> CudaCopyEngine<'a> {
         tracing::info!(target: "cuteafd::host_cache", mechanism = mechanism.name(), devices = streams.len(),
             runtime_version = runtime.as_ref().map(CudaRuntime::version).unwrap_or(0),
             "host snapshot cache copy mechanism");
-        Ok(Self { library, template, regions, chunks: Vec::new(), streams, next_event: 0,
+        Ok(Self { library, template, regions, chunks: Vec::new(), streams, mapping: None, next_event: 0,
             started: Instant::now(), runtime, submissions: 0, batch_dsts: Vec::new(),
             batch_srcs: Vec::new(), batch_sizes: Vec::new(), ordered: Vec::new(), routed: Vec::new(), owners: Vec::new(), retained: Vec::new() })
+    }
+    /// Free bytes per registered GPU. A pinned backing that is mapped into these
+    /// contexts reserves page-table bytes on each of them, which no allocation
+    /// request covers; sampling around the chunk loop is how the ledger learns
+    /// that measured cost. A device whose query fails is left out rather than
+    /// failing the pool: the owner is an accounting detail, and without a sample
+    /// it simply stays unmeasured (admission still charges driver page tables).
+    fn mapped_free(&self) -> Vec<(i32, usize)> {
+        let mut devices: Vec<(i32, usize)> = Vec::with_capacity(self.streams.len());
+        for rank in &self.streams {
+            let device = rank[0].device;
+            if devices.iter().any(|&(id, _)| id == device.id) { continue; }
+            match device.run(|| self.library.cuda_physical_memory_info()) {
+                Ok((free, _)) => devices.push((device.id, free)),
+                Err(error) => tracing::warn!(target: "cuteafd::memory", device = device.id,
+                    %error, "pinned host mapping cost unavailable"),
+            }
+        }
+        devices
     }
     fn resolve_host(chunks: &[Option<CuteafdHostBuffer>], range: HostRange) -> Result<CuteafdHostBuffer> {
         let chunk = chunks.get(range.chunk as usize).and_then(Option::as_ref).context("host cache chunk released")?;
@@ -268,7 +316,10 @@ impl<'a> CudaCopyEngine<'a> {
 }
 impl PinnedMemory for CudaCopyEngine<'_> {
     fn allocate_chunk(&mut self, bytes: usize) -> Result<HostChunk> {
-        let buffer = self.library.alloc_host_buffer(bytes)?;
+        if self.mapping.is_none() {
+            self.mapping = Some(HostMapping { before: self.mapped_free(), owner: None });
+        }
+        let buffer = self.library.alloc_host_buffer(bytes, Tag::prefix("shared/prefix-host"))?;
         self.chunks.push(Some(buffer));
         Ok(HostChunk { id: (self.chunks.len() - 1) as u32, bytes })
     }
@@ -278,6 +329,26 @@ impl PinnedMemory for CudaCopyEngine<'_> {
         let mut buffer = self.chunks.get_mut(chunk.id as usize).and_then(Option::take)
             .context("host cache chunk already released")?;
         self.library.free_host_buffer(&mut buffer)
+    }
+    /// The pool's chunks are all mapped: publish what they cost each device as a
+    /// measured owner, so the graph level and the ledger residual stop treating
+    /// page-table bytes as unclaimed growth.
+    fn chunks_reserved(&mut self, count: usize) -> Result<()> {
+        let Some(mapping) = self.mapping.take() else { return Ok(()) };
+        let after = self.mapped_free();
+        let owner = MeasuredOwner::PinnedHostMapping { chunks: count };
+        let mut recorded = false;
+        for &(device, before) in &mapping.before {
+            let Some(&(_, now)) = after.iter().find(|&&(id, _)| id == device) else { continue };
+            if now > before { continue; }
+            let bytes = before - now;
+            memory_ledger::record_unclaimed(Space::Device, device, owner, bytes);
+            recorded = true;
+            tracing::info!(target: "cuteafd::memory", device, bytes, chunks = count,
+                "pinned host mapping device cost");
+        }
+        self.mapping = Some(HostMapping { before: mapping.before, owner: recorded.then_some(owner) });
+        Ok(())
     }
 }
 impl CopyEngine for CudaCopyEngine<'_> {
@@ -339,6 +410,11 @@ impl CopyEngine for CudaCopyEngine<'_> {
 }
 impl Drop for CudaCopyEngine<'_> {
     fn drop(&mut self) {
+        if let Some(HostMapping { before, owner: Some(owner) }) = self.mapping.take() {
+            for (device, _) in before {
+                memory_ledger::release_unclaimed(Space::Device, device, owner);
+            }
+        }
         let store = self.synchronize(Stream::Store);
         let restore = self.synchronize(Stream::Restore);
         if let Err(error) = store.and(restore) {
@@ -367,6 +443,36 @@ mod cuda_tests {
     use crate::shared::memory::device::{Allocation, Device};
 
     #[test]
+    fn copy_census_reports_present_chunks_not_quota_without_native_work() -> Result<()> {
+        use crate::shared::memory::receipts::Inventory;
+        use cuteafd_core::memory_layout::Category;
+        use cuteafd_loader::placement::planner::{CoordinatorDevices, Lifetime, Location};
+        let (_directory, fixture) = crate::shared::memory::cpu_stream_fixture()?;
+        let library = fixture.load()?;
+        let owner = Allocation::new(Device { library: &library, id: 0 }, 256, crate::shared::memory::TEST)?;
+        let mut engine = CudaCopyEngine::registered(&library, &[owner.buffer])?;
+        let physical = [0];
+        let devices = CoordinatorDevices::new(&physical)?;
+        let before = fixture.events()?;
+        let mut empty = Inventory::new(devices, "empty", Lifetime::TARGET, Category::Prefix, "copy");
+        engine.allocation_receipts(&mut empty, "host")?;
+        assert!(empty.receipts.iter().all(|r| r.allocation.location != Location::PINNED));
+        assert_eq!(fixture.events()?, before);
+        let chunk = engine.allocate_chunk(4096)?;
+        let actual = engine.chunks[chunk.id as usize].unwrap();
+        let before = fixture.events()?;
+        let mut inventory = Inventory::new(devices, "fixture", Lifetime::TARGET, Category::Prefix, "copy");
+        engine.allocation_receipts(&mut inventory, "host")?;
+        let pinned: Vec<_> = inventory.receipts.iter().filter(|r| r.allocation.location == Location::PINNED).collect();
+        assert_eq!(pinned.len(), 1);
+        assert_eq!((pinned[0].address, pinned[0].allocation.bytes), (actual.ptr as u64, actual.bytes as u64));
+        assert!(inventory.receipts.iter().all(|r| r.allocation.location != Location::coordinator(0)),
+            "registered target buffers are borrowed, not new owners");
+        assert_eq!(fixture.events()?, before);
+        Ok(())
+    }
+
+    #[test]
     #[ignore = "requires an allocated CPU build slot and explicit NVMe fixture directory"]
     fn aggregate_registered_owner_survives_external_drop() -> Result<()> {
         use cuteafd_ffi::native_library_lifetime_fixture::Fixture;
@@ -376,7 +482,7 @@ mod cuda_tests {
         }
         let fixture = Fixture::build()?;
         let library = fixture.load()?;
-        let owner = Rc::new(Aggregate(Allocation::new(Device { library: &library, id: 1 }, 256)?));
+        let owner = Rc::new(Aggregate(Allocation::new(Device { library: &library, id: 1 }, 256, crate::shared::memory::TEST)?));
         let weak = Rc::downgrade(&owner);
         let engine = CudaCopyEngine::registered_retained(&library, Vec::new(), vec![owner.clone()])?;
         drop(owner);
@@ -394,7 +500,7 @@ mod cuda_tests {
         // SAFETY: all CUDA owners are destroyed before the loaded library.
         let lib = unsafe { NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?)? };
         let devices = [Device { library: &lib, id: 0 }, Device { library: &lib, id: 1 }];
-        let allocations = devices.map(|device| Allocation::new(device, 4096)).into_iter().collect::<Result<Vec<_>>>()?;
+        let allocations = devices.map(|device| Allocation::new(device, 4096, crate::shared::memory::TEST)).into_iter().collect::<Result<Vec<_>>>()?;
         let buffers: Vec<_> = allocations.iter().map(|allocation| allocation.buffer).collect();
         for round in 1..=2u8 {
             let originals: Vec<_> = (0..2).map(|rank| vec![round * 29 + rank * 47; 4096]).collect();
@@ -483,7 +589,7 @@ mod cuda_tests {
         use std::sync::atomic::Ordering;
         // SAFETY: every CUDA owner is destroyed before this loaded library.
         let lib = unsafe { NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?)? };
-        let owners = (0..2).map(|id| Allocation::new(Device { library: &lib, id }, 4096).map(Rc::new))
+        let owners = (0..2).map(|id| Allocation::new(Device { library: &lib, id }, 4096, crate::shared::memory::TEST).map(Rc::new))
             .collect::<Result<Vec<_>>>()?;
         let weak: Vec<_> = owners.iter().map(Rc::downgrade).collect();
         lib.cuda_set_device(0)?;
@@ -526,8 +632,8 @@ mod cuda_tests {
         let mut allocations = Vec::new();
         for id in 0..2 {
             let device = Device { library: &lib, id };
-            allocations.push(Allocation::new(device, 4096)?);
-            allocations.push(Allocation::new(device, 2048)?);
+            allocations.push(Allocation::new(device, 4096, crate::shared::memory::TEST)?);
+            allocations.push(Allocation::new(device, 2048, crate::shared::memory::TEST)?);
         }
         let buffers: Vec<_> = allocations.iter().map(|allocation| allocation.buffer).collect();
         // No peer-access setup: every host copy must use its owning GPU.
@@ -584,7 +690,7 @@ mod cuda_tests {
         lib.cuda_set_device(0)?;
         let devices = [Device { library: &lib, id: 0 }, Device { library: &lib, id: 1 }];
         for device in devices { device.run(|| lib.cuda_enable_peer(1-device.id))?; }
-        let buffers = devices.map(|device| Allocation::new(device, 4096))
+        let buffers = devices.map(|device| Allocation::new(device, 4096, crate::shared::memory::TEST))
             .into_iter().collect::<Result<Vec<_>>>()?;
         let originals = [vec![17u8; 4096], vec![93u8; 4096]];
         let mut engine = CudaCopyEngine::new(&lib, buffers[0].buffer)?;

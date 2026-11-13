@@ -88,7 +88,9 @@ def test_mimo_serving_draft_head_is_separate_from_fixed_target_and_replay():
     draft = (source / 'families/mimo_v2/dflash.rs').read_text()
     serving = draft.split('pub fn draft(', 1)[1].split('pub fn draft_rows(', 1)[0]
     replay = draft.split('pub fn draft_rows(', 1)[1].split('fn draft_from(', 1)[0]
-    assert 'head.launch_draft(' in serving and 'plan.launch(' in replay
+    assert 'head.launch_draft(' in serving
+    assert 'plan.context("BF16 diagnostic head was not prepared")?.launch(' in replay
+    assert 'prepare_workspace' not in serving and 'prepare_workspace' not in replay
 
 
 def test_glm_serving_uses_shared_head_and_diagnostics_keep_explicit_routes():
@@ -104,7 +106,7 @@ def test_glm_serving_uses_shared_head_and_diagnostics_keep_explicit_routes():
     wrapper = (source / 'glm5_flash/dspark.rs').read_text().split("impl<'a> Drafter<'a>", 1)[1]
     diagnostic = wrapper.split('pub fn draft_device_diagnostic(', 1)[1].split('\n    }', 1)[0]
     assert 'Self::RemoteDflash(d) => d.draft_device_diagnostic(sequences, embedding, head)' in diagnostic
-    remote = (source / 'glm5_flash/remote_dflash.rs').read_text()
+    remote = (source.parent / 'shared/draft/remote_dflash.rs').read_text()
     adapter = remote.split('fn launch_head(', 1)[1].split('\n    }', 1)[0]
     assert 'self.launch_head_at(head, self.target.hidden.buffer.ptr.cast_const(),' in adapter
     assert 'self.target.logits.buffer.ptr, rows, serving, self.bridge.exchange.stream(0))' in adapter

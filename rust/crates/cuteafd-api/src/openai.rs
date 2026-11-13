@@ -116,6 +116,9 @@ pub fn vision_input_enabled() -> bool {
 /// The served model's public id, prompt encoding and EOS token ids.
 #[derive(Debug, Clone)]
 pub struct ModelProfile {
+    /// Process diagnostics collected only by `/v1/stats` on a blocking worker.
+    pub stats_diagnostics: Option<fn(&mut Value)>,
+    pub expert_usage: cuteafd_core::expert_usage::Reader,
     pub literal_tokens: Arc<cuteafd_loader::LiteralTokens>,
     pub engine_health: Option<health::HealthWitness>,
     /// Live readiness for remote vision; absent on existing local serving paths.
@@ -162,7 +165,7 @@ impl ModelProfile {
     pub fn new(id: impl Into<String>, encoding: ModelEncoding) -> Self {
         let eos_token_ids = encoding.eos_token_ids();
         let capabilities = MediaCapabilities { vision: matches!(encoding, ModelEncoding::DeepseekV41), audio: false };
-        Self { id: id.into(), encoding, eos_token_ids, capabilities, engine_health: None, media_preparer: None, vision_health: None,
+        Self { stats_diagnostics: None, expert_usage: Default::default(), id: id.into(), encoding, eos_token_ids, capabilities, engine_health: None, media_preparer: None, vision_health: None,
             audio_preparer: None, audio_health: None, gateway: None, v41_turns: V41Turns::default(),
             literal_tokens: Arc::new(cuteafd_loader::LiteralTokens::new([
                 "<｜deepseek_image｜>", "<｜begin▁of▁sentence｜>", "<｜end▁of▁sentence｜>",
@@ -246,6 +249,9 @@ mod images;
 pub mod media;
 mod literals;
 pub mod console;
+mod expert_usage;
+mod memory;
+pub use memory::publish_memory_inventory;
 pub use console::ConsoleHub;
 pub mod probe;
 pub mod engine;
@@ -402,6 +408,8 @@ pub fn router_for_model(queue: mpsc::Sender<NativeRequest>, limits: NativeLimits
     let tables = cuteafd_loader::MappedTableStatsReader::registered();
     let admission = admission::Admission::new(queue.max_capacity(), wait);
     let images = images::ImageDecoder::new(queue.max_capacity());
+    let expert_routes = expert_usage::routes(console.clone(), profile.expert_usage.clone());
+    let memory_routes = memory::routes(console.clone(), stats.clone(), profile.stats_diagnostics);
     let console_routes = Router::new()
         .route("/", get(console::page))
         .route("/v1/console", get(console::socket))
@@ -430,7 +438,7 @@ pub fn router_for_model(queue: mpsc::Sender<NativeRequest>, limits: NativeLimits
     // official aliases) owns /v1/models; the served model's entry keeps the
     // chat route's fields, so existing readers see the same record first.
     if mount.is_none() { routes = routes.route("/v1/models", get(models)); }
-    let mut router = routes.layer(body_limit).with_state(state.clone()).merge(console_routes);
+    let mut router = routes.layer(body_limit).with_state(state.clone()).merge(console_routes).merge(expert_routes).merge(memory_routes);
     if let Some(mount) = mount {
         let backend = engine::backend(state.clone(), mount.snapshot.clone(), mount.options);
         let mut gateway = crate::gateway::Gateway::new(backend, mount.models.clone());
@@ -464,12 +472,19 @@ pub fn publish_host_heap(value: Value) {
 }
 
 async fn stats_route(State(state): State<NativeState>) -> Json<Value> {
+    // Model-sized diagnostics never run on the serving thread or async reactor.
+    tokio::task::spawn_blocking(move || collect_stats(&state)).await.expect("stats worker panicked")
+}
+
+fn collect_stats(state: &NativeState) -> Json<Value> {
     let mut value = state.stats.lock().map(|stats| stats.clone()).unwrap_or(Value::Null);
     if !value.is_object() { value = json!({}); }
+    if let Some(collect) = state.profile.stats_diagnostics { collect(&mut value); }
     refresh_mapped_tables(&mut value, &state.tables);
     let object = value.as_object_mut().unwrap();
     object.insert("host_heap".into(), HOST_HEAP.read().unwrap_or_else(|e| e.into_inner()).clone());
     object.extend(state.admission.metrics().as_object().unwrap().clone());
+    object.insert("expert_usage".into(), state.profile.expert_usage.snapshot());
     object.insert("http_queue_len".into(), json!(state.queue.max_capacity() - state.queue.capacity()));
     let thermal = cuteafd_core::thermal::current();
     if !thermal.is_null() { object.insert("thermal".into(), thermal); }
@@ -953,6 +968,10 @@ pub(crate) fn build(profile: &ModelProfile, limits: NativeLimits, headers: &axum
     let tools_declared = !converted.conversation.tools.is_empty();
     let stop_token_ids = profile.stop_token_ids(tools_declared);
     let streaming = converted.stream;
+    // Streamed requests may emit argument deltas as they arrive; a non-streamed
+    // request always buffers, so a call cut at `max_tokens` never returns
+    // partial JSON in `arguments`.
+    let stream_args = streaming;
     let stop_sequences = converted.parsing_options.stop_sequences.clone();
     let id = format!("chatcmpl-{}", uuid::Uuid::new_v4());
     let tap = Arc::new(Mutex::new(Tap::default()));
@@ -973,10 +992,10 @@ pub(crate) fn build(profile: &ModelProfile, limits: NativeLimits, headers: &axum
             let prompt = if expanded_media_probe { String::new() } else {
                 encoding.render_literals(&raw, thinking.enabled, &mut |text| shield.literal(text, &profile.literal_tokens)).map_err(Rejection::bad)?
             };
-            let parser = kimi::KimiOutputParser::new(kimi::KimiParserOptions { thinking:thinking.enabled,
+            let parser = kimi::KimiOutputParser::with_stream_args(kimi::KimiParserOptions { thinking:thinking.enabled,
                 tools:(tools_declared && converted.conversation.tool_choice != deepseek_recipe_core::tools::ToolChoice::None)
                     .then(|| converted.conversation.tools.clone()),
-                stop_sequences:converted.parsing_options.stop_sequences.clone() });
+                stop_sequences:converted.parsing_options.stop_sequences.clone() }, stream_args);
             (prompt, Vec::new(), OutputProcessor::Kimi(glm5::GlmStreamProcessor::new(generator, parser)))
         }
         Some((Templated::Glm(encoding), raw, thinking)) => {
@@ -992,9 +1011,9 @@ pub(crate) fn build(profile: &ModelProfile, limits: NativeLimits, headers: &axum
             let prompt = if expanded_media_probe { String::new() } else {
                 encoding.render(&raw, &options).map_err(Rejection::bad)?
             };
-            let parser = glm5::GlmOutputParser::new(glm5::GlmParserOptions { thinking: thinking.enabled,
+            let parser = glm5::GlmOutputParser::with_stream_args(glm5::GlmParserOptions { thinking: thinking.enabled,
                 tools: tools_declared.then(|| converted.conversation.tools.clone()),
-                stop_sequences: converted.parsing_options.stop_sequences.clone(), id: id.clone() });
+                stop_sequences: converted.parsing_options.stop_sequences.clone(), id: id.clone() }, stream_args);
             (prompt, Vec::new(), OutputProcessor::Glm(glm5::GlmStreamProcessor::new(generator, parser)))
         }
         Some((Templated::Step5(encoding), raw, _thinking)) => {
@@ -1009,9 +1028,9 @@ pub(crate) fn build(profile: &ModelProfile, limits: NativeLimits, headers: &axum
             let prompt = if expanded_media_probe { String::new() } else {
                 encoding.render(&raw, &options).map_err(Rejection::bad)?
             };
-            let parser = step5::Step5OutputParser::new(step5::Step5ParserOptions {
+            let parser = step5::Step5OutputParser::with_stream_args(step5::Step5ParserOptions {
                 tools: tools_declared.then(|| converted.conversation.tools.clone()),
-                stop_sequences: converted.parsing_options.stop_sequences.clone() });
+                stop_sequences: converted.parsing_options.stop_sequences.clone() }, stream_args);
             (prompt, Vec::new(), OutputProcessor::Step5(glm5::GlmStreamProcessor::new(generator, parser)))
         }
         Some((Templated::Muse(encoding), raw, thinking)) => {
@@ -1026,11 +1045,11 @@ pub(crate) fn build(profile: &ModelProfile, limits: NativeLimits, headers: &axum
             let prompt = if expanded_media_probe { String::new() } else {
                 encoding.render(&raw, &options).map_err(Rejection::bad)?
             };
-            let parser = muse::MuseOutputParser::new(muse::MuseParserOptions {
+            let parser = muse::MuseOutputParser::with_stream_args(muse::MuseParserOptions {
                 prefilled_user: !thinking.enabled,
                 tools: (tools_declared && converted.conversation.tool_choice != deepseek_recipe_core::tools::ToolChoice::None)
                     .then(|| converted.conversation.tools.clone()),
-                stop_sequences: converted.parsing_options.stop_sequences.clone() });
+                stop_sequences: converted.parsing_options.stop_sequences.clone() }, stream_args);
             (prompt, Vec::new(), OutputProcessor::Muse(glm5::GlmStreamProcessor::new(generator, parser)))
         }
         Some((Templated::Mistral(encoding), raw, _thinking)) => {
@@ -1040,9 +1059,9 @@ pub(crate) fn build(profile: &ModelProfile, limits: NativeLimits, headers: &axum
             let prompt = if expanded_media_probe { String::new() } else {
                 encoding.render(&raw, &options).map_err(Rejection::bad)?
             };
-            let parser = mistral::MistralOutputParser::new(mistral::MistralParserOptions {
+            let parser = mistral::MistralOutputParser::with_stream_args(mistral::MistralParserOptions {
                 tools: tools_declared.then(|| converted.conversation.tools.clone()),
-                stop_sequences: converted.parsing_options.stop_sequences.clone() });
+                stop_sequences: converted.parsing_options.stop_sequences.clone() }, stream_args);
             (prompt, Vec::new(), OutputProcessor::Mistral(glm5::GlmStreamProcessor::new(generator, parser)))
         }
         Some((Templated::Qwen(encoding), raw, thinking)) => {
@@ -1058,15 +1077,15 @@ pub(crate) fn build(profile: &ModelProfile, limits: NativeLimits, headers: &axum
             let prompt = if expanded_media_probe { String::new() } else {
                 encoding.render(&raw, &options).map_err(Rejection::bad)?
             };
-            let parser = qwen4::QwenOutputParser::new(qwen4::QwenParserOptions { thinking: thinking.enabled,
+            let parser = qwen4::QwenOutputParser::with_stream_args(qwen4::QwenParserOptions { thinking: thinking.enabled,
                 tools: tools_declared.then(|| converted.conversation.tools.clone()),
-                stop_sequences: converted.parsing_options.stop_sequences.clone() });
+                stop_sequences: converted.parsing_options.stop_sequences.clone() }, stream_args);
             (prompt, Vec::new(), OutputProcessor::Qwen(glm5::GlmStreamProcessor::new(generator, parser)))
         }
         None => {
             if expanded_media_probe {
                 // Supplied native ids already contain image rows; do not render another prompt.
-                (String::new(), Vec::new(), OutputProcessor::Deepseek(glm5::GlmStreamProcessor::new(generator, deepseek::parser::DeepseekOutputParser::new(converted.parsing_options))))
+                (String::new(), Vec::new(), OutputProcessor::Deepseek(glm5::GlmStreamProcessor::new(generator, deepseek::parser::DeepseekOutputParser::with_stream_args(converted.parsing_options, stream_args))))
             } else {
             let rendered = if matches!(profile.encoding, ModelEncoding::DeepseekV4) {
                 DeepseekV4Encoding::new().render_conversation(&converted.conversation)
@@ -1080,7 +1099,7 @@ pub(crate) fn build(profile: &ModelProfile, limits: NativeLimits, headers: &axum
                 rendered
             };
             (rendered.prompt, rendered.image_sources,
-                OutputProcessor::Deepseek(glm5::GlmStreamProcessor::new(generator, deepseek::parser::DeepseekOutputParser::new(converted.parsing_options))))
+                OutputProcessor::Deepseek(glm5::GlmStreamProcessor::new(generator, deepseek::parser::DeepseekOutputParser::with_stream_args(converted.parsing_options, stream_args))))
             }
         }
     };
@@ -1617,6 +1636,48 @@ mod tests {
     fn request(stream: bool) -> axum::http::Request<Body> {
         axum::http::Request::post("/v1/chat/completions").header("content-type","application/json").body(Body::from(json!({"model":MODEL,"messages":[{"role":"user","content":"What is 2 + 2? Answer with just the number."}],"thinking":{"type":"disabled"},"temperature":0,"max_tokens":16,"stream":stream}).to_string())).unwrap()
     }
+    #[tokio::test]
+    async fn stats_collect_diagnostics_lazily_off_the_request_thread() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static CALLS: AtomicU64 = AtomicU64::new(0);
+        static CURRENT: AtomicU64 = AtomicU64::new(5);
+        thread_local! { static REQUEST_THREAD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
+        fn diagnostics(value: &mut Value) {
+            REQUEST_THREAD.with(|here| assert!(!here.get(), "diagnostics ran on HTTP reactor"));
+            CALLS.fetch_add(1, Ordering::SeqCst);
+            value["graph_cache"] = json!([{"charged": CURRENT.load(Ordering::SeqCst)}]);
+            value["graph_captures"] = json!(CURRENT.load(Ordering::SeqCst));
+            value["memory_reconciliation"] = json!({"first_request": null});
+        }
+        REQUEST_THREAD.with(|here| here.set(true));
+        let (tx, _rx) = mpsc::channel(4);
+        let published = Arc::new(Mutex::new(json!({"requests": 2, "verify": {"output_tokens": 17}})));
+        let mut profile = ModelProfile::default();
+        profile.stats_diagnostics = Some(diagnostics);
+        let app = router_for_model(tx, NativeLimits::default(), published.clone(),
+            std::time::Duration::from_secs(25), ConsoleHub::disabled(), profile);
+        assert_eq!(CALLS.load(Ordering::SeqCst), 0);
+        let mut keys = None;
+        for current in [5, 9] {
+            CURRENT.store(current, Ordering::SeqCst);
+            let response = app.clone().oneshot(axum::http::Request::get("/v1/stats")
+                .body(Body::empty()).unwrap()).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            let value: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(value["graph_cache"][0]["charged"], current);
+            assert_eq!(value["graph_captures"], current);
+            assert_eq!(value["requests"], 2);
+            assert_eq!(value["verify"]["output_tokens"], 17);
+            let current_keys = value.as_object().unwrap().keys().cloned().collect::<Vec<_>>();
+            if let Some(keys) = &keys { assert_eq!(keys, &current_keys); }
+            keys = Some(current_keys);
+        }
+        assert_eq!(CALLS.load(Ordering::SeqCst), 2);
+        assert!(published.lock().unwrap().get("graph_cache").is_none());
+        REQUEST_THREAD.with(|here| here.set(false));
+    }
+
     #[tokio::test]
     async fn stats_read_live_tables_before_first_publish_and_after_idle_batch() {
         use cuteafd_loader::{MappedTable, RowFormat, TablePart};

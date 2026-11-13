@@ -1,7 +1,7 @@
 //! Pre-allocation descriptions shared with MiMo's allocation path. CUDA
 //! manifest queries read shape/scratch metadata before loading any weights.
 use anyhow::{ensure, Context, Result};
-use cuteafd_loader::families::mimo_v2::admission::{tensor_bytes, draft_prefix_reservations, prefill_shape, workspace_scratch, draft_reservations_with, DraftReservations, DraftScratch};
+use cuteafd_loader::families::mimo_v2::admission::{tensor_bytes, draft_prefix_reservations, prefill_shape, workspace_scratch, draft_reservations_with, draft_rank_reservations_with, DraftReservations, DraftScratch};
 
 use cuteafd_core::serving_capacity::MemoryReservation;
 use cuteafd_ffi::programs::Programs;
@@ -9,15 +9,29 @@ use cuteafd_loader::families::mimo_v2::{MimoKvCache, MimoKvFormats, MimoPrefillO
 
 /// Exact tensor admission against the measured post-module baseline.
 pub(super) struct Preflight {
+    pub expert_usage: Option<cuteafd_core::expert_usage::Geometry>,
     pub capacity: cuteafd_core::serving_capacity::ResolvedCapacity,
-    pub graph_plan: cuteafd_loader::families::mimo_v2::decode_graph::MimoDecodeGraphPlan,
-    pub graph_bound_bytes: Vec<u64>,
+    pub graph_layout: cuteafd_loader::families::mimo_v2::decode_graph::MimoGraphLayout,
     pub host_config: Option<cuteafd_hostcache::config::Config>,
     pub local_expert_budget: usize,
     pub placement: cuteafd_loader::placement::Placement,
     pub expert_directory: Option<std::path::PathBuf>,
     pub working_set: cuteafd_loader::placement::SparkWorkingSet,
     pub prefill_rows: usize,
+    pub push_host: Option<cuteafd_loader::push_load::PushHostEnvelope>,
+    pub expert_resident_bytes: [usize; 2],
+}
+
+fn push_host_envelope(checkpoint: &cuteafd_loader::plan::Checkpoint, ranks: usize,
+    catalog: Option<&cuteafd_loader::OfficialV41Catalog>)
+    -> Result<Option<cuteafd_loader::push_load::PushHostEnvelope>> {
+    use crate::shared::experts::rtx::push::PushPolicy;
+    if PushPolicy::for_snapshot(&checkpoint.snapshot)? == PushPolicy::Mount { return Ok(None); }
+    let envelope = cuteafd_loader::placement::families::mimo_v2::push_host_envelope(checkpoint, ranks, catalog)?;
+    ensure!(envelope.slots == cuteafd_ffi::push_ring::DEFAULT_SLOTS as u64
+        && envelope.slot_bytes == cuteafd_ffi::push_ring::DEFAULT_SLOT_BYTES as u64,
+        "MiMo admitted push ring differs from runtime ABI");
+    Ok(Some(envelope))
 }
 
 fn routed_costs(opened: &super::Opened, args: &super::EngineArgs, layers: usize, ranks: usize)
@@ -41,7 +55,6 @@ fn routed_costs(opened: &super::Opened, args: &super::EngineArgs, layers: usize,
     if bf16_sibling(&directory).is_some_and(|path| path.is_dir()) {
         directory = bf16_sibling(&directory).context("MiMo BF16 package sibling")?;
     }
-    let whole = Bytes2 { resident: expert_layer_bytes(tensors, 1, 0, Slicing::Padded)?, staging: 0 };
     let routed = opened.cfg.dense.iter().take(layers).filter(|&&dense| !dense).count();
     let onboard = args.onboard.resolve(routed);
     let zero_local = onboard.layers(routed) == Some(0);
@@ -49,25 +62,28 @@ fn routed_costs(opened: &super::Opened, args: &super::EngineArgs, layers: usize,
     if zero_local || (metadata.is_none()
         && onboard == cuteafd_loader::placement::Onboard::Auto && args.fp8_package.is_none()) {
         ensure!(args.peers.is_some(), "MiMo zero local experts requires Spark peers");
-        let costs = opened.cfg.dense.iter().take(layers).map(|&dense| (!dense).then_some(ExpertCost {
-            whole, half: [Bytes2::default(); 2], tp2: ranks == 2, spark_ok: true,
-        })).collect();
+        let costs = opened.cfg.dense.iter().take(layers).enumerate().map(|(layer, &dense)| -> Result<_> {
+            if dense { return Ok(None); }
+            let view = tensors.for_coordinator().for_layer_metadata(layer)?;
+            let supported = view.format() == tensors.format();
+            Ok(Some(ExpertCost { whole: Bytes2 { resident: expert_layer_bytes(&view, 1, 0, Slicing::Padded)?, staging: 0 },
+                half: [Bytes2::default(); 2], tp2: ranks == 2 && supported, whole_supported: supported, spark_ok: true }))
+        }).collect::<Result<Vec<_>>>()?;
         return Ok((costs, 0, [0; 2], None));
     }
     let metadata = metadata.context("MiMo local experts need a generated BF16-input package manifest")?;
     let scratch = |path: &std::path::Path| -> Result<u64> {
         let layout = path.file_name().and_then(|name| name.to_str()).context("MiMo package layout")?;
-        cuteafd_loader::placement::inventory::fp8moe_scratch_bytes(&metadata, layout, rows as u64)
+        cuteafd_loader::placement::inventory::fp8moe_scratch_bytes(&metadata, layout, rows as u64)?
             .context("MiMo expert manifest lacks selected capacity")
     };
-    let (half, workspace, tp2_workspace) = if ranks == 2 {
-        let plans = [Fp8MoeTp2::plan(tensors, &directory, 0, rows)?, Fp8MoeTp2::plan(tensors, &directory, 1, rows)?];
+    let (workspace, tp2_workspace) = if ranks == 2 {
+        let plans = [Fp8MoeTp2::plan(tensors, &directory, &[tensors.shape().first_layer], 0, rows)?, Fp8MoeTp2::plan(tensors, &directory, &[tensors.shape().first_layer], 1, rows)?];
         for plan in &plans {
             ensure!(scratch(&plan.directory)? == plan.scratch_bytes as u64,
                 "MiMo expert manifest scratch differs from native package ABI");
         }
-        (plans.each_ref().map(|plan| Bytes2 { resident: plan.resident_layer_bytes as u64, staging: plan.staging_bytes as u64 }),
-            0, plans.each_ref().map(|plan| plan.workspace_bytes as u64))
+        (0, plans.each_ref().map(|plan| plan.workspace_bytes as u64))
     } else {
         // SAFETY: this reads only the trusted generated package's static ABI.
         let metadata = unsafe { cuteafd_ffi::fp8_moe::Fp8MoeMetadata::read(&directory) }?;
@@ -77,18 +93,29 @@ fn routed_costs(opened: &super::Opened, args: &super::EngineArgs, layers: usize,
             && metadata.info.experts == opened.cfg.experts && metadata.info.topk == opened.cfg.topk
             && metadata.info.intermediate == opened.cfg.moe_intermediate,
             "MiMo local package does not match BF16-input checkpoint geometry: {:?}", metadata.info);
-        ([Bytes2::default(); 2], metadata.scratch_for(rows)?.max(256) as u64, [0; 2])
+        (metadata.scratch_for(rows)?.max(256) as u64, [0; 2])
     };
-    let costs = opened.cfg.dense.iter().take(layers).map(|&dense| (!dense).then_some(ExpertCost {
-        whole, half, tp2: ranks == 2, spark_ok: args.peers.is_some(),
-    })).collect();
+    let costs = opened.cfg.dense.iter().take(layers).enumerate().map(|(layer, &dense)| -> Result<_> {
+        if dense { return Ok(None); }
+        let view = tensors.for_coordinator().for_layer_metadata(layer)?;
+        let supported = view.format() == tensors.format();
+        let whole = Bytes2 { resident: expert_layer_bytes(&view, 1, 0, Slicing::Padded)?, staging: 0 };
+        let half = if ranks == 2 {
+            let bytes = |rank| -> Result<_> {
+                let (_, slicing) = cuteafd_loader::placement::families::mimo_v2::exact_package(&directory, &view, 2, rank);
+                Ok(Bytes2 { resident: expert_layer_bytes(&view, 2, rank, slicing)?, staging: 0 })
+            };
+            [bytes(0)?, bytes(1)?]
+        } else { [Bytes2::default(); 2] };
+        Ok(Some(ExpertCost { whole, half, tp2: ranks == 2 && supported,
+            whole_supported: supported, spark_ok: args.peers.is_some() }))
+    }).collect::<Result<Vec<_>>>()?;
     Ok((costs, workspace, tp2_workspace, Some(directory)))
 }
 
-fn resolve_pool_context(capacity: &mut cuteafd_core::serving_capacity::ResolvedCapacity, automatic: bool, unit_rows: u64) -> Result<()> {
+fn resolve_pool_context(capacity: &mut cuteafd_core::serving_capacity::ResolvedCapacity, context: cuteafd_loader::placement::planner::Context, unit_rows: u64) -> Result<()> {
     capacity.effective_max_context_tokens = crate::shared::context::pool_context("mimo_v2",
-        usize::try_from(capacity.effective_max_context_tokens)?, automatic,
-        usize::try_from(capacity.allocated_gpu_kv_tokens)?, super::engine::PAGE_ROWS)? as u64;
+        context, usize::try_from(capacity.allocated_gpu_kv_tokens)?)? as u64;
     let sequence_units = capacity.effective_max_context_tokens.div_ceil(unit_rows);
     capacity.active_max_context_sequences = (capacity.allocated_gpu_kv_tokens / unit_rows / sequence_units)
         .min(u64::from(capacity.concurrency)) as u32;
@@ -202,10 +229,10 @@ pub(super) fn preflight(
     serving: Option<(&crate::shared::prefix::PrefixArgs, usize)>,
     prefill_output: MimoPrefillOutput,
     prefix_draft: bool,
-    automatic_context: bool,
+    serving_context: cuteafd_loader::placement::planner::Context,
 ) -> Result<Preflight> {
     preflight_shape(opened, args, programs, split_device, serving,
-        prefill_output, prefix_draft, automatic_context)
+        prefill_output, prefix_draft, serving_context)
 }
 
 fn preflight_shape(
@@ -216,12 +243,9 @@ fn preflight_shape(
     serving: Option<(&crate::shared::prefix::PrefixArgs, usize)>,
     prefill_output: MimoPrefillOutput,
     prefix_draft: bool,
-    automatic_context: bool,
+    serving_context: cuteafd_loader::placement::planner::Context,
 ) -> Result<Preflight> {
-    use cuteafd_core::serving_capacity::{
-        admit_device_reservations_with_headroom, CapacityPolicy, DeviceMemory,
-        small_card_headroom_bytes,
-    };
+    use cuteafd_core::serving_capacity::{CapacityPolicy, DeviceMemory};
     use cuteafd_ffi::programs::VOCABULARY_HEAD_WORKSPACE;
     use cuteafd_loader::families::mimo_v2::capacity::{
         mimo_capacity_profiles, MimoCapacityOptions, MimoRankRuntime,
@@ -242,6 +266,8 @@ fn preflight_shape(
     );
     let devices: Vec<i32> = std::iter::once(args.device).chain(split_device).collect();
     let ranks = devices.len();
+    ensure!(!args.tp2_dflash || (ranks == 2 && args.draft.is_some()),
+        "TP2 DFlash requires a drafter and two target GPUs");
     let concurrency = serving.map_or(1, |(_, c)| c);
     ensure!(
         (1..=super::engine::DECODE_ROWS).contains(&concurrency) && concurrency <= args.rings,
@@ -254,7 +280,7 @@ fn preflight_shape(
     let draft_mark_bytes = args.draft.as_deref().filter(|_| prefix_draft).map(super::dflash::drafter_dir)
         .map(|dir| -> Result<u64> {
             let draft = super::dflash::DflashConfig::read(&dir)?;
-            Ok(cuteafd_loader::families::mimo_v2::draft_representation::mimo_draft_mark_bytes(draft.layers as u64, draft.kv_heads as u64, draft.head_dim as u64, args.draft_kv_cache)?)
+            draft.mark_bytes(if args.tp2_dflash { 2 } else { 1 }, args.draft_kv_cache)
         }).transpose()?.unwrap_or(0);
     let target_mark_bytes = cache
         .ranks
@@ -309,29 +335,16 @@ fn preflight_shape(
         args.local_experts,
         args.peers.is_some(),
     );
-    let graph_plan = cuteafd_loader::families::mimo_v2::decode_graph::MimoDecodeGraphPlan::new(
-        cfg.layers,
+    // One bounded graph reserve per physical device, selected by the resolved
+    // layout and charged once, before KV sizing.
+    let graph_layout = cuteafd_loader::families::mimo_v2::decode_graph::graph_layout(
+        cfg,
         ranks,
-        super::engine::DECODE_ROWS,
+        backend == ExpertBackend::Spark,
         args.decode_graphs
             && layers == cfg.layers
             && (routed_layers == 0 || backend != ExpertBackend::None),
     )?;
-    let graph_exec_bytes = tensor_bytes(
-        "MiMo decode graph executable bound",
-        &[args.decode_graph_reserve_kib, 1024],
-    )?;
-    let graph_driver_margin = tensor_bytes(
-        "MiMo decode graph driver margin",
-        &[args.decode_graph_driver_reserve_mib, 1 << 20],
-    )?;
-    let graph_reservations = (0..ranks)
-        .map(|rank| graph_plan.reservations(rank, graph_exec_bytes, graph_driver_margin))
-        .collect::<std::result::Result<Vec<_>, _>>()?;
-    let graph_bound_bytes = graph_reservations
-        .iter()
-        .map(|costs| costs.iter().map(|r| r.bytes).sum::<u64>())
-        .collect::<Vec<_>>();
     let transport_lanes = resolved_prefill_shape(usize::from(args.peers.is_some()),
         args.prefill_rows, args.prefill_waves)?.waves as usize;
     let spark_ranks = match args
@@ -356,7 +369,7 @@ fn preflight_shape(
     let mut runtime = Vec::with_capacity(ranks);
     let mut memory = Vec::with_capacity(ranks);
     let mut post_kv_loading_additional = Vec::with_capacity(ranks);
-    let mut draft_packing = Vec::new();
+    let mut draft_packing = vec![vec![]; ranks];
     for (rank, &device) in devices.iter().enumerate() {
         let device_id = u32::try_from(device).context("negative CUDA device id")?;
         let (free, total) =
@@ -368,26 +381,33 @@ fn preflight_shape(
             total_bytes: total as u64,
             baseline_free_bytes: free as u64,
         });
-        // The code still to load before ready: the serving thread's cuBLAS handle, lazily loaded
-        // functions and transport mappings (`placement::inventory::LOADED_CODE`, which the planner
-        // charges in its baseline), instead of another context/module envelope.
+        // Selected program code only; BLAS pools have separate named owners.
         let pending = crate::shared::inventory::pending_code(library, device, rank, ranks == 2,
             cfg.program_family()?, "*", &cuteafd_loader::placement::ProgramSet::from_names(
                 &[cfg.program_family()?, &format!("{}2", cfg.program_family()?)], programs.names()))?;
-        let cublas = MemoryReservation { name: "runtime.loaded_code".into(), bytes: pending };
-        let mut additional = vec![cublas.clone()];
+        let code = MemoryReservation { name: "runtime.loaded_code".into(), bytes: pending };
+        let mut additional = vec![code.clone()];
+        let mut resident_weights = cuteafd_loader::placement::ResidentWeights::default();
+        let mut weight_arenas = Vec::new();
         additional.extend(cuteafd_loader::families::mimo_v2::admission::transport_reservations(
-            cfg, ranks, rank, args.prefill_rows, transport_lanes, 0, cuteafd_core::SparkReplyFormat::Bf16)?);
+            cfg, ranks, rank, args.prefill_rows, transport_lanes, 0, cuteafd_core::spark_reply::requested().prefill(false))?);
         // Only modules and the already-attached peer are live before drafter
         // packing. Spark transport, samplers, marks, graphs and reusable target
         // workspaces are constructed later and do not consume this phase.
         post_kv_loading_additional.push(additional.clone());
         if rank == 0 {
             additional.extend(cuteafd_loader::families::mimo_v2::admission::transport_reservations(
-                cfg, 1, 0, args.prefill_rows, transport_lanes, spark_ranks, cuteafd_core::SparkReplyFormat::Bf16)?);
+                cfg, 1, 0, args.prefill_rows, transport_lanes, spark_ranks, cuteafd_core::spark_reply::requested().prefill(false))?);
             if serving.is_some() {
                 additional.extend(cuteafd_loader::families::mimo_v2::admission::sampling_reservations(cfg.vocab_size)?);
             }
+            if backend == ExpertBackend::Local && args.expert_window.is_some() {
+                let (reservations, weights) = local_expert_reservations(opened, args, layers)?;
+                additional.extend(reservations);
+                resident_weights = resident_weights.checked_add(weights)?;
+            }
+        }
+        if rank == 0 || args.tp2_dflash {
             if let Some(dir) = args.draft.as_deref().map(super::dflash::drafter_dir) {
                 let draft = super::dflash::DflashConfig::read(&dir)?;
                 ensure!(
@@ -396,23 +416,28 @@ fn preflight_shape(
                         && draft.taps.iter().all(|&l| l < layers),
                     "DFlash geometry or taps do not fit the selected target layers"
                 );
-                let reservations = draft_reservations(
+                let reservations = draft_rank_reservations(
                     library,
                     &dir,
                     &draft,
                     opened.weight_formats.draft,
                     args.draft_capacity(draft.block)?,
+                    rank,
+                    if args.tp2_dflash { 2 } else { 1 },
                 )?;
+                resident_weights = resident_weights.checked_add(reservations.resident_weights)?;
                 additional.extend(reservations.steady);
-                additional.extend(draft_prefix_reservations(prefix_draft, draft_mark_bytes, mark_slots,
-                    args.rings as u64)?);
-                draft_packing = reservations.packing;
-            }
-            if backend == ExpertBackend::Local && args.expert_window.is_some() {
-                additional.extend(local_expert_reservations(opened, args, layers)?);
+                weight_arenas.push(reservations.arena);
+                let local = draft.for_tp(if args.tp2_dflash { 2 } else { 1 })?;
+                let mark = cuteafd_loader::families::mimo_v2::draft_representation::mimo_draft_mark_bytes(
+                    local.layers as u64, local.kv_heads as u64, local.head_dim as u64, args.draft_kv_cache)?;
+                additional.extend(draft_prefix_reservations(prefix_draft,
+                    if rank == 0 { mark } else { mark - 8 }, mark_slots,
+                    if rank == 0 { args.rings as u64 } else { 0 })?);
+                draft_packing[rank] = reservations.packing;
             }
         }
-        additional.extend(graph_reservations[rank].iter().cloned());
+        additional.extend(graph_layout.reservations(rank)?);
         let workspaces = workspace_options(
             cfg,
             args,
@@ -426,10 +451,12 @@ fn preflight_shape(
             opened.weight_formats.any_fp8_output(),
         )?;
         runtime.push(MimoRankRuntime {
+            weight_arenas,
+            resident_weights,
             device: device_id,
             workspaces,
             additional,
-            loading_additional: vec![cublas],
+            loading_additional: vec![code],
         });
     }
     let profiles_for = |selected_spark_ranks: usize| -> Result<_> {
@@ -438,7 +465,7 @@ fn preflight_shape(
         for (rank, costs) in selected_runtime.iter_mut().enumerate() {
             costs.additional.retain(|cost| !cost.name.starts_with("transport."));
             costs.additional.extend(cuteafd_loader::families::mimo_v2::admission::transport_reservations(
-                cfg, ranks, rank, args.prefill_rows, lanes, selected_spark_ranks, cuteafd_core::SparkReplyFormat::Bf16)?);
+                cfg, ranks, rank, args.prefill_rows, lanes, selected_spark_ranks, cuteafd_core::spark_reply::requested().prefill(false))?);
             costs.workspaces = workspace_options(cfg, args, programs, ranks, rank, lanes,
                 selected_spark_ranks > 0, VOCABULARY_HEAD_WORKSPACE as u64, prefill_output,
                 opened.weight_formats.any_fp8_output())?;
@@ -470,102 +497,122 @@ fn preflight_shape(
     };
     let spark_profiles = profiles_for(spark_ranks)?;
     let no_spark_profiles = if spark_ranks == 0 { spark_profiles.clone() } else { profiles_for(0)? };
+    let mut resident_weights = spark_profiles.resident_weights.clone();
+    cuteafd_loader::placement::families::mimo_v2::add_local_media_weights(&mut resident_weights,
+        &devices, args.planner_media_weights, crate::shared::memory::budget::resident_weight_limit())?;
+    use cuteafd_loader::placement::families::mimo_v2::admission::{self as contract, ProductionInput};
+    use cuteafd_loader::placement::planner::{Baseline, EmbeddingHome, Operation, Phase, PrefillShape};
+    let maximum_pool_tokens = contract::maximum_pool_tokens(
+        &memory.iter().map(|sample| sample.total_bytes).collect::<Vec<_>>(),
+        args.max_context as u64, (args.pool_tokens > 0).then_some(args.pool_tokens as u64),
+        spark_profiles.steady.pool_unit_rows);
     let policy = CapacityPolicy {
         concurrency: u32::try_from(concurrency)?,
-        small_card_headroom: true,
-        target_pool_tokens: (if memory.iter().any(|m| m.total_bytes <= 32u64 << 30) { 1u64 << 20 }
-            else { cuteafd_core::serving_capacity::DEFAULT_GPU_KV_TOKENS }).max(args.max_context as u64),
+        target_pool_tokens: maximum_pool_tokens,
         max_context_tokens: Some(args.max_context as u64),
-        // 0: the largest pool every GPU admits after all fixed costs, up to the target.
-        pool_tokens: (args.pool_tokens > 0).then_some(args.pool_tokens as u64),
+        pool_tokens: Some(maximum_pool_tokens),
         ..CapacityPolicy::default()
     };
     let report = reservation_report(&spark_profiles.steady, &memory, policy)?;
     let intake_probe_bytes = cuteafd_loader::families::mimo_v2::admission::spark_intake_probe_bytes(
         spark_ranks > 0, std::env::var("CUTEAFD_SPARK_INTAKE").ok().as_deref())?;
-    for sample in &memory {
-        debug_assert_eq!(cuteafd_loader::families::mimo_v2::admission::headroom_bytes(sample.total_bytes, false),
-            sample.total_bytes - cuteafd_core::serving_capacity::admission_ceiling(sample.total_bytes, 97,
-                small_card_headroom_bytes(sample.total_bytes))?);
-    }
-    use cuteafd_loader::placement::{Baseline, families::mimo_v2::{MimoInputs, solve_working_set, resolved_capacity}};
-    let inputs = MimoInputs { automatic_context: automatic_context,
-        cfg, profile: &spark_profiles.steady, layers, kv, mtp_stages: args.mtp,
-        gpus: memory.iter().map(|m| (m.total_bytes, Baseline::Measured { free_bytes: m.baseline_free_bytes })).collect(),
-        headroom_floor: 0, spark_ranks, startup_probe_bytes: intake_probe_bytes,
-        context: args.max_context as u64, requested_pool: policy.pool_tokens, pool_ceiling_at_target: false,
-        onboard: args.onboard.resolve(cfg.dense.iter().take(layers).filter(|&&dense| !dense).count()),
-        experts: expert_costs, expert_workspace, tp2_workspace,
-        rows: args.prefill_rows.max(64) as u64, lanes: transport_lanes as u64,
+    let prefill = PrefillShape {
+        rows: args.prefill_rows.max(64) as u64,
+        waves: transport_lanes as u64,
     };
-    let solution = solve_working_set(&inputs, &no_spark_profiles.steady)
-        .with_context(|| format!("MiMo shared placement; configured-Spark reservation contract {report}"))?;
-    let selected = inputs.selected(&no_spark_profiles.steady, &solution.working_set);
-    let profiles = if solution.working_set.spark_ranks == 0 { &no_spark_profiles } else { &spark_profiles };
-    let intake_probe_bytes = selected.startup_probe_bytes;
-    for (rank, costs) in post_kv_loading_additional.iter_mut().enumerate() {
-        costs.retain(|cost| !cost.name.starts_with("transport."));
-        costs.extend(cuteafd_loader::families::mimo_v2::admission::transport_reservations(
-            cfg, ranks, rank, args.prefill_rows, solution.working_set.prefill_lanes as usize, 0, cuteafd_core::SparkReplyFormat::Bf16)?);
+    let embedding = if args.token_io.embed_placement
+        .context("MiMo embedding placement must resolve before admission")?
+        == crate::shared::token_io::EmbedPlacement::Host
+    {
+        EmbeddingHome::HostPinned
+    } else {
+        EmbeddingHome::Device(0)
+    };
+    let operation = if args.full_prefill_logits { Operation::Scoring } else { Operation::Serving };
+    let budgets = contract::production_budgets(
+        &memory.iter().map(|sample| (sample.total_bytes, sample.total_bytes)).collect::<Vec<_>>(),
+        &(0..memory.len()).map(|_| contract::device_headroom()).collect::<Vec<_>>(),
+        memory.iter().map(|sample| Baseline::Sampled {
+            free: sample.baseline_free_bytes, phase: Phase::Load,
+            source: "measured post-module free memory".into() }).collect(),
+        cuteafd_loader::formats::mapped_preload::host_memory_before_process()?,
+        cuteafd_loader::placement::reserve::spark_cap(), spark_ranks)?;
+    let request = contract::production_request(
+        serving_context, (args.pool_tokens > 0).then_some(args.pool_tokens as u64),
+        args.onboard.resolve(routed_layers), prefill, operation,
+        crate::shared::memory::budget::resident_weight_limit(), cuteafd_core::spark_reply::requested());
+    let push_host = push_host_envelope(&opened.checkpoint, ranks, opened.catalog.as_ref())?;
+    let mut prepared = ProductionInput {
+        startup_probe_bytes: intake_probe_bytes,
+        expert_usage: args.expert_usage_enabled()?,
+        blas_head: crate::shared::target_head::TargetHead::configured().blas_head(
+            opened.weight_formats.head == cuteafd_loader::families::mimo_v2::projection::MimoProjectionRepresentation::Bf16),
+        draft_head: args.draft.is_some(),
+        cfg, layers, kv, mtp_stages: args.mtp, context: args.max_context as u64,
+        maximum_pool_tokens, prefill, lanes: transport_lanes as u64, embedding, gpus: ranks,
+        spark_ranks, experts: expert_costs, expert_workspace, tp2_workspace,
+        spark: spark_profiles.clone(), no_spark: no_spark_profiles.clone(),
+        post_kv_additional: post_kv_loading_additional, draft_packing,
+        host: contract::HostOwners { expert_input: args.expert_input.into(), output: prefill_output,
+            serving: serving.is_some(), scoring_rows: if args.full_prefill_logits {
+                super::engine::prefill_span_rows(args.prefill_span_rows, args.prefill_rows)? } else { 64 },
+            diagnostic_rows: if std::env::var("CUTEAFD_ROUTE_CHECK").ok().and_then(|s| s.parse::<usize>().ok()).unwrap_or(0) > 0 {
+                super::engine::prefill_span_rows(args.prefill_span_rows, args.prefill_rows)?.max(64) } else { args.prefill_rows.min(256) },
+            prefix_bytes: host_bytes, media_bytes: 0,
+            headroom: serving.map_or(0, |(prefix, _)| prefix.host_cache_headroom_bytes) },
+        spark_reply_formats: cuteafd_core::spark_reply::requested(),
+        resident_weights, operation, budgets,
+    }.prepare()?;
+    if let Some(envelope) = &push_host { prepared.admit_push(envelope)?; }
+    let admitted = prepared.admit(request).with_context(|| format!(
+        "MiMo shared placement; configured-Spark reservation contract {report}"))?;
+    let mut expert_resident_bytes = [0usize; 2];
+    for &layer in &admitted.spark.rtx_layers {
+        let cost = prepared.recipe.experts[layer].context("MiMo admitted expert cost")?;
+        for (rank, bytes) in expert_resident_bytes.iter_mut().enumerate().take(ranks) {
+            let resident = if ranks == 2 { cost.half[rank].resident } else { cost.whole.resident };
+            *bytes = bytes.checked_add(usize::try_from(resident)?).context("MiMo pushed expert residency overflow")?;
+        }
     }
-    let report = reservation_report(&profiles.steady, &memory, policy)?;
-    tracing::info!(reservations = %report, working_set = ?solution.working_set,
-        "MiMo selected allocation contract after module preload, before weight loads");
-    for (loading, &sample) in profiles.loading.iter().zip(&memory) {
-        admit_device_reservations_with_headroom(policy.gpu_occupancy_percent, sample,
-            &loading.reservations, small_card_headroom_bytes(sample.total_bytes))
-            .with_context(|| format!("MiMo target-loading admission; steady contract {report}"))?;
-    }
-    let placement = solution.placement;
-    let mut capacity = resolved_capacity(&selected, &solution.request, &placement,
+    let mut capacity = contract::resolved_capacity(&admitted,
         u32::try_from(concurrency)?, u32::try_from(args.rings)?)?;
+    let working = admitted.spark;
+    let placement = admitted.placement;
+    let profiles = if working.spark_ranks == 0 { &no_spark_profiles } else { &spark_profiles };
+    let intake_probe_bytes = if working.spark_ranks > 0 { intake_probe_bytes } else { 0 };
+    tracing::info!(phases = %serde_json::to_string(&admitted.solved.phases)?,
+        "MiMo admitted phase ledger before allocations");
+    cuteafd_loader::placement::reserve::log_plan(&admitted.solved, "mimo_v2");
+    {
+        use sha2::{Digest, Sha256};
+        let hash = |path: &std::path::Path| -> Result<String> {
+            let mut file = std::fs::File::open(path)?;
+            let mut digest = Sha256::new();
+            std::io::copy(&mut file, &mut digest)?;
+            Ok(format!("{:x}", digest.finalize()))
+        };
+        let layout = format!("snapshot/{}; draft/{:?}; context/{}; C{}; host-prefix/{}; replies/{:?}",
+            args.snapshot.display(), args.draft, args.max_context, concurrency, host_bytes,
+            cuteafd_core::spark_reply::requested());
+        cuteafd_ffi::memory_ledger::fault::set_inputs(serde_json::json!({
+            "memory_reconciliation_provenance": {
+                "schema_version": 1, "family": "mimo_v2", "source_commit": env!("CUTEAFD_BUILD_COMMIT"),
+                "source_dirty": env!("CUTEAFD_BUILD_DIRTY"), "toolchain": env!("CUTEAFD_BUILD_TOOLCHAIN"),
+                "native_sha256": hash(library.loaded_path())?, "programs_sha256": hash(&args.manifest)?,
+                "layout": layout, "devices": memory, "spark_world": working.spark_ranks,
+                "onboard_layers": admitted.solved.decisions.onboard_layers,
+                "prefill": admitted.solved.decisions.prefill,
+                "graph_basis": { "rows": graph_layout.rows, "pinned": graph_layout.pinned,
+                    "reserve_policy": graph_layout.policies }
+            }
+        }));
+    }
     tracing::info!(placement = %placement.summary(), "MiMo shared admission solve");
     let pool_tokens = capacity.allocated_gpu_kv_tokens;
     let shortfall_tokens = (args.max_context as u64).saturating_sub(pool_tokens);
     tracing::info!(pool_tokens, context_tokens=args.max_context, full_context_sequences=pool_tokens / args.max_context as u64,
         slots=concurrency, shortfall_tokens, "MiMo full-context pool admission before allocation");
-    resolve_pool_context(&mut capacity, automatic_context, profiles.steady.pool_unit_rows)?;
-    let diagnostic_rows = if std::env::var("CUTEAFD_ROUTE_CHECK").ok()
-        .and_then(|value| value.parse::<usize>().ok()).unwrap_or(0) > 0 {
-        super::engine::prefill_span_rows(args.prefill_span_rows, args.prefill_rows)?.max(64)
-    } else { args.prefill_rows.min(256) };
-    let diagnostic_layers = placement.tp2.map_or(0, |tp2| tp2.layers);
-    let mut tables = cuteafd_loader::families::mimo_v2::admission::future_host_workspaces(cfg,
-        args.prefill_rows, solution.working_set.prefill_lanes as usize, ranks, pool_tokens,
-        usize::try_from(capacity.effective_max_context_tokens)?, solution.working_set.spark_ranks,
-        args.expert_input.into(), kv, prefill_output, serving.is_some(), diagnostic_rows, diagnostic_layers)?;
-    if args.token_io.embed_placement == Some(crate::shared::token_io::EmbedPlacement::Host) {
-        tables.push(("mimo/embedding".into(), tensor_bytes("MiMo host embedding", &[cfg.vocab_size, cfg.hidden, 2])?));
-    }
-    let score_rows = if args.full_prefill_logits {
-        super::engine::prefill_span_rows(args.prefill_span_rows, args.prefill_rows)?
-    } else { 64 };
-    let scoring = cuteafd_core::memory_layout::host_logits_bytes(score_rows as u64,
-        score_rows.max(64) as u64, cfg.vocab_size as u64).context("MiMo host scoring overflow")?;
-    let views = tables.iter().map(|(name, bytes)| (name.as_str(), *bytes)).collect::<Vec<_>>();
-    crate::shared::memory::budget::admit_host_memory(host_bytes, &views, scoring,
-        serving.map_or(0, |(prefix, _)| prefix.host_cache_headroom_bytes))?;
-    if !draft_packing.is_empty() {
-        let units = capacity.allocated_gpu_kv_tokens / profiles.steady.pool_unit_rows;
-        for (rank, phase) in profiles.post_target_kv.iter().enumerate() {
-            let mut costs = phase.reservations.clone();
-            costs.extend(post_kv_loading_additional[rank].iter().cloned());
-            costs.push(MemoryReservation {
-                name: "kv.target_records_before_draft".into(),
-                bytes: units
-                    .checked_mul(phase.pool_unit_bytes)
-                    .context("MiMo packing-phase target KV bytes")?,
-            });
-            if rank == 0 {
-                costs.extend(draft_packing.iter().cloned());
-            }
-            admit_device_reservations_with_headroom(policy.gpu_occupancy_percent, memory[rank],
-                &costs, small_card_headroom_bytes(memory[rank].total_bytes))
-                .context("MiMo selected drafter packing admission after target KV allocation")?;
-            tracing::info!(rank, reservations = %serde_json::to_string(&costs)?,
-                "MiMo selected drafter packing phase before any model allocation");
-        }
-    }
+    resolve_pool_context(&mut capacity, serving_context, profiles.steady.pool_unit_rows)?;
     let local_expert_budget = capacity.devices[0]
         .reservations
         .iter()
@@ -574,41 +621,23 @@ fn preflight_shape(
             bytes.checked_add(reservation.bytes)
         })
         .context("MiMo admitted local expert size overflow")?;
-    if intake_probe_bytes > 0 {
-        // The GPU-landing and H2D probes each release their 64 MiB before
-        // transport storage is created. Admit their maximum, not their sum,
-        // as the startup peak reserved before automatic pool sizing.
-        // On small cards the probe uses floor slack released before serving:
-        // charge max(probe, floor), not probe + floor, only for this phase.
-        let lead = &capacity.devices[0];
-        let mut costs = lead.reservations.clone();
-        costs.push(MemoryReservation {
-            name: "kv.logical_pool".into(),
-            bytes: lead.pool_bytes,
-        });
-        costs.push(MemoryReservation {
-            name: "startup.spark_intake_probe_temporary".into(),
-            bytes: intake_probe_bytes,
-        });
-        admit_device_reservations_with_headroom(policy.gpu_occupancy_percent, memory[0],
-            &costs, small_card_headroom_bytes(memory[0].total_bytes).saturating_sub(intake_probe_bytes))?;
-    }
     tracing::info!(checkpoint_max_context = capacity.checkpoint_max_context_tokens,
         max_context = capacity.effective_max_context_tokens, requested_pool = args.pool_tokens,
         allocated_pool = capacity.allocated_gpu_kv_tokens, requested_default = capacity.requested_kv_floor_tokens,
         requested_state_slots = capacity.state_slots, allocated_rings = args.rings,
         host_prefix_bytes = capacity.host_prefix_bytes, mark_slots, intake_probe_bytes,
-        ?graph_plan, ?graph_bound_bytes,
+        ?graph_layout,
         reservations = %serde_json::to_string(&capacity.devices)?,
         "MiMo pre-allocation capacity against measured post-module baseline");
     Ok(Preflight {
+        expert_usage: prepared.recipe.expert_usage.clone(),
         capacity,
-        graph_plan,
-        graph_bound_bytes,
+        graph_layout,
         host_config,
         local_expert_budget: usize::try_from(local_expert_budget)?,
-        placement, expert_directory, working_set: solution.working_set,
+        placement, expert_directory, working_set: working,
         prefill_rows: args.prefill_rows,
+        push_host, expert_resident_bytes,
     })
 }
 
@@ -632,12 +661,8 @@ fn reservation_report(
             .total_bytes
             .checked_sub(sample.baseline_free_bytes)
             .context("invalid physical GPU memory sample")?;
-        let minimum_free = if policy.small_card_headroom {
-            cuteafd_core::serving_capacity::small_card_headroom_bytes(sample.total_bytes)
-        } else { 0 };
-        let budget = cuteafd_core::serving_capacity::admission_ceiling(
-            sample.total_bytes, policy.gpu_occupancy_percent, minimum_free)?
-            .saturating_sub(non_engine);
+        let minimum_free = cuteafd_loader::placement::families::mimo_v2::admission::device_headroom();
+        let budget = sample.total_bytes.saturating_sub(minimum_free).saturating_sub(non_engine);
         let mut fixed = std::collections::BTreeMap::<&str, u64>::new();
         for cost in &costs.reservations {
             let category = cost
@@ -742,7 +767,7 @@ fn local_expert_reservations(
     opened: &super::Opened,
     args: &super::EngineArgs,
     layers: usize,
-) -> Result<Vec<MemoryReservation>> {
+) -> Result<(Vec<MemoryReservation>, cuteafd_loader::placement::ResidentWeights)> {
     use cuteafd_ffi::fp8_moe::{Fp8MoeMetadata, Fp8MoeWeights};
     use cuteafd_loader::formats::fp8_experts::ExpertFormat;
     let count = opened
@@ -753,7 +778,7 @@ fn local_expert_reservations(
         .filter(|&&dense| !dense)
         .count();
     if count == 0 {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), Default::default()));
     }
     let tensors = opened
         .catalog
@@ -788,24 +813,25 @@ fn local_expert_reservations(
     let resident_layers = args.expert_window.map_or(count, |window| window.min(count));
     ensure!(resident_layers > 0, "MiMo expert window must be positive");
     let layer_bytes = crate::shared::experts::fp8::Fp8Layer::bytes(tensors, 1)?;
-    Ok(vec![
+    let weights = tensor_bytes("MiMo local expert store", &[resident_layers, layer_bytes])?;
+    Ok((vec![
         MemoryReservation {
             name: "experts.local_resident_weights".into(),
-            bytes: tensor_bytes("MiMo local expert store", &[resident_layers, layer_bytes])?,
+            bytes: weights,
         },
         MemoryReservation {
             name: "experts.local_scratch".into(),
             bytes: {
                 let manifest = local_package_manifest(&directory)?;
                 let capacity = super::engine::expert_capacity(args.prefill_rows);
-                let bytes = cuteafd_loader::placement::inventory::fp8moe_scratch_bytes(&manifest, "tp1", capacity as u64)
+                let bytes = cuteafd_loader::placement::inventory::fp8moe_scratch_bytes(&manifest, "tp1", capacity as u64)?
                     .context("MiMo local package lacks tp1 scratch at selected capacity")?;
                 ensure!(bytes == metadata.scratch_for(capacity)?.max(256) as u64,
                     "MiMo local package JSON/native scratch contracts disagree");
                 bytes
             },
         },
-    ])
+    ], cuteafd_loader::placement::ResidentWeights(weights)))
 }
 
 pub(super) fn draft_reservations(
@@ -815,10 +841,22 @@ pub(super) fn draft_reservations(
     mode: cuteafd_loader::families::mimo_v2::draft_representation::MimoDraftRepresentation,
     capacity: cuteafd_loader::families::mimo_v2::draft_representation::MimoDraftCapacity,
 ) -> Result<DraftReservations> {
+    draft_rank_reservations(library, directory, cfg, mode, capacity, 0, 1)
+}
+
+pub(super) fn draft_rank_reservations(
+    library: &cuteafd_ffi::NativeLibrary,
+    directory: &std::path::Path,
+    cfg: &super::dflash::DflashConfig,
+    mode: cuteafd_loader::families::mimo_v2::draft_representation::MimoDraftRepresentation,
+    capacity: cuteafd_loader::families::mimo_v2::draft_representation::MimoDraftCapacity,
+    rank: usize,
+    ranks: usize,
+) -> Result<DraftReservations> {
     let headers = cuteafd_loader::read_safetensors_metadata(
         &directory.join("dflash_draft_model.safetensors"),
     )?;
-    draft_reservations_with(cfg, &headers, mode, capacity, |shape| match shape {
+    draft_rank_reservations_with(cfg, &headers, mode, capacity, rank, ranks, |shape| match shape {
         DraftScratch::Fp8 { rows, k, n } => library.fp8_w8a16_workspace(rows, k, n),
         DraftScratch::Attention {
             sequences,
@@ -857,6 +895,40 @@ pub(super) fn workspace_native_scratch(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn push_host_owners_follow_namespace_and_selected_dense_headers() -> anyhow::Result<()> {
+        let root = tempfile::tempdir()?;
+        let tensor = |name: &str, bytes| cuteafd_loader::plan::checkpoint::CheckpointTensor {
+            shard: "header-only.safetensors".into(),
+            meta: cuteafd_loader::SafetensorsTensorMetadata { name: name.into(),
+                dtype: cuteafd_core::DType::Bf16, shape: vec![1], byte_offset: 0, byte_length: bytes },
+        };
+        let checkpoint = cuteafd_loader::plan::Checkpoint {
+            view: None, snapshot: root.path().into(), config: serde_json::json!({}),
+            quantize_config: None, weight_map: Default::default(), tensors: vec![
+                tensor("model.layers.0.self_attn.q_proj.weight", 4096),
+                tensor("model.layers.1.mlp.experts.0.gate_proj.weight", 1 << 30),
+            ],
+            missing_shards: vec![], shard_bytes: 0,
+        };
+        assert!(super::push_host_envelope(&checkpoint, 2, None)?.is_none());
+        let path = std::ffi::CString::new(root.path().as_os_str().as_encoded_bytes())?;
+        let value = br#"{"me":"raptor"}"#;
+        // SAFETY: path, attribute name and value remain valid across setxattr.
+        let status = unsafe { libc::setxattr(path.as_ptr(), c"user.sparknest.cluster".as_ptr(),
+            value.as_ptr().cast(), value.len(), 0) };
+        anyhow::ensure!(status == 0, "setxattr: {}", std::io::Error::last_os_error());
+        let envelope = super::push_host_envelope(&checkpoint, 2, None)?.unwrap();
+        let owners = envelope.allocations("mimo.load.push")?;
+        assert_eq!(owners.iter().map(|owner| owner.bytes).sum::<u64>(), envelope.bytes()?);
+        assert_eq!(envelope.expert_bytes.len(), 2);
+        assert_eq!(envelope.dense_bytes, vec![cuteafd_loader::push_load::admitted_push_envelope(
+            4096, cuteafd_ffi::push_ring::DEFAULT_SLOTS, cuteafd_ffi::push_ring::DEFAULT_SLOT_BYTES as u64)?; 2]);
+        assert!(owners.iter().all(|owner| owner.lifetime.last == cuteafd_loader::placement::planner::Phase::Load));
+        assert!(super::push_host_envelope(&checkpoint, 0, None).is_err());
+        Ok(())
+    }
+
     #[test]
     fn local_admission_reads_manifest_from_sealed_package_root() {
         let root = tempfile::tempdir().unwrap();
@@ -920,16 +992,16 @@ mod tests {
         let profile = CapacityProfile {
             context: ContextLimits { checkpoint_max_tokens: 1048576, compiled_index_max_tokens: None },
             pool_unit_rows: 64,
-            devices: vec![DeviceCosts { device: 0, pool_unit_bytes: 64, reservations: vec![] }],
+            devices: vec![DeviceCosts { device: 0, pool_unit_bytes: 64, reservations: vec![], reserve_bytes: 0 }],
             host_prefix_bytes: 0,
         };
         let policy = CapacityPolicy { pool_tokens: Some(962560), ..CapacityPolicy::default() };
         let memory = [DeviceMemory { device: 0, total_bytes: 2000000, baseline_free_bytes: 2000000 }];
         let mut capacity = resolve_capacity(policy, &profile, &memory).unwrap();
         assert_eq!(capacity.active_max_context_sequences, 0);
-        assert!(resolve_pool_context(&mut capacity.clone(), false, 64).is_err());
-        resolve_pool_context(&mut capacity, true, 64).unwrap();
-        assert_eq!(capacity.effective_max_context_tokens, 962496);
+        assert!(resolve_pool_context(&mut capacity.clone(), cuteafd_loader::placement::planner::Context::pinned(1 << 20), 64).is_err());
+        resolve_pool_context(&mut capacity, cuteafd_loader::placement::planner::Context::automatic(1 << 20), 64).unwrap();
+        assert_eq!(capacity.effective_max_context_tokens, 962560);
         assert_eq!(capacity.active_max_context_sequences, 1);
     }
 
@@ -946,6 +1018,7 @@ mod tests {
         use cuteafd_core::serving_capacity::{
             CapacityPolicy, CapacityProfile, ContextLimits, DeviceCosts, DeviceMemory,
         };
+        let padding = cuteafd_core::memory_policy::MemoryPolicy::current().release_padding();
         let profile = CapacityProfile {
             context: ContextLimits {
                 checkpoint_max_tokens: 32,
@@ -956,6 +1029,7 @@ mod tests {
             devices: vec![DeviceCosts {
                 device: 1,
                 pool_unit_bytes: 3200,
+                reserve_bytes: padding,
                 reservations: [
                     ("model.layers.0.values", 1000),
                     ("draft.weights", 1000),
@@ -973,22 +1047,25 @@ mod tests {
         };
         let memory = [DeviceMemory {
             device: 1,
-            total_bytes: 10000,
-            baseline_free_bytes: 9000,
+            total_bytes: 10000 + padding,
+            baseline_free_bytes: 9000 + padding,
         }];
         let policy = CapacityPolicy {
             max_context_tokens: Some(32),
-            pool_tokens: Some(63),
+            pool_tokens: Some(127),
             ..CapacityPolicy::default()
         };
         let report: serde_json::Value =
             serde_json::from_str(&reservation_report(&profile, &memory, policy).unwrap()).unwrap();
-        assert_eq!(report["requested_pool_tokens"], 64);
+        assert_eq!(report["requested_pool_tokens"], 128);
         let device = &report["devices"][0];
-        assert_eq!(device["engine_budget_bytes"], 8700);
+        // The sample includes 100MiB release padding; subtract it and sampled
+        // occupancy (1000), with no 97% ceiling, before this tiny pool test.
+        assert_eq!(device["minimum_free_bytes"], padding);
+        assert_eq!(device["engine_budget_bytes"], 9000);
         assert_eq!(device["fixed_bytes"], 5524);
-        assert_eq!(device["requested_pool_bytes"], 3200);
-        assert_eq!(device["complete_requested_bytes"], 8724);
+        assert_eq!(device["requested_pool_bytes"], 6400);
+        assert_eq!(device["complete_requested_bytes"], 11924);
         assert_eq!(device["fixed_categories"]["draft"], 1000);
         assert_eq!(device["fixed_categories"]["prefill"], 2000);
         assert!(
@@ -1095,8 +1172,9 @@ mod tests {
         assert_eq!(bytes("draft.layer0.k_ring"), 20 * 1024 * 128 * 2);
         assert_eq!(bytes("draft.layer0.v_ring"), 20 * 1024 * 128 * 2);
         assert_eq!(bytes("draft.workspace.logits"), 16 * 8 * 256 * 4);
-        assert_eq!(bytes("draft.weights.fp8_values"), layout.weights.fp8_values);
-        assert_eq!(bytes("draft.weights.fp8_scales"), layout.weights.fp8_scales);
+        assert_eq!(reservations.arena.layout.payload_bytes() as u64,
+            layout.weights.resident_bytes().unwrap());
+        assert_eq!(reservations.resident_weights.0, reservations.arena.layout.bytes() as u64);
         assert!(!costs
             .iter()
             .any(|cost| cost.name == "draft.weights.bf16_values"
@@ -1118,6 +1196,76 @@ mod tests {
     }
 
     #[test]
+    fn tp2_draft_admission_validates_full_sources_and_charges_local_owners() {
+        use cuteafd_loader::families::{mimo_v2::draft_representation::{MimoDraftCapacity,
+            MimoDraftRepresentation, mimo_draft_mark_bytes}, qwen4::Qwen4KvCache};
+        let (mut cfg, mut headers) = draft_fixture();
+        cfg.heads = 4;
+        cfg.kv_heads = 2;
+        cfg.intermediate = 256;
+        for header in &mut headers {
+            let name = header.name.as_str();
+            header.shape = if name.ends_with("attention_sink_bias") { vec![4] }
+                else if name.ends_with("q_proj.weight") { vec![512, 128] }
+                else if name.ends_with("k_proj.weight") || name.ends_with("v_proj.weight") { vec![256, 128] }
+                else if name.ends_with("o_proj.weight") { vec![128, 512] }
+                else if name.ends_with("gate_proj.weight") || name.ends_with("up_proj.weight") { vec![256, 128] }
+                else if name.ends_with("down_proj.weight") { vec![128, 256] }
+                else { header.shape.clone() };
+            header.byte_length = 2 * header.shape.iter().product::<usize>() as u64;
+        }
+        for mode in [MimoDraftRepresentation::Bf16Only, MimoDraftRepresentation::Fp8Only] {
+            for kv in [Qwen4KvCache::Bf16, Qwen4KvCache::Fp8] {
+                let capacity = MimoDraftCapacity { kv_cache: kv,
+                    ..MimoDraftCapacity::new(20, 16, cfg.block).unwrap() };
+                let whole = draft_reservations_with(&cfg, &headers, mode, capacity, |_| Ok(2048)).unwrap();
+                let local = draft_rank_reservations_with(&cfg, &headers, mode, capacity, 0, 2, |shape| {
+                    if let DraftScratch::Attention { heads, kv_heads, .. } = shape {
+                        assert_eq!((heads, kv_heads), (2, 1));
+                    }
+                    Ok(2048)
+                }).unwrap();
+                let bytes = |owners: &[cuteafd_core::serving_capacity::MemoryReservation], name: &str|
+                    owners.iter().find(|owner| owner.name == name).unwrap().bytes;
+                for ring in ["draft.layer0.k_ring", "draft.layer0.v_ring"] {
+                    let local_record = kv.plane_record_bytes(1, 128) as u64;
+                    assert_eq!(bytes(&local.steady, ring), 20 * 1024 * local_record);
+                    if kv == Qwen4KvCache::Bf16 {
+                        assert_eq!(2 * bytes(&local.steady, ring), bytes(&whole.steady, ring));
+                    }
+                }
+                for owner in ["draft.taps", "draft.fused", "draft.fused_norm", "draft.workspace.h",
+                    "draft.workspace.n", "draft.workspace.logits", "draft.workspace.head_workspace"] {
+                    assert_eq!(bytes(&local.steady, owner), bytes(&whole.steady, owner), "{owner}");
+                }
+                assert_eq!(bytes(&local.steady, "draft.workspace.reduced"), capacity.block_rows as u64 * 128 * 2);
+                let peer = draft_rank_reservations_with(&cfg, &headers, mode, capacity, 1, 2,
+                    |shape| { assert!(!matches!(shape, DraftScratch::Topk { .. })); Ok(2048) }).unwrap();
+                for name in ["head_workspace", "logits", "unary", "candidates", "topk_workspace"] {
+                    assert!(!peer.steady.iter().any(|owner| owner.name == format!("draft.workspace.{name}")));
+                }
+                assert_eq!(peer.resident_weights.0, local.resident_weights.0);
+                assert_eq!(local.resident_weights.0, local.arena.layout.bytes() as u64);
+                assert_eq!(local.arena.layout.payload_bytes() as u64,
+                    cfg.for_tp(2).unwrap().runtime_layout(mode, capacity).unwrap().weights.resident_bytes().unwrap());
+                assert_eq!(local.arena.lifetime, cuteafd_loader::placement::planner::Lifetime {
+                    first: cuteafd_loader::placement::planner::Phase::DraftLoad,
+                    last: cuteafd_loader::placement::planner::Phase::Growth,
+                });
+                assert!(local.packing.iter().all(|owner| !owner.name.contains("ring") && !owner.name.contains("workspace")));
+                let whole_mark = mimo_draft_mark_bytes(1, 2, 128, kv).unwrap();
+                let local_mark = mimo_draft_mark_bytes(1, 1, 128, kv).unwrap();
+                assert_eq!(cfg.mark_bytes(2, kv).unwrap(), 2 * local_mark - 8);
+                if kv == Qwen4KvCache::Bf16 { assert_eq!(whole_mark, 2 * local_mark - 8); }
+                else { assert!(cfg.mark_bytes(2, kv).unwrap() > whole_mark); }
+            }
+        }
+        headers.iter_mut().find(|t| t.name.ends_with("q_proj.weight")).unwrap().shape[0] /= 2;
+        assert!(draft_rank_reservations_with(&cfg, &headers, MimoDraftRepresentation::Bf16Only,
+            MimoDraftCapacity::new(20, 16, cfg.block).unwrap(), 0, 2, |_| panic!("native query before source validation")).is_err());
+    }
+
+    #[test]
     fn compact_draft_rings_preserve_every_other_reservation() {
         use cuteafd_loader::families::{mimo_v2::draft_representation::{MimoDraftCapacity,
             MimoDraftRepresentation}, qwen4::Qwen4KvCache};
@@ -1128,11 +1276,18 @@ mod tests {
             let compact = MimoDraftCapacity { kv_cache: Qwen4KvCache::Fp8, ..capacity };
             let fp8 = draft_reservations_with(&cfg, &headers, mode, compact, |_| Ok(2048)).unwrap();
             assert_eq!(bf16.steady.len(), fp8.steady.len());
-            for (a, b) in bf16.steady.iter().zip(&fp8.steady) {
+            for (index, (a, b)) in bf16.steady.iter().zip(&fp8.steady).enumerate() {
                 assert_eq!(a.name, b.name);
                 if a.name.ends_with("_ring") {
                     assert_eq!(a.bytes, 20 * 1024 * 128 * 2);
                     assert_eq!(b.bytes, 20 * 1024 * 144);
+                } else if a.name == "draft.backing.tail" {
+                    // The slack follows the ring widths, so only its shape is shared.
+                    for (reservations, bytes) in [(&bf16, a.bytes), (&fp8, b.bytes)] {
+                        assert_eq!(bytes,
+                            cuteafd_loader::placement::planner::independent_backing_slack(
+                                reservations.steady[..index].iter().map(|cost| cost.bytes)).unwrap());
+                    }
                 } else {
                     assert_eq!(a.bytes, b.bytes, "{}", a.name);
                 }
@@ -1185,10 +1340,8 @@ mod tests {
         )
         .unwrap();
         assert!(reservations.steady.iter().all(|r| !r.name.contains("fp8")));
-        assert!(reservations
-            .steady
-            .iter()
-            .any(|r| r.name == "draft.weights.bf16_values"));
+        assert!(reservations.steady.iter().all(|r| !r.name.starts_with("draft.weights.")));
+        assert!(reservations.arena.layout.views().keys().all(|name| !name.ends_with(".payload")));
         assert!(reservations.packing.is_empty());
         let invalid = MimoDraftCapacity {
             kv_cache: cuteafd_loader::families::qwen4::Qwen4KvCache::Bf16,

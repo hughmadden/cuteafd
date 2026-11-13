@@ -5,6 +5,121 @@ use cuteafd_loader::push_load::{
 };
 use std::collections::{BTreeMap, VecDeque};
 
+#[test]
+fn static_weight_views_retain_backing_and_match_tensor_checksums() -> Result<()> {
+    use cuteafd_ffi::native_library_lifetime_fixture::Fixture;
+    use sha2::{Digest, Sha256};
+    let fixture = Fixture::build_for_tests()?;
+    let library = fixture.load()?;
+    fixture.immediate_copies(&library)?;
+    fixture.configure_memory(&library, 1, 1 << 20)?;
+    fixture.strict_device_free(&library, true)?;
+    let device = Device { library: &library, id: 1 };
+    let tensors = [("payload".to_string(), vec![3u8; 513]), ("scales".into(), vec![17u8; 258])];
+    let layout = cuteafd_loader::serving_capacity::WeightArenaLayout::new("test/core/1",
+        tensors.iter().map(|(name, data)| (name.clone(), data.len())))?;
+    let arena = DeviceWeightArena::new(device, layout, crate::shared::memory::TEST_ARENA)?;
+    assert_eq!(arena.layout().padding_bytes(), 255);
+    assert!(weight_allocation(Device { library: &library, id: 0 }, Some(&arena), "payload", 513, crate::shared::memory::TEST_ARENA).is_err());
+    assert!(arena.view("absent", 513).is_err());
+    assert!(arena.view("payload", 512).is_err());
+    let views = tensors.iter().map(|(name, data)| arena.view(name, data.len())).collect::<Result<Vec<_>>>()?;
+    assert_eq!(views[1].buffer.ptr as usize - views[0].buffer.ptr as usize, 768);
+    for ((_, data), view) in tensors.iter().zip(&views) {
+        let tensor = Allocation::new(device, data.len(), crate::shared::memory::TEST)?;
+        device.run(|| {
+            library.copy_h2d(tensor.buffer, data)?;
+            library.copy_h2d(view.buffer, data)?;
+            let mut old = vec![0; data.len()];
+            let mut packed = vec![0; data.len()];
+            library.copy_d2h(&mut old, tensor.buffer)?;
+            library.copy_d2h(&mut packed, view.buffer)?;
+            assert_eq!(Sha256::digest(&old), Sha256::digest(&packed));
+            assert_eq!(&packed, data);
+            Ok(())
+        })?;
+    }
+    drop(arena);
+    assert_eq!(device.run(|| library.cuda_physical_memory_info())?.0, (1 << 20) - 1026,
+        "views retain the full physical request");
+    assert_eq!(views[0].weight_backing().unwrap().id, "test/core/1");
+    drop(views);
+    assert_eq!(device.run(|| library.cuda_physical_memory_info())?.0, 1 << 20);
+    let events = fixture.events()?;
+    assert_eq!(events.matches('D').count(), 3);
+    assert_eq!(events.matches('d').count(), 3);
+    assert_eq!(fixture.device_free_mismatch(&library)?.0, 0);
+    Ok(())
+}
+
+#[test]
+fn static_weight_receipts_share_one_backing_across_inventories() -> Result<()> {
+    use cuteafd_loader::placement::planner::{CoordinatorDevices, Lifetime, PhaseOrder};
+    use cuteafd_core::memory_layout::Category;
+    use super::super::receipts::{Census, Inventory};
+    let fixture = cuteafd_ffi::native_library_lifetime_fixture::Fixture::build_for_tests()?;
+    let library = fixture.load()?;
+    fixture.strict_device_free(&library, true)?;
+    let device = Device { library: &library, id: 1 };
+    let layout = cuteafd_loader::serving_capacity::WeightArenaLayout::new("test/core/1",
+        [("first".into(), 257), ("second".into(), 2)])?;
+    let arena = DeviceWeightArena::new(device, layout, crate::shared::memory::TEST_ARENA)?;
+    let first = arena.view("first", 257)?;
+    let second = super::super::DeviceAllocation::from_allocation(arena.view("second", 2)?);
+    let devices = [1];
+    let devices = CoordinatorDevices::new(&devices)?;
+    let mut one = Inventory::new(devices, "one", Lifetime::TARGET, Category::Weights, "fixture");
+    let mut two = Inventory::new(devices, "two", Lifetime::TARGET, Category::Weights, "fixture");
+    first.inventory(&mut one, "first")?;
+    second.inventory(&mut two, "second")?;
+    drop(arena);
+    let mut census = Census::default();
+    census.owners(one.receipts);
+    census.owners(two.receipts);
+    census.normalize(PhaseOrder::DRAFT_THEN_TARGET)?;
+    assert_eq!(census.receipts.len(), 3);
+    let backings = census.receipts.iter().filter(|r| r.allocation.view.is_none()).collect::<Vec<_>>();
+    assert_eq!(backings.len(), 1);
+    assert_eq!((backings[0].allocation.id.as_str(), backings[0].allocation.bytes), ("test/core/1", 514));
+    for receipt in census.receipts.iter().filter(|r| r.allocation.view.is_some()) {
+        assert_eq!(receipt.allocation.view.as_ref().unwrap().backing, "test/core/1");
+    }
+    assert_eq!(census.receipts[2].allocation.view.as_ref().unwrap().offset, 512);
+    drop(first);
+    assert_eq!(fixture.events()?.matches('d').count(), 0);
+    drop(second);
+    assert_eq!(fixture.events()?.matches('d').count(), 1);
+    assert_eq!(fixture.device_free_mismatch(&library)?.0, 0);
+    Ok(())
+}
+
+#[test]
+fn static_weight_partial_load_and_failed_drain_keep_owner_contract() -> Result<()> {
+    for failed_drain in [false, true] {
+        let fixture = cuteafd_ffi::native_library_lifetime_fixture::Fixture::build_for_tests()?;
+        let library = fixture.load()?;
+        fixture.strict_device_free(&library, true)?;
+        let device = Device { library: &library, id: 1 };
+        let load = || -> Result<()> {
+            let layout = cuteafd_loader::serving_capacity::WeightArenaLayout::new("test/core/1",
+                [("first".into(), 257), ("second".into(), 2)])?;
+            let arena = DeviceWeightArena::new(device, layout, crate::shared::memory::TEST_ARENA)?;
+            let first = arena.view("first", 257)?;
+            if failed_drain { library.quarantine_module_after_failed_drain(); }
+            // A later tensor's rejected extent unwinds the partially loaded views.
+            let _second = arena.view("second", 3)?;
+            drop(first);
+            Ok(())
+        };
+        assert!(load().is_err());
+        assert_eq!(fixture.events()?.matches('D').count(), 1);
+        assert_eq!(fixture.events()?.matches('d').count(), usize::from(!failed_drain));
+        assert_eq!(fixture.device_free_mismatch(&library)?.0, 0);
+        assert_eq!(library.cuda_get_device()?, 0);
+    }
+    Ok(())
+}
+
 struct FileWalk<'a> {
     walks: Vec<RunWalk<'a>>,
     heads: std::collections::BinaryHeap<std::cmp::Reverse<(u64, u64, u32, usize)>>,
@@ -194,5 +309,80 @@ fn real_v41_full_plan_interleaved_sources_and_file_replay() -> Result<()> {
         plan.plan.check(&plan.file_sizes, &plan.arenas)?;
         simulate(&plan, rank, "V4.1 full-layer native")?;
     }
+    Ok(())
+}
+
+#[test]
+fn v41_workspace_components_allocate_once_and_retain_independent_generations() -> Result<()> {
+    use cuteafd_loader::serving_capacity::v41_workspace;
+    use cuteafd_core::memory_layout::ArenaTag;
+    let fixture = cuteafd_ffi::native_library_lifetime_fixture::Fixture::build_for_tests()?;
+    let library = fixture.load()?;
+    fixture.immediate_copies(&library)?;
+    fixture.strict_device_free(&library, true)?;
+    for rank in 0..2 {
+        library.cuda_set_device(rank)?;
+        for layout in [v41_workspace::hc(1)?, v41_workspace::window(1, 1, &[0, 1], 256)?,
+            v41_workspace::engram(1, 256)?, v41_workspace::projection(1, 5120, 512, 256, true)?] {
+            let before = fixture.events()?;
+            let arena = workspace_arena(&library, layout.clone(), ArenaTag::workspace("test/v41-workspace"))?;
+            assert_eq!(arena.layout().bytes(), layout.bytes());
+            let views = layout.views().iter().map(|(name, view)| arena.view(name, view.bytes()))
+                .collect::<Result<Vec<_>>>()?;
+            for (index, view) in views.iter().enumerate() {
+                assert_eq!(view.buffer.ptr as usize % 256, 0);
+                let bytes = vec![index as u8; view.buffer.bytes.min(32)];
+                library.copy_h2d(view.buffer, &bytes)?;
+                let mut actual = vec![0; bytes.len()];
+                library.copy_d2h(&mut actual, view.buffer)?;
+                assert_eq!(actual, bytes);
+            }
+            assert_eq!(fixture.events()?.matches('D').count(), before.matches('D').count() + 1);
+            drop(arena);
+            assert_eq!(fixture.events()?.matches('d').count(), before.matches('d').count());
+            drop(views);
+            assert_eq!(fixture.events()?.matches('d').count(), before.matches('d').count() + 1);
+        }
+    }
+    assert_eq!(fixture.device_free_mismatch(&library)?.0, 0);
+    Ok(())
+}
+
+/// One physical backing per arena, recorded once under the arena's tag; every
+/// view reports that tag, and the arena-less standalone tag never applies to a view.
+#[test]
+fn arena_views_inherit_one_backing_tag() -> Result<()> {
+    use cuteafd_core::memory_layout::{arena_class, ArenaTag, MemoryKind};
+    use cuteafd_ffi::{memory_ledger, native_library_lifetime_fixture::Fixture};
+    let fixture = Fixture::build_for_tests()?;
+    let library = fixture.load()?;
+    fixture.configure_memory(&library, 1, 1 << 20)?;
+    let device = Device { library: &library, id: 0 };
+    let layout = cuteafd_loader::serving_capacity::WeightArenaLayout::new("test/kv-arena/0",
+        [("pages".to_string(), 4096), ("index".to_string(), 512)])?;
+    let audit = memory_ledger::AllocationAudit::begin();
+    let start = audit.checkpoint();
+    let arena: DeviceArena<'_, arena_class::FixedPool> = DeviceArena::new(device, layout, ArenaTag::kv("test/kv-arena"))?;
+    let views = [arena.view("pages", 4096)?, arena.view("index", 512)?];
+    let history = audit.finish();
+    // The audit sees every thread; this test's owner is unique to it.
+    let backings = history.events[start..].iter().filter_map(|event| match event {
+        memory_ledger::AllocationEvent::Allocated(record)
+            if record.key.tag.owner == "test/kv-arena" => Some(*record),
+        _ => None }).collect::<Vec<_>>();
+    assert_eq!(backings.len(), 1, "an arena records exactly one backing: {backings:?}");
+    assert_eq!(backings[0].key.tag, memory_ledger::Tag::kv("test/kv-arena"));
+    assert_eq!(backings[0].bytes, arena.layout().bytes());
+    for view in &views {
+        assert_eq!(view.tag(), Some(arena.tag()));
+        assert_eq!(view.tag().unwrap().kind, MemoryKind::Kv);
+    }
+    // A weight arena view ignores the standalone tag a caller passes.
+    let weights = DeviceWeightArena::new(device, cuteafd_loader::serving_capacity::WeightArenaLayout::new(
+        "test/weight-arena/0", [("w".to_string(), 256)])?, ArenaTag::weights("test/weight-arena"))?;
+    let view = weight_allocation(device, Some(&weights), "w", 256, ArenaTag::drafter_weights("test/elsewhere"))?;
+    assert_eq!(view.tag(), Some(memory_ledger::Tag::weights("test/weight-arena")));
+    let standalone = weight_allocation(device, None, "w", 256, ArenaTag::drafter_weights("test/elsewhere"))?;
+    assert_eq!(standalone.tag(), Some(memory_ledger::Tag::drafter_weights("test/elsewhere")));
     Ok(())
 }

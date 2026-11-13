@@ -11,6 +11,7 @@ use cuteafd_ffi::{
     V41Tp2ExpertReducer,
 };
 use std::{ffi::c_void, rc::Rc};
+use crate::shared::memory::Tag;
 
 pub(crate) fn kernel_capacities(max_rows: usize, exports: &[u32]) -> Result<Vec<u32>> {
     ensure!((1..=4096).contains(&max_rows), "invalid TP2 rank capacity");
@@ -28,13 +29,50 @@ pub(super) fn output_bytes(geometry: ExpertGeometry, rows: usize) -> Result<usiz
         .context("TP2 output extent overflow")
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StageInventory {
+    geometry: ExpertGeometry,
+    stages: usize,
+}
+
+impl StageInventory {
+    fn new(geometry: ExpertGeometry, accepted_families: &[&str], stages: usize) -> Result<Self> {
+        ensure!(geometry.family().is_some_and(|family| accepted_families.contains(&family)),
+            "stage inventory does not accept the process expert family");
+        (geometry.layers as usize).checked_add(stages).context("stage inventory overflow")?;
+        Ok(Self { geometry, stages })
+    }
+}
+
+static STAGE_INVENTORY: std::sync::OnceLock<StageInventory> = std::sync::OnceLock::new();
+
+/// The family launch layer declares same-geometry absolute stages before loading
+/// any arena. Like the process geometry, this inventory cannot change afterward.
+pub(crate) fn register_stage_inventory(accepted_families: &[&str], stages: usize) -> Result<()> {
+    let inventory = StageInventory::new(expert_geometry(), accepted_families, stages)?;
+    let registered = STAGE_INVENTORY.get_or_init(|| inventory);
+    ensure!(*registered == inventory, "process stage inventory already differs");
+    Ok(())
+}
+
 pub(super) fn validate_layers(layers: &[usize], rank: u8) -> Result<()> {
-    ensure!(
-        rank < 2 && !layers.is_empty()
-            && layers.windows(2).all(|ids| ids[0] < ids[1])
-            && layers.iter().all(|&layer| layer < expert_geometry().layers as usize),
-        "invalid TP2 rank or ordered absolute layer IDs"
-    );
+    validate_layers_for(expert_geometry(), STAGE_INVENTORY.get().copied(), layers, rank)
+}
+
+fn validate_layers_for(geometry: ExpertGeometry, inventory: Option<StageInventory>,
+    layers: &[usize], rank: u8) -> Result<()> {
+    let stages = match inventory {
+        Some(inventory) => {
+            ensure!(inventory.geometry == geometry, "stage inventory geometry differs");
+            inventory.stages
+        }
+        None => 0,
+    };
+    let bound = (geometry.layers as usize).checked_add(stages).context("stage inventory overflow")?;
+    ensure!(rank < 2 && !layers.is_empty()
+        && layers.windows(2).all(|ids| ids[0] < ids[1])
+        && layers.iter().all(|&layer| layer < bound),
+        "invalid TP2 rank or ordered absolute layer IDs");
     Ok(())
 }
 
@@ -317,27 +355,13 @@ impl<'a> NativeTp2<'a> {
             output_policy,
             format.is_nvfp4(),
         )?;
-        let mut resident = workspace;
-        for &layer in layers {
-            let plan = ExpertWeights::plan(
-                device.library,
-                catalog,
-                ExpertLayer::BackboneTp2 {
-                    layer,
-                    rank: rank as usize,
-                },
-            )?;
-            resident = resident
-                .checked_add(plan.resident_bytes)
-                .context("TP2 resident overflow")?;
-            ensure!(
-                resident
-                    .checked_add(plan.device_staging_bytes)
-                    .context("TP2 peak overflow")?
-                    <= budget,
-                "TP2 weights + workspace + staging exceed budget {budget}"
-            );
-        }
+        let selections = layers.iter().map(|&layer| ExpertLayer::BackboneTp2 {
+            layer, rank: rank as usize }).collect::<Vec<_>>();
+        let layout = ExpertWeights::arena_layout(device, catalog, selections.iter().copied())?;
+        let plans = selections.into_iter().map(|layer| device.run(||
+            ExpertWeights::plan(device.library, catalog, layer))).collect::<Result<Vec<_>>>()?;
+        crate::shared::experts::weight_layout::admit(&layout,
+            plans.iter().map(|p| p.device_staging_bytes).max().unwrap_or(0), workspace, budget)?;
         Ok(workspace)
     }
 
@@ -448,36 +472,24 @@ impl<'a> NativeTp2<'a> {
         let weights = if ExpertFormat::of(catalog).is_nvfp4()
             || std::env::var("CUTEAFD_TP2_SHARED_READ").as_deref() == Ok("0")
         {
-            let mut remaining = available;
-            let mut weights = [
-                devices[0].own(|| Ok(Vec::new()))?,
-                devices[1].own(|| Ok(Vec::new()))?,
-            ];
-            for &layer in &layers {
-                // SAFETY: fresh, unaliased GPU owners only; both workers drain
-                // before returning and DeviceOwner destroys on its owning GPU.
-                let pair = unsafe {
-                    cuteafd_ffi::synchronized_load::load_pair(|rank| {
-                        devices[rank].own(|| {
-                            let _memory_scope = cuteafd_ffi::memory_ledger::scope_owned(&label);
-                            Ok(vec![ExpertWeights::load(
-                                devices[rank].library,
-                                catalog,
-                                ExpertLayer::BackboneTp2 { layer, rank },
-                                remaining[rank],
-                            )?])
-                        })
-                    })
-                }?;
-                for (rank, mut loaded) in pair.into_iter().enumerate() {
-                    remaining[rank] -= loaded[0].budget().resident_bytes;
-                    devices[rank].run(|| {
-                        weights[rank].append(loaded.get_mut());
-                        Ok(())
-                    })?;
-                }
-            }
-            weights
+            // SAFETY: each worker builds its own fresh rank backing and drains
+            // all uploads. DeviceOwner retires that backing on its original GPU.
+            unsafe {
+                cuteafd_ffi::synchronized_load::load_pair(|rank| devices[rank].own(|| {
+                    let _memory_scope = cuteafd_ffi::memory_ledger::scope_owned(&label);
+                    let arena = ExpertWeights::arena(devices[rank], catalog,
+                        layers.iter().map(|&layer| ExpertLayer::BackboneTp2 { layer, rank }))?;
+                    let mut remaining = available[rank];
+                    let mut loaded = Vec::with_capacity(layers.len());
+                    for &layer in &layers {
+                        let weight = ExpertWeights::load_into(devices[rank].library, catalog,
+                            ExpertLayer::BackboneTp2 { layer, rank }, remaining, &arena)?;
+                        remaining -= weight.budget().resident_bytes;
+                        loaded.push(weight);
+                    }
+                    Ok(loaded)
+                }))
+            }?
         } else {
             ExpertWeights::load_tp2_pair(devices, catalog, &layers, available)?
         };
@@ -580,10 +592,12 @@ impl<'a> NativeTp2<'a> {
             NativeOutputPolicy::TokenSums,
         )?;
         let weights = device.own(|| {
+            let arena = ExpertWeights::arena(device, catalog,
+                layers.iter().map(|&layer| ExpertLayer::BackboneTp2 { layer, rank: rank as usize }))?;
             let mut loaded = Vec::with_capacity(layers.len());
             let mut remaining = budget - workspace_bytes;
             for &layer in &layers {
-                let weight = ExpertWeights::load(
+                let weight = ExpertWeights::load_into(
                     device.library,
                     catalog,
                     ExpertLayer::BackboneTp2 {
@@ -591,6 +605,7 @@ impl<'a> NativeTp2<'a> {
                         rank: rank as usize,
                     },
                     remaining,
+                    &arena,
                 )?;
                 remaining -= weight.budget().resident_bytes;
                 loaded.push(weight);
@@ -717,8 +732,8 @@ impl<'a> NativeTp2<'a> {
             .unwrap();
         let [scratch_bytes, partial_bytes] = Self::allocation_sizes(
             scratch_bytes, geometry, max_rows, output_policy, nvfp4)?;
-        let scratch = Allocation::new(device, scratch_bytes)?;
-        let output = Allocation::new(device, partial_bytes)?;
+        let scratch = Allocation::new(device, scratch_bytes, Tag::workspace("experts/rtx-native-scratch"))?;
+        let output = Allocation::new(device, partial_bytes, Tag::workspace("experts/rtx-native-output"))?;
         let stream = Stream::new(device)?;
         let states = device.own(|| {
             let mut states = Vec::with_capacity(kernels.len());
@@ -817,6 +832,15 @@ impl<'a> NativeTp2<'a> {
 }
 
 impl RtxExpertLayer for NativeTp2<'_> {
+    fn allocation_receipts(&self, inventory: &mut crate::shared::memory::receipts::Inventory<'_>,
+        name: &str) -> Result<()> {
+        for (index, weight) in self.weights.iter().enumerate() {
+            weight.allocation_receipts(inventory, &format!("{name}.weight.{}", self.layers[index]))?;
+        }
+        inventory.device(&format!("{name}.scratch"), self._scratch.buffer)?;
+        inventory.device(&format!("{name}.output"), self.output.buffer)
+    }
+
     fn shard(&self) -> RtxShard {
         RtxShard::Tp2 { rank: self.rank }
     }
@@ -985,6 +1009,27 @@ mod tests {
             }
         }
         assert!(validate_layers(&[0], 2).is_err());
+    }
+
+    #[test]
+    fn absolute_stages_require_matching_declared_inventory() {
+        let geometry = expert_geometry();
+        let accepted = [geometry.family().unwrap()];
+        let first = geometry.layers as usize;
+        for stages in [0, 1, 3, 5] {
+            let inventory = StageInventory::new(geometry, &accepted, stages).unwrap();
+            for rank in 0..2 {
+                let layers: Vec<_> = std::iter::once(0).chain(first..first + stages).collect();
+                assert!(validate_layers_for(geometry, Some(inventory), &layers, rank).is_ok());
+                assert!(validate_layers_for(geometry, Some(inventory), &[first + stages], rank).is_err());
+            }
+        }
+        assert!(StageInventory::new(geometry, &[], 1).is_err());
+        assert!(StageInventory::new(geometry, &accepted, usize::MAX).is_err());
+        assert!(validate_layers_for(geometry, None, &[first], 0).is_err());
+        let other = ExpertGeometry { layers: geometry.layers + 1, ..geometry };
+        let inventory = StageInventory::new(geometry, &accepted, 1).unwrap();
+        assert!(validate_layers_for(other, Some(inventory), &[0], 0).is_err());
     }
 
     #[test]

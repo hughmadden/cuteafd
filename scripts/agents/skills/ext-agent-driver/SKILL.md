@@ -20,7 +20,7 @@ text with `--text`. It does not require a Python package install.
 ```sh
 python3 scripts/agents/ext-agent.py start TASK --tool grok --effort high \
   --cwd /absolute/worktree --preamble /absolute/preamble --brief /absolute/brief --auto-approve
-python3 scripts/agents/ext-agent.py start TASK --tool agy --model gemini-4-argon-high \
+python3 scripts/agents/ext-agent.py start TASK --tool agy --model gemini-4-carbon-high \
   --cwd /absolute/worktree --preamble /absolute/preamble --brief /absolute/brief --auto-approve
 python3 scripts/agents/ext-agent.py wait TASK --until idle --timeout 600
 python3 scripts/agents/ext-agent.py status TASK --lines 30

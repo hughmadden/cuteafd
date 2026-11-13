@@ -47,6 +47,23 @@ impl<'a> NativeScratch<'a> {
     }
 }
 
+impl NativeScratch<'_> {
+    /// Actual retained owners, independent of requested scratch extents.
+    pub(super) fn allocation_buffers(&self) -> Vec<(&'static str, Buffer)> {
+        let linear = self.linear.view();
+        let mut out = vec![
+            ("linear.rotated", linear.rotated), ("linear.table", linear.table),
+            ("linear.block_scales", linear.block_scales), ("linear.partial", linear.partial),
+            ("linear.acc", linear.acc), ("stage.qkv", self.qkv.buffer), ("stage.q", self.q.buffer),
+            ("stage.gate", self.gate.buffer), ("stage.up", self.up.buffer),
+            ("stage.hidden", self.hidden.buffer), ("stage.kw", self.kw.buffer),
+            ("stage.iq", self.iq.buffer), ("stage.values", self.values.buffer),
+        ];
+        if let Some(records) = linear.records { out.push(("linear.records", records)); }
+        out
+    }
+}
+
 /// A buffer's first `bytes`.
 fn head(buffer: Buffer, bytes: usize) -> Result<Buffer> {
     ensure!(bytes <= buffer.bytes, "native view of {bytes} B past a {} B buffer", buffer.bytes);
@@ -73,7 +90,7 @@ impl<'a> GlmEngine<'a> {
         let s = self.native_scratch(rank, w)?;
         let projection_geometry = layer.native_projections.get(projection).context("native projection geometry")?;
         self.on(rank, || programs.linear(projection_geometry,
-            |component| layer.native(&crate::shared::experts::exlr8::dense_weights::key(projection, component)),
+            |component| layer.native(&cuteafd_loader::plan::exlr8::dense::requests::key(projection, component)),
             s.linear.view(),
             x, rows, bf16_out, self.exlr8_prefill_activations == super::super::Exlr8PrefillActivations::A8,
             self.stream_of(rank)))
@@ -142,7 +159,7 @@ impl<'a> GlmEngine<'a> {
         self.on(rank, || unsafe { programs.companion("exlr8_dense_f32_narrow_pack_n128_p160")?
             .launch(&[s.linear.view().acc.ptr, s.kw.buffer.ptr], rows as u32, 0, stream).map_err(anyhow::Error::from) })?;
         self.on(rank, || unsafe { programs.companion("exlr8_dense_bf16_index_weights")?
-            .launch(&[x.ptr, layer.native(&crate::shared::experts::exlr8::dense_weights::key("index_w", "bf16"))?.ptr, s.linear.view().acc.ptr],
+            .launch(&[x.ptr, layer.native(&cuteafd_loader::plan::exlr8::dense::requests::key("index_w", "bf16"))?.ptr, s.linear.view().acc.ptr],
                 rows as u32, 0, stream)?;
             programs.companion("exlr8_dense_f32_narrow_pack_n32_p160")?
                 .launch(&[s.linear.view().acc.ptr, s.kw.buffer.ptr], rows as u32, 128, stream).map_err(anyhow::Error::from) })?;
@@ -204,17 +221,30 @@ impl<'a> GlmEngine<'a> {
         w.core.as_deref().context("GLM K6 scratch not admitted")
     }
 
+    fn core_shape(layer: &GlmLayer<'_>, key: &str) -> Result<[usize; 2]> {
+        layer.core.get(key).map(|w| w.shape).or_else(|| layer.attention_native.get(key).map(|w| w.layout.shape))
+            .with_context(|| format!("GLM missing staged projection {key}"))
+    }
+
     pub(super) fn core_split(layer: &GlmLayer<'_>, key: &str) -> bool {
         layer.core.get(key).is_some_and(|weight|
             weight.side == cuteafd_loader::formats::dense_trellis::TrellisSide::Input)
+            || layer.attention_native.get(key).is_some_and(|w| w.layout.ranks > 1
+                && w.layout.split == cuteafd_loader::formats::trellis_core::CoreSplit::Input)
+    }
+
+    /// Remote routed output already includes the complete shared down-core
+    /// egress on rank 0. Rank 1 has no second BF16 contribution in this case.
+    pub(super) fn shared_zero_elided(&self, index: usize, layer: &GlmLayer<'_>) -> bool {
+        !layer.dense && Self::core_split(layer, "down") && !self.tp2_layer(index)
     }
 
     /// Native cores occupy a disjoint partition of each existing receive slot:
     /// the following routed/BF16 publication must not overwrite a live core.
-    fn core_received(&self, rank: usize, slot: usize, rows: usize) -> Result<Buffer> {
+    fn core_received(&self, rank: usize, slot: usize, rows: usize, element_bytes: usize) -> Result<Buffer> {
         let exchange = self.exchange()?;
         let offset = self.prefill_rows.max(DECODE_ROWS) * self.cfg.hidden * self.tp2_exchange.element_bytes();
-        let bytes = rows * self.cfg.hidden * 2;
+        let bytes = rows * self.cfg.hidden * element_bytes;
         ensure!(offset + bytes <= exchange.slot_bytes(), "GLM K6 peer core exceeds admitted receive slot");
         let base = Buffer { ptr: exchange.recv(rank, slot)?, bytes: exchange.slot_bytes(),
             device_id: exchange.device(rank), flags: 0 };
@@ -226,8 +256,9 @@ impl<'a> GlmEngine<'a> {
         let at = slot(index, key == "down", lane);
         if Self::core_split(layer, key) {
             let core = &w.core_rows.as_ref().context("GLM K6 retained core rows")?[usize::from(key == "down")];
+            let element_bytes = if layer.attention_native.contains_key(key) { 4 } else { 2 };
             self.exchange()?.push_to(rank, at, core.buffer.ptr,
-                self.core_received(1 - rank, at, rows)?.ptr, rows * self.cfg.hidden * 2)
+                self.core_received(1 - rank, at, rows, element_bytes)?.ptr, rows * self.cfg.hidden * element_bytes)
         } else {
             self.exchange()?.push(rank, at, w.delta.buffer.ptr, rows * self.cfg.hidden * 2)
         }
@@ -235,14 +266,23 @@ impl<'a> GlmEngine<'a> {
 
     fn reduce_projection(&self, rank: usize, index: usize, lane: usize, w: &Workspace<'_>,
         layer: &GlmLayer<'_>, key: &str, rows: usize, output: Buffer) -> Result<()> {
-        let weights = layer.core.get(key).context("GLM K6 split weights")?;
         let programs = self.core_programs(rank)?;
         let retained = w.core_rows.as_ref().context("GLM K6 retained core rows")?;
         let local = retained[usize::from(key == "down")].buffer;
-        let peer = self.core_received(rank, slot(index, key == "down", lane), rows)?;
-        // Widen retained BF16 cores for rank-ordered F32 addition, then run
-        // the one complete H128/svh egress.
+        let native = layer.attention_native.contains_key(key);
+        let peer = self.core_received(rank, slot(index, key == "down", lane), rows, if native { 4 } else { 2 })?;
+        // Native projections retain F32 partials; trellis projections widen
+        // retained BF16 cores before the complete H128/svh egress.
         let (first, second) = if rank == 0 { (local, peer) } else { (peer, local) };
+        if native {
+            // SAFETY: both rank-ordered F32 partials have completed their exchange;
+            // distinct admitted reduction/output owners survive stream completion.
+            return self.on(rank, || unsafe {
+                programs.f32_add.launch(first, second, retained[2].buffer, rows * self.cfg.hidden, self.stream_of(rank))?;
+                programs.narrow.launch(retained[2].buffer.ptr, output.ptr, rows * self.cfg.hidden, self.stream_of(rank))
+            });
+        }
+        let weights = layer.core.get(key).context("GLM K6 split weights")?;
         self.on(rank, || programs.projection(weights)?.reduced(&programs.add, rows,
             first, second, retained[2].buffer, weights, output, self.stream_of(rank)))
     }
@@ -263,7 +303,13 @@ impl<'a> GlmEngine<'a> {
         layer: &GlmLayer<'_>, weight: *mut c_void, rows: Scalar,
         first: *mut c_void, second: *mut c_void) -> Result<()> {
         if layer.dense { self.projection_norm(rank, index, lane, w, layer, "down", weight, rows, first, second) }
-        else { self.norm_full(rank, w, weight, 2, rows, first, second) }
+        else {
+            // A BF16 delta plus +0 is redundant on real model data. Elision
+            // preserves -0 instead of canonicalizing it and can preserve NaN
+            // payloads differently; native goldens gate byte-exact real data.
+            let deltas = if self.shared_zero_elided(index, layer) { 1 } else { 2 };
+            self.norm_full(rank, w, weight, deltas, rows, first, second)
+        }
     }
 
     pub(super) fn meet_shared_core(&self, rank: usize, index: usize, w: &Workspace<'_>,
@@ -274,6 +320,10 @@ impl<'a> GlmEngine<'a> {
         self.exchange()?.wait(rank, slot(index, true, w.lane))?;
         if rank == 0 {
             self.reduce_projection(rank, index, w.lane, w, layer, "down", rows, w.shared.buffer)
+        } else if self.shared_zero_elided(index, layer) {
+            // The later routed-result wait (also on the terminal layer) orders
+            // retained-core reuse after rank 0's reader. No zero buffer is read.
+            Ok(())
         } else {
             // SAFETY: only rank 0 contributes shared; this rank's combine reads
             // its zeroed BF16 buffer after this operation on the same stream.
@@ -282,10 +332,17 @@ impl<'a> GlmEngine<'a> {
         }
     }
 
-    /// Input-side projections narrow F32 cores to retained BF16 before any
-    /// following projection reuses the accumulator. Their caller owns the meet.
+    /// Input-side native projections retain F32 partials, while trellis cores
+    /// retain BF16. Their caller owns the meet before either storage is reused.
     fn core_linear(&self, rank: usize, w: &Workspace<'_>, layer: &GlmLayer<'_>, key: &str,
         input: Buffer, output: Buffer, rows: usize, retained: Option<Buffer>) -> Result<()> {
+        if let Some(weights) = layer.attention_native.get(key) {
+            let output = if Self::core_split(layer, key) {
+                retained.context("GLM native split projection has no retained F32 storage")?
+            } else { output };
+            return self.on(rank, || self.core_programs(rank)?.native(weights,
+                self.core_scratch(w)?, input, output, rows, self.stream_of(rank)));
+        }
         let weights = layer.core.get(key).with_context(|| format!("GLM K6 missing {key}"))?;
         let programs = self.core_programs(rank)?;
         let scratch = self.core_scratch(w)?;
@@ -293,11 +350,11 @@ impl<'a> GlmEngine<'a> {
         let stream = self.stream_of(rank);
         self.on(rank, || {
             if weights.side == cuteafd_loader::formats::dense_trellis::TrellisSide::Input {
-                let core = projection.core(rows, input, weights, &scratch.projection, stream)?;
+                let core = projection.core(rows, input, weights, scratch.projection.as_ref().context("GLM trellis scratch missing")?, stream)?;
                 let retained = retained.context("GLM K6 split core has no retained row storage")?;
                 crate::shared::dense_trellis::retain_partial(&programs.narrow, core, retained,
                     rows * weights.shape[0], stream)
-            } else { projection.local(rows, input, weights, &scratch.projection, output, stream) }
+            } else { projection.local(rows, input, weights, scratch.projection.as_ref().context("GLM trellis scratch missing")?, output, stream) }
         })
     }
 
@@ -311,7 +368,7 @@ impl<'a> GlmEngine<'a> {
         let pitch = self.cfg.q_lora_rank + self.cfg.kv_lora_rank + self.cfg.qk_rope_head_dim;
         for (key, logical, column) in [("q_a", self.cfg.q_lora_rank, 0),
             ("kv_a", self.cfg.kv_lora_rank + self.cfg.qk_rope_head_dim, self.cfg.q_lora_rank)] {
-            let stored = layer.core[key].shape[0];
+            let stored = Self::core_shape(layer, key)?[0];
             self.core_linear(rank, w, layer, key, w.x.buffer, q, rows, None)?;
             let (source_pitch, destination_pitch, width, offset) = super::super::core_runtime::pack_layout(
                 rows, stored, logical, pitch, column)?;
@@ -366,9 +423,9 @@ impl<'a> GlmEngine<'a> {
             ("s", layer.ptr("query_scale_s")?), ("b", layer.ptr("query_scale_b")?), ("query", query)], &[row])?;
         self.run_on(rank, &format!("{family}_absorb{tag}{placed}_{cap}"), &[("a", q.ptr), ("w", layer.ptr("w_uk")?),
             ("out", query)], &[row])?;
-        if layer.core.contains_key("kv_a") {
+        if layer.core.contains_key("kv_a") || layer.attention_native.contains_key("kv_a") {
             let width = self.cfg.kv_lora_rank + if rope { self.cfg.qk_rope_head_dim } else { 0 };
-            let stored = layer.core["kv_a"].shape[0];
+            let stored = Self::core_shape(layer, "kv_a")?[0];
             self.core_linear(rank, w, layer, "kv_a", w.x.buffer, q, rows, None)?;
             let (source_pitch, destination_pitch, bytes, _) = super::super::core_runtime::pack_layout(
                 rows, stored, width, width, 0)?;
@@ -449,7 +506,7 @@ impl<'a> GlmEngine<'a> {
         let (gate, up, hidden) = (scratch.stage("gate")?, scratch.stage("up")?, scratch.stage("hidden")?);
         self.core_linear(rank, w, layer, "gate", w.x.buffer, gate, rows, None)?;
         self.core_linear(rank, w, layer, "up", w.x.buffer, up, rows, None)?;
-        let intermediate = layer.core["gate"].shape[0];
+        let intermediate = Self::core_shape(layer, "gate")?[0];
         let name = match self.cfg.variant.ml4() {
             // Mistral Large 4's format-neutral SwiGLU (whole and two-GPU widths).
             Some(_) => format!("ml4_swiglu_i{intermediate}"),

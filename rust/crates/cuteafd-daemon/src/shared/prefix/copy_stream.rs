@@ -87,6 +87,18 @@ impl<'a> PrefixCopies<'a> {
 
     pub(crate) fn ranks(&self) -> usize { self.ranks.len() }
 
+    /// Stream/event driver storage is measured separately at startup, not invented as buffers.
+    pub(crate) fn allocation_receipts(&self,
+        inventory: &mut crate::shared::memory::receipts::Inventory<'_>, name: &str) -> Result<()> {
+        inventory.host(&format!("{name}.ranks"), &self.ranks)?;
+        for (index, rank) in self.ranks.iter().enumerate() {
+            let rank = rank.try_borrow()?;
+            inventory.host(&format!("{name}.rank.{index}.readers"), &rank.readers)?;
+            inventory.host(&format!("{name}.rank.{index}.events"), &rank.produced)?;
+        }
+        Ok(())
+    }
+
     /// Runs `copies` on rank `rank`'s copy stream (the argument), fenced
     /// against every reader on both sides; `copies` runs with the rank's
     /// device current. Even when `copies` fails part way, the `landed` join is

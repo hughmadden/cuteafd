@@ -1,4 +1,5 @@
 //! Packed FP8 committed dSpark KV rings with generation-checked request slots.
+use crate::shared::memory::Tag;
 use crate::shared::memory::{DeviceAllocation, HostAllocation, LoadStream};
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::{
@@ -37,6 +38,18 @@ pub(crate) struct WindowView {
     pub buffer: CuteafdDeviceBuffer,
     pub valid_rows: usize,
     pub committed_end: u64,
+}
+/// Stable ring geometry only; carries no request, lease or read reservation.
+#[derive(Clone, Copy)]
+pub(crate) struct WindowGeometry {
+    pub owner: u64,
+    pub ring: CuteafdDeviceBuffer,
+    pub slots: u32,
+}
+impl WindowRead {
+    pub(crate) fn geometry(&self) -> WindowGeometry {
+        WindowGeometry { owner: self.owner, ring: self.ring, slots: self.slots }
+    }
 }
 pub(crate) struct WindowRead {
     pub owner: u64,
@@ -113,7 +126,6 @@ pub(crate) struct DsparkWindow<'a> {
     ring: DeviceAllocation<'a>,
     descriptors: DeviceAllocation<'a>,
     staging: HostAllocation<'a>,
-    graph: Option<*mut c_void>,
     slots: [Slot; cuteafd_core::V41_MAX_REQUESTS],
     access: SlotAccess,
     slot_count: usize,
@@ -121,6 +133,9 @@ pub(crate) struct DsparkWindow<'a> {
     owner: u64,
 }
 impl<'a> DsparkWindow<'a> {
+    pub(crate) fn startup_geometry(&self) -> WindowGeometry {
+        WindowGeometry { owner: self.owner, ring: self.ring.buffer, slots: self.slot_count as u32 }
+    }
     pub fn device(&self) -> crate::shared::memory::device::Device<'a> {
         crate::shared::memory::device::Device { library: self.stream.library, id: self.ring.buffer.device_id }
     }
@@ -152,38 +167,22 @@ impl<'a> DsparkWindow<'a> {
                 raw: library.cuda_stream_create()?,
             },
             kernel: library.v41_dspark_cache()?,
-            source: DeviceAllocation::new(library, source_rows as usize * 1024)?,
-            ring: DeviceAllocation::new(library, slots * V41DsparkCache::SLOT_BYTES)?,
-            descriptors: DeviceAllocation::new(library, cuteafd_core::V41_WRITE_DESCRIPTOR_BYTES)?,
-            staging: HostAllocation::new(library, cuteafd_core::V41_WRITE_DESCRIPTOR_BYTES)?,
-            graph: None,
+            source: DeviceAllocation::new(library, source_rows as usize * 1024, Tag::drafter_kv("v41/draft-cache"))?,
+            ring: DeviceAllocation::new(library, slots * V41DsparkCache::SLOT_BYTES, Tag::drafter_kv("v41/draft-cache"))?,
+            descriptors: DeviceAllocation::new(library, cuteafd_core::V41_WRITE_DESCRIPTOR_BYTES, Tag::drafter_workspace("v41/draft-cache"))?,
+            staging: HostAllocation::new(library, cuteafd_core::V41_WRITE_DESCRIPTOR_BYTES, Tag::staging("v41/draft-cache"))?,
             slots: [Slot::default(); cuteafd_core::V41_MAX_REQUESTS],
             access: SlotAccess::default(),
             slot_count: slots,
             source_rows,
             owner,
         };
-        // Inactive descriptors warm/capture the fixed launch without reading source.
+        // Inactive descriptors warm the fixed launch without reading source.
         library.copy_h2d(value.descriptors.buffer, value.staging.bytes_mut())?;
         unsafe {
             value.enqueue()?;
         }
         value.synchronize()?;
-        unsafe {
-            library.cuda_graph_begin_capture(value.stream.raw)?;
-        }
-        let launched = unsafe { value.enqueue() };
-        let captured = unsafe { library.cuda_graph_end_capture(value.stream.raw) };
-        match (launched, captured) {
-            (Ok(()), Ok(graph)) => value.graph = Some(graph),
-            (Err(error), Ok(graph)) => {
-                unsafe {
-                    library.cuda_graph_exec_destroy(graph)?;
-                }
-                return Err(error);
-            }
-            (Err(error), Err(_)) | (Ok(()), Err(error)) => return Err(error),
-        }
         Ok(value)
     }
     fn synchronize(&self) -> Result<()> {
@@ -325,9 +324,7 @@ impl<'a> DsparkWindow<'a> {
             self.stream
                 .library
                 .copy_h2d(self.descriptors.buffer, self.staging.bytes_mut())?;
-            self.stream
-                .library
-                .cuda_graph_launch(self.graph.context("cache graph missing")?, self.stream.raw)
+            self.enqueue()
         })();
         let drained = self.synchronize();
         if let Err(error) = launched.and(drained) {
@@ -407,14 +404,7 @@ impl<'a> DsparkWindow<'a> {
 }
 impl Drop for DsparkWindow<'_> {
     fn drop(&mut self) {
-        if let Err(error) = self.synchronize() {
-            tracing::error!(%error,"draining dSpark window");
-        }
-        if let Some(graph) = self.graph.take() {
-            if let Err(error) = unsafe { self.stream.library.cuda_graph_exec_destroy(graph) } {
-                tracing::error!(%error,"destroying dSpark window graph");
-            }
-        }
+        crate::shared::decode_graph::fatal_drain(self.synchronize(), "dSpark window");
     }
 }
 
@@ -475,11 +465,11 @@ mod reservation_tests {
         let first_write = window.prepare_async_write(&[chunk(first, 2)], 2)?;
         let second_write = window.prepare_async_write(&[chunk(second, 2)], 2)?;
         assert!(window.attention_read(&[(first, 2)]).is_err());
-        let ring = DeviceAllocation::new(&lib, V41DsparkCache::SLOT_BYTES)?;
+        let ring = DeviceAllocation::new(&lib, V41DsparkCache::SLOT_BYTES, crate::shared::memory::TEST)?;
         assert!(window.capture_ring(first, ring.buffer).is_err());
         assert!(window.release(first).is_err());
         assert_eq!(window.committed_end(first)?, Some(2));
-        let descriptors = [DeviceAllocation::new(&lib, cuteafd_core::V41_WRITE_DESCRIPTOR_BYTES)?, DeviceAllocation::new(&lib, cuteafd_core::V41_WRITE_DESCRIPTOR_BYTES)?];
+        let descriptors = [DeviceAllocation::new(&lib, cuteafd_core::V41_WRITE_DESCRIPTOR_BYTES, crate::shared::memory::TEST)?, DeviceAllocation::new(&lib, cuteafd_core::V41_WRITE_DESCRIPTOR_BYTES, crate::shared::memory::TEST)?];
         lib.copy_h2d(descriptors[0].buffer, first_write.descriptor_bytes())?;
         lib.copy_h2d(descriptors[1].buffer, second_write.descriptor_bytes())?;
         // Declare streams last: error unwinding drains them before tickets/buffers.

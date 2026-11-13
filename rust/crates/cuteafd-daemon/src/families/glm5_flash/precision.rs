@@ -1,6 +1,5 @@
-//! Header-only admission of the FP8 block consumers' inputs (MLA, dense and
-//! shared-expert projections): checkpoint E4M3 with FP32 128x128 scales, or
-//! BF16 quantized to those blocks at load (the FP8 copy is the only resident one).
+//! Header-only admission: selected native BF16 attention stays BF16; FP8 block
+//! consumers accept native E4M3/scales or BF16 quantized only when selected.
 use cuteafd_core::DType;
 use cuteafd_loader::families::glm5_flash::{GlmNextAttention, GlmNextConfig};
 use cuteafd_loader::plan::checkpoint::Checkpoint;
@@ -44,7 +43,7 @@ fn require(checkpoint: &Checkpoint, name: String, dtype: DType, shape: Vec<usize
     Ok(())
 }
 
-fn block(checkpoint: &Checkpoint, name: String, rows: usize, cols: usize,
+pub(super) fn block(checkpoint: &Checkpoint, name: String, rows: usize, cols: usize,
     consumer: &'static str) -> Result<(), ProjectionInputError> {
     let at = checkpoint.tensors.binary_search_by(|t| t.meta.name.cmp(&name))
         .map_err(|_| ProjectionInputError::Missing { name: name.clone() })?;
@@ -100,7 +99,11 @@ pub(crate) fn check_projection_inputs(primary: &Checkpoint,
                 ("o_proj.weight", h, v_width),
             ] {
                 let name = format!("{prefix}.self_attn.{suffix}");
-                if core.get_weight(&name).is_none() { block(primary, name, rows, cols, "MLA FP8 block projection")?; }
+                if core.get_weight(&name).is_some() { continue; }
+                let stem = name.strip_suffix(".weight").unwrap();
+                if core.native.get(stem).is_some_and(|p| !p.fp8) {
+                    require(primary, name, DType::Bf16, vec![rows, cols], 2, "native MLA BF16 projection")?;
+                } else { block(primary, name, rows, cols, "MLA FP8 block projection")?; }
             }
         }
         let dense = cfg.dense[layer];
@@ -117,6 +120,8 @@ pub(crate) fn check_projection_inputs(primary: &Checkpoint,
                 for scalar in ["weight_scale_2", "input_scale"] {
                     self::scalar(primary, format!("{name}.{scalar}"))?;
                 }
+            } else if core.native.get(&name).is_some_and(|p| !p.fp8) {
+                require(primary, format!("{name}.weight"), DType::Bf16, vec![rows, cols], 2, "native dense/shared BF16 MLP")?;
             } else {
                 block(primary, format!("{name}.weight"), rows, cols, "dense/shared FP8 block MLP")?;
             }
@@ -188,7 +193,7 @@ mod tests {
             }
         }
         tensors.sort_by(|a, b| a.meta.name.cmp(&b.meta.name));
-        (Checkpoint { snapshot: "/no-payload".into(), config: serde_json::Value::Null, quantize_config: None, weight_map: Default::default(),
+        (Checkpoint { view: None, snapshot: "/no-payload".into(), config: serde_json::Value::Null, quantize_config: None, weight_map: Default::default(),
             tensors, missing_shards: vec![], shard_bytes: 0 }, cfg)
     }
 
@@ -208,21 +213,22 @@ mod tests {
     }
 
     #[test]
-    fn direct_cli_bf16_is_admitted_for_block_quantization_at_load() {
+    fn direct_cli_bf16_preserves_native_projection_precision() {
         let (mut checkpoint, cfg) = fixture();
         widen_sources(&mut checkpoint);
         check_projection_inputs(&checkpoint, &cfg, cfg.layers).unwrap();
     }
 
     #[test]
-    fn other_source_formats_and_partial_bf16_blocks_are_named() {
+    fn unsupported_source_formats_are_named_and_native_bf16_needs_no_blocks() {
         let (mut checkpoint, cfg) = fixture();
         widen_sources(&mut checkpoint);
         let name = "model.language_model.layers.0.mlp.gate_proj.weight";
         checkpoint.tensors.iter_mut().find(|t| t.meta.name == name).unwrap().meta.dtype = DType::F16;
         let error = check_projection_inputs(&checkpoint, &cfg, cfg.layers).unwrap_err();
-        assert!(matches!(error, ProjectionInputError::Source { ref name, actual: DType::F16, .. }
-            if name == "model.language_model.layers.0.mlp.gate_proj.weight"), "{error}");
+        assert!(matches!(error, ProjectionInputError::Native(_)), "{error}");
+        assert!(error.to_string().contains(name.strip_suffix(".weight").unwrap())
+            && error.to_string().contains("F16"), "{error}");
         let (mut checkpoint, mut cfg) = fixture();
         widen_sources(&mut checkpoint);
         cfg.moe_intermediate = 2000;
@@ -233,8 +239,7 @@ mod tests {
                 t.meta.byte_length = s.iter().map(|&n| n as u64).product::<u64>() * 2;
             }
         }
-        assert!(matches!(check_projection_inputs(&checkpoint, &cfg, cfg.layers),
-            Err(ProjectionInputError::Blocks { .. })));
+        check_projection_inputs(&checkpoint, &cfg, cfg.layers).unwrap();
     }
 
     #[test]

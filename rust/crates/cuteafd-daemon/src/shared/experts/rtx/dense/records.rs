@@ -9,12 +9,13 @@ use crate::shared::fp8_load_quant::{LoadKernels, Target};
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::{CuteafdDeviceBuffer, NativeLibrary};
 use std::{ffi::c_void, ops::Range, os::unix::fs::FileExt, path::PathBuf};
+use crate::shared::memory::Tag;
 
 /// The most bytes one step stages (one or more whole scale units).
 pub(crate) use cuteafd_loader::shared::dense_read::STEP_BYTES;
 /// Preferred transform window; indivisible scale units still fit STEP_BYTES.
 pub(crate) const TRANSFORM_BYTES: usize = cuteafd_ffi::push_ring::DEFAULT_SLOT_BYTES;
-use cuteafd_loader::shared::dense_read::{ReadBatch, PINNED_FLOOR_BYTES};
+use cuteafd_loader::shared::dense_read::{MountLoad, ReadBatch, PINNED_FLOOR_BYTES};
 
 /// Rows `rows` of a checkpoint tensor (rows of `row_bytes` at `base` in `path`),
 /// bytes `cols` of each, packed row by row.
@@ -116,11 +117,43 @@ pub(crate) struct Operand {
     pub bytes: usize,
 }
 
+/// Unchanged rectangles landing directly in an existing resident pinned owner.
+#[derive(Clone)]
+pub(crate) struct HostOperand {
+    pub device: i32,
+    pub landing: crate::shared::memory::HostLanding,
+    pub rect: Rect,
+}
+impl HostOperand {
+    pub fn mount(&self) -> Result<()> {
+        self.landing.fill(|out| self.rect.read(out))?;
+        self.landing.ready.store(true, std::sync::atomic::Ordering::Release);
+        Ok(())
+    }
+}
+/// Record without reading, or use the mount only outside a SparkNest namespace.
+pub(crate) fn host_operand(operand: HostOperand, policy: super::super::push::PushPolicy) -> Result<()> {
+    ensure!(operand.rect.bytes() == operand.landing.bytes(), "host operand extent differs from owner");
+    let mut pending = Some(operand);
+    if recorded(|r| r.host_operands.push(pending.take().expect("one host operand"))) { return Ok(()); }
+    let operand = pending.expect("host operand");
+    match policy {
+        super::super::push::PushPolicy::Required => anyhow::bail!("SparkNest host embedding requires an admitted push group"),
+        super::super::push::PushPolicy::Mount => operand.mount(),
+    }
+}
+
 /// One GPU transform of a step's staged bytes (byte offsets are into the staging).
 #[derive(Clone)]
 pub(crate) enum Job {
     /// Staged bytes `at..at + bytes` copied unchanged to `dst`.
     Upload { at: usize, bytes: usize, dst: CuteafdDeviceBuffer },
+    /// V4.1 raw UE8M0 TP2 projection grid packed from bounded staging.
+    V41Scales { k: u32, n: u32, packed: CuteafdDeviceBuffer },
+    /// Raw UE8M0 block grid expanded by the family's existing AOT program.
+    BlockFp8Scales { family: &'static str, n_blocks: usize, k_blocks: usize, dst: CuteafdDeviceBuffer },
+    /// Staged I64 IDs narrowed on GPU, with checked range status.
+    NarrowI64I32 { dst: CuteafdDeviceBuffer },
     /// BF16 gate parameters converted by the checkpoint's host coefficient
     /// contract (no device transcendental rounding changes).
     ResidualGate { temperature: f32, alpha: CuteafdDeviceBuffer, beta: CuteafdDeviceBuffer },
@@ -247,7 +280,7 @@ impl Finish {
                     && k_major.is_none_or(|b| b.bytes >= rows * kb * 4 && b.device_id == grid.device_id)
                     && index.iter().all(|&r| r == u32::MAX || (r as usize + 1) * grid_cols * 4 <= grid.bytes),
                     "scale gather outside its operands");
-                let staged = crate::shared::memory::DeviceAllocation::new(library, rows * 4)?;
+                let staged = crate::shared::memory::DeviceAllocation::new(library, rows * 4, Tag::staging("experts/dense-scale-index"))?;
                 let bytes: Vec<u8> = index.iter().flat_map(|r| r.to_le_bytes()).collect();
                 library.copy_h2d(staged.buffer, &bytes)?;
                 // SAFETY: every buffer is live on the current device and sized as
@@ -318,8 +351,39 @@ pub(crate) struct Step {
     pub jobs: Vec<Job>,
 }
 
+impl Operand {
+    pub fn mount_load(&self) -> Result<MountLoad> {
+        let mut owner = MountLoad::default();
+        for (rect, _) in &self.lands {
+            owner.merge(MountLoad::read(ReadBatch::new(rect.rows.len(), rect.row_bytes, rect.width(), STEP_BYTES)?));
+        }
+        Ok(owner)
+    }
+}
+
 impl Step {
     pub fn bytes(&self) -> usize { self.rects.iter().map(Rect::bytes).sum() }
+
+    pub fn mount_load(&self) -> Result<MountLoad> {
+        let mut owner = MountLoad { pinned_source: self.bytes().max(PINNED_FLOOR_BYTES) as u64,
+            ..Default::default() };
+        for rect in &self.rects {
+            owner.merge(MountLoad::read(ReadBatch::new(rect.rows.len(), rect.row_bytes, rect.width(), usize::MAX)?));
+        }
+        for job in &self.jobs {
+            let bytes = match job {
+                Job::Quant { rows, layout, .. } => crate::shared::fp8_load_quant::quant_table_bytes(rows.len(), *layout)?,
+                Job::ScaleCodes { .. } => crate::shared::fp8_load_quant::scale_code_table_bytes(1)?,
+                // These transforms own additional non-retained host scratch;
+                // a MountLoad receipt must not silently claim to cover it.
+                Job::ResidualGate { .. } | Job::NarrowI64I32 { .. } =>
+                    anyhow::bail!("dense mount receipt does not cover this transform's host scratch"),
+                _ => 0,
+            };
+            owner.pinned_tables = owner.pinned_tables.max(bytes as u64);
+        }
+        Ok(owner)
+    }
 
     /// Runs the jobs on the current device (`device`) from `staged`; jobs that
     /// gather (expert and W8A16 packs) first copy the step into `scratch`, a
@@ -347,8 +411,7 @@ impl Step {
         let mut device_copy = |scratch: &mut Option<crate::shared::memory::DeviceAllocation<'l>>| -> Result<*const u8> {
             if let Some(ptr) = on_device { return Ok(ptr); }
             if scratch.is_none() {
-                *scratch = Some(crate::shared::memory::DeviceAllocation::named(library, STEP_BYTES,
-                    "staging/coordinator-dense-device")?);
+                *scratch = Some(crate::shared::memory::DeviceAllocation::new(library, STEP_BYTES, crate::shared::memory::tag(crate::shared::memory::MemoryKind::Staging, "staging/coordinator-dense-device"))?);
             }
             let buffer = scratch.as_ref().context("dense device scratch")?.buffer;
             load_timing::upload(self.bytes(), || library.copy_h2d(buffer, &staged[..self.bytes()]))?;
@@ -370,6 +433,52 @@ impl Step {
                     ensure!(at + bytes <= staged.len() && bytes <= dst.bytes, "upload outside its step");
                     load_timing::upload(bytes, || library.copy_h2d(CuteafdDeviceBuffer { bytes, ..dst },
                         &staged[at..at + bytes]))?;
+                }
+                Job::V41Scales { k, n, packed } => {
+                    ensure!(self.bytes() == k as usize * n as usize / 1024,
+                        "V4.1 projection scale staging extent differs");
+                    // Keep the projection loader's admitted raw-grid peak, not
+                    // the larger generic STEP_BYTES transform workspace.
+                    let source = crate::shared::memory::DeviceAllocation::new(library, self.bytes(),
+                        Tag::staging("v41/projection-scales"))?;
+                    load_timing::upload(self.bytes(), || library.copy_h2d(source.buffer, &staged[..self.bytes()]))?;
+                    Finish::V41Scales { capacity: 1, k, n, source: source.buffer, packed }
+                        .run_drained(library, stream)?;
+                }
+                Job::BlockFp8Scales { family, n_blocks, k_blocks, dst } => {
+                    let bytes = n_blocks.checked_mul(k_blocks).context("block scale grid overflow")?;
+                    ensure!(bytes == self.bytes() && bytes.checked_mul(512).is_some_and(|size| size <= dst.bytes),
+                        "block scale expansion outside its operands");
+                    let source = device_copy(scratch)?;
+                    let programs = library.programs()?;
+                    let program = programs.program(&format!("{family}_block_fp8_scale_prep"), &["scale", "scale_mma"])?;
+                    // SAFETY: the bounded source and expanded destination are live
+                    // on this device until the completion drain below.
+                    unsafe {
+                        program.launch(&[source.cast_mut().cast(), dst.ptr],
+                            &[cuteafd_ffi::programs::Scalar::I32(i32::try_from(n_blocks)?),
+                              cuteafd_ffi::programs::Scalar::I32(i32::try_from(k_blocks)?)], stream)?;
+                        library.cuda_stream_synchronize(stream)?;
+                    }
+                }
+                Job::NarrowI64I32 { dst } => {
+                    let bytes = self.bytes();
+                    ensure!(bytes > 0 && bytes % 8 == 0 && dst.bytes >= bytes / 2,
+                        "I64 narrowing outside its operands");
+                    let status = HostAllocation::new(library, 4, crate::shared::memory::tag(crate::shared::memory::MemoryKind::Staging, "staging/coordinator-dense-status"))?;
+                    let alias = library.cuda_host_buffer_device_alias(status.buffer)?;
+                    // SAFETY: pinned staging, aligned status and I32 destination
+                    // remain live through the drain before status is inspected.
+                    unsafe {
+                        library.load_narrow_i64_i32(staged.as_ptr().cast(), dst.ptr, bytes / 8, alias.ptr, stream)?;
+                        if let Err(error) = library.cuda_stream_synchronize(stream) {
+                            // The status is job-local: quarantine before it drops,
+                            // rather than waiting for Step::run's outer drain.
+                            library.quarantine_module_after_failed_drain();
+                            return Err(error);
+                        }
+                    }
+                    ensure!(status.bytes() == [0; 4], "checkpoint I64 router ID exceeds I32 range");
                 }
                 Job::NarrowF32Bf16 { at, bytes, dst } => {
                     ensure!(at + bytes <= staged.len() && bytes % 4 == 0 && dst.bytes >= bytes / 2,
@@ -579,7 +688,7 @@ impl DenseSink {
     }
     /// Every record, finishes included (leaves the sink empty).
     pub fn take_all(&self) -> Records {
-        Records { operands: self.operands.take(), steps: self.steps.take(), finishes: self.finishes.take(),
+        Records { host_operands: Vec::new(), operands: self.operands.take(), steps: self.steps.take(), finishes: self.finishes.take(),
             peer_copies: self.peer_copies.take() }
     }
 }
@@ -710,6 +819,7 @@ pub(crate) fn committed_peer_copies<T>(library: &NativeLibrary, delivered: Resul
 #[derive(Clone, Default)]
 pub(crate) struct Records {
     pub operands: Vec<Operand>,
+    pub host_operands: Vec<HostOperand>,
     pub steps: Vec<Step>,
     pub finishes: Vec<Finish>,
     pub peer_copies: Vec<PeerCopy>,
@@ -719,6 +829,7 @@ impl Records {
     /// `other`'s records after these (loader order).
     pub fn extend(&mut self, other: Records) {
         self.operands.extend(other.operands);
+        self.host_operands.extend(other.host_operands);
         self.steps.extend(other.steps);
         self.finishes.extend(other.finishes);
         self.peer_copies.extend(other.peer_copies);
@@ -747,13 +858,22 @@ impl Records {
 pub(crate) struct DenseLoad<'a> {
     library: &'a NativeLibrary,
     mount: std::cell::RefCell<Option<Mount<'a>>>,
+    admitted: std::cell::Cell<Option<MountLoad>>,
     pub sink: Option<DenseSink>,
 }
 
 impl<'a> DenseLoad<'a> {
-    pub fn mount(library: &'a NativeLibrary) -> Self { Self { library, mount: Default::default(), sink: None } }
+    pub fn mount(library: &'a NativeLibrary) -> Self {
+        Self { library, mount: Default::default(), admitted: Default::default(), sink: None }
+    }
     pub fn push(library: &'a NativeLibrary) -> Self {
-        Self { library, mount: Default::default(), sink: Some(Default::default()) }
+        Self { library, mount: Default::default(), admitted: Default::default(), sink: Some(Default::default()) }
+    }
+    pub fn admit_mount(&self, receipt: MountLoad) -> Result<()> {
+        ensure!(self.sink.is_none() && self.mount.borrow().is_none() && self.admitted.get().is_none(),
+            "dense mount receipt must be bound exactly once before loading");
+        self.admitted.set(Some(receipt));
+        Ok(())
     }
     pub fn pushing(&self) -> bool { self.sink.is_some() }
 
@@ -771,6 +891,7 @@ impl<'a> DenseLoad<'a> {
         let mut pending = Some(operand);
         if recorded(|r| r.operands.push(pending.take().expect("one operand"))) { return Ok(()); }
         let operand = pending.take().context("operand")?;
+        if let Some(receipt) = self.admitted.get() { receipt.validate(operand.mount_load()?)?; }
         let device = Device { library: self.library, id: operand.device };
         device.run(|| self.runner()?.operand(&operand))
     }
@@ -784,6 +905,7 @@ impl<'a> DenseLoad<'a> {
         let mut pending = Some(step);
         if recorded(|r| r.steps.push(pending.take().expect("one step"))) { return Ok(()); }
         let step = pending.take().context("step")?;
+        if let Some(receipt) = self.admitted.get() { receipt.validate(step.mount_load()?)?; }
         let device = Device { library: self.library, id: step.device };
         device.run(|| self.runner()?.step(&step, stream))
     }
@@ -817,8 +939,9 @@ pub(crate) struct Mount<'a> {
     staging: Option<HostAllocation<'a>>,
     /// The whole rows of the last partial-width read (column shares of one tensor).
     rows: Option<(Rect, Vec<u8>)>,
-    /// Per-GPU device scratch of gathering jobs.
-    scratch: std::collections::HashMap<i32, Option<crate::shared::memory::DeviceAllocation<'a>>>,
+    /// Gathering scratch must retire on its owning GPU, even if the mount
+    /// runner is released or unwound with another device current.
+    scratch: std::collections::HashMap<i32, crate::shared::memory::device::DeviceOwner<'a, Option<crate::shared::memory::DeviceAllocation<'a>>>>,
 }
 
 impl<'a> Mount<'a> {
@@ -852,7 +975,7 @@ impl<'a> Mount<'a> {
     fn grow(&mut self, bytes: usize) -> Result<()> {
         if self.staging.as_ref().is_none_or(|s| s.buffer.bytes < bytes) {
             drop(self.staging.take());
-            self.staging = Some(HostAllocation::named(self.library, bytes.max(PINNED_FLOOR_BYTES), "staging/coordinator-dense")?);
+            self.staging = Some(HostAllocation::new(self.library, bytes.max(PINNED_FLOOR_BYTES), crate::shared::memory::tag(crate::shared::memory::MemoryKind::Staging, "staging/coordinator-dense"))?);
         }
         Ok(())
     }
@@ -870,8 +993,13 @@ impl<'a> Mount<'a> {
         }
         if self.kernels.is_none() { self.kernels = Some(LoadKernels::new(self.library)?); }
         let kernels = self.kernels.as_mut().context("load kernels")?;
-        let scratch = self.scratch.entry(step.device).or_default();
-        step.run(kernels, self.library, &staging.bytes()[..bytes], stream, scratch)
+        let scratch = match self.scratch.entry(step.device) {
+            std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(Device { library: self.library, id: step.device }.own(|| Ok(None))?)
+            }
+        };
+        step.run(kernels, self.library, &staging.bytes()[..bytes], stream, scratch.get_mut())
     }
 }
 
@@ -892,6 +1020,7 @@ pub(crate) fn fill_by_mount(library: &NativeLibrary, operands: &[Operand], steps
 /// [`fill_by_mount`] for a whole record set, then its finishes.
 pub(crate) fn fill_records_by_mount(library: &NativeLibrary, records: &Records,
     stream: impl Fn(i32) -> *mut c_void) -> Result<()> {
+    for host in &records.host_operands { host.mount()?; }
     fill_by_mount(library, &records.operands, &records.steps, &stream)?;
     records.run_finishes(library, stream)?;
     run_peer_copies(library, &records.peer_copies)
@@ -900,6 +1029,89 @@ pub(crate) fn fill_records_by_mount(library: &NativeLibrary, records: &Records,
 
 #[cfg(test)]
 mod window_tests {
+    #[test]
+    fn mount_scratch_drops_on_each_owning_device() -> anyhow::Result<()> {
+        use super::*;
+        use crate::shared::memory::device::Allocation;
+        let fixture = cuteafd_ffi::native_library_lifetime_fixture::Fixture::build_for_tests()?;
+        let library = fixture.load()?;
+        fixture.immediate_copies(&library)?;
+        fixture.strict_device_free(&library, true)?;
+        let capacity = STEP_BYTES * 2;
+        for id in 0..2 { fixture.configure_memory(&library, id, capacity)?; }
+        let dir = tempfile::tempdir_in(fixture.directory())?;
+        let path = dir.path().join("tiles.bin");
+        let bytes = (0..1024).map(|i| (i * 29 % 251) as u8).collect::<Vec<_>>();
+        std::fs::write(&path, &bytes)?;
+        // No arenas: reproduce the shared mount lifetime on two physical devices.
+        let outputs = (0..2).map(|id| Allocation::new(Device { library: &library, id }, bytes.len(), crate::shared::memory::TEST))
+            .collect::<Result<Vec<_>>>()?;
+        let steps = outputs.iter().map(|output| Step {
+            device: output.device.id,
+            rects: vec![Rect { name: "tiles".into(), path: path.clone(), base: 0,
+                row_bytes: 128, rows: 0..8, cols: 0..128 }],
+            jobs: vec![Job::TrellisTiles { rows: 8, k0: 0, tiles: 8, tile_bytes: 16,
+                k16: 8, input: false, dst: output.buffer }],
+        }).collect::<Vec<_>>();
+        for ambient in 0..2 {
+            for cleanup in ["drop", "release", "error", "fallback"] {
+                library.cuda_set_device(ambient)?;
+                if cleanup == "fallback" {
+                    fill_by_mount(&library, &[], &steps, |_| std::ptr::null_mut())?;
+                } else {
+                    let result = (|| -> Result<()> {
+                        let dense = DenseLoad::mount(&library);
+                        for step in &steps { dense.step(step.clone(), std::ptr::null_mut())?; }
+                        if cleanup == "release" { dense.release(); }
+                        if cleanup == "error" {
+                            let mut invalid = steps[1].clone();
+                            invalid.rects[0].path = dir.path().join("missing.bin");
+                            dense.step(invalid, std::ptr::null_mut())?;
+                        }
+                        Ok(())
+                    })();
+                    assert_eq!(result.is_err(), cleanup == "error");
+                }
+                assert_eq!(library.cuda_get_device()?, ambient, "{cleanup} restores caller device");
+                assert_eq!(fixture.device_free_mismatch(&library)?, (0, -1, -1),
+                    "{cleanup} with ambient GPU{ambient}");
+                for output in &outputs {
+                    let free = output.device.run(|| library.cuda_physical_memory_info())?.0;
+                    assert_eq!(free, capacity - bytes.len(), "{cleanup} releases all scratch");
+                    let mut actual = vec![0; bytes.len()];
+                    output.device.run(|| library.copy_d2h(&mut actual, output.buffer))?;
+                    assert_eq!(actual, bytes, "{cleanup} keeps gathered contents");
+                }
+            }
+        }
+        drop(outputs);
+        assert_eq!(fixture.device_free_mismatch(&library)?, (0, -1, -1));
+        for id in 0..2 {
+            assert_eq!(Device { library: &library, id }.run(|| library.cuda_physical_memory_info())?.0, capacity);
+        }
+        Ok(())
+    }
+    #[test]
+    fn mount_load_records_charge_partial_rows_and_quant_tables() -> anyhow::Result<()> {
+        use super::*;
+        let rect = Rect { name: "o_proj.weight".into(), path: "/not-opened".into(), base: 0,
+            row_bytes: 32768, rows: 0..2048, cols: 0..16384 };
+        let buffer = CuteafdDeviceBuffer { bytes: 32 << 20, device_id: 0, ..Default::default() };
+        let operand = Operand { device: 0, buffer, lands: vec![(rect.clone(), 0)], bytes: 32 << 20 };
+        let expected = MountLoad { pinned_source: 32 << 20, full_row_cache: 64 << 20, pinned_tables: 0 };
+        assert_eq!(operand.mount_load()?, expected);
+        let step = Step { device: 0, rects: vec![rect], jobs: vec![Job::Quant {
+            rows: 0..2048, pitch: 8192, col0: 0, cols: 8192,
+            layout: crate::shared::fp8_load_quant::Layout::Block,
+            rule: crate::shared::fp8_linear::Fp8Scales::Amax,
+            target: Target { q: buffer, q_stride: 8192, scales: buffer, kmajor: None },
+        }] };
+        let actual = step.mount_load()?;
+        assert_eq!(actual, MountLoad { pinned_tables: 1 << 20, ..expected });
+        assert!(expected.validate(actual).is_err());
+        actual.validate(operand.mount_load()?)?;
+        Ok(())
+    }
     use super::*;
 
     #[test]
@@ -910,9 +1122,9 @@ mod window_tests {
         for id in 0..2 { fixture.configure_memory(&library, id, 1 << 30)?; }
         fixture.immediate_copies(&library)?;
         let source = Device { library: &library, id: 1 }.run(||
-            crate::shared::memory::DeviceAllocation::new(&library, 256))?;
+            crate::shared::memory::DeviceAllocation::new(&library, 256, crate::shared::memory::TEST))?;
         let destination = Device { library: &library, id: 0 }.run(||
-            crate::shared::memory::DeviceAllocation::new(&library, 256))?;
+            crate::shared::memory::DeviceAllocation::new(&library, 256, crate::shared::memory::TEST))?;
         let bytes: Vec<_> = (0..256).map(|i| (i as u8).wrapping_mul(29)).collect();
         let untouched = vec![0xa5; 256];
         library.copy_h2d(source.buffer, &bytes)?;
@@ -1005,6 +1217,72 @@ mod absorb_fp8_tests {
     use super::*;
     use cuteafd_ffi::native_library_lifetime_fixture::Fixture;
 
+    #[test]
+    #[ignore = "requires an allocated CPU build slot and explicit NVMe fixture directory"]
+    fn checked_i64_ids_replay_exactly_and_reject_overflow() -> Result<()> {
+        let fixture = Fixture::build()?;
+        let library = fixture.load()?;
+        fixture.configure_memory(&library, 0, 1 << 30)?;
+        fixture.immediate_copies(&library)?;
+        let device = Device { library: &library, id: 0 };
+        let dir = tempfile::tempdir_in(fixture.directory())?;
+        let path = dir.path().join("router.bin");
+        for values in [vec![i64::from(i32::MIN), -1, 0, i64::from(i32::MAX)],
+            vec![i64::from(i32::MAX) + 1], vec![i64::from(i32::MIN) - 1]] {
+            let valid = values.iter().all(|&value| i32::try_from(value).is_ok());
+            std::fs::write(&path, values.iter().flat_map(|value| value.to_le_bytes()).collect::<Vec<_>>())?;
+            let output = crate::shared::memory::DeviceAllocation::new(&library, values.len() * 4, crate::shared::memory::TEST)?;
+            let rect = Rect { name: "router".into(), path: path.clone(), base: 0,
+                row_bytes: 8, rows: 0..values.len(), cols: 0..8 };
+            let step = Step { device: 0, rects: vec![rect], jobs: vec![Job::NarrowI64I32 { dst: output.buffer }] };
+            let (_, records) = recording(|| DenseLoad::mount(&library).step(step, std::ptr::null_mut()))?;
+            assert_eq!(records.steps.len(), 1);
+            let layout = super::super::RankLayout::new(records.operands, records.steps, 0)?;
+            assert_eq!(layout.host_staging.table_bytes, 4);
+            let replay = super::super::testing::replay(device, layout, dir.path(), 1, 0);
+            if valid {
+                replay?;
+                let mut actual = vec![0; values.len() * 4];
+                library.copy_d2h(&mut actual, output.buffer)?;
+                let expected = values.iter().flat_map(|&value| i32::try_from(value).unwrap().to_le_bytes()).collect::<Vec<_>>();
+                assert_eq!(actual, expected);
+            } else {
+                assert!(format!("{:#}", replay.unwrap_err()).contains("I64 router ID exceeds I32 range"));
+                assert!(!library.is_quarantined_after_failed_drain(), "a drained range error is recoverable");
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires an allocated CPU build slot and explicit NVMe fixture directory"]
+    fn i64_status_survives_a_first_drain_failure() -> Result<()> {
+        let fixture = Fixture::build()?;
+        let library = fixture.load()?;
+        fixture.configure_memory(&library, 0, 1 << 30)?;
+        let mut source = HostAllocation::new(&library, 8, crate::shared::memory::TEST)?;
+        source.bytes_mut().copy_from_slice(&1i64.to_le_bytes());
+        let output = crate::shared::memory::DeviceAllocation::new(&library, 4, crate::shared::memory::TEST)?;
+        let step = Step { device: 0, rects: vec![Rect { name: "router".into(),
+            path: fixture.directory().join("unused"), base: 0, row_bytes: 8, rows: 0..1, cols: 0..8 }],
+            jobs: vec![Job::NarrowI64I32 { dst: output.buffer }] };
+        let mut kernels = LoadKernels::new(&library)?;
+        fixture.configure_pack(&library, 0, 1)?;
+        fixture.configure_drain_after(&library, 0)?;
+        let before = fixture.events()?.len();
+        let result = step.run(&mut kernels, &library, source.bytes(), std::ptr::null_mut(), &mut None);
+        assert!(result.is_err());
+        assert!(library.is_quarantined_after_failed_drain());
+        drop(output);
+        drop(source);
+        let events = fixture.events()?;
+        let events = &events[before..];
+        assert!(events.contains('A'), "the job allocated its mapped status: {events}");
+        assert_eq!(events.matches('S').count(), 2, "first drain and outer error drain: {events}");
+        assert!(!events.contains('F'), "neither status nor pinned source can be freed: {events}");
+        Ok(())
+    }
+
     /// GLM 5.3 head geometry (448 rows per head spans 3.5 grid blocks), the
     /// second of two ranks, staged through the mount: every byte and scale
     /// matches the loader's host rule (`weights::GlmLoader::kv_b`).
@@ -1026,7 +1304,7 @@ mod absorb_fp8_tests {
         std::fs::write(&path, [kv_b.as_slice(), grid_bytes.as_slice()].concat())?;
         let (share, rank) = (heads / 2, 1usize);
         let first = rank * share * (nope + v);
-        let alloc = |bytes: usize| crate::shared::memory::DeviceAllocation::new(&library, bytes);
+        let alloc = |bytes: usize| crate::shared::memory::DeviceAllocation::new(&library, bytes, crate::shared::memory::TEST);
         let (uk, uk_s) = (alloc(share * lat * nope)?, alloc(share * lat * (nope / 64) * 4)?);
         let (uv, uv_s) = (alloc(share * v * lat)?, alloc(share * v * (lat / 64) * 4)?);
         let values = Rect { name: "kv_b".into(), path: path.clone(), base: 0, row_bytes: lat,

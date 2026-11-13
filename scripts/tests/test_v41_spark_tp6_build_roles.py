@@ -4,7 +4,7 @@ the `write-v41-expert-tp-manifest.py` role table.
 
 No hardware, Docker, SSH, cmake or cargo is touched. The test extracts the real
 role-selection block from each script by its boundary comments, sources the real
-`scripts/lib/release-common.sh` for `release_die`/`release_spark_topology_explicit`,
+`scripts/lib/release-common.sh` for `release_die`,
 and runs the block in bash under a matrix of configurations. A change to the
 allowlist, the default set or the multi-role syntax fails here rather than at
 release time.
@@ -27,6 +27,7 @@ cannot pass silently.
 """
 from __future__ import annotations
 
+import importlib.util
 import json
 import subprocess
 import sys
@@ -46,7 +47,7 @@ UNIVERSAL = "tp2;tp3;tp5;tp6;tp7;tp8"
 # its dry-run exit. wip.sh names the WIP role variable in its usage text earlier in
 # the file, so its block is located from the right.
 BUILD_START = "# release-spark-tp-roles:start"
-WIP_START = "# Opt-in replicated-group Spark expert roles"
+WIP_START = "# Opt-in Spark expert roles"
 BLOCK_END = "if ((dry_run)); then"
 
 
@@ -63,7 +64,7 @@ def _role_block(script: Path = BUILD, *, variable: str = "spark_tp_roles",
     return block
 
 
-def _run(script: Path, spark_tp: str, override: str | None, *, variable: str,
+def _run(script: Path, override: str | None, *, variable: str,
          env_name: str, block: str) -> subprocess.CompletedProcess:
     harness = f"""
 set -euo pipefail
@@ -71,13 +72,7 @@ source "{RELEASE_COMMON}"
 {block}
 printf 'ROLES=%s\\n' "${{{variable}}}"
 """
-    env = {
-        "PATH": "/usr/bin:/bin:/usr/local/bin",
-        "SPARK_TP": spark_tp,
-        # `release_spark_topology_explicit` reads SPARK_EP under `set -u`; an
-        # explicit topology always sets it, so mirror that here.
-        "SPARK_EP": "1" if spark_tp else "",
-    }
+    env = {"PATH": "/usr/bin:/bin:/usr/local/bin"}
     # An unset override means "use the script's own default"; a set override is the
     # documented escape hatch, and an empty one is the explicit legacy request.
     if override is not None:
@@ -88,13 +83,13 @@ printf 'ROLES=%s\\n' "${{{variable}}}"
     )
 
 
-def _run_roles(spark_tp: str, override: str | None) -> subprocess.CompletedProcess:
-    return _run(BUILD, spark_tp, override, variable="spark_tp_roles",
+def _run_roles(override: str | None) -> subprocess.CompletedProcess:
+    return _run(BUILD, override, variable="spark_tp_roles",
                 env_name="CUTEAFD_RELEASE_SPARK_TP_ROLES", block=_role_block())
 
 
-def _run_wip_roles(spark_tp: str, override: str | None) -> subprocess.CompletedProcess:
-    return _run(WIP, spark_tp, override, variable="wip_spark_tp_roles",
+def _run_wip_roles(override: str | None) -> subprocess.CompletedProcess:
+    return _run(WIP, override, variable="wip_spark_tp_roles",
                 env_name="CUTEAFD_WIP_SPARK_TP_ROLES",
                 block=_role_block(WIP, variable="wip_spark_tp_roles", last=True,
                                   marker=WIP_START))
@@ -105,10 +100,9 @@ def _roles(result: subprocess.CompletedProcess) -> str:
     return result.stdout.rstrip().splitlines()[-1].removeprefix("ROLES=")
 
 
-@pytest.mark.parametrize("spark_tp", ["", "2", "3", "4", "6"])
-def test_build_release_default_is_universal(spark_tp) -> None:
-    """No configured topology may narrow what a published image can serve."""
-    assert _roles(_run_roles(spark_tp, None)) == UNIVERSAL
+def test_build_release_default_is_universal() -> None:
+    """No configuration may narrow what a published image can serve."""
+    assert _roles(_run_roles(None)) == UNIVERSAL
 
 
 @pytest.mark.parametrize(
@@ -122,39 +116,28 @@ def test_build_release_default_is_universal(spark_tp) -> None:
     ],
 )
 def test_build_release_subset_escape_hatch(override, expected) -> None:
-    assert _roles(_run_roles("4", override)) == expected
+    assert _roles(_run_roles(override)) == expected
 
 
 def test_build_rejects_an_unknown_role_with_a_clear_error() -> None:
-    result = _run_roles("", "tp9")
+    result = _run_roles("tp9")
     assert result.returncode == 2, result.stdout
     assert "accepts only tp2, tp3, tp5, tp6, tp7 and tp8" in result.stderr
     assert "tp9" in result.stderr
 
 
 @pytest.mark.parametrize(
-    "spark_tp,override,expected",
-    [
-        ("", None, UNIVERSAL),
-        ("4", None, UNIVERSAL),
-        ("6", None, UNIVERSAL),
-        ("2", None, UNIVERSAL),
-        ("3", None, UNIVERSAL),
-        ("3", "", ""),
-        ("6", "", ""),
-        ("", UNIVERSAL, UNIVERSAL),
-        ("", "tp6", "tp6"),
-        ("4", UNIVERSAL, UNIVERSAL),
-    ],
+    "override,expected",
+    [(None, UNIVERSAL), ("", ""), (UNIVERSAL, UNIVERSAL), ("tp6", "tp6")],
 )
-def test_wip_role_selection_matrix(spark_tp, override, expected) -> None:
+def test_wip_role_selection_matrix(override, expected) -> None:
     """WIP shares release defaults and validation, with a subset escape hatch."""
-    result = _run_wip_roles(spark_tp, override)
+    result = _run_wip_roles(override)
     assert _roles(result) == expected
 
 
 def test_wip_rejects_an_unknown_role_and_names_the_wip_variable() -> None:
-    result = _run_wip_roles("", "tp9")
+    result = _run_wip_roles("tp9")
     assert result.returncode == 2, result.stdout
     assert "CUTEAFD_WIP_SPARK_TP_ROLES accepts only tp2, tp3, tp5, tp6, tp7 and tp8" in result.stderr
 
@@ -165,11 +148,10 @@ def test_wip_subset_is_always_contained_in_the_release_default() -> None:
     The parity that matters is containment: every role a slot resolves must also be
     baked into the published image, so a slot result transfers to the release path.
     """
-    release = set(_roles(_run_roles("", None)).split(";")) - {""}
+    release = set(_roles(_run_roles(None)).split(";")) - {""}
     assert release == set(UNIVERSAL.split(";"))
-    for spark_tp in ("2", "3", "4", "6"):
-        slot = set(_roles(_run_wip_roles(spark_tp, None)).split(";")) - {""}
-        assert slot <= release, (spark_tp, slot, release)
+    slot = set(_roles(_run_wip_roles(None)).split(";")) - {""}
+    assert slot <= release, (slot, release)
 
 
 @pytest.mark.parametrize("tp,width", [(3, 768), (6, 384)])
@@ -243,10 +225,18 @@ def _write_export(directory: Path, role: str) -> Path:
     return path
 
 
-def test_manifest_writer_accepts_tp6_and_rejects_a_wrong_extent(tmp_path: Path) -> None:
-    role = "tp6"
+@pytest.mark.parametrize("role,width,wrong_width", [
+    ("tp2", 1152, 200),
+    ("tp3", 768, 200),
+    ("tp6", 384, 200),
+    ("tp8", 288, 200),
+    ("tp8", 288, 384),
+])
+def test_manifest_writer_accepts_native_width_and_rejects_a_wrong_extent(
+    tmp_path: Path, role: str, width: int, wrong_width: int,
+) -> None:
     export_dir = tmp_path / f"v41_spark_{role}_experts"
-    _write_export(export_dir, "spark_tp6")
+    _write_export(export_dir, f"spark_{role}")
     output = tmp_path / "V41_EXPERT_TP_AOT.json"
     # The writer requires the built library whenever a role is requested; a stub
     # file exercises the hash/validation path without any native build.
@@ -264,15 +254,15 @@ def test_manifest_writer_accepts_tp6_and_rejects_a_wrong_extent(tmp_path: Path) 
     result = invoke()
     assert result.returncode == 0, result.stderr
     document = json.loads(output.read_text(encoding="utf-8"))
-    assert document["spark_tp_roles"] == ["tp6"]
-    assert document["manifests"]["tp6"]["spark_tp_degree"] == 6
-    assert document["manifests"]["tp6"]["geometry"]["intermediate"] == 384
-    assert document["manifests"]["tp6"]["geometry"]["kernel_intermediate"] == 384
+    assert document["spark_tp_roles"] == [role]
+    assert document["manifests"][role]["spark_tp_degree"] == int(role.removeprefix("tp"))
+    assert document["manifests"][role]["geometry"]["intermediate"] == width
+    assert document["manifests"][role]["geometry"]["kernel_intermediate"] == width
 
-    # A geometry that disagrees with the official 384 must fail closed.
+    # Reject both malformed K32 extents and stale H128 padding.
     manifest_path = export_dir / "v41_experts.json"
     payload = json.loads(manifest_path.read_text(encoding="utf-8"))
-    payload["geometry"]["kernel_intermediate"] = 640
+    payload["geometry"]["kernel_intermediate"] = wrong_width
     manifest_path.write_text(json.dumps(payload), encoding="utf-8")
     failed = invoke()
     assert failed.returncode == 2
@@ -344,3 +334,55 @@ def test_ml4_adjacent_width_roles_do_not_claim_v41_degree_objects(tmp_path: Path
     assert document["spark_tp_roles"] == []
     assert document["manifests"] == {}
     assert document["symbols_verified"] is False
+
+
+def _write_width_package(directory: Path, artifact) -> None:
+    import hashlib
+
+    directory.mkdir(parents=True, exist_ok=True)
+    variants, hashes = [], {}
+    for capacity in CAPACITIES:
+        obj = directory / f"v41_{artifact.name}_m{capacity}.o"
+        obj.write_bytes(f"{artifact.name}-{capacity}\n".encode())
+        variants.append({"name": obj.stem, "capacity_rows": capacity})
+        hashes[obj.name] = hashlib.sha256(obj.read_bytes()).hexdigest()
+    (directory / "v41_experts.json").write_text(json.dumps({
+        "schema": 1, "capability": [12, 1], "role": artifact.name, "family": "v41",
+        "geometry": {"experts": 384, "hidden": 5120, "intermediate": artifact.logical,
+                     "kernel_intermediate": artifact.stored, "topk": 6},
+        "variants": variants, "artifact_sha256": hashes, "decode_capacities": [1, 16, 64]}))
+
+
+def _width_artifacts(world: int):
+    spec = importlib.util.spec_from_file_location("width_spark_packages", REPO / "python/tools/lib/spark_packages.py")
+    packages = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(packages)
+    return packages.native_spark_artifacts("v41")[world]
+
+
+@pytest.mark.parametrize("world", [5, 7])
+def test_unequal_v41_worlds_are_attested_only_by_their_complete_width_packages(tmp_path: Path, world: int) -> None:
+    """A V4.1 TP5/TP7 image advertises its role exactly when every adjacent-width
+    package the world loads is present and valid; a partial set fails the build,
+    so preflight can never pass a world that would fail at worker startup."""
+    library = tmp_path / "libcuteafd_native.so"
+    library.write_bytes(b"stub")
+    output = tmp_path / "V41_EXPERT_TP_AOT.json"
+    command = [sys.executable, str(MANIFEST), "--role", "expert", "--requested", f"tp{world}",
+               "--native-build-dir", str(tmp_path), "--native-library", str(library), "--output", str(output)]
+    artifacts = _width_artifacts(world)
+    assert len(artifacts) == 2 and all(a.name.startswith("spark_w") for a in artifacts)
+    _write_width_package(tmp_path / f"v41_{artifacts[0].name}_experts", artifacts[0])
+    partial = subprocess.run(command, capture_output=True, text=True, timeout=60)
+    assert partial.returncode == 2 and "needs width packages" in partial.stderr, partial.stderr
+    _write_width_package(tmp_path / f"v41_{artifacts[1].name}_experts", artifacts[1])
+    result = subprocess.run(command, capture_output=True, text=True, timeout=60)
+    assert result.returncode == 0, result.stderr
+    document = json.loads(output.read_text())
+    assert document["spark_tp_roles"] == [f"tp{world}"]
+    assert sorted(document["manifests"][f"tp{world}"]["width_packages"]) == sorted(a.name for a in artifacts)
+    # A corrupted width object is refused, not advertised.
+    victim = next((tmp_path / f"v41_{artifacts[1].name}_experts").glob("*.o"))
+    victim.write_bytes(b"corrupt")
+    corrupt = subprocess.run(command, capture_output=True, text=True, timeout=60)
+    assert corrupt.returncode == 2 and "does not match its hash" in corrupt.stderr

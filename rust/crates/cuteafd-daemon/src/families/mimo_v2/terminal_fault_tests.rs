@@ -75,8 +75,8 @@ fn run_case(label: &str, captured: bool, lanes: usize, injected: u32, serving: b
     )?;
     let weights = MimoWeights {
         layers: vec![],
-        norm: DeviceAllocation::new(&library, 256)?,
-        head: super::super::head::MimoHead::Bf16(DeviceAllocation::new(&library, 256)?),
+        norm: DeviceAllocation::new(&library, 256, crate::shared::memory::TEST)?,
+        head: super::super::head::MimoHead::Bf16(DeviceAllocation::new(&library, 256, crate::shared::memory::TEST)?),
         output_fp8: false,
     };
     let mut engine = ManuallyDrop::new(MimoEngine::new(
@@ -171,7 +171,7 @@ fn run_case(label: &str, captured: bool, lanes: usize, injected: u32, serving: b
                     library.cuda_graph_begin_capture(engine.stream_of(rank))?;
                 }
                 queue(rank)?;
-                unsafe { library.cuda_graph_end_capture(engine.stream_of(rank)) }
+                unsafe { library.cuda_graph_end_capture_for_test(engine.stream_of(rank)) }
             })?;
             let key = GraphKey {
                 layer: 0,
@@ -182,7 +182,7 @@ fn run_case(label: &str, captured: bool, lanes: usize, injected: u32, serving: b
             };
             let graph = GraphExec(exec, &library);
             if rank == 0 {
-                engine.graphs.borrow_mut().insert(key, graph);
+                engine.graphs.borrow_mut().insert(key, graph, None);
             } else {
                 engine
                     .peer
@@ -190,7 +190,7 @@ fn run_case(label: &str, captured: bool, lanes: usize, injected: u32, serving: b
                     .unwrap()
                     .graphs
                     .borrow_mut()
-                    .insert(key, graph);
+                    .insert(key, graph, None);
             }
             engine.on(rank, || {
                 // SAFETY: captured exec and bound owners remain in the engine.
@@ -275,7 +275,7 @@ fn run_case(label: &str, captured: bool, lanes: usize, injected: u32, serving: b
         "device/pinned owners freed before shutdown result: {frees:?}"
     );
     if let Some(error) = &error {
-        ensure!(error.downcast_ref::<TerminalStepError>().is_some(), "typed primary submission error lost: {error:#}");
+        ensure!(StepFailure::is_terminal(error), "typed primary submission error lost: {error:#}");
     }
     if serving && injected == 0 {
         ensure!(late_frees[0] >= 3 && late_frees[1] >= 2, "serving owners were never released after drainage: {late_frees:?}");

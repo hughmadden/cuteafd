@@ -1,7 +1,8 @@
 //! Draft transformer chain with optional shared embedding and terminal heads.
 use crate::shared::decode_graph::{fatal_drain, GraphBank, GraphOwner};
 use super::{DsparkStage, DsparkTerminal, DsparkWeights};
-use crate::families::deepseek_v41::v41_dspark_cache::{DsparkWindow, WindowLease, WindowRead};
+use crate::families::deepseek_v41::v41_dspark_cache::{DsparkWindow, WindowGeometry, WindowLease, WindowRead};
+use crate::shared::memory::Tag;
 use crate::shared::memory::{DeviceAllocation, HostAllocation, LoadStream};
 use crate::families::deepseek_v41::v41_tensors::{NativeRtxTensors, VocabularyHead};
 use anyhow::{ensure, Context, Result};
@@ -10,6 +11,63 @@ use cuteafd_ffi::{CuteafdDeviceBuffer, V41AttentionOps};
 use std::ffi::c_void;
 mod distributed;
 pub(crate) use distributed::DistributedDsparkChain;
+
+pub(crate) type GraphVisitor<'f> = dyn FnMut(i32, &'static str, bool,
+    &mut dyn crate::shared::decode_graph::CacheAttached) -> Result<()> + 'f;
+
+pub(super) fn warn_topology(error: Option<String>) {
+    if let Some(error) = error {
+        tracing::warn!(%error, "dSpark graph topology unavailable; disabling chain reuse");
+    }
+}
+
+/// Whether an error is a device/driver failure (a native-library status return)
+/// rather than a host-side invariant failure. Only device failures are terminal
+/// for a draft chain: a CPU-side guard must not latch the lane.
+pub(crate) fn is_device_failure(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| cause.is::<cuteafd_ffi::NativeStatusError>())
+}
+
+/// Keep the device-tagged cause when only one side has it, and carry the other
+/// as context so neither failure is lost.
+pub(crate) fn prefer_device(first: anyhow::Error, second: anyhow::Error) -> anyhow::Error {
+    if is_device_failure(&second) && !is_device_failure(&first) {
+        second.context(format!("first failure: {first:#}"))
+    } else {
+        first.context(format!("second failure: {second:#}"))
+    }
+}
+
+/// Combine a launch result with the drain or capture result that follows it.
+/// Both are inspected: a plain launch error must not hide a tagged device error
+/// from the drain, which is what the liveness gate classifies on.
+pub(crate) fn settle(launched: Result<()>, drained: Result<()>) -> Result<()> {
+    match (launched, drained) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+        (Err(first), Err(second)) => Err(prefer_device(first, second)),
+    }
+}
+
+/// A sticky terminal failure for a draft chain. A CUDA or replay error is not
+/// recoverable in-process, so the lane must fail the round instead of falling
+/// back to anchors forever with the error masked. Host-side invariant failures
+/// are deliberately not recorded: they are recoverable and must not latch.
+#[derive(Default)]
+pub(crate) struct DraftFailure(Option<String>);
+impl DraftFailure {
+    pub(crate) fn record(&mut self, error: &anyhow::Error) {
+        if self.0.is_none() && is_device_failure(error) { self.0 = Some(format!("{error:#}")); }
+    }
+    pub(crate) fn check(&self, what: &str) -> Result<()> {
+        match &self.0 {
+            Some(reason) => anyhow::bail!("{what} failed until restart: {reason}"),
+            None => Ok(()),
+        }
+    }
+    #[cfg(test)]
+    pub(crate) fn is_failed(&self) -> bool { self.0.is_some() }
+}
 
 pub(crate) struct DsparkChain<'weights, 'library> {
     stream: LoadStream<'library>,
@@ -29,6 +87,8 @@ pub(crate) struct DsparkChain<'weights, 'library> {
     token_count: Option<usize>,
     terminal: Option<DsparkTerminal<'weights, 'library>>,
     ops: V41AttentionOps<'library>,
+    /// A CUDA/replay failure is terminal for this chain.
+    failure: DraftFailure,
 }
 /// Own reservations before the first upload. Errors and unwinding drain before
 /// pinned inputs or cache ring slots may be reused. Successful polls disarm it.
@@ -90,12 +150,9 @@ impl<'library> DsparkWeights<'library> {
         requests: u32,
         budget: usize,
     ) -> Result<DsparkChain<'weights, 'library>> {
-        ensure!(
-            embedding.get("embed.weight")?.bytes == 129280 * 5120 * 2,
-            "invalid shared embedding extent"
-        );
+        let (table_bytes, table_device) = embedding.embedding_layout()?;
+        ensure!(table_bytes == 129280 * 5120 * 2, "invalid shared embedding extent");
         let mut chain = self.chain(requests, budget)?;
-        let table_device = embedding.get("embed.weight")?.device_id;
         if table_device != chain.tokens.buffer.device_id {
             // Plan peer access once. Draft graphs only read the shared table;
             // tokens, residuals and all transformer work stay on this device.
@@ -129,13 +186,14 @@ impl<'library> DsparkWeights<'library> {
             graphs: GraphBank::new(None),
             ready: None,
             pending: None,
-            download: HostAllocation::new(library, requests as usize * (2 * self.draft_width + 1) * 4)?,
+            download: HostAllocation::new(library, requests as usize * (2 * self.draft_width + 1) * 4, Tag::staging("v41/draft-chain"))?,
             embedding: None,
-            tokens: DeviceAllocation::new(library, requests as usize * 4)?,
-            token_staging: HostAllocation::new(library, requests as usize * 4)?,
+            tokens: DeviceAllocation::new(library, requests as usize * 4, Tag::drafter_workspace("v41/draft-chain"))?,
+            token_staging: HostAllocation::new(library, requests as usize * 4, Tag::staging("v41/draft-chain"))?,
             token_count: None,
             terminal: None,
             ops: library.v41_attention_ops_width(self.draft_width)?,
+            failure: DraftFailure::default(),
         })
     }
 }
@@ -159,6 +217,28 @@ impl DsparkChain<'_, '_> {
         self.invalidate();
         self.terminal.as_mut().context("dSpark chain has no terminal")?
             .stage_sampling(rngs, temperatures)
+    }
+    pub(crate) fn capture_startup(&mut self, windows: [&DsparkWindow<'_>; 3]) -> Result<()> {
+        ensure!(self.pending.is_none() && self.ready.is_none(), "draft startup requires idle owner");
+        self.synchronize()?;
+        let geometry = windows.map(DsparkWindow::startup_geometry);
+        ensure!(geometry.iter().all(|g| g.ring.device_id == self.tokens.buffer.device_id),
+            "draft startup ring device differs");
+        let counts = self.tokens.buffer.bytes / 4;
+        let entries = cuteafd_loader::serving_capacity::v41_graphs::v41_prewarm_drafts(crate::families::deepseek_v41::graph_policy::ranks(), self.tokens.buffer.device_id as usize, counts, self.maximum);
+        let original = self.width;
+        let recorded = (|| -> Result<()> {
+            for entry in entries {
+                self.set_width(entry.width)?;
+                // SAFETY: real ring/weight owners stay pinned; capture only
+                // records commands and never reads uninitialized metadata.
+                unsafe { self.capture_geometry(&geometry, entry.requests)?; }
+                crate::shared::decode_graph::device::observe_device(self.stream.library, self.tokens.buffer.device_id)?;
+            }
+            Ok(())
+        })();
+        let restored = self.set_width(original);
+        recorded.and(restored)
     }
     pub fn has_graph(&self, count: usize) -> bool { self.graphs.contains(&(count, self.width)) }
     pub fn width(&self) -> usize { self.width }
@@ -290,6 +370,9 @@ impl DsparkChain<'_, '_> {
         Ok(())
     }
     unsafe fn enqueue(&mut self, reads: &[WindowRead; 3], requests: usize) -> Result<()> {
+        unsafe { self.enqueue_geometry(&reads.each_ref().map(WindowRead::geometry), requests) }
+    }
+    unsafe fn enqueue_geometry(&mut self, reads: &[WindowGeometry; 3], requests: usize) -> Result<()> {
         let forward = self.timing.begin_retained("forward", "forward", None, requests * self.width, self.stream.raw)?;
         if let Some(embedding) = self.embedding {
             let output = self.inputs();
@@ -325,7 +408,7 @@ impl DsparkChain<'_, '_> {
             }
             let layer = self.timing.begin_retained("forward", "layer", Some(stage), requests * self.width, self.stream.raw)?;
             unsafe {
-                self.stages[stage].enqueue_on(&reads[stage], requests, self.stream.raw)?;
+                self.stages[stage].enqueue_geometry(&reads[stage], requests, self.stream.raw)?;
             }
             self.timing.end_retained(layer, self.stream.raw)?;
         }
@@ -368,7 +451,7 @@ impl DsparkChain<'_, '_> {
         self.upload(&reads, bindings)?;
         let launched = unsafe { self.enqueue(&reads, bindings[0].len()) };
         let drained = self.synchronize();
-        if let Err(error) = launched.and(drained) {
+        if let Err(error) = settle(launched, drained) {
             self.invalidate();
             return Err(error);
         }
@@ -393,33 +476,44 @@ impl DsparkChain<'_, '_> {
     }
     /// Warmup completed; never suspend while capturing.
     unsafe fn capture_ready(&mut self, reads: &[WindowRead; 3], count: usize) -> Result<()> {
+        unsafe { self.capture_geometry(&reads.each_ref().map(WindowRead::geometry), count) }
+    }
+    unsafe fn capture_geometry(&mut self, reads: &[WindowGeometry; 3], count: usize) -> Result<()> {
+        let key = (count, self.width);
+        if self.graphs.contains(&key) { return Ok(()); }
+        let pinned = cuteafd_loader::serving_capacity::v41_graphs::v41_pinned_draft(crate::families::deepseek_v41::graph_policy::ranks(), self.tokens.buffer.device_id as usize, count, self.width);
+        let Some(mut ticket) = self.graphs.cache_ticket(&key, pinned, None) else { return Ok(()); };
         unsafe {
-            self.stream
+            ticket.capture_result(self.stream
                 .library
-                .cuda_graph_begin_capture(self.stream.raw)?;
+                .cuda_graph_begin_capture(self.stream.raw))?;
         }
-        let launched = unsafe { self.enqueue(reads, count) };
-        let captured = unsafe { self.stream.library.cuda_graph_end_capture(self.stream.raw) };
+        let launched = unsafe { self.enqueue_geometry(reads, count) };
+        let captured = unsafe { ticket.capture_result(self.stream.library.cuda_graph_end_capture_topology(self.stream.raw)) };
         self.invalidate();
         match (launched, captured) {
-            (Ok(()), Ok(graph)) => {
+            (Ok(()), Ok((graph, nodes, width, spans, inspection))) => {
                 let device = self.tokens.buffer.device_id;
                 // SAFETY: chain pins all captured weights/workspaces and drains on Drop.
                 let owner = unsafe { GraphOwner::new(self.stream.library, device, graph,
                     reads.each_ref().map(|r| r.owner))? };
-                self.graphs.insert((count, self.width), owner, None);
+                warn_topology(inspection);
+                self.graphs.cache_commit(key, owner, ticket, nodes as u64, width,
+                    spans || self.spans_devices());
                 tracing::debug!(target: "cuteafd::graph_capture", count, width=self.width,
                     bank=self as *const Self as usize, retained=self.graphs.len(),
                     "native dSpark chain graph captured");
                 Ok(())
             }
-            (Err(error), Ok(graph)) => {
+            (Err(error), Ok((graph, _, _, _, _))) => {
                 unsafe {
                     self.stream.library.cuda_graph_exec_destroy(graph)?;
                 }
                 Err(error)
             }
-            (Err(error), Err(_)) | (Ok(()), Err(error)) => Err(error),
+            (Ok(()), Err(error)) if cuteafd_ffi::is_small_graph(&error) => Ok(()),
+            (Ok(()), Err(error)) => Err(error),
+            (Err(launched), Err(captured)) => Err(prefer_device(launched, captured)),
         }
     }
     /// # Safety
@@ -431,7 +525,10 @@ impl DsparkChain<'_, '_> {
     ) -> Result<[CuteafdDeviceBuffer; 2]> {
         let reads = self.prepare(windows, bindings)?;
         let count = bindings[0].len();
-        let captured = self.graphs.get(&(count, self.width)).context("dSpark chain count not captured")?;
+        let Some(captured) = self.graphs.cached_launch(&(count, self.width)) else {
+            // SAFETY: eager execution has the same retained-input contract.
+            return unsafe { self.execute(windows, bindings) };
+        };
         let (graph, owners) = (captured.raw, captured.pins);
         ensure!(
             count == bindings[0].len() && owners == reads.each_ref().map(|r| r.owner),
@@ -444,7 +541,7 @@ impl DsparkChain<'_, '_> {
                 .cuda_graph_launch(graph, self.stream.raw)
         };
         let drained = self.synchronize();
-        launched.and(drained)?;
+        settle(launched, drained)?;
         self.ready = Some(count);
         self.output()
     }
@@ -478,11 +575,15 @@ impl DsparkChain<'_, '_> {
         Ok(())
     }
     unsafe fn launch_download(&mut self, count: usize) -> Result<()> {
-        let graph = self.graphs.get(&(count, self.width)).context("dSpark chain count not captured")?.raw;
+        let graph = self.graphs.cached_launch(&(count, self.width)).map(|owner| owner.raw);
+        // A denied capture already executed eagerly in the completed warm pass.
+        // Copy that result rather than sampling a second time or requiring a graph.
         let output = self.terminal.as_ref().context("dSpark chain has no terminal")?.output_storage(count)?;
         unsafe {
             let span = self.timing.begin("graph_forward_terminal", None, count * self.width, self.stream.raw)?;
-            self.stream.library.cuda_graph_launch(graph, self.stream.raw)?;
+            if let Some(graph) = graph {
+                self.stream.library.cuda_graph_launch(graph, self.stream.raw)?;
+            }
             self.timing.end(span, self.stream.raw)?;
             let bytes = self.download.bytes_mut();
             self.stream.library.copy_d2h_async(&mut bytes[..count * (self.width + 1) * 4], output[0], self.stream.raw)?;
@@ -529,11 +630,21 @@ impl DsparkChain<'_, '_> {
         }
         anyhow::bail!("dSpark replay incomplete after its stream drained")
     }
-    #[cfg(test)]
-    pub fn cancel_pending_for_test(&mut self) {
+    /// Record a CUDA/replay failure as terminal for this chain.
+    pub(crate) fn note_failure(&mut self, error: &anyhow::Error) { self.failure.record(error); }
+    /// A terminal draft is not a reusable target-only fallback.
+    pub fn require_live(&self) -> Result<()> { self.failure.check("dSpark draft chain") }
+    /// Copy a draft output buffer to the host on this chain's stream.
+    pub fn copy_d2h(&self, dst: &mut [u8], buffer: CuteafdDeviceBuffer) -> Result<()> {
+        self.stream.library.copy_d2h(dst, buffer)
+    }
+    /// Drop a pending replay so its requests can be released.
+    pub fn cancel_replay(&mut self) {
         self.pending = None; // guard drains before releasing reads
         self.invalidate();
     }
+    #[cfg(test)]
+    pub fn cancel_pending_for_test(&mut self) { self.cancel_replay(); }
     pub fn output(&self) -> Result<[CuteafdDeviceBuffer; 2]> {
         let requests = self.ready.context("dSpark chain output incomplete")?;
         let mut output = self.stages[2].output_storage();
@@ -547,7 +658,96 @@ impl Drop for DsparkChain<'_, '_> {
         fatal_drain(self.synchronize(), "dSpark chain");
         if let Some(pending) = &mut self.pending { pending.armed = false; }
         self.pending = None; // GPU work has drained before read reservations release.
-        self.graphs.retire_all();
-        fatal_drain(self.graphs.drain_retired(|| Ok(())).map(drop), "dSpark chain graphs");
+        if self.graphs.cache_attached() {
+            self.graphs.cache_clear_drained();
+        } else {
+            self.graphs.retire_all();
+            fatal_drain(self.graphs.drain_retired(|| Ok(())).map(drop), "dSpark chain graphs");
+        }
+    }
+}
+
+#[cfg(test)]
+mod failure_tests {
+    use super::*;
+    #[test]
+    fn dspark_full_reserve_miss_runs_eager_without_refusal() -> Result<()> {
+        use crate::shared::decode_graph::device::{Basis, Cycle, Preference, Site};
+        let mut bank = GraphBank::<(usize, usize), usize>::new(None);
+        bank.attach_device_for_test(-164_401, 200, Site {
+            name: "dspark_chain", cycle: Cycle::Wave, preference: Preference::Capture,
+            bootstrap: 100, basis: Basis::Bytes, spans_devices: false,
+        })?;
+        let ticket = bank.cache_ticket(&(1, 5), true, None).expect("initial reserve fits");
+        bank.cache_commit((1, 5), 17, ticket, 1, 1, false);
+        bank.cache_measured(200);
+        let mut eager_runs = 0;
+        for _ in 0..3 {
+            assert!(bank.cached_launch(&(2, 7)).is_none());
+            if bank.cache_ticket(&(2, 7), false, None).is_none() {
+                eager_runs += 1;
+            } else {
+                anyhow::bail!("a full dSpark reserve must not capture");
+            }
+        }
+        assert_eq!(eager_runs, 3);
+        assert_eq!(bank.cached_launch(&(1, 5)), Some(&17));
+        Ok(())
+    }
+
+    #[test]
+    fn dspark_failed_capture_cancels_ticket_and_preserves_eager_fallback() -> Result<()> {
+        use crate::shared::decode_graph::device::{Basis, Cycle, Preference, Site};
+        let mut bank = GraphBank::<(usize, usize), usize>::new(None);
+        bank.attach_device_for_test(-164_402, 200, Site {
+            name: "dspark_chain", cycle: Cycle::Other, preference: Preference::Capture,
+            bootstrap: 100, basis: Basis::Bytes, spans_devices: true,
+        })?;
+        let ticket = bank.cache_ticket(&(1, 5), false, None).expect("initial reserve fits");
+        drop(ticket); // Simulates any failure between begin and owner insertion.
+        bank.cache_measured(0);
+        assert!(bank.cached_launch(&(1, 5)).is_none());
+        assert!(bank.cache_ticket(&(1, 5), false, None).is_some());
+        Ok(())
+    }
+
+    fn device() -> anyhow::Error {
+        anyhow::Error::new(cuteafd_ffi::NativeStatusError { context: "capture".into(), status: 98,
+            detail: "invalid device function".into() }).context("capture failed")
+    }
+    #[test]
+    fn settling_never_masks_a_device_failure_in_either_order() -> Result<()> {
+        settle(Ok(()), Ok(()))?;
+        for (launch, drain) in [(Err(anyhow::anyhow!("host guard")), Err(device())),
+            (Err(device()), Err(anyhow::anyhow!("host drain"))), (Ok(()), Err(device())),
+            (Err(device()), Ok(()))] {
+            let error = settle(launch, drain).unwrap_err();
+            assert!(is_device_failure(&error));
+            let mut failure = DraftFailure::default();
+            failure.record(&error);
+            assert!(failure.check("draft").is_err());
+        }
+        let mut failure = DraftFailure::default();
+        failure.record(&settle(Err(anyhow::anyhow!("host")), Err(anyhow::anyhow!("host drain"))).unwrap_err());
+        failure.check("draft")?;
+        failure.record(&device());
+        let first = failure.check("draft").unwrap_err().to_string();
+        failure.record(&anyhow::anyhow!("later host failure"));
+        assert_eq!(failure.check("draft").unwrap_err().to_string(), first);
+        Ok(())
+    }
+}
+
+impl DsparkChain<'_, '_> {
+    fn spans_devices(&self) -> bool {
+        self.stages.iter().any(|stage| stage.peer_stream().is_some())
+            || self.embedding.is_some_and(|embedding| embedding.get("embed.weight")
+                .is_ok_and(|table| table.device_id != self.tokens.buffer.device_id))
+    }
+    pub(crate) fn visit_graph_banks(&mut self, f: &mut GraphVisitor<'_>) -> Result<()> {
+        f(self.tokens.buffer.device_id, "dspark_chain", self.spans_devices(), &mut self.graphs)?;
+        for stage in &mut self.stages { stage.visit_graph_banks(f)?; }
+        if let Some(terminal) = &mut self.terminal { terminal.visit_graph_banks(f)?; }
+        Ok(())
     }
 }

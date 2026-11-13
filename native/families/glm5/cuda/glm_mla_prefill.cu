@@ -1,3 +1,4 @@
+#include "memory_failure.h"
 // Sparse MLA prefill over FP8 latent records on F16 or E4M3 tensor cores (SM120):
 // GLM 5.x (656-byte records: 512 E4M3 codes, 4 FP32 group scales, 64 BF16
 // RoPE dims; 576-wide absorbed query) and GLM 5.3 Flash (528-byte records,
@@ -1004,9 +1005,9 @@ extern "C" int32_t cuteafd_glm_mla_prefill_check(const void* q, const void* kv, 
   const int64_t n = int64_t(rows) * heads * kD;
   void *ref = nullptr, *out = nullptr;
   double* dev = nullptr;
-  cudaError_t e = cudaMalloc(&ref, n * 2);
-  if (e == cudaSuccess) e = cudaMalloc(&out, n * 2);
-  if (e == cudaSuccess) e = cudaMalloc(&dev, 3 * sizeof(double));
+  cudaError_t e = CUTEAFD_TRACK_ALLOC("cudaMalloc", &ref, n * 2, 0, CUTEAFD_MEMORY_KIND_WORKSPACE, "glm/mla-prefill-check", cudaMalloc(&ref, n * 2));
+  if (e == cudaSuccess) e = CUTEAFD_TRACK_ALLOC("cudaMalloc", &out, n * 2, 0, CUTEAFD_MEMORY_KIND_WORKSPACE, "glm/mla-prefill-check", cudaMalloc(&out, n * 2));
+  if (e == cudaSuccess) e = CUTEAFD_TRACK_ALLOC("cudaMalloc", &dev, 3 * sizeof(double), 0, CUTEAFD_MEMORY_KIND_WORKSPACE, "glm/mla-prefill-check", cudaMalloc(&dev, 3 * sizeof(double)));
   if (e == cudaSuccess) {
     e = cudaError_t(cuteafd_glm_mla_prefill(q, kv, indices, lengths, ref, rows, heads, topk, record_bytes, scale_log2,
                                             4, stream));
@@ -1026,8 +1027,8 @@ extern "C" int32_t cuteafd_glm_mla_prefill_check(const void* q, const void* kv, 
     stats[3 * k + 1] = h[2];
     stats[3 * k + 2] = sqrt(h[1] / double(n));
   }
-  cudaFree(ref);
-  cudaFree(out);
-  cudaFree(dev);
+  CUTEAFD_TRACK_FREE(ref, cudaFree(ref));
+  CUTEAFD_TRACK_FREE(out, cudaFree(out));
+  CUTEAFD_TRACK_FREE(dev, cudaFree(dev));
   return e;
 }

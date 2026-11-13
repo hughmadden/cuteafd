@@ -1,4 +1,5 @@
 //! Namespace-required native Spark load; execution views exist only after Done.
+use crate::shared::memory::Tag;
 use super::{ExpertLayer, ExpertWeights, NativeExpertServiceConfig};
 use crate::shared::{experts::layer::ExpertLoadBudget, memory::{device::Device,
     push_consumer, push_initialize, push_native::RankPlan,
@@ -29,14 +30,11 @@ pub(super) fn load<'a>(library: &'a NativeLibrary, catalog: &OfficialV41Catalog,
         let checked = plan.checked(catalog, &root, config.world, config.rank)?;
         ensure!(checked.plan.files.iter().all(|file| cuteafd_loader::push_load::is_push_shard(&root.join(file))),
             "native push source is not a SparkNest shard");
-        let headroom = super::spark_runtime_headroom()?;
+        let headroom = super::spark_runtime_headroom(config, cuteafd_core::expert_geometry(), plan.layout.bytes())?;
         let peak = admit_peak(plan.layout.bytes(), plan.scratch, plan.host_scratch, headroom,
             library.cuda_allocatable_memory_info()?.0)?;
         ensure!(plan.layout.bytes().checked_add(plan.scratch).is_some_and(|n| n <= config.device_budget),
             "native push transform exceeds device budget");
-        if config.declared_world.ownership_topology().is_some() {
-            ensure!(peak <= config.device_budget, "native push unified peak exceeds configured admission");
-        }
         let offer = Offer { rank: config.rank, host: host.into(), arena_bytes: plan.logical_bytes(),
             placement: plan.placement.clone() };
         tracing::info!(rank = config.rank, resident_bytes = resident, transform_bytes = plan.scratch,
@@ -64,7 +62,7 @@ fn receive<'a>(library: &'a NativeLibrary, plan: RankPlan,
     let joined = (|| -> Result<_> {
         let expected = ExpectedCoverage::from_plan(checked, u32::try_from(rank_id)?)?;
         let arena = plan.scales.destination(device, plan.layout.clone(), expected)?;
-        let ring = RegisteredRing::new(library, DEFAULT_SLOTS, DEFAULT_SLOT_BYTES)?;
+        let ring = RegisteredRing::new(library, DEFAULT_SLOTS, DEFAULT_SLOT_BYTES, Tag::staging("experts/spark-push-ring"))?;
         let rank = client.join(JoinArgs { group, token, rank: u32::try_from(rank_id)?,
             ring_fd: ring.fd().as_raw_fd(), slots: u32::try_from(ring.slots())?,
             slot_bytes: u32::try_from(ring.slot_bytes())? })?;

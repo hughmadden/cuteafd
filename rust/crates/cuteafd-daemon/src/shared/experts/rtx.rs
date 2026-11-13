@@ -29,6 +29,8 @@ pub(crate) mod native;
 pub(crate) mod pair;
 pub(crate) mod push;
 pub(crate) mod routes;
+#[cfg(test)]
+mod local_physical_tests;
 
 pub(crate) use combine::{Combine, ExchangeDtype, FusedCombine};
 pub(crate) use landed::Tp2Weights;
@@ -114,6 +116,10 @@ pub(super) fn resident_index(layers: &[usize], layer: usize) -> Result<usize> {
 
 /// One rank's routed half of an exact ordered set of backbone layers.
 pub(crate) trait RtxExpertLayer {
+    fn allocation_receipts(&self, _inventory: &mut crate::shared::memory::receipts::Inventory<'_>,
+        _name: &str) -> Result<()> {
+        anyhow::bail!("expert backend has no passive owner inventory")
+    }
     fn shard(&self) -> RtxShard;
     /// Element type of [`Self::output`].
     fn partial(&self) -> PartialDtype;

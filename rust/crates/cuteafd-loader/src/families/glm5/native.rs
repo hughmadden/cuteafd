@@ -34,7 +34,10 @@ impl ScratchLayout {
 
 pub fn scratch_layouts(cfg: &GlmDsaConfig, records: &[DenseRecord], plan: &DensePlan,
     decode_rows: usize, prefill_rows: usize, a8: bool) -> Result<[ScratchLayout; 2]> {
-    let (heads, inter) = (cfg.heads / plan.world, cfg.dense_intermediate / plan.world);
+    // Whole-attention owners retain full heads; FFNs remain tensor-parallel.
+    let heads = plan.tensors.iter().filter_map(|slice| slice.absorbed.as_ref().map(|kv| kv.heads))
+        .max().unwrap_or(cfg.heads / plan.world);
+    let inter = cfg.dense_intermediate / plan.world;
     Ok([
         ScratchLayout::new(cfg, heads, inter, decode_rows,
             LinearScratchLayout::from_plan(records, plan, decode_rows, false)?)?,

@@ -123,9 +123,9 @@ impl<'a> GlmContextSplit<'a> {
                     unsafe { engine.library.reserve_h2d_ordered(table.buffer, engine.stream_of(rank))?; }
                 }
                 engine.library.cuda_zero_bytes(topk_scratch.buffer, topk_scratch.buffer.bytes)?;
-                let _scope = cuteafd_ffi::memory_ledger::scope("context-staging");
                 let view = staging_pages * (record_page_bytes(cfg) as usize + INDEX_PAGE_BYTES);
-                let staging = [engine.alloc(view)?, engine.alloc(view)?];
+                let staging = [engine.alloc_tagged(view, Tag::staging("glm/context-staging"))?,
+                    engine.alloc_tagged(view, Tag::staging("glm/context-staging"))?];
                 // The sink operand is never read (no sink): a 256-byte floor allocation, uncharged.
                 let sink = engine.alloc(0)?;
                 Ok((ContextRank { candidates, own, peer, topk_scratch, partial_scratch, gather, commit, staging }, sink))
@@ -134,6 +134,57 @@ impl<'a> GlmContextSplit<'a> {
         let (r0, s0) = rank(0, &mut partial)?;
         let (r1, s1) = rank(1, &mut partial)?;
         Ok(Self { ranks: [r0, r1], exchange, staging_pages, partial, sink: [s0, s1] })
+    }
+
+    pub(super) fn allocation_receipts(&self, engine: &GlmEngine<'_>)
+        -> Result<Vec<cuteafd_loader::placement::planner::Receipt>> {
+        use super::allocation::Census;
+        use cuteafd_core::memory_layout::Category;
+        use cuteafd_loader::placement::planner::{Allocation, CoordinatorDevices, Lifetime, Location, Receipt};
+        let mut out = Vec::new();
+        let physical_devices = engine.census_physical_devices()?;
+        let devices = CoordinatorDevices::new(&physical_devices)?;
+        let storage = self.exchange.allocation_buffers();
+        for (rank, r) in self.ranks.iter().enumerate() {
+            let mut census = Census {
+                prefix: format!("glm.exchange.rank.{rank}"), receipts: Vec::new(),
+                devices, rank: u8::try_from(rank)?,
+            };
+            for (name, buffer, category) in [
+                ("exchange", storage[rank], Category::Transport),
+                ("candidates", r.candidates.buffer, Category::Workspace),
+                ("own", r.own.buffer, Category::Workspace),
+                ("peer", r.peer.buffer, Category::Workspace),
+                ("topk_scratch", r.topk_scratch.buffer, Category::Workspace),
+                ("partial_scratch", r.partial_scratch.buffer, Category::Workspace),
+                ("gather", r.gather.buffer, Category::Workspace),
+                ("sink", self.sink[rank].buffer, Category::Workspace),
+            ] {
+                census.record(&format!("context.{name}"), buffer, Lifetime::TARGET, category, "GLM exchanges")?;
+            }
+            let mut uploads = Vec::new();
+            for (lane, table) in r.commit.iter().enumerate() {
+                census.record(&format!("context.commit.{lane}"), table.buffer, Lifetime::TARGET,
+                    Category::Workspace, "GLM exchanges")?;
+                uploads.push((format!("commit.{lane}"), table.buffer));
+            }
+            for (parity, staging) in r.staging.iter().enumerate() {
+                census.record(&format!("context.staging.{parity}"), staging.buffer, Lifetime::TARGET,
+                    Category::Workspace, "GLM exchanges")?;
+                let half = self.staging_pages.div_ceil(2);
+                uploads.push((format!("gather.{parity}"), view(&r.gather, parity * half * 4, half * 4)?));
+            }
+            for (name, destination) in uploads {
+                let Some(actual) = engine.library.ordered_h2d_staging_buffer(destination, engine.stream_of(rank))? else { continue };
+                census.receipts.push(Receipt {
+                    allocation: Allocation::buffer(format!("{}.context.upload.{name}", census.prefix),
+                        Location::PINNED, actual.bytes as u64, Lifetime::TARGET, Category::Staging, "GLM exchanges"),
+                    address: actual.ptr as u64,
+                });
+            }
+            out.extend(census.receipts);
+        }
+        Ok(out)
     }
 
     /// Bytes this split allocated on each GPU beside the exchange (the solver's

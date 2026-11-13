@@ -150,6 +150,7 @@ mod tests {
         let dir = snapshot();
         let spec = TowerSpec::from_snapshot(dir.path(), 4096).unwrap();
         super::super::tests::assert_ctypes_spec(dir.path(), "qwen4", &spec);
+        super::super::push::tests::assert_vision_plan(dir.path(), &spec);
         assert_eq!(spec.image_family(), cuteafd_loader::media::ImageFamily::Qwen);
         assert_eq!(spec.reads.len(), 333);
         assert_eq!(spec.native.head_dim, 72);

@@ -1,22 +1,16 @@
 //! V4.1 coordinator ranks receive device-resident dense operands and onboarded
 //! experts in one committed group. Namespace launches require push; planning or
-//! delivery failure never permits a mounted reread. Intentional host-mapped
-//! embedding and Engram tables are not coordinator device operands.
+//! delivery failure never permits a mounted reread. Host embeddings land in
+//! their resident pinned owner; random-access Engram tables stay mapped.
 use crate::shared::experts::rtx::{dense::{self, Records}, push::{CoordinatorPush, PushedExperts, PushPolicy}};
 use crate::shared::memory::device::Device;
 use anyhow::{Context, Result};
 use cuteafd_loader::OfficialV41Catalog;
 
-/// Whether this launch may push its coordinator ranks (records are taken
-/// while loading; unused records then fill through the mount).
-pub(super) fn wanted(args: &crate::cli::NativeServeArgs, catalog: &OfficialV41Catalog) -> Result<bool> {
-    let policy = PushPolicy::for_snapshot(&args.snapshot)?;
-    policy.plan(|| {
-        anyhow::ensure!(!args.peers.is_empty() && catalog.exl3().is_none() && catalog.nvfp4().is_none()
-            && catalog.fp8().is_none(),
-            "V4.1 coordinator push does not support this weight placement yet");
-        Ok(())
-    }).map(|planned| planned.is_some()).map_err(Into::into)
+/// Record coordinator operands when namespace identity requires push.
+/// Nonnamespace checkpoints retain the ordinary mounted loader.
+pub(super) fn wanted(args: &crate::cli::NativeServeArgs, _catalog: &OfficialV41Catalog) -> Result<bool> {
+    Ok(PushPolicy::for_snapshot(&args.snapshot)? == PushPolicy::Required)
 }
 
 /// The coordinator ranks the Spark admission starts with, or none (the
@@ -30,8 +24,8 @@ pub(super) struct Planned<'a> {
 
 #[allow(clippy::type_complexity)]
 pub(super) fn plan<'a>(snapshot: &std::path::Path, catalog: &OfficialV41Catalog, devices: [Device<'a>; 2],
-    records: &Records, tp2_layers: usize, tp2_budgets: [usize; 2], draft_expert_bytes: usize, sparks: usize)
-    -> Result<(Planned<'a>, Vec<std::net::TcpStream>, crate::shared::memory::push_exl3::CoordinatorRanks)> {
+    records: &Records, tp2_layers: usize, tp2_budgets: [usize; 2], draft_expert_bytes: usize, sparks: usize, envelope: cuteafd_loader::push_load::PushHostEnvelope)
+    -> Result<(Planned<'a>, Option<(Vec<std::net::TcpStream>, crate::shared::memory::push_exl3::CoordinatorRanks)>)> {
     let dense = dense::plan_records(snapshot, records.clone(), &devices, sparks)?;
     use crate::shared::experts::{layer::ExpertLayer, rtx::push::{CoordinatorExperts, WholeOwner}};
     let owners = (0..2).map(|rank| {
@@ -40,9 +34,17 @@ pub(super) fn plan<'a>(snapshot: &std::path::Path, catalog: &OfficialV41Catalog,
         Ok(WholeOwner { rank, selections, budget: tp2_budgets[rank].checked_add(draft_expert_bytes)
             .context("V4.1 mixed expert admission overflow")? })
     }).collect::<Result<Vec<_>>>()?;
-    let (push, streams, ranks) = CoordinatorPush::prepare(snapshot, Some(catalog), 2,
-        (tp2_layers > 0 || draft_expert_bytes > 0).then_some(CoordinatorExperts::Native { owners }))?;
-    Ok((Planned { push, dense: Some(dense), sparks }, streams, ranks))
+    let experts = if draft_expert_bytes > 0 { Some(CoordinatorExperts::Native { owners }) }
+        else if tp2_layers > 0 { Some(CoordinatorExperts::Tp2 {
+            layers: (0..tp2_layers).collect(), budgets: tp2_budgets.to_vec(),
+        }) } else { None };
+    let (push, ranks) = if sparks == 0 {
+        (CoordinatorPush::prepare_alone_admitted(snapshot, Some(catalog), 2, experts, envelope)?, None)
+    } else {
+        let (push, streams, ranks) = CoordinatorPush::prepare_admitted(snapshot, Some(catalog), 2, experts, envelope)?;
+        (push, Some((streams, ranks)))
+    };
+    Ok((Planned { push, dense: Some(dense), sparks }, ranks))
 }
 
 impl<'a> Planned<'a> {
@@ -71,7 +73,7 @@ pub(super) struct Whole<'a> {
 #[allow(clippy::type_complexity)]
 pub(super) fn plan_whole<'a>(snapshot: &std::path::Path, catalog: &OfficialV41Catalog,
     device: Device<'a>, records: &Records,
-    selected: &[(crate::shared::experts::layer::ExpertLayer, usize)], sparks: usize)
+    selected: &[(crate::shared::experts::layer::ExpertLayer, usize)], sparks: usize, envelope: cuteafd_loader::push_load::PushHostEnvelope)
     -> Result<(Whole<'a>, Option<(Vec<std::net::TcpStream>, crate::shared::memory::push_exl3::CoordinatorRanks)>)> {
     let dense = dense::plan_records(snapshot, records.clone(), &[device], sparks)?;
     let budget = selected.iter().try_fold(0usize, |sum, (_, bytes)| sum.checked_add(*bytes))
@@ -81,9 +83,9 @@ pub(super) fn plan_whole<'a>(snapshot: &std::path::Path, catalog: &OfficialV41Ca
             selections: selected.iter().map(|(selection, _)| *selection).collect(), budget }],
     });
     let (push, ranks) = if sparks == 0 {
-        (CoordinatorPush::prepare_alone(snapshot, Some(catalog), 1, experts)?, None)
+        (CoordinatorPush::prepare_alone_admitted(snapshot, Some(catalog), 1, experts, envelope)?, None)
     } else {
-        let (push, streams, ranks) = CoordinatorPush::prepare(snapshot, Some(catalog), 1, experts)?;
+        let (push, streams, ranks) = CoordinatorPush::prepare_admitted(snapshot, Some(catalog), 1, experts, envelope)?;
         (push, Some((streams, ranks)))
     };
     Ok((Whole { push, dense, sparks }, ranks))
@@ -118,7 +120,7 @@ mod tests {
     use crate::families::deepseek_v41::v41_projection_tp2::{shard_tests, Kind, Wave, Weights};
     use crate::shared::experts::rtx::{dense::Recorder, push::tests::{assert_bytes_equal, mark_namespace,
         push_records_alone}};
-    use crate::shared::memory::device::{Allocation, Device, Stream};
+    use crate::shared::memory::{Tag, device::{Allocation, Device, Stream}};
     use anyhow::{ensure, Context, Result};
     use cuteafd_ffi::CuteafdDeviceBuffer;
 
@@ -158,7 +160,6 @@ mod tests {
             let pushed = pushed?;
             let sockets = tempfile::tempdir_in(&fixtures)?;
             push_records_alone(&snapshot, sockets.path(), devices, records)?;
-            for weights in pushed.iter().flatten() { weights.release_raw_scales(); }
             // Every shard lands byte for byte, and each GPU holds exactly the
             // bytes its loader charges (weight half and packed scales).
             let planned = Weights::device_bytes(&lib, kind)?;
@@ -178,13 +179,13 @@ mod tests {
             let budgets = Wave::device_bytes(&lib, kind, capacity, 0)?;
             let mut on_pushed = Wave::new([&pushed[0], &pushed[1]], capacity, 0, budgets)?;
             let mut on_mounted = Wave::new([&mounted[0], &mounted[1]], capacity, 0, budgets)?;
-            let input = Allocation::new(devices[0], capacity as usize * k * 2)?;
+            let input = Allocation::new(devices[0], capacity as usize * k * 2, Tag::workspace("v41/projection-push-test"))?;
             // The unsharded projection on GPU0, independent of the shard loader.
             let plan = devices[0].run(|| lib.v41_fp8_matrix_plan(capacity, k as u32, n as u32))?;
             let stream = Stream::new(devices[0])?;
-            let scratch = Allocation::new(devices[0], plan.info().scratch_bytes as usize)?;
-            let alpha = Allocation::new(devices[0], 16)?;
-            let full_output = Allocation::new(devices[0], capacity as usize * n * 2)?;
+            let scratch = Allocation::new(devices[0], plan.info().scratch_bytes as usize, Tag::workspace("v41/projection-push-test"))?;
+            let alpha = Allocation::new(devices[0], 16, Tag::workspace("v41/projection-push-test"))?;
+            let full_output = Allocation::new(devices[0], capacity as usize * n * 2, Tag::workspace("v41/projection-push-test"))?;
             devices[0].run(|| unsafe { plan.initialize_scratch(scratch.buffer, alpha.buffer, stream.raw) })?;
             stream.drain()?;
             let mut max_error = 0f32;
@@ -197,7 +198,9 @@ mod tests {
                 let names = shard_tests::names(layer, kind);
                 let full = devices[0].own(|| crate::families::deepseek_v41::v41_tensors::NativeRtxTensors::load(&lib,
                     &catalog, &names, crate::families::deepseek_v41::v41_tensors::NativeRtxTensors::plan(&catalog, &names)?, 1 << 20))?;
-                let full_scales = Allocation::new(devices[0], k * n / 32)?;
+                let full_scales = Allocation::new(devices[0],
+                    usize::try_from(lib.v41_fp8_matrix_info(1, k as u32, n as u32)?.packed_weight_scale_bytes)?,
+                    Tag::workspace("v41/projection-push-test"))?;
                 devices[0].run(|| unsafe { lib.v41_fp8_matrix_kernel(1, k as u32, n as u32)?
                     .pack_scales(full.get().get(&names[1])?, full_scales.buffer, stream.raw) })?;
                 devices[0].run(|| unsafe { plan.launch(input.buffer, full.get().get(&names[0])?, full_scales.buffer,

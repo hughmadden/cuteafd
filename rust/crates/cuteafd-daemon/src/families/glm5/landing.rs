@@ -174,8 +174,8 @@ impl PushSink {
         self.deferred.borrow_mut().push(job);
         Ok(())
     }
-    /// The recorded operands and deferred transforms (leaves the sink empty).
-    pub fn take(&self) -> (Vec<crate::shared::experts::rtx::dense::Operand>, Vec<Kmajor>) {
-        (self.dense.take().0, self.deferred.take())
+    /// Every dense record and deferred transform (leaves the sink empty).
+    pub fn take(&self) -> (crate::shared::experts::rtx::dense::Records, Vec<Kmajor>) {
+        (self.dense.take_all(), self.deferred.take())
     }
 }

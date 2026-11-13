@@ -28,6 +28,9 @@ pub fn template_effort(body: &Value) -> Result<Option<String>, String> {
         other => other.to_owned(),
     };
     if !EFFORTS.contains(&effort.as_str()) {
+        if effort == "none" {
+            return Err("Muse thinking is enabled but reasoning_effort is \"none\"; disable thinking or select low, medium, high, or xhigh".into());
+        }
         return Err(format!("reasoning_effort {effort:?} is not one of the Muse template's {EFFORTS:?}"));
     }
     Ok(Some(effort))

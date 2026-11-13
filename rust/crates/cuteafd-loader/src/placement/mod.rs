@@ -21,21 +21,27 @@ pub mod draft;
 pub mod expert_tier;
 pub mod route_trace;
 pub mod tier_cache;
+pub mod expert_usage;
 pub mod rtx_onboard;
 pub mod families;
 pub mod inventory;
+pub mod graph_nodes;
 pub mod planner;
+pub mod runtime_memory;
 mod pool;
+pub mod reserve;
+pub mod graph_reserve;
+pub mod sampled_baseline;
 pub mod attention;
 mod residual;
 mod solve;
 mod spark;
-pub use spark::{ComponentDemand, SparkAssignment, SparkBudgetInventory, SparkEndpointOwners, SparkIntakeMode, SparkIntakeOwners, SparkIoBytes, SparkLinkOwners, SparkResidentLayout, SparkRingGeometry, SparkWaveOwners, SparkWaveStaging, SparkWorkingSet, WorkingSetComponent};
+pub use spark::{ComponentDemand, PreparedSparkLink, SparkAssignment, SparkBudgetInventory, SparkEndpointOwners, SparkIntakeCandidates, SparkIntakeMode, SparkIntakeOwners, SparkIoBytes, SparkLinkCandidate, SparkLinkOwners, SparkResidentLayout, SparkRingGeometry, SparkWaveOwners, SparkWaveStaging, SparkWorkingSet, WorkingSetComponent};
 #[cfg(test)]
 mod tests;
 
-pub use inventory::{loaded_code, ArchContext, GraphRank, GraphSet, Lifetime, LoadedCode, ProgramSet, RuntimeSample, ARCH_CONTEXTS};
-pub use pool::{PoolPolicy, AGENTIC_FLOOR_TOKENS};
+pub use inventory::{ArchContext, GraphRank, GraphSet, Lifetime, ProgramSet, RuntimeSample, ARCH_CONTEXTS};
+pub use pool::{CoordinatorCard, PoolPolicy, AGENTIC_FLOOR_TOKENS};
 pub use residual::{validate_layer_pipeline_lanes, LAYER_PIPELINE_MAX_LANES, hop_buffer_bytes, plan_hops, residual_homes, Hop, HopKind, HopPoint, HopSpec, HopStorage, LayerExecutionPlan, LayerPlanError, ResidualHome, RoutedReplication, TerminalHome, Transition, HOP_SLOTS};
 pub use solve::{solve, solve_frozen, solve_with_marks, MarkSelection};
 pub use attention::{AttentionPlacement, ContextBuffers, ContextExchangeLayout, KvDemand, LayerOwnership, CONTEXT_EXCHANGES};
@@ -50,6 +56,13 @@ pub struct ResidentWeights(pub u64);
 impl ResidentWeights {
     pub const DEFAULT_LIMIT: Self = Self(80 << 30);
 
+    pub fn check(self, gpu: u8, limit: Self) -> Result<(), PlacementError> {
+        if self.0 > limit.0 {
+            return Err(PlacementError::ResidentWeightLimit { gpu, required: self.0, limit: limit.0 });
+        }
+        Ok(())
+    }
+
     pub fn checked_add(self, other: Self) -> Result<Self, PlacementError> {
         self.0.checked_add(other.0).map(Self)
             .ok_or(PlacementError::Overflow("resident weights"))
@@ -61,6 +74,8 @@ impl ResidentWeights {
 #[derive(Debug, Clone, PartialEq)]
 pub struct PlacementRequest {
     pub inventory: Inventory,
+    /// Independent per-coordinator resident-weight ceiling, including drafters.
+    pub resident_weight_limit: Option<ResidentWeights>,
     /// None selects the family default and permits memory-driven mode flips.
     pub attention_placement: Option<AttentionPlacement>,
     pub context_buffers: ContextBuffers,
@@ -159,9 +174,10 @@ pub struct Inventory {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GpuBudget {
+    /// The device cap: physical total bounded by `GPU_MEMORY_CAP`.
     pub capacity_bytes: u64,
-    /// Kept free for runtime growth and allocator slack; never allocated.
-    pub headroom_bytes: u64,
+    /// The memory policy's named reserve (`reserve::gpu`): kept free inside the cap.
+    pub reserve_bytes: u64,
     pub baseline: Baseline,
 }
 
@@ -181,8 +197,8 @@ impl GpuBudget {
     pub fn available(&self) -> u64 {
         match self.baseline {
             Baseline::Planned { context_bytes, loaded_bytes } => self.capacity_bytes
-                .saturating_sub(self.headroom_bytes).saturating_sub(context_bytes).saturating_sub(loaded_bytes),
-            Baseline::Measured { free_bytes } => free_bytes.saturating_sub(self.headroom_bytes),
+                .saturating_sub(self.reserve_bytes).saturating_sub(context_bytes).saturating_sub(loaded_bytes),
+            Baseline::Measured { free_bytes } => free_bytes.saturating_sub(self.reserve_bytes),
         }
     }
 }
@@ -238,6 +254,7 @@ pub struct LayerExtraDemand {
     pub category: Category,
     pub group: String,
     pub bytes: u64,
+    pub resident_weights: ResidentWeights,
     pub residency: LayerResidency,
     pub basis: Basis,
 }
@@ -245,7 +262,11 @@ pub struct LayerExtraDemand {
 impl LayerExtraDemand {
     pub fn new(category: Category, group: impl Into<String>, bytes: u64,
         residency: LayerResidency, basis: Basis) -> Self {
-        Self { category, group: group.into(), bytes, residency, basis }
+        Self { category, group: group.into(), bytes, resident_weights: ResidentWeights::default(), residency, basis }
+    }
+
+    pub fn with_resident_weights(self, resident_weights: ResidentWeights) -> Self {
+        Self { resident_weights, ..self }
     }
 
     pub(crate) fn on_gpu(&self, mode: LayerMode, gpu: usize) -> bool {
@@ -281,6 +302,8 @@ pub struct ExpertCost {
     /// Half-width TP2 layers exist for this build (placement PR 4): on two
     /// RTX with peer access the layer's RTX home is `RtxTp2`, never `RtxWhole`.
     pub tp2: bool,
+    /// The selected homogeneous RTX package can execute this whole layer.
+    pub whole_supported: bool,
     pub spark_ok: bool,
 }
 
@@ -386,19 +409,39 @@ impl BoundedDemand {
     }
 }
 
+/// An opaque mandatory owner can mix checkpoint weights and runtime storage.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MovablePart {
+    pub memory: Bytes2,
+    pub resident_weights: ResidentWeights,
+}
+
+impl MovablePart {
+    pub fn new(memory: Bytes2, resident_weights: ResidentWeights) -> Self {
+        Self { memory, resident_weights }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Demand {
     pub gpu: u8,
     pub category: Category,
     pub group: String,
     pub bytes: u64,
+    /// Positive for already-loaded weights even when future allocation is zero.
+    pub resident_weights: ResidentWeights,
     pub basis: Basis,
     pub lifetime: ItemLifetime,
 }
 
 impl Demand {
     pub fn new(gpu: u8, category: Category, group: impl Into<String>, bytes: u64, basis: Basis) -> Self {
-        Self { gpu, category, group: group.into(), bytes, basis, lifetime: ItemLifetime::ReadyResident }
+        Self { gpu, category, group: group.into(), bytes, resident_weights: ResidentWeights::default(),
+            basis, lifetime: ItemLifetime::ReadyResident }
+    }
+
+    pub fn with_resident_weights(self, resident_weights: ResidentWeights) -> Self {
+        Self { resident_weights, ..self }
     }
 
     pub fn with_lifetime(self, lifetime: ItemLifetime) -> Self { Self { lifetime, ..self } }
@@ -417,6 +460,8 @@ pub enum MovableId {
     /// dSpark stage experts (V4); loaded into the GPU's local expert arena.
     DsparkExperts,
     Drafter,
+    Head,
+    SparkIntake,
     Vision,
     Audio,
 }
@@ -425,7 +470,7 @@ pub enum MovableId {
 pub struct Movable {
     pub id: MovableId,
     /// Loaded in order; each part's staging is transient.
-    pub parts: Vec<Bytes2>,
+    pub parts: Vec<MovablePart>,
     /// Allowed GPUs; most free bytes for ordinary movables, best remaining
     /// pool capacity for candidates with conditional demands.
     pub allowed: Vec<u8>,
@@ -551,10 +596,11 @@ pub struct Placement {
     pub peer_row_bytes: u64,
     /// The onboard this placement resolved: RTX-resident routed layers.
     pub onboard_layers: usize,
-    /// The pool the same solve admits with no RTX expert layers (everything
-    /// else, including the chosen attention modes, unchanged), filled to the
-    /// pool ceiling; equal to `pool_tokens` when nothing is onboarded.
-    pub max_pool_tokens_no_onboard: u64,
+    /// The legacy solve's no-onboarding pool ceiling, when it computed one.
+    /// Contract plans do not compute this counterfactual. Remove this field
+    /// outright once the last family moves to the contract planner.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_pool_tokens_no_onboard: Option<u64>,
     pub layers: Vec<LayerAssignment>,
     pub movables: Vec<(MovableId, u8)>,
     /// Bounding whole-layer RTX expert range per GPU (`layers == 0`: none).
@@ -628,6 +674,8 @@ impl Placement {
 
     fn layer_summary(&self) -> String {
         let attention = self.attention_summary();
+        let counterfactual = self.max_pool_tokens_no_onboard
+            .map(|maximum| format!(" (max_pool_tokens_no_onboard={maximum})")).unwrap_or_default();
         let charged = self.hops.iter().filter(|h| h.charged()).count();
         let mut hops = if charged == 0 { String::new() } else { format!("; {charged} residual hops") };
         let direct: Vec<_> = self.hops.iter().filter(|h| h.storage == HopStorage::DirectInput).map(|h|
@@ -636,8 +684,8 @@ impl Placement {
             hops.push_str(&format!("; direct-input residual hops [{}] (no extra receive storage)", direct.join(", ")));
         }
         if let Some(t) = self.tp2 {
-            return format!("attention {attention}; pool {} tokens (max_pool_tokens_no_onboard={}); onboard {} RTX expert layers: rtx0/rtx1: {} TP2 expert layer halves ({}..{}); arenas [{}, {}] B; TP1 dSpark {} B{hops}",
-                self.pool_tokens, self.max_pool_tokens_no_onboard, self.onboard_layers, t.layers, t.first, t.first + t.layers,
+            return format!("attention {attention}; pool {} tokens{counterfactual}; onboard {} RTX expert layers: rtx0/rtx1: {} TP2 expert layer halves ({}..{}); arenas [{}, {}] B; TP1 dSpark {} B{hops}",
+                self.pool_tokens, self.onboard_layers, t.layers, t.first, t.first + t.layers,
                 t.peak_bytes[0], t.peak_bytes[1], self.expert_ranges[0].peak_bytes);
         }
         let ranges = self.expert_ranges.iter().enumerate()
@@ -645,8 +693,8 @@ impl Placement {
                 .filter_map(|(layer, a)| (a.experts == ExpertHome::RtxWhole { gpu: gpu as u8 }).then_some(layer))
                 .collect::<Vec<_>>(), r.peak_bytes))
             .collect::<Vec<_>>().join(", ");
-        format!("attention {attention}; pool {} tokens (max_pool_tokens_no_onboard={}); onboard {} RTX expert layers: {ranges}{hops}",
-            self.pool_tokens, self.max_pool_tokens_no_onboard, self.onboard_layers)
+        format!("attention {attention}; pool {} tokens{counterfactual}; onboard {} RTX expert layers: {ranges}{hops}",
+            self.pool_tokens, self.onboard_layers)
     }
 }
 
@@ -691,7 +739,7 @@ impl std::fmt::Display for PoolLimits {
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum PlacementError {
-    #[error("explicit KV pool of {requested} tokens is below the compiled/max-context floor of {floor} tokens; increase --pool-tokens (POOL_TOKENS, or KV_POOL_SIZE for a byte pool), or lower --max-context/--max-context-tokens (MAX_CONTEXT_TOKENS) to match")]
+    #[error("explicit KV pool of {requested} tokens is below the compiled/max-context floor of {floor} tokens; increase --pool-tokens (POOL_TOKENS, or KV_POOL_SIZE for a byte pool), or lower --max-context-tokens (MAX_CONTEXT_TOKENS) to match")]
     RequestedBelowContext { requested: u64, floor: u64 },
     #[error("placement inventory is invalid: {0}")]
     Inventory(&'static str),
@@ -703,6 +751,8 @@ pub enum PlacementError {
     PoolDoesNotFit { requested: u64, fit: u64, limits: PoolLimits },
     #[error("{family} drafter was placed on rtx{gpu}, where this build has no executor for it")]
     DrafterHome { family: &'static str, gpu: u8 },
+    #[error("rtx{gpu} resident weights need {required} bytes, over the {limit} byte weight budget")]
+    ResidentWeightLimit { gpu: u8, required: u64, limit: u64 },
     #[error("startup phase {phase} needs {required} bytes on rtx{gpu}, but only {available} bytes are free")]
     StartupPeak { gpu: u8, phase: String, required: u64, available: u64 },
     #[error("KV pool and mandatory {what} do not fit on rtx{gpu}")]

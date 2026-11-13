@@ -15,6 +15,7 @@ pub(super) fn packed_scale_bytes(library: &NativeLibrary) -> Result<usize> {
 pub(super) fn pack_scales<'a>(
     library: &'a NativeLibrary,
     tensors: &NativeRtxTensors<'a>,
+    arena: &crate::shared::memory::weight_arena::DeviceWeightArena<'a>,
 ) -> Result<[DeviceAllocation<'a>; 9]> {
     let up = library.v41_fp8_matrix_kernel(16, 5120, 2304)?;
     let down = library.v41_fp8_matrix_kernel(16, 2304, 5120)?;
@@ -26,8 +27,10 @@ pub(super) fn pack_scales<'a>(
     };
     for stage in 0..3 {
         for (name, kernel) in [("w1", &up), ("w3", &up), ("w2", &down)] {
-            packed.push(DeviceAllocation::new(
-                library,
+            packed.push(crate::families::deepseek_v41::weight_layout::allocation(
+                library, Some(arena),
+                &crate::families::deepseek_v41::weight_layout::packed_scale_name(
+                    &format!("mtp.{stage}.ffn.shared_experts.{name}.weight")),
                 kernel.info().packed_weight_scale_bytes as usize,
             )?);
             unsafe {
@@ -80,7 +83,7 @@ impl DsparkSharedFfn<'_, '_> {
         crate::families::deepseek_v41::v41_shared_ffn::SharedFfn::device_bytes(library, capacity)
     }
     pub(super) fn matches_stage(&self, weights: &DsparkWeights<'_>, stage: usize) -> bool {
-        self.stage == stage && std::ptr::eq(self.weights, weights)
+        self.stage == stage && std::ptr::addr_eq(self.weights, weights)
     }
     pub(in crate::families::deepseek_v41::v41_experts) fn matches(
         &self,

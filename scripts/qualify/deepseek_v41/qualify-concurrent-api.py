@@ -6,9 +6,11 @@ parser=argparse.ArgumentParser()
 parser.add_argument('--base-url', default='http://127.0.0.1:18042')
 parser.add_argument('--output', type=Path, required=True)
 parser.add_argument('--max-concurrency', type=int, choices=range(1,17), default=16)
+parser.add_argument('--api-key-file', type=Path, help='bearer token file for an authenticated server')
 args=parser.parse_args()
 api=runpy.run_path(str(Path(__file__).resolve().parents[2] / 'qualify-ds41-native-api.py'))
 base=args.base_url
+api_key=args.api_key_file.read_text().strip() if args.api_key_file else None
 records=[]
 def body(i):
  b=api['payload'](f'Count from {i%4*200+1} to {(i%4+1)*200}, separated by commas. Output only the sequence.',True)
@@ -16,7 +18,7 @@ def body(i):
  return b
 def run(i,cancel=False):
  start=time.perf_counter()
- r=api['stream_case'](base,body(i),cancel)
+ r=api['stream_case'](base,body(i),cancel,api_key=api_key)
  return dict(index=i,start=start,end=time.perf_counter(),cancel=cancel,result=r)
 expected={}
 def same_result(actual, reference):

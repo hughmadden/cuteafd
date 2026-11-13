@@ -1,0 +1,16 @@
+{
+  "source": "Illustrative graph-pin schema fixture, not measured telemetry; schema from PR #1642",
+  "graph_cache": [{
+    "device": 0,
+    "basis": {"kind": "nodes", "node_rate": 66800, "graph_rate": 420000},
+    "reserve": 1191182336,
+    "charged": 335544320,
+    "pinned": 8388608,
+    "pending_capture": 0,
+    "telemetry_bytes": 4096,
+    "pools": {"live_nodes": 3200, "node_high_water": 3800, "live_execs": 120, "exec_high_water": 130},
+    "cycles": {"decode": {"hits": 930, "misses": 5, "captures": 5, "eager_runs": 12, "evictions": 1}, "verify": {"hits": 300, "misses": 12, "captures": 10, "eager_runs": 2, "evictions": 6}},
+    "top_hits": [{"device": 0, "bank": 1, "site": "illustrative.decode", "shape": "rows=16", "cycle": "decode", "hits": 930, "misses": 5, "captures": 5, "evictions": 1, "recaptures": 1, "ghost_hits": 2, "permanent_bytes": 8388608, "capture_bytes": 12582912, "nodes": 56, "executables": 1, "pinned": true, "hit_histogram": {"rolling": true, "interval_ms": 10000, "start_ms": 0, "counts": [5, 12, 25, 42, 75, 90, 54, 82, 130, 172, 150, 93]}}],
+    "top_churn": [{"device": 0, "bank": 2, "site": "illustrative.verify", "shape": "rows=64,width=8", "cycle": "verify", "hits": 300, "misses": 12, "captures": 10, "evictions": 6, "recaptures": 4, "ghost_hits": 5, "permanent_bytes": 16777216, "capture_bytes": null, "nodes": 120, "executables": 1, "pinned": false, "hit_histogram": {"rolling": true, "interval_ms": 10000, "start_ms": 0, "counts": [0, 1, 0, 20, 0, 100, 0, 4, 25, 80, 50, 20]}}]
+  }]
+}

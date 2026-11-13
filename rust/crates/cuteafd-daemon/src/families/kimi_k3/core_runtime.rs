@@ -24,10 +24,13 @@ pub(crate) fn kda_projected(core:&KimiKdaCore<'_>,projections:[Projected<'_,'_>;
     weights:KimiKdaCoreWeights,batch:KimiKdaCoreBatch,stream:*mut c_void)->Result<()> {
     let outputs=[batch.q,batch.k,batch.v,batch.gate];
     match grouped {
-        Some(grouped)=> {
+        Some(grouped) if projections.iter().all(|p| p.weights.bits==grouped.bits()
+            && p.weights.codebook==projections[0].weights.codebook)=> {
             let scratch=projections[0].scratch;
             ensure!(projections.iter().all(|p|std::ptr::eq(p.scratch,scratch)
-                && (p.weights.shape[1],p.weights.shape[0])==grouped.geometry()),
+                && (p.weights.shape[1],p.weights.shape[0])==grouped.geometry()
+                && p.weights.bits==grouped.bits()
+                && p.projection.program.policy().bits==grouped.bits()),
                 "K6 grouped KDA members differ in scratch or geometry");
             ensure!(batch.rows<=scratch.rows,"K6 scratch live-row ceiling");
             let get=|name|scratch.buffers[name];
@@ -36,7 +39,7 @@ pub(crate) fn kda_projected(core:&KimiKdaCore<'_>,projections:[Projected<'_,'_>;
             grouped.launch(batch.rows,batch.input,members,get("rotated"),get("table"),get("scales"),
                 get("partial"),get("accumulator"),stream)?;
         }
-        None=>for (projection,output) in projections.iter().zip(outputs) {
+        _=>for (projection,output) in projections.iter().zip(outputs) {
             projection.run(batch.rows,batch.input,output,stream)?;
         },
     }
@@ -75,11 +78,16 @@ pub(crate) fn ffn_projected(gate:Projected<'_,'_>,up:Projected<'_,'_>,down:Proje
 /// Serialized projections reuse one lane-private scratch set, never one set per
 /// layer. Their BF16 outputs remain distinct until the downstream core consumes them.
 pub(crate) struct CorePrograms<'a> {
-    projections:BTreeMap<(usize,usize,usize,String),Projection<'a>>,
-    grouped:BTreeMap<(usize,usize,usize,String),GroupedTrellis<'a>>,
+    projections:BTreeMap<(usize,usize,usize,String,usize),Projection<'a>>,
+    grouped:BTreeMap<(usize,usize,usize,String,usize),GroupedTrellis<'a>>,
     /// Diagnostic only: false forces the four standalone launches (bitwise A/B).
     grouped_enabled:std::cell::Cell<bool>,
     pub layouts:Vec<Option<ProjectionLayout>>,
+    pub native_inventory:cuteafd_loader::families::kimi_k3::core::CoreInventory,
+    native_bf16:[cuteafd_ffi::draft_projection::DraftProjections<'a>;2],
+    native_fp8:[cuteafd_ffi::native_attention::Fp8Projections<'a>;2],
+    pub native_scratch:usize,
+    pub native_add:cuteafd_ffi::F32Add<'a>,
     pub kda:[KimiKdaCore<'a>;2],
     pub mla:BTreeMap<(usize,usize,usize),KimiMlaSplit<'a>>,
     pub norm:cuteafd_ffi::KimiRmsNorm<'a>,pub situ:KimiSitu<'a>,pub copy:V41PeerCopy<'a>,
@@ -111,11 +119,13 @@ impl<'a> CorePrograms<'a> {
             for mode in modes {
                 for rank in super::weights::LayerLayout::ranks_with_core(cfg,layer,mode,inventory,ranks)? {
                     for weight in rank.core_layouts() {
-                        let key=projection_key(weight.shape,weight.side,weight.codebook);
+                        let key=projection_key(weight.shape,weight.side,weight.codebook,weight.bits);
                         if projections.contains_key(&key) {continue;}
-                        let projection=Projection::load_geometry(programs,key.0,key.1,key.2,&key.3,rows,TrellisDType::Bf16)?;
+                        let projection=Projection::load_geometry_bits(programs,key.0,key.1,key.2,key.4,&key.3,rows,TrellisDType::Bf16)?;
+                        ensure!(weight.bits==projection.program.policy().bits,
+                            "Kimi {}: loaded K{} projection resolved to K{} program",weight.stem,weight.bits,projection.program.policy().bits);
                         let mut required=ProjectionLayout::new(&projection.program,rows)?;
-                        if let Some(policy)=GroupedPolicy::from_package_geometry(programs,key.0,key.1,key.2,&key.3)? {
+                        if let Some(policy)=GroupedPolicy::from_package_geometry_bits(programs,key.0,key.1,key.2,key.4,&key.3)? {
                             let program=GroupedTrellis::load(programs,projection.program.policy(),&policy)?;
                             required.merge(&ProjectionLayout{rows,extents:cuteafd_loader::families::kimi_k3::core::
                                 ProjectionScratchLayout::grouped(key.0,key.1,rows,policy.groups)?.extents})?;
@@ -132,8 +142,10 @@ impl<'a> CorePrograms<'a> {
         if let Some(head)=inventory.get_weight("language_model.lm_head") {
             let weight=CoreWeightLayout::new(head,
                 cuteafd_loader::formats::dense_trellis::TrellisSide::Output,0,1)?;
-            let key=projection_key(weight.shape,weight.side,weight.codebook);
-            let projection=Projection::load_geometry(programs,key.0,key.1,key.2,&key.3,rows.min(64),TrellisDType::F32)?;
+            let key=projection_key(weight.shape,weight.side,weight.codebook,weight.bits);
+            let projection=Projection::load_geometry_bits(programs,key.0,key.1,key.2,key.4,&key.3,rows.min(64),TrellisDType::F32)?;
+            ensure!(weight.bits==projection.program.policy().bits,
+                "Kimi head: loaded K{} projection resolved to K{} program",weight.bits,projection.program.policy().bits);
             let mut required=ProjectionLayout::new(&projection.program,rows.min(64))?;
             if let Some(layout)=&mut layouts[head_rank] {
                 // Only a body owner also serves full-capacity layer projections.
@@ -149,27 +161,65 @@ impl<'a> CorePrograms<'a> {
                 ==planned[rank].as_ref().map(|p|(&p.extents,p.rows)),
                 "K6 runtime/planner rank {rank} scratch differs");
         }
+        use cuteafd_ffi::draft_projection::{DraftProjections, ProjectionOutput};
+        let geometries = inventory.native_geometries(ranks)?;
+        let shapes = |fp8, partial| geometries.iter().filter(|g| g.2 == fp8 && g.3 == partial)
+            .map(|g| (g.0, g.1)).collect::<Vec<_>>();
+        let native_bf16 = [DraftProjections::load_with_output(programs, &shapes(false, false), rows.max(64), ProjectionOutput::Bf16)?,
+            DraftProjections::load_with_output(programs, &shapes(false, true), rows.max(64), ProjectionOutput::F32)?];
+        let native_fp8 = [cuteafd_ffi::native_attention::Fp8Projections::load(programs, &shapes(true, false), rows.max(64), ProjectionOutput::Bf16)?,
+            cuteafd_ffi::native_attention::Fp8Projections::load(programs, &shapes(true, true), rows.max(64), ProjectionOutput::F32)?];
+        let mut native_scratch = 0;
+        for (k, n, fp8, partial) in geometries {
+            if fp8 { native_scratch = native_scratch.max(native_fp8[usize::from(partial)].scratch_bytes(k, n)?); }
+        }
         let heads=cfg.kda_heads/ranks;
         let kda=[KimiKdaCore::load(programs,&format!("kda_core_h{heads}_m64"),64,true)?,
             KimiKdaCore::load(programs,&format!("kda_core_h{heads}_m4096"),4096,false)?];
         let mut mla=BTreeMap::new();
+        let k31 = cfg.dsa.is_some();
+        let prefix = if k31 { "kimik31_" } else { "" };
         for heads in [48,96] {for stride in [576,640] {for capacity in [64,4096] {
-            let names=[format!("mla_rank_norm_h{heads}_kv{stride}{}_m{capacity}",cache_format.program_suffix()),
-                format!("mla_query_h{heads}_m{capacity}"),format!("mla_gate_output_h{heads}_m{capacity}")];
-            mla.insert((heads,stride,capacity),KimiMlaSplit::load(programs,
+            let names=[format!("{prefix}mla_rank_norm_h{heads}_kv{stride}{}_m{capacity}",cache_format.program_suffix()),
+                format!("{prefix}mla_query_h{heads}_m{capacity}"),format!("{prefix}mla_gate_output_h{heads}_m{capacity}")];
+            let load = if k31 { KimiMlaSplit::load_k31 } else { KimiMlaSplit::load };
+            mla.insert((heads,stride,capacity),load(programs,
                 [&names[0],&names[1],&names[2]],heads,capacity,stride,cache_format)?);
         }}}
-        Ok(Some(Self{projections,grouped,grouped_enabled:std::cell::Cell::new(true),layouts,kda,mla,norm:cuteafd_ffi::KimiRmsNorm::load(programs,3584)?,situ:KimiSitu::load(programs,6144/ranks)?,
+        Ok(Some(Self{projections,grouped,grouped_enabled:std::cell::Cell::new(true),layouts,native_inventory:inventory.clone(),native_bf16,native_fp8,native_scratch,native_add:programs.library().f32_add()?,kda,mla,norm:cuteafd_ffi::KimiRmsNorm::load(programs,3584)?,situ:KimiSitu::load(programs,6144/ranks)?,
             copy:programs.library().v41_peer_copy()?,narrow:programs.library().f32_bf16_narrow()?,
             core_add:programs.library().bf16_f32_add()?}))
     }
+    pub(crate) fn native_projection(&self, weight:&crate::shared::native_attention::NativeAttentionWeights<'_>,
+        rows:usize, input:Buffer, output:Buffer, scratch:Option<Buffer>, stream:*mut c_void)->Result<()> {
+        use cuteafd_loader::families::kimi_k3::core::CoreSplit;
+        let layout = &weight.layout;
+        let [n,k] = layout.shape;
+        let partial = layout.ranks == 2 && layout.split == CoreSplit::Input;
+        ensure!(input.device_id == weight.values.buffer.device_id && output.device_id == input.device_id
+            && input.bytes >= rows*k*2, "Kimi native projection input/device differs from retained owner");
+        // SAFETY: admitted lane and weight owners survive queued work and graph replay;
+        // the selected registry checks output precision, capacity and alignment.
+        unsafe {
+            if layout.fp8 {
+                self.native_fp8[usize::from(partial)].launch(input.ptr, weight.values.buffer.ptr,
+                    weight.scales.as_ref().context("Kimi native FP8 scales absent")?.buffer.ptr, output,
+                    scratch.context("Kimi native FP8 scratch not admitted")?, rows,k,n,stream)?;
+            } else {
+                self.native_bf16[usize::from(partial)].launch_checked(input.ptr, weight.values.buffer.ptr,
+                    output,rows,k,n,stream)?;
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn projection(&self,weights:&CoreWeights<'_>)->Result<&Projection<'a>> {
-        self.projections.get(&projection_key(weights.shape,weights.side,weights.codebook))
+        self.projections.get(&projection_key(weights.shape,weights.side,weights.codebook,weights.bits))
             .ok_or_else(||anyhow::anyhow!("Kimi K6 weight geometry not resolved before admission"))
     }
     /// The grouped KDA launch for these member weights, when the package has one.
     pub(crate) fn grouped(&self,weights:&CoreWeights<'_>)->Option<&GroupedTrellis<'a>> {
-        self.grouped.get(&projection_key(weights.shape,weights.side,weights.codebook)).filter(|_|self.grouped_enabled.get())
+        self.grouped.get(&projection_key(weights.shape,weights.side,weights.codebook,weights.bits)).filter(|_|self.grouped_enabled.get())
     }
     pub(crate) fn set_grouped(&self,enabled:bool) { self.grouped_enabled.set(enabled); }
     pub(crate) fn projected<'b>(&'b self,weights:&'b CoreWeights<'a>,scratch:&'b ProjectionScratch<'a>)->Result<Projected<'a,'b>> {
@@ -177,11 +227,11 @@ impl<'a> CorePrograms<'a> {
     }
 }
 fn projection_key(shape:[usize;2],side:cuteafd_loader::formats::dense_trellis::TrellisSide,
-    book:cuteafd_loader::formats::exl3_storage::Exl3Codebook)->(usize,usize,usize,String) {
+    book:cuteafd_loader::formats::exl3_storage::Exl3Codebook,bits:usize)->(usize,usize,usize,String,usize) {
     (shape[1],shape[0],match side {cuteafd_loader::formats::dense_trellis::TrellisSide::Output=>1,
         cuteafd_loader::formats::dense_trellis::TrellisSide::Input=>2},
         match book {cuteafd_loader::formats::exl3_storage::Exl3Codebook::Mcg=>"mcg",
-            cuteafd_loader::formats::exl3_storage::Exl3Codebook::Mul1=>"mul1"}.into())
+            cuteafd_loader::formats::exl3_storage::Exl3Codebook::Mul1=>"mul1"}.into(),bits)
 }
 
 #[cfg(test)]
@@ -199,7 +249,7 @@ mod runtime_layout_tests {
         for rows in [1,16,63,64,4096] {
             let planned=ProjectionScratchLayout::new(128,256,rows)?;
             let layout=ProjectionLayout{extents:planned.extents.clone(),rows};
-            let scratch=layout.allocate(device)?;
+            let scratch=layout.allocate(device, crate::shared::memory::Tag::workspace("kimi/native-projection"))?;
             assert_eq!(layout.demand(0,"Kimi K6 projection scratch")?.bytes as usize,
                 scratch._owners.values().map(|owner|owner.buffer.bytes).sum::<usize>());
             assert_eq!(layout.bytes()?,planned.bytes()?);
@@ -237,15 +287,15 @@ mod runtime_layout_tests {
                         let projection=&inventory.projections[&weight.stem];
                         // Local native allocations contain only compressed payload and vectors.
                         assert_eq!(weight.bytes as u64,projection.resident_bytes(weight.ranks)?);
-                        geometries.insert(projection_key(weight.shape,weight.side,weight.codebook),());
+                        geometries.insert(projection_key(weight.shape,weight.side,weight.codebook,weight.bits),());
                     }
                 }
             }
         }
         let head=CoreWeightLayout::new(inventory.get_weight("language_model.lm_head").unwrap(),TrellisSide::Output,0,1)?;
-        geometries.insert(projection_key(head.shape,head.side,head.codebook),());
-        let policies=geometries.keys().map(|(k,n,side,book)|{
-            serde_json::json!({"input_features":k,"output_features":n,"sharded_side":side,"codebook":book})
+        geometries.insert(projection_key(head.shape,head.side,head.codebook,head.bits),());
+        let policies=geometries.keys().map(|(k,n,side,book,bits)|{
+            serde_json::json!({"input_features":k,"output_features":n,"sharded_side":side,"codebook":book,"bits":bits})
         }).collect::<Vec<_>>();
         let mut programs=Vec::new();
         let mut program=|name:String,bytes:usize| programs.push(serde_json::json!({"name":name,
@@ -279,10 +329,10 @@ mod runtime_layout_tests {
                 for rank in 0..ranks {
                     let mut runtime:Option<ProjectionLayout>=None;
                     if on {
-                        for ((k,n,side,_),()) in &geometries {
+                        for ((k,n,side,_,bits),()) in &geometries {
                             if *n==cfg.vocab_size && rank!=ranks-1 {continue;}
                             let live=if *n==cfg.vocab_size {unit.min(64)}else{unit};
-                            let w=DenseTrellisGeometry{input:*k,output:*n,bits:6,side:*side,rows:live,
+                            let w=DenseTrellisGeometry{input:*k,output:*n,bits:*bits,side:*side,rows:live,
                                 input_dtype:TrellisDType::Bf16,output_dtype:TrellisDType::Bf16}.workspace()?;
                             let extents=BTreeMap::from([("rotated",w.rotated),("table",w.pointer_table),
                                 ("scales",w.block_scales),("partial",w.partial),("accumulator",w.accumulator)]);

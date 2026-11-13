@@ -1,10 +1,10 @@
 //! Append-only target steps: mutable proposal rows never overlap the old frontier.
 use super::{
-    scratch::{BufferOwner, CompactKv},
+    scratch::{Arena, BufferOwner, CompactKv, Plane},
     cache::CacheRank,
     prefix::{Frontier, Placement, Step5Prefix},
 };
-use crate::shared::memory::device::{Allocation, Device, Stream};
+use crate::shared::memory::{device::{Device, Stream}, Tag};
 use anyhow::{ensure, Context, Result};
 use cuteafd_engine::prefix::{PrefixCache, RefPagePool};
 use cuteafd_ffi::{
@@ -33,15 +33,15 @@ fn view(buffer: CuteafdDeviceBuffer, offset: usize, bytes: usize) -> Result<Cute
 /// One lane per rank, allocated before execution. CSA K/Z must survive until the
 /// acceptance count is known; projection and attention scratch can be reused.
 struct RegionScratch<'a> {
-    starts: Allocation<'a>,
-    counts: Allocation<'a>,
-    unrounded: Allocation<'a>,
+    starts: Plane<'a>,
+    counts: Plane<'a>,
+    unrounded: Plane<'a>,
     compress: Program<'a>,
 }
 
 pub(super) struct Staging<'a> {
     pub stream: Rc<Stream<'a>>,
-    raw: Vec<(Allocation<'a>, Allocation<'a>)>,
+    raw: Vec<(Plane<'a>, Plane<'a>)>,
     sparse: Option<RegionScratch<'a>>,
     compact: Option<CompactKv<'a>>,
     rows: usize,
@@ -49,14 +49,18 @@ pub(super) struct Staging<'a> {
     bytes: usize,
     busy: Cell<bool>,
     cache_owner: usize,
-    positions: Allocation<'a>,
-    requests: Allocation<'a>,
-    ring_table: Allocation<'a>,
-    page_table: Allocation<'a>,
+    positions: Plane<'a>,
+    requests: Plane<'a>,
+    ring_table: Plane<'a>,
+    page_table: Plane<'a>,
     table_width: usize,
+    graph_requests: Plane<'a>,
+    graph_ring_table: Plane<'a>,
+    graph_page_table: Plane<'a>,
     sequences: usize,
 }
 
+#[derive(Clone)]
 pub(super) struct StepInputs<'s, 'a> {
     pub stream: &'s crate::shared::memory::device::Stream<'a>,
     pub positions: CuteafdDeviceBuffer,
@@ -70,6 +74,7 @@ pub(super) struct StepInputs<'s, 'a> {
 
 /// Borrowed only inside the transaction callback, after this layer was staged.
 /// The transaction retains page leases, staging metadata and all queued inputs.
+#[derive(Clone)]
 pub(super) struct AttentionRead<'s, 'a> {
     pub inputs: StepInputs<'s, 'a>,
     pub start: usize,
@@ -78,11 +83,13 @@ pub(super) struct AttentionRead<'s, 'a> {
     pub summaries: Option<CuteafdDeviceBuffer>,
     pub table: CuteafdDeviceBuffer,
     pub table_width: usize,
+    pub table_batch: usize,
     pub pages: usize,
 }
 
 // Every sequence can prepend seven committed CSA rows. Keep each prefix
 // disjoint until acceptance, while compressor scratch is reused in stream order.
+#[cfg(test)]
 fn retained_wave_rows(rows: usize, sequences: usize) -> Result<usize> {
     ensure!(rows > 0 && sequences > 0, "Step-5 staging requires rows and sequences");
     rows.checked_add(sequences.min(rows).checked_mul(7)
@@ -147,8 +154,18 @@ impl<'a> Staging<'a> {
         // Positions, requests and raw region rows span the whole step; ring
         // writes are per unit (`ring.step`).
         let rows = usize::try_from(cache.layout().step_rows)?;
-        let retained = retained_wave_rows(rows, sequences)?;
         let regions = (rows + 7) / 8;
+        let storage = cuteafd_loader::plan::families::step5::admission::staging_layout(
+            cache.layout(), cache.rank(), sequences)?;
+        ensure!(storage.bytes == bytes, "Step-5 staging backing differs from admission");
+        let arena = Arena::new(device, bytes, Tag::staging("step5/transaction-producers"))?;
+        let mut regions_iter = storage.regions.into_iter();
+        let mut next = || -> Result<Plane<'a>> {
+            let region = regions_iter.next().context("Step-5 missing staging view")?;
+            arena.planes(device, &[region.len()], region.start)?.pop().context("Step-5 empty staging view")
+        };
+        let (positions, requests, ring_table, page_table) = (next()?, next()?, next()?, next()?);
+        let (graph_requests, graph_ring_table, graph_page_table) = (next()?, next()?, next()?);
         let sparse = if cache.layout().ranks[cache.rank()].regions.is_empty() { None } else {
             let spec = programs.spec("step5_region_compress")?;
             ensure!(spec.scalar_kinds == b"il" && spec.scratch.is_empty()
@@ -157,9 +174,9 @@ impl<'a> Staging<'a> {
             let compress = device.run(|| programs.program("step5_region_compress",
                 &["keys", "logits", "starts", "counts", "output", "unrounded"]))?;
             Some(RegionScratch {
-                starts: Allocation::new(device, (regions * 4).max(256))?,
-                counts: Allocation::new(device, (regions * 4).max(256))?,
-                unrounded: Allocation::new(device, (regions * 256 * 4).max(256))?,
+                starts: next()?,
+                counts: next()?,
+                unrounded: next()?,
                 compress,
             })
         };
@@ -168,8 +185,8 @@ impl<'a> Staging<'a> {
             .iter()
             .map(|_| {
                 Ok((
-                    Allocation::new(device, retained * 256 * 2)?,
-                    Allocation::new(device, retained * 256 * 2)?,
+                    next()?,
+                    next()?,
                 ))
             })
             .collect::<Result<Vec<_>>>()?;
@@ -180,8 +197,10 @@ impl<'a> Staging<'a> {
             let heads = state.sliding.iter().filter(|s| !s.mtp).map(|s| s.query_heads)
                 .chain(state.regions.iter().map(|s| s.query_heads)).collect::<BTreeSet<_>>()
                 .into_iter().collect::<Vec<_>>();
-            Some(CompactKv::new(device, programs, unit_rows, &heads, sizes, None)?)
+            // These compact planes are transaction staging, not persistent KV.
+            Some(CompactKv::with_planes(device, programs, unit_rows, &heads, vec![next()?, next()?])?)
         };
+        ensure!(regions_iter.next().is_none(), "Step-5 unused staging views");
         let stream = Rc::new(Stream::new(device)?);
         cache.register_lane(&stream)?;
         let owner = Self {
@@ -189,10 +208,8 @@ impl<'a> Staging<'a> {
             raw,
             sparse,
             compact,
-            positions: Allocation::new(device, (rows * 8).max(256))?,
-            requests: Allocation::new(device, (rows * 4).max(256))?,
-            ring_table: Allocation::new(device, (table_width * 4).max(256))?,
-            page_table: Allocation::new(device, (table_width * 4).max(256) * sequences)?,
+            positions, requests, ring_table, page_table,
+            graph_requests, graph_ring_table, graph_page_table,
             table_width,
             sequences,
             rows,
@@ -219,6 +236,12 @@ impl<'a> Staging<'a> {
             .flat_map(|page| ((page as u64 % physical_pages) as i32).to_le_bytes())
             .collect();
         device.run(|| device.library.copy_h2d(owner.ring_table.buffer, &table))?;
+        for sequence in 0..sequences {
+            let table: Vec<u8> = (0..table_width).flat_map(|page|
+                ((sequence as u64 * physical_pages + page as u64 % physical_pages) as i32).to_le_bytes()).collect();
+            let target = view(owner.graph_ring_table.buffer, sequence * table_width * 4, table_width * 4)?;
+            device.run(|| device.library.copy_h2d(target, &table))?;
+        }
         Ok(owner)
     }
     pub(super) fn positions(&self) -> CuteafdDeviceBuffer { self.positions.buffer }
@@ -580,7 +603,14 @@ impl<'e, 'a, E: CopyEngine> Step<'e, 'a, E> {
         step.active = true;
         let positions: Vec<u8> = step.sequences.iter().flat_map(|sequence|
             (sequence.base..sequence.base + sequence.rows).flat_map(|p| (p as i64).to_le_bytes())).collect();
+        let graph_requests: Vec<u8> = step.sequences.iter().flat_map(|sequence|
+            (0..sequence.rows).flat_map(|_| (sequence.sequence as i32).to_le_bytes())).collect();
         for stage in &step.staging {
+            stage.stream.device.run(|| {
+                // SAFETY: persistent row IDs are uploaded on their consuming lane stream.
+                unsafe { stage.stream.device.library.copy_h2d_ordered(
+                    stage.graph_requests.buffer, &graph_requests, stage.stream.raw) }
+            })?;
             stage.stream.device.run(|| {
                 // SAFETY: owned metadata and lane allocations survive the Drop drain.
                 unsafe { stage.stream.device.library.copy_h2d_ordered(
@@ -590,6 +620,12 @@ impl<'e, 'a, E: CopyEngine> Step<'e, 'a, E> {
                 let table: Vec<u8> = sequence.pages.iter().flat_map(|p| (*p as i32).to_le_bytes()).collect();
                 let bytes = (stage.table_width * 4).max(256);
                 let target = view(stage.page_table.buffer, index * bytes, bytes)?;
+                let graph_target = view(stage.graph_page_table.buffer,
+                    sequence.sequence as usize * stage.table_width * 4, stage.table_width * 4)?;
+                stage.stream.device.run(|| {
+                    // SAFETY: physical-sequence tables survive all graph replays and are stream ordered.
+                    unsafe { stage.stream.device.library.copy_h2d_ordered(graph_target, &table, stage.stream.raw) }
+                })?;
                 stage.stream.device.run(|| {
                     // SAFETY: sequence-local tables are disjoint; ordered uploads retain sources.
                     unsafe { stage.stream.device.library.copy_h2d_ordered(target, &table, stage.stream.raw) }
@@ -743,12 +779,53 @@ impl<'e, 'a, E: CopyEngine> Step<'e, 'a, E> {
                 }, sequence.start)
             };
             work(input_owner, AttentionRead { inputs, start, key, value, summaries, table,
-                table_width: stage.table_width, pages })?;
+                table_width: stage.table_width, table_batch: 1, pages })?;
         }
         self.attended[rank].insert((layer, self.unit));
         self.failed = false;
         guard.complete = true;
         Ok(())
+    }
+
+    /// Native selected attention indexes persistent cache components through device row IDs.
+    /// No sequence, absolute position, physical page or request offset enters a graph key.
+    pub(super) fn attend_batched<O>(&mut self, rank: usize, layer: usize, input_owner: &'e O,
+        work: impl FnOnce(&'e O, AttentionRead<'_, 'a>) -> Result<()>) -> Result<bool> {
+        if self.unit_mode() { return Ok(false); }
+        let cache = self.ranks[rank].borrow();
+        let state = &cache.layout().ranks[rank];
+        let stage = self.staging[rank];
+        let (key, value, summaries, table, pages) =
+            if let Some(ring) = state.sliding.iter().find(|r| r.layer == layer && !r.mtp) {
+                (cache.component(ring.key)?, cache.component(ring.value)?, None,
+                    stage.graph_ring_table.buffer,
+                    usize::try_from(cache.layout().ring.rows / 64 * cache.sequences())?)
+            } else {
+                let region = state.regions.iter().find(|r| r.layer == layer)
+                    .context("Step-5 batched attention layer")?;
+                let summary = region.summaries.context("Step-5 batched summary span")?;
+                // The native region-score ABI's request stride is compiled at 1M/8 summaries.
+                // Shorter explicit contexts retain the sequence-local eager reader.
+                if summary.bytes != 131072 * 256 { return Ok(false); }
+                let (key, value) = cache.csa_planes(layer)?;
+                (key, value, Some(cache.component(summary)?), stage.graph_page_table.buffer,
+                    usize::try_from(cache.page_count())?)
+            };
+        ensure!(!self.failed && self.complete[rank].contains(&(layer, self.unit)),
+            "Step-5 batched attention requires staged layer");
+        self.failed = true;
+        let mut guard = stage.stream.cancellation_guard("Step-5 batched attention callback");
+        guard.complete = self.submission.get();
+        work(input_owner, AttentionRead { inputs: StepInputs {
+            stream: &stage.stream, positions: stage.positions.buffer, requests: stage.graph_requests.buffer,
+            rows: self.rows, base: self.base, extent: self.extent,
+            heads: cache.layout().query_heads(rank, layer)?, kv_format: cache.layout().kv_format,
+        }, start: 0, key, value, summaries, table, table_width: stage.table_width,
+            table_batch: stage.sequences, pages })?;
+        self.attended[rank].insert((layer, self.unit));
+        self.failed = false;
+        guard.complete = true;
+        Ok(true)
     }
 
     /// BF16 projections are ordered on the lane stream. Borrowed allocations
@@ -1125,6 +1202,7 @@ fn zero(stream: &Stream<'_>, target: CuteafdDeviceBuffer) -> Result<()> {
 #[cfg(test)]
 pub(super) mod tests {
     use super::*;
+    use crate::shared::memory::device::Allocation;
 
     #[test]
     fn packed_check_descriptors_equal_singletons_and_partners_cannot_change_positions() -> Result<()> {
@@ -1408,7 +1486,7 @@ pub(super) mod tests {
                 assert_eq!(retained_wave_rows(rows, sequences).unwrap(), retained);
                 let extra_raw = (retained - (rows + 7)) * 512 * 2 * 23;
                 assert_eq!(Staging::bytes_for_sequences(&layout, 0, sequences).unwrap(),
-                    single + extra_raw + table * (sequences - 1));
+                    single + extra_raw + 3 * table * (sequences - 1));
             }
         }
         for (rows, sequences) in [(0, 1), (1, 0), (usize::MAX, 1), (usize::MAX, usize::MAX)] {
@@ -1448,8 +1526,8 @@ pub(super) mod tests {
         let mut layout = super::super::cache::tests::layout_for(1024, 2, 0, 64);
         layout.ranks[1].regions.clear();
         layout.geometry.ranks[1].persistent_unit_bytes = 0;
-        // Positions, request ids and the two attention page tables only.
-        assert_eq!(Staging::bytes(&layout, 1)?, 64 * 8 + 256 + 2 * 256);
+        // Positions, eager/graph request ids and eager/graph attention page tables.
+        assert_eq!(Staging::bytes(&layout, 1)?, 64 * 8 + 2 * 256 + 4 * 256);
         assert!(Staging::bytes(&layout, 0)? > Staging::bytes(&layout, 1)?);
         Ok(())
     }
@@ -1501,11 +1579,48 @@ pub(super) mod tests {
                 assert_eq!(bf16.target_pack_planes(rank)?, [0; 2]);
                 assert_eq!(fp8.target_pack_planes(rank)?, [expected; 2]);
                 for sequences in [1, 4, 16] {
-                    assert_eq!(Staging::bytes_for_sequences(&fp8, rank, sequences)?
-                        - Staging::bytes_for_sequences(&bf16, rank, sequences)?, 2 * expected);
+                    let before = Staging::bytes_for_sequences(&bf16, rank, sequences)?;
+                    let packed = cuteafd_loader::serving_capacity::PackedWeightRegions::new([before, expected, expected])?;
+                    assert_eq!(Staging::bytes_for_sequences(&fp8, rank, sequences)?, packed.bytes);
                 }
             }
         }}
+        Ok(())
+    }
+
+    #[test]
+    fn packed_staging_views_share_one_retained_backing_for_every_format() -> Result<()> {
+        use cuteafd_loader::{families::qwen4::Qwen4KvCache, plan::families::step5::admission::staging_layout};
+        let (_directory, fixture) = crate::shared::memory::cpu_stream_fixture()?;
+        let library = fixture.load()?;
+        let device = Device { library: &library, id: 0 };
+        for format in [Qwen4KvCache::Bf16, Qwen4KvCache::Fp8] {
+            for rows in [1, 64, 513] {
+                let layout = super::super::cache::tests::layout_with_format(8192, 2, 0, rows, format);
+                let storage = staging_layout(&layout, 0, 4)?;
+                assert_eq!(storage.bytes, Staging::bytes_for_sequences(&layout, 0, 4)?);
+                assert_eq!(storage.regions.len(), 7 + 3 + 2 * 23 + if format == Qwen4KvCache::Fp8 { 2 } else { 0 });
+                assert!(storage.regions.windows(2).all(|r| r[0].end <= r[1].start));
+                let before = fixture.events()?.matches('D').count();
+                let arena = Arena::new(device, storage.bytes, Tag::staging("step5/test-producers"))?;
+                let planes = storage.regions.iter().map(|r| {
+                    arena.planes(device, &[r.len()], r.start)?.pop().context("staging test view")
+                }).collect::<Result<Vec<_>>>()?;
+                assert_eq!(fixture.events()?.matches('D').count() - before, 1);
+                let backing = planes[0].buffer.ptr as usize;
+                for (plane, region) in planes.iter().zip(&storage.regions) {
+                    assert_eq!(plane.buffer.ptr as usize - backing, region.start);
+                    assert_eq!(plane.buffer.ptr as usize % 256, 0);
+                    assert_eq!(plane.buffer.bytes, region.len());
+                    assert!(region.end <= storage.bytes);
+                }
+                let frees = fixture.events()?.matches('d').count();
+                drop(arena);
+                assert_eq!(fixture.events()?.matches('d').count(), frees, "views retain the backing");
+                drop(planes);
+                assert_eq!(fixture.events()?.matches('d').count(), frees + 1);
+            }
+        }
         Ok(())
     }
 
@@ -1514,12 +1629,13 @@ pub(super) mod tests {
         for step in [1, 64, 513, 4096] {
             let layout = super::super::cache::tests::layout_for(8192, 2, 0, step);
             let regions = (step as usize + 7) / 8;
-            let expected = 23 * (step as usize + 7) * 512 * 2
-                + (regions * 4).max(256) * 2
-                + (regions * 1024).max(256)
-                + (step as usize * 8).max(256)
-                + (step as usize * 4).max(256)
-                + (8192usize.div_ceil(64) * 4).max(256) * 2;
+            let mut sizes = vec![(step as usize * 8).max(256), (step as usize * 4).max(256),
+                (8192usize.div_ceil(64) * 4).max(256), (8192usize.div_ceil(64) * 4).max(256),
+                (step as usize * 4).max(256),
+                (8192usize.div_ceil(64) * 4).max(256), (8192usize.div_ceil(64) * 4).max(256),
+                (regions * 4).max(256), (regions * 4).max(256), (regions * 1024).max(256)];
+            sizes.extend(vec![(step as usize + 7) * 512; 2 * 23]);
+            let expected = cuteafd_loader::serving_capacity::PackedWeightRegions::new(sizes).unwrap().bytes;
             assert_eq!(Staging::bytes(&layout, 0).unwrap(), expected);
             assert_eq!(Staging::bytes(&layout, 1).unwrap(), expected);
             assert!(Staging::bytes(&layout, 2).is_err());
@@ -1555,7 +1671,7 @@ pub(super) mod tests {
         for (pass, (counts, accepted)) in [([7usize, 3], [7usize, 3]), ([17, 5], [9, 4])].into_iter().enumerate() {
             let total: usize = counts.iter().sum();
             let make = |stride: usize, start: usize, rows: usize, salt: usize| -> Result<Allocation<'_>> {
-                let allocation = Allocation::new(device, (rows * stride).max(256))?;
+                let allocation = Allocation::new(device, (rows * stride).max(256), crate::shared::memory::TEST)?;
                 let bytes: Vec<u8> = (start..start + rows).flat_map(|row|
                     std::iter::repeat_n(((row + pass * 13 + salt) % 31 + 1) as u8, stride)).collect();
                 device.run(|| library.copy_h2d(allocation.buffer, &bytes))?;
@@ -1673,7 +1789,7 @@ pub(super) mod tests {
             None,
         )?);
         let input = |bytes| -> Result<Allocation<'_>> {
-            let allocation = Allocation::new(device, bytes)?;
+            let allocation = Allocation::new(device, bytes, crate::shared::memory::TEST)?;
             // BF16 1.0, valid for both raw projections and compressor logits.
             let data: Vec<u8> = [0x80, 0x3f].into_iter().cycle().take(bytes).collect();
             device.run(|| library.copy_h2d(allocation.buffer, &data))?;

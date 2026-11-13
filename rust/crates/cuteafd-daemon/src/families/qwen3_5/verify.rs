@@ -55,9 +55,10 @@ impl<'a> Verification<'a> {
     pub(super) fn new(device: Device<'a>, cfg: &Qwen35Config, slots: usize) -> Result<Self> {
         let mut layout = Self::layout(cfg, slots)?;
         for owner in &mut layout.owners { owner.0 = device.id; }
-        let mark = Rc::new(Allocation::new(device, layout.bytes.max(256))?);
-        let logits = Allocation::new(device, REPLAY_ROWS * cfg.vocab * 4)?;
-        let hidden = Allocation::new(device, cfg.attention.len() * REPLAY_ROWS * cfg.hidden * 2)?;
+        let mark = Rc::new(Allocation::new(device, layout.bytes.max(256), Tag::kv("qwen35/verify-mark"))?);
+        let logits = Allocation::new(device, REPLAY_ROWS * cfg.vocab * 4, Tag::workspace("qwen35/verify-logits"))?;
+        let hidden = Allocation::new(device, cfg.attention.len() * REPLAY_ROWS * cfg.hidden * 2,
+            Tag::workspace("qwen35/verify-hidden"))?;
         let owner = NEXT_ENGINE.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
             .map_err(|_| anyhow::anyhow!("dense target identity exhausted"))?;
         Ok(Self { owner, generation: 0, mark, layout, logits, hidden, taps: Vec::new(), pending: None })
@@ -356,8 +357,29 @@ impl<'a> DenseEngine<'a> {
 
     pub(crate) fn verify_taps(&self) -> &[HiddenTap] { &self.verification.taps }
 
-    fn verify_rows(&mut self, plan: rows::Rows, rows: usize, layers: &[usize], speculative: bool) -> Result<()> {
+    pub(super) fn verify_rows(&mut self, plan: rows::Rows, rows: usize, layers: &[usize], speculative: bool) -> Result<()> {
+        let result = self.enqueue_verify_rows(plan, rows, layers, speculative);
+        // Failed captures can still grow driver storage. Observe only after
+        // the whole single-rank submission, on successful and failed paths.
+        let completed = self.graph_completed();
+        result.and(completed)
+    }
+
+    fn enqueue_verify_rows(&mut self, mut plan: rows::Rows, rows: usize, layers: &[usize], speculative: bool) -> Result<()> {
         self.healthy = false;
+        self.graphs.cycle(speculative);
+        if self.graphs.enabled && plan.stride > 0 {
+            let stride = plan.stride.next_power_of_two().min(self.cfg.max_context.div_ceil(64));
+            if stride != plan.stride {
+                let mut pages = Vec::with_capacity(plan.tokens.len() * stride);
+                for row in plan.pages.chunks_exact(plan.stride) {
+                    pages.extend_from_slice(row);
+                    pages.resize(pages.len() + stride - plan.stride, -1);
+                }
+                plan.pages = pages;
+                plan.stride = stride;
+            }
+        }
         let tokens = &plan.tokens;
         let physical = &plan.physical;
         let library = self.stream.device.library;
@@ -374,10 +396,8 @@ impl<'a> DenseEngine<'a> {
             self.row_tables(&plan)?;
             self.embedding.embed(tokens, self.ids.buffer, 1, self.planes.residual, self.stream.raw)?;
             let step = Step { rows: tokens.len(), capacity: REPLAY_ROWS, table_stride: plan.stride, splits: 1, speculative };
-            let blocks = Blocks { programs: self.programs, admitted: &self.admitted, cfg: &self.cfg,
-                homes: &self.homes, bank: &self.bank, stream: self.stream.raw };
-            for (index, layer) in self.weights.layers.iter().enumerate() {
-                blocks.run(index, layer, self.planes, self.kv[index].as_ref().map(|v| v.buffer), &step)?;
+            for index in 0..self.weights.layers.len() {
+                self.graph_layer(index, &step)?;
                 if let Some(tap) = layers.iter().position(|&layer| layer == index) {
                     let width = self.cfg.hidden * 2;
                     for (active, &row) in physical.iter().enumerate() {
@@ -541,7 +561,7 @@ mod tests {
         assert_eq!(Verification::bytes(&cfg, 16).unwrap(), 16 * layout.bytes + 64 * cfg.vocab * 4
             + 32 * 64 * cfg.hidden * 2);
         for slots in [1, 4, 16, 64] {
-            let native = placement::families::qwen3_5::NativeBuffers::new(&cfg, 1024, slots, 10, false).unwrap();
+            let native = cuteafd_loader::placement::families::qwen3_5::NativeBuffers::new(&cfg, 1024, slots, 10, false).unwrap();
             assert_eq!(native.verify.iter().sum::<usize>(), Verification::bytes(&cfg, slots).unwrap());
             assert_eq!(native.verify[0], Verification::layout(&cfg, slots).unwrap().bytes);
             let gdn = GdnLayout::new(cfg.gdn).unwrap();

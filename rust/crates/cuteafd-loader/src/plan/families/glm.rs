@@ -28,7 +28,7 @@ pub struct Glm {
 /// GLM 5.x: serve-glm / glm-golden on the glm coordinator programs.
 pub static GLM5: Glm =
     Glm { id: "glm5", architecture: "GlmMoeDsaForCausalLM", runtime: RuntimeStatus::Serving, media_cache_headroom: false,
-        exlr8: Exlr8Execution { dense_worlds: &[1, 2], onboard_worlds: &[2] },
+        exlr8: Exlr8Execution { dense_worlds: &[1, 2], onboard_worlds: &[1, 2] },
         decode_rows: crate::placement::families::glm5::DECODE_ROWS as u32,
         decode_lanes: crate::plan::decode_lanes::LaneSupport::One {
             reason: "a second lane needs its own graph set, about 3 GiB per GPU today (213 shapes), more than one onboarded layer (2.26 GiB per GPU), and the big dense core leaves little round trip to hide (predicted loss, #705, #744)" } };
@@ -533,6 +533,10 @@ impl GlmModel {
 }
 
 impl FamilyModel for GlmModel {
+    fn contract_admission(&self) -> bool { true }
+
+    fn admits_expert_packages(&self) -> bool { self.id == "glm5_flash" }
+
     fn spec(&self) -> &ModelSpec {
         &self.spec
     }
@@ -574,13 +578,18 @@ impl FamilyModel for GlmModel {
             // ModelOpt NVFP4 dense MLPs run natively (serve-glmf: the fp8-glmfdense-nvfp4 package).
             Component::DenseFfn if self.id == "glm5_flash" && operand.is_nvfp4()
                 && operand.scale.as_ref().is_some_and(|s| s.cols == 16) => Ok(()),
-            _ if matches!(self.id, "glm5" | "glm5_flash") && operand.exl3_bits() == Some(6) => {
+            _ if operand.exl3_bits().is_some() => {
+                let bits = operand.exl3_bits().unwrap();
+                let widths = if self.id == "glm5_flash" { crate::families::glm5_flash::core::NATIVE_CORE_WIDTHS }
+                    else { crate::families::glm5::core::NATIVE_CORE_WIDTHS };
+                require(widths.contains(&bits), || format!(
+                    "{} {stem}: unsupported dense core width K{bits}; shipping widths {widths:?}; add a native trellis_linear exporter program and family dispatch before loading this width", self.id))?;
                 let shape = self.core_shapes.get(&format!("{stem}.weight"))
-                    .ok_or_else(|| format!("{stem}: outside GLM's native K6 core keep-list"))?;
+                    .ok_or_else(|| format!("{stem}: outside GLM's native trellis core keep-list"))?;
                 let padded = self.id == "glm5" && stem.ends_with(".self_attn.kv_a_proj_with_mqa")
                     && operand.logical == [shape[0].next_multiple_of(128), shape[1]];
                 require(operand.logical == *shape || padded, || format!(
-                    "{stem}: native K6 shape {:?}, expected {shape:?} (kv_a may store N128 padding)", operand.logical))?;
+                    "{stem}: native trellis core shape {:?}, expected {shape:?} (kv_a may store N128 padding)", operand.logical))?;
                 operand.logical = shape.clone();
                 Ok(())
             }

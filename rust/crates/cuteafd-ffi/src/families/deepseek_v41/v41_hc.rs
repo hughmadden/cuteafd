@@ -129,7 +129,7 @@ impl NativeLibrary {
                 .get::<unsafe extern "C" fn() -> i32>(b"cuteafd_v41_hc_project_initialize")?
         };
         let status = unsafe { initialize() };
-        ensure!(status == 0, "mHC AOT initialization CUDA status {status}");
+        self.status_to_result("mHC AOT initialization CUDA status", status)?;
         let begin = unsafe {
             self.lib
                 .get::<Begin>(b"cuteafd_v41_hc_begin")
@@ -154,7 +154,7 @@ impl NativeLibrary {
                     .context("SM89 mHC boundary: the library is not an sm_89 build")?
             };
             let status = unsafe { sm89_initialize() };
-            ensure!(status == 0, "SM89 mHC initialization CUDA status {status}");
+            self.status_to_result("SM89 mHC initialization CUDA status", status)?;
             post_finish = Some(unsafe { *self.lib.get::<PostFinish>(b"cuteafd_v41_hc_post_finish")? });
         }
         static REPORTED: std::sync::Once = std::sync::Once::new();
@@ -262,7 +262,7 @@ impl V41Hc<'_> {
                 stream,
             )
         };
-        ensure!(status == 0, "mHC begin CUDA status {status}");
+        self._library.status_to_result("mHC begin CUDA status", status)?;
         Ok(true)
     }
 
@@ -300,7 +300,7 @@ impl V41Hc<'_> {
                 stream,
             )
         };
-        ensure!(status == 0, "mHC mixes CUDA status {status}");
+        self._library.status_to_result("mHC mixes CUDA status", status)?;
         Ok(())
     }
 
@@ -345,7 +345,7 @@ impl V41Hc<'_> {
                 stream,
             )
         };
-        ensure!(status == 0, "mHC mixes CUDA status {status}");
+        self._library.status_to_result("mHC mixes CUDA status", status)?;
         Ok(())
     }
 
@@ -370,7 +370,7 @@ impl V41Hc<'_> {
                 stream,
             )
         };
-        ensure!(status == 0, "mHC pre CUDA status {status}");
+        self._library.status_to_result("mHC pre CUDA status", status)?;
         Ok(())
     }
     /// # Safety
@@ -407,7 +407,7 @@ impl V41Hc<'_> {
                 stream,
             )
         };
-        ensure!(status == 0, "mHC post CUDA status {status}");
+        self._library.status_to_result("mHC post CUDA status", status)?;
         Ok(())
     }
     /// The SM89 boundary's finish and post: next pre, post and comb from the
@@ -464,7 +464,7 @@ impl V41Hc<'_> {
                 stream,
             )
         };
-        ensure!(status == 0, "mHC post finish CUDA status {status}");
+        self._library.status_to_result("mHC post finish CUDA status", status)?;
         Ok(())
     }
 }

@@ -1,7 +1,11 @@
 mod families;
+pub use families::minimax_m3;
 mod shared;
-pub use shared::{audio, pcm_audio, dense_trellis, draft_projection, exlr8, fp8_moe, glm_stage, mla_draft, native_dense, native_dense_glue, peer_exchange, programs, projected_index, projected_kda, vision};
-pub use families::kimi_k3::{KimiMla, KimiMlaBatch, KimiMlaError, KimiMlaMode, KimiMlaWeights,
+pub use shared::{audio, pcm_audio, dense_trellis, draft_projection, exlr8, fp8_moe, glm_stage, mla_draft, native_attention, native_dense, native_dense_glue, peer_exchange, programs, projected_index, projected_kda, vision};
+pub use families::kimi_k3::{KimiMla, KimiMlaProjection, KimiMlaBatch, KimiMlaError, KimiMlaMode, KimiMlaWeights,
+    KimiMlaPartial, KimiMlaPartialBatch, KimiIndexProducer, KimiIndexWeights, KimiIndexBatch,
+    KimiSparseMla, KimiSparseBatch, KimiIndexTopK, KimiIndexSelection, KimiIndexMode,
+    KimiCandidateMerge, KimiCandidateBatch,
     KimiFfn, KimiFfnBatch, KimiFfnMode, KimiLatent, KimiPrefixMode, KimiResidual, KimiResidualBatch, KimiResidualSite,
     KimiRmsNorm, KimiSitu, KimiW8Error, KimiKda, KimiKdaBatch, KimiKdaWeights, KimiKdaCommit, KimiKdaGeometry,
     KimiRouter, KimiRoutes, KimiExpertInput, MLA_PAGE_ROWS, MLA_RECORD_BYTES};
@@ -12,7 +16,7 @@ pub use shared::packed_head::PackedHeadPlanes;
 pub use shared::v41_device_ops::{Bf16Add, Bf16F32Add, F32Bf16Narrow, F32Add, V41PeerCopy};
 pub use families::deepseek_v41::v41_candidate_blocks::V41CandidateBlocks;
 pub use families::deepseek_v41::v41_index_topk::V41IndexTopK;
-pub use families::deepseek_v41::v41_sparse_attention::{V41SparseAttention, V41SparseBatch, V41SparseSource, V41SparseWindow};
+pub use families::deepseek_v41::v41_sparse_attention::{V41SparseAttention, V41SparseBatch, V41SparseBatchRecipe, V41SparseSource, V41SparseWindow};
 pub use families::deepseek_v41::v41_index_scores::V41IndexScores;
 pub use families::deepseek_v41::v41_kv::{V41Kv, V41KvStoreLayer, V41KvStoreLayers};
 pub use families::deepseek_v41::v41_vision::V41VisionOps;
@@ -36,9 +40,12 @@ pub use shared::v41_experts::{
     v41_pack_intermediate_supported, v41_rank_count_supported, V41ScaleCodeJob,
 };
 pub use shared::rtx_combine::{RtxPartialDtype, RtxTp2Combine};
+pub use shared::expert_usage;
 mod cuda_runtime;
 pub mod host_isa;
 pub mod memory_ledger;
+pub mod load_timing;
+mod observer_context;
 pub mod synchronized_load;
 pub mod push_ring;
 pub mod event_waiters;
@@ -518,12 +525,49 @@ pub fn graph_capture_sites() -> Vec<(String, u64)> {
     sites
 }
 
+/// Live `cudaStreamCreate` handles this crate made minus successful destroys,
+/// and its peak since start. Every context's driver slabs follow the live count
+/// (2 MiB per four live streams), so admission can charge the measured peak.
+static LIVE_STREAMS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static PEAK_STREAMS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Process-wide stream census (`live`, `peak`).
+pub fn stream_census() -> (u64, u64) {
+    (LIVE_STREAMS.load(std::sync::atomic::Ordering::SeqCst), PEAK_STREAMS.load(std::sync::atomic::Ordering::SeqCst))
+}
+
 pub type CuteafdStatus = c_int;
 
+/// A native-library call returned a non-OK status. This is a device/driver
+/// failure (CUDA, RDMA or NCCL), not a host-side invariant failure: callers
+/// that keep device state alive across calls must treat it as terminal.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("{context} returned status {status}: {detail}")]
+pub struct NativeStatusError {
+    pub context: String,
+    pub status: CuteafdStatus,
+    pub detail: String,
+}
+
 pub const CUTEAFD_STATUS_OK: CuteafdStatus = 0;
+pub const CUTEAFD_STATUS_BUFFER_TOO_SMALL: CuteafdStatus = 2;
+pub const CUTEAFD_STATUS_ALLOCATION_FAILED: CuteafdStatus = 4;
 pub const CUTEAFD_STATUS_CUDA_UNAVAILABLE: CuteafdStatus = 3;
 pub const CUTEAFD_STATUS_RDMA_UNAVAILABLE: CuteafdStatus = 7;
 pub const CUTEAFD_STATUS_NCCL_UNAVAILABLE: CuteafdStatus = 8;
+pub const CUTEAFD_STATUS_CAPTURE_REQUIRES_PREPARE: CuteafdStatus = 9;
+
+/// Capture succeeded, but recording <=2 nodes is not worth an executable.
+/// No captured work ran; the caller must execute the segment eagerly.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("graph capture has only {nodes} nodes; run eagerly")]
+pub struct SmallGraphCapture { pub nodes: usize }
+
+pub fn is_small_graph(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<SmallGraphCapture>().is_some()
+}
+
+pub const CUTEAFD_STATUS_GRAPH_TOO_SMALL: CuteafdStatus = 10;
 pub const CUTEAFD_DEVICE_BUFFER_FLAG_HOST_FALLBACK: u64 = 1;
 pub const CUTEAFD_DEVICE_BUFFER_FLAG_MANAGED: u64 = 2;
 pub const CUTEAFD_DEVICE_BUFFER_FLAG_MAPPED_HOST: u64 = 4;
@@ -1157,15 +1201,20 @@ impl Default for CuteafdRdmaRcCompletionStats {
 }
 
 type VersionFn = unsafe extern "C" fn(out: *mut c_char, out_len: usize) -> CuteafdStatus;
-type AllocHostBufferFn =
-    unsafe extern "C" fn(bytes: usize, out: *mut CuteafdHostBuffer) -> CuteafdStatus;
+type AllocHostBufferFn = unsafe extern "C" fn(bytes: usize, out: *mut CuteafdHostBuffer,
+    kind: u32, owner: *const c_char) -> CuteafdStatus;
 type CudaHostBufferDeviceAliasFn =
     unsafe extern "C" fn(host: CuteafdHostBuffer, out: *mut CuteafdDeviceBuffer) -> CuteafdStatus;
 type FreeHostBufferFn = unsafe extern "C" fn(buf: *mut CuteafdHostBuffer) -> CuteafdStatus;
-type AllocDeviceBufferFn =
-    unsafe extern "C" fn(bytes: usize, out: *mut CuteafdDeviceBuffer) -> CuteafdStatus;
-type AllocManagedDeviceBufferFn =
-    unsafe extern "C" fn(bytes: usize, out: *mut CuteafdDeviceBuffer) -> CuteafdStatus;
+type AllocDeviceBufferFn = unsafe extern "C" fn(bytes: usize, out: *mut CuteafdDeviceBuffer,
+    kind: u32, owner: *const c_char) -> CuteafdStatus;
+type AllocManagedDeviceBufferFn = unsafe extern "C" fn(bytes: usize, out: *mut CuteafdDeviceBuffer,
+    kind: u32, owner: *const c_char) -> CuteafdStatus;
+
+/// The tag as the native allocators take it: kind integer plus a NUL-terminated owner.
+fn native_tag(tag: memory_ledger::Tag) -> Result<(u32, CString)> {
+    Ok((tag.kind.as_raw(), CString::new(tag.owner).context("allocation owner contains NUL")?))
+}
 type FreeDeviceBufferFn = unsafe extern "C" fn(buf: *mut CuteafdDeviceBuffer) -> CuteafdStatus;
 type CudaStreamCreateFn = unsafe extern "C" fn(out: *mut *mut c_void) -> CuteafdStatus;
 type CudaStreamDestroyFn = unsafe extern "C" fn(cuda_stream: *mut c_void) -> CuteafdStatus;
@@ -1705,6 +1754,7 @@ native_symbols! {
     cuteafd_cuda_graph_census_end: unsafe extern "C" fn(*mut c_void) -> CuteafdStatus,
     cuteafd_cuda_graph_begin_capture: CudaGraphBeginCaptureFn,
     cuteafd_cuda_graph_end_capture: CudaGraphEndCaptureFn,
+    cuteafd_cuda_graph_end_capture_topology: unsafe extern "C" fn(*mut c_void, *mut *mut c_void, *mut usize, *mut usize, *mut i32) -> CuteafdStatus,
     cuteafd_cuda_graph_launch: CudaGraphLaunchFn,
     cuteafd_cuda_graph_exec_destroy: CudaGraphExecDestroyFn,
     cuteafd_copy_h2d: CopyH2DFn,
@@ -1782,13 +1832,60 @@ native_symbols! {
     cuteafd_xgrammar_compiler_create_json: XGrammarCompilerCreateFn,
 }
 
+/// Lifetime-pinned physical memory reader for cache policy owners without a library borrow.
+pub struct PhysicalMemoryQuery {
+    _module: Arc<Library>,
+    get_device: unsafe extern "C" fn(*mut i32) -> CuteafdStatus,
+    set_device: unsafe extern "C" fn(i32) -> CuteafdStatus,
+    memory_info: unsafe extern "C" fn(*mut usize, *mut usize) -> CuteafdStatus,
+}
+
+impl PhysicalMemoryQuery {
+    pub fn sample(&self, device: i32) -> Result<(usize, usize)> {
+        fn checked(context: &str, status: CuteafdStatus) -> Result<()> {
+            if status == CUTEAFD_STATUS_OK { return Ok(()) }
+            Err(anyhow::Error::new(NativeStatusError { context: context.into(), status,
+                detail: "physical memory query failed".into() }))
+        }
+        let mut previous = -1;
+        // SAFETY: the module pins these function pointers and previous is writable.
+        checked("memory query get device", unsafe { (self.get_device)(&mut previous) })?;
+        // SAFETY: CUDA ordinals are validated by the runtime.
+        checked("memory query set device", unsafe { (self.set_device)(device) })?;
+        struct Restore<'a> { query: &'a PhysicalMemoryQuery, previous: i32, armed: bool }
+        impl Drop for Restore<'_> {
+            fn drop(&mut self) {
+                // SAFETY: query pins the setter and previous came from the runtime.
+                if self.armed {
+                    let status = unsafe { (self.query.set_device)(self.previous) };
+                    if status != CUTEAFD_STATUS_OK { tracing::error!(status, "restoring memory query device"); }
+                }
+            }
+        }
+        let mut restore = Restore { query: self, previous, armed: previous != device };
+        let (mut free, mut total) = (0, 0);
+        // SAFETY: the module pins the query; both outputs are writable.
+        let result = checked("physical memory query", unsafe { (self.memory_info)(&mut free, &mut total) });
+        if restore.armed {
+            // SAFETY: previous is the runtime's ordinal and the module remains pinned.
+            checked("memory query restore device", unsafe { (self.set_device)(previous) })?;
+            restore.armed = false;
+        }
+        result?;
+        anyhow::ensure!(free <= total && total > 0, "invalid CUDA memory information");
+        Ok((free, total))
+    }
+}
+
 pub struct NativeLibrary {
     artifact_root: std::path::PathBuf,
+    loaded_path: std::path::PathBuf,
     lib: ManuallyDrop<Arc<Library>>,
     symbols: NativeSymbols,
     quarantine_after_failed_drain: AtomicBool,
     sync_h2d_staging: Mutex<SyncH2DStagingBuffer>,
     ordered_h2d_staging: Mutex<std::collections::BTreeMap<(i32, usize, usize), OrderedH2DStaging>>,
+    native_modules_loaded: Mutex<std::collections::BTreeSet<i32>>,
     rdma_rc_endpoint_try_poll_fn: RdmaRcEndpointTryPollFn,
 }
 
@@ -1883,7 +1980,7 @@ impl Drop for PinnedBytes {
     }
 }
 impl NativeLibrary {
-    pub fn pinned_bytes(&self, bytes: usize) -> Result<PinnedBytes> {
+    pub fn pinned_bytes(&self, bytes: usize, tag: memory_ledger::Tag) -> Result<PinnedBytes> {
         let free = self.cuteafd_free_host_buffer()?;
         let record = self.cuteafd_cuda_event_record()?;
         let query = self.cuteafd_cuda_event_query()?;
@@ -1891,7 +1988,7 @@ impl NativeLibrary {
         let destroy = self.cuteafd_cuda_event_destroy()?;
         let create = self.cuteafd_cuda_event_create_ordering()?;
         let get_device = self.cuteafd_cuda_get_device()?;
-        let buffer = self.alloc_host_buffer(bytes)?;
+        let buffer = self.alloc_host_buffer(bytes, tag)?;
         // SAFETY: newly allocated, exclusive storage must be initialized before
         // safe byte slices expose it (including unused capacity padding).
         unsafe { std::ptr::write_bytes(buffer.ptr.cast::<u8>(), 0, bytes); }
@@ -2174,11 +2271,26 @@ impl Drop for CuteafdNcclComm {
     }
 }
 
-/// RC endpoint send/recv spans are allocated natively (pinned or malloc'd and
-/// registered); the ledger keys them by endpoint handle.
-fn record_rdma_rings(handle: *mut c_void, bytes: usize) {
-    let _scope = memory_ledger::scope("transport/rdma-rings");
-    memory_ledger::record_alloc(memory_ledger::Space::Pinned, -1, handle as usize, bytes);
+/// Record native backing, not the endpoint handle or requested ring capacity.
+fn record_rdma_rings(handle: *mut c_void, views: [CuteafdRdmaRcEndpointBufferView; 2]) -> Result<()> {
+    anyhow::ensure!(!handle.is_null(), "null RDMA endpoint owner");
+    for view in &views {
+        anyhow::ensure!(!view.host_ptr.is_null() && view.bytes > 0,
+            "empty RDMA endpoint backing");
+        (view.host_ptr as usize).checked_add(view.bytes).context("RDMA backing overflow")?;
+    }
+    let mut extents = views.map(|view| (view.host_ptr as usize, view.bytes));
+    extents.sort_unstable();
+    anyhow::ensure!(extents[0].0 + extents[0].1 <= extents[1].0,
+        "overlapping RDMA endpoint backing");
+    for view in views {
+        let space = if view.host_flags & CUTEAFD_HOST_BUFFER_FLAG_PINNED != 0 {
+            memory_ledger::Space::Pinned
+        } else { memory_ledger::Space::Host };
+        memory_ledger::record_endpoint_alloc(space, view.host_ptr as usize, view.bytes, handle as usize,
+            memory_ledger::Tag::new(memory_ledger::MemoryKind::Transport, "transport/rdma-rings"));
+    }
+    Ok(())
 }
 
 /// Per-destination pinned source and copy-completion fence. Raw owners are
@@ -2217,9 +2329,8 @@ impl SyncH2DStagingBuffer {
                     .context("freeing undersized synchronous H2D pinned staging buffer")?;
                 self.buffer = CuteafdHostBuffer::default();
             }
-            let _scope = memory_ledger::scope("staging/sync-h2d");
             self.buffer = library
-                .alloc_host_buffer(bytes)
+                .alloc_host_buffer(bytes, memory_ledger::Tag::new(memory_ledger::MemoryKind::Staging, "staging/sync-h2d"))
                 .context("allocating reusable synchronous H2D pinned staging buffer")?;
             if self.buffer.ptr.is_null() {
                 anyhow::bail!("reusable synchronous H2D pinned staging buffer is null");
@@ -2267,7 +2378,7 @@ impl Drop for NativeLibrary {
         if let Ok(mut staging) = self.sync_h2d_staging.lock() {
             staging.release_with_library(self);
         }
-        // SAFETY: this is the sole normal-path owner of the module. Staging
+        // SAFETY: release this library's module pin exactly once. Staging
         // was released while its free function was still loaded; quarantine
         // deliberately bypasses both releases.
         unsafe { ManuallyDrop::drop(&mut self.lib) };
@@ -2305,16 +2416,23 @@ impl NativeLibrary {
         let rdma_rc_endpoint_try_poll_fn =
             unsafe { *lib.get::<RdmaRcEndpointTryPollFn>(b"cuteafd_rdma_rc_endpoint_try_poll")? };
         sync_expert_hidden(&lib)?;
+        memory_ledger::fault::install(&lib);
         Ok(Self {
             artifact_root,
+            loaded_path: path,
             lib: ManuallyDrop::new(Arc::new(lib)),
             symbols: NativeSymbols::default(),
             quarantine_after_failed_drain: AtomicBool::new(false),
             sync_h2d_staging: Mutex::new(SyncH2DStagingBuffer::default()),
             ordered_h2d_staging: Mutex::new(Default::default()),
+            native_modules_loaded: Mutex::new(Default::default()),
             rdma_rc_endpoint_try_poll_fn,
         })
     }
+
+    /// The actual host-ISA-selected module, not the unselected base filename.
+    /// Startup provenance hashes this file; it is never an admission input.
+    pub fn loaded_path(&self) -> &Path { &self.loaded_path }
 
     /// Irreversibly retain this module and its reusable pinned H2D staging
     /// until process teardown after a stream drain failed to prove completion.
@@ -2351,12 +2469,22 @@ impl NativeLibrary {
 
 
 
-    pub fn alloc_host_buffer(&self, bytes: usize) -> Result<CuteafdHostBuffer> {
+    /// Pinned, device-mapped host memory holding `tag`.
+    #[track_caller]
+    pub fn alloc_host_buffer(&self, bytes: usize, tag: memory_ledger::Tag) -> Result<CuteafdHostBuffer> {
+        self.alloc_host_buffer_with(bytes, tag)
+    }
+
+    #[track_caller]
+    fn alloc_host_buffer_with(&self, bytes: usize, tag: memory_ledger::Tag) -> Result<CuteafdHostBuffer> {
+        let _failure_boundary = memory_ledger::fault::boundary();
         let alloc_fn: AllocHostBufferFn = self.cuteafd_alloc_host_buffer()?;
+        let (kind, owner) = native_tag(tag)?;
         let mut buffer = CuteafdHostBuffer::default();
-        let status = unsafe { alloc_fn(bytes, &mut buffer) };
+        // SAFETY: the output and owner string live through this synchronous call.
+        let status = unsafe { alloc_fn(bytes, &mut buffer, kind, owner.as_ptr()) };
         self.status_to_result("cuteafd_alloc_host_buffer", status)?;
-        memory_ledger::record_alloc(memory_ledger::Space::Pinned, -1, buffer.ptr as usize, buffer.bytes);
+        memory_ledger::record_alloc(memory_ledger::Space::Pinned, -1, buffer.ptr as usize, buffer.bytes, tag);
         Ok(buffer)
     }
 
@@ -2376,9 +2504,19 @@ impl NativeLibrary {
 
     pub fn free_host_buffer(&self, buffer: &mut CuteafdHostBuffer) -> Result<()> {
         let free_fn: FreeHostBufferFn = self.cuteafd_free_host_buffer()?;
-        memory_ledger::record_free(buffer.ptr as usize);
+        let address = buffer.ptr as usize;
         let status = unsafe { free_fn(buffer) };
-        self.status_to_result("cuteafd_free_host_buffer", status)
+        self.status_to_result("cuteafd_free_host_buffer", status)?;
+        memory_ledger::record_free(address);
+        Ok(())
+    }
+
+    /// Pin the native module for a physical-memory observer without a library borrow.
+    pub fn physical_memory_query(&self) -> Result<PhysicalMemoryQuery> {
+        Ok(PhysicalMemoryQuery { _module: Arc::clone(&self.lib),
+            get_device: self.cuteafd_cuda_get_device()?,
+            set_device: self.cuteafd_cuda_set_device()?,
+            memory_info: self.cuteafd_cuda_memory_info()? })
     }
 
     /// Physical free and total bytes, including other processes and CUDA's
@@ -2394,7 +2532,8 @@ impl NativeLibrary {
         Ok((free, total))
     }
 
-    /// Allocatable free/total bytes on the current device, before logical budgets.
+    /// Allocatable free/total bytes before logical budgets, excluding declared
+    /// external observer capacity. Raw physical diagnostics remain unchanged.
     /// Integrated-device allocations reclaim Linux page cache, so MemAvailable is the
     /// shared device/host headroom. GB10 device pages are not charged to memcg,
     /// so Docker memory limits bound host allocations only, not device admission.
@@ -2403,12 +2542,16 @@ impl NativeLibrary {
     /// before reclaiming page cache. Raw samples remain available for diagnostics.
     /// Discrete devices keep cudaMemGetInfo, regardless of compute capability.
     pub fn cuda_allocatable_memory_info(&self) -> Result<(usize, usize)> {
-        let info = self.cuda_device_info(self.cuda_get_device()?)?;
-        device_allocatable_memory(&info, || self.cuda_physical_memory_info(), || {
+        let device = self.cuda_get_device()?;
+        // The observer must be resident before taking the device-wide sample.
+        let observer = observer_context::bytes(device)?;
+        let info = self.cuda_device_info(device)?;
+        let (free, total) = device_allocatable_memory(&info, || self.cuda_physical_memory_info(), || {
             let available = allocatable_bytes(true, 0,
                 || std::fs::read_to_string("/proc/meminfo").context("reading device allocatable memory"))?;
             Ok(available)
-        })
+        })?;
+        observer_context::exclude(free, total, observer)
     }
 
     /// Effective free/total bytes under the coordinator's logical ceiling.
@@ -2447,7 +2590,7 @@ impl NativeLibrary {
         budget.admit(cuteafd_core::serving_capacity::DeviceMemory {
             device: u32::try_from(self.cuda_get_device()?)?, total_bytes: total as u64,
             baseline_free_bytes: free as u64,
-        }, bytes as u64)?;
+        }, bytes as u64).map_err(|error| memory_ledger::capture_failure(error.into()))?;
         Ok(Some(guard))
     }
 
@@ -2545,45 +2688,110 @@ impl NativeLibrary {
         Ok(bytes)
     }
 
-    pub fn alloc_device_buffer(&self, bytes: usize) -> Result<CuteafdDeviceBuffer> {
+    /// Device memory on the current device holding `tag`. The tag is not
+    /// optional: an allocation that does not say what it holds does not compile.
+    ///
+    /// ```compile_fail
+    /// # fn untagged(library: &cuteafd_ffi::NativeLibrary) -> anyhow::Result<()> {
+    /// library.alloc_device_buffer(4096)?; // missing the Tag argument
+    /// # Ok(()) }
+    /// ```
+    ///
+    /// ```compile_fail
+    /// # fn stringly(library: &cuteafd_ffi::NativeLibrary) -> anyhow::Result<()> {
+    /// library.alloc_device_buffer(4096, "kv/pages")?; // a string is not a Tag
+    /// # Ok(()) }
+    /// ```
+    ///
+    /// ```no_run
+    /// # fn tagged(library: &cuteafd_ffi::NativeLibrary) -> anyhow::Result<()> {
+    /// use cuteafd_ffi::memory_ledger::{MemoryKind, Tag};
+    /// library.alloc_device_buffer(4096, Tag::new(MemoryKind::Kv, "doc/kv-pages"))?;
+    /// # Ok(()) }
+    /// ```
+    #[track_caller]
+    pub fn alloc_device_buffer(&self, bytes: usize, tag: memory_ledger::Tag) -> Result<CuteafdDeviceBuffer> {
+        self.alloc_device_buffer_with(bytes, tag)
+    }
+
+    /// The tag this thread last asked a native allocator for, whether or not
+    /// that allocation succeeded (failure reports name the attempted owner).
+    pub fn last_allocation_tag(&self) -> Result<Option<memory_ledger::Tag>> {
+        type LastTag = unsafe extern "C" fn(*mut u32, *mut c_char, usize, *mut usize) -> CuteafdStatus;
+        // SAFETY: versioned native ABI writing into local, bounded outputs.
+        let last: libloading::Symbol<LastTag> = unsafe { self.lib.get(b"cuteafd_last_allocation_tag")? };
+        let (mut kind, mut required) = (0u32, 0usize);
+        // First ask for the owner's size, then read it whole: never truncate.
+        // SAFETY: a zero-length query writes only the two scalars.
+        let status = unsafe { last(&mut kind, std::ptr::null_mut(), 0, &mut required) };
+        if status != CUTEAFD_STATUS_BUFFER_TOO_SMALL && status != 0 {
+            self.status_to_result("cuteafd_last_allocation_tag", status)?;
+        }
+        let mut owner = vec![0 as c_char; required.max(1)];
+        // SAFETY: `owner` holds `required` bytes, the size native reported.
+        let status = unsafe { last(&mut kind, owner.as_mut_ptr(), owner.len(), &mut required) };
+        self.status_to_result("cuteafd_last_allocation_tag", status)?;
+        let Some(kind) = memory_ledger::MemoryKind::from_raw(kind) else { return Ok(None) };
+        // SAFETY: native wrote a NUL-terminated string inside `owner`.
+        let owner = unsafe { CStr::from_ptr(owner.as_ptr()) }.to_str().context("allocation owner is not UTF8")?;
+        Ok(Some(memory_ledger::tag(kind, owner)))
+    }
+
+    #[track_caller]
+    fn alloc_device_buffer_with(&self, bytes: usize, tag: memory_ledger::Tag) -> Result<CuteafdDeviceBuffer> {
+        let _failure_boundary = memory_ledger::fault::boundary();
         let _budget_guard = self.admit_gpu_allocation(bytes)?;
         let alloc_fn: AllocDeviceBufferFn = self.cuteafd_alloc_device_buffer()?;
+        let (kind, owner) = native_tag(tag)?;
         let mut buffer = CuteafdDeviceBuffer::default();
-        let status = unsafe { alloc_fn(bytes, &mut buffer) };
+        // SAFETY: the output and owner string live through this synchronous call.
+        let status = unsafe { alloc_fn(bytes, &mut buffer, kind, owner.as_ptr()) };
         self.status_to_result("cuteafd_alloc_device_buffer", status)?;
-        memory_ledger::record_alloc(memory_ledger::Space::Device, buffer.device_id, buffer.ptr as usize, buffer.bytes);
+        memory_ledger::record_alloc(memory_ledger::Space::Device, buffer.device_id, buffer.ptr as usize, buffer.bytes, tag);
         Ok(buffer)
     }
 
-    pub fn alloc_managed_device_buffer(&self, bytes: usize) -> Result<CuteafdDeviceBuffer> {
+    /// Managed memory holding `tag`.
+    #[track_caller]
+    pub fn alloc_managed_device_buffer(&self, bytes: usize, tag: memory_ledger::Tag) -> Result<CuteafdDeviceBuffer> {
+        let _failure_boundary = memory_ledger::fault::boundary();
         let _budget_guard = self.admit_gpu_allocation(bytes)?;
         let alloc_fn: AllocManagedDeviceBufferFn = self.cuteafd_alloc_managed_device_buffer()?;
+        let (kind, owner) = native_tag(tag)?;
         let mut buffer = CuteafdDeviceBuffer::default();
-        let status = unsafe { alloc_fn(bytes, &mut buffer) };
+        // SAFETY: the output and owner string live through this synchronous call.
+        let status = unsafe { alloc_fn(bytes, &mut buffer, kind, owner.as_ptr()) };
         self.status_to_result("cuteafd_alloc_managed_device_buffer", status)?;
-        memory_ledger::record_alloc(memory_ledger::Space::Managed, buffer.device_id, buffer.ptr as usize, buffer.bytes);
+        memory_ledger::record_alloc(memory_ledger::Space::Managed, buffer.device_id, buffer.ptr as usize, buffer.bytes, tag);
         Ok(buffer)
     }
 
     pub fn free_device_buffer(&self, buffer: &mut CuteafdDeviceBuffer) -> Result<()> {
         let free_fn: FreeDeviceBufferFn = self.cuteafd_free_device_buffer()?;
-        memory_ledger::record_free(buffer.ptr as usize);
+        let address = buffer.ptr as usize;
         let status = unsafe { free_fn(buffer) };
-        self.status_to_result("cuteafd_free_device_buffer", status)
+        self.status_to_result("cuteafd_free_device_buffer", status)?;
+        memory_ledger::record_free(address);
+        Ok(())
     }
 
     pub fn cuda_stream_create(&self) -> Result<*mut c_void> {
+        let _failure_boundary = memory_ledger::fault::boundary();
         let create_fn: CudaStreamCreateFn = self.cuteafd_cuda_stream_create()?;
         let mut cuda_stream = std::ptr::null_mut();
         let status = unsafe { create_fn(&mut cuda_stream) };
         self.status_to_result("cuteafd_cuda_stream_create", status)?;
+        let live = LIVE_STREAMS.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+        PEAK_STREAMS.fetch_max(live, std::sync::atomic::Ordering::SeqCst);
         Ok(cuda_stream)
     }
 
     pub unsafe fn cuda_stream_destroy(&self, cuda_stream: *mut c_void) -> Result<()> {
         let destroy_fn: CudaStreamDestroyFn = self.cuteafd_cuda_stream_destroy()?;
         let status = unsafe { destroy_fn(cuda_stream) };
-        self.status_to_result("cuteafd_cuda_stream_destroy", status)
+        self.status_to_result("cuteafd_cuda_stream_destroy", status)?;
+        LIVE_STREAMS.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(())
     }
 
     /// Diagnostic drain of every stream on the calling thread's current CUDA device.
@@ -2622,6 +2830,7 @@ impl NativeLibrary {
     }
 
     pub fn cuda_event_create(&self) -> Result<*mut c_void> {
+        let _failure_boundary = memory_ledger::fault::boundary();
         let create_fn: CudaEventCreateFn = self.cuteafd_cuda_event_create()?;
         let mut cuda_event = std::ptr::null_mut();
         let status = unsafe { create_fn(&mut cuda_event) };
@@ -2631,6 +2840,7 @@ impl NativeLibrary {
 
     /// Timing-disabled event for stream ordering only.
     pub fn cuda_event_create_ordering(&self) -> Result<*mut c_void> {
+        let _failure_boundary = memory_ledger::fault::boundary();
         let create_fn: CudaEventCreateFn = self.cuteafd_cuda_event_create_ordering()?;
         let mut cuda_event = std::ptr::null_mut();
         let status = unsafe { create_fn(&mut cuda_event) };
@@ -2641,6 +2851,7 @@ impl NativeLibrary {
     /// An ordering event whose [`Self::cuda_event_synchronize`] sleeps until
     /// the device signals it instead of spinning: per-step host waits.
     pub fn cuda_event_create_blocking(&self) -> Result<*mut c_void> {
+        let _failure_boundary = memory_ledger::fault::boundary();
         let create_fn: CudaEventCreateFn = self.cuteafd_cuda_event_create_blocking()?;
         let mut cuda_event = std::ptr::null_mut();
         // SAFETY: the output is a valid local; native writes it only on success.
@@ -2813,6 +3024,7 @@ impl NativeLibrary {
 
     #[track_caller]
     pub unsafe fn cuda_graph_end_capture(&self, cuda_stream: *mut c_void) -> Result<*mut c_void> {
+        let _failure_boundary = memory_ledger::fault::boundary();
         let _budget_guard = coordinator_gpu_budget().map(|_| GPU_BUDGET_ALLOCATION.lock()
             .unwrap_or_else(|e| e.into_inner()));
         let end_capture_fn: CudaGraphEndCaptureFn = self.cuteafd_cuda_graph_end_capture()?;
@@ -2834,6 +3046,46 @@ impl NativeLibrary {
         Ok(cuda_graph_exec)
     }
 
+
+    /// Correctness-oracle bypass; serving uses the guarded topology capture.
+    /// # Safety
+    /// The test owns the stream capture and retains every captured pointer.
+    #[cfg(any(test, feature = "test-support"))]
+    pub unsafe fn cuda_graph_end_capture_for_test(&self, stream: *mut c_void) -> Result<*mut c_void> {
+        // SAFETY: the test-only export has this fixed C ABI; self retains its DSO.
+        let end = unsafe { self.lib.get::<unsafe extern "C" fn(*mut c_void, *mut *mut c_void) -> CuteafdStatus>(b"cuteafd_cuda_graph_end_capture_for_test")? };
+        let mut exec = std::ptr::null_mut();
+        // SAFETY: caller owns capture; output is a valid local pointer.
+        let status = unsafe { end(stream, &mut exec) };
+        self.status_to_result("cuteafd_cuda_graph_end_capture_for_test", status)?;
+        Ok(exec)
+    }
+
+    /// # Safety
+    /// The stream is in capture mode and all captured storage remains live.
+    pub unsafe fn cuda_graph_end_capture_topology(&self, stream: *mut c_void)
+        -> Result<(*mut c_void, usize, usize, bool, Option<String>)> {
+        let _failure_boundary = memory_ledger::fault::boundary();
+        let _budget_guard = coordinator_gpu_budget().map(|_| GPU_BUDGET_ALLOCATION.lock()
+            .unwrap_or_else(|e| e.into_inner()));
+        let end = self.cuteafd_cuda_graph_end_capture_topology()?;
+        let (mut exec, mut nodes, mut width, mut spans) = (std::ptr::null_mut(), 0, 0, 0);
+        // SAFETY: outputs are valid and stream's capture is caller-owned.
+        let status = unsafe { end(stream, &mut exec, &mut nodes, &mut width, &mut spans) };
+        if status == CUTEAFD_STATUS_GRAPH_TOO_SMALL {
+            return Err(SmallGraphCapture { nodes }.into());
+        }
+        self.status_to_result("cuteafd_cuda_graph_end_capture_topology", status)?;
+        let inspection_error = (width == 0).then(|| self.last_error().unwrap_or_default());
+        if coordinator_gpu_budget().is_some() {
+            if let Err(error) = self.cuda_memory_info() {
+                // SAFETY: the executable has not launched and owns no queued work.
+                unsafe { self.cuda_graph_exec_destroy(exec)? };
+                return Err(error.context("graph executable exceeds coordinator GPU budget"));
+            }
+        }
+        Ok((exec, nodes, width, spans != 0, inspection_error))
+    }
 
     pub unsafe fn cuda_graph_launch(
         &self,
@@ -3221,6 +3473,24 @@ impl NativeLibrary {
             .context("freeing synchronous H2D pinned staging buffer")?;
         staging.buffer = CuteafdHostBuffer::default();
         Ok(bytes)
+    }
+
+    /// Inspect the current synchronous upload backing without allocating or waiting.
+    /// The descriptor borrows this library's storage and must not outlive it.
+    pub fn sync_h2d_staging_buffer(&self) -> Result<Option<CuteafdHostBuffer>> {
+        let staging = self.sync_h2d_staging.lock()
+            .map_err(|_| anyhow::anyhow!("synchronous H2D pinned staging lock is poisoned"))?;
+        Ok((!staging.buffer.ptr.is_null()).then_some(staging.buffer))
+    }
+
+    /// Inspect an existing ordered-upload backing. An unused destination is absent;
+    /// observing it never creates staging, records an event or changes the device.
+    pub fn ordered_h2d_staging_buffer(&self, dst: CuteafdDeviceBuffer,
+        stream: *mut c_void) -> Result<Option<CuteafdHostBuffer>> {
+        let entries = self.ordered_h2d_staging.lock()
+            .map_err(|_| anyhow::anyhow!("ordered H2D staging lock is poisoned"))?;
+        Ok(entries.get(&(dst.device_id, stream as usize, dst.ptr as usize))
+            .map(|entry| entry.staging.buffer))
     }
 
     #[cfg(test)]
@@ -4484,6 +4754,7 @@ impl NativeLibrary {
         &self,
         buffer: &mut [u8],
     ) -> Result<CuteafdRdmaRegisterProbe> {
+        let _failure_boundary = memory_ledger::fault::boundary();
         let register_fn: RdmaRegisterHostBufferProbeFn = self.cuteafd_rdma_register_host_buffer_probe()?;
         let mut probe = CuteafdRdmaRegisterProbe::default();
         let status = unsafe { register_fn(buffer.as_mut_ptr().cast(), buffer.len(), &mut probe) };
@@ -4514,6 +4785,7 @@ impl NativeLibrary {
         gid_index: u32,
         bytes: usize,
     ) -> Result<CuteafdRdmaRcSendRecvProbe> {
+        let _failure_boundary = memory_ledger::fault::boundary();
         let probe_fn: RdmaRcSendRecvLoopbackProbeFn = self.cuteafd_rdma_rc_send_recv_loopback_probe()?;
         let device_name = CString::new(device_name).context("RDMA device name contains NUL")?;
         let mut probe = CuteafdRdmaRcSendRecvProbe::default();
@@ -4533,6 +4805,7 @@ impl NativeLibrary {
         request_frame: &[u8],
         response_frame: &[u8],
     ) -> Result<CuteafdRdmaRcProtocolV2LoopbackProbe> {
+        let _failure_boundary = memory_ledger::fault::boundary();
         let probe_fn: RdmaRcProtocolV2LoopbackProbeFn = self.cuteafd_rdma_rc_protocol_v2_loopback_probe()?;
         let device_name = CString::new(device_name).context("RDMA device name contains NUL")?;
         let mut probe = CuteafdRdmaRcProtocolV2LoopbackProbe::default();
@@ -4569,8 +4842,11 @@ impl NativeLibrary {
         max_sge: u32,
         host_buffer_flags: u64,
     ) -> Result<CuteafdRdmaRcEndpointInfo> {
+        let _failure_boundary = memory_ledger::fault::boundary();
         // SAFETY: the symbol has the declared C ABI; all argument buffers live through the call.
         let create_fn: RdmaRcEndpointCreateOnGidWithBufferFlagsFn = self.cuteafd_rdma_rc_endpoint_create_on_gid_with_buffer_flags()?;
+        let _: RdmaRcEndpointBufferViewFn = self.cuteafd_rdma_rc_endpoint_buffer_view()?;
+        let destroy_fn: RdmaRcEndpointDestroyFn = self.cuteafd_rdma_rc_endpoint_destroy()?;
         let device_name = CString::new(device_name).context("RDMA device name contains NUL")?;
         let mut info = CuteafdRdmaRcEndpointInfo::default();
         // SAFETY: device_name and info remain valid for the synchronous native call.
@@ -4595,7 +4871,17 @@ impl NativeLibrary {
             "cuteafd_rdma_rc_endpoint_create_on_gid_with_buffer_flags",
             status,
         )?;
-        record_rdma_rings(info.handle, send_registered_span_bytes + recv_registered_span_bytes);
+        let tracked = (|| {
+            record_rdma_rings(info.handle, [self.rdma_rc_endpoint_buffer_view(info.handle, false)?,
+                self.rdma_rc_endpoint_buffer_view(info.handle, true)?])
+        })();
+        if let Err(error) = tracked {
+            // SAFETY: creation succeeded; no endpoint or borrowed view escaped.
+            let status = unsafe { destroy_fn(info.handle) };
+            self.status_to_result("cuteafd_rdma_rc_endpoint_destroy after census failure", status)
+                .context(format!("RDMA backing tracking failed: {error:#}"))?;
+            return Err(error);
+        }
         Ok(info)
     }
 
@@ -4664,6 +4950,7 @@ impl NativeLibrary {
     /// Registers the first `bytes` of the endpoint's send buffer for remote
     /// reads and returns its (address, rkey).
     pub fn rdma_rc_endpoint_expose_send_read(&self, handle: *mut c_void, bytes: usize) -> Result<(u64, u32)> {
+        let _failure_boundary = memory_ledger::fault::boundary();
         type ExposeReadFn = unsafe extern "C" fn(*mut c_void, usize, *mut u64, *mut u32) -> CuteafdStatus;
         // SAFETY: resolving the symbol does not call it.
         let expose: ExposeReadFn = self.cuteafd_rdma_rc_endpoint_expose_send_read()?;
@@ -4768,6 +5055,7 @@ impl NativeLibrary {
     /// struct is returned even when landing is unavailable (see `status`).
     pub fn rdma_gpu_landing_probe(&self, device_name: &str, port_num: u32, gid_index: u32, bytes: usize,
         iterations: u32) -> Result<(CuteafdRdmaGpuLandingProbe, Option<String>)> {
+        let _failure_boundary = memory_ledger::fault::boundary();
         let probe_fn: RdmaGpuLandingProbeFn = self.cuteafd_rdma_gpu_landing_probe()?;
         let name = CString::new(device_name).context("RDMA device name contains NUL")?;
         let mut out = CuteafdRdmaGpuLandingProbe::default();
@@ -4942,6 +5230,7 @@ impl NativeLibrary {
         ptr: *mut c_void,
         bytes: usize,
     ) -> Result<u32> {
+        let _failure_boundary = memory_ledger::fault::boundary();
         type RegisterFn = unsafe extern "C" fn(*mut c_void, *mut c_void, usize, *mut u32) -> CuteafdStatus;
         let register: RegisterFn = self.cuteafd_rdma_rc_endpoint_register_region()?;
         let mut region = 0;
@@ -4957,6 +5246,7 @@ impl NativeLibrary {
     pub unsafe fn rdma_rc_endpoint_register_device_region(
         &self, handle: *mut c_void, ptr: *mut c_void, bytes: usize,
     ) -> Result<u32> {
+        let _failure_boundary = memory_ledger::fault::boundary();
         let register = self.cuteafd_rdma_rc_endpoint_register_device_region()?;
         let mut region = 0;
         // SAFETY: the caller retains the allocation for the endpoint's lifetime.
@@ -4986,9 +5276,11 @@ impl NativeLibrary {
 
     pub fn rdma_rc_endpoint_destroy(&self, handle: *mut c_void) -> Result<()> {
         let destroy_fn: RdmaRcEndpointDestroyFn = self.cuteafd_rdma_rc_endpoint_destroy()?;
-        memory_ledger::record_free(handle as usize);
+        // SAFETY: endpoint ownership and quiescence are established by the caller.
         let status = unsafe { destroy_fn(handle) };
-        self.status_to_result("cuteafd_rdma_rc_endpoint_destroy", status)
+        self.status_to_result("cuteafd_rdma_rc_endpoint_destroy", status)?;
+        memory_ledger::record_endpoint_free(handle as usize);
+        Ok(())
     }
 
     /// Metadata-only symbol check; terminal ownership is unavailable on older
@@ -5009,13 +5301,7 @@ impl NativeLibrary {
 
     pub fn last_error(&self) -> Result<String> {
         let last_error_fn: LastErrorFn = self.cuteafd_last_error()?;
-        let mut buf = vec![0 as c_char; 512];
-        let status = unsafe { last_error_fn(buf.as_mut_ptr(), buf.len()) };
-        if status != CUTEAFD_STATUS_OK {
-            anyhow::bail!("cuteafd_last_error returned status {status}");
-        }
-        let cstr = unsafe { CStr::from_ptr(buf.as_ptr()) };
-        Ok(cstr.to_string_lossy().into_owned())
+        read_native_last_error(last_error_fn)
     }
 
     fn status_to_result(&self, context: &str, status: CuteafdStatus) -> Result<()> {
@@ -5025,8 +5311,31 @@ impl NativeLibrary {
         let last_error = self
             .last_error()
             .unwrap_or_else(|err| format!("last error unavailable: {err}"));
-        anyhow::bail!("{context} returned status {status}: {last_error}");
+        Err(memory_ledger::capture_failure(anyhow::Error::new(NativeStatusError {
+            context: context.to_string(),
+            status,
+            detail: last_error,
+        })))
     }
+}
+
+fn read_native_last_error(last_error_fn: LastErrorFn) -> Result<String> {
+    let mut buf = vec![0 as c_char; 512];
+    // SAFETY: native writes at most buf.len() bytes and retains the error across reads.
+    let mut status = unsafe { last_error_fn(buf.as_mut_ptr(), buf.len()) };
+    if status == CUTEAFD_STATUS_BUFFER_TOO_SMALL {
+        buf.resize(4096, 0);
+        // SAFETY: the resized output is live and bounded for this synchronous retry.
+        status = unsafe { last_error_fn(buf.as_mut_ptr(), buf.len()) };
+    }
+    if status != CUTEAFD_STATUS_OK && status != CUTEAFD_STATUS_BUFFER_TOO_SMALL {
+        anyhow::bail!("cuteafd_last_error returned status {status}");
+    }
+    let mut message = c_char_array_to_string(&buf);
+    if status == CUTEAFD_STATUS_BUFFER_TOO_SMALL {
+        message.push_str(" [truncated]");
+    }
+    Ok(message)
 }
 
 pub fn c_char_array_to_string(value: &[c_char]) -> String {
@@ -5815,6 +6124,81 @@ mod tests {
     use std::path::PathBuf;
     use std::slice;
 
+    #[test]
+    fn native_last_error_retries_and_retains_truncated_diagnostics() -> Result<()> {
+        thread_local! {
+            static ERROR: std::cell::RefCell<(String, Vec<usize>)> =
+                std::cell::RefCell::new((String::new(), Vec::new()));
+        }
+        unsafe extern "C" fn fake_last_error(out: *mut c_char, out_len: usize) -> CuteafdStatus {
+            ERROR.with(|state| {
+                let mut state = state.borrow_mut();
+                state.1.push(out_len);
+                let bytes = state.0.as_bytes();
+                let count = bytes.len().min(out_len - 1);
+                // SAFETY: the reader provides out_len writable bytes, including the terminator.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(bytes.as_ptr(), out.cast::<u8>(), count);
+                    *out.add(count) = 0;
+                }
+                if count == bytes.len() { CUTEAFD_STATUS_OK } else { CUTEAFD_STATUS_BUFFER_TOO_SMALL }
+            })
+        }
+        for (size, expected_calls) in [(0, vec![512]), (19, vec![512]), (511, vec![512]),
+            (512, vec![512, 4096]), (4095, vec![512, 4096]), (8192, vec![512, 4096])] {
+            let prefix = "cudaErrorMemoryAllocation owner=";
+            let original = if size < prefix.len() { "x".repeat(size) } else {
+                format!("{prefix}{}", "x".repeat(size - prefix.len()))
+            };
+            ERROR.with(|state| *state.borrow_mut() = (original.clone(), Vec::new()));
+            let message = read_native_last_error(fake_last_error)?;
+            let expected = if original.len() < 4096 { original } else {
+                format!("{} [truncated]", &original[..4095])
+            };
+            assert_eq!(message, expected);
+            ERROR.with(|state| assert_eq!(state.borrow().1, expected_calls));
+        }
+        let original = format!("{}\u{e9}", "x".repeat(4094));
+        ERROR.with(|state| *state.borrow_mut() = (original, Vec::new()));
+        assert_eq!(read_native_last_error(fake_last_error)?,
+            format!("{}{} [truncated]", "x".repeat(4094), char::REPLACEMENT_CHARACTER));
+        Ok(())
+    }
+
+    #[test]
+    fn native_last_error_preserves_non_buffer_status_failures() {
+        unsafe extern "C" fn failed_last_error(_: *mut c_char, _: usize) -> CuteafdStatus {
+            1 // CUTEAFD_STATUS_INVALID_ARGUMENT
+        }
+        assert_eq!(read_native_last_error(failed_last_error).unwrap_err().to_string(),
+            "cuteafd_last_error returned status 1");
+        unsafe extern "C" fn failed_retry(_: *mut c_char, out_len: usize) -> CuteafdStatus {
+            if out_len == 512 { CUTEAFD_STATUS_BUFFER_TOO_SMALL } else { 6 } // INTERNAL_ERROR
+        }
+        assert_eq!(read_native_last_error(failed_retry).unwrap_err().to_string(),
+            "cuteafd_last_error returned status 6");
+    }
+
+    pub(super) fn draft_failure_library() -> Result<NativeLibrary> {
+        let fixture = crate::native_library_lifetime_fixture::Fixture::build_for_tests()?;
+        fixture.load()
+    }
+
+    pub(super) fn assert_draft_native_failure(result: Result<()>) {
+        let error = result.unwrap_err();
+        let tagged = error.downcast_ref::<NativeStatusError>().expect("draft launch must retain the native tag");
+        assert_ne!(tagged.status, 0);
+        assert_eq!(tagged.detail, "injected CPU fixture failure");
+    }
+
+    #[test]
+    fn native_status_keeps_driver_diagnostics_and_success() -> Result<()> {
+        let library = draft_failure_library()?;
+        library.status_to_result("draft test", 0)?;
+        assert_draft_native_failure(library.status_to_result("draft test", 98));
+        Ok(())
+    }
+
     fn native_library_path() -> Option<PathBuf> {
         if let Ok(path) = env::var("CUTEAFD_NATIVE_LIB") {
             return Some(PathBuf::from(path));
@@ -6299,6 +6683,7 @@ mod tests {
     #[test]
     #[ignore = "requires a GPU and a built libcuteafd_native.so; run with --ignored"]
     fn v41_sampler_device_greedy_matches_cpu_oracle() -> Result<()> {
+        let _ledger = crate::memory_ledger::test_guard();
         let library = load_device_test_library()?;
         // Five tiny rows, exercising ties, a mask, and a strict-finites row.
         let vocab = 6_usize;
@@ -6330,17 +6715,17 @@ mod tests {
         params[4].flags |= CUTEAFD_V41_SAMPLER_FLAG_NO_MASK;
         params[4].mask_row = CUTEAFD_V41_SAMPLER_NO_MASK_ROW;
 
-        let logits_buffer = library.alloc_device_buffer(rows * vocab * 4)?;
+        let logits_buffer = library.alloc_device_buffer(rows * vocab * 4, crate::memory_ledger::TEST)?;
         // K1 dereferences the parameter block on device, so upload it: this is
         // the residency requirement the ABI documents, and the launch below
         // must use this buffer rather than the host slice.
-        let params_buffer = library.alloc_device_buffer(rows * CUTEAFD_V41_SAMPLER_PARAM_BYTES)?;
-        let mask_buffer = library.alloc_device_buffer(rows * words * 4)?;
-        let ids = library.alloc_device_buffer(rows * 4)?;
-        let status = library.alloc_device_buffer(rows * 4)?;
-        let detail = library.alloc_device_buffer(rows * 4)?;
-        let scores = library.alloc_device_buffer(rows * 4)?;
-        let scratch = library.alloc_device_buffer(rows * CUTEAFD_V41_SAMPLER_SCRATCH_BYTES)?;
+        let params_buffer = library.alloc_device_buffer(rows * CUTEAFD_V41_SAMPLER_PARAM_BYTES, crate::memory_ledger::TEST)?;
+        let mask_buffer = library.alloc_device_buffer(rows * words * 4, crate::memory_ledger::TEST)?;
+        let ids = library.alloc_device_buffer(rows * 4, crate::memory_ledger::TEST)?;
+        let status = library.alloc_device_buffer(rows * 4, crate::memory_ledger::TEST)?;
+        let detail = library.alloc_device_buffer(rows * 4, crate::memory_ledger::TEST)?;
+        let scores = library.alloc_device_buffer(rows * 4, crate::memory_ledger::TEST)?;
+        let scratch = library.alloc_device_buffer(rows * CUTEAFD_V41_SAMPLER_SCRATCH_BYTES, crate::memory_ledger::TEST)?;
 
         let result = (|| -> Result<Vec<u32>> {
             // A kernel that never ran would leave these sentinels in place, so
@@ -6484,18 +6869,18 @@ mod tests {
             assert_eq!(mask.len(), rows * words);
             assert_eq!(mask_words_per_row, words);
         }
-        let logits_buffer = library.alloc_device_buffer(rows * vocab * 4)?;
-        let params_buffer = library.alloc_device_buffer(rows * CUTEAFD_V41_SAMPLER_PARAM_BYTES)?;
+        let logits_buffer = library.alloc_device_buffer(rows * vocab * 4, crate::memory_ledger::TEST)?;
+        let params_buffer = library.alloc_device_buffer(rows * CUTEAFD_V41_SAMPLER_PARAM_BYTES, crate::memory_ledger::TEST)?;
         let mask_buffer = match mask {
-            Some(_) => Some(library.alloc_device_buffer(rows * words * 4)?),
+            Some(_) => Some(library.alloc_device_buffer(rows * words * 4, crate::memory_ledger::TEST)?),
             None => None,
         };
-        let ids = library.alloc_device_buffer(rows * 4)?;
-        let status = library.alloc_device_buffer(rows * 4)?;
-        let detail = library.alloc_device_buffer(rows * 4)?;
-        let scores = library.alloc_device_buffer(rows * 4)?;
-        let total = library.alloc_device_buffer(rows * 4)?;
-        let scratch = library.alloc_device_buffer(rows * CUTEAFD_V41_SAMPLER_SCRATCH_BYTES)?;
+        let ids = library.alloc_device_buffer(rows * 4, crate::memory_ledger::TEST)?;
+        let status = library.alloc_device_buffer(rows * 4, crate::memory_ledger::TEST)?;
+        let detail = library.alloc_device_buffer(rows * 4, crate::memory_ledger::TEST)?;
+        let scores = library.alloc_device_buffer(rows * 4, crate::memory_ledger::TEST)?;
+        let total = library.alloc_device_buffer(rows * 4, crate::memory_ledger::TEST)?;
+        let scratch = library.alloc_device_buffer(rows * CUTEAFD_V41_SAMPLER_SCRATCH_BYTES, crate::memory_ledger::TEST)?;
 
         let result = (|| -> Result<(Vec<u32>, Vec<u32>, Vec<f32>)> {
             let sentinel: Vec<u8> = (0..rows).flat_map(|_| 0xDEAD_BEEFu32.to_ne_bytes()).collect();
@@ -6635,6 +7020,7 @@ mod tests {
     #[test]
     #[ignore = "requires a GPU and a built libcuteafd_native.so; run with --ignored"]
     fn v41_sampler_device_fast_path_matches_cpu_oracle() -> Result<()> {
+        let _ledger = crate::memory_ledger::test_guard();
         let library = load_device_test_library()?;
 
         // ---- small deterministic rows, vocab 6 ----
@@ -6966,26 +7352,26 @@ mod tests {
         if let Some(mask) = mask {
             assert_eq!(mask.len(), rows * words);
         }
-        let logits_buffer = library.alloc_device_buffer(rows * vocab * 4)?;
-        let params_buffer = library.alloc_device_buffer(rows * CUTEAFD_V41_SAMPLER_PARAM_BYTES)?;
+        let logits_buffer = library.alloc_device_buffer(rows * vocab * 4, crate::memory_ledger::TEST)?;
+        let params_buffer = library.alloc_device_buffer(rows * CUTEAFD_V41_SAMPLER_PARAM_BYTES, crate::memory_ledger::TEST)?;
         let mask_buffer = match mask {
-            Some(_) => Some(library.alloc_device_buffer(rows * words * 4)?),
+            Some(_) => Some(library.alloc_device_buffer(rows * words * 4, crate::memory_ledger::TEST)?),
             None => None,
         };
-        let ids = library.alloc_device_buffer(rows * 4)?;
-        let status = library.alloc_device_buffer(rows * 4)?;
-        let detail = library.alloc_device_buffer(rows * 4)?;
-        let scores = library.alloc_device_buffer(rows * 4)?;
-        let scratch = library.alloc_device_buffer(rows * CUTEAFD_V41_SAMPLER_SCRATCH_BYTES)?;
-        let retained = library.alloc_device_buffer(rows * 4)?;
-        let passes = library.alloc_device_buffer(rows * 4)?;
+        let ids = library.alloc_device_buffer(rows * 4, crate::memory_ledger::TEST)?;
+        let status = library.alloc_device_buffer(rows * 4, crate::memory_ledger::TEST)?;
+        let detail = library.alloc_device_buffer(rows * 4, crate::memory_ledger::TEST)?;
+        let scores = library.alloc_device_buffer(rows * 4, crate::memory_ledger::TEST)?;
+        let scratch = library.alloc_device_buffer(rows * CUTEAFD_V41_SAMPLER_SCRATCH_BYTES, crate::memory_ledger::TEST)?;
+        let retained = library.alloc_device_buffer(rows * 4, crate::memory_ledger::TEST)?;
+        let passes = library.alloc_device_buffer(rows * 4, crate::memory_ledger::TEST)?;
         let rank_ids = match capacity {
             0 => None,
-            _ => Some(library.alloc_device_buffer(rows * capacity * 4)?),
+            _ => Some(library.alloc_device_buffer(rows * capacity * 4, crate::memory_ledger::TEST)?),
         };
         let rank_scratch = match capacity {
             0 => None,
-            _ => Some(library.alloc_device_buffer(rows * capacity * 8)?),
+            _ => Some(library.alloc_device_buffer(rows * capacity * 8, crate::memory_ledger::TEST)?),
         };
 
         let result = (|| -> Result<TopkRun> {
@@ -7141,6 +7527,7 @@ mod tests {
     #[test]
     #[ignore = "requires a GPU and a built libcuteafd_native.so; run with --ignored"]
     fn v41_sampler_device_topk_set_and_order_matches_cpu_oracle() -> Result<()> {
+        let _ledger = crate::memory_ledger::test_guard();
         let library = load_device_test_library()?;
 
         // ---- small deterministic rows, vocab 8 ----
@@ -7403,12 +7790,13 @@ mod tests {
 
     #[test]
     fn allocate_copy_free_roundtrip() -> Result<()> {
+        let _ledger = crate::memory_ledger::test_guard();
         let Some(library) = load_test_library()? else {
             return Ok(());
         };
         let input = b"cuteafd native ffi roundtrip".to_vec();
         let mut output = vec![0_u8; input.len()];
-        let mut buffer = library.alloc_device_buffer(input.len())?;
+        let mut buffer = library.alloc_device_buffer(input.len(), crate::memory_ledger::TEST)?;
 
         library.copy_h2d(buffer, &input)?;
         library.copy_d2h(&mut output, buffer)?;
@@ -7422,12 +7810,13 @@ mod tests {
 
     #[test]
     fn managed_device_buffer_copy_free_roundtrip() -> Result<()> {
+        let _ledger = crate::memory_ledger::test_guard();
         let Some(library) = load_test_library()? else {
             return Ok(());
         };
         let input = b"cuteafd managed native ffi roundtrip".to_vec();
         let mut output = vec![0_u8; input.len()];
-        let mut buffer = library.alloc_managed_device_buffer(input.len())?;
+        let mut buffer = library.alloc_managed_device_buffer(input.len(), crate::memory_ledger::TEST)?;
 
         assert!(!buffer.ptr.is_null());
         assert!(buffer.bytes >= input.len());
@@ -7444,13 +7833,14 @@ mod tests {
 
     #[test]
     fn copy_h2d_reuses_synchronous_pinned_staging() -> Result<()> {
+        let _ledger = crate::memory_ledger::test_guard();
         let Some(library) = load_test_library()? else {
             return Ok(());
         };
         let first = b"cuteafd native ffi reusable sync h2d staging".to_vec();
         let second = b"shorter sync h2d payload".to_vec();
         let mut output = vec![0_u8; first.len()];
-        let mut buffer = library.alloc_device_buffer(first.len())?;
+        let mut buffer = library.alloc_device_buffer(first.len(), crate::memory_ledger::TEST)?;
 
         library.copy_h2d(buffer, &first)?;
         let first_staging = library
@@ -7476,13 +7866,14 @@ mod tests {
 
     #[test]
     fn device_to_device_copy_roundtrip() -> Result<()> {
+        let _ledger = crate::memory_ledger::test_guard();
         let Some(library) = load_test_library()? else {
             return Ok(());
         };
         let input = b"cuteafd native ffi d2d roundtrip".to_vec();
         let mut output = vec![0_u8; input.len()];
-        let mut src = library.alloc_device_buffer(input.len())?;
-        let mut dst = library.alloc_device_buffer(input.len())?;
+        let mut src = library.alloc_device_buffer(input.len(), crate::memory_ledger::TEST)?;
+        let mut dst = library.alloc_device_buffer(input.len(), crate::memory_ledger::TEST)?;
 
         library.copy_h2d(src, &input)?;
         library.copy_d2d(dst, src, input.len())?;
@@ -7496,12 +7887,13 @@ mod tests {
 
     #[test]
     fn pinned_host_buffer_copy_roundtrip() -> Result<()> {
+        let _ledger = crate::memory_ledger::test_guard();
         let Some(library) = load_test_library()? else {
             return Ok(());
         };
         let input = b"cuteafd pinned staging ffi roundtrip".to_vec();
         let mut output = vec![0_u8; input.len()];
-        let mut host = library.alloc_host_buffer(input.len())?;
+        let mut host = library.alloc_host_buffer(input.len(), crate::memory_ledger::TEST)?;
         assert!(!host.ptr.is_null());
         assert_eq!(host.bytes, input.len());
         assert_ne!(host.flags, CUTEAFD_HOST_BUFFER_FLAG_NONE);
@@ -7511,7 +7903,7 @@ mod tests {
             std::ptr::copy_nonoverlapping(input.as_ptr(), host.ptr.cast::<u8>(), input.len());
         }
 
-        let mut device = library.alloc_device_buffer(input.len())?;
+        let mut device = library.alloc_device_buffer(input.len(), crate::memory_ledger::TEST)?;
         library.copy_host_buffer_h2d(device, host, input.len())?;
         library.copy_d2h(&mut output, device)?;
         assert_eq!(output, input);
@@ -7541,8 +7933,8 @@ mod tests {
 
         let pitched_source = [1_u8, 2, 3, 90, 91, 4, 5, 6, 92, 93, 7, 8, 9, 94, 95];
         let pitched_expected = [1_u8, 2, 3, 0, 4, 5, 6, 0, 7, 8, 9, 0];
-        let mut pitched_host = library.alloc_host_buffer(pitched_source.len())?;
-        let mut pitched_device = library.alloc_device_buffer(pitched_expected.len())?;
+        let mut pitched_host = library.alloc_host_buffer(pitched_source.len(), crate::memory_ledger::TEST)?;
+        let mut pitched_device = library.alloc_device_buffer(pitched_expected.len(), crate::memory_ledger::TEST)?;
         library.copy_h2d(pitched_device, &[0_u8; 12])?;
         unsafe {
             std::ptr::copy_nonoverlapping(
@@ -7650,11 +8042,11 @@ mod tests {
         let Some(library) = load_test_library()? else {
             return Ok(());
         };
-        let err = library.alloc_device_buffer(0).unwrap_err().to_string();
+        let err = library.alloc_device_buffer(0, crate::memory_ledger::TEST).unwrap_err().to_string();
         assert!(err.contains("status 1"));
         assert!(err.contains("size is zero"));
         let err = library
-            .alloc_managed_device_buffer(0)
+            .alloc_managed_device_buffer(0, crate::memory_ledger::TEST)
             .unwrap_err()
             .to_string();
         assert!(err.contains("status 1"));
@@ -7785,6 +8177,7 @@ mod tests {
     #[test]
     #[ignore = "requires a GPU and a built libcuteafd_native.so; run with --ignored"]
     fn v41_sampler_device_nucleus_ordered_matches_cpu_oracle() -> Result<()> {
+        let _ledger = crate::memory_ledger::test_guard();
         let library = load_device_test_library()?;
 
         // ---- small deterministic rows, vocab 8 ----
@@ -7925,6 +8318,7 @@ mod tests {
     #[test]
     #[ignore = "requires a GPU and a built libcuteafd_native.so; run with --ignored"]
     fn v41_sampler_device_nucleus_reports_internal_for_unsupported_rows() -> Result<()> {
+        let _ledger = crate::memory_ledger::test_guard();
         let library = load_device_test_library()?;
         let vocab = 400_usize;
         let logits: Vec<f32> = (0..vocab).map(|token| -0.01 * token as f32).collect();
@@ -8031,29 +8425,29 @@ mod tests {
         if let Some(mask) = mask {
             assert_eq!(mask.len(), rows * words);
         }
-        let logits_buffer = library.alloc_device_buffer(rows * vocab * 4)?;
-        let params_buffer = library.alloc_device_buffer(rows * CUTEAFD_V41_SAMPLER_PARAM_BYTES)?;
+        let logits_buffer = library.alloc_device_buffer(rows * vocab * 4, crate::memory_ledger::TEST)?;
+        let params_buffer = library.alloc_device_buffer(rows * CUTEAFD_V41_SAMPLER_PARAM_BYTES, crate::memory_ledger::TEST)?;
         let mask_buffer = match mask {
-            Some(_) => Some(library.alloc_device_buffer(rows * words * 4)?),
+            Some(_) => Some(library.alloc_device_buffer(rows * words * 4, crate::memory_ledger::TEST)?),
             None => None,
         };
-        let ids = library.alloc_device_buffer(rows * 4)?;
-        let status = library.alloc_device_buffer(rows * 4)?;
-        let detail = library.alloc_device_buffer(rows * 4)?;
-        let scores = library.alloc_device_buffer(rows * 4)?;
-        let scratch = library.alloc_device_buffer(rows * CUTEAFD_V41_SAMPLER_SCRATCH_BYTES)?;
-        let retained = library.alloc_device_buffer(rows * 4)?;
-        let passes = library.alloc_device_buffer(rows * 4)?;
+        let ids = library.alloc_device_buffer(rows * 4, crate::memory_ledger::TEST)?;
+        let status = library.alloc_device_buffer(rows * 4, crate::memory_ledger::TEST)?;
+        let detail = library.alloc_device_buffer(rows * 4, crate::memory_ledger::TEST)?;
+        let scores = library.alloc_device_buffer(rows * 4, crate::memory_ledger::TEST)?;
+        let scratch = library.alloc_device_buffer(rows * CUTEAFD_V41_SAMPLER_SCRATCH_BYTES, crate::memory_ledger::TEST)?;
+        let retained = library.alloc_device_buffer(rows * 4, crate::memory_ledger::TEST)?;
+        let passes = library.alloc_device_buffer(rows * 4, crate::memory_ledger::TEST)?;
         let rank_ids = match capacity {
             0 => None,
-            _ => Some(library.alloc_device_buffer(rows * capacity * 4)?),
+            _ => Some(library.alloc_device_buffer(rows * capacity * 4, crate::memory_ledger::TEST)?),
         };
         let rank_scratch = match capacity {
             0 => None,
-            _ => Some(library.alloc_device_buffer(rows * capacity * 8)?),
+            _ => Some(library.alloc_device_buffer(rows * capacity * 8, crate::memory_ledger::TEST)?),
         };
-        let out_total = library.alloc_device_buffer(rows * 4)?;
-        let out_nucleus = library.alloc_device_buffer(rows * 4)?;
+        let out_total = library.alloc_device_buffer(rows * 4, crate::memory_ledger::TEST)?;
+        let out_nucleus = library.alloc_device_buffer(rows * 4, crate::memory_ledger::TEST)?;
 
         let result = (|| -> Result<NucleusRun> {
             let sentinel: Vec<u8> = (0..rows).flat_map(|_| 0xDEAD_BEEFu32.to_ne_bytes()).collect();

@@ -164,7 +164,8 @@ impl<'a> RouteCensus<'a> {
         let gpus = gpus.iter().map(|&id| {
             let device = Device { library, id };
             let _scope = cuteafd_ffi::memory_ledger::scope("diagnostics/route-census");
-            let counts = Allocation::new(device, shape.bytes() + SELECTORS)?;
+            let counts = Allocation::new(device, shape.bytes() + SELECTORS,
+                crate::shared::memory::Tag::workspace("diagnostics/route-census"))?;
             device.run(|| library.cuda_zero_bytes(counts.buffer, counts.buffer.bytes))?;
             Ok(Gpu { counts, selectors: Cell::new(0) })
         }).collect::<Result<Vec<_>>>()?;
@@ -680,7 +681,7 @@ mod tests {
         let ids: Vec<Vec<u32>> = rows.iter().enumerate().map(|(seed, &rows)|
             (0..rows * 6).map(|i| ((i * 7919 + seed * 104_729) % 384) as u32).collect()).collect();
         let buffers = ids.iter().map(|ids| -> Result<_> {
-            let buffer = DeviceAllocation::new(&library, ids.len() * 4)?;
+            let buffer = DeviceAllocation::new(&library, ids.len() * 4, crate::shared::memory::TEST)?;
             library.copy_h2d(buffer.buffer, &ids.iter().flat_map(|id| id.to_ne_bytes()).collect::<Vec<_>>())?;
             Ok(buffer)
         }).collect::<Result<Vec<_>>>()?;

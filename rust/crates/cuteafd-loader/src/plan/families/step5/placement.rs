@@ -43,7 +43,7 @@ pub(super) fn layout(
     if spark_ranks > 0 {
         crate::plan::experts::spark_recipe(&package, 1536, spark_ranks)?;
     }
-    if let Some(refusal) = crate::plan::experts::frozen_refusal(&package, spark_ranks) {
+    if let Some(refusal) = (spark_ranks > 0).then(|| crate::plan::experts::frozen_refusal(&package, spark_ranks)).flatten() {
         anyhow::bail!("Step-5 layout is unqualified: {refusal}");
     }
     ensure!(
@@ -52,7 +52,7 @@ pub(super) fn layout(
     );
     ensure!(
         matches!(coordinators, 1 | 2) && opts.rtx_bytes.len() == coordinators
-            && worlds.contains(&spark_ranks)
+            && (spark_ranks == 0 || worlds.contains(&spark_ranks))
             && opts.rtx_bytes.iter().all(|&bytes| bytes > 32 << 30),
         Unqualified("coordinator/Spark count or 5090")
     );
@@ -94,16 +94,19 @@ pub(super) fn layout(
         .workspace_manifest
         .as_deref()
         .unwrap_or_else(|| std::path::Path::new("/opt/cuteafd/share/PROGRAMS.json"));
-    let manifest: serde_json::Value = serde_json::from_slice(
-        &std::fs::read(path)
-            .context("Step-5 native admission requires its matching PROGRAMS.json")?,
-    )?;
+    let manifest = input.manifest(path)
+        .context("Step-5 native admission requires its matching PROGRAMS.json")?;
+    let typed_manifest = input.programs_manifest(path)?;
+    let contract = super::coordinator::CoordinatorContract::from_model(input.checkpoint(), model)?;
+    let native_selection = super::native::NativeSelection::resolve(&contract, &model.cfg, coordinators,
+        opts.native_mtp_layers, checked_rows, Some(&typed_manifest))?;
     ensure!(
         manifest["capacities"]["max_context"] == model.cfg.max_context,
         "Step-5 exports require the checkpoint's 1M compiled extent"
     );
     let prefixes = super::native::program_prefixes(coordinators == 2);
-    let programs = ProgramSet::from_manifest(&manifest, prefixes);
+    let mut programs = ProgramSet::from_manifest(&manifest, prefixes);
+    native_selection.augment_programs(&mut programs);
     let entries = manifest["programs"]
         .as_array()
         .context("Step-5 program manifest lacks entries")?;
@@ -169,7 +172,7 @@ pub(super) fn layout(
                 code.push(allowance.bytes);
                 GpuBudget {
                     capacity_bytes,
-                    headroom_bytes: opts.headroom_bytes,
+                    reserve_bytes: crate::placement::reserve::gpu("step5"),
                     baseline: Baseline::Planned {
                         context_bytes: arch.context_bytes,
                         loaded_bytes: 0,
@@ -180,15 +183,17 @@ pub(super) fn layout(
         spark_ranks,
         peer_access: coordinators == 2,
     };
-    let inputs = RuntimeInputs { spark_reply_format: opts.resolved_spark_reply_format(false),
-                kv_format: opts.step5_kv,
+    let inputs = RuntimeInputs { graph_layout: crate::serving_capacity::step5_graphs::Step5GraphLayout::resolve(
+            &catalog, &contract, coordinators, spark_ranks), decode_graphs: opts.step5_decode_graphs, host: super::admission::HostInputs::from_contract(&contract, &model.cfg, coordinators,
+            crate::plan::layout::recipe_host_memory(opts)?, opts.host_cache_bytes, 8 << 30)?, resident_weight_limit: Some(ResidentWeights(opts.weight_budget_bytes)), spark_reply_format: opts.resolved_spark_reply_format(false),
+                kv_format: opts.step5_kv, bf16_target_head: opts.bf16_target_head,
         inventory,
         rows: usize::try_from(shape.span_rows)?,
         waves,
         unit: checked_rows,
         full_prefill_logits: opts.full_prefill_logits,
         sequences,
-        context,
+        context, serving_context: crate::placement::planner::Context::resolve(context, (opts.context_tokens > 0).then_some(opts.context_tokens)),
         requested_pool: opts.pool_tokens,
         marks: MarkRule {
             lanes: sequences,
@@ -198,11 +203,32 @@ pub(super) fn layout(
         },
         peer_diagnostics: false,
         pending_code: code,
-        startup: vec![],
         onboard: super::admission::OnboardInputs::new(input.expert_catalog()?, opts.workspace_manifest.as_deref(),
             checked_rows, coordinators, waves, opts.resolve_onboard(catalog.routed_experts().routed_layers()).unwrap_or(Onboard::Auto))?,
     };
-    let admitted = admission::forecast_mtp(input.checkpoint(), &inputs, opts.native_mtp_layers)?;
+    let admitted = admission::admit_mtp_with_contract(input.checkpoint(), &inputs, opts.native_mtp_layers, &contract)?;
+    for rank in 0..coordinators {
+        let layout = super::coordinator::RankWeightLayout::from_contract(&contract, &model.cfg, rank,
+            coordinators, Some(&admitted.ownership))?;
+        native_selection.validate_layout(&layout, checked_rows)?;
+    }
+    let mtp = super::coordinator::RankWeightLayout::mtp_from_contract(input.checkpoint(), &contract,
+        opts.native_mtp_layers)?;
+    native_selection.validate_layout(&mtp, checked_rows)?;
+    report.phase_ledger = Some(crate::plan::SolvedPhaseLedger::from(&admitted.solved));
+    let mut host_items: Vec<_> = [planner::Location::HOST, planner::Location::PINNED].into_iter()
+        .map(|location| admitted.solved.items(location)).collect::<Result<Vec<_>, _>>()?
+        .into_iter().flatten().filter(|item| item.category != Category::Prefix).collect();
+    host_items.extend(admitted.solved.facts.deferred.iter().filter(|owner|
+        [planner::Location::HOST, planner::Location::PINNED].contains(&owner.location)
+            && owner.view.is_none() && owner.category != Category::Prefix
+            && owner.lifetime.contains(planner::Phase::Ready, admitted.solved.facts.phase_order))
+        .map(|owner| Item::new(owner.category, &owner.group, "", owner.bytes, Basis::Exact)
+            .with_lifetime(cuteafd_core::memory_layout::ItemLifetime::PostReadyReserve)));
+    report.host_budget_bytes = admitted.host_cache_bytes;
+    report.host_ledger = Some(cuteafd_core::memory_layout::HostLayout::new(inputs.host.memory.0,
+        inputs.host.memory.1, inputs.host.headroom.max(inputs.host.memory.0 / 10),
+        admitted.host_cache_bytes, host_items).context("Step-5 admitted host ledger overflow")?);
     report.attention_placement = admitted.placement.attention_placement;
     report.bytes_by_owner.clear();
     report.bytes_by_owner.insert(
@@ -215,11 +241,11 @@ pub(super) fn layout(
             .sum(),
     );
     let mut memory = MemoryLayout { devices: Vec::new(), pool_tokens: admitted.placement.pool_tokens,
-        waste: vec![], notes: vec![format!("WIP eager Step-5: exact native allocation owners; zero graphs; {} native MTP stages; no media", opts.native_mtp_layers),
+        waste: vec![], notes: vec![format!("Step-5: exact native allocation owners; decode graphs {}; {} native MTP stages; eager prefill; no media", opts.step5_decode_graphs, opts.native_mtp_layers),
             "Offline CUDA/code baseline is estimated; serving must re-admit against pre-weight live samples and native export ABIs".into(),
             format!("{}; {sequences} sequences, request context {}, compiled extent {}",
                 if coordinators == 2 { "SWA head split, complete-cost contiguous CSA owners" } else { "Single-device SWA and CSA ownership" },
-                admitted.cache.context, model.cfg.max_context)] };
+                admitted.solved.served_context(), model.cfg.max_context)] };
     let csa_owners = (0..coordinators).map(|rank| admitted.placement.layers.iter().enumerate()
         .filter(|(layer, item)| model.cfg.full[*layer]
             && matches!(item.mode, LayerMode::Whole { gpu, .. } if usize::from(gpu) == rank)).count())
@@ -234,16 +260,7 @@ pub(super) fn layout(
             ArchContext::coordinator(opts.coordinator_arch, opts.rtx_bytes[rank], None).context_bytes,
             Basis::Calibrated,
         ));
-        items.push(
-            Item::new(
-                Category::Reserved,
-                "coordinator headroom",
-                "",
-                opts.headroom_bytes,
-                Basis::Formula,
-            )
-            .with_lifetime(cuteafd_core::memory_layout::ItemLifetime::PostReadyReserve),
-        );
+        items.extend(crate::placement::reserve::gpu_item("step5"));
         memory.devices.push(DeviceLayout {
             kind: DeviceKind::Rtx,
             index: rank as u32,
@@ -282,14 +299,11 @@ pub(super) fn layout(
         slot_bytes: 8 << 20,
         alignment: 4096,
     };
-    let recipe = crate::plan::experts::checkpoint_spark_recipe(
-        input.checkpoint(),
-        spark_ranks,
-        &working.spark_layers,
-    )?;
-    for rank in 0..spark_ranks {
+    let recipe = (!working.spark_layers.is_empty()).then(|| crate::plan::experts::checkpoint_spark_recipe(
+        input.checkpoint(), spark_ranks, &working.spark_layers)).transpose()?;
+    for rank in 0..if working.spark_layers.is_empty() { 0 } else { spark_ranks } {
         let layout = if exl3 { SparkResidentLayout::Exl3 { world: spark_ranks, rank } }
-            else { SparkResidentLayout::Fp8 { world: spark_ranks, rank, slicing: recipe.slicing } };
+            else { SparkResidentLayout::Fp8 { world: spark_ranks, rank, slicing: recipe.as_ref().context("remote Step-5 package")?.slicing } };
         let assignment = SparkAssignment::from_catalog(&catalog, &working, rank, layout, &endpoints, rings)?;
         ensure!(
             assignment.resident_bytes
@@ -317,7 +331,7 @@ pub(super) fn layout(
                     assignment.resident_bytes,
                     Basis::Exact,
                 ),
-                cuteafd_core::memory_layout::spark_runtime_residual(),
+                cuteafd_core::memory_layout::spark_worker_process_resident_item(),
             ],
         };
         for (group, bytes) in [

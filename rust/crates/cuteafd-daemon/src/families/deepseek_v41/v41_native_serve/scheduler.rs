@@ -193,59 +193,50 @@ fn retire_request<'a, C: DraftChain<'a>>(mut request: Active<'a>, requests: &mut
         if let Err(error) = &state { probe.fail(format!("state diagnostic: {error:#}")); }
         probe.finish_state();
     }
-    target.and(speculative.map(|_| ())).and(state)
+    let retired = target.and(speculative.map(|_| ())).and(state);
+    requests.mark_retired(retired.is_ok() && request.finished && !request.failed);
+    retired
 }
 
 /// Allocate the optional pinned pool before signalling HTTP readiness. A bad
 /// cache configuration or allocation failure must fail startup, not leave a
 /// healthy-looking front door whose worker has already exited.
 pub(super) fn prepare_prefix_cache<'a>(lib: &'a NativeLibrary, args: &crate::cli::NativeServeArgs,
-    requests: &Requests<'a>, arenas: super::prefix::Arenas<'a>, draft: bool) -> Result<PrefixCache<'a>> {
+    requests: &Requests<'a>, arenas: super::prefix::Arenas<'a>, draft: bool, admitted: &super::admission::Admitted) -> Result<PrefixCache<'a>> {
+    let prefix = &args.prefix;
+    ensure!(prefix.prefix_partial == crate::shared::prefix::Toggle::Off,
+        "V4.1 restores exact prefix frontiers only (--prefix-partial off)");
     let units = requests.cache().unit_capacity();
-    let layout = super::prefix::layout(units, draft, true);
-    let mut config = args.host_cache_config()?;
-    config.eviction_headroom = crate::shared::prefix::budget::eviction_headroom(layout, args.host_cache_evict_tokens)?;
-    if args.host_cache_evict_tokens > 0 { config.eviction_headroom[3] = super::scores::VOCAB as u64 * 4; }
-    if matches!(args.host_cache_bytes, crate::shared::prefix::HostBudget::Auto) {
-        let required = crate::shared::prefix::budget::retained_bytes(layout,
-            args.concurrency as usize, args.max_context_tokens as usize, config.chunk_bytes)?;
-        let memory = crate::shared::prefix::budget::host_memory()?;
-        config.bytes = crate::shared::prefix::budget::resolve_bytes(layout, None,
-            args.concurrency as usize, args.max_context_tokens as usize, config.chunk_bytes, memory)?;
-        anyhow::ensure!(config.bytes > 0,
-            "automatic host prefix quota resolves to zero; provide a positive quota or disable host retention explicitly");
+    let layout = super::prefix::layout(units, draft);
+    let entries = prefix.prefix_cache_entries;
+    // Admission sized the host quota jointly with every other host owner; adopt that exact
+    // quota with the shared tier's geometry and limits.
+    let bytes = admitted.host.prefix_bytes;
+    let host = if prefix.host_cache_bytes.enabled() && entries > 0 && bytes > 0 {
+        let mut config = prefix.host_config_for(layout, args.max_context_tokens as usize, bytes)?;
+        if prefix.host_cache_evict_tokens > 0 { config.eviction_headroom[3] = super::scores::VOCAB as u64 * 4; }
         config.validate()?;
-        tracing::info!(target: "cuteafd::host_cache", required_bytes=required, resolved_bytes=config.bytes,
-            "automatic host cache budget (staging and snapshot overhead excluded from token capacity)");
-    }
-    let geometry = cuteafd_core::prefix::HostCacheGeometry { unit_rows: layout.page_rows as u64,
-        page_bytes: layout.page_bytes as u64, mark_bytes: layout.mark_bytes as u64,
-        draft_bytes: layout.draft_bytes as u64 };
-    let max_conversations = geometry.conversations(config.bytes, args.max_context_tokens as u64, config.chunk_bytes);
-    let conversations_50k = geometry.conversations(config.bytes, 50_000, config.chunk_bytes);
-    tracing::info!(mark_bytes = layout.mark_bytes, host_bytes = config.bytes,
-        conversations_max_context = max_conversations, conversations_50k, "host prefix capacity");
-    if config.enabled() && conversations_50k < args.concurrency as u64 + 4 {
-        tracing::warn!(conversations_50k, desired = args.concurrency + 4,
-            "host prefix quota holds fewer 50K conversations than concurrency plus four");
-    }
-    let host = if config.enabled() && args.resolved_prefix_entries() > 0 {
-        let rows = cuteafd_core::coordinator_programs::v41_live_rows(args.prefill_batch_tokens)
-            .context("invalid V4.1 prefill capacity for host logits")?;
-        let logits = cuteafd_core::memory_layout::host_logits_bytes(
-            u64::from(rows), u64::from(rows),
-            super::scores::VOCAB as u64).context("V4.1 host logits reservation overflow")?;
-        crate::shared::memory::budget::admit_host_memory_with_resident_formulas(config.bytes, &requests.engram_host_workspace(),
-            &requests.engram_host_formulas(), logits, 8 << 30)?;
+        let geometry = cuteafd_core::prefix::HostCacheGeometry { unit_rows: layout.page_rows as u64,
+            page_bytes: layout.page_bytes as u64, mark_bytes: layout.mark_bytes as u64,
+            draft_bytes: layout.draft_bytes as u64 };
+        let conversations_50k = geometry.conversations(bytes, 50_000, config.chunk_bytes);
+        tracing::info!(mark_bytes = layout.mark_bytes, host_bytes = bytes, conversations_50k,
+            conversations_max_context = geometry.conversations(bytes, args.max_context_tokens as u64, config.chunk_bytes),
+            "host prefix capacity");
+        if conversations_50k < args.concurrency as u64 + 4 {
+            tracing::warn!(conversations_50k, desired = args.concurrency + 4,
+                "host prefix quota holds fewer 50K conversations than concurrency plus four");
+        }
         let engine = crate::shared::prefix::CudaCopyEngine::registered_with_owners(lib,
             &requests.cache().source_buffers(), arenas.owners())?;
         tracing::info!(target: "cuteafd::host_cache", config = ?config, "host snapshot cache enabled");
         Some((config, engine))
     } else { None };
-    let entries = args.resolved_prefix_entries() as usize;
-    let prefix = cuteafd_engine::prefix::PrefixConfig { entries, mark_slots: cuteafd_core::prefix::mark_slots_with_host(0, entries as u64, 1, u64::MAX, host.is_some()) as usize,
-        keep_logits: true, min_tokens: 1 };
-    PrefixCache::new(arenas, prefix, true, host, layout)
+    let mark_slots = prefix.mark_rule(args.concurrency as usize).slots(layout.mark_bytes);
+    ensure!(mark_slots == arenas.slots(), "V4.1 mark arena holds {} slots, the mark rule {mark_slots}", arenas.slots());
+    let config = cuteafd_engine::prefix::PrefixConfig { entries, mark_slots, keep_logits: true,
+        min_tokens: prefix.prefix_cache_min_tokens };
+    PrefixCache::new(arenas, config, host, layout)
 }
 
 /// The per-second `stats` payload for the serving worker.
@@ -264,12 +255,12 @@ fn serving_stats<C: cuteafd_engine::media::EncoderClient>(prefixes: &PrefixCache
     // `host_cache_config` (packet HC-9), not just `store_pace_ns`: fleet
     // operators tune several of these knobs, and one key keeps the export
     // forward-compatible as new knobs land.
-    let mut stats = serde_json::json!({
+    let stats = serde_json::json!({
         "host_cache": prefixes.host_metrics(),
         "host_cache_config": prefixes.host_config(),
         // The engine's prefix counters: hits by kind, hit tokens, host promotions (host-tier
         // restores), captures, evictions and page/mark occupancy.
-        "prefix": prefixes.stats(),
+        "prefix": prefixes.serving_stats(),
         "target_sampling": sampling_stats::snapshot(),
         "dspark_policy": super::speculative::policy_snapshot(),
         "admission": kv_waiter.stats(),
@@ -281,7 +272,6 @@ fn serving_stats<C: cuteafd_engine::media::EncoderClient>(prefixes: &PrefixCache
         "prefill_queue": {"prefilling": prefilling, "prefetch_waves_cancelled":
             super::prefill_target::PREFETCH_WAVES_CANCELLED.load(std::sync::atomic::Ordering::Relaxed)},
     });
-    crate::shared::probe::graph_capture_stats(&mut stats);
     stats
 }
 
@@ -815,6 +805,13 @@ fn pack_waiting<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, runtim
     Ok(())
 }
 
+fn finish_startup<P>(decode_share: &crate::shared::prefill_share::DecodeShareArgs,
+    ready: impl FnOnce() -> Result<()>) -> Result<crate::shared::prefill_share::PrefillQueue<P>> {
+    let prefills = decode_share.queue::<P>()?;
+    ready()?;
+    Ok(prefills)
+}
+
 /// Serve until the request channel closes: admitted prompts wait in the decode-share
 /// queue (`--decode-share`) and prefill in rounds between decode rounds.
 #[allow(clippy::too_many_arguments)]
@@ -828,6 +825,7 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
     stats: std::sync::Arc<std::sync::Mutex<serde_json::Value>>,
     mut prefixes: PrefixCache<'a>,
     census: Option<&crate::shared::route_census::RouteCensus<'a>>,
+    ready: impl FnOnce() -> Result<()>,
 ) -> Result<()> {
     // Serving starts with every lane idle: the routing census counts from here.
     if let Some(census) = census { census.begin()?; }
@@ -851,24 +849,32 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
     // still needs wait here for their encodes; decode keeps running.
     let mut media = admission::Media::new(&mut *vision, args.concurrency as usize)?;
     let mut stats_published = Instant::now();
-    let limits = args.reserve.limits(args.max_context_tokens as usize)?;
+    let limits = args.prefix.reserve.limits(args.max_context_tokens as usize)?;
     // KV reservation by decode chunks (issue #951): admission, top-ups and stalls.
-    let mut reserve = KvReserve::new(args.reserve.config(args.max_context_tokens as usize)?, UNIT_TOKENS);
+    let mut reserve = KvReserve::new(args.prefix.reserve.config(args.max_context_tokens as usize)?, UNIT_TOKENS);
     let verify_rows = draft.as_ref().map_or(1, |d| d.max_verify_rows());
     let limit = (args.max_context_tokens as usize).min(prefixes.engine().pool().capacity() * UNIT_TOKENS);
     crate::shared::prefill_packing::log_mode(args.prefill_packing,
         if args.prefill_packing == crate::shared::prefill_packing::PackingMode::Exact { 0 }
         else { args.prefill_batch_tokens as usize });
-    // Admitted prompts wait here and prefill in rounds (`--decode-share`); share
-    // 0 prefills every waiting prompt whole before the next step, as before.
-    let mut prefills = args.decode_share.queue::<QueuedPrompt<'a, P::Suffix>>()?;
     let whole = args.decode_share.decode_share == 0.0;
     let mut times = super::prefill_target::V41PrefillTimes::default();
     // Keep pending owners outside the fallible loop so every fatal exit can drain them.
     let mut admitted = std::collections::VecDeque::<PackedAdmission>::new();
     let mut media_ready = std::collections::VecDeque::new();
+    // Validate the final startup owner before publishing a healthy front door.
+    let mut prefills = finish_startup::<QueuedPrompt<'a, P::Suffix>>(&args.decode_share, ready)?;
     let result = crate::shared::api::run_scheduler(|| {
     loop {
+        unsafe { // SAFETY: V4.1 graph owners borrow persistent engine storage only.
+            crate::shared::decode_graph::device::observe_completed(lib, |f| {
+            first.visit_graph_banks(f)?;
+            second.visit_graph_banks(f)?;
+            for (slot, _) in &mut prefill_slots.slots { slot.visit_graph_banks(f)?; }
+            if let Some(draft) = draft.as_deref_mut() { draft.visit_graph_banks(f)?; }
+            Ok(())
+        }) }?;
+        requests.reconcile_completed();
         if let Some(reason) = cuteafd_transport::health::failure_reason() {
             anyhow::bail!("expert wire unavailable until restart: {reason}");
         }
@@ -1064,11 +1070,8 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
                 let restore = (restore_started, Instant::now());
                 let resume = if images.is_empty() { prompt.len() } else {
                     let source_end = requests.cache().committed_end(lease)? as usize;
-                    let start = if requests.cache().stage(lease)? == crate::families::deepseek_v41::v41_backbone_cache::CacheStage::EncoderReplay {
-                        requests.cache().history_end(lease)? as usize
-                    } else { source_end };
                     // Encode only when a span from the restored frontier on lacks features.
-                    if requests.images(lease)?.needed(start, prompt.len())?.is_empty() { prompt.len() } else { start }
+                    if requests.images(lease)?.needed(source_end, prompt.len())?.is_empty() { prompt.len() } else { source_end }
                 };
                 Ok((image_keys, hit, restore, resume))
             })();
@@ -2025,12 +2028,10 @@ fn prepare_decode_lane<'a>(requests: &mut Requests<'a>, active: &[Option<Active<
 fn start_admission_lookahead(requests: &mut Requests<'_>, lease: CacheLease, prompt: &[u32],
     args: &crate::cli::NativeServeArgs) {
     let shape = super::PrefillShape::from_args(args);
-    // An encoder-prefix replay re-runs the window before the cached end first.
-    let replay_end = requests.cache().committed_end(lease).map_or(0, |end| end as usize);
     let result = requests.start_lookahead(lease, prompt, |start| {
         if prompt.len() - start <= shape.rows {
             Ok(cuteafd_loader::TableUnitPlan::new(vec![prompt.len() as u64], 1))
-        } else { super::prefill_target::prompt_units(start, replay_end, prompt.len(), shape.rows, shape.waves) }
+        } else { super::prefill_target::prompt_units(start, prompt.len(), shape.rows, shape.waves) }
     });
     if let Err(error) = result { tracing::warn!(%error, "Engram look-ahead not started; rows load on demand"); }
 }
@@ -2081,7 +2082,6 @@ fn single_lane_round<'w, 'a>(lib: &'a NativeLibrary, runtime: &tokio::runtime::R
     let capture = draft.as_deref().map(DraftRuntime::capture).unwrap_or_default();
     // Speculative rows vary every round: keep each decode shape's graphs,
     // whether or not this policy captures routes.
-    if draft.as_deref().is_some_and(DraftRuntime::has_policy) { pass.retain_small_graph_shapes(); }
     let seeds = members.iter().map(|&slot| {
         let r = active[slot].as_ref().unwrap();
         Ok((r.id(), r.anchor, requests.cache().committed_end(r.lease)?, r.job.max_tokens-r.generated))
@@ -2093,7 +2093,13 @@ fn single_lane_round<'w, 'a>(lib: &'a NativeLibrary, runtime: &tokio::runtime::R
     // The anchors' rows are known since the last commit: fetch them across the draft phase.
     prefetch_drafts(requests, active, members, &seeds.iter().map(|seed| vec![seed.1]).collect::<Vec<_>>());
     let mut inputs = if let Some(draft) = draft.as_deref_mut() {
-        clock.draft(|| draft.propose(lane, &seeds))?
+        match clock.draft(|| draft.propose(lane, &seeds)) {
+            Ok(inputs) => inputs,
+            // W64-1: a failed proposal verifies the anchors only while the draft
+            // is still live; a terminal draft fails the round. The round did no
+            // draft work, so report 0 like the independent path does.
+            Err(error) => { clock.drafted_us(0); draft.anchor_fallback(lane, &seeds, &error)? },
+        }
     } else { seeds.iter().map(|r| vec![r.1]).collect() };
     if let Some(draft) = draft.as_deref_mut() { extend_inputs(draft, active, members, &mut inputs)?; }
     prefetch_drafts(requests, active, members, &inputs);
@@ -2666,7 +2672,7 @@ pub(super) fn console_round(tally: console::Tally, lane: usize, shared: bool, st
 
 /// Publishes the resolved KV pool (the compressed source with the fewest
 /// tokens) and host-cache bytes for the benchmark's capacity record.
-pub(crate) fn publish_capacity(requests: &Requests<'_>, prefixes: &PrefixCache<'_>, max_tokens: u64) {
+pub(crate) fn publish_capacity(requests: &Requests<'_>, prefixes: &PrefixCache<'_>, max_tokens: Option<u64>) {
     // A unit is one page of each ratio-two source (the binding ones): same tokens and pages as
     // the per-source report before units.
     let units = requests.cache().unit_capacity() as u64;
@@ -2674,7 +2680,7 @@ pub(crate) fn publish_capacity(requests: &Requests<'_>, prefixes: &PrefixCache<'
         units));
     let host = prefixes.host_config().map_or(0, |config| config.bytes as u64);
     if let Some((tokens, pages)) = tokens {
-        cuteafd_bench::context::set_kv(tokens, Some(max_tokens), pages, "FP4 compressed (CSA/HCA) + FP8 window", host);
+        cuteafd_bench::context::set_kv(tokens, max_tokens, pages, "FP4 compressed (CSA/HCA) + FP8 window", host);
     }
 }
 
@@ -2776,6 +2782,19 @@ fn commit_lane<'w, 'a>(lib: &'a NativeLibrary, lane: usize,
 mod sampling_tests {
     use super::*;
     use crate::families::deepseek_v41::v41_native_serve::scores::{ROW_BYTES, VOCAB};
+
+    #[test]
+    fn startup_queue_validation_precedes_readiness() {
+        use crate::shared::prefill_share::DecodeShareArgs;
+        let ready_count = std::cell::Cell::new(0);
+        let ready = || { ready_count.set(ready_count.get() + 1); Ok(()) };
+        let error = finish_startup::<()>(&DecodeShareArgs { decode_share: 1.0 }, ready).err().unwrap();
+        assert!(error.to_string().contains("--decode-share must be in [0, 1)"));
+        assert_eq!(ready_count.get(), 0, "failed startup must not publish Ready");
+        let queue = finish_startup::<()>(&DecodeShareArgs { decode_share: 0.2 }, ready).unwrap();
+        assert!(queue.is_empty());
+        assert_eq!(ready_count.get(), 1, "successful startup publishes Ready exactly once");
+    }
 
     #[test]
     fn packing_group_matches_boot_sized_suffix_arena_through_c64() {

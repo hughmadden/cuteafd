@@ -13,14 +13,141 @@ const TILE: usize = 64;
 const CAPACITY: usize = 131072;
 const SELECT: usize = 4 * 4104;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Native output ABI scratch, a dedicated plane in each attention workspace.
+pub const OUTPUT_SCRATCH_BYTES: usize = 256;
+pub const SWA_OUTPUT_SCRATCH: usize = 16;
+pub const CSA_OUTPUT_SCRATCH: usize = 32;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RankAdmission {
+    pub resident_weights: crate::placement::ResidentWeights,
+    /// Independently retired backings and their logical weight-budget payloads.
+    pub weight_arenas: Vec<(crate::serving_capacity::WeightArenaLayout, crate::placement::ResidentWeights, cuteafd_core::memory_layout::MemoryKind)>,
+    /// Private scratch only; immutable weight storage is charged by `weight_arenas`.
     pub immutable: u64,
+    /// One request per independently retained private projection scratch.
+    pub private_requests: Vec<u64>,
+    pub drafter_requests: Vec<u64>,
+    /// Only BF16 vocabulary heads retain a cuBLAS/cuBLASLt handle pair.
+    pub vocabulary_heads: Vec<String>,
+    /// The layer scratch is separate from the reusable compute arena.
+    pub projection_bytes: u64,
     pub workspace: u64,
+}
+
+/// Native projection storage remains allocated while the reusable arena runs
+/// the head or predictors. Only the arena's phase-local bytes may overlap.
+pub fn with_arena_phase(workspace: u64, projection_bytes: u64, phase_bytes: u64) -> Result<u64> {
+    let arena = workspace.checked_sub(projection_bytes)
+        .context("Step-5 projection scratch exceeds workspace")?;
+    projection_bytes.checked_add(arena.max(phase_bytes))
+        .context("Step-5 phase workspace overflow")
 }
 
 pub fn program_prefixes(split: bool) -> &'static [&'static str] {
     if split { &["step5", "step52"] } else { &["step5"] }
+}
+
+/// Concrete mixed-attention requirements survive export resolution and placement.
+#[derive(Debug, Clone)]
+pub struct NativeRequirement {
+    pub layout: crate::formats::native_attention::NativeLayout,
+    pub output: cuteafd_ffi::draft_projection::ProjectionOutput,
+}
+
+#[derive(Debug, Clone)]
+pub struct NativeSelection {
+    pub requirements: Vec<NativeRequirement>,
+    pub rows: usize,
+    pub resolved: crate::placement::planner::native_attention::NativePrograms,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("Step-5 native owner {operand} differs from preweight selection: {detail}")]
+pub struct NativeOwnerMismatch {
+    pub operand: String,
+    pub detail: String,
+}
+
+impl NativeSelection {
+    pub fn resolve(contract: &CoordinatorContract, cfg: &Config, ranks: usize, depth: usize,
+        rows: usize, manifest: Option<&crate::placement::inventory::ProgramsManifest>) -> Result<Self> {
+        use crate::{formats::{native_attention::NativeLayout, trellis_core::CoreSplit},
+            placement::planner::native_attention::{NativeProgram, NativePrograms}};
+        use cuteafd_ffi::draft_projection::ProjectionOutput;
+        ensure!(matches!(ranks, 1 | 2) && depth <= cfg.mtp && (1..=4096).contains(&rows),
+            "Step-5 native program geometry");
+        let mut requirements = Vec::new();
+        for layer in 0..cfg.layers + depth {
+            let stem = format!("model.layers.{layer}.self_attn.o_proj");
+            let qkv_compressed = ["q", "k", "v"].iter().all(|leaf| contract.core.projections
+                .contains_key(&format!("model.layers.{layer}.self_attn.{leaf}_proj")));
+            let name = format!("{stem}.weight");
+            let fp8 = contract.fp8_tensors.contains(&name);
+            if (!qkv_compressed && !fp8) || contract.core.projections.contains_key(&stem) { continue; }
+            let declared = if layer < cfg.layers {
+                contract.weights.tensors.iter().any(|tensor| tensor.meta.name == name
+                    && tensor.meta.dtype == cuteafd_core::DType::Bf16
+                    && tensor.meta.shape == [cfg.hidden, cfg.heads * cfg.dim])
+            } else {
+                contract.mtp_declarations.iter().any(|(key, shape, dtype)| key == &name
+                    && *dtype == cuteafd_core::DType::Bf16 && *shape == [cfg.hidden, cfg.heads * cfg.dim])
+            };
+            ensure!(declared, NativeOwnerMismatch { operand: name.clone(),
+                detail: "mixed attention lacks its declared BF16 output matrix".into() });
+            let split = layer < cfg.layers && !cfg.full[layer] && ranks == 2;
+            requirements.push(NativeRequirement { layout: NativeLayout {
+                stem, shape: [cfg.hidden, cfg.heads * cfg.dim / if split { 2 } else { 1 }],
+                fp8, rank: 0, ranks: if split { 2 } else { 1 },
+                split: if split { CoreSplit::Input } else { CoreSplit::Whole },
+            }, output: if split { ProjectionOutput::F32 } else { ProjectionOutput::Bf16 } });
+        }
+        let requests = requirements.iter().map(|request| NativeProgram {
+            layout: &request.layout, output: request.output }).collect::<Vec<_>>();
+        let resolved = NativePrograms::resolve(&requests, rows, manifest)?;
+        Ok(Self { requirements, rows, resolved })
+    }
+
+    pub fn augment_programs(&self, programs: &mut crate::placement::inventory::ProgramSet) {
+        if self.resolved.programs.is_empty() { return; }
+        programs.names.extend(self.resolved.programs.iter().cloned());
+        programs.names.sort();
+        programs.names.dedup();
+    }
+
+    /// Compare actual storage and launch ABI with the retained requests, never re-resolve.
+    pub fn validate_layout(&self, layout: &RankWeightLayout, rows: usize) -> Result<()> {
+        use cuteafd_ffi::draft_projection::ProjectionOutput;
+        let mismatch = |operand: &str, detail: &str| NativeOwnerMismatch {
+            operand: operand.into(), detail: detail.into() };
+        ensure!(rows > 0 && rows <= self.rows, mismatch("rows", "row ceiling exceeded"));
+        for operand in &layout.operands {
+            let Some(stem) = operand.name.strip_suffix(".weight") else { continue; };
+            let mixed = stem.strip_suffix(".o_proj").is_some_and(|prefix| ["q", "k", "v"].iter()
+                .all(|leaf| layout.core.contains_key(&format!("{prefix}.{leaf}_proj.weight"))));
+            if !mixed && operand.dtype != cuteafd_core::DType::F8E4M3 { continue; }
+            let output = if operand.slice == super::coordinator::WeightSlice::Cols && layout.ranks == 2 {
+                ProjectionOutput::F32
+            } else { ProjectionOutput::Bf16 };
+            let request = self.requirements.iter().find(|request| request.layout.stem == stem)
+                .ok_or_else(|| mismatch(&operand.name, "owner was not selected before inventory"))?;
+            ensure!(operand.dtype == if request.layout.fp8 { cuteafd_core::DType::F8E4M3 } else { cuteafd_core::DType::Bf16 }
+                && operand.shape == request.layout.shape && output == request.output
+                && operand.allocation_bytes == request.layout.bytes()?,
+                mismatch(&operand.name, "shape, storage, output precision or capacity changed"));
+            if request.layout.fp8 {
+                ensure!(self.resolved.fp8_scratch_bytes <= OUTPUT_SCRATCH_BYTES as u64,
+                    mismatch(&operand.name, "manifest FP8 scratch exceeds named output scratch plane"));
+            }
+        }
+        for request in &self.requirements {
+            let prefix = request.layout.stem.strip_suffix("o_proj").expect("output requirement");
+            if !layout.core.contains_key(&format!("{prefix}q_proj.weight")) { continue; }
+            ensure!(layout.operands.iter().any(|operand| operand.name == format!("{}.weight", request.layout.stem)),
+                mismatch(&request.layout.stem, "owned QKV lacks its selected native output"));
+        }
+        Ok(())
+    }
 }
 
 pub fn validate_span_rows(rows: usize) -> Result<()> {
@@ -29,7 +156,7 @@ pub fn validate_span_rows(rows: usize) -> Result<()> {
     Ok(())
 }
 
-pub fn swa_planes(rows: usize, heads: usize) -> Result<[usize; 16]> {
+pub fn swa_planes(rows: usize, heads: usize) -> Result<[usize; 17]> {
     ensure!(
         (1..=4096).contains(&rows) && matches!(heads, 32 | 64),
         "Step-5 SWA allocation geometry"
@@ -54,11 +181,12 @@ pub fn swa_planes(rows: usize, heads: usize) -> Result<[usize; 16]> {
         pages * 4,
         rows * 512 * 4,
         rows * H * 4,
+        OUTPUT_SCRATCH_BYTES,
     ]
     .map(|n| n.max(256)))
 }
 
-pub fn csa_planes(rows: usize) -> Result<[usize; 32]> {
+pub fn csa_planes(rows: usize) -> Result<[usize; 33]> {
     ensure!((1..=8192).contains(&rows), "Step-5 CSA allocation rows");
     let pages = rows.div_ceil(64);
     let regions = rows.div_ceil(8);
@@ -95,6 +223,7 @@ pub fn csa_planes(rows: usize) -> Result<[usize; 32]> {
         TILE * 4 * 4,
         TILE * 4 * 512 * 4,
         TILE * 4 * 512 * 4,
+        OUTPUT_SCRATCH_BYTES,
     ]
     .map(|n| n.max(256)))
 }
@@ -244,7 +373,8 @@ pub fn mtp_metadata_planes(rows: usize) -> Result<[usize; 5]> {
     Ok([rows * 8, rows * 8, rows * 4, pages * 4, 8].map(|n| n.max(256)))
 }
 
-/// One sequential predictor scratch recipe, shared with the target arena.
+/// Predictor extent within the one Workspace sequential-scratch backing.
+/// Target and MTP reuse it in stream order; charge their maximum, not their sum.
 /// Only greedy token/status words survive across stages within a draft chain.
 pub fn mtp_forecast_workspace(rows: usize, depth: usize, kv_format: Qwen4KvCache) -> Result<u64> {
     ensure!(depth <= 3, "Step-5 predictor depth must be 0..=3");
@@ -316,16 +446,24 @@ pub(super) fn rank_admission_from_contract(
 pub fn rank_admission_for_layout(contract: &CoordinatorContract, cfg: &Config, layout: &RankWeightLayout,
     ownership: &ExecutionOwnership, rank: usize, unit: usize, span: usize, logits: usize,
 ) -> Result<RankAdmission> {
-    let immutable = layout
+    let weights = layout
         .operands
         .iter()
         .filter(|w| w.name != "model.embed_tokens.weight")
-        .try_fold(contract.rope_tables.allocation_bytes, |n, w| {
+        .try_fold(0u64, |n, w| {
             n.checked_add(w.allocation_bytes)
         })
         .context("Step-5 native rank immutable overflow")?;
-    let mut immutable = layout.core.values().try_fold(immutable, |n, core| n.checked_add(core.bytes as u64))
-        .context("Step-5 native core immutable overflow")?;
+    let weights = layout.core.values().try_fold(weights, |n, core| n.checked_add(core.bytes as u64))
+        .context("Step-5 native core weights overflow")?;
+    let entry = rank == usize::from(ownership.execution().spec().entry_gpu);
+    let arena = layout.target_arena(Some(&contract.rope_tables), rank as i32, cfg.layers, entry)?;
+    let embedding = if entry { layout.operands.iter().find(|w| w.name == "model.embed_tokens.weight")
+        .map_or(0, |w| w.allocation_bytes) } else { 0 };
+    let logical = weights.checked_add(embedding).context("Step-5 target logical weights overflow")?;
+    let mut immutable = 0u64;
+    let mut private_requests = Vec::new();
+    let projection_bytes = native_scratch_bytes(layout, unit)?;
     let owns = (0..cfg.layers).any(|layer| ownership.layer(layer, rank).is_ok_and(|l| l.query_heads > 0));
     let mut workspace = if owns {
         rank_attention_bytes(&cfg, ownership, rank, unit)?.checked_add(ffn_region_bytes(unit, span)?)
@@ -335,13 +473,21 @@ pub fn rank_admission_for_layout(contract: &CoordinatorContract, cfg: &Config, l
     if rank == ownership.execution().spec().head_gpu as usize {
         // Only logit planes reuse the arena; native scratch lives with the head's private owners.
         let head_scratch = layout.core.get("lm_head.weight").map(|core|
-            crate::formats::head::native_private_scratch(core.shape, unit)?.bytes())
+            crate::formats::head::native_private_scratch(core.shape, unit)?.packed_bytes())
             .transpose()?.unwrap_or(0) as u64;
+        if head_scratch > 0 { private_requests.push(head_scratch); }
         immutable = immutable.checked_add(head_scratch).context("Step-5 private head scratch overflow")?;
-        workspace = workspace.max(plane_bytes(&head_planes(logits)?)?);
+        workspace = with_arena_phase(workspace, projection_bytes, plane_bytes(&head_planes(logits)?)?)?;
     }
     Ok(RankAdmission {
+        resident_weights: crate::placement::ResidentWeights(weights),
+        weight_arenas: vec![(arena, crate::placement::ResidentWeights(logical), cuteafd_core::memory_layout::MemoryKind::Weights)],
         immutable,
+        private_requests,
+        drafter_requests: Vec::new(),
+        vocabulary_heads: if rank == usize::from(ownership.execution().spec().head_gpu)
+            && !layout.core.contains_key("lm_head.weight") { vec!["target".into()] } else { vec![] },
+        projection_bytes,
         workspace,
     })
 }
@@ -355,7 +501,7 @@ pub fn native_scratch_bytes(layout: &RankWeightLayout, unit: usize) -> Result<u6
         let next = crate::formats::trellis_core::ProjectionScratchLayout::new(k, n, unit)?;
         match &mut merged { Some(layout) => layout.merge(&next)?, None => merged = Some(next) }
     }
-    Ok(merged.map(|layout| layout.bytes()).transpose()?.map_or(0, |bytes| bytes as u64))
+    Ok(merged.map(|layout| layout.packed_bytes()).transpose()?.map_or(0, |bytes| bytes as u64))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -380,9 +526,16 @@ pub fn mtp_native_scratch_bytes(checkpoint: &Checkpoint, depth: usize, unit: usi
 
 pub fn mtp_native_scratch_from_contract(checkpoint: &Checkpoint, contract: &CoordinatorContract,
     depth: usize, unit: usize) -> Result<u64> {
+    mtp_native_scratch_requests(checkpoint, contract, depth, unit)?.into_iter()
+        .try_fold(0u64, |total, bytes| total.checked_add(bytes))
+        .context("Step-5 MTP native scratch overflow")
+}
+
+pub fn mtp_native_scratch_requests(checkpoint: &Checkpoint, contract: &CoordinatorContract,
+    depth: usize, unit: usize) -> Result<Vec<u64>> {
     let rows = mtp_rows(unit)?;
     use crate::formats::trellis_core::ProjectionScratchLayout;
-    let mut total = 0u64;
+    let mut requests = Vec::new();
     for stage in 0..depth {
         let layout = RankWeightLayout::mtp_stage_from_contract(checkpoint, contract, stage)?;
         let mut owners = std::collections::BTreeMap::<&str, ProjectionScratchLayout>::new();
@@ -394,10 +547,10 @@ pub fn mtp_native_scratch_from_contract(checkpoint: &Checkpoint, contract: &Coor
             match owners.get_mut(owner) { Some(layout) => layout.merge(&next)?, None => { owners.insert(owner, next); } }
         }
         for layout in owners.values() {
-            total = total.checked_add(layout.bytes()? as u64).context("Step-5 MTP native scratch overflow")?;
+            requests.push(layout.packed_bytes()? as u64);
         }
     }
-    Ok(total)
+    Ok(requests)
 }
 
 pub fn plane_bytes(planes: &[usize]) -> Result<u64> {
@@ -416,6 +569,21 @@ pub fn layer_workspace(unit: usize, span: usize, full: bool, heads: usize) -> Re
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn arena_phase_preserves_separate_projection_charge() -> Result<()> {
+        for projection in [0, 257_851_656] {
+            for layer in [0, 1_522_825_664] {
+                for phase in [0, 1024, 4_396_122_112] {
+                    assert_eq!(with_arena_phase(layer + projection, projection, phase)?,
+                        projection + layer.max(phase));
+                }
+            }
+        }
+        assert!(with_arena_phase(1, 2, 0).is_err());
+        assert!(with_arena_phase(u64::MAX, 1, u64::MAX).is_err());
+        Ok(())
+    }
 
     fn end(layout: &[(usize, usize)]) -> usize {
         layout.iter().map(|&(offset, bytes)| offset + bytes).max().unwrap()
@@ -468,7 +636,7 @@ mod tests {
                 for (name, core) in &layout.core {
                     let [n, k] = core.shape;
                     if name.contains(".transformer.shared_head.") {
-                        expected += crate::formats::head::native_private_scratch(core.shape, rows.head)?.bytes()? as u64;
+                        expected += crate::formats::head::native_private_scratch(core.shape, rows.head)?.packed_bytes()? as u64;
                         continue;
                     }
                     let owner = if name.contains(".self_attn.") { "attention" }
@@ -479,9 +647,13 @@ mod tests {
                         None => { layer_owners.insert(owner, scratch); }
                     }
                 }
-                for layout in layer_owners.values() { expected += layout.bytes()? as u64; }
+                for layout in layer_owners.values() { expected += layout.packed_bytes()? as u64; }
             }
             assert_eq!(mtp_native_scratch_bytes(&checkpoint, 3, unit)?, expected);
+            let contract = CoordinatorContract::from_checkpoint(&checkpoint)?;
+            let requests = mtp_native_scratch_requests(&checkpoint, &contract, 3, unit)?;
+            assert_eq!(requests.len(), 12, "four independent backings per MTP stage");
+            assert_eq!(requests.iter().sum::<u64>(), expected);
         }
         assert!(mtp_rows(0).is_err());
         assert!(mtp_rows(8256).is_err(), "a multi-wave span is not an allocation unit");
@@ -501,11 +673,15 @@ mod tests {
         assert_eq!(layout.core["lm_head.weight"].bits, 6);
         let weights = layout.operands.iter().filter(|w| w.name != "model.embed_tokens.weight")
             .map(|w| w.allocation_bytes).sum::<u64>()
-            + layout.core.values().map(|core| core.bytes as u64).sum::<u64>()
-            + CoordinatorContract::from_checkpoint(&checkpoint)?.rope_tables.allocation_bytes;
+            + layout.core.values().map(|core| core.bytes as u64).sum::<u64>();
+        let arena = layout.target_arena(Some(&CoordinatorContract::from_checkpoint(&checkpoint)?.rope_tables),
+            0, cfg.layers, true)?;
+        assert!(arena.padding_bytes() > 0);
         for logits in [16, 64] {
             let admitted = rank_admission(&checkpoint, &ownership, 0, 64, 64, logits)?;
-            assert_eq!(admitted.immutable, weights + 165511240);
+            assert_eq!(admitted.immutable, 165511432);
+            assert_eq!(admitted.resident_weights.0, weights);
+            assert_eq!(admitted.weight_arenas[0].0, arena);
             let reusable = rank_attention_bytes(&cfg, &ownership, 0, 64)?
                 + ffn_region_bytes(64, 64)? + native_scratch_bytes(&layout, 64)?;
             assert_eq!(admitted.workspace, reusable.max(plane_bytes(&head_planes(logits)?)?));

@@ -334,7 +334,7 @@ mod tests {
             expected.push((read(&reference, 0, cached, &lib)?, carry(&reference, 0)?));
         }
         let sources = [input(0), input(1)].map(|host| -> Result<DeviceAllocation<'_>> {
-            let buffer = DeviceAllocation::new(&lib, host.len())?;
+            let buffer = DeviceAllocation::new(&lib, host.len(), crate::shared::memory::TEST)?;
             lib.copy_h2d(buffer.buffer, &host)?;
             Ok(buffer)
         }).into_iter().collect::<Result<Vec<_>>>()?;

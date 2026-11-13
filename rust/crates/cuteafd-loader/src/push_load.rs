@@ -18,6 +18,104 @@ pub use nest_push::{client::{JoinArgs, Poll, Conn, Listener}, plan, proto, slot}
 pub mod builder;
 pub mod native;
 
+/// Concurrent H2D streams per push destination; admission shares this count.
+pub const COPY_STREAMS: usize = 4;
+
+/// Header-bound dense receive, boundary windows and transform scratch. Source
+/// reads are windowed, so a large selected tensor never charges its full size.
+pub fn admitted_push_envelope(largest_selected_dense_bytes: u64, slots: usize, slot_bytes: u64)
+    -> Result<u64, crate::placement::planner::Refusal> {
+    use crate::placement::planner::Refusal;
+    let overflow = || Refusal::Overflow("dense push envelope");
+    let slots = u64::try_from(slots).map_err(|_| overflow())?;
+    let largest = largest_selected_dense_bytes.min(crate::shared::dense_read::STEP_BYTES as u64);
+    let windows = slots.checked_mul(2).and_then(|n| n.checked_add(1)).ok_or_else(overflow)?;
+    largest.checked_mul(windows).and_then(|n| n.checked_mul(2))
+        .and_then(|n| n.checked_add(slots.checked_mul(slot_bytes)?))
+        .and_then(|n| n.checked_add(largest.checked_mul(10)?)).ok_or_else(overflow)
+}
+
+/// Header-derived concurrent coordinator receive owners, admitted by the
+/// caller's complete recipe before any push allocation or group handshake.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PushHostEnvelope {
+    pub expert_bytes: Vec<u64>,
+    pub dense_bytes: Vec<u64>,
+    pub retained_bytes: Vec<u64>,
+    pub slots: u64,
+    pub slot_bytes: u64,
+}
+
+impl PushHostEnvelope {
+    pub fn new(expert_bytes: Vec<u64>, dense_bytes: Vec<u64>, slots: u64, slot_bytes: u64)
+        -> Result<Self, crate::placement::planner::Refusal> {
+        let retained_bytes = vec![0; expert_bytes.len()];
+        Self::with_retained(expert_bytes, dense_bytes, retained_bytes, slots, slot_bytes)
+    }
+
+    pub fn with_retained(expert_bytes: Vec<u64>, dense_bytes: Vec<u64>, retained_bytes: Vec<u64>,
+        slots: u64, slot_bytes: u64) -> Result<Self, crate::placement::planner::Refusal> {
+        let envelope = Self { expert_bytes, dense_bytes, retained_bytes, slots, slot_bytes };
+        envelope.bytes()?;
+        Ok(envelope)
+    }
+
+    pub fn bytes(&self) -> Result<u64, crate::placement::planner::Refusal> {
+        use crate::placement::planner::Refusal;
+        if !(1..=2).contains(&self.expert_bytes.len()) || self.dense_bytes.len() != self.expert_bytes.len()
+            || self.retained_bytes.len() != self.expert_bytes.len() || self.slots == 0 || self.slot_bytes == 0 {
+            return Err(Refusal::InvalidFact("invalid coordinator push host geometry".into()));
+        }
+        let rings = self.slots.checked_mul(self.slot_bytes)
+            .and_then(|bytes| bytes.checked_mul(self.expert_bytes.len() as u64))
+            .ok_or(Refusal::Overflow("coordinator push receive rings"))?;
+        self.expert_bytes.iter().chain(&self.dense_bytes).chain(&self.retained_bytes).try_fold(rings, |sum, bytes|
+            sum.checked_add(*bytes).ok_or(Refusal::Overflow("coordinator push host owners")))
+    }
+
+    pub fn validate_usage(&self, actual: &Self) -> Result<(), crate::placement::planner::Refusal> {
+        use crate::placement::planner::{Phase, Refusal};
+        self.bytes()?;
+        actual.bytes()?;
+        if self.expert_bytes.len() != actual.expert_bytes.len() || self.slots != actual.slots
+            || self.slot_bytes != actual.slot_bytes {
+            return Err(Refusal::InvalidFact("coordinator push topology differs from admission".into()));
+        }
+        for (kind, expected, used) in [("expert", &self.expert_bytes, &actual.expert_bytes),
+            ("dense", &self.dense_bytes, &actual.dense_bytes),
+            ("retained", &self.retained_bytes, &actual.retained_bytes)] {
+            for (rank, (&available, &required)) in expected.iter().zip(used).enumerate() {
+                if required > available {
+                    return Err(Refusal::Capacity { budget: format!("coordinator push {kind} host rank {rank}"),
+                        phase: Phase::Load, required, available, owners: vec![] });
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Receive rings and transform/validation scratch die at the load barrier.
+    /// Source/index metadata remains a distinct host owner through serving.
+    pub fn allocations(&self, prefix: &str)
+        -> Result<Vec<crate::placement::planner::Allocation>, crate::placement::planner::Refusal> {
+        use crate::placement::planner::{Allocation, Lifetime, Location, Phase, Refusal};
+        use cuteafd_core::memory_layout::Category;
+        self.bytes()?;
+        if prefix.is_empty() { return Err(Refusal::InvalidFact("empty push owner identity".into())); }
+        let lifetime = Lifetime { first: Phase::Load, last: Phase::Load };
+        let ring = self.slots * self.slot_bytes;
+        Ok(self.expert_bytes.iter().zip(&self.dense_bytes).zip(&self.retained_bytes).enumerate()
+            .flat_map(|(rank, ((&expert, &dense), &retained))|
+                [("ring", ring, Location::PINNED, lifetime),
+                 ("expert", expert, Location::PINNED, lifetime),
+                 ("dense", dense, Location::PINNED, lifetime),
+                 ("retained", retained, Location::HOST, Lifetime::RESIDENT)].into_iter()
+                    .filter(|(_, bytes, _, _)| *bytes > 0).map(move |(kind, bytes, location, lifetime)|
+                        Allocation::buffer(format!("{prefix}.{rank}.{kind}"), location, bytes,
+                            lifetime, Category::Staging, format!("coordinator push {kind}")))).collect())
+    }
+}
+
 // Applied by nest-push as SO_RCVTIMEO/SO_SNDTIMEO for each blocking I/O,
 // not a wall-clock load limit: every received progress event renews the wait.
 pub const PUSH_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -120,11 +218,41 @@ fn load_group_with_client<T, E>(
     })
 }
 
+/// Linux reserves one pathname byte for NUL; abstract addresses use that byte
+/// for the leading NUL represented by `@` in the configured endpoint.
+#[derive(Debug, thiserror::Error)]
+#[error("{setting}: socket {kind} is {bytes} bytes > {limit} bytes")]
+pub struct SocketEndpointError {
+    pub setting: &'static str,
+    pub kind: &'static str,
+    pub bytes: usize,
+    pub limit: usize,
+}
+
+fn validate_endpoint(socket: &str, setting: &'static str) -> io::Result<()> {
+    let (kind, bytes) = match socket.strip_prefix('@') {
+        Some(name) => ("abstract name", name.len()),
+        None => ("path", socket.len()),
+    };
+    if bytes > 107 {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput,
+            SocketEndpointError { setting, kind, bytes, limit: 107 }));
+    }
+    Ok(())
+}
+
+/// Validate before binding an isolated fake-source endpoint, without creating
+/// directories, removing socket paths, or silently renaming the endpoint.
+pub fn validate_socket_endpoint(socket: &str) -> io::Result<()> {
+    validate_endpoint(socket, "push socket")
+}
+
 /// Uses the shared protocol implementation, including deadlines from the first
 /// Create/Join send. No optional accelerator may hang normal model loading.
 pub struct PushClient {
     socket: String,
     timeout: Duration,
+    setting: &'static str,
 }
 
 impl Default for PushClient {
@@ -136,7 +264,7 @@ impl Default for PushClient {
 impl PushClient {
     fn configured(socket: Option<String>) -> Self {
         Self { socket: socket.filter(|name| !name.is_empty()).unwrap_or_else(|| SOCKET.into()),
-            timeout: PUSH_IDLE_TIMEOUT }
+            timeout: PUSH_IDLE_TIMEOUT, setting: "CUTEAFD_PUSH_SOCKET" }
     }
 
     /// Explicit endpoint for embedding and isolated startup protocol fixtures.
@@ -144,15 +272,18 @@ impl PushClient {
         if socket.is_empty() || timeout.is_zero() {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid push endpoint or timeout"));
         }
-        Ok(Self { socket, timeout })
+        validate_socket_endpoint(&socket)?;
+        Ok(Self { socket, timeout, setting: "push socket" })
     }
 
     pub fn create(&self, ranks: Vec<RankSpec>, files: Vec<String>) -> io::Result<PushGroup> {
+        validate_endpoint(&self.socket, self.setting)?;
         Coordinator::create(&self.socket, ranks, files, Some(self.timeout))
             .map(|coordinator| PushGroup { coordinator })
     }
 
     pub fn join(&self, args: JoinArgs) -> io::Result<PushRank> {
+        validate_endpoint(&self.socket, self.setting)?;
         Rank::join(&self.socket, args, Some(self.timeout)).map(|rank| PushRank { rank })
     }
 }

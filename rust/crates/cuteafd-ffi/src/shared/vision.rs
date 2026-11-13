@@ -184,6 +184,7 @@ impl VisionLedger {
 #[derive(Debug)]
 pub enum VisionError {
     Native(i32),
+    Failure(anyhow::Error),
     InvalidInput(&'static str),
     Runtime(String),
     Library(libloading::Error),
@@ -191,6 +192,7 @@ pub enum VisionError {
 impl fmt::Display for VisionError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Failure(error) => std::fmt::Display::fmt(error, f),
             Self::Native(status) => write!(f, "vision native status {status}"),
             Self::InvalidInput(reason) => f.write_str(reason),
             Self::Runtime(reason) => f.write_str(reason),
@@ -198,22 +200,29 @@ impl fmt::Display for VisionError {
         }
     }
 }
-impl std::error::Error for VisionError {}
+impl std::error::Error for VisionError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self { Self::Failure(error) => Some(error.as_ref()), _ => None }
+    }
+}
 impl From<libloading::Error> for VisionError {
     fn from(e: libloading::Error) -> Self {
         Self::Library(e)
     }
 }
+#[cfg(feature = "test-support")]
+pub fn check_for_test(status: i32) -> Result<(), VisionError> { check(status) }
 fn check(status: i32) -> Result<(), VisionError> {
     if status == 0 {
+        crate::memory_ledger::fault::clear_failure();
         Ok(())
     } else {
-        Err(VisionError::Native(status))
+        Err(VisionError::Failure(crate::memory_ledger::capture_failure(anyhow::Error::new(VisionError::Native(status)))))
     }
 }
 
 type Required = unsafe extern "C" fn(*const RawVisionSpec, *mut VisionLedger) -> i32;
-type Create = unsafe extern "C" fn(*const RawVisionSpec, i32, u64, *mut *mut c_void) -> i32;
+type Create = unsafe extern "C" fn(*const RawVisionSpec, i32, u64, *const super::media_backings::RawTags, *mut *mut c_void) -> i32;
 type Upload = unsafe extern "C" fn(*mut c_void, u64, *const u8, u64) -> i32;
 type Observer = unsafe extern "C" fn(*mut c_void, i32, *const c_void, i32, i32, i32) -> i32;
 type Encode = unsafe extern "C" fn(
@@ -229,20 +238,19 @@ type Encode = unsafe extern "C" fn(
     *mut c_void,
 ) -> i32;
 type Ledger = unsafe extern "C" fn(*mut c_void, *mut VisionLedger) -> i32;
-type Destroy = unsafe extern "C" fn(*mut c_void) -> i32;
 
 pub struct NativeVision {
     _library: Library,
     owner: *mut c_void,
     encode: Encode,
     ledger: Ledger,
-    destroy: Destroy,
     max_tokens: usize,
     output_width: usize,
     patch_size: usize,
     /// Mistral's Pixtral tower (reserved 4) emits its whole LM span: one
     /// [IMG_BREAK]/[IMG_END] row after each merged row of [IMG] rows.
     span_markers: bool,
+    backings: super::media_backings::MediaBackings,
     // CUDA and the BLAS handle never migrate away from their owner thread.
     _thread: PhantomData<Rc<()>>,
 }
@@ -252,11 +260,36 @@ impl NativeVision {
         // SAFETY: trusted library and versioned header ABI; query initializes no CUDA state.
         unsafe {
             let library = Library::new(crate::host_isa::native_library(path))?;
+            crate::memory_ledger::fault::install(&library);
             let required = library.get::<Required>(b"cuteafd_vision_required")?;
             let mut ledger = VisionLedger::default();
             check(required(&spec.raw()?, &mut ledger))?;
             Ok(ledger)
         }
+    }
+    /// `tags` name the tower's weight arena and scratch arena in the ledger.
+    pub fn prepare(path: &Path, spec: &VisionSpec, device: i32, admitted: u64, tags: crate::memory_ledger::MediaTags)
+        -> Result<Self, VisionError> {
+        Self::load_inner(path, spec, device, admitted, None, tags)
+    }
+    /// Existing admitted arena; the caller retains this owner until external writes drain.
+    pub fn weight_arena(&self) -> Result<usize, VisionError> {
+        // SAFETY: exact header ABI; the owner is live and confined to this thread.
+        unsafe {
+            let get = self._library.get::<unsafe extern "C" fn(*mut c_void, *mut *mut c_void) -> i32>(b"cuteafd_vision_weight_arena")?;
+            let mut arena = std::ptr::null_mut();
+            check(get(self.owner, &mut arena))?;
+            Ok(arena as usize)
+        }
+    }
+    pub fn upload_range(&self, offset: u64, bytes: &[u8]) -> Result<(), VisionError> {
+        // SAFETY: native checks the range and drains the host upload before return.
+        unsafe { check(self._library.get::<Upload>(b"cuteafd_vision_upload")?(self.owner, offset, bytes.as_ptr(), bytes.len() as u64)) }
+    }
+    /// External push streams must already be drained by the group receiver.
+    pub fn commit_weights(&mut self) -> Result<(), VisionError> {
+        // SAFETY: exact header ABI and live thread-confined owner.
+        unsafe { check(self._library.get::<unsafe extern "C" fn(*mut c_void) -> i32>(b"cuteafd_vision_commit_weights")?(self.owner)) }
     }
     /// Check admission before native weights, scratch or cuBLAS allocations.
     /// `weights` must be the complete initialized arena described by `spec`.
@@ -266,8 +299,13 @@ impl NativeVision {
         device: i32,
         admitted_bytes: u64,
         weights: &[u8],
+        tags: crate::memory_ledger::MediaTags,
     ) -> Result<Self, VisionError> {
-        if weights.len() as u64 != spec.weight_bytes {
+        Self::load_inner(path, spec, device, admitted_bytes, Some(weights), tags)
+    }
+    fn load_inner(path: &Path, spec: &VisionSpec, device: i32, admitted_bytes: u64, weights: Option<&[u8]>,
+        tags: crate::memory_ledger::MediaTags) -> Result<Self, VisionError> {
+        if weights.is_some_and(|w| w.len() as u64 != spec.weight_bytes) {
             return Err(VisionError::InvalidInput(
                 "vision weight arena length mismatch",
             ));
@@ -276,6 +314,7 @@ impl NativeVision {
         // versioned header's exact ABI; the library outlives the native owner.
         unsafe {
             let library = Library::new(crate::host_isa::native_library(path))?;
+            crate::memory_ledger::fault::install(&library);
             let required = *library.get::<Required>(b"cuteafd_vision_required")?;
             let create = *library.get::<Create>(b"cuteafd_vision_create")?;
             let upload = *library.get::<Upload>(b"cuteafd_vision_upload")?;
@@ -290,24 +329,26 @@ impl NativeVision {
                 owner: std::ptr::null_mut(),
                 encode: *library.get::<Encode>(b"cuteafd_vision_encode")?,
                 ledger: *library.get::<Ledger>(b"cuteafd_vision_get_ledger")?,
-                destroy: *library.get::<Destroy>(b"cuteafd_vision_destroy")?,
                 _library: library,
                 max_tokens: spec.max_tokens as usize,
                 output_width: spec.output_width as usize,
                 patch_size: if spec.abi_version == 1 { 16 } else { spec.patch_size as usize },
                 span_markers: spec.abi_version == 2 && spec.reserved == MISTRAL_RESERVED,
+                backings: Default::default(),
                 _thread: PhantomData,
             };
-            check(create(&spec.raw()?, device, admitted_bytes, &mut result.owner))?;
-            if result.owner.is_null() {
-                return Err(VisionError::InvalidInput("null vision owner"));
+            let native = super::media_backings::NativeTags::new(tags).map_err(VisionError::Native)?;
+            let status = create(&spec.raw()?, device, admitted_bytes, &native.raw(), &mut result.owner);
+            // Each backing native still holds is recorded, success or not; on
+            // failure Drop destroys the owner and retires what native frees.
+            match super::media_backings::MediaBackings::created(&result._library, "cuteafd_vision", status,
+                result.owner, device, tags) {
+                Ok(backings) => result.backings = backings,
+                Err((status, backings)) => { result.backings = backings; return Err(VisionError::Native(status)); }
             }
-            check(upload(
-                result.owner,
-                0,
-                weights.as_ptr(),
-                weights.len() as u64,
-            ))?;
+            if let Some(weights) = weights {
+                check(upload(result.owner, 0, weights.as_ptr(), weights.len() as u64))?;
+            }
             Ok(result)
         }
     }
@@ -364,7 +405,8 @@ impl Drop for NativeVision {
     fn drop(&mut self) {
         if !self.owner.is_null() {
             // SAFETY: destroy drains before freeing; library remains loaded.
-            let status = unsafe { (self.destroy)(self.owner) };
+            // Only backings native reports as freed leave the ledger.
+            let status = unsafe { self.backings.destroy(&self._library, "cuteafd_vision", self.owner) };
             if status != 0 {
                 tracing::error!(status, "vision teardown failed");
             }

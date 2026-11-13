@@ -1,7 +1,7 @@
 //! Kimi's binding of the shared MLA DFlash executor to local or remote streams.
 use super::weights::GlobalWeights;
 use crate::shared::{draft::remote::{Prepared, RemoteBridge}, fp8_linear::{Fp8Rows, Fp8Scales},
-    memory::device::{Allocation, DeviceOwner, Stream}, peer_split::{RankDevice, TerminalState},
+    memory::{device::{Allocation, DeviceOwner, Stream}, Tag}, peer_split::{RankDevice, TerminalState},
     speculation::dflash::{ContextRow, DflashDrafter, Draft, DraftSeq, TargetHead, TAP_ROWS}};
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::{CuteafdDeviceBuffer, programs::Programs};
@@ -13,6 +13,7 @@ use std::{cell::{Cell, RefCell}, path::PathBuf, rc::Rc};
 pub(crate) struct Options {
     pub snapshot: PathBuf,
     pub fp8: bool,
+    pub tp2_dflash: bool,
     pub cache_format: cuteafd_core::MlaCacheFormat,
 }
 
@@ -27,7 +28,7 @@ impl Options {
     pub(crate) fn layout(&self, slots: usize, context: usize, sms: usize) -> Result<MlaDraftRuntimeLayout> {
         let cfg = MlaDflashConfig::read(&self.snapshot)?;
         cfg.runtime_layout(self.representation(), GlmDraftCapacity::new(slots, slots.min(8), cfg.block)?,
-            context, slots.checked_mul(context).context("draft pool overflow")?, sms, Fp8Rows::W8a16.code() as u8, self.cache_format).map_err(Into::into)
+            context, slots.checked_mul(context).context("draft pool overflow")?, sms, Fp8Rows::W8a16.code() as u8, self.cache_format)?.with_context_split(self.tp2_dflash).map_err(Into::into)
     }
 }
 
@@ -123,23 +124,39 @@ pub(crate) struct NativeDraft<'a> {
     context_pending: Cell<bool>,
     window_marks: Option<Rc<Allocation<'a>>>,
     window_bytes: usize,
-    /// A K6 target head (no BF16 operand to borrow): the target rank's K6
-    /// programs and this drafter's own head scratch, used only on the bridge stream.
-    k6_head: Option<(Rc<super::device::NativePrograms<'a>>, crate::shared::dense_trellis::ProjectionScratch<'a>)>,
+    programs: &'a Programs<'a>,
+    /// The drafter owns a head program and scratch at its admitted row capacity;
+    /// only the immutable target head weights are shared with the target lane.
+    k6_head: Option<(crate::shared::dense_trellis::Projection<'a>, crate::shared::dense_trellis::ProjectionScratch<'a>)>,
     cache_format: cuteafd_core::MlaCacheFormat,
     marks: usize,
 }
 
+// Kimi constructs this owner before loading target weights. Shared post-target
+// drafters retain their DraftLoad default instead of inheriting Kimi's chronology.
+fn common_draft_receipts(draft: &DflashDrafter<'_>,
+    devices: cuteafd_loader::placement::planner::CoordinatorDevices<'_>)
+    -> Result<Vec<cuteafd_loader::placement::planner::Receipt>> {
+    draft.allocation_receipts_with_lifetime(devices, "kimi.draft",
+        cuteafd_loader::placement::planner::Lifetime::RESIDENT)
+}
+
 impl<'a> NativeDraft<'a> {
+    pub(crate) fn allocation_receipts(&self, devices: cuteafd_loader::placement::planner::CoordinatorDevices<'_>)
+        -> Result<Vec<cuteafd_loader::placement::planner::Receipt>> {
+        self.owners.draft.device.run(|| common_draft_receipts(&self.owners.draft, devices))
+    }
+
     pub(crate) fn load(admission: &mut super::admission::Admission<'a>,
         programs: &'a Programs<'a>, options: &Options, streams: [Rc<Stream<'a>>; 2],
         layout: &MlaDraftRuntimeLayout) -> Result<Self> {
-        Self::load_for_ranks(admission, programs, options, streams.to_vec(), layout)
+        Self::load_for_ranks(admission, programs, options, streams.to_vec(), layout, None)
     }
 
     pub(crate) fn load_for_ranks(admission: &mut super::admission::Admission<'a>,
         programs: &'a Programs<'a>, options: &Options, streams: Vec<Rc<Stream<'a>>>,
-        layout: &MlaDraftRuntimeLayout) -> Result<Self> {
+        layout: &MlaDraftRuntimeLayout,
+        exchange: Option<([Rc<Stream<'a>>; 2], Rc<crate::shared::peer_split::PeerExchange<'a>>)>) -> Result<Self> {
         ensure!(options.cache_format == layout.cache_format(), "Kimi draft options/admission cache records differ");
         ensure!(matches!(streams.len(), 1 | 2)
             && (streams.len() == 1 || streams[0].device.id != streams[1].device.id),
@@ -154,20 +171,23 @@ impl<'a> NativeDraft<'a> {
                 "kimi-remote-mla-dflash", crate::shared::draft::remote::decode_extent(
                     layout.capacity().block_rows, layout.target_hidden(), layout.target_vocab(), head)?)?))
         };
-        let file = std::fs::read(options.snapshot.join("model.safetensors"))?;
+        // Recording preserves admitted allocation order; the shared group fills
+        // these owners before target binding without a host payload read.
+        let file = if crate::shared::experts::rtx::dense::is_recording() { Vec::new() }
+            else { std::fs::read(options.snapshot.join("model.safetensors"))? };
         let draft = admission.allocate_draft(bridge.stream().device, programs, &options.snapshot, file,
-            bridge.stream().raw, options.representation(), Fp8Scales::Amax, Fp8Rows::W8a16)?;
+            bridge.stream().raw, options.representation(), Fp8Scales::Amax, Fp8Rows::W8a16, exchange)?;
         let demands = cuteafd_loader::families::kimi_k3::draft_bridge_demands_for_ranks(
             layout, admission.lane_rows(), streams.len())?;
         let device = streams[0].device;
         let allocate = |name| -> Result<Allocation<'a>> {
             let demand = demands.iter().find(|d| d.group == name).context("Kimi draft bridge inventory missing")?;
-            Allocation::new(device, usize::try_from(demand.bytes)?)
+            Allocation::new(device, usize::try_from(demand.bytes)?, Tag::drafter_workspace("kimi/draft-bridge"))
         };
         let marks = usize::try_from(admission.mark_selection.slots)?;
         let window_bytes = layout.window_mark_bytes()?;
         let window_marks = admission.allocate_draft_marks(streams[head].device)?;
-        Ok(Self { window_marks, window_bytes, k6_head: None, cache_format: layout.cache_format(), marks, owners: Owners { draft, target: None }, taps: allocate("DFlash bridge taps")?,
+        Ok(Self { window_marks, window_bytes, programs, k6_head: None, cache_format: layout.cache_format(), marks, owners: Owners { draft, target: None }, taps: allocate("DFlash bridge taps")?,
             ids: allocate("DFlash bridge input ids")?, input: allocate("DFlash bridge gathered input")?,
             bridge, producer: RefCell::new(crate::shared::memory::device::Event::new(device)?),
             consumed: RefCell::new(crate::shared::memory::device::Event::new(streams[head].device)?),
@@ -176,8 +196,8 @@ impl<'a> NativeDraft<'a> {
 
     pub(crate) fn cache_format(&self) -> cuteafd_core::MlaCacheFormat { self.cache_format }
 
-    /// `head_programs` are the head rank's native programs; with a K6 head the
-    /// drafter projects through them into its own admitted head scratch.
+    /// Validate the head rank, retaining a separate K6 program and scratch
+    /// sized at the drafter's own admitted capacity.
     pub(crate) fn bind_target(&mut self, target: [Rc<GlobalWeights<'a>>; 2],
         head_programs: Rc<super::device::NativePrograms<'a>>) -> Result<()> {
         self.bind_target_ranks(target.to_vec(), head_programs)
@@ -196,14 +216,19 @@ impl<'a> NativeDraft<'a> {
             ensure!(weight.shape == [cfg.vocab, cfg.hidden], "Kimi draft K6 target head geometry differs");
             ensure!(head_programs.device.id == self.target_streams[head].device.id,
                 "Kimi draft K6 head programs are not on the head rank");
-            let projection = head_programs.core.as_ref().context("K6 head programs not resolved")?.projection(weight)?;
-            let rows = self.owners.draft.max_batch_sequences() * cfg.block;
+            let rows = self.owners.draft.max_batch_sequences().checked_mul(cfg.block)
+                .context("Kimi draft head row capacity overflow")?;
+            let projection = self.target_streams[head].device.run(|| {
+                crate::shared::dense_trellis::Projection::load_geometry_bits(self.programs,
+                    cfg.hidden, cfg.vocab, 1, weight.bits, crate::shared::dense_trellis::codebook(weight),
+                    rows, cuteafd_ffi::dense_trellis::TrellisDType::F32)
+            })?;
             let scratch = {
                 let _scope = cuteafd_ffi::memory_ledger::scope("drafter/kimi K6 head scratch");
                 crate::shared::dense_trellis::ProjectionLayout::new(&projection.program, rows)?
-                    .allocate(self.target_streams[head].device)?
+                    .allocate(self.target_streams[head].device, Tag::drafter_workspace("kimi/draft-head-projection"))?
             };
-            self.k6_head = Some((head_programs, scratch));
+            self.k6_head = Some((projection, scratch));
         } else {
             ensure!(target[head].buffer("head")?.bytes == cfg.vocab * cfg.hidden * 2,
                 "Kimi draft target head differs from admitted BF16 geometry");
@@ -365,7 +390,7 @@ impl<'a> NativeDraft<'a> {
     pub(crate) fn drafts(&self) -> usize { self.owners.draft.cfg.drafts() }
     pub(crate) fn require_live(&self) -> Result<()> { self.bridge.require_live() }
     pub(crate) fn abort(&self) -> Result<()> { self.bridge.abort() }
-    pub(crate) fn drain(&self) -> Result<()> { self.bridge.synchronize() }
+    pub(crate) fn drain(&self) -> Result<()> { self.bridge.synchronize()?; self.common().drain_mla() }
     pub(crate) fn finish_terminal(&self, drained: bool) { self.bridge.finish_terminal(drained); }
 
     pub(crate) fn propose(&self, sequences: &[DraftSeq]) -> Result<Vec<Draft>> {
@@ -385,9 +410,8 @@ impl<'a> NativeDraft<'a> {
                 }
             };
             let head = match &self.k6_head {
-                Some((programs, scratch)) => {
+                Some((projection, scratch)) => {
                     let weight = target[head].core_head.as_ref().context("Kimi draft K6 target head absent")?;
-                    let projection = programs.core.as_ref().context("K6 head programs not resolved")?.projection(weight)?;
                     let device = self.target_streams[head].device.id;
                     let (hidden, vocab) = (draft.cfg.hidden, draft.cfg.vocab);
                     TargetHead::Launch(Box::new(move |x, logits, rows, stream| {
@@ -447,6 +471,34 @@ mod tests {
     use super::*;
     /// Fixed lane rows for these tap fixtures, independent of serving defaults.
     const TARGET_TAP_ROWS: usize = 4096;
+
+    #[test]
+    fn draft_arena_census_counts_load_and_matches_admitted_startup_without_double_charge() -> Result<()> {
+        use cuteafd_loader::placement::planner::{CoordinatorDevices, Location, Phase, PhaseOrder};
+        crate::shared::speculation::dflash::physical_tests::with_mla_arena_fixture(|draft, layout, planned| {
+            let mut census = crate::shared::memory::receipts::Census::default();
+            census.owners(common_draft_receipts(draft, CoordinatorDevices::new(&[1])?)?);
+            census.normalize(PhaseOrder::DRAFT_THEN_TARGET)?;
+            let root = census.receipts.iter().find(|receipt| receipt.allocation.id == planned.id())
+                .context("Kimi retained draft arena root missing")?;
+            assert!(root.allocation.lifetime.contains(Phase::Load, PhaseOrder::DRAFT_THEN_TARGET));
+            assert_eq!(root.allocation.bytes, layout.weights().resident_bytes()?);
+            let load = census.receipts.iter().filter(|receipt| receipt.allocation.location == Location::coordinator(0)
+                && receipt.allocation.view.is_none()
+                && receipt.allocation.lifetime.contains(Phase::Load, PhaseOrder::DRAFT_THEN_TARGET))
+                .map(|receipt| receipt.allocation.bytes).sum::<u64>();
+            let aliases = census.receipts.iter().filter(|receipt| receipt.allocation.view.as_ref()
+                .is_some_and(|view| view.backing == planned.id())).map(|receipt| receipt.allocation.bytes).sum::<u64>();
+            assert_eq!(aliases, root.allocation.bytes);
+            let (admitted, startup) = layout.demands(0)?;
+            assert_eq!(load, admitted.owned.iter().map(|owner| owner.bytes).sum::<u64>());
+            assert_eq!(load, layout.resident_bytes()?);
+            // Immutable aliases contribute zero physical bytes; staging contributes once.
+            assert_eq!(load + layout.weights().max_load_staging, startup.bytes);
+            assert_eq!(admitted.owned.iter().filter(|owner| owner.group == "MLA DFlash owned weights").count(), 1);
+            Ok(())
+        })
+    }
 
     #[test]
     fn subwave_taps_match_full_chunk_bytes() -> Result<()> {
@@ -534,9 +586,107 @@ mod tests {
 
     #[test]
     fn precision_is_one_explicit_resident_representation() {
-        let options = Options { snapshot: PathBuf::new(), fp8: false, cache_format: Default::default() };
+        let options = Options { snapshot: PathBuf::new(), fp8: false, cache_format: Default::default(), tp2_dflash: false };
         assert_eq!(options.representation(), GlmDraftRepresentation::Bf16Only);
         assert_eq!(Options { fp8: true, ..options }.representation(), GlmDraftRepresentation::Fp8Only);
+    }
+
+    #[test]
+    #[ignore = "requires sealed Kimi target/drafter, six Spark workers and CUTEAFD_KIMI_PUSH_DUMP via golden-run"]
+    fn native_mla_push_dumps_each_requested_batch() -> Result<()> {
+        let _ = tracing_subscriber::fmt().with_ansi(false)
+            .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+            .with_test_writer().try_init();
+        use crate::shared::qwen::scheduler::{self, Backend};
+        use cuteafd_engine::{media::RequestMedia, prefix::{PrefixFamily, RefPagePool}};
+        use super::super::{backend::{DraftState, KimiBackend}, prefix::Placement, startup};
+        use std::sync::Arc;
+        let env = |key| std::env::var(key).with_context(|| format!("Kimi push regression needs {key}"));
+        let snapshot = PathBuf::from(env("CUTEAFD_GOLDEN_SNAPSHOT")?);
+        let drafter = PathBuf::from(env("CUTEAFD_KIMI_DRAFT_SNAPSHOT")?);
+        let output = PathBuf::from(env("CUTEAFD_KIMI_PUSH_DUMP")?);
+        use crate::shared::golden_scores::push_regression as regression;
+        let native = PathBuf::from(env("CUTEAFD_NATIVE_LIB")?);
+        let manifest = PathBuf::from(env("CUTEAFD_PROGRAM_MANIFEST")?);
+        let peers = env("CUTEAFD_GOLDEN_PEERS")?.split(',').map(str::parse)
+            .collect::<std::result::Result<Vec<std::net::SocketAddr>, _>>()?;
+        ensure!(peers.len() == 6, "Kimi push regression requires six real Spark ranks");
+        use crate::shared::experts::rtx::push::PushPolicy;
+        ensure!(PushPolicy::for_snapshot(&snapshot)? == PushPolicy::Required
+            && PushPolicy::for_snapshot(&drafter)? == PushPolicy::Required,
+            "Kimi push regression requires target and drafter in a push namespace");
+        let checkpoint = cuteafd_loader::plan::Checkpoint::coordinator(&snapshot, false, false)?;
+        let cfg = cuteafd_loader::families::kimi_k3::config::KimiK3Config::from_hf(&checkpoint.config)?;
+        cfg.release_geometry()?;
+        let (local_layers, hosted_layers) = native_hosted_tail(&cfg.dense,
+            &env("CUTEAFD_GOLDEN_EXPERT_LAYERS")?)?;
+        cuteafd_core::set_expert_geometry(cuteafd_core::ExpertGeometry::KIMI_K3)
+            .map_err(|_| anyhow::anyhow!("Kimi push regression requires an isolated test process"))?;
+        startup::preflight(&manifest, &native)?;
+        // SAFETY: golden-run supplies the sealed library; all borrowers drop before it.
+        let library = Arc::new(unsafe { cuteafd_ffi::NativeLibrary::load(&native)? });
+        let programs = library.programs()?.with_manifest(&manifest)?;
+        let cache_format = cuteafd_core::MlaCacheFormat::Fp8;
+        let spark_cap = cuteafd_core::memory_policy::MemoryPolicy { spark_cap: Some(110 << 30), ..Default::default() };
+        let loaded = spark_cap.scoped(|| startup::load(&library, &programs, &checkpoint, &cfg, &cfg, startup::Options { role: startup::Role::Golden { skip_routed_experts: false }, expert_usage: false, expert_usage_reader: Default::default(),
+            cache_format, attention: None, devices: [0], native_lib: &native, manifest: &manifest, peers,
+            rtx_expert_layers: cuteafd_loader::placement::OnboardSetting::Layers(local_layers),
+            rows: 2048, waves: 2, prefill_rows: Some(1024),
+            context: cuteafd_loader::placement::planner::Context::pinned(8192), slots: 2, marks: 0, max_context: 8192, pool_tokens: Some(16384), graphs: false, full_prefill_logits: false,
+            ffn_mode: cuteafd_ffi::KimiFfnMode::default(), hosted_layers: Some(hosted_layers),
+            draft: Some(Options { snapshot: drafter, fp8: true, tp2_dflash: false, cache_format }), verify_rows: 0, prefix: None,
+        }))?;
+        let engine = &loaded.engine;
+        let backend = KimiBackend::new(engine)?;
+        let family = engine.prefix_family()?;
+        let layout = family.layout();
+        let mut pool = RefPagePool::new(layout.pages, layout.page_rows);
+        let draft = engine.native_draft().context("Kimi push regression needs MLA DFlash")?;
+        ensure!(draft.max_batch_sequences() >= 2, "Kimi push regression needs two admitted draft slots");
+        std::fs::create_dir_all(&output)?;
+        let prefix_error = |error: cuteafd_engine::prefix::BoxError| anyhow::anyhow!("{error}");
+        for sequences in [1, 2] {
+            let prompts = regression::prompts(sequences);
+            let mut placements = Vec::new();
+            let mut states = Vec::new();
+            for (slot, prompt) in prompts.iter().enumerate() {
+                let capacity = (prompt.len() + 16).div_ceil(layout.page_rows) * layout.page_rows;
+                let mut placement = Placement { units: pool.alloc(capacity / layout.page_rows)?, slot, len: 0, state_len: 0 };
+                family.bind(&mut placement).map_err(prefix_error)?;
+                family.admit_draft_pages(&mut placement, capacity).map_err(prefix_error)?;
+                backend.bind_request(&mut placement, (), RequestMedia::new(Vec::new(), cfg.hidden, prompt.len())?, prompt, 0)?;
+                let mut state = DraftState::default();
+                for (index, chunk) in prompt.chunks(1024).enumerate() {
+                    backend.prefill_device(&mut placement, chunk, 1, &pool)?;
+                    backend.prefill_draft(&placement, index * 1024, chunk, Some(42 + slot as u32), &mut state)?;
+                }
+                ensure!(draft.frontier(slot)? == (0, prompt.len()), "missing Kimi draft context slot {slot}");
+                placements.push(placement);
+                states.push(state);
+            }
+            let propose = |states: &mut [DraftState]| -> Result<Vec<Vec<u32>>> {
+                let mut batch = placements.iter().zip(states).map(|(placement, seq)| scheduler::DraftSeq {
+                    placement, seq, depth: draft.drafts() }).collect::<Vec<_>>();
+                backend.draft(&mut batch, &mut scheduler::DraftTiming::default(), &mut crate::shared::token_io::TokenSelector::new(&library,
+                    crate::shared::token_io::SelectPlacement::Device, backend.geometry().vocab_size, 1)?)
+            };
+            regression::draft_dump(&output, sequences, draft.drafts(), draft.common().cfg.block,
+                cfg.vocab_size, || Ok((propose(&mut states)?, draft.common().last_logits(sequences)?)))?;
+            // Fixed teacher-forced rows keep target comparison independent of draft agreement.
+            let rows = regression::teacher_rows();
+            let mut batch = placements.iter_mut().map(|placement| (placement, rows.as_slice())).collect::<Vec<_>>();
+            let logits = backend.verify_device(&mut batch, true, &pool)?.context("Kimi verify logits absent")?;
+            library.cuda_set_device(0)?;
+            let values = logits.to_host(&library)?;
+            regression::target_dump(&output, sequences, cfg.vocab_size, &values)?;
+            for placement in &mut placements {
+                backend.cancel(placement)?;
+                family.drain().map_err(prefix_error)?;
+                family.discard(placement).map_err(prefix_error)?;
+                pool.release(&placement.units);
+            }
+        }
+        Ok(())
     }
 
     #[test]
@@ -554,6 +704,7 @@ mod tests {
         let peers = env("CUTEAFD_GOLDEN_PEERS")?.split(',').map(str::parse)
             .collect::<std::result::Result<Vec<std::net::SocketAddr>, _>>()?;
         let cache_format = std::env::var("CUTEAFD_KIMI_KV_CACHE").unwrap_or_else(|_| "bf16".into()).parse().map_err(anyhow::Error::msg)?;
+        let tp2_dflash = std::env::var("CUTEAFD_KIMI_TP2_DFLASH").unwrap_or_else(|_| "false".into()).parse::<bool>()?;
         let checkpoint = cuteafd_loader::plan::Checkpoint::coordinator(&snapshot, false, false)?;
         let cfg = cuteafd_loader::families::kimi_k3::config::KimiK3Config::from_hf(&checkpoint.config)?;
         cfg.release_geometry()?;
@@ -565,14 +716,14 @@ mod tests {
         // SAFETY: golden-run supplies the sealed library; all borrowers drop before it.
         let library = Arc::new(unsafe { cuteafd_ffi::NativeLibrary::load(&native)? });
         let programs = library.programs()?.with_manifest(&manifest)?;
-        let loaded = startup::load(&library, &programs, &checkpoint, &cfg, &cfg, startup::Options {
+        let loaded = startup::load(&library, &programs, &checkpoint, &cfg, &cfg, startup::Options { role: startup::Role::Golden { skip_routed_experts: false }, expert_usage: false, expert_usage_reader: Default::default(),
             cache_format,
-            devices: [0, 1], native_lib: &native, peers,
-            rtx_expert_layers: cuteafd_loader::placement::OnboardSetting::Layers(local_layers), spark_budget_gib: None,
-            rows: TARGET_TAP_ROWS, waves: 2, prefill_rows: None, slots: 1, marks: 1, max_context: 524_288,
-            pool_tokens: Some(524_288), graphs: true, ffn_mode: cuteafd_ffi::KimiFfnMode::default(),
+            attention: None, devices: [0, 1], native_lib: &native, manifest: &manifest, peers,
+            rtx_expert_layers: cuteafd_loader::placement::OnboardSetting::Layers(local_layers),
+            rows: TARGET_TAP_ROWS, waves: 2, prefill_rows: None, context: cuteafd_loader::placement::planner::Context::pinned(524_288), slots: 1, marks: 1, max_context: 524_288,
+            pool_tokens: Some(524_288), graphs: true, full_prefill_logits: false, ffn_mode: cuteafd_ffi::KimiFfnMode::default(),
             hosted_layers: Some(hosted_layers),
-            draft: Some(Options { snapshot: drafter, fp8: true, cache_format }), verify_rows: 0,
+            draft: Some(Options { snapshot: drafter, fp8: true, tp2_dflash, cache_format }), verify_rows: 0, prefix: None,
         })?;
         let engine = &loaded.engine;
         let backend = KimiBackend::new(engine)?;
@@ -656,7 +807,8 @@ mod tests {
             if arm < 2 { states.push(draft.readback(0, suffix.len())?); }
             else { warm_states.push(draft.readback(0, suffix.len())?); }
             let proposed = backend.draft(&mut [scheduler::DraftSeq {
-                placement: &placement, seq: &mut seq, depth: 7 }], &mut scheduler::DraftTiming::default())?.remove(0);
+                placement: &placement, seq: &mut seq, depth: 7 }], &mut scheduler::DraftTiming::default(), &mut crate::shared::token_io::TokenSelector::new(&library,
+                    crate::shared::token_io::SelectPlacement::Device, backend.geometry().vocab_size, 1)?)?.remove(0);
             assert_eq!(proposed.len(), 7);
             if arm == 0 { common_verify = std::iter::once(anchor).chain(proposed.iter().copied()).collect(); }
             else { assert_eq!(common_verify[0], anchor); }
@@ -714,8 +866,8 @@ mod tests {
         fixture.immediate_copies(&library)?;
         let bridge = Bridge::Local { stream: Stream::new(device)?, terminal: Cell::new(TerminalState::Active) };
         let target = Stream::new(device)?;
-        let source = Allocation::new(device, 64)?;
-        let destination = Allocation::new(device, 32)?;
+        let source = Allocation::new(device, 64, crate::shared::memory::TEST)?;
+        let destination = Allocation::new(device, 32, crate::shared::memory::TEST)?;
         let bytes = (0u8..64).collect::<Vec<_>>();
         device.run(|| library.copy_h2d(source.buffer, &bytes))?;
         let mut producer = crate::shared::memory::device::Event::new(device)?;

@@ -1,3 +1,4 @@
+#include "memory_failure.h"
 // Shared BF16 causal PCM pyramid. Tower arithmetic uses pinned AOT programs;
 // the owner handles streaming/lifetimes and the public feature RMSNorm egress.
 #include "cuteafd_pcm_audio.h"
@@ -77,17 +78,36 @@ extern "C" int32_t cuteafd_pcm_required(const cuteafd_pcm_spec* spec,cuteafd_pcm
   if(!spec||!out||!valid(*spec))return cudaErrorInvalidValue;
   Owner o;o.s=*spec;*out={spec->weight_bytes,scratch(&o),2,0};return 0;
 }
-extern "C" int32_t cuteafd_pcm_destroy(void* p){
-  if(!p)return 0;auto* o=static_cast<Owner*>(p);int device=-1;int first=cudaGetDevice(&device);
+extern "C" int32_t cuteafd_pcm_get_backings(void* p,cuteafd_media_backings* out){
+  if(!p||!out)return cudaErrorInvalidValue;auto* o=static_cast<Owner*>(p);
+  *out={o->weights,o->weights?o->ledger.weights:0,o->arena,o->arena?o->ledger.scratch:0};return 0;
+}
+extern "C" int32_t cuteafd_pcm_destroy(void* p){uint32_t released=0;return cuteafd_pcm_destroy_backings(p,&released);}
+// Release everything releasable, nulling exactly what was freed; the owner and
+// any backing whose free failed are kept for a later attempt.
+static int32_t release_owner(Owner* o,uint32_t* released){
+  *released=0;int device=-1;int first=cudaGetDevice(&device);
   if(!first&&device!=o->device)return cudaErrorInvalidDevice;
   auto save=[&](int e){if(!first)first=e;};
   if(o->stream)save(cudaStreamSynchronize(o->stream));
-  if(o->modules)save(cuteafd_pcm_support_destroy(o->modules));
-  if(o->arena)save(cudaFree(o->arena));if(o->weights)save(cudaFree(o->weights));
-  if(o->stream)save(cudaStreamDestroy(o->stream));delete o;return first;
+  if(o->modules){save(cuteafd_pcm_support_destroy(o->modules));o->modules=nullptr;}
+  if(o->arena){int e=cudaFree(o->arena);if(!e){*released|=CUTEAFD_MEDIA_RELEASED_WORKSPACE;o->arena=nullptr;}save(e);}
+  if(o->weights){int e=cudaFree(o->weights);if(!e){*released|=CUTEAFD_MEDIA_RELEASED_WEIGHTS;o->weights=nullptr;}save(e);}
+  if(o->stream){save(cudaStreamDestroy(o->stream));o->stream=nullptr;}
+  return first;
 }
-extern "C" int32_t cuteafd_pcm_create(const cuteafd_pcm_spec* spec,int32_t device,uint64_t admitted,void** out){
-  if(!out)return cudaErrorInvalidValue;*out=nullptr;cuteafd_pcm_ledger ledger{};
+extern "C" int32_t cuteafd_pcm_destroy_backings(void* p,uint32_t* released){
+  if(released)*released=0;
+  if(!p)return 0;if(!released)return cudaErrorInvalidValue;
+  auto* o=static_cast<Owner*>(p);int first=release_owner(o,released);
+  // A backing still held after a failed free keeps its owner alive so the
+  // caller's ledger entry stays true; retrying destroy frees it later.
+  if(!o->weights&&!o->arena)delete o;
+  return first;
+}
+extern "C" int32_t cuteafd_pcm_create(const cuteafd_pcm_spec* spec,int32_t device,uint64_t admitted,
+    const cuteafd_media_tags* tags,void** out){
+  if(!out||!tags)return cudaErrorInvalidValue;*out=nullptr;cuteafd_pcm_ledger ledger{};
   int e=cuteafd_pcm_required(spec,&ledger);if(e)return e;
   if(admitted<ledger.weights+ledger.scratch)return cudaErrorMemoryAllocation;
   int current=-1;e=cudaGetDevice(&current);if(e)return e;if(current!=device)return cudaErrorInvalidDevice;
@@ -95,10 +115,13 @@ extern "C" int32_t cuteafd_pcm_create(const cuteafd_pcm_spec* spec,int32_t devic
   o->s=*spec;o->ledger=ledger;o->device=device;
   int least=0,greatest=0;e=cudaDeviceGetStreamPriorityRange(&least,&greatest);
   if(!e)e=cudaStreamCreateWithPriority(&o->stream,cudaStreamNonBlocking,least);
-  if(!e)e=cudaMalloc(&o->weights,ledger.weights);
-  if(!e)e=cudaMalloc(&o->arena,ledger.scratch);
+  if(!e)e=cuteafd_media_allocate(reinterpret_cast<void**>(&o->weights),ledger.weights,tags->weight_kind,tags->weight_owner);
+  if(!e)e=cuteafd_media_allocate(reinterpret_cast<void**>(&o->arena),ledger.scratch,tags->workspace_kind,tags->workspace_owner);
   if(!e){scratch(o);e=cuteafd_pcm_support_create(&o->modules);}
-  if(e){cuteafd_pcm_destroy(o);return e;}*out=o;return 0;
+  // Failure returns the owner only when a backing could not be freed, holding
+  // exactly the still-live backings the caller must record and destroy later.
+  if(e){uint32_t released=0;release_owner(o,&released);if(o->weights||o->arena)*out=o;else delete o;return e;}
+  *out=o;return 0;
 }
 extern "C" int32_t cuteafd_pcm_upload(void* p,uint64_t offset,const void* data,uint64_t bytes){
   if(!p||!data||!bytes)return cudaErrorInvalidValue;auto* o=static_cast<Owner*>(p);
@@ -107,6 +130,18 @@ extern "C" int32_t cuteafd_pcm_upload(void* p,uint64_t offset,const void* data,u
   int d=-1;int e=cudaGetDevice(&d);if(e)return e;if(d!=o->device)return cudaErrorInvalidDevice;
   e=cudaMemcpyAsync(o->weights+offset,data,bytes,cudaMemcpyHostToDevice,o->stream);e=drain(o,e);
   if(!e)o->uploaded+=bytes;return e;
+}
+extern "C" int32_t cuteafd_pcm_weight_arena(void* p,void** arena){
+  if(!p||!arena)return cudaErrorInvalidValue;auto* o=static_cast<Owner*>(p);
+  if(o->uploaded)return cudaErrorInvalidValue;
+  int d=-1;int e=cudaGetDevice(&d);if(e)return e;if(d!=o->device)return cudaErrorInvalidDevice;
+  e=drain(o,cudaMemsetAsync(o->weights,0,o->s.weight_bytes,o->stream));
+  if(!e)*arena=o->weights;return e;
+}
+extern "C" int32_t cuteafd_pcm_commit_weights(void* p){
+  if(!p)return cudaErrorInvalidValue;auto* o=static_cast<Owner*>(p);
+  int d=-1;int e=cudaGetDevice(&d);if(e)return e;if(d!=o->device)return cudaErrorInvalidDevice;
+  e=drain(o,0);if(!e)o->uploaded=o->s.weight_bytes;return e;
 }
 extern "C" int32_t cuteafd_pcm_get_ledger(void* p,cuteafd_pcm_ledger* out){
   if(!p||!out)return cudaErrorInvalidValue;*out=static_cast<Owner*>(p)->ledger;return 0;

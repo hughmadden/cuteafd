@@ -8,6 +8,31 @@ use std::path::Path;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum TowerKind { Image, Audio }
+
+#[derive(Debug, thiserror::Error)]
+#[error("Muse selected attention bundle cannot reuse default media towers: {0}")]
+struct TowerBundleMismatch(String);
+
+/// Snapshot tower loaders are valid only while both bundles select identical towers.
+fn validate_shared_towers(view: &cuteafd_loader::plan::checkpoint::CheckpointView) -> Result<()> {
+    use cuteafd_loader::plan::{Checkpoint, checkpoint::{CoreView, CheckpointView}};
+    let selected = Checkpoint::inventory_view(view)?;
+    let default = Checkpoint::inventory_view(&CheckpointView::select(view.snapshot(), CoreView::Original)?)?;
+    let towers = |checkpoint: &Checkpoint| checkpoint.weight_map.iter().filter(|(name, _)|
+        cuteafd_loader::media::muse_vision::is_tensor(name) || name.starts_with("model.audio_tower."))
+        .map(|(name, shard)| (name.clone(), shard.clone())).collect::<std::collections::BTreeMap<_, _>>();
+    if towers(&selected) != towers(&default) {
+        return Err(TowerBundleMismatch("tower tensor names or shards differ".into()).into());
+    }
+    for pointer in ["/vision_config", "/audio_config", "/image_token_id", "/audio_token_id",
+        "/video_token_id", "/out_hidden_size", "/projector_hidden_size", "/projector_hidden_act",
+        "/text_config/hidden_size", "/text_config/rms_norm_eps"] {
+        if selected.config.pointer(pointer) != default.config.pointer(pointer) {
+            return Err(TowerBundleMismatch(format!("tower configuration {pointer} differs")).into());
+        }
+    }
+    Ok(())
+}
 impl TowerKind {
     fn matches(self, key: MediaKey) -> bool { key.is_audio() == (self == Self::Audio) }
 }
@@ -24,9 +49,9 @@ pub(crate) struct Markers {
 /// not engine-owned constants. Audio and vision share one expansion algorithm.
 pub(crate) struct Binding { markers: Vec<Markers>, video: Option<u32> }
 impl Binding {
-    pub fn from_snapshot(snapshot: &Path, vocabulary: usize) -> Result<Self> {
-        let config: serde_json::Value = serde_json::from_slice(&std::fs::read(snapshot.join("config.json"))?)?;
-        let tokenizer: serde_json::Value = serde_json::from_slice(&std::fs::read(snapshot.join("tokenizer_config.json"))?)?;
+    pub fn from_view(view: &cuteafd_loader::plan::checkpoint::CheckpointView, vocabulary: usize) -> Result<Self> {
+        let config = view.config()?;
+        let tokenizer: serde_json::Value = serde_json::from_slice(&std::fs::read(view.snapshot().join("tokenizer_config.json"))?)?;
         let marker = |text: &str| -> Result<u32> {
             let mut found = tokenizer["added_tokens_decoder"].as_object().context("Muse tokenizer special tokens")?
                 .iter().filter(|(_, value)| value["content"].as_str() == Some(text));
@@ -282,11 +307,12 @@ fn apply_audio_features(job: &NativeRequest, media: &mut RequestMedia,
     Ok(())
 }
 
-pub(super) fn inventory(snapshot: &Path, vision: cuteafd_loader::plan::MediaMode,
+pub(super) fn inventory(view: &cuteafd_loader::plan::checkpoint::CheckpointView, vision: cuteafd_loader::plan::MediaMode,
     audio: cuteafd_loader::plan::MediaMode, replicas: usize)
     -> Result<cuteafd_loader::placement::families::muse_spark::MediaOptions> {
-    // Coordinator role filtering deliberately excludes towers; read their headers separately.
-    let checkpoint = cuteafd_loader::plan::Checkpoint::open_for_role(snapshot, "Muse bundled media", |name| {
+    validate_shared_towers(view)?;
+    // Coordinator role filtering deliberately excludes towers; read their selected headers separately.
+    let checkpoint = cuteafd_loader::plan::Checkpoint::open_view_for_role(view, "Muse bundled media", |name| {
         vision != cuteafd_loader::plan::MediaMode::Off && ["model.vision_tower.", "model.vision_adapter.",
             "model.vision_projection."].iter().any(|prefix| name.starts_with(prefix))
     })?;
@@ -294,6 +320,7 @@ pub(super) fn inventory(snapshot: &Path, vision: cuteafd_loader::plan::MediaMode
 }
 
 pub(super) struct Ready {
+    pub push: crate::shared::vision::push::Contribution,
     pub encoder: crate::shared::qwen::Encoder,
     pub image: Option<std::sync::Arc<cuteafd_api::openai::media::MediaPreparer>>,
     pub audio: Option<std::sync::Arc<cuteafd_api::openai::media::audio::AudioPreparer>>,
@@ -324,12 +351,19 @@ impl ApiReady {
 }
 
 impl Ready {
-    pub fn load(args: &super::serve::ServeArgs, library: &cuteafd_ffi::NativeLibrary,
-        admitted: &cuteafd_loader::placement::families::muse_spark::MediaAdmission) -> Result<Self> {
+    pub fn load(args: &super::serve::ServeArgs, view: &cuteafd_loader::plan::checkpoint::CheckpointView,
+        library: &cuteafd_ffi::NativeLibrary,
+        admitted: &cuteafd_loader::placement::families::muse_spark::MediaAdmission,
+        host: cuteafd_loader::placement::families::muse_spark::HostAdmission) -> Result<Self> {
         use crate::shared::{qwen::Encoder, vision::{self, EncoderService, local::LocalEncoder, remote::*}};
         use cuteafd_loader::{media::{ImageFamily, ProcessorConfig}, plan::encoder::EncoderKind};
         use std::{sync::Arc, time::Duration};
         args.validate()?;
+        ensure!(view.snapshot() == args.snapshot, "Muse media snapshot differs from selected view");
+        validate_shared_towers(view)?;
+        tracing::info!(vision = %admitted.vision.reason, audio = %admitted.audio.reason,
+            vision_shortfall = admitted.vision.shortfall, audio_shortfall = admitted.audio.shortfall,
+            "Muse admitted bundled towers");
         let image_on = admitted.vision.admitted_bytes() > 0;
         let audio_on = admitted.audio.admitted_bytes() > 0;
         ensure!(image_on || args.vision_peers.is_empty(), "disabled vision cannot have encoder peers");
@@ -338,11 +372,12 @@ impl Ready {
             ensure!(args.audio_peers.len() == admitted.audio.spark_ranks().len(),
                 "Muse audio replica peers differ from admission");
         }
-        let (prefix, cache_bytes) = if image_on || audio_on { args.prefix.with_media_headroom(args.media_cache_bytes)? }
-            else { (args.prefix.clone(), 0) };
+        let mut prefix = args.prefix.clone();
+        prefix.host_cache_bytes = crate::shared::prefix::budget::HostBudget::Bytes(host.prefix_bytes);
+        let cache_bytes = usize::try_from(host.media_bytes)?;
         if !image_on && !audio_on {
             ensure!(args.vision_peers.is_empty() && args.audio_peers.is_empty(), "disabled media cannot have encoder peers");
-            return Ok(Self { encoder: Encoder::Off, image: None, audio: None, cache_bytes, prefix });
+            return Ok(Self { push: Default::default(), encoder: Encoder::Off, image: None, audio: None, cache_bytes, prefix });
         }
         let processor = if image_on { ProcessorConfig::from_snapshot(&args.snapshot, ImageFamily::Muse)? }
             // The audio-only adapter never reads image normalization or patch fields.
@@ -393,24 +428,43 @@ impl Ready {
         let audio = ready_audio.as_ref().map(|audio| audio.preparer.clone());
         let mut audio_encoder = ready_audio.as_mut().and_then(|audio| audio.remote.take()).map(Encoder::Remote).unwrap_or(Encoder::Off);
         let mut local_audio = ready_audio.and_then(|audio| audio.local);
+        let mut push = vision::push::Contribution::default();
         let shared_local = local_image.is_some() && local_audio.is_some() && image_gpu == audio_gpu;
         if let Some(spec) = local_image.take() {
-            let service = EncoderService::start_with_audio(spec, args.native_lib.clone(), image_gpu.context("vision GPU")?,
-                admitted.vision.admitted_bytes(), if shared_local { local_audio.take() } else { None })?;
+            let (service, contribution) = EncoderService::start_coordinator(&args.snapshot,
+                Some((spec, admitted.vision.admitted_bytes())), args.native_lib.clone(), image_gpu.context("vision GPU")?,
+                if shared_local { local_audio.take() } else { None })?;
+            push.extend(contribution);
             image_encoder = Encoder::Local(LocalEncoder::new(service, &processor, 8192, 4096));
         }
         if let Some(audio) = local_audio {
-            let service = EncoderService::start_audio(args.native_lib.clone(), audio_gpu.context("audio GPU")?, audio)?;
+            let (service, contribution) = EncoderService::start_coordinator(&args.snapshot, None,
+                args.native_lib.clone(), audio_gpu.context("audio GPU")?, Some(audio))?;
+            push.extend(contribution);
             audio_encoder = Encoder::Local(LocalEncoder::new(service, &processor, 8192, 4096));
         }
         let encoder = if shared_local { image_encoder } else { Encoder::split(image_encoder, audio_encoder) };
-        Ok(Self { encoder, image, audio, cache_bytes, prefix })
+        Ok(Self { push, encoder, image, audio, cache_bytes, prefix })
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn media_binding_uses_immutable_selected_config() -> Result<()> {
+        use cuteafd_loader::plan::checkpoint::{CoreView, CheckpointView};
+        let dir = tempfile::tempdir()?;
+        std::fs::write(dir.path().join("config.json"), "{}")?;
+        std::fs::write(dir.path().join("tokenizer_config.json"), "{}")?;
+        let view = CheckpointView::select(dir.path(), CoreView::Original)?;
+        std::fs::write(dir.path().join("config.json"), "invalid unselected bytes")?;
+        let binding = Binding::from_view(&view, 100)?;
+        assert!(binding.markers.is_empty() && binding.video.is_none());
+        Ok(())
+    }
+
     fn binding() -> Binding {
         Binding { markers: vec![Markers { kind: TowerKind::Image, placeholder: 7, start: 8, end: 9 },
             Markers { kind: TowerKind::Audio, placeholder: 10, start: 11, end: 12 }], video: Some(13) }
@@ -424,11 +478,13 @@ mod tests {
         assert!(!coordinator.tensors.iter().any(|tensor| tensor.meta.name.starts_with("model.vision_tower.")));
         let full = Checkpoint::open(dir.path())?;
         let expected = MediaOptions::from_checkpoint(&full, MediaMode::Auto, MediaMode::Auto, 2)?;
-        let actual = inventory(dir.path(), MediaMode::Auto, MediaMode::Auto, 2)?;
+        let view = cuteafd_loader::plan::checkpoint::CheckpointView::select(dir.path(),
+            cuteafd_loader::plan::checkpoint::CoreView::Original)?;
+        let actual = inventory(&view, MediaMode::Auto, MediaMode::Auto, 2)?;
         assert_eq!(actual.vision_bytes, expected.vision_bytes);
         assert_eq!(actual.audio_bytes, expected.audio_bytes);
         assert_eq!(actual.replicas, 2);
-        let disabled = inventory(dir.path(), MediaMode::Off, MediaMode::Off, 1)?;
+        let disabled = inventory(&view, MediaMode::Off, MediaMode::Off, 1)?;
         assert_eq!((disabled.vision_bytes, disabled.audio_bytes), ((0, 0), (0, 0)));
         Ok(())
     }

@@ -25,15 +25,68 @@ __device__ __forceinline__ float f(bf16 v) { return __bfloat162float(v); }
 __device__ __forceinline__ float r(float v) { return __bfloat162float(__float2bfloat16(v)); }
 
 constexpr int kRank = 512;
+constexpr int kRows = 3 * kRank;
 constexpr int kMaxSequences = 32;
 constexpr int kBlocks = 296;
 constexpr int kThreads = 256;
+constexpr int kMaxRowsPerBlock = 32;  // one warp per row, 1024 threads
 
-// One block per sequence: joint = W . [state | w1[prev] | h] + b, then the gates.
+// joint = W . [state | w1[prev] | h] + b for this block's rows, one warp per row.
+// Every row keeps the single-CTA kernel's arithmetic exactly: the same lane
+// strided fmaf order over the width, the same warp reduction and the same BF16
+// rounding of sum + bias. Only which row a warp owns moves, and the row blocks
+// are sized from the device's SM count at launch. The gates follow in
+// joint_gate_kernel once every row of the sequence is written.
 // state/e are BF16 [sequences, 512]; h is BF16 [sequences * block, hidden].
+__global__ void joint_rows_kernel(const bf16* w1, const bf16* joint_w, const bf16* joint_b, const bf16* hidden,
+                                  const uint32_t* anchors, const uint32_t* drafts, const bf16* state,
+                                  float* joint_out, int hidden_width, int block, int step, int rows_per_block) {
+  extern __shared__ float x[];  // [2 * kRank + hidden_width]
+  const int s = blockIdx.y;
+  const uint32_t prev = step == 0 ? anchors[s] : drafts[s * block + step - 1];
+  const int width = 2 * kRank + hidden_width;
+  const bf16* h = hidden + (uint64_t(s) * block + step) * hidden_width;
+  for (int i = threadIdx.x; i < width; i += blockDim.x) {
+    float v;
+    if (i < kRank) v = step == 0 ? 0.0f : f(state[s * kRank + i]);
+    else if (i < 2 * kRank) v = f(w1[uint64_t(prev) * kRank + (i - kRank)]);
+    else v = f(h[i - 2 * kRank]);
+    x[i] = v;
+  }
+  __syncthreads();
+  const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
+  const int row = blockIdx.x * rows_per_block + warp;
+  if (warp < rows_per_block && row < kRows) {
+    const bf16* w = joint_w + uint64_t(row) * width;
+    float sum = 0;
+    for (int i = lane; i < width; i += 32) sum = fmaf(f(w[i]), x[i], sum);
+    for (int k = 16; k; k >>= 1) sum += __shfl_xor_sync(0xffffffffu, sum, k);
+    if (lane == 0) joint_out[uint64_t(s) * kRows + row] = r(sum + f(joint_b[row]));
+  }
+}
+
+// The gates, once every row of the sequence is in joint_g: one block per sequence.
+__global__ void joint_gate_kernel(const float* joint_g, bf16* state, bf16* embed, int step) {
+  const int s = blockIdx.x;
+  const float* joint = joint_g + uint64_t(s) * kRows;
+  for (int i = threadIdx.x; i < kRank; i += blockDim.x) {
+    const float g = r(1.0f / (1.0f + __expf(-joint[i])));
+    const float c = r(tanhf(joint[kRank + i]));
+    const float old = step == 0 ? 0.0f : f(state[s * kRank + i]);
+    const float next = r(r(g * old) + r(r(1.0f - g) * c));
+    state[s * kRank + i] = __float2bfloat16(next);
+    embed[s * kRank + i] = __float2bfloat16(r(tanhf(joint[2 * kRank + i])));
+  }
+}
+
+#ifdef CUTEAFD_ML4_DSPSPARK_LEGACY_ORACLE
+// The pre-#1285 single-CTA joint kernel, compiled only for the byte-exactness
+// oracle (`native/tests/ml4_dspark_oracle.py`) so both paths can run the same
+// inputs in one library. It writes the rows it gates to `joint_out` as well, so
+// the oracle compares the projections bit for bit, not just the argmaxes.
 __global__ void joint_kernel(const bf16* w1, const bf16* joint_w, const bf16* joint_b, const bf16* hidden,
                              const uint32_t* anchors, const uint32_t* drafts, bf16* state, bf16* embed,
-                             int hidden_width, int block, int step) {
+                             float* joint_out, int hidden_width, int block, int step) {
   extern __shared__ float x[];  // [2 * kRank + hidden_width]
   __shared__ float joint[3 * kRank];
   const int s = blockIdx.x;
@@ -57,6 +110,7 @@ __global__ void joint_kernel(const bf16* w1, const bf16* joint_w, const bf16* jo
     if (lane == 0) joint[o] = r(sum + f(joint_b[o]));
   }
   __syncthreads();
+  for (int i = threadIdx.x; i < 3 * kRank; i += blockDim.x) joint_out[uint64_t(s) * kRows + i] = joint[i];
   for (int i = threadIdx.x; i < kRank; i += blockDim.x) {
     const float g = r(1.0f / (1.0f + __expf(-joint[i])));
     const float c = r(tanhf(joint[kRank + i]));
@@ -66,6 +120,7 @@ __global__ void joint_kernel(const bf16* w1, const bf16* joint_w, const bf16* jo
     embed[s * kRank + i] = __float2bfloat16(r(tanhf(joint[2 * kRank + i])));
   }
 }
+#endif
 
 // Lane's share of output[v] . e (16 elements per lane), warp-summed.
 __device__ __forceinline__ float dot512(const bf16* w2, uint32_t v, const bf16* e, int lane) {
@@ -231,12 +286,92 @@ __global__ void final_kernel(const float* partial_value, const uint32_t* partial
   if (lane == 0) drafts[s * block + step] = bi;
 }
 
+// The calling device's SM count, cached per thread; the projection's row blocks
+// are sized from it, so one SM120 build serves every RTX card.
+int device_sms() {
+  static thread_local int cached_device = -1, cached_count = 0;
+  int device = 0;
+  if (cudaGetDevice(&device) != cudaSuccess) return 0;
+  if (device != cached_device) {
+    int count = 0;
+    if (cudaDeviceGetAttribute(&count, cudaDevAttrMultiProcessorCount, device) != cudaSuccess) return 0;
+    cached_device = device;
+    cached_count = count;
+  }
+  return cached_count;
+}
+
+// One call of the whole head. `split` selects the row-split projection (every
+// production call) or the pre-#1285 single-CTA projection (oracle build only).
+int32_t markov_launch(const void* logits, const void* hidden, const void* embedding, const void* joint_w,
+                      const void* joint_b, const void* output, const void* norms, const void* anchors, void* drafts,
+                      void* workspace, int sequences, int block, int vocab, int rank, int hidden_width,
+                      cudaStream_t s, bool split) {
+  if (sequences < 1 || sequences > kMaxSequences || block < 1 || rank != kRank || hidden_width < 1 ||
+      hidden_width % 8)
+    return cudaErrorInvalidValue;
+#ifndef CUTEAFD_ML4_DSPSPARK_LEGACY_ORACLE
+  if (!split) return cudaErrorInvalidValue;
+#endif
+  auto* values = static_cast<float*>(workspace);
+  auto* indices = reinterpret_cast<uint32_t*>(values + uint64_t(sequences) * kBlocks);
+  auto* top = indices + uint64_t(sequences) * kBlocks;
+  auto* state = reinterpret_cast<bf16*>(top + uint64_t(sequences) * block);
+  auto* embed = state + uint64_t(sequences) * kRank;
+  auto* joint = reinterpret_cast<float*>(embed + uint64_t(sequences) * kRank);
+  const size_t shared = size_t(2 * kRank + hidden_width) * sizeof(float);
+  int rows_per_block = 0, row_blocks = 0;
+  if (split) {
+    const int sms = device_sms();
+    rows_per_block = sms > 0 ? kRows / sms : kMaxRowsPerBlock;
+    rows_per_block = rows_per_block < 1 ? 1 : (rows_per_block > kMaxRowsPerBlock ? kMaxRowsPerBlock : rows_per_block);
+    row_blocks = (kRows + rows_per_block - 1) / rows_per_block;
+  }
+  if (shared > 48 * 1024) {
+    const cudaError_t error = split
+        ? cudaFuncSetAttribute(joint_rows_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, int(shared))
+#ifdef CUTEAFD_ML4_DSPSPARK_LEGACY_ORACLE
+        : cudaFuncSetAttribute(joint_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, int(shared));
+#else
+        : cudaSuccess;
+#endif
+    if (error != cudaSuccess) return error;
+  }
+  row_argmax_kernel<<<sequences * block, 1024, 0, s>>>(static_cast<const float*>(logits), top, vocab);
+  for (int step = 0; step < block; ++step) {
+    if (split) {
+      joint_rows_kernel<<<dim3(row_blocks, sequences), 32 * rows_per_block, shared, s>>>(
+          static_cast<const bf16*>(embedding), static_cast<const bf16*>(joint_w), static_cast<const bf16*>(joint_b),
+          static_cast<const bf16*>(hidden), static_cast<const uint32_t*>(anchors),
+          static_cast<const uint32_t*>(drafts), state, joint, hidden_width, block, step, rows_per_block);
+      joint_gate_kernel<<<sequences, kRank, 0, s>>>(joint, state, embed, step);
+    }
+#ifdef CUTEAFD_ML4_DSPSPARK_LEGACY_ORACLE
+    else {
+      joint_kernel<<<sequences, 512, shared, s>>>(
+          static_cast<const bf16*>(embedding), static_cast<const bf16*>(joint_w), static_cast<const bf16*>(joint_b),
+          static_cast<const bf16*>(hidden), static_cast<const uint32_t*>(anchors),
+          static_cast<const uint32_t*>(drafts), state, embed, joint, hidden_width, block, step);
+    }
+#endif
+    vocab_partial_kernel<<<kBlocks, kThreads, 0, s>>>(
+        static_cast<const float*>(logits), static_cast<const bf16*>(output), static_cast<const float*>(norms), top,
+        embed, values, indices, sequences, vocab, block, step);
+    final_kernel<<<sequences, 32, 0, s>>>(values, indices, static_cast<uint32_t*>(drafts), kBlocks, block, step);
+  }
+  return cudaGetLastError();
+}
+
 }  // namespace
 
 // Workspace bytes cuteafd_ml4_dspark_markov needs for `sequences` x `block` rows.
+// Layout: partial values [sequences * kBlocks] F32, partial indices
+// [sequences * kBlocks] U32, base argmax top [sequences * block] U32, state and
+// embedding [sequences * kRank] BF16 each, then the joint projection
+// [sequences * kRows] F32.
 extern "C" uint64_t cuteafd_ml4_dspark_markov_workspace(int32_t sequences, int32_t block) {
-  // partials (value + index), top per row, state and embedding (BF16).
-  return uint64_t(sequences) * kBlocks * 8 + uint64_t(sequences) * block * 4 + uint64_t(sequences) * kRank * 4;
+  return uint64_t(sequences) * kBlocks * 8 + uint64_t(sequences) * block * 4 + uint64_t(sequences) * kRank * 4 +
+      uint64_t(sequences) * kRows * 4;
 }
 
 // norms [vocab] F32 = slackened row norms of the output projection (BF16 [vocab, 512]), once at load.
@@ -258,31 +393,19 @@ extern "C" int32_t cuteafd_ml4_dspark_markov(const void* logits, const void* hid
                                              const void* norms, const void* anchors, void* drafts, void* workspace,
                                              int32_t sequences, int32_t block, int32_t vocab, int32_t rank,
                                              int32_t hidden_width, void* stream) {
-  if (sequences < 1 || sequences > kMaxSequences || block < 1 || rank != kRank || hidden_width < 1 ||
-      hidden_width % 8)
-    return cudaErrorInvalidValue;
-  auto s = static_cast<cudaStream_t>(stream);
-  auto* values = static_cast<float*>(workspace);
-  auto* indices = reinterpret_cast<uint32_t*>(values + uint64_t(sequences) * kBlocks);
-  auto* top = indices + uint64_t(sequences) * kBlocks;
-  auto* state = reinterpret_cast<bf16*>(top + uint64_t(sequences) * block);
-  auto* embed = state + uint64_t(sequences) * kRank;
-  const size_t shared = size_t(2 * kRank + hidden_width) * sizeof(float);
-  if (shared > 48 * 1024) {
-    const cudaError_t error = cudaFuncSetAttribute(joint_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                                   int(shared));
-    if (error != cudaSuccess) return error;
-  }
-  row_argmax_kernel<<<sequences * block, 1024, 0, s>>>(static_cast<const float*>(logits), top, vocab);
-  for (int step = 0; step < block; ++step) {
-    joint_kernel<<<sequences, 512, shared, s>>>(
-        static_cast<const bf16*>(embedding), static_cast<const bf16*>(joint_w), static_cast<const bf16*>(joint_b),
-        static_cast<const bf16*>(hidden), static_cast<const uint32_t*>(anchors),
-        static_cast<const uint32_t*>(drafts), state, embed, hidden_width, block, step);
-    vocab_partial_kernel<<<kBlocks, kThreads, 0, s>>>(
-        static_cast<const float*>(logits), static_cast<const bf16*>(output), static_cast<const float*>(norms), top,
-        embed, values, indices, sequences, vocab, block, step);
-    final_kernel<<<sequences, 32, 0, s>>>(values, indices, static_cast<uint32_t*>(drafts), kBlocks, block, step);
-  }
-  return cudaGetLastError();
+  return markov_launch(logits, hidden, embedding, joint_w, joint_b, output, norms, anchors, drafts, workspace,
+      sequences, block, vocab, rank, hidden_width, static_cast<cudaStream_t>(stream), true);
 }
+
+#ifdef CUTEAFD_ML4_DSPSPARK_LEGACY_ORACLE
+// The same head on the pre-#1285 single-CTA joint kernel, for
+// `native/tests/ml4_dspark_oracle.py`. Not part of the production ABI.
+extern "C" int32_t cuteafd_ml4_dspark_markov_oracle(const void* logits, const void* hidden, const void* embedding,
+                                                    const void* joint_w, const void* joint_b, const void* output,
+                                                    const void* norms, const void* anchors, void* drafts,
+                                                    void* workspace, int32_t sequences, int32_t block, int32_t vocab,
+                                                    int32_t rank, int32_t hidden_width, void* stream) {
+  return markov_launch(logits, hidden, embedding, joint_w, joint_b, output, norms, anchors, drafts, workspace,
+      sequences, block, vocab, rank, hidden_width, static_cast<cudaStream_t>(stream), false);
+}
+#endif

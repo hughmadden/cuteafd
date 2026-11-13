@@ -11,7 +11,7 @@ enum Phase { Normalize, Project, Assemble, Sample }
 pub(crate) struct DistributedDsparkTerminal<'w, 'a> {
     terminal: DeviceOwner<'a, DsparkTerminal<'w, 'a>>,
     head: DistributedVocabularyWave<'w, 'a>,
-    /// Captured stages indexed [width 5/7][normalize/sample][requests - 1].
+    /// Sampling stages indexed by width, sampling mode and request count.
     graphs: crate::shared::decode_graph::GraphBank<(usize, usize, usize), crate::shared::decode_graph::GraphOwner<'a, ()>>,
     ready: Option<usize>,
     pending: Option<(usize, Phase)>,
@@ -47,13 +47,33 @@ impl<'w, 'a> DistributedDsparkTerminal<'w, 'a> {
         ensure!(weights.tensor("mtp.2.norm.weight")?.device_id == devices[1].id,
             "draft terminal weights must reside on rank 1");
         let head_bytes = DistributedVocabularyWave::device_bytes(capacity * weights.draft_width, shards[0].tokens().end)?;
-        let mut head = DistributedVocabularyWave::new(devices, shards, capacity * weights.draft_width, head_bytes)?;
-        head.use_fp8(crate::families::deepseek_v41::v41_tensors::Fp8Head::Draft)?;
+        let head = DistributedVocabularyWave::new(devices, shards, capacity * weights.draft_width, head_bytes,
+            crate::families::deepseek_v41::v41_tensors::Fp8Head::Draft)?;
         Ok(Self {
             terminal: devices[1].own(|| weights.terminal_storage(None, capacity, required[1] - head_bytes[1]))?,
             head,
             graphs: crate::shared::decode_graph::GraphBank::new(None), ready: None, pending: None,
         })
+    }
+    pub(crate) fn capture_startup(&mut self, capacity: usize, maximum: usize) -> Result<()> {
+        ensure!(self.pending.is_none() && self.ready.is_none(), "terminal startup requires idle owner");
+        let entries = cuteafd_loader::serving_capacity::v41_graphs::v41_prewarm_drafts(crate::families::deepseek_v41::graph_policy::ranks(), 1, capacity, maximum);
+        let original = self.terminal.width();
+        let recorded = (|| -> Result<()> {
+            for entry in entries {
+                self.set_width(entry.width)?;
+                for sampling in [true] {
+                    // SAFETY: records existing normalization and sampling
+                    // against stable terminal storage without publishing state.
+                    unsafe { self.capture_stage(entry.requests, sampling)?; }
+                    let device = self.terminal.device;
+                    crate::shared::decode_graph::device::observe_device(device.library, device.id)?;
+                }
+            }
+            Ok(())
+        })();
+        let restored = self.set_width(original);
+        recorded.and(restored)
     }
     /// GPU1 residual/pre-mix and anchor storage, with the ordinary terminal layout.
     pub fn inputs(&self) -> [CuteafdDeviceBuffer; 3] { self.terminal.inputs() }
@@ -69,11 +89,12 @@ impl<'w, 'a> DistributedDsparkTerminal<'w, 'a> {
         self.ready = None;
         self.terminal.stage_sampling(rngs, temperatures)
     }
-    unsafe fn enqueue_stage(&self, requests: usize, sampling: bool) -> Result<()> {
+    unsafe fn enqueue_stage(&mut self, requests: usize, sampling: bool) -> Result<()> {
         let device = self.terminal.device;
         let terminal = self.terminal.get();
         device.run(|| unsafe {
-            let graph = self.graphs.get(&(terminal.width(), usize::from(sampling), requests)).map(|owner| owner.raw);
+            let key = (terminal.width(), usize::from(sampling), requests);
+            let graph = sampling.then(|| self.graphs.cached_launch(&key)).flatten().map(|owner| owner.raw);
             let span = terminal.timing.begin(if sampling { "graph_selector_confidence" } else { "graph_terminal_norm" },
                 None, requests * terminal.width, terminal.stream.raw)?;
             crate::shared::decode_graph::census::dispatch(device.library, terminal.stream.raw, c"dspark", requests,
@@ -83,25 +104,36 @@ impl<'w, 'a> DistributedDsparkTerminal<'w, 'a> {
         })
     }
     unsafe fn capture_stage(&mut self, requests: usize, sampling: bool) -> Result<()> {
+        if !sampling { return Ok(()); }
         let device = self.terminal.device;
         let terminal = self.terminal.get();
         let mode = usize::from(sampling);
         let width = terminal.width();
-        if !self.graphs.contains(&(width, mode, requests)) && !crate::shared::decode_graph::census::eager("dspark") {
-            let graph = device.run(|| unsafe {
-                device.library.cuda_graph_begin_capture(terminal.stream.raw)?;
-                let queued = if sampling { terminal.enqueue_sampling_on(requests, terminal.stream.raw) }
-                    else { terminal.enqueue_normalize_on(requests, terminal.stream.raw) };
-                let captured = device.library.cuda_graph_end_capture(terminal.stream.raw);
+        let key = (width, mode, requests);
+        if !self.graphs.contains(&key) && !crate::shared::decode_graph::census::eager("dspark") {
+            let pinned = cuteafd_loader::serving_capacity::v41_graphs::v41_pinned_draft(crate::families::deepseek_v41::graph_policy::ranks(), 1, requests, width);
+            let Some(mut ticket) = self.graphs.cache_ticket(&key, pinned, None) else { return Ok(()); };
+            let capture = device.run(|| unsafe {
+                ticket.capture_result(device.library.cuda_graph_begin_capture(terminal.stream.raw))?;
+                // Capture records commands only; runtime begin/enqueue retain
+                // sampling validation before any execution or graph replay.
+                let queued = if sampling { terminal.enqueue_sampling_geometry(requests, terminal.stream.raw) }
+                    else { terminal.enqueue_normalize_geometry(requests, terminal.stream.raw) };
+                let captured = ticket.capture_result(device.library.cuda_graph_end_capture_topology(terminal.stream.raw));
                 match (queued, captured) {
-                    (Ok(()), Ok(graph)) => Ok(graph),
-                    (Err(error), Ok(graph)) => { device.library.cuda_graph_exec_destroy(graph)?; Err(error) }
-                    (Err(error), Err(_)) | (Ok(()), Err(error)) => Err(error),
+                    (Ok(()), Ok(graph)) => Ok(Some(graph)),
+                    (Err(error), Ok((graph, _, _, _, _))) => { device.library.cuda_graph_exec_destroy(graph)?; Err(error) }
+                    (Ok(()), Err(error)) if cuteafd_ffi::is_small_graph(&error) => Ok(None),
+                    (Ok(()), Err(error)) => Err(error),
+                    // A plain enqueue error must not hide a tagged capture error.
+                    (Err(queued), Err(captured)) => Err(super::super::chain::prefer_device(queued, captured)),
                 }
             })?;
+            let Some((graph, nodes, width, spans, inspection)) = capture else { return Ok(()) };
             // SAFETY: terminal pins all storage and Drop drains its device stream.
             let owner = unsafe { crate::shared::decode_graph::GraphOwner::new(device.library, device.id, graph, ())? };
-            self.graphs.insert((width, mode, requests), owner, None);
+            super::super::chain::warn_topology(inspection);
+            self.graphs.cache_commit(key, owner, ticket, nodes as u64, width, spans);
         }
         Ok(())
     }
@@ -223,6 +255,12 @@ mod tests {
         let mut lanes = [DistributedDsparkTerminal::new(devices, &weights, [&shards[0], &shards[1]], 16, budgets)?,
             DistributedDsparkTerminal::new(devices, &weights, [&shards[0], &shards[1]], 16, budgets)?];
         let mut reference = devices[1].own(|| weights.terminal(&full, 16, DsparkTerminal::device_bytes_with_width(16, width)?))?;
+        lanes[0].capture_startup(16, width)?;
+        assert!(lanes[0].terminal.sampling_requests.is_none());
+        for count in [0, 1, 17] {
+            assert!(unsafe { lanes[0].begin(count) }.is_err());
+            assert!(lanes[0].pending.is_none());
+        }
         let runtime = tokio::runtime::Builder::new_current_thread().build()?;
         let download = |buffers: [CuteafdDeviceBuffer; 3]| -> Result<Vec<Vec<u8>>> {
             buffers.into_iter().map(|buffer| {
@@ -297,7 +335,19 @@ impl Drop for DistributedDsparkTerminal<'_, '_> {
         self.cancel();
         let device = self.terminal.device;
         fatal_drain(device.run(|| self.terminal.synchronize()), "distributed terminal");
-        self.graphs.retire_all();
-        fatal_drain(self.graphs.drain_retired(|| Ok(())).map(drop), "distributed terminal graphs");
+        if self.graphs.cache_attached() {
+            self.graphs.cache_clear_drained();
+        } else {
+            self.graphs.retire_all();
+            fatal_drain(self.graphs.drain_retired(|| Ok(())).map(drop), "distributed terminal graphs");
+        }
+    }
+}
+
+impl DistributedDsparkTerminal<'_, '_> {
+    pub(crate) fn visit_graph_banks(&mut self, f: &mut super::super::chain::GraphVisitor<'_>) -> Result<()> {
+        f(self.terminal.device.id, "dspark_distributed_terminal", true, &mut self.graphs)?;
+        self.terminal.get_mut().visit_graph_banks(&mut |device, site, _, bank| f(device, site, true, bank))?;
+        Ok(())
     }
 }

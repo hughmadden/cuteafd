@@ -56,7 +56,7 @@ struct Buffer<'a> {
 impl<'a> Buffer<'a> {
     fn new(library: &'a NativeLibrary, device: i32, bytes: usize) -> Result<Self> {
         let allocation = on_device(library, device, || {
-            let allocation = DeviceAllocation::new(library, bytes.max(256))?;
+            let allocation = DeviceAllocation::new(library, bytes.max(256), crate::shared::memory::TEST)?;
             library.cuda_zero_bytes(allocation.buffer, allocation.buffer.bytes)?;
             Ok(allocation)
         })?;
@@ -200,7 +200,7 @@ fn time_rounds(ctx: &Ctx<'_>, rounds: usize, body: &dyn Fn(usize) -> Result<()>)
             let captured = (0..rounds).try_for_each(|_| body(rank));
             library.cuda_set_device(ctx.ranks[rank].device)?;
             // SAFETY: ends the capture begun above.
-            let graph = unsafe { library.cuda_graph_end_capture(ctx.ranks[rank].stream) };
+            let graph = unsafe { library.cuda_graph_end_capture_for_test(ctx.ranks[rank].stream) };
             captured.and(graph)
         })?;
     }

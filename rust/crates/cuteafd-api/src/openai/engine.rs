@@ -537,7 +537,7 @@ impl Backend for Engine {
             turn.sampling = Default::default();
             let built = this.built(&turn, &names)?;
             let Some(snapshot) = this.snapshot.clone() else {
-                return Ok(crate::gateway::backend::estimate_tokens(&turn));
+                return Err(GatewayError::unsupported("exact token counting requires the serving snapshot tokenizer; refusing an estimated count"));
             };
             super::count_prompt(&this.state, built, snapshot).await.map_err(rejection)
         })

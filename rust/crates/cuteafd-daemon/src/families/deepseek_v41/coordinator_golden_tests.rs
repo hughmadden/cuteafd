@@ -161,38 +161,39 @@ pub(crate) fn mount_two_gpu(library: &NativeLibrary, catalog: &cuteafd_loader::O
     out: &mut Digests) -> Result<()> {
     let devices = [Device { library, id: 0 }, Device { library, id: 1 }];
     let map = CachePlacement::encoder_decoder();
-    let weights = BackboneLaneWeights::load_distributed(library, catalog, map,
-        BackboneLaneWeights::distributed_device_bytes(library, catalog, map)?, 16 << 20)?;
+    let arenas = super::weight_layout::TargetArenas::new(library,
+        super::weight_layout::target_layout_for_arch(catalog, Some(map), true, super::v41_tensors::fp8_head(), false, false,
+            crate::shared::inventory::device_arch(library, 0)?)?)?;
+    let weights = BackboneLaneWeights::load_in(library, catalog, 16 << 20, Some(map), false, false, Some(&arenas))?;
     collect(library, out, |f| weights.visit(f))?;
     drop(weights);
-    let producers = CacheProducerWeights::load_distributed(library, catalog, map,
-        CacheProducerWeights::distributed_device_bytes(library, catalog, map)?, 16 << 20)?;
+    let producers = CacheProducerWeights::load_in(library, catalog, 16 << 20, Some(map), Some(&arenas))?;
     collect(library, out, |f| producers.visit(f))?;
     drop(producers);
-    let index = IndexLaneWeights::load_distributed(library, catalog, map,
-        IndexLaneWeights::distributed_device_bytes(library, catalog, map)?, 16 << 20)?;
+    let index = IndexLaneWeights::load_in(library, catalog, 16 << 20, Some(map), Some(&arenas))?;
     collect(library, out, |f| index.visit(f))?;
     drop(index);
-    let engram = PlacedEngramWeights::load(library, catalog, map,
-        PlacedEngramWeights::device_bytes(library, catalog, map)?, 16 << 20)?;
+    let engram = PlacedEngramWeights::load_in(library, catalog, map, 16 << 20, Some(&arenas))?;
     collect(library, out, |f| engram.visit(f))?;
     drop(engram);
-    let table = devices[0].own(|| NativeRtxTensors::load_embedding(library, catalog,
-        crate::shared::memory::EmbedPlacement::Gpu))?;
+    let table = devices[0].own(|| NativeRtxTensors::load_embedding_in(library, catalog,
+        crate::shared::memory::EmbedPlacement::Gpu, Some(arenas.get(0)?)))?;
     collect(library, out, |f| table.visit("gpu0.", f))?;
     drop(table);
     for (gpu, tokens) in [(0usize, 0..64640), (1, 64640..129280)] {
-        let shard = devices[gpu].own(|| VocabularyShard::load(library, catalog, tokens, 1 << 30, 16 << 20))?;
+        let shard = devices[gpu].own(|| VocabularyShard::load_in(library, catalog, tokens, 1 << 30, 16 << 20,
+            Some(arenas.get(gpu as i32)?)))?;
         collect(library, out, |f| shard.visit(&format!("gpu{gpu}.vocab."), f))?;
     }
-    let head = devices[1].own(|| TargetHeadWeights::load(library, catalog,
-        TargetHeadWeights::device_bytes(catalog)?, 16 << 20))?;
+    let head = devices[1].own(|| TargetHeadWeights::load_in(library, catalog,
+        TargetHeadWeights::device_bytes(catalog)?, 16 << 20, Some(arenas.get(1)?)))?;
     collect(library, out, |f| head.visit("gpu1.head.", f))?;
     drop(head);
     use crate::families::deepseek_v41::v41_backbone_shared::tp2::Weights as SharedWeights;
     for device in devices {
         for layer in 0..40 {
-            let shared = SharedWeights::load(device, catalog, layer, SharedWeights::load_peak_device_bytes())?;
+            let shared = SharedWeights::load_in(device, catalog, layer, SharedWeights::load_peak_device_bytes(),
+                Some(arenas.get(device.id)?))?;
             collect(library, out, |f| shared.visit(f))?;
         }
     }
@@ -223,24 +224,26 @@ pub(crate) fn mount_one_gpu(library: &NativeLibrary, catalog: &cuteafd_loader::O
     out: &mut Digests) -> Result<()> {
     let device = Device { library, id: 0 };
     device.run(|| {
-        let weights = BackboneLaneWeights::load(library, catalog,
-            BackboneLaneWeights::device_bytes(library, catalog)?, 16 << 20)?;
+        let arenas = super::weight_layout::TargetArenas::new(library,
+            super::weight_layout::target_layout_for_arch(catalog, None, false, super::v41_tensors::fp8_head(), false, false,
+                crate::shared::inventory::device_arch(library, 0)?)?)?;
+        let arena = Some(arenas.get(device.id)?);
+        let weights = BackboneLaneWeights::load_in(library, catalog, 16 << 20, None, false, false, Some(&arenas))?;
         collect(library, out, |f| weights.visit(&mut |n, b| f(format!("single.{n}"), b)))?;
         drop(weights);
-        let producers = CacheProducerWeights::load(library, catalog,
-            CacheProducerWeights::device_bytes(library, catalog)?, 16 << 20)?;
+        let producers = CacheProducerWeights::load_in(library, catalog, 16 << 20, None, Some(&arenas))?;
         collect(library, out, |f| producers.visit(&mut |n, b| f(format!("single.{n}"), b)))?;
         drop(producers);
-        let index = IndexLaneWeights::load(library, catalog, IndexLaneWeights::device_bytes(library, catalog)?, 16 << 20)?;
+        let index = IndexLaneWeights::load_in(library, catalog, 16 << 20, None, Some(&arenas))?;
         collect(library, out, |f| index.visit(&mut |n, b| f(format!("single.{n}"), b)))?;
         drop(index);
         for i in 0..2 {
-            let engram = crate::families::deepseek_v41::v41_engram::layer::EngramLayerWeights::load(library, catalog,
-                i, 256 << 20, 16 << 20)?;
+            let engram = crate::families::deepseek_v41::v41_engram::layer::EngramLayerWeights::load_in(library, catalog,
+                i, 256 << 20, 16 << 20, arena)?;
             collect(library, out, |f| engram.visit(&format!("single.engram{i}."), f))?;
         }
-        let vocabulary = crate::families::deepseek_v41::v41_tensors::VocabularyHead::load(library, catalog,
-            crate::families::deepseek_v41::v41_tensors::VocabularyHead::plan(catalog)?, 16 << 20)?;
+        let vocabulary = crate::families::deepseek_v41::v41_tensors::VocabularyHead::load_in(library, catalog,
+            crate::families::deepseek_v41::v41_tensors::VocabularyHead::plan(catalog)?, 16 << 20, arena)?;
         collect(library, out, |f| vocabulary.visit("single.vocab.", f))?;
         Ok(())
     })
@@ -291,9 +294,28 @@ pub(crate) fn check(actual: &Digests, subset: bool) -> Result<()> {
 }
 
 #[test]
+fn coordinator_oracle_head_mode_is_independent_of_environment() -> Result<()> {
+    let status = std::process::Command::new(std::env::current_exe()?)
+        .args(["--exact", "families::deepseek_v41::coordinator_golden_tests::coordinator_oracle_head_mode_child",
+            "--ignored"])
+        .env("CUTEAFD_V41_FP8_HEAD", "packed").status()?;
+    anyhow::ensure!(status.success(), "isolated coordinator head-mode check failed");
+    Ok(())
+}
+
+#[test]
+#[ignore = "isolated child of coordinator_oracle_head_mode_is_independent_of_environment"]
+fn coordinator_oracle_head_mode_child() -> Result<()> {
+    super::v41_tensors::use_golden_fp8_head()?;
+    assert_eq!(super::v41_tensors::fp8_head(), super::v41_tensors::Fp8Head::All);
+    Ok(())
+}
+
+#[test]
 #[ignore = "requires CUTEAFD_PUSH_V41, CUTEAFD_NATIVE_LIB and two RTX GPUs"]
 fn installed_coordinator_operands_match_the_mount_golden() -> Result<()> {
     let Some(snapshot) = snapshot() else { return Ok(()) };
+    super::v41_tensors::use_golden_fp8_head()?;
     let library = library()?;
     library.cuda_set_device(0)?;
     for gpu in [0, 1] { Device { library: &library, id: gpu }.run(|| library.cuda_enable_peer(1 - gpu))?; }
@@ -314,41 +336,61 @@ fn installed_coordinator_operands_match_the_mount_golden() -> Result<()> {
 #[test]
 #[ignore = "requires CUTEAFD_PUSH_V41 (a SparkNest namespace), CUTEAFD_NATIVE_LIB and two RTX GPUs"]
 fn installed_pushed_coordinator_operands_match_the_mount_golden() -> Result<()> {
+    pushed_coordinator_operands(false)
+}
+
+#[test]
+#[ignore = "requires SparkNest push endpoint, CUTEAFD_PUSH_V41 and two RTX GPUs"]
+fn installed_sparknest_coordinator_operands_match_current_mount() -> Result<()> {
+    pushed_coordinator_operands(true)
+}
+
+fn pushed_coordinator_operands(real_push: bool) -> Result<()> {
     use crate::shared::experts::rtx::dense::{Recorder, Records, STEP_BYTES};
     let Some(snapshot) = snapshot() else { return Ok(()) };
+    super::v41_tensors::use_golden_fp8_head()?;
     let library = library()?;
     library.cuda_set_device(0)?;
     for gpu in [0, 1] { Device { library: &library, id: gpu }.run(|| library.cuda_enable_peer(1 - gpu))?; }
     let catalog = cuteafd_loader::read_official_v41_catalog(&snapshot)?;
     let (root, _) = cuteafd_loader::push_load::namespace(&snapshot)?;
     let layers = std::env::var("CUTEAFD_V41_GOLDEN_TP2_LAYERS").ok().map(|v| v.parse()).transpose()?.unwrap_or(2);
+    let mut expected = Digests::new();
+    if real_push {
+        let started = std::time::Instant::now();
+        mount_two_gpu(&library, &catalog, &mut expected)?;
+        mount_tp2(&library, &catalog, layers, &mut expected)?;
+        eprintln!("current mount reference: {} operands in {:.2} s", expected.len(), started.elapsed().as_secs_f64());
+    }
+    let reads = crate::shared::memory::load_timing::Split::start();
     let devices = [Device { library: &library, id: 0 }, Device { library: &library, id: 1 }];
     let socket_dir = tempfile::tempdir()?;
-    // Dense owners, recorded in groups the size of one GPU's memory headroom.
+    let map = CachePlacement::encoder_decoder();
+    let arenas = super::weight_layout::TargetArenas::new(&library,
+        super::weight_layout::target_layout_for_arch(&catalog, Some(map), true, super::v41_tensors::fp8_head(), false, false,
+            crate::shared::inventory::device_arch(&library, 0)?)?)?;
+    // Bind the same final arena views as serving before recording delivery.
     let recorder = Recorder::start(true)?.context("recorder")?;
     let mut owners = Digests::new();
     let owners_ref = &mut owners;
     // Record the owners, keeping them alive until pushed and digested.
-    let map = CachePlacement::encoder_decoder();
-    let weights = BackboneLaneWeights::load_distributed(&library, &catalog, map,
-        BackboneLaneWeights::distributed_device_bytes(&library, &catalog, map)?, 16 << 20)?;
-    let producers = CacheProducerWeights::load_distributed(&library, &catalog, map,
-        CacheProducerWeights::distributed_device_bytes(&library, &catalog, map)?, 16 << 20)?;
-    let index = IndexLaneWeights::load_distributed(&library, &catalog, map,
-        IndexLaneWeights::distributed_device_bytes(&library, &catalog, map)?, 16 << 20)?;
-    let engram = PlacedEngramWeights::load(&library, &catalog, map,
-        PlacedEngramWeights::device_bytes(&library, &catalog, map)?, 16 << 20)?;
-    let table = devices[0].own(|| NativeRtxTensors::load_embedding(&library, &catalog,
-        crate::shared::memory::EmbedPlacement::Gpu))?;
+    let weights = BackboneLaneWeights::load_in(&library, &catalog, 16 << 20, Some(map), false, false, Some(&arenas))?;
+    let producers = CacheProducerWeights::load_in(&library, &catalog, 16 << 20, Some(map), Some(&arenas))?;
+    let index = IndexLaneWeights::load_in(&library, &catalog, 16 << 20, Some(map), Some(&arenas))?;
+    let engram = PlacedEngramWeights::load_in(&library, &catalog, map, 16 << 20, Some(&arenas))?;
+    let table = devices[0].own(|| NativeRtxTensors::load_embedding_in(&library, &catalog,
+        crate::shared::memory::EmbedPlacement::Gpu, Some(arenas.get(0)?)))?;
     let vocab = [(0usize, 0..64640), (1, 64640..129280)].map(|(gpu, tokens)|
-        devices[gpu].own(|| VocabularyShard::load(&library, &catalog, tokens, 1 << 30, 16 << 20)));
+        devices[gpu].own(|| VocabularyShard::load_in(&library, &catalog, tokens, 1 << 30, 16 << 20,
+            Some(arenas.get(gpu as i32)?))));
     let vocab = vocab.into_iter().collect::<Result<Vec<_>>>()?;
-    let head = devices[1].own(|| TargetHeadWeights::load(&library, &catalog,
-        TargetHeadWeights::device_bytes(&catalog)?, 16 << 20))?;
+    let head = devices[1].own(|| TargetHeadWeights::load_in(&library, &catalog,
+        TargetHeadWeights::device_bytes(&catalog)?, 16 << 20, Some(arenas.get(1)?)))?;
     use crate::families::deepseek_v41::v41_backbone_shared::tp2::Weights as SharedWeights;
     let mut shared = Vec::new();
     for device in devices {
-        for layer in 0..40 { shared.push(SharedWeights::load(device, &catalog, layer, SharedWeights::load_peak_device_bytes())?); }
+        for layer in 0..40 { shared.push(SharedWeights::load_in(device, &catalog, layer, SharedWeights::load_peak_device_bytes(),
+            Some(arenas.get(device.id)?))?); }
     }
     let draft = devices[1].own(|| crate::families::deepseek_v41::v41_experts::dspark::DsparkWeights::load_serving(
         &library, &catalog, 80, 8, 32 << 30, 16 << 20))?;
@@ -361,18 +403,41 @@ fn installed_pushed_coordinator_operands_match_the_mount_golden() -> Result<()> 
     let plans = (0..2).map(|gpu| crate::shared::memory::push_coordinator::CoordinatorExpertPlan::new(&catalog,
         &(0..layers).collect::<Vec<_>>(), gpu, usize::MAX)).collect::<Result<Vec<_>>>()?;
     rss_guard(32)?;
-    let bounds = devices.iter().map(|device| crate::shared::experts::rtx::dense::RankLayout::new(
-        records.operands.clone(), records.steps.clone(), device.id).map(|layout| layout.host_staging))
-        .collect::<Result<Vec<_>>>()?;
-    crate::shared::experts::rtx::dense::testing::PEAKS.with(|p| p.borrow_mut().clear());
-    let mut pushed = Vec::new();
-    for (gpu, plan) in plans.into_iter().enumerate() {
-        let started = std::time::Instant::now();
-        pushed.push(crate::shared::experts::rtx::push::tests::receive_pushed(devices[gpu], Some(&catalog), &root,
-            socket_dir.path(), &records, (layers > 0).then_some(plan), 4, gpu)?);
-        eprintln!("gpu{gpu} rank pushed in {:.2} s", started.elapsed().as_secs_f64());
-        rss_guard(32)?;
+    let mut bounds = Vec::new();
+    for (device, plan) in devices.iter().zip(&plans) {
+        bounds.push(crate::shared::experts::rtx::dense::RankLayout::new(
+            records.operands.clone(), records.steps.clone(), device.id)?.host_staging);
+        // Combined completes dense operands before the expert scale-code staging arena.
+        let scales = plan.scales.host_staging();
+        if layers > 0 && scales.staging_bytes > 0 { bounds.push(scales); }
     }
+    crate::shared::experts::rtx::dense::testing::PEAKS.with(|p| p.borrow_mut().clear());
+    let pushed = if real_push {
+        use crate::shared::experts::rtx::push::{CoordinatorExperts, CoordinatorPush, PushPolicy};
+        let experts = CoordinatorExperts::Tp2 { layers: (0..layers).collect(), budgets: vec![80 << 30; 2] };
+        let dense_bounds = devices.iter().map(|device| crate::shared::experts::rtx::dense::RankLayout::new(
+            records.operands.clone(), records.steps.clone(), device.id).map(|layout| layout.host_staging))
+            .collect::<Result<Vec<_>>>()?;
+        let envelope = experts.host_envelope(&catalog, 2, &dense_bounds)?;
+        let dense = crate::shared::experts::rtx::dense::plan_records(&snapshot, records.clone(), &devices, 0)?;
+        let push = CoordinatorPush::prepare_alone_admitted(&snapshot, Some(&catalog), 2, Some(experts), envelope)?;
+        let started = std::time::Instant::now();
+        let (delivered, ()) = push.receive_with(devices.to_vec(), Some(&catalog), 0, Some(Ok(dense)), || ());
+        let delivered = PushPolicy::Required.committed(delivered)?.context("required SparkNest group commit")?;
+        eprintln!("SparkNest coordinator group committed in {:.2} s", started.elapsed().as_secs_f64());
+        delivered
+    } else {
+        let mut pushed = Vec::new();
+        for (gpu, plan) in plans.into_iter().enumerate() {
+            let started = std::time::Instant::now();
+            pushed.push(crate::shared::experts::rtx::push::tests::receive_pushed(devices[gpu], Some(&catalog), &root,
+                socket_dir.path(), &records, (layers > 0).then_some(plan), 4, gpu)?);
+            eprintln!("gpu{gpu} rank pushed in {:.2} s", started.elapsed().as_secs_f64());
+            rss_guard(32)?;
+        }
+        pushed
+    };
+    assert_eq!(reads.read_bytes(), 0, "coordinator dense and RTX expert receivers must not read the mount");
     collect(&library, owners_ref, |f| weights.visit(f))?;
     collect(&library, owners_ref, |f| producers.visit(f))?;
     collect(&library, owners_ref, |f| index.visit(f))?;
@@ -390,10 +455,60 @@ fn installed_pushed_coordinator_operands_match_the_mount_golden() -> Result<()> 
         collect(&library, owners_ref, |f| native.visit(f))?;
     }
     let peaks = crate::shared::experts::rtx::dense::testing::PEAKS.with(|p| p.take());
-    assert_eq!(peaks.len(), bounds.len(), "one staging measurement per coordinator rank");
-    for ((staged, pinned), bound) in peaks.iter().zip(bounds) {
-        eprintln!("rank staging peak {staged} B in use, {pinned} B pinned, admitted {} B", bound.staging_bytes);
-        assert!(*staged <= bound.staging_bytes as u64 && *pinned <= bound.staging_bytes as u64);
+    if !real_push {
+        assert_eq!(peaks.len(), bounds.len(), "one staging measurement per dense or expert-scale arena");
+        for ((staged, pinned), bound) in peaks.iter().zip(bounds) {
+            eprintln!("rank staging peak {staged} B in use, {pinned} B pinned, admitted {} B", bound.staging_bytes);
+            assert!(*staged <= bound.staging_bytes as u64 && *pinned <= bound.staging_bytes as u64);
+        }
     }
-    check(&owners, true)
+    if real_push {
+        assert_eq!(owners, expected, "SparkNest coordinator operands differ from current mount loaders");
+        eprintln!("PASS {} operands byte-identical to current mount; zero coordinator mount bytes", owners.len());
+        Ok(())
+    } else { check(&owners, true) }
+}
+
+#[test]
+#[ignore = "requires CUTEAFD_PUSH_V41, projection shard AOT and two RTX GPUs"]
+fn checkpoint_pushed_projection_operands_match_mount() -> Result<()> {
+    use crate::shared::experts::rtx::dense;
+    use super::v41_projection_tp2::{Weights, Kind};
+    use cuteafd_core::memory_layout::ArenaTag;
+    let snapshot = snapshot().context("set CUTEAFD_PUSH_V41")?;
+    let library = library()?;
+    let catalog = cuteafd_loader::read_official_v41_catalog(&snapshot)?;
+    let (root, _) = cuteafd_loader::push_load::namespace(&snapshot)?;
+    let sockets = tempfile::tempdir()?;
+    for kind in [Kind::QueryB, Kind::OutputB] {
+        for rank in 0..2 {
+            let device = Device { library: &library, id: rank as i32 };
+            let projection = match kind { Kind::QueryB => "wq_b", Kind::OutputB => "wo_b" };
+            let weight = format!("layers.2.attn.{projection}.weight");
+            let names = [weight.clone(),
+                cuteafd_loader::placement::families::deepseek_v41::weight_layout::packed_scale_name(&weight)];
+            let (k, n) = kind.geometry();
+            let layout = cuteafd_loader::serving_capacity::WeightArenaLayout::new("projection/oracle",
+                [(names[0].clone(), k * n / 2),
+                    (names[1].clone(), Weights::device_bytes(&library, kind)? - k * n / 2)])?;
+            let arena = crate::shared::memory::weight_arena::DeviceWeightArena::new(device,
+                layout.clone(), ArenaTag::weights("v41/target"))?;
+            let mounted = device.run(|| Weights::load_in(device, &catalog, 2, kind, rank,
+                Weights::load_peak_device_bytes(&library, kind)?, Some(&arena)))?;
+            let expected = { let [weight, scales] = mounted.buffers(); [digest(&library, weight)?, digest(&library, scales)?] };
+            drop(mounted);
+            drop(arena);
+            let arena = crate::shared::memory::weight_arena::DeviceWeightArena::new(device,
+                layout, ArenaTag::weights("v41/target"))?;
+            let reads = crate::shared::memory::load_timing::Split::start();
+            let (pushed, records) = dense::recording(|| device.run(|| Weights::load_in(device, &catalog,
+                2, kind, rank, Weights::load_peak_device_bytes(&library, kind)?, Some(&arena))))?;
+            crate::shared::experts::rtx::push::tests::receive_pushed(device, None, &root,
+                sockets.path(), &records, None, 0, rank)?;
+            assert_eq!(reads.read_bytes(), 0, "projection receiver must not read the mount");
+            assert_eq!({ let [weight, scales] = pushed.buffers(); [digest(&library, weight)?, digest(&library, scales)?] }, expected);
+            eprintln!("{kind:?} rank {rank}: pushed weights and packed scales byte-identical to mount; zero receiver mount bytes");
+        }
+    }
+    Ok(())
 }

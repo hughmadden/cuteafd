@@ -166,14 +166,11 @@ fn quant(snapshot: &Path, spark_ranks: usize) -> Vec<QuantGroup> {
 }
 
 /// The speculator the options select.
-fn speculator(_family: Option<&str>, settings: &[Setting]) -> Option<String> {
+pub(crate) fn speculator(_family: Option<&str>, settings: &[Setting]) -> Option<String> {
     let truthy = |names: &[&str]| setting(settings, names).is_some_and(|v| v == "true");
     let number = |names: &[&str]| setting(settings, names).and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
     if truthy(&["dspark"]) {
-        return Some(match setting(settings, &["dspark-draft-limit"]) {
-            Some(limit) => format!("dSpark (≤{limit} drafts)"),
-            None => "dSpark".into(),
-        });
+        return Some("dSpark".into());
     }
     if let Some(draft) = setting(settings, &["draft"]).filter(|v| *v != "false") {
         let name = Path::new(draft).file_name().and_then(|n| n.to_str()).unwrap_or(draft);
@@ -189,28 +186,23 @@ fn speculator(_family: Option<&str>, settings: &[Setting]) -> Option<String> {
 
 fn layout(hardware: &Hardware, settings: &[Setting]) -> String {
     let mut parts = vec![format!("{} RTX", hardware.used_gpus())];
-    if setting(settings, &["split-device"]).is_some() {
+    if setting(settings, &["split-device"]).is_some_and(|value| value.parse::<usize>().is_ok()) {
         parts[0].push_str(" (head split)");
     }
     match hardware.sparks.len() {
         0 => parts.push("experts on the coordinator".into()),
-        n => {
-            let tp = setting(settings, &["spark-tp"]).and_then(|v| v.parse::<usize>().ok());
-            let ep = setting(settings, &["spark-ep"]).and_then(|v| v.parse::<usize>().ok());
-            parts.push(match (tp, ep) {
-                (Some(tp), Some(ep)) => format!("experts TP{tp}×EP{ep} over {n} Sparks"),
-                _ => format!("experts TP{n} over {n} Sparks"),
-            });
-        }
+        n => parts.push(format!("experts TP{n} over {n} Sparks")),
     }
     if let Some(placement) = context::mapped_placement() { parts.push(placement.label()); }
     parts.join(" · ")
 }
 
 pub fn configuration(context: &ServerContext, hardware: &Hardware) -> Configuration {
-    let settings = context.settings.clone();
+    let settings = context.report_settings();
     let quant = context.snapshot.as_deref().map(|s| quant(s, hardware.sparks.len())).unwrap_or_default();
     Configuration {
+        draft: if speculator(context.family.as_deref(), &settings).is_none() { "no speculation" }
+            else { context.draft_mode() }.into(),
         supports_thinking_off: context.supports_thinking_off,
         snapshot: context.snapshot.as_ref().map(|p| p.display().to_string()),
         quant,
@@ -364,9 +356,29 @@ mod tests {
     }
 
     #[test]
+    fn resolved_absent_split_is_not_a_head_split() {
+        let hardware = Hardware::default();
+        assert!(!layout(&hardware, &[s("split-device", "none", None, "resolved")]).contains("head split"));
+        assert!(layout(&hardware, &[s("split-device", "1", None, "resolved")]).contains("head split"));
+    }
+
+    #[test]
+    fn configuration_reports_resolved_draft_mode_not_requested_length() {
+        let mut context = ServerContext { settings: vec![s("draft-length", "99", None, "cli"), s("draft", "/drafter", None, "cli")], ..Default::default() };
+        assert_eq!(configuration(&context, &Hardware::default()).draft, "adaptive");
+        let inactive = ServerContext { settings: vec![s("draft-length", "4", None, "cli")], ..Default::default() };
+        assert_eq!(configuration(&inactive, &Hardware::default()).draft, "no speculation");
+        context.resolve("draft-mode", "fixed 7");
+        let encoded = serde_json::to_value(configuration(&context, &Hardware::default())).unwrap();
+        assert_eq!(encoded["draft"], "fixed 7");
+        assert_eq!(Configuration::default().draft, "adaptive");
+        assert_eq!(serde_json::from_str::<Configuration>("{}").unwrap().draft, "adaptive");
+    }
+
+    #[test]
     fn speculator_follows_the_options() {
         assert_eq!(speculator(Some("deepseek_v41"), &[s("dspark", "true", Some("false"), "cli"),
-            s("dspark-draft-limit", "5", Some("5"), "default")]).as_deref(), Some("dSpark (≤5 drafts)"));
+            s("draft-mode", "adaptive", None, "resolved")]).as_deref(), Some("dSpark"));
         assert_eq!(speculator(Some("qwen4"), &[s("mtp", "3", Some("0"), "cli")]).as_deref(), Some("MTP ×3"));
         assert_eq!(speculator(Some("glm5"), &[s("draft", "/hf/GLM-5.3-DFlash2", None, "cli")]).as_deref(),
             Some("DFlash2 (GLM-5.3-DFlash2)"));

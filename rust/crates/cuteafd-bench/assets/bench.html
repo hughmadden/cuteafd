@@ -521,7 +521,7 @@ function tableFor(id, comparedResult = null) {
     const c = report.server.configuration;
     const settings = c.settings || [];
     const differs = (s) => s.source !== 'default' && s.value !== s.default;
-    const rows = settings.map((s) => [s.name, s.value ?? '∅', s.default ?? '∅', s.source]);
+    const rows = settings.map((s) => [s.name, s.value ?? '∅', s.default ?? '∅', s.source === 'default' ? 'launch default' : s.source]);
     return tableHtml(['tensor group', 'formats'], (c.quant || []).map((q) => [q.group, q.formats.join(' + ')]))
       + tableHtml(['option', 'value', 'default', 'source'], rows, settings.map((s) => differs(s) ? 'differs' : ''));
   }

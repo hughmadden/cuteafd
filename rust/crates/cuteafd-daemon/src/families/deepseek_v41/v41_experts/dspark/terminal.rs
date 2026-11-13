@@ -1,5 +1,6 @@
 use crate::shared::decode_graph::{fatal_drain, BindingGraphs};
 use super::{DsparkConfidence, DsparkMarkov, DsparkWeights};
+use crate::shared::memory::Tag;
 use crate::shared::memory::{DeviceAllocation, HostAllocation, LoadStream};
 use crate::families::deepseek_v41::v41_tensors::VocabularyHead;
 use anyhow::{ensure, Context, Result};
@@ -10,7 +11,7 @@ mod distributed;
 pub(crate) use distributed::DistributedDsparkTerminal;
 
 struct LocalHead<'w, 'a> {
-    kernel: V41VocabularyProjection<'a>,
+    kernel: Option<V41VocabularyProjection<'a>>,
     _workspace: DeviceAllocation<'a>,
     weights: &'w VocabularyHead<'a>,
     /// Scratch of the head copy (`CUTEAFD_V41_FP8_HEAD`; a packed head's coarse plane).
@@ -66,16 +67,18 @@ impl<'library> DsparkWeights<'library> {
         self.tensor("mtp.2.norm.weight")?;
         let local_head = head.map(|weights| -> Result<_> {
             ensure!(weights.device_id() == library.cuda_get_device()?, "dSpark head device differs");
-            let workspace = DeviceAllocation::new(library, V41VocabularyProjection::WORKSPACE_BYTES)?;
-            let kernel = unsafe { library.v41_vocabulary_head(workspace.buffer)? };
+            let workspace = DeviceAllocation::new(library, V41VocabularyProjection::WORKSPACE_BYTES, Tag::drafter_workspace("v41/draft-terminal"))?;
             let fp8_scratch = crate::families::deepseek_v41::v41_tensors::fp8_scratch(library, weights.copy(),
                 capacity * self.draft_width, crate::families::deepseek_v41::v41_tensors::Fp8Head::Draft)?;
+            let kernel = if fp8_scratch.is_some() { None } else {
+                Some(unsafe { library.v41_vocabulary_head(workspace.buffer, cuteafd_ffi::programs::HeadMode::Gemm)? })
+            };
             Ok(LocalHead { kernel, _workspace: workspace, weights, fp8_scratch })
         }).transpose()?;
         Ok(DsparkTerminal {
             timing: crate::shared::draft::timing::DraftTiming::from_env(library, "v41-terminal")?,
             local_head,
-            normalized: DeviceAllocation::new(library, capacity * self.draft_width * 10240)?,
+            normalized: DeviceAllocation::new(library, capacity * self.draft_width * 10240, Tag::drafter_workspace("v41/draft-terminal"))?,
             weights: self,
             stream: LoadStream {
                 library,
@@ -86,18 +89,18 @@ impl<'library> DsparkWeights<'library> {
                 .confidence(capacity * self.draft_width, DsparkConfidence::device_bytes(capacity * self.draft_width)?)?,
             sample: library.v41_draft_step()?,
             hc: library.v41_hc()?,
-            residual: DeviceAllocation::new(library, capacity * self.draft_width * 40960)?,
-            pre_mix: DeviceAllocation::new(library, capacity * self.draft_width * 16)?,
-            shared_logits: DeviceAllocation::new(library, capacity * self.draft_width * 129280 * 4)?,
-            adjusted_logits: DeviceAllocation::new(library, capacity * self.draft_width * 129280 * 4)?,
-            rng: DeviceAllocation::new(library, capacity * 16)?,
+            residual: DeviceAllocation::new(library, capacity * self.draft_width * 40960, Tag::drafter_workspace("v41/draft-terminal"))?,
+            pre_mix: DeviceAllocation::new(library, capacity * self.draft_width * 16, Tag::drafter_workspace("v41/draft-terminal"))?,
+            shared_logits: DeviceAllocation::new(library, capacity * self.draft_width * 129280 * 4, Tag::drafter_workspace("v41/draft-terminal"))?,
+            adjusted_logits: DeviceAllocation::new(library, capacity * self.draft_width * 129280 * 4, Tag::drafter_workspace("v41/draft-terminal"))?,
+            rng: DeviceAllocation::new(library, capacity * 16, Tag::drafter_workspace("v41/draft-terminal"))?,
             sampling_requests: None,
-            sampling_staging: HostAllocation::new(library, capacity * 20)?,
-            temperatures: DeviceAllocation::new(library, capacity * 4)?,
-            tokens: DeviceAllocation::new(library, capacity * (self.draft_width + 1) * 4)?,
+            sampling_staging: HostAllocation::new(library, capacity * 20, Tag::staging("v41/draft-terminal"))?,
+            temperatures: DeviceAllocation::new(library, capacity * 4, Tag::drafter_workspace("v41/draft-terminal"))?,
+            tokens: DeviceAllocation::new(library, capacity * (self.draft_width + 1) * 4, Tag::drafter_workspace("v41/draft-terminal"))?,
             capacity,
             width: self.draft_width,
-            graph: BindingGraphs::new(library)?,
+            graph: BindingGraphs::new(library, "dspark_terminal")?,
             ready_requests: None,
         })
     }
@@ -224,15 +227,7 @@ impl DsparkTerminal<'_, '_> {
         })
     }
     pub(super) fn validate_sampling(&self, requests: usize) -> Result<()> {
-        ensure!(
-            requests > 0 && requests <= self.capacity,
-            "terminal requests exceed capacity"
-        );
-        ensure!(
-            self.sampling_requests == Some(requests),
-            "sampling state does not match live requests"
-        );
-        Ok(())
+        validate_sampling_state(self.capacity, self.sampling_requests, requests)
     }
     unsafe fn enqueue(&self, requests: usize) -> Result<()> {
         unsafe { self.enqueue_on(requests, self.stream.raw) }
@@ -243,7 +238,7 @@ impl DsparkTerminal<'_, '_> {
         unsafe {
             self.enqueue_normalize_on(requests, stream)?;
             let span = self.timing.begin_retained("head", "head", None, requests * self.width, stream)?;
-            crate::families::deepseek_v41::v41_tensors::project_vocabulary(self.stream.library, &head.kernel,
+            crate::families::deepseek_v41::v41_tensors::project_vocabulary(self.stream.library, head.kernel.as_ref(),
                 head.weights.weight(), head.weights.copy().zip(head.fp8_scratch.as_ref()), self.normalized.buffer,
                 self.shared_logits.buffer, requests * self.width, stream)?;
             self.timing.end_retained(span, stream)?;
@@ -252,6 +247,12 @@ impl DsparkTerminal<'_, '_> {
     }
     unsafe fn enqueue_normalize_on(&self, requests: usize, stream: *mut c_void) -> Result<()> {
         self.validate_sampling(requests)?;
+        // SAFETY: runtime validation above establishes live sampling state.
+        unsafe { self.enqueue_normalize_geometry(requests, stream) }
+    }
+    /// Record the same commands without requiring or publishing sampling state.
+    unsafe fn enqueue_normalize_geometry(&self, requests: usize, stream: *mut c_void) -> Result<()> {
+        validate_geometry(self.capacity, requests)?;
         let span = self.timing.begin_retained("normalize", "terminal_norm", None, requests * self.width, stream)?;
         let library = self.stream.library;
         unsafe {
@@ -278,6 +279,12 @@ impl DsparkTerminal<'_, '_> {
     }
     unsafe fn enqueue_sampling_on(&self, requests: usize, stream: *mut c_void) -> Result<()> {
         self.validate_sampling(requests)?;
+        // SAFETY: runtime validation above establishes live sampling state.
+        unsafe { self.enqueue_sampling_geometry(requests, stream) }
+    }
+    /// Capture records accesses to the real RNG storage; it never consumes RNG.
+    unsafe fn enqueue_sampling_geometry(&self, requests: usize, stream: *mut c_void) -> Result<()> {
+        validate_geometry(self.capacity, requests)?;
         let library = self.stream.library;
         let row_bytes = requests * 129280 * 4;
         let span = self.timing.begin_retained("sample", "selector", None, requests * self.width, stream)?;
@@ -349,37 +356,6 @@ impl DsparkTerminal<'_, '_> {
         self.output()
     }
     /// # Safety
-    /// Same input contract as execute; warms the complete sequence before capture.
-    pub unsafe fn capture(&mut self, requests: usize) -> Result<()> {
-        ensure!(self.graph.is_none(), "terminal graph already captured");
-        unsafe {
-            self.execute(requests)?;
-        }
-        self.ready_requests = None;
-        unsafe {
-            self.stream
-                .library
-                .cuda_graph_begin_capture(self.stream.raw)?;
-        }
-        let launch = unsafe { self.enqueue(requests) };
-        let captured = unsafe { self.stream.library.cuda_graph_end_capture(self.stream.raw) };
-        match (launch, captured) {
-            (Ok(()), Ok(graph)) => {
-                // SAFETY: wave pins captured storage through drained teardown.
-                unsafe { self.graph.insert(requests, graph)?; }
-                Ok(())
-            }
-            (Err(error), Ok(graph)) => {
-                if let Err(cleanup) = unsafe { self.stream.library.cuda_graph_exec_destroy(graph) }
-                {
-                    tracing::error!(%cleanup, "destroying failed terminal capture");
-                }
-                Err(error)
-            }
-            (Err(error), Err(_)) | (Ok(()), Err(error)) => Err(error),
-        }
-    }
-    /// # Safety
     /// Same input contract as execute; prepare new sampling state for a fresh attempt.
     pub unsafe fn replay(&mut self, requests: usize) -> Result<[CuteafdDeviceBuffer; 3]> {
         self.ready_requests = None;
@@ -387,11 +363,10 @@ impl DsparkTerminal<'_, '_> {
             self.sampling_requests == Some(requests),
             "sampling state does not match replay requests"
         );
-        let (graph, captured) = self.graph.get().context("terminal graph is not captured")?;
-        ensure!(
-            requests == captured,
-            "terminal replay shape differs from capture"
-        );
+        let Some(graph) = self.graph.cached_launch(&requests) else {
+            // SAFETY: replay and eager execution have the same input contract.
+            return unsafe { self.execute(requests) };
+        };
         unsafe {
             self.stream
                 .library
@@ -425,10 +400,44 @@ impl DsparkTerminal<'_, '_> {
         ])
     }
 }
+fn validate_geometry(capacity: usize, requests: usize) -> Result<()> {
+    ensure!(requests > 0 && requests <= capacity, "terminal requests exceed capacity");
+    Ok(())
+}
+
+fn validate_sampling_state(capacity: usize, staged: Option<usize>, requests: usize) -> Result<()> {
+    validate_geometry(capacity, requests)?;
+    ensure!(staged == Some(requests), "sampling state does not match live requests");
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn runtime_sampling_validation_rejects_unstaged_or_mismatched_requests() {
+        assert!(validate_geometry(8, 3).is_ok());
+        for (staged, requests) in [(None, 3), (Some(2), 3), (Some(0), 0), (Some(9), 9)] {
+            assert!(validate_sampling_state(8, staged, requests).is_err());
+        }
+        assert!(validate_sampling_state(8, Some(3), 3).is_ok());
+    }
+}
+
 impl Drop for DsparkTerminal<'_, '_> {
     fn drop(&mut self) {
         fatal_drain(self.synchronize(), "dSpark terminal");
         // SAFETY: owning stream has drained before executable retirement.
         fatal_drain(unsafe { self.graph.clear() }, "dSpark terminal graphs");
+    }
+}
+
+impl DsparkTerminal<'_, '_> {
+    pub(crate) fn visit_graph_banks(&mut self, f: &mut super::chain::GraphVisitor<'_>) -> Result<()> {
+        f(self.tokens.buffer.device_id, "dspark_terminal", false, &mut self.graph)?;
+        self.markov.visit_graph_banks(f)?;
+        self.confidence.visit_graph_banks(f)?;
+        Ok(())
     }
 }

@@ -203,17 +203,61 @@ fn family_of(command: &str) -> Option<&'static str> {
 
 /// Records a serve command's resolved options (value, default, source) for
 /// the benchmark; other commands record nothing.
-pub(crate) fn capture(matches: &ArgMatches, coordinator_budget_gib: Option<f64>) -> Result<()> {
-    if let Some(context) = serve_context(matches, coordinator_budget_gib)? {
+pub(crate) fn capture(matches: &ArgMatches, memory: crate::cli::MemoryArgs, graph_floor: Option<&str>) -> Result<()> {
+    if let Some(mut context) = serve_context(matches, Some(memory))? {
+        if let Some(value) = graph_floor {
+            context.settings.push(Setting { name: "graph-disable-low-mem".into(), value: Some(value.into()), default: None, source: "resolved".into() });
+        }
+        let formats = cuteafd_core::spark_reply::requested();
+        let (prefill, decode) = reply_settings(&mut context, formats);
+        tracing::info!(%prefill, %decode, prefill_explicit = formats.prefill.is_some(),
+            decode_explicit = formats.decode.is_some(), "resolved Spark reply phase formats");
         cuteafd_bench::context::set(context);
     }
     Ok(())
 }
 
+fn reply_settings(context: &mut cuteafd_bench::context::ServerContext,
+    formats: cuteafd_core::spark_reply::SparkReplyFormats) -> (String, String) {
+    let partial = context.command == "serve-muse";
+    let (prefill, decode) = (formats.prefill(partial).to_string(), formats.decode().to_string());
+    for (name, value, default) in [
+        ("spark-prefill-reply-format", prefill.clone(), cuteafd_core::spark_reply::SparkReplyFormats::default().prefill(partial).to_string()),
+        ("spark-decode-reply-format", decode.clone(), "bf16".to_owned()),
+        ("spark-prefill-reply-format-explicit", formats.prefill.is_some().to_string(), "false".to_owned()),
+        ("spark-decode-reply-format-explicit", formats.decode.is_some().to_string(), "false".to_owned()),
+    ] {
+        context.settings.retain(|setting| setting.name != name);
+        context.settings.push(Setting { name: name.into(), value: Some(value), default: Some(default), source: "resolved".into() });
+    }
+    (prefill, decode)
+}
+
+/// Startup-derived argument definitions. This typed registry is shared by
+/// capture and the rewrite inventory gate; adding a normalizer requires an entry.
+#[derive(Clone, Copy)]
+struct DerivedArguments { family: Option<&'static str>, names: &'static [&'static str] }
+const DERIVED_ARGUMENTS: &[DerivedArguments] = &[
+    DerivedArguments { family: None, names: &["max-context-tokens", "pool-tokens", "kv-format", "prefill-rows", "prefill-waves",
+        "prefill-span-rows", "prefill-units", "rtx-expert-layers", "onboard", "attention-placement",
+        "attention-plan-rows", "prefix-cache-entries", "spark-prefill-reply-format", "spark-decode-reply-format"] },
+    DerivedArguments { family: Some("glm5"), names: &["max-sequences", "draft-context-slots", "draft-window-marks", "draft-fp8"] },
+    DerivedArguments { family: Some("glm5_flash"), names: &["max-sequences", "slots", "draft-sequences", "draft-context-slots",
+        "index-cache", "prefix-marks", "split-device", "draft-fp8", "kda-output-shard", "kda-prefill-expanded", "kda-fp32-partials", "fp8-head",
+        "kda-fp8", "kda-nvfp4-gate", "fp8-prefill"] },
+    DerivedArguments { family: Some("mimo_v2"), names: &["max-sequences", "rings", "draft-sequences", "draft-context-slots",
+        "http-queue-depth", "split-device", "embedding-placement", "fp8-head", "fp8-o-proj", "draft-fp8", "draft-representation"] },
+    DerivedArguments { family: Some("qwen4"), names: &["slots", "mtp"] },
+    DerivedArguments { family: Some("deepseek_v41"), names: &["prefill-batch-tokens", "prefill-reserve-rows", "decode-lanes", "max-context-tokens", "embedding-placement", "kv-pool-size"] },
+];
+fn derived_argument(family: &str, name: &str) -> bool {
+    DERIVED_ARGUMENTS.iter().any(|rule| rule.family.is_none_or(|id| id == family) && rule.names.contains(&name))
+}
+
 /// The serve command's resolved settings, without publishing them. Tests read
 /// this directly: `capture` stores one process-wide context, so a test that
 /// called it would replace whatever another test was asserting.
-fn serve_context(matches: &ArgMatches, coordinator_budget_gib: Option<f64>)
+fn serve_context(matches: &ArgMatches, memory: Option<crate::cli::MemoryArgs>)
     -> Result<Option<cuteafd_bench::context::ServerContext>> {
     let Some((name, sub)) = matches.subcommand() else { return Ok(None) };
     let Some(family) = family_of(name) else { return Ok(None) };
@@ -221,9 +265,11 @@ fn serve_context(matches: &ArgMatches, coordinator_budget_gib: Option<f64>)
     let Some(definition) = command.find_subcommand(name) else { return Ok(None) };
     let mut settings: Vec<Setting> = Vec::new();
     let mut snapshot = None;
+    let mut derived = Vec::new();
     for arg in definition.get_arguments() {
         let id = arg.get_id().as_str();
-        if matches!(id, "help" | "version" | "coordinator_gpu_budget_gib") {
+        if matches!(id, "help" | "version" | "gpu_memory_cap" | "spark_memory_cap" | "gpu_reserve" | "spark_reserve"
+            | "family_reserve" | "memory_padding" | "graph_node_padding" | "kv_target_tokens" | "kv_min_tokens" | "kv_max_tokens") {
             continue;
         }
         let value = sub.get_raw(id).map(|values| values.map(|v| v.to_string_lossy().into_owned())
@@ -234,9 +280,9 @@ fn serve_context(matches: &ArgMatches, coordinator_budget_gib: Option<f64>)
             Some(clap::parser::ValueSource::DefaultValue) => "default",
             _ => "unset",
         };
-        if value.is_none() && source == "unset" {
-            continue;
-        }
+        let name = arg.get_long().map(str::to_string).unwrap_or_else(|| id.replace('_', "-"));
+        if derived_argument(family, &name) { derived.push(name.clone()); }
+        if value.is_none() && source == "unset" && !derived_argument(family, &name) { continue; }
         let mut defaults: Vec<String> = arg.get_default_values().iter().map(|v| v.to_string_lossy().into_owned())
             .collect();
         if defaults.is_empty() {
@@ -255,10 +301,19 @@ fn serve_context(matches: &ArgMatches, coordinator_budget_gib: Option<f64>)
             source: source.to_string() });
     }
     // Global options are not in the unbuilt family definition. Pass the
-    // resolved ceiling explicitly so generic serve's reparse retains it too.
-    if let Some(gib) = coordinator_budget_gib {
-        settings.push(Setting { name: "coordinator-gpu-budget-gib".into(), value: Some(gib.to_string()),
-            default: None, source: "cli".into() });
+    // resolved memory policy explicitly so generic serve's reparse retains it too.
+    if let Some(memory) = memory {
+        if let Some(value) = memory.graph_node_padding {
+            settings.push(Setting { name: "graph-node-padding".into(), value: Some(value.to_string()), default: None, source: "cli".into() });
+        }
+        for (name, value) in [("gpu-memory-cap", memory.gpu_memory_cap), ("spark-memory-cap", memory.spark_memory_cap),
+            ("gpu-reserve", memory.gpu_reserve), ("spark-reserve", memory.spark_reserve),
+            ("family-reserve", memory.family_reserve), ("memory-padding", memory.memory_padding), ("kv-target-tokens", memory.kv_target_tokens),
+            ("kv-min-tokens", memory.kv_min_tokens), ("kv-max-tokens", memory.kv_max_tokens)] {
+            if let Some(value) = value {
+                settings.push(Setting { name: name.into(), value: Some(value.to_string()), default: None, source: "cli".into() });
+            }
+        }
     }
     // The parsed flag already applies CUTEAFD_ATTENTION_PLACEMENT (cli over env over
     // default). Report that resolution once; the launch spelling is the same option.
@@ -267,20 +322,25 @@ fn serve_context(matches: &ArgMatches, coordinator_budget_gib: Option<f64>)
         .or_else(|| std::env::var("CUTEAFD_ATTENTION_PLACEMENT").ok())
         .unwrap_or_else(|| "auto".into());
     // Reject an unrunnable placement before loading CUDA or starting workers.
-    let mode = attention_mode(family, sub, &requested)?;
+    let mode = core_view(family, sub, &requested)?;
     let executor = placement_executor(family)?;
     settings.retain(|setting| setting.name != "attention-placement");
     settings.push(Setting { name: "attention-placement".into(), value: Some(mode.to_string()),
         default: Some(executor.attention_default().to_string()), source: "resolved".into() });
+    settings.push(Setting { name: "per-layer-timing".into(),
+        value: Some(if crate::shared::draft::timing_profile() { "on (perturbing)" } else { "off" }.into()),
+        default: None, source: "resolved".into() });
     settings.extend(cuteafd_bench::context::env_settings().into_iter()
         .filter(|setting| setting.name != "CUTEAFD_ATTENTION_PLACEMENT"));
-    Ok(Some(cuteafd_bench::context::ServerContext { command: name.to_string(),
-        family: None, snapshot, settings, supports_thinking_off: None }))
+    let mut context = cuteafd_bench::context::ServerContext { command: name.to_string(),
+        family: None, snapshot, settings, supports_thinking_off: None, derived: Vec::new() };
+    for name in derived { context.require_resolved(&name); }
+    Ok(Some(context))
 }
 
 /// The attention placement `requested` resolves to for a serve command: two coordinator GPUs
 /// are generic serve's `--rtx-gpus 2` or a family's `--split-device`.
-fn attention_mode(family: &str, sub: &ArgMatches, requested: &str)
+fn core_view(family: &str, sub: &ArgMatches, requested: &str)
     -> Result<cuteafd_loader::placement::AttentionPlacement> {
     let requested = cuteafd_loader::placement::attention::parse(requested).map_err(anyhow::Error::msg)?;
     let executor = placement_executor(family)?;
@@ -290,9 +350,91 @@ fn attention_mode(family: &str, sub: &ArgMatches, requested: &str)
 }
 
 #[cfg(test)]
+pub(crate) fn fixture_prefix() -> crate::shared::prefix::PrefixArgs {
+    use clap::Parser;
+    #[derive(Parser)]
+    struct Cli { #[command(flatten)] prefix: crate::shared::prefix::PrefixArgs }
+    Cli::try_parse_from(["fixture"]).unwrap().prefix
+}
+
+#[cfg(test)]
+pub(crate) fn assert_resolved_family_seam<T>(family: &str, later: &[&str],
+    seam: impl FnOnce() -> Result<T>) -> Result<T> {
+    let command = crate::commands::family::FAMILIES.iter()
+        .find(|(id, _, _)| *id == family).unwrap().1;
+    let mut argv = vec!["cuteafd", command, "--snapshot", "/fixture", "--native-lib", "/native"];
+    if family == "step5" { argv.extend(["--peers", "127.0.0.1:19000"]); }
+    let matches = crate::cli::Cli::command().try_get_matches_from(argv)?;
+    let mut context = serve_context(&matches, None)?.unwrap();
+    reply_settings(&mut context, Default::default());
+    let (result, facts) = cuteafd_bench::context::capture_resolved(seam);
+    // A refused admission has no effective serving configuration to report.
+    let result = result?;
+    facts.apply(&mut context);
+    let missing = context.validate_resolved().err().unwrap_or_default()
+        .into_iter().collect::<std::collections::BTreeSet<_>>();
+    let later = later.iter().map(|name| name.to_string())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(missing, later, "{family}: update CPU coverage or later-stage inventory; facts={facts:?}");
+    context.derived.retain(|name| !later.contains(name));
+    assert_eq!(context.validate_resolved(), Ok(()), "{family}: missing CPU runtime facts");
+    Ok(result)
+}
+
+#[cfg(test)]
+pub(crate) fn assert_resolved_seam<T>(family: &str, names: &[&str], seam: impl FnOnce() -> T) -> T {
+    let (result, facts) = cuteafd_bench::context::capture_resolved(seam);
+    let mut context = cuteafd_bench::context::ServerContext::default();
+    for name in names {
+        assert!(derived_argument(family, name), "{family}/{name} must be marked derived");
+        context.require_resolved(name);
+    }
+    facts.apply(&mut context);
+    assert_eq!(context.validate_resolved(), Ok(()), "{family}: {facts:?}");
+    result
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use clap::FromArgMatches;
+
+    #[test]
+    fn derived_cli_requests_are_not_effective_runtime_values() {
+        let matches = crate::cli::Cli::command().try_get_matches_from([
+            "cuteafd", "serve-glmf", "--snapshot", "/s", "--native-lib", "/l", "--slots", "8",
+            "--index-cache", "keys",
+        ]).unwrap();
+        let context = serve_context(&matches, None).unwrap().unwrap();
+        for name in ["slots", "index-cache", "draft-context-slots"] {
+            let value = context.settings.iter().find(|s| s.name == name).unwrap();
+            assert_eq!(value.source, "unresolved");
+            assert!(value.value.is_none());
+        }
+        assert!(context.validate_resolved().is_err());
+    }
+
+    #[test]
+    fn cards_record_resolved_reply_pair_and_omission_separately() {
+        use cuteafd_core::{spark_reply::SparkReplyFormats, SparkReplyFormat::{Bf16, Fp8}};
+        for command in ["serve-muse", "serve-glm"] {
+            let mut context = cuteafd_bench::context::ServerContext { command: command.into(), ..Default::default() };
+            let omitted = SparkReplyFormats::default();
+            reply_settings(&mut context, omitted);
+            assert_eq!(context.settings[0].value.as_deref(), Some(if command == "serve-muse" { "nvfp4" } else { "bf16" }));
+            assert_eq!(context.settings[1].value.as_deref(), Some("bf16"));
+            assert!(context.settings[2..].iter().all(|setting| setting.value.as_deref() == Some("false")));
+            reply_settings(&mut context, SparkReplyFormats { prefill: None, decode: Some(Bf16) });
+            assert_eq!(context.settings[2].value.as_deref(), Some("false"));
+            assert_eq!(context.settings[3].value.as_deref(), Some("true"), "explicit default is not omission");
+            reply_settings(&mut context, SparkReplyFormats { prefill: Some(Fp8), decode: Some(Fp8) });
+            assert_eq!(context.settings.len(), 4, "one canonical record per resolved setting");
+            assert_eq!(context.settings[0].value.as_deref(), Some("fp8"));
+            assert_eq!(context.settings[1].value.as_deref(), Some("fp8"));
+            assert!(context.settings[2..].iter().all(|setting| setting.value.as_deref() == Some("true")));
+            assert!(context.settings.iter().all(|setting| setting.source == "resolved"));
+        }
+    }
 
     #[test]
     fn every_serve_family_command_has_a_placement_executor() {
@@ -312,22 +454,22 @@ mod tests {
         let matches = crate::cli::Cli::command().try_get_matches_from([
             "cuteafd", "serve-glm", "--snapshot", "/s", "--native-lib", "/l",
         ]).unwrap();
-        let error = attention_mode("unregistered", matches.subcommand().unwrap().1, "auto").unwrap_err();
+        let error = core_view("unregistered", matches.subcommand().unwrap().1, "auto").unwrap_err();
         assert!(error.downcast_ref::<MissingPlacementExecutor>().is_some());
     }
 
     #[test]
     fn step5_context_uses_registered_native_attention_placement() {
-        for extra in [vec![], vec!["--split-device", "1"]] {
+        for (extra, resolved) in [(vec![], "heads"), (vec!["--split-device", "1"], "layers")] {
             let argv = ["cuteafd", "serve-step5", "--snapshot", "/s", "--native-lib", "/l", "--peers", "127.0.0.1:19000"]
                 .into_iter().chain(extra).collect::<Vec<_>>();
             let matches = crate::cli::Cli::command().try_get_matches_from(argv).unwrap();
             let context = serve_context(&matches, None).unwrap().expect("Step-5 serve context");
             assert_eq!(context.family, None);
             let placement = context.settings.iter().find(|s| s.name == "attention-placement").unwrap();
-            assert_eq!(placement.value.as_deref(), Some("heads"));
-            assert_eq!(placement.default.as_deref(), Some("heads"));
-            assert!(attention_mode("step5", matches.subcommand().unwrap().1, "context").is_err());
+            assert_eq!(placement.value.as_deref(), Some(resolved));
+            assert_eq!(placement.default.as_deref(), Some("layers"));
+            assert!(core_view("step5", matches.subcommand().unwrap().1, "context").is_err());
         }
     }
 
@@ -360,20 +502,20 @@ mod tests {
         };
         let split = serve(&["--split-device", "1"]);
         let (_, sub) = split.subcommand().unwrap();
-        assert_eq!(attention_mode("glm5", sub, "context").unwrap(), Context);
-        assert_eq!(attention_mode("glm5", sub, "auto").unwrap(), Context);
-        assert_eq!(attention_mode("glm5", sub, "heads").unwrap(), Heads);
+        assert_eq!(core_view("glm5", sub, "context").unwrap(), Context);
+        assert_eq!(core_view("glm5", sub, "auto").unwrap(), Context);
+        assert_eq!(core_view("glm5", sub, "heads").unwrap(), Heads);
         let one = serve(&[]);
         let (_, sub) = one.subcommand().unwrap();
-        assert!(attention_mode("glm5", sub, "context").is_err());
-        assert_eq!(attention_mode("glm5", sub, "auto").unwrap(), Heads);
+        assert!(core_view("glm5", sub, "context").is_err());
+        assert_eq!(core_view("glm5", sub, "auto").unwrap(), Heads);
     }
 
     #[test]
     fn dense_qwen_context_leaves_family_to_loader_and_reports_active_draft_settings() {
         for draft in [None, Some("/model/dspark")] {
             let mut argv = vec!["cuteafd", "serve-qwen35", "--snapshot", "/target", "--native-lib", "/native.so"];
-            if let Some(snapshot) = draft { argv.extend(["--draft", snapshot, "--draft-fixed", "7"]); }
+            if let Some(snapshot) = draft { argv.extend(["--draft", snapshot, "--draft-length", "7"]); }
             let matches = crate::cli::Cli::command().try_get_matches_from(argv).unwrap();
             let context = serve_context(&matches, None).unwrap().expect("dense serve context");
             assert_eq!(context.family, None);
@@ -382,26 +524,26 @@ mod tests {
             assert_eq!(configuration.speculator.is_some(), draft.is_some());
             if draft.is_some() {
                 assert_eq!(configuration.speculator.as_deref(), Some("dSpark (dspark)"));
-                assert_eq!(context.settings.iter().find(|s| s.name == "draft-fixed").unwrap().value.as_deref(), Some("7"));
+                assert_eq!(context.settings.iter().find(|s| s.name == "draft-length").unwrap().value.as_deref(), Some("7"));
             }
         }
     }
 
     #[test]
     fn serve_options_are_captured_with_defaults_and_sources() {
-        let argv = ["cuteafd", "--coordinator-gpu-budget-gib", "32", "serve-qwen4", "--snapshot", "/hub/models--Qwen--Q/snapshots/abc", "--native-lib",
+        let argv = ["cuteafd", "--gpu-memory-cap", "32GiB", "serve-qwen4", "--snapshot", "/hub/models--Qwen--Q/snapshots/abc", "--native-lib",
             "/opt/lib.so", "--max-sequences", "2"];
         let matches = crate::cli::Cli::command().try_get_matches_from(argv).unwrap();
         let cli = crate::cli::Cli::from_arg_matches(&matches).unwrap();
-        capture(&matches, cli.coordinator_gpu_budget_gib).unwrap();
+        capture(&matches, cli.memory, cli.graph_disable_low_mem.as_deref()).unwrap();
         let context = cuteafd_bench::context::get();
         assert_eq!(context.family, None);
         assert_eq!(context.snapshot.as_deref(), Some(std::path::Path::new("/hub/models--Qwen--Q/snapshots/abc")));
         let find = |name: &str| context.settings.iter().find(|s| s.name == name).cloned()
             .unwrap_or_else(|| panic!("{name} missing"));
-        let budget = find("coordinator-gpu-budget-gib");
+        let budget = find("gpu-memory-cap");
         assert_eq!((budget.value.as_deref(), budget.default.as_deref(), budget.source.as_str()),
-            (Some("32"), None, "cli"));
+            (Some("34359738368"), None, "cli"));
         assert_eq!(context.settings.iter().filter(|s| s.name == budget.name).count(), 1);
         let sequences = find("max-sequences");
         assert_eq!((sequences.value.as_deref(), sequences.default.as_deref(), sequences.source.as_str()),

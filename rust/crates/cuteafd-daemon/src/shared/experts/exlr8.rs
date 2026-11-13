@@ -15,7 +15,8 @@ pub(crate) use shared::{NativeExperts, NativePlan};
 
 pub(crate) use cuteafd_loader::plan::exlr8::PrefillActivations as Exlr8PrefillActivations;
 
-const BANKS: usize = 2;
+const BANKS: usize = Residency::LOAD_BANKS;
+const _: () = assert!(EXPERT_READ_LANES == Residency::LOAD_LANES);
 
 pub(crate) struct Exlr8Weights<'a> {
     buffer: CuteafdDeviceBuffer,
@@ -63,6 +64,20 @@ fn record_payload(layout: &Residency, buffer: CuteafdDeviceBuffer,
 }
 
 impl<'a> Exlr8Weights<'a> {
+    pub(crate) fn allocation_receipts(&self, inventory: &mut crate::shared::memory::receipts::Inventory<'_>,
+        name: &str) -> Result<()> {
+        match &self._arena {
+            ArenaOwner::Mount { _allocation } => {
+                if _allocation.backing.as_ref().and_then(|owner| owner.weight_backing()).is_some() {
+                    _allocation.inventory(inventory, name)
+                } else {
+                    inventory.backed_device(name, self.buffer, _allocation.buffer)
+                }
+            }
+            ArenaOwner::Push { _rank } => inventory.backed_device(name, self.buffer, _rank.allocation_buffer()),
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn image(&self) -> CuteafdDeviceBuffer { self.buffer }
 
@@ -81,14 +96,7 @@ impl<'a> Exlr8Weights<'a> {
 
     pub(crate) fn plan(layout: &Residency) -> Result<ExpertLoadBudget> {
         let descriptor_bytes = layout.descriptor_host_bytes()?;
-        let descriptor_upload = layout.experts.checked_mul(layout.units)
-            .and_then(|n| n.checked_mul(3 * 3 * 8))
-            .context("EXLR8 descriptor upload overflow")?;
-        let bank_bytes = layout
-            .staging_bytes
-            .max(16)
-            .checked_mul(EXPERT_READ_LANES * BANKS)
-            .and_then(|bytes| bytes.checked_add(descriptor_upload.max(layout.hidden)))
+        let bank_bytes = layout.mount_pinned_bytes()?.checked_add(layout.sync_upload_bytes()?)
             .context("EXLR8 pinned staging overflow")?;
         Ok(ExpertLoadBudget {
             resident_bytes: layout.resident_bytes,
@@ -127,6 +135,16 @@ impl<'a> Exlr8Weights<'a> {
         )
     }
 
+    pub(crate) fn shared_request(layout: &Residency) -> Result<cuteafd_loader::placement::planner::Allocation> {
+        use cuteafd_loader::placement::planner::{Allocation, Lifetime, Location};
+        ensure!(layout.set == cuteafd_loader::plan::exlr8::residency::ExpertSet::Shared
+            && matches!(layout.world, 1 | 2) && layout.rank < layout.world && layout.resident_bytes > 0,
+            "invalid native shared allocation request");
+        Ok(Allocation::buffer(format!("glm.weights.gpu.{}.shared.layer.{}.backing", layout.rank, layout.layer),
+            Location::coordinator(layout.rank as u8), layout.resident_bytes as u64, Lifetime::RESIDENT,
+            cuteafd_core::memory_layout::Category::Weights, "GLM target weights"))
+    }
+
     /// `available` excludes all caller-owned workspace/graph reservations. Admit
     /// pinned bytes against host/UMA headroom before calling this device loader.
     pub(crate) fn load(
@@ -134,10 +152,24 @@ impl<'a> Exlr8Weights<'a> {
         layout: Residency,
         available: usize,
     ) -> Result<Self> {
+        layout.check_budget(available, &[])?;
+        let allocation = DeviceAllocation::new(library, layout.resident_bytes, crate::shared::memory::tag(crate::shared::memory::MemoryKind::Experts, "experts/weights/exlr8"))?;
+        Self::load_into(library, layout, available, allocation)
+    }
+
+    pub(crate) fn load_into(library: &'a NativeLibrary, layout: Residency, available: usize,
+        arena: DeviceAllocation<'a>) -> Result<Self> {
         let budget = Self::plan(&layout)?;
         layout.check_budget(available, &[])?;
-        let arena =
-            DeviceAllocation::named(library, layout.resident_bytes, "experts/weights/exlr8")?;
+        let shared = if layout.set == cuteafd_loader::plan::exlr8::residency::ExpertSet::Shared {
+            Some(Self::shared_request(&layout)?)
+        } else { None };
+        let device = library.cuda_get_device()?;
+        ensure!(arena.buffer.bytes == layout.resident_bytes, "EXLR8 arena extent differs from plan");
+        if let Some(request) = shared {
+            ensure!(arena.buffer.bytes as u64 == request.bytes && arena.buffer.device_id == device
+                && !arena.buffer.ptr.is_null(), "native shared allocation differs from request");
+        }
         let (pointers, bits) = layout.descriptors(arena.buffer.ptr as u64)?;
         // Synchronous uploads finish before the bounded pinned banks are reused.
         for (offset, bytes) in layout.signs_offsets.iter().zip(&layout.signs) {
@@ -165,7 +197,7 @@ impl<'a> Exlr8Weights<'a> {
         }
         let per_bank = layout.staging_bytes.max(16);
         let mut hosts = (0..BANKS).map(|_| (0..EXPERT_READ_LANES)
-            .map(|_| HostAllocation::named(library, per_bank, "experts/load/exlr8"))
+            .map(|_| HostAllocation::new(library, per_bank, crate::shared::memory::tag(crate::shared::memory::MemoryKind::Staging, "experts/load/exlr8")))
             .collect::<Result<Vec<_>>>()).collect::<Result<Vec<_>>>()?;
         // Declared after the banks so every exit drains before releasing pinned memory.
         let streams = (0..BANKS).map(|_| Ok(LoadStream {
@@ -249,6 +281,76 @@ impl<'a> Exlr8Weights<'a> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn arena_mount_views_preserve_units_descriptors_and_signs() -> Result<()> {
+        use crate::shared::memory::device::Device;
+        let fixture = cuteafd_ffi::native_library_lifetime_fixture::Fixture::build_for_tests()?;
+        let library = fixture.load()?;
+        fixture.immediate_copies(&library)?;
+        fixture.strict_device_free(&library, true)?;
+        let device = Device { library: &library, id: 1 };
+        for padded in [false, true] {
+            let root = tempfile::tempdir()?;
+            cuteafd_loader::plan::testing::exlr8::fixture(root.path(), padded);
+            for world in [1, 2, 6] {
+                for rank in 0..world {
+                    let plan = Residency::plan(root.path(), "mixed", 3, world, rank, ExpertSet::Routed)?;
+                    // A second independent layer image exercises a nonzero base.
+                    let regions = vec![("first".into(), plan.resident_bytes),
+                        ("second".into(), plan.resident_bytes)];
+                    let before = fixture.events()?.matches('D').count();
+                    let arena = super::super::weight_layout::arena(device, "exlr8", regions)?;
+                    let mut weights = Vec::new();
+                    for name in ["first", "second"] {
+                        let allocation = DeviceAllocation::from_allocation(arena.view(name, plan.resident_bytes)?);
+                        weights.push(device.run(|| Exlr8Weights::load_into(&library, plan.clone(),
+                            usize::MAX, allocation))?);
+                    }
+                    assert_eq!(fixture.events()?.matches('D').count() - before, 1);
+                    let layout = arena.layout().clone();
+                    drop(arena);
+                    let mut inventory = crate::shared::memory::receipts::Inventory::new(
+                        cuteafd_loader::placement::planner::CoordinatorDevices::new(&[1])?, "fixture",
+                        cuteafd_loader::placement::planner::Lifetime::TARGET,
+                        cuteafd_core::memory_layout::Category::Experts, "expert fixture");
+                    for (index, weight) in weights.iter().enumerate() {
+                        weight.allocation_receipts(&mut inventory, &format!("layer.{index}"))?;
+                    }
+                    super::super::weight_layout::assert_receipts(&inventory.receipts, &[layout])?;
+                    for weight in &weights {
+                        for unit in &weight.layout.loads {
+                            let mut staged = vec![0; unit.staging_bytes()];
+                            unit.read(&mut staged)?;
+                            let mut cursor = 0;
+                            for (source, &offset) in unit.source.iter().zip(&unit.destination) {
+                                let mut actual = vec![0; source.bytes];
+                                device.run(|| library.copy_d2h(&mut actual,
+                                    view(weight.buffer, offset, source.bytes)?))?;
+                                assert_eq!(actual, staged[cursor..cursor + source.bytes]);
+                                cursor += source.bytes;
+                            }
+                        }
+                        for (index, signs) in weight.layout.signs.iter().enumerate() {
+                            let mut actual = vec![0; signs.len()];
+                            device.run(|| library.copy_d2h(&mut actual, weight.signs(index != 0)?))?;
+                            assert_eq!(&actual, signs);
+                        }
+                        let (pointers, bits) = weight.layout.descriptors(weight.buffer.ptr as u64)?;
+                        for (buffer, expected) in [(weight.pointers()?, pointers.iter().flat_map(|n| n.to_le_bytes()).collect::<Vec<_>>()),
+                            (weight.bits()?, bits.iter().flat_map(|n| n.to_le_bytes()).collect())] {
+                            let mut actual = vec![0; buffer.bytes];
+                            device.run(|| library.copy_d2h(&mut actual, buffer))?;
+                            assert_eq!(actual, expected);
+                        }
+                    }
+                    drop(weights);
+                }
+            }
+        }
+        assert_eq!(fixture.device_free_mismatch(&library)?.0, 0);
+        Ok(())
+    }
+
     use super::*;
     use cuteafd_loader::plan::exlr8::residency::ExpertSet;
 

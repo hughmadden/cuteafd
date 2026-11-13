@@ -1,123 +1,87 @@
-//! MiMo admission over its exact allocation profile. Both planner and runtime
-//! supply the same retained representations; only the GPU baseline differs.
-use crate::families::mimo_v2::{admission::headroom_bytes, MimoAttention, MimoKvFormats, MimoV2Config};
-use crate::placement::*;
-use crate::serving_capacity::{mimo_cache_geometry, CacheGeometryError};
-use cuteafd_core::memory_layout::{Basis, Category, Item};
-use cuteafd_core::serving_capacity::{CapacityProfile, MemoryReservation, ResolvedCapacity, ResolvedDeviceCapacity};
+//! MiMo physical facts. Both planner and runtime declare the same owners and
+//! retained representations; only the GPU baseline differs.
+pub mod admission;
 
-#[derive(Clone)]
-pub struct MimoInputs<'a> {
-    /// True only when the operator left context automatic.
-    pub automatic_context: bool,
-    pub cfg: &'a MimoV2Config,
-    pub profile: &'a CapacityProfile,
-    pub layers: usize,
-    pub kv: MimoKvFormats,
-    pub mtp_stages: usize,
-    /// Physical totals and baselines, in logical rank order. MiMo samples
-    /// before weights, so every retained representation is still a demand.
-    pub gpus: Vec<(u64, Baseline)>,
-    pub headroom_floor: u64,
-    pub spark_ranks: usize,
-    pub startup_probe_bytes: u64,
-    pub context: u64,
-    pub requested_pool: Option<u64>,
-    /// Automatic pools under a fixed onboard stop at the target (no growth to free memory).
-    pub pool_ceiling_at_target: bool,
-    pub onboard: Onboard,
-    /// Backbone order (including dense layers), exact whole/TP2 package costs.
-    pub experts: Vec<Option<ExpertCost>>,
-    pub expert_workspace: u64,
-    pub tp2_workspace: [u64; 2],
-    pub rows: u64,
-    pub lanes: u64,
+pub use admission::route_exchange_bytes;
+
+use crate::families::mimo_v2::MimoV2Config;
+use crate::placement::{PlacementError, ResidentWeights};
+use cuteafd_core::memory_layout::Category;
+
+/// Item category for one profile reservation or pool owner.
+pub fn reservation_category(name: &str) -> Category {
+    if name.starts_with("mimo.") && name.ends_with(".tail") { Category::Runtime }
+    else if name.contains("embed_tokens") { Category::Embedding }
+    else if name == "draft.fp8_scratch" { Category::Workspace }
+    else if name.starts_with("draft.") { Category::Drafter }
+    else if name.starts_with("workspace.") || name.starts_with("decode.") || name.starts_with("prefill") || name.starts_with("sampling.")
+        || name == "transport.spark_intake_planes" || name == "state.prefill_kv_wide" { Category::Workspace }
+    else if name.starts_with("transport.") { Category::Transport }
+    else if name.starts_with("prefix.") { Category::Prefix }
+    else if name.starts_with("state.") || name.starts_with("context.") { Category::Kv }
+    else if name == "graph reserve" { Category::Runtime }
+    else if name == "experts.local_scratch" { Category::Workspace }
+    else if name.starts_with("experts.") { Category::Experts }
+    else if name.starts_with("runtime.") || name.starts_with("graphs.") { Category::Runtime }
+    else { Category::Weights }
 }
 
-pub struct MimoSolution {
-    pub request: PlacementRequest,
-    pub placement: Placement,
-    pub working_set: SparkWorkingSet,
-}
-
-impl<'a> MimoInputs<'a> {
-    pub fn selected<'b>(&'b self, no_spark: &'b CapacityProfile, working_set: &SparkWorkingSet) -> MimoInputs<'b> {
-        let remote = working_set.includes(WorkingSetComponent::SparkExperts);
-        MimoInputs { profile: if remote { self.profile } else { no_spark },
-            spark_ranks: working_set.selected_ranks().len(),
-            lanes: working_set.prefill_lanes,
-            startup_probe_bytes: if remote { self.startup_probe_bytes } else { 0 },
-            ..self.clone() }
+/// Item group: physical families that keep their own ledger row.
+pub fn reservation_group(name: &str) -> &str {
+    match name {
+        "state.active_rings" => "state",
+        "prefix.exact_mark_arena" => "marks",
+        "prefix.dflash_context_marks" => "DFlash context marks",
+        "prefix.dflash_valid_floor_transfer" => "DFlash valid-floor transfer",
+        _ => name,
     }
 }
 
-/// Evaluate each contiguous RTX prefix with the fixed storage its Spark suffix
-/// actually executes. Nothing is refunded after admission or recomputed by workers.
-pub fn solve_working_set(inputs: &MimoInputs<'_>, no_spark: &CapacityProfile)
-    -> Result<MimoSolution, CacheGeometryError> {
-    let routed = inputs.experts.iter().enumerate().filter_map(|(layer, cost)| cost.map(|_| layer))
-        .collect::<Vec<_>>();
-    let counts = match inputs.onboard.layers(routed.len()) {
-        Some(n) => vec![n],
-        None if inputs.spark_ranks == 0 => vec![routed.len()],
-        None => (0..=routed.len()).collect(),
+/// Already-loaded tower owners follow physical CUDA ordinals, not rank numbers.
+/// Their physical storage is in the baseline; only checkpoint weights are added.
+pub fn add_local_media_weights(weights: &mut [ResidentWeights], devices: &[i32],
+    media: Option<(i32, ResidentWeights)>, limit: ResidentWeights) -> Result<(), PlacementError> {
+    if weights.len() != devices.len() {
+        return Err(PlacementError::Inventory("MiMo media owner/rank geometry"));
+    }
+    if let Some((device, media)) = media {
+        if let Some(rank) = devices.iter().position(|&ordinal| ordinal == device) {
+            weights[rank] = weights[rank].checked_add(media)?;
+        } else {
+            let gpu = u8::try_from(device)
+                .map_err(|_| PlacementError::Inventory("MiMo media CUDA ordinal"))?;
+            media.check(gpu, limit)?;
+        }
+    }
+    Ok(())
+}
+
+/// Selected-header receive bounds shared by offline placement and live admission.
+pub fn push_host_envelope(checkpoint: &crate::plan::Checkpoint, ranks: usize,
+    catalog: Option<&crate::OfficialV41Catalog>) -> anyhow::Result<crate::push_load::PushHostEnvelope> {
+    use anyhow::{ensure, Context, Result};
+    ensure!((1..=2).contains(&ranks), "MiMo push rank count");
+    let (slots, slot) = (128, 1 << 20);
+    let largest = checkpoint.tensors.iter().filter(|tensor| !tensor.meta.name.contains(".experts."))
+        .map(|tensor| tensor.meta.byte_length).max().unwrap_or(0);
+    let dense = crate::push_load::admitted_push_envelope(largest, slots as usize, slot)?;
+    let expert = if let Some(manifest) = catalog.and_then(|catalog| catalog.exl3()) {
+        let layers = catalog.context("MiMo push catalog")?.routed_experts();
+        (0..ranks).map(|rank| -> Result<u64> {
+            (layers.first_layer..layers.layers).try_fold(0u64, |bytes, layer| {
+                let plan = manifest.residency(crate::V41Exl3Layer::Backbone(layer), ranks, rank)?;
+                bytes.checked_add(plan.loads.iter().filter(|load| load.tensor.ends_with(".trellis")).count() as u64 * 4)
+                    .context("MiMo push validation overflow")
+            })
+        }).collect::<Result<Vec<_>>>()?
+    } else {
+        let bytes = catalog.into_iter().flat_map(|catalog| catalog.tensors()).filter(|tensor|
+            tensor.metadata.name.ends_with("input_scale") || tensor.metadata.name.ends_with("weight_scale_2"))
+            .map(|tensor| tensor.metadata.byte_length).max().unwrap_or(0).checked_mul(2)
+            .context("MiMo push native validation overflow")?.max(2 << 20);
+        vec![bytes; ranks]
     };
-    let mut best: Option<MimoSolution> = None;
-    let mut failure = None;
-    for n in counts {
-        if n > 0 && inputs.expert_workspace == 0 && inputs.tp2_workspace.iter().all(|&bytes| bytes == 0) {
-            if failure.is_none() {
-                failure = Some(PlacementError::Inventory("MiMo local experts need a matching BF16-input package").into());
-            }
-            continue;
-        }
-        let spark_layers = routed[n..].to_vec();
-        if !spark_layers.is_empty() && inputs.spark_ranks == 0 {
-            failure = Some(PlacementError::SparkFree { layers: routed.len(), placed: n }.into());
-            continue;
-        }
-        let remote = !spark_layers.is_empty();
-        let working_set = SparkWorkingSet { rtx_layers: routed[..n].to_vec(), spark_layers,
-            spark_ranks: if remote { inputs.spark_ranks } else { 0 },
-            prefill_lanes: inputs.lanes };
-        let selected = inputs.selected(no_spark, &working_set);
-        let result = (|| {
-            let mut request = request(&selected)?;
-            request.onboard = Onboard::Layers(n);
-            if inputs.onboard == Onboard::Auto && inputs.spark_ranks > 0 {
-                request.pool.ceiling = request.pool.target;
-                // Spark Auto may clamp serving context to a smaller pool;
-                // fixed candidates must not introduce a new context floor.
-                if remote && request.pool.requested.is_none() { request.pool.floor = 0; }
-            }
-            if inputs.pool_ceiling_at_target && request.pool.requested.is_none() {
-                request.pool.ceiling = request.pool.target;
-            }
-            let placement = solve(&request)?;
-            let actual = placement.layers.iter().enumerate().filter_map(|(layer, assignment)|
-                (assignment.experts == ExpertHome::Spark).then_some(layer)).collect::<Vec<_>>();
-            let local = placement.layers.iter().enumerate().filter_map(|(layer, assignment)|
-                matches!(assignment.experts, ExpertHome::RtxTp2 | ExpertHome::RtxWhole { .. })
-                    .then_some(layer)).collect::<Vec<_>>();
-            if actual != working_set.spark_layers || local != working_set.rtx_layers
-                || placement.onboard_layers != n {
-                return Err(PlacementError::Inventory("MiMo solved prefix disagrees with its working set").into());
-            }
-            Ok::<_, CacheGeometryError>(MimoSolution { request, placement, working_set })
-        })();
-        match result {
-            Ok(candidate) => {
-                let score = |solution: &MimoSolution| (
-                    solution.placement.pool_tokens.min(solution.request.pool.target),
-                    solution.placement.onboard_layers as u64);
-                if best.as_ref().is_none_or(|current| score(&candidate) > score(current)) {
-                    best = Some(candidate);
-                }
-            }
-            Err(error) => if failure.is_none() { failure = Some(error); },
-        }
-    }
-    best.ok_or_else(|| failure.unwrap_or_else(|| PlacementError::Inventory("MiMo has no feasible working set").into()))
+    Ok(crate::push_load::PushHostEnvelope::new(expert, vec![dense; ranks], slots, slot)?)
 }
 
 /// Exact native weight/scale bytes, shared with the allocation path.
@@ -180,6 +144,37 @@ pub fn exact_package(directory: &std::path::Path,
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::families::mimo_v2::{MimoAttention, MimoKvFormats};
+    use crate::placement::planner::Pin;
+    use crate::placement::{Bytes2, ExpertCost, Onboard};
+    use crate::serving_capacity::mimo_cache_geometry;
+    use cuteafd_core::serving_capacity::{
+        CapacityProfile, ContextLimits, DeviceCosts, MemoryReservation,
+    };
+
+    #[test]
+    fn media_resources_follow_physical_ordinals_and_check_independent_owners() {
+        for devices in [[7, 2], [2, 7]] {
+            for rank in 0..2 {
+                let mut weights = [ResidentWeights(11), ResidentWeights(22)];
+                add_local_media_weights(&mut weights, &devices,
+                    Some((devices[rank], ResidentWeights(123))), ResidentWeights(256)).unwrap();
+                assert_eq!(weights[rank].0, [11, 22][rank] + 123);
+                assert_eq!(weights[1 - rank].0, [11, 22][1 - rank]);
+            }
+            let mut weights = [ResidentWeights(11), ResidentWeights(22)];
+            add_local_media_weights(&mut weights, &devices, None, ResidentWeights(256)).unwrap();
+            add_local_media_weights(&mut weights, &devices, Some((9, ResidentWeights(256))), ResidentWeights(256)).unwrap();
+            assert_eq!(weights, [ResidentWeights(11), ResidentWeights(22)]);
+            assert_eq!(add_local_media_weights(&mut weights, &devices,
+                Some((9, ResidentWeights(257))), ResidentWeights(256)),
+                Err(PlacementError::ResidentWeightLimit { gpu: 9, required: 257, limit: 256 }));
+        }
+        assert!(add_local_media_weights(&mut [ResidentWeights(u64::MAX)], &[7],
+            Some((7, ResidentWeights(1))), ResidentWeights(u64::MAX)).is_err());
+        assert!(add_local_media_weights(&mut [], &[7], None, ResidentWeights(1)).is_err());
+    }
+
     #[test]
     fn route_exchange_matches_native_slot_alignment_and_rejects_overflow() {
         for rows in [1, 3, 64, 4096] {
@@ -192,160 +187,7 @@ mod tests {
         for (rows, topk, lanes) in [(u64::MAX, 8, 3), (64, u64::MAX, 3), (64, 8, u64::MAX)] {
             assert!(route_exchange_bytes(rows, topk, lanes).is_err());
         }
-        assert_eq!(cuteafd_core::memory_layout::Category::of_scope("peer-split"), Category::Transport);
-    }
-    #[test]
-    fn selected_spark_working_set_drives_every_fixed_demand_and_policy() {
-        use cuteafd_core::serving_capacity::{ContextLimits, DeviceCosts};
-        let mut cfg = MimoV2Config::from_hf(&crate::plan::testing::mimo_pro_config()).unwrap();
-        cfg.layers = 4;
-        cfg.dense = vec![true, false, false, false];
-        cfg.attention = vec![MimoAttention::Full; 4];
-        for ranks in [1, 2] {
-            let cache = mimo_cache_geometry(&cfg, 4, ranks, MimoKvFormats::default(), 0).unwrap();
-            let profile = |spark| CapacityProfile {
-                context: ContextLimits { checkpoint_max_tokens: 1 << 20, compiled_index_max_tokens: None },
-                pool_unit_rows: cache.logical_unit_rows, host_prefix_bytes: 0,
-                devices: cache.ranks.iter().enumerate().map(|(rank, storage)| DeviceCosts {
-                    device: rank as u32, pool_unit_bytes: storage.persistent_unit_bytes + 256,
-                    reservations: vec![MemoryReservation { name: if spark { "transport.spark_intake_planes" }
-                        else { "workspace.local" }.into(), bytes: if spark { 2 << 30 } else { 1 << 30 } }],
-                }).collect(),
-            };
-            let spark = profile(true);
-            let local = profile(false);
-            let cost = ExpertCost { whole: Bytes2 { resident: 1 << 30, staging: 0 },
-                half: [Bytes2 { resident: 512 << 20, staging: 0 }; 2], tp2: ranks == 2, spark_ok: true };
-            let inputs = MimoInputs { automatic_context: false, cfg: &cfg, profile: &spark, layers: 4, kv: MimoKvFormats::default(),
-                mtp_stages: 0, gpus: vec![(96 << 30, Baseline::Measured { free_bytes: 90 << 30 }); ranks],
-                headroom_floor: 0, spark_ranks: 6, startup_probe_bytes: 64 << 20, context: 256 << 10,
-                requested_pool: Some(2 << 20), pool_ceiling_at_target: false, onboard: Onboard::Auto,
-                experts: vec![None, Some(cost), Some(cost), Some(cost)], expert_workspace: if ranks == 1 { 1 << 20 } else { 0 },
-                tp2_workspace: if ranks == 2 { [1 << 20; 2] } else { [0; 2] }, rows: 4096, lanes: 3 };
-            let all = solve_working_set(&inputs, &local).unwrap();
-            assert_eq!(all.placement.onboard_layers, 3);
-            assert_eq!(all.working_set, SparkWorkingSet { rtx_layers: vec![1, 2, 3],
-                spark_layers: vec![], spark_ranks: 0, prefill_lanes: 3 });
-            assert!(all.working_set.includes(WorkingSetComponent::RtxExperts));
-            assert!(!all.working_set.includes(WorkingSetComponent::SparkExperts));
-            assert!(all.working_set.selected_ranks().is_empty());
-            assert_eq!(all.request.fixed[0].group, "workspace.local");
-            assert_eq!(all.request.inventory.gpus[0].headroom_bytes, headroom_bytes(96 << 30, false));
-            let tight = MimoInputs { gpus: all.placement.items.iter().enumerate().map(|(rank, items)|
-                (96 << 30, Baseline::Measured { free_bytes: items.iter().map(|item| item.bytes).sum::<u64>()
-                    + all.request.inventory.gpus[rank].headroom_bytes + (512 << 20) })).collect(), ..inputs.clone() };
-            assert_eq!(solve_working_set(&tight, &local).unwrap().placement.onboard_layers, 3,
-                "the local-only branch fits without charging unused configured Spark storage");
-            let mut overcharged = request(&tight).unwrap();
-            overcharged.onboard = Onboard::Layers(3);
-            assert!(solve(&overcharged).is_err(), "configured-peer costs would incorrectly reject all-local");
-            let selected = inputs.selected(&local, &all.working_set);
-            let configured_only = inputs.selected(&local, &SparkWorkingSet { spark_ranks: 6,
-                prefill_lanes: 3, ..SparkWorkingSet::default() });
-            assert_eq!((configured_only.spark_ranks, configured_only.lanes,
-                configured_only.startup_probe_bytes), (0, 3, 0));
-            assert!(std::ptr::eq(configured_only.profile, &local));
-            assert_eq!(resolved_capacity(&selected, &all.request, &all.placement, 16, 16).unwrap().devices[0]
-                .reservations[0].name, "workspace.local");
-            for onboard in [Onboard::Layers(2)] {
-                let partial = solve_working_set(&MimoInputs { onboard, ..inputs.clone() }, &local).unwrap();
-                assert_eq!(partial.working_set.rtx_layers, vec![1, 2]);
-                assert_eq!(partial.working_set.spark_layers, vec![3]);
-                assert!(partial.working_set.includes(WorkingSetComponent::RtxExperts));
-                assert!(partial.working_set.includes(WorkingSetComponent::SparkExperts));
-                assert_eq!(partial.working_set.selected_ranks(), 0..6);
-                assert_eq!((partial.working_set.spark_ranks, partial.working_set.prefill_lanes), (6, 3));
-                assert_eq!(partial.request.fixed[0].group, "transport.spark_intake_planes");
-                assert_eq!(partial.request.inventory.gpus[0].headroom_bytes, (96u64 << 30)
-                    - (96u64 << 30) * 97 / 100 + (64 << 20));
-            }
-            for onboard in [Onboard::Layers(3)] {
-                let result = solve_working_set(&MimoInputs { onboard, ..inputs.clone() }, &local).unwrap();
-                assert_eq!(result.placement.onboard_layers, 3);
-                assert_eq!(result.working_set.spark_ranks, 0);
-            }
-            let fallback = solve_working_set(&MimoInputs { expert_workspace: 0, tp2_workspace: [0; 2],
-                requested_pool: None, ..inputs.clone() }, &local).unwrap();
-            assert_eq!(fallback.placement.onboard_layers, 0);
-            assert!(fallback.working_set.rtx_layers.is_empty());
-            assert!(!fallback.working_set.includes(WorkingSetComponent::RtxExperts));
-            assert!(fallback.working_set.includes(WorkingSetComponent::SparkExperts));
-            assert_eq!(fallback.working_set.spark_layers, vec![1, 2, 3]);
-            assert_eq!(fallback.placement.pool_tokens, 2 << 20);
-            let constrained = MimoInputs { context: 1 << 20, requested_pool: None,
-                expert_workspace: 0, tp2_workspace: [0; 2],
-                gpus: vec![(96 << 30, Baseline::Measured { free_bytes: 5 << 30 }); ranks], ..inputs.clone() };
-            let shrunk = solve_working_set(&constrained, &local).unwrap();
-            assert!(shrunk.placement.pool_tokens < constrained.context);
-            assert!(shrunk.placement.pool_tokens > 0);
-            assert_eq!(shrunk.request.pool.floor, 0);
-            assert!(solve_working_set(&MimoInputs { requested_pool: Some(1 << 20),
-                ..constrained }, &local).is_err(), "an explicit remote pool must never shrink");
-            // Fixed zero onboarding: an automatic pool is capped at the target but
-            // shrinks to what fits; an explicit pool stays strict; below the floor fails.
-            let zero = |free: u64, requested_pool: Option<u64>| solve_working_set(&MimoInputs {
-                onboard: Onboard::Layers(0), pool_ceiling_at_target: true, requested_pool, context: 256 << 10,
-                expert_workspace: 0, tp2_workspace: [0; 2],
-                gpus: vec![(96 << 30, Baseline::Measured { free_bytes: free }); ranks], ..inputs.clone() }, &local);
-            let roomy = zero(90 << 30, None).unwrap().placement.pool_tokens;
-            assert_eq!(roomy, 2 << 20, "automatic pool is capped at the target");
-            let mut free = 90u64 << 30;
-            let fitted = loop {
-                free -= 1 << 30;
-                let pool = zero(free, None).map(|s| s.placement.pool_tokens);
-                if pool.as_ref().is_ok_and(|&p| p < 2 << 20) { break (free, pool.unwrap()); }
-                assert!(pool.is_ok(), "no shrunk pool between the target and the floor");
-            };
-            assert!(fitted.1 >= 256 << 10 && fitted.1 < 2 << 20);
-            assert!(matches!(zero(fitted.0, Some(2 << 20)).err(), Some(CacheGeometryError::ResidentTensor { what, .. })
-                if what.starts_with("explicit KV pool of")), "an explicit pool stays strict (PoolDoesNotFit)");
-            assert!(zero(1 << 30, None).is_err(), "below the floor still fails");
-            assert!(solve_working_set(&MimoInputs { spark_ranks: 0, onboard: Onboard::Layers(2),
-                ..inputs.clone() }, &local).is_err());
-        }
-    }
-
-    #[test]
-    fn drafter_movable_places_exactly_like_the_former_fixed_demands() {
-        use cuteafd_core::serving_capacity::{ContextLimits, DeviceCosts};
-        let mut cfg = MimoV2Config::from_hf(&crate::plan::testing::mimo_pro_config()).unwrap();
-        cfg.layers = 4;
-        cfg.dense = vec![true, false, false, false];
-        cfg.attention = vec![MimoAttention::Full; 4];
-        for ranks in [1, 2] {
-            let cache = mimo_cache_geometry(&cfg, 4, ranks, MimoKvFormats::default(), 0).unwrap();
-            let mut drafts = vec![("draft.weights.fp8_values", 1400u64 << 20), ("draft.fp8_scratch", 16 << 20),
-                ("draft.layer0.k_ring", 32 << 20), ("workspace.local", 1 << 30)];
-            let profile = CapacityProfile {
-                context: ContextLimits { checkpoint_max_tokens: 1 << 20, compiled_index_max_tokens: None },
-                pool_unit_rows: cache.logical_unit_rows, host_prefix_bytes: 0,
-                devices: cache.ranks.iter().enumerate().map(|(rank, storage)| DeviceCosts {
-                    device: rank as u32, pool_unit_bytes: storage.persistent_unit_bytes + 256,
-                    reservations: drafts.iter().filter(|(name, _)| rank == 0 || !name.starts_with("draft."))
-                        .map(|&(name, bytes)| MemoryReservation { name: name.into(), bytes }).collect(),
-                }).collect(),
-            };
-            let cost = ExpertCost { whole: Bytes2 { resident: 1 << 30, staging: 0 },
-                half: [Bytes2 { resident: 512 << 20, staging: 0 }; 2], tp2: ranks == 2, spark_ok: true };
-            for onboard in [Onboard::Auto, Onboard::Layers(2)] {
-                let inputs = MimoInputs { automatic_context: false, cfg: &cfg, profile: &profile, layers: 4, kv: MimoKvFormats::default(),
-                    mtp_stages: 0, gpus: vec![(96 << 30, Baseline::Measured { free_bytes: 90 << 30 }); ranks],
-                    headroom_floor: 0, spark_ranks: 6, startup_probe_bytes: 64 << 20, context: 256 << 10,
-                    requested_pool: None, pool_ceiling_at_target: false, onboard,
-                    experts: vec![None, Some(cost), Some(cost), Some(cost)],
-                    expert_workspace: if ranks == 1 { 1 << 20 } else { 0 },
-                    tp2_workspace: if ranks == 2 { [1 << 20; 2] } else { [0; 2] }, rows: 4096, lanes: 3 };
-                let req = request(&inputs).unwrap();
-                assert_eq!(req.movables.len(), 1);
-                assert!(req.fixed.iter().all(|d| !d.group.starts_with("draft.")));
-                assert_eq!(req.movables[0].conditional[0].demands.iter()
-                    .map(|d| (d.category, d.group.as_str())).collect::<Vec<_>>(),
-                    [(Category::Drafter, "draft.weights.fp8_values"), (Category::Workspace, "draft.fp8_scratch"),
-                        (Category::Drafter, "draft.layer0.k_ring")]);
-                crate::placement::draft::assert_same_as_fixed(&req);
-            }
-            drafts.retain(|(name, _)| !name.starts_with("draft."));
-        }
+        assert_eq!(cuteafd_core::memory_layout::Tag::transport("test/peer-split").kind.category(), Category::Transport);
     }
 
     #[test]
@@ -360,208 +202,463 @@ mod tests {
         std::fs::write(&manifest, "{}").unwrap();
         assert!(package_manifest(&layout, None).unwrap().is_some());
     }
-}
 
-/// Ready route exchange includes receive slots, control and abort words on each rank.
-pub fn route_exchange_bytes(rows: u64, topk: u64, lanes: u64) -> anyhow::Result<u64> {
-    let slot = |rows: u64| -> anyhow::Result<u64> {
-        rows.checked_mul(topk).and_then(|n| n.checked_mul(4)).map(|n| n.div_ceil(16))
-            .and_then(|n| n.checked_mul(32)).map(|n| n.max(256))
-            .ok_or_else(|| anyhow::anyhow!("MiMo route slot overflow"))
-    };
-    let prefill_slots = lanes.checked_mul(2).ok_or_else(|| anyhow::anyhow!("MiMo route slots overflow"))?;
-    let slots = prefill_slots.checked_add(2).ok_or_else(|| anyhow::anyhow!("MiMo route slots overflow"))?;
-    let control = slots.checked_add(1).and_then(|words| words.checked_mul(16))
-        .ok_or_else(|| anyhow::anyhow!("MiMo route control overflow"))?;
-    let decode = slot(64)?.checked_mul(2).ok_or_else(|| anyhow::anyhow!("MiMo decode routes overflow"))?;
-    prefill_slots.checked_mul(slot(rows)?).and_then(|bytes| bytes.checked_add(decode))
-        .and_then(|bytes| bytes.checked_add(control.max(256))).and_then(|bytes| bytes.checked_add(256))
-        .ok_or_else(|| anyhow::anyhow!("MiMo route exchange bytes overflow"))
-}
-
-/// Keep the allocation names in the ready ledger; category mapping is shared
-/// rather than independently guessed by planner and runtime.
-pub fn reservation_category(name: &str) -> Category {
-    if name.contains("embed_tokens") { Category::Embedding }
-    else if name == "draft.fp8_scratch" { Category::Workspace }
-    else if name.starts_with("draft.") { Category::Drafter }
-    else if name.starts_with("workspace.") || name.starts_with("decode.") || name.starts_with("prefill") || name.starts_with("sampling.")
-        || name == "transport.spark_intake_planes" || name == "state.prefill_kv_wide" { Category::Workspace }
-    else if name.starts_with("transport.") { Category::Transport }
-    else if name.starts_with("prefix.") { Category::Prefix }
-    else if name.starts_with("state.") || name.starts_with("context.") { Category::Kv }
-    else if name == "experts.local_scratch" { Category::Workspace }
-    else if name.starts_with("experts.") { Category::Experts }
-    else if name.starts_with("runtime.") || name.starts_with("graphs.") { Category::Runtime }
-    else { Category::Weights }
-}
-
-pub fn reservation_group(name: &str) -> &str {
-    match name {
-        "state.active_rings" => "state",
-        "prefix.exact_mark_arena" => "marks",
-        "prefix.dflash_context_marks" => "DFlash context marks",
-        "prefix.dflash_valid_floor_transfer" => "DFlash valid-floor transfer",
-        _ => name,
-    }
-}
-
-pub fn request(inputs: &MimoInputs<'_>) -> Result<PlacementRequest, CacheGeometryError> {
-    let ranks = inputs.gpus.len();
-    let profile = inputs.profile;
-    let layers = inputs.layers;
-    if !(1..=2).contains(&ranks) || profile.devices.len() != ranks || inputs.experts.len() != layers {
-        return Err(PlacementError::Inventory("MiMo ranks, profile and layer costs disagree").into());
-    }
-    let cache = mimo_cache_geometry(inputs.cfg, layers, ranks, inputs.kv, inputs.mtp_stages)?;
-    if profile.pool_unit_rows != cache.logical_unit_rows {
-        return Err(PlacementError::Inventory("MiMo pool quantum").into());
-    }
-    let mut fixed = Vec::new();
-    let mut drafter = Vec::new();
-    let mut pool_overhead = Vec::new();
-    for (rank, costs) in profile.devices.iter().enumerate() {
-        for reservation in &costs.reservations {
-            let demand = Demand::new(rank as u8, reservation_category(&reservation.name),
-                reservation_group(&reservation.name), reservation.bytes, Basis::Formula);
-            // The external drafter's own allocations form the shared drafter Movable.
-            if reservation.name.starts_with("draft.") { drafter.push(demand) } else { fixed.push(demand) }
-        }
-        pool_overhead.push(costs.pool_unit_bytes.checked_sub(cache.ranks[rank].persistent_unit_bytes)
-            .ok_or(PlacementError::Inventory("MiMo pool tables omit layer records"))?);
-    }
-    let mut tp2_workspace = inputs.tp2_workspace;
-    if ranks == 2 && tp2_workspace.iter().any(|&bytes| bytes > 0) {
-        let bytes = route_exchange_bytes(inputs.rows.max(64), inputs.cfg.topk as u64, inputs.lanes)
-            .map_err(|_| PlacementError::Overflow("MiMo route exchange"))?;
-        for workspace in &mut tp2_workspace {
-            *workspace = workspace.checked_add(bytes).ok_or(PlacementError::Overflow("MiMo TP2 workspace"))?;
-        }
-    }
-    let routed = inputs.experts.iter().filter(|cost| cost.is_some()).count();
-    let local_package = inputs.expert_workspace > 0 || inputs.tp2_workspace.iter().any(|&bytes| bytes > 0);
-    let mut pool = PoolPolicy::resolve(&inputs.gpus.iter().map(|g| g.0).collect::<Vec<_>>(), inputs.context,
-        inputs.requested_pool, profile.pool_unit_rows, inputs.spark_ranks == 0)
-        .with_automatic_context(inputs.automatic_context);
-    let onboard = if routed > 0 && !local_package {
-        if inputs.spark_ranks == 0 || !(inputs.onboard == Onboard::Auto || inputs.onboard.layers(routed) == Some(0)) {
-            return Err(PlacementError::Inventory("MiMo local experts need a matching BF16-input package").into());
-        }
-        // Zero eligible local layers must not turn auto's bounded pool into a
-        // fixed-onboard pool that consumes every remaining byte.
-        if inputs.onboard == Onboard::Auto {
-            pool.ceiling = pool.target;
-            if pool.requested.is_none() { pool.floor = 0; }
-        }
-        Onboard::Layers(0)
-    } else { inputs.onboard };
-    let whole = inputs.cfg.head_split(1).map_err(|_| PlacementError::Inventory("MiMo whole heads"))?;
-    let split = inputs.cfg.head_split(2).map_err(|_| PlacementError::Inventory("MiMo split heads"))?;
-    let demands = (0..layers).map(|layer| {
-        let full = inputs.cfg.attention[layer] == MimoAttention::Full;
-        let bytes = |share: &MimoV2Config| {
-            if full { profile.pool_unit_rows * share.record_bytes(MimoAttention::Full, inputs.kv) as u64 } else { 0 }
+    /// Four backbone layers, one routed slot: enough to exercise the contract
+    /// without a checkpoint, at MiMo's real pool quantum.
+    fn fixture(ranks: usize, context: u64) -> (MimoV2Config, CapacityProfile, CapacityProfile) {
+        let mut cfg = MimoV2Config::from_hf(&crate::plan::testing::mimo_pro_config()).unwrap();
+        cfg.layers = 4;
+        cfg.dense = vec![true, false, false, false];
+        cfg.attention = vec![MimoAttention::Full; 4];
+        let cache = mimo_cache_geometry(&cfg, 4, ranks, MimoKvFormats::default(), 0).unwrap();
+        let profile = CapacityProfile {
+            context: ContextLimits { checkpoint_max_tokens: 1 << 20, compiled_index_max_tokens: None },
+            pool_unit_rows: cache.logical_unit_rows,
+            host_prefix_bytes: 0,
+            devices: cache.ranks.iter().enumerate().map(|(rank, storage)| DeviceCosts {
+                device: rank as u32,
+                pool_unit_bytes: storage.persistent_unit_bytes + storage.pool_metadata_unit_bytes + 256,
+                reservations: vec![MemoryReservation { name: format!("state.rank{rank}"),
+                    bytes: 64 << 20 }], reserve_bytes: 0,
+            }).collect(),
         };
-        LayerDemand {
-            kind: if full { AttentionClass::Gqa } else { AttentionClass::Swa },
-            // Exact representations (including replicated routers and the lead head) are
-            // already in the profile; later ownership executors must split them.
-            weights: ModeBytes::default(),
-            fixed_bytes: ModeBytes::default(), extra: Vec::new(), context_indexer: false, colocate: None,
-            kv_unit: KvDemand::from(ModeBytes { whole: bytes(&whole), split: [bytes(&split); 2] }),
-            experts: inputs.experts[layer],
-            modes: if ranks == 2 { vec![LayerMode::HeadSplit] }
-                else { vec![LayerMode::Whole { gpu: 0, ffn: FfnMode::Owner }] },
+        let _ = context;
+        (cfg, profile.clone(), profile)
+    }
+
+    fn phase_profiles(profile: &CapacityProfile) -> crate::families::mimo_v2::capacity::MimoCapacityProfiles {
+        crate::families::mimo_v2::capacity::MimoCapacityProfiles { weight_arenas: vec![vec![]; profile.devices.len()], resident_weights: vec![ResidentWeights(0); profile.devices.len()],
+            loading: profile.devices.iter().map(|costs| DeviceCosts { device: costs.device, reservations: vec![], pool_unit_bytes: 0, reserve_bytes: 0 }).collect(),
+            post_target_kv: profile.devices.clone(), steady: profile.clone() }
+    }
+
+    fn input<'a>(cfg: &'a MimoV2Config, spark: &'a CapacityProfile, no_spark: &'a CapacityProfile,
+        ranks: usize, context: u64) -> admission::ProductionInput<'a> {
+        let cost = ExpertCost { whole: Bytes2 { resident: 1 << 30, staging: 0 },
+            half: [Bytes2 { resident: 512 << 20, staging: 0 }; 2], tp2: ranks == 2,
+            whole_supported: true, spark_ok: true };
+        admission::ProductionInput {
+            startup_probe_bytes: 64 << 20,
+            expert_usage: false,
+            blas_head: crate::placement::planner::serving::BlasHead::Native, draft_head: false,
+            cfg, layers: 4, kv: MimoKvFormats::default(), mtp_stages: 0, context,
+            maximum_pool_tokens: admission::maximum_pool_tokens(&[96 << 30; 2][..ranks], context,
+                None, spark.pool_unit_rows),
+            prefill: crate::placement::planner::PrefillShape { rows: 4096, waves: 3 },
+            lanes: 3, embedding: crate::placement::planner::EmbeddingHome::Device(0),
+            gpus: ranks, spark_ranks: 6,
+            experts: vec![None, Some(cost), Some(cost), Some(cost)],
+            expert_workspace: if ranks == 1 { 1 << 20 } else { 0 },
+            tp2_workspace: if ranks == 2 { [1 << 20; 2] } else { [0; 2] },
+            spark: phase_profiles(spark), no_spark: phase_profiles(no_spark),
+            post_kv_additional: vec![vec![]; ranks], draft_packing: vec![vec![]; ranks],
+            host: admission::HostOwners { expert_input: Default::default(), output: crate::families::mimo_v2::MimoPrefillOutput::LastRow,
+                serving: true, scoring_rows: 64, diagnostic_rows: 256, prefix_bytes: 0, media_bytes: 0, headroom: 0 },
+            spark_reply_formats: Default::default(),
+            resident_weights: vec![ResidentWeights(11 << 30); ranks],
+            operation: crate::placement::planner::Operation::Serving,
+            budgets: admission::production_budgets(&vec![(96 << 30, 96 << 30); ranks],
+                &[0; 2][..ranks], vec![crate::placement::planner::Baseline::Forecast {
+                    occupied: 0, source: "unit test".into(), assumed: false }; ranks],
+                (128 << 30, 128 << 30), 108 << 30, 6).unwrap(),
         }
-    }).collect();
-    // DFlash reads GPU0's taps and borrows its head; the shared Movable keeps it
-    // there until a measured bridge binding allows the other GPU.
-    if drafter.iter().any(|d| d.gpu != 0) {
-        return Err(PlacementError::Inventory("MiMo drafter allocations outside the head GPU").into());
     }
-    let movables = if drafter.is_empty() { Vec::new() } else {
-        vec![draft::DrafterDemand::itemized(drafter, 0).movable(ranks)?]
-    };
-    let gpus = inputs.gpus.iter().enumerate().map(|(rank, &(capacity_bytes, baseline))| GpuBudget {
-        capacity_bytes, baseline,
-        headroom_bytes: headroom_bytes(capacity_bytes, false)
-            .max(if rank == 0 { inputs.startup_probe_bytes.saturating_add(capacity_bytes - capacity_bytes * 97 / 100) } else { 0 })
-            .max(inputs.headroom_floor),
-    }).collect();
-    Ok(PlacementRequest { expert_tier: None,
-        pool_bounded: Vec::new(),
-        inventory: Inventory { gpus, spark_ranks: inputs.spark_ranks, peer_access: ranks == 2 },
-        pool,
-        layers: demands, pool_overhead, fixed, startup: Vec::new(), movables,
-        attention_placement: None, context_buffers: Default::default(), layers_first_gpu: 0,
-        expert_workspace: inputs.expert_workspace, tp2_workspace,
-        minimum_expert_layers: 0,
-        onboard, expert_gpus: 1, policy: LayerPolicy::default(),
-        hops: HopSpec { storage: crate::placement::HopStorage::ReceiveSlots, row_bytes: inputs.cfg.hidden as u64 * 2, rows: inputs.rows, lanes: inputs.lanes,
-            entry_gpu: 0, head_gpu: 0, terminal: if ranks == 2 { TerminalHome::Replicated } else { TerminalHome::AttentionOwner } },
-        executor: super::MIMO_V2,
-    })
-}
 
-/// Split the admitted arena into ready residency and transport categories.
-/// The solver reserves route storage only when it opens a TP2 arena.
-pub fn expert_items(inputs: &MimoInputs<'_>, placement: &Placement, rank: usize) -> Result<Vec<Item>, PlacementError> {
-    let mut items = placement.items[rank].iter().filter(|item| item.format == "tp2" || item.format == "local")
-        .cloned().collect::<Vec<_>>();
-    if placement.tp2.is_some() {
-        let route = route_exchange_bytes(inputs.rows.max(64), inputs.cfg.topk as u64, inputs.lanes)
-            .map_err(|_| PlacementError::Overflow("MiMo route exchange"))?;
-        let arena = items.iter_mut().find(|item| item.format == "tp2")
-            .ok_or(PlacementError::Inventory("MiMo TP2 arena item"))?;
-        arena.bytes = arena.bytes.checked_sub(route).ok_or(PlacementError::Inventory("MiMo TP2 route reservation"))?;
-        items.push(Item::new(Category::Transport, "TP2 canonical routes", "", route, Basis::Formula));
+    #[test]
+    fn pushed_expert_weights_start_at_load_without_double_charging_runtime_bytes() {
+        use crate::placement::planner::{self, ComponentKind, Location, Operation, Phase, Recipe};
+        for ranks in [1, 2] {
+            let (cfg, spark, no_spark) = fixture(ranks, 4096);
+            let mut prepared = input(&cfg, &spark, &no_spark, ranks, 4096).prepare().unwrap();
+            let request = admission::production_request(4096, Some(4096), Onboard::Layers(1),
+                prepared.recipe.prefill, Operation::Serving, ResidentWeights(u64::MAX), Default::default());
+            let mount = prepared.recipe.prepare(&request).unwrap();
+            prepared.recipe.pushed_experts = true;
+            let push = prepared.recipe.prepare(&request).unwrap();
+            for rank in 0..ranks {
+                let id = format!("rtx{rank}.experts.arena");
+                let owners = |contract: &planner::Contract| contract.components.iter().filter_map(|component|
+                    match &component.kind {
+                        ComponentKind::Allocation { template, .. } if template.id == id =>
+                            Some((component.activation.clone(), template.clone())),
+                        _ => None,
+                    }).collect::<Vec<_>>();
+                let mount_owners = owners(&mount);
+                let push_owners = owners(&push);
+                assert_eq!(mount_owners.len(), push_owners.len());
+                for ((activation, old), (selected, new)) in mount_owners.iter().zip(&push_owners) {
+                    assert_eq!(activation, selected);
+                    assert_eq!(new.location, Location::coordinator(rank as u8));
+                    assert_eq!(old.lifetime.first, Phase::Warmup);
+                    assert_eq!(new.lifetime.first, Phase::Load);
+                    assert_eq!(new.lifetime.last, Phase::Growth);
+                    let workspace = push.components.iter().filter_map(|component| match &component.kind {
+                        ComponentKind::Allocation { template, .. } if component.activation == *selected
+                            && template.id == format!("rtx{rank}.experts.workspace") => Some(template),
+                        _ => None,
+                    }).collect::<Vec<_>>();
+                    assert_eq!(workspace.len(), 1);
+                    assert_eq!(workspace[0].lifetime.first, Phase::Warmup);
+                    assert_eq!(new.bytes + workspace[0].bytes, old.bytes);
+                }
+            }
+            prepared.admit(request).unwrap();
+        }
     }
-    Ok(items)
-}
 
-/// Preserve the capacity interface consumed by context/prefix startup, without
-/// a second pool solve. Startup load and post-KV packing checks remain separate.
-pub fn resolved_capacity(inputs: &MimoInputs<'_>, request: &PlacementRequest, placement: &Placement,
-    concurrency: u32, rings: u32) -> Result<ResolvedCapacity, PlacementError> {
-    if concurrency == 0 || rings < concurrency || inputs.context == 0 {
-        return Err(PlacementError::Inventory("MiMo concurrency, rings or context"));
+    #[test]
+    fn sampled_context_survives_zero_gpu_reserve() {
+        cuteafd_core::memory_policy::MemoryPolicy { gpu_reserve: Some(0), ..Default::default() }.scoped(|| {
+            for ranks in [1, 2] {
+                let (cfg, spark, no_spark) = fixture(ranks, 4096);
+                let mut facts = input(&cfg, &spark, &no_spark, ranks, 4096);
+                let occupancy = 686_424_064;
+                for budget in facts.budgets.iter_mut().take(ranks) {
+                    budget.baseline = crate::placement::planner::Baseline::Sampled {
+                        free: budget.physical_bytes - occupancy, phase: crate::placement::planner::Phase::Load,
+                        source: "test preweight sample".into() };
+                }
+                let prepared = facts.prepare().unwrap();
+                let request = admission::production_request(4096, Some(4096), Onboard::Layers(0),
+                    prepared.recipe.prefill, crate::placement::planner::Operation::Serving,
+                    ResidentWeights(u64::MAX), Default::default());
+                let admitted = prepared.admit(request).unwrap();
+                let owners: Vec<_> = admitted.solved.facts.allowances.iter().filter(|owner|
+                    crate::placement::sampled_baseline::is_source(&owner.source)).collect();
+                assert_eq!(owners.len(), ranks);
+                assert!(owners.iter().all(|owner| owner.bytes == occupancy));
+            }
+        });
     }
-    let units = placement.pool_tokens / inputs.profile.pool_unit_rows;
-    let mut feasible_units = u64::MAX;
-    let mut devices = Vec::new();
-    for (rank, costs) in inputs.profile.devices.iter().enumerate() {
-        let gpu = request.inventory.gpus[rank];
-        let budget = gpu.available();
-        let mut reservations = costs.reservations.clone();
-        reservations.extend(expert_items(inputs, placement, rank)?.into_iter().map(|item| MemoryReservation {
-            name: if item.group == "TP2 canonical routes" { "transport.tp2_routes".into() }
-                else { format!("experts.{}", item.group) }, bytes: item.bytes }));
-        let reserved = reservations.iter().try_fold(0u64, |n, r| n.checked_add(r.bytes))
-            .ok_or(PlacementError::Overflow("MiMo reservations"))?;
-        let pool_bytes = units.checked_mul(costs.pool_unit_bytes).ok_or(PlacementError::Overflow("MiMo pool bytes"))?;
-        let used = reserved.checked_add(pool_bytes).ok_or(PlacementError::Overflow("MiMo engine bytes"))?;
-        let unused = budget.checked_sub(used).ok_or(PlacementError::Mandatory { gpu: rank as u8, what: "MiMo resolved capacity".into() })?;
-        if costs.pool_unit_bytes > 0 { feasible_units = feasible_units.min((budget - reserved) / costs.pool_unit_bytes); }
-        let non_engine_bytes = match gpu.baseline {
-            Baseline::Measured { free_bytes } => gpu.capacity_bytes.saturating_sub(free_bytes),
-            Baseline::Planned { context_bytes, loaded_bytes } => context_bytes + loaded_bytes,
-        };
-        devices.push(ResolvedDeviceCapacity { device: costs.device, total_bytes: gpu.capacity_bytes,
-            non_engine_bytes, engine_budget_bytes: budget, reservations, reserved_bytes: reserved,
-            pool_bytes, unused_budget_bytes: unused });
+
+    #[test]
+    fn measured_context_is_named_once_without_reducing_capacity_twice() {
+        use crate::placement::planner::{Baseline, Location, Operation, Phase};
+        for ranks in [1, 2] {
+            let (cfg, spark, no_spark) = fixture(ranks, 4096);
+            let mut facts = input(&cfg, &spark, &no_spark, ranks, 4096);
+            let occupancy = 686_424_064;
+            let before = facts.budgets[0].available().unwrap();
+            for budget in facts.budgets.iter_mut().take(ranks) {
+                budget.baseline = Baseline::Sampled { free: budget.physical_bytes - occupancy,
+                    phase: Phase::Load, source: "post-module test sample".into() };
+            }
+            let prepared = facts.prepare().unwrap();
+            for budget in prepared.budgets.iter().take(ranks) {
+                assert_eq!(budget.available().unwrap(), before);
+                assert!(matches!(budget.baseline, Baseline::Forecast { occupied: 0, .. }));
+            }
+            let request = admission::production_request(4096, Some(4096), Onboard::Layers(0),
+                prepared.recipe.prefill, Operation::Serving, ResidentWeights(u64::MAX), Default::default());
+            let admitted = prepared.admit(request).unwrap();
+            let capacity = admission::resolved_capacity(&admitted, 1, 1).unwrap();
+            for rank in 0..ranks {
+                let location = Location::coordinator(rank as u8);
+                for phase in [Phase::Load, Phase::Warmup, Phase::Ready, Phase::Growth] {
+                    let items = admitted.solved.items_at(location, phase).unwrap();
+                    let owners = items.iter().filter(|item| item.group.starts_with("sampled baseline: MiMo context and selected modules:")).collect::<Vec<_>>();
+                    assert_eq!(owners.len(), 1);
+                    assert_eq!(owners[0].bytes, occupancy);
+                }
+                let receipt = &capacity.devices[rank];
+                assert_eq!(receipt.non_engine_bytes, 0);
+                assert_eq!(receipt.reservations.iter().filter(|item|
+                    item.name.starts_with("sampled baseline: MiMo context and selected modules:")).map(|item| item.bytes).sum::<u64>(), occupancy);
+                assert_eq!(receipt.engine_budget_bytes, before);
+            }
+            // Offline forecasts are already itemized outside the recipe.
+            let mut offline = input(&cfg, &spark, &no_spark, ranks, 4096);
+            offline.budgets[0].baseline = Baseline::Forecast { occupied: occupancy,
+                source: "retained context/media items".into(), assumed: false };
+            let prepared = offline.prepare().unwrap();
+            assert!(prepared.recipe.context_owners.is_empty());
+            assert_eq!(prepared.budgets[0].available().unwrap(), before - occupancy);
+        }
     }
-    let feasible = feasible_units.checked_mul(inputs.profile.pool_unit_rows).ok_or(PlacementError::Overflow("MiMo feasible pool"))?;
-    let floor = inputs.requested_pool.filter(|&n| n > 0).unwrap_or(request.pool.target);
-    Ok(ResolvedCapacity {
-        concurrency, state_slots: rings,
-        checkpoint_max_context_tokens: inputs.profile.context.checkpoint_max_tokens,
-        compiled_index_max_context_tokens: inputs.profile.context.compiled_index_max_tokens,
-        effective_max_context_tokens: inputs.context, requested_kv_floor_tokens: floor,
-        feasible_gpu_kv_tokens: feasible, allocated_gpu_kv_tokens: placement.pool_tokens,
-        requested_floor_fits_hardware: feasible >= floor, requested_floor_allocated: placement.pool_tokens >= floor,
-        requested_floor_shortfall_tokens: floor.saturating_sub(placement.pool_tokens),
-        active_max_context_sequences: (units / inputs.context.div_ceil(inputs.profile.pool_unit_rows))
-            .min(concurrency as u64) as u32,
-        host_prefix_bytes: inputs.profile.host_prefix_bytes, explicit_pool_override: request.pool.requested.is_some(), devices,
-    })
+
+    #[test]
+    fn intake_probe_is_startup_only_and_lazy_prefill_still_publishes() {
+        use crate::placement::planner::{Location, Operation, Phase};
+        for ranks in [1, 2] {
+            let (cfg, mut spark, mut no_spark) = fixture(ranks, 4096);
+            for profile in [&mut spark, &mut no_spark] {
+                for costs in &mut profile.devices {
+                    costs.reservations.push(MemoryReservation { name: "prefill.test".into(), bytes: 128 << 20 });
+                    costs.reservations.push(MemoryReservation { name: "state.prefill_kv_wide".into(), bytes: 256 << 20 });
+                }
+            }
+            let prepared = input(&cfg, &spark, &no_spark, ranks, 4096).prepare().unwrap();
+            for onboard in [0, 3] {
+                let request = admission::production_request(4096, Some(4096), Onboard::Layers(onboard),
+                    prepared.recipe.prefill, Operation::Serving, ResidentWeights(u64::MAX), Default::default());
+                let admitted = prepared.admit(request).unwrap();
+                for rank in 0..ranks {
+                    for phase in [Phase::Warmup, Phase::Ready, Phase::Growth] {
+                        let items = admitted.solved.items_at(Location::coordinator(rank as u8), phase).unwrap();
+                        let probe = items.iter().filter(|item| item.group == "MiMo startup intake probe").map(|item| item.bytes).sum::<u64>();
+                        assert_eq!(probe, if phase == Phase::Warmup && onboard == 0 && rank == 0 { 64 << 20 } else { 0 });
+                        let prefill = items.iter().filter(|item| item.group == "prefill.test" || item.group == "state.prefill_kv_wide")
+                            .map(|item| item.bytes).sum::<u64>();
+                        assert_eq!(prefill, if phase == Phase::Growth { 384 << 20 } else { 0 });
+                    }
+                    let items = &admitted.placement.items[rank];
+                    assert!(!items.iter().any(|item| item.group == "MiMo startup intake probe"));
+                    assert_eq!(items.iter().filter(|item| item.group == "prefill.test").count(), 1);
+                    assert_eq!(items.iter().filter(|item| item.group == "state.prefill_kv_wide").count(), 1);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn arena_charges_replace_payloads_once_across_phases_and_onboarding() {
+        use crate::families::mimo_v2::capacity::MimoWeightArena;
+        use crate::placement::planner::{self, ComponentKind, Lifetime, Location, Phase, Recipe};
+        use crate::serving_capacity::WeightArenaLayout;
+        let (cfg, spark, no_spark) = fixture(2, 4096);
+        let mut facts = input(&cfg, &spark, &no_spark, 2, 4096);
+        let arenas = (0..2).map(|rank| vec![
+            MimoWeightArena { kind: cuteafd_core::memory_layout::MemoryKind::Weights, layout: WeightArenaLayout::new(format!("mimo.target.rank{rank}"),
+                [("payload".into(), (3 << 20) + 1), ("norm".into(), 17)]).unwrap(), lifetime: Lifetime::RESIDENT },
+            MimoWeightArena { kind: cuteafd_core::memory_layout::MemoryKind::DrafterWeights, layout: WeightArenaLayout::new(format!("mimo.dflash.rank{rank}"),
+                [("draft.payload".into(), (5 << 20) + 1)]).unwrap(),
+                lifetime: Lifetime { first: Phase::DraftLoad, last: Phase::Growth } },
+        ]).collect::<Vec<_>>();
+        for profiles in [&mut facts.spark, &mut facts.no_spark] {
+            profiles.weight_arenas = arenas.clone();
+            for (rank, arenas) in arenas.iter().enumerate() {
+                for arena in arenas {
+                    let rows = arena.reservations().unwrap();
+                    profiles.steady.devices[rank].reservations.extend(rows.clone());
+                    if arena.lifetime == Lifetime::RESIDENT {
+                        profiles.loading[rank].reservations.extend(rows.clone());
+                        profiles.post_target_kv[rank].reservations.extend(rows);
+                    }
+                }
+            }
+        }
+        let prepared = facts.prepare().unwrap();
+        let request = admission::production_request(4096, Some(4096), Onboard::Layers(1),
+            prepared.recipe.prefill, planner::Operation::Serving, ResidentWeights(u64::MAX), Default::default());
+        let contract = prepared.recipe.prepare(&request).unwrap();
+        let mut roots = Vec::new();
+        for component in &contract.components {
+            if let ComponentKind::Allocation { template, .. } = &component.kind {
+                assert!(!template.id.contains(".mimo."), "no phase-specific duplicate arena rows");
+                if template.group == "weight arena" {
+                    assert_eq!(component.activation, planner::Activation::always());
+                    assert!(template.view.is_none());
+                    roots.push(template);
+                }
+            }
+        }
+        assert_eq!(roots.len(), 4);
+        for (rank, arenas) in arenas.iter().enumerate() {
+            for arena in arenas {
+                let root = roots.iter().find(|root| root.id == arena.layout.id()).unwrap();
+                assert_eq!(root.location, Location::coordinator(rank as u8));
+                assert_eq!(root.bytes, arena.layout.bytes() as u64);
+                assert_eq!(root.lifetime, arena.lifetime);
+                assert_eq!(root.category, arena.kind.category());
+                let tails = contract.components.iter().filter_map(|component| match &component.kind {
+                    ComponentKind::AllocationGranularity(tail) if tail.id == format!("{}.tail", root.id) => Some(tail),
+                    _ => None,
+                }).collect::<Vec<_>>();
+                assert_eq!(tails.len(), 1);
+                assert_eq!(tails[0].backings[0].backing, root.id);
+                assert_eq!(tails[0].requests(), [root.bytes]);
+                assert_eq!(tails[0].lifetime, root.lifetime);
+                assert_eq!(tails[0].bytes().unwrap(), arena.reservations().unwrap()[1].bytes);
+            }
+        }
+        let admitted = prepared.admit(request).unwrap();
+        for rank in 0..2 {
+            let claimed = admitted.solved.facts.resident_weights.iter()
+                .filter(|claim| claim.location == Location::coordinator(rank)).map(|claim| claim.weights.0).sum::<u64>();
+            let expert = admitted.solved.facts.resident_weights.iter()
+                .filter(|claim| claim.location == Location::coordinator(rank) && claim.id.contains("experts.arena"))
+                .map(|claim| claim.weights.0).sum::<u64>();
+            assert_eq!(claimed - expert, 11 << 30, "arena claims replace the old aggregate");
+        }
+    }
+
+    #[test]
+    fn expert_usage_prices_one_canonical_producer_even_with_tp2() {
+        use crate::placement::planner::{ComponentKind, Location, Operation, Recipe};
+        for ranks in [1, 2] {
+            let (cfg, spark, no_spark) = fixture(ranks, 4096);
+            let off = input(&cfg, &spark, &no_spark, ranks, 4096).prepare().unwrap();
+            assert!(off.recipe.expert_usage.is_none());
+            let mut facts = input(&cfg, &spark, &no_spark, ranks, 4096);
+            facts.expert_usage = true;
+            let on = facts.prepare().unwrap();
+            let geometry = on.recipe.expert_usage.as_ref().unwrap();
+            assert_eq!(geometry.routed_layers, [1, 2, 3]);
+            assert_eq!((geometry.layers, geometry.experts, geometry.topk), (4, cfg.experts, cfg.topk));
+            let request = admission::production_request(4096, Some(4096), Onboard::Layers(1),
+                on.recipe.prefill, Operation::Serving, ResidentWeights(u64::MAX), Default::default());
+            let contract = on.recipe.prepare(&request).unwrap();
+            let mut owners = Vec::new();
+            let mut unchanged = Vec::new();
+            for component in contract.components {
+                if let ComponentKind::Allocation { template, .. } = &component.kind {
+                    if template.id.starts_with("expert-usage.") {
+                        assert_eq!(component.bytes.at(1).unwrap(), component.bytes.at(on.recipe.maximum_pages).unwrap());
+                        owners.push(template.clone());
+                        continue;
+                    }
+                }
+                unchanged.push(component);
+            }
+            assert_eq!(format!("{unchanged:?}"), format!("{:?}", off.recipe.prepare(&request).unwrap().components));
+            assert_eq!(owners.len(), 4);
+            let table = geometry.table_bytes().unwrap() as u64;
+            for (suffix, location, bytes) in [
+                ("gpu0.counters", Location::coordinator(0), table),
+                ("gpu0.snapshot", Location::coordinator(0), table),
+                ("gpu0.pinned", Location::PINNED, table),
+                ("history", Location::HOST, geometry.host_bytes(1).unwrap() as u64),
+            ] {
+                let owner = owners.iter().find(|owner| owner.id == format!("expert-usage.{suffix}")).unwrap();
+                assert_eq!((owner.location, owner.bytes), (location, bytes));
+            }
+        }
+    }
+
+    #[test]
+    fn expert_usage_geometry_follows_backbone_not_expert_costs() {
+        let (mut cfg, spark, no_spark) = fixture(1, 4096);
+        let mut facts = input(&cfg, &spark, &no_spark, 1, 4096);
+        facts.expert_usage = true;
+        facts.experts.fill(None);
+        let prepared = facts.prepare().unwrap();
+        assert!(prepared.recipe.routed.is_empty());
+        assert_eq!(prepared.recipe.expert_usage.unwrap().routed_layers, [1, 2, 3]);
+        cfg.dense.fill(true);
+        let mut facts = input(&cfg, &spark, &no_spark, 1, 4096);
+        facts.expert_usage = true;
+        facts.experts.fill(None);
+        assert!(facts.prepare().unwrap().recipe.expert_usage.is_none());
+    }
+
+    #[test]
+    fn blas_capacity_receipt_matches_ready_owners_and_pre_body_preparation() {
+        use crate::placement::planner::{Location, Phase, serving::BlasHead};
+        for ranks in [1, 2] {
+            for head in [BlasHead::Native, BlasHead::TensorLt, BlasHead::Gemm] {
+                for draft in [false, true] {
+                    let (cfg, spark, no_spark) = fixture(ranks, 4096);
+                    let mut facts = input(&cfg, &spark, &no_spark, ranks, 4096);
+                    facts.blas_head = head;
+                    facts.draft_head = draft;
+                    let prepared = facts.prepare().unwrap();
+                    let request = admission::production_request(4096, Some(4096), Onboard::Layers(0),
+                        prepared.recipe.prefill, crate::placement::planner::Operation::Serving,
+                        ResidentWeights(u64::MAX), Default::default());
+                    let admitted = prepared.admit(request).unwrap();
+                    let capacity = admission::resolved_capacity(&admitted, 1, 1).unwrap();
+                    let solved = &admitted.solved;
+                    for rank in 0..ranks {
+                        let allowances = |phase| solved.facts.allowances.iter().filter(move |owner|
+                            owner.location == Location::coordinator(rank as u8)
+                                && owner.lifetime.contains(phase, solved.facts.phase_order));
+                        // The CUDA compute stream exists from the first load
+                        // copy, so its driver stream slab is resident in every
+                        // phase. It is the only allowance charged before Ready;
+                        // the old opaque post-Ready growth charge is gone.
+                        let pre_ready = allowances(Phase::DraftLoad).collect::<Vec<_>>();
+                        assert_eq!(pre_ready.len(), 1);
+                        assert!(pre_ready[0].source.starts_with("mimo/driver-stream-slabs"), "{:?}", pre_ready[0].source);
+                        assert_eq!(pre_ready[0].bytes, crate::placement::planner::cuda_stream_slab_bytes(
+                            admission::startup_peak_live_streams()).unwrap());
+                        let gemm = allowances(Phase::Ready).filter(|owner| owner.source.starts_with("cuBLAS handles:"))
+                            .map(|owner| owner.bytes).sum::<u64>();
+                        assert_eq!(gemm, u64::from(rank == 0 && (head.gemm() || (head.bf16() && draft))) * (64 << 20));
+                        for owner in allowances(Phase::Ready) {
+                            let receipts = capacity.devices[rank].reservations.iter()
+                                .filter(|item| item.name == owner.source).collect::<Vec<_>>();
+                            assert_eq!(receipts.len(), 1);
+                            assert_eq!(receipts[0].bytes, owner.bytes);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn zero_and_unset_pool_admit_identically() {
+        let (cfg, spark, no_spark) = fixture(1, 256 << 10);
+        let context = 256 << 10;
+        let prepared = input(&cfg, &spark, &no_spark, 1, context).prepare().unwrap();
+        let request = |pool| admission::production_request(context, pool, Onboard::Auto,
+            prepared.recipe.prefill, crate::placement::planner::Operation::Serving,
+            ResidentWeights(u64::MAX), Default::default());
+        let unset = prepared.admit(request(None)).unwrap();
+        let zero = prepared.admit(request(Some(0))).unwrap();
+        assert!(matches!(unset.solved.request.pool, Pin::Auto));
+        assert!(matches!(zero.solved.request.pool, Pin::Auto));
+        assert_eq!(unset.placement.pool_tokens, zero.placement.pool_tokens);
+        assert_eq!(unset.spark.rtx_layers, zero.spark.rtx_layers);
+        assert_eq!(unset.placement.items, zero.placement.items);
+    }
+
+    #[test]
+    fn host_tables_match_admitted_curves_and_share_embedding_budget() {
+        let (cfg, spark, no_spark) = fixture(2, 4096);
+        let mut facts = input(&cfg, &spark, &no_spark, 2, 4096);
+        facts.embedding = crate::placement::planner::EmbeddingHome::HostPinned;
+        let prepared = facts.prepare().unwrap();
+        let recipe = &prepared.recipe;
+        let components = recipe.host.components(recipe, 1).unwrap();
+        for pages in [1, 2, 63, 64, 65, 66, 1024, recipe.maximum_pages] {
+            for (component, (name, bytes)) in components.iter().zip(recipe.host.demands(recipe, pages, 1).unwrap()) {
+                assert_eq!(component.bytes.at(pages).unwrap(), bytes, "{name} pages={pages}");
+            }
+        }
+        let request = admission::production_request(4096, Some(4096), Onboard::Layers(1), recipe.prefill,
+            crate::placement::planner::Operation::Serving, ResidentWeights(u64::MAX), Default::default());
+        let admitted = prepared.admit(request).unwrap();
+        let host = admitted.solved.items(crate::placement::planner::Location::PINNED).unwrap();
+        assert!(host.iter().any(|item| item.category == Category::Embedding && item.bytes > 0));
+        assert!(admitted.solved.phases.iter().any(|row| row.budget == "rtx0"
+            && row.phase == crate::placement::planner::Phase::Load));
+    }
+
+    #[test]
+    fn explicit_reply_formats_are_preserved_by_the_same_contract() {
+        use cuteafd_core::spark_reply::{SparkReplyFormat::*, SparkReplyFormats};
+        let (cfg, spark, no_spark) = fixture(1, 4096);
+        for prefill in [Bf16, Fp8, Nvfp4] {
+            for decode in [Bf16, Fp8, Nvfp4] {
+                let formats = SparkReplyFormats { prefill: Some(prefill), decode: Some(decode) };
+                let mut facts = input(&cfg, &spark, &no_spark, 1, 4096);
+                facts.spark_reply_formats = formats;
+                let prepared = facts.prepare().unwrap();
+                let request = admission::production_request(4096, Some(4096), Onboard::Layers(0), prepared.recipe.prefill,
+                    crate::placement::planner::Operation::Serving, ResidentWeights(u64::MAX), formats);
+                let admitted = prepared.admit(request).unwrap();
+                assert_eq!(admitted.solved.decisions.spark_reply_formats, Some(formats));
+            }
+        }
+    }
+
+    #[test]
+    fn unaffordable_card_returns_a_typed_refusal() {
+        let (cfg, spark, no_spark) = fixture(1, 256 << 10);
+        let context = 256 << 10;
+        let mut prepared = input(&cfg, &spark, &no_spark, 1, context);
+        prepared.budgets = admission::production_budgets(&[(1 << 30, 1 << 30)], &[0],
+            vec![crate::placement::planner::Baseline::Forecast { occupied: 0,
+                source: "unit test".into(), assumed: false }], (128 << 30, 128 << 30),
+            108 << 30, 6).unwrap();
+        let prepared = prepared.prepare().unwrap();
+        let request = admission::production_request(context, None, Onboard::Auto,
+            prepared.recipe.prefill, crate::placement::planner::Operation::Serving,
+            ResidentWeights(u64::MAX), Default::default());
+        let refused = prepared.admit(request).err().expect("a 1 GiB card cannot hold the context floor");
+        assert!(matches!(refused, crate::placement::planner::Refusal::Capacity { .. }
+            | crate::placement::planner::Refusal::FullContextShortfall { .. }
+            | crate::placement::planner::Refusal::Unsupported), "unexpected refusal {refused}");
+    }
 }

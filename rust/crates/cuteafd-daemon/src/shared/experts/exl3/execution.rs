@@ -2,6 +2,7 @@
 //! each launch only substitutes live inputs/row bounds and enqueues GPU work.
 use super::Exl3Weights;
 use crate::shared::memory::DeviceAllocation;
+use crate::shared::memory::Tag;
 pub(crate) use cuteafd_loader::serving_capacity::Exl3Epilogue;
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::{CuteafdDeviceBuffer, NativeLibrary, V41Exl3Kernel, V41Exl3Routes};
@@ -236,6 +237,7 @@ fn exl3_activation(activation: cuteafd_core::FfnActivation) -> &'static str {
         cuteafd_core::FfnActivation::SiluBf16Product { .. } => "silu",
         cuteafd_core::FfnActivation::SiluPostClampFp32Product { .. } => "silu_post_clamp",
         cuteafd_core::FfnActivation::Situ { .. } => "situ",
+            cuteafd_core::FfnActivation::SwigluOai { .. } => "swigluoai",
     }
 }
 
@@ -318,17 +320,16 @@ impl<'a> Exl3Workspace<'a> {
         self.allocations.values().map(|allocation| allocation.buffer.bytes).sum()
     }
     fn layout(directories: &[PathBuf], epilogue: Exl3Epilogue) -> Result<BTreeMap<String, (usize, String)>> {
-        ensure!(!directories.is_empty(), "empty EXL3 capacity workspace");
-        let mut layout: BTreeMap<String, (usize, String)> = BTreeMap::new();
-        for directory in directories {
-            let meta: Manifest = serde_json::from_slice(&std::fs::read(directory.join("v41_exl3.json"))?)?;
-            for (name, spec) in meta.buffers {
-                if name != spec.allocation || spec.zero_on_create || !epilogue.allocates(&name) { continue; }
-                let entry = layout.entry(name).or_insert((0, spec.dtype.clone()));
-                ensure!(entry.1 == spec.dtype, "EXL3 shared scratch dtype mismatch");
-                entry.0 = entry.0.max(spec.bytes.max(16));
-            }
-        }
+        let manifests = directories.iter().map(|directory| -> Result<serde_json::Value> {
+            Ok(serde_json::from_slice(&std::fs::read(directory.join("v41_exl3.json"))?)?)
+        }).collect::<Result<Vec<_>>>()?;
+        let physical = cuteafd_loader::serving_capacity::Exl3WorkspaceLayout::from_manifests(
+            &manifests, false, epilogue)?;
+        let layout = physical.owners.into_iter().filter_map(|owner| {
+            owner.name.strip_prefix("shared.").map(|name| {
+                Ok((name.to_owned(), (usize::try_from(owner.bytes)?, owner.dtype.clone())))
+            })
+        }).collect::<Result<BTreeMap<_, _>>>()?;
         Ok(layout)
     }
     /// Total allocation payload for all specializations sharing one lane arena.
@@ -346,7 +347,7 @@ impl<'a> Exl3Workspace<'a> {
         let mut allocations = BTreeMap::new();
         let mut dtypes = BTreeMap::new();
         for (name, (bytes, dtype)) in Self::layout(directories, epilogue)? {
-            allocations.insert(name.clone(), DeviceAllocation::new(library, bytes)?);
+            allocations.insert(name.clone(), DeviceAllocation::new(library, bytes, Tag::workspace("experts/exl3-shared-scratch"))?);
             dtypes.insert(name, dtype);
         }
         Ok(Rc::new(Self { allocations, dtypes }))
@@ -476,15 +477,41 @@ struct LoadedModules<'a> {
     routes: Option<V41Exl3Routes>,
     wire: Option<cuteafd_ffi::V41Exl3Wire<'a>>,
 }
+pub(crate) struct Exl3ModulePaths {
+    pub core: PathBuf,
+    pub routes: Option<PathBuf>,
+}
+
 impl<'a> Exl3Modules<'a> {
     /// # Safety
     /// The directory contains trusted native code for the current CUDA device.
     pub(crate) unsafe fn load(
         library: &'a NativeLibrary, directory: &Path, format: Exl3InputFormat,
     ) -> Result<Self> {
+        let meta: Manifest = serde_json::from_slice(&std::fs::read(directory.join("v41_exl3.json"))?)?;
+        let paths = Exl3ModulePaths {
+            core: directory.join("libcuteafd_exl3.so"),
+            routes: meta.route_preparation.as_ref().map(|route| directory.join(&route.manifest)
+                .parent().unwrap().join("libv41_exl3_routes.so")),
+        };
+        // SAFETY: same trusted-package contract, with its installed library paths.
+        unsafe { Self::load_manifest(library, directory, format, paths, meta) }
+    }
+
+    /// # Safety
+    /// The supplied native modules implement the installed manifest's ABI and
+    /// are trusted for the current device. Assets always come from `directory`.
+    pub(crate) unsafe fn load_from(library: &'a NativeLibrary, directory: &Path,
+        format: Exl3InputFormat, paths: Exl3ModulePaths) -> Result<Self> {
+        let meta: Manifest = serde_json::from_slice(&std::fs::read(directory.join("v41_exl3.json"))?)?;
+        // SAFETY: caller supplies the trusted module ABI; only parsing is factored out.
+        unsafe { Self::load_manifest(library, directory, format, paths, meta) }
+    }
+
+    unsafe fn load_manifest(library: &'a NativeLibrary, directory: &Path,
+        format: Exl3InputFormat, paths: Exl3ModulePaths, meta: Manifest) -> Result<Self> {
         let device = crate::shared::memory::device::Device { library, id: library.cuda_get_device()? };
         let owner = device.own(|| {
-            let meta: Manifest = serde_json::from_slice(&std::fs::read(directory.join("v41_exl3.json"))?)?;
             meta.group_rows()?;
             let core_reads_wire = meta.wire_input()?;
             ensure!(!core_reads_wire || format == Exl3InputFormat::Fp8K32,
@@ -501,7 +528,7 @@ impl<'a> Exl3Modules<'a> {
 
             meta.validate_native_contract()?;
             // SAFETY: the caller trusts this native package; the device owner scopes destruction.
-            let kernel = unsafe { V41Exl3Kernel::load(directory.join("libcuteafd_exl3.so"))? };
+            let kernel = unsafe { V41Exl3Kernel::load(&paths.core)? };
             let info = kernel.info();
             ensure!(
                 info.version == meta.native_info_version.unwrap_or(2)
@@ -536,7 +563,7 @@ impl<'a> Exl3Modules<'a> {
                 ensure!(format!("{:x}", Sha256::digest(&bytes)) == route.sha256,
                     "EXL3 route export hash mismatch");
                 // SAFETY: the caller trusts this package and its referenced route library.
-                Some(unsafe { V41Exl3Routes::load(path.parent().unwrap().join("libv41_exl3_routes.so"))? })
+                Some(unsafe { V41Exl3Routes::load(paths.routes.as_ref().context("missing EXL3 route module path")?)? })
             };
             let wire = if format == Exl3InputFormat::Fp8K32 && !core_reads_wire {
                 Some(library.v41_exl3_wire()?)
@@ -577,6 +604,20 @@ pub(crate) enum Exl3InputFormat {
 }
 
 impl<'a> Exl3Execution<'a> {
+    pub(crate) fn allocation_receipts(&self, inventory: &mut crate::shared::memory::receipts::Inventory<'_>,
+        name: &str) -> Result<()> {
+        if let Some(wire) = &self.wire { inventory.device(&format!("{name}.wire"), wire.buffer)?; }
+        for (index, owner) in self._storage.iter().enumerate() {
+            inventory.device(&format!("{name}.storage.{index}"), owner.buffer)?;
+        }
+        if let Some(shared) = &self._shared_workspace {
+            for (key, owner) in &shared.allocations {
+                inventory.backed_device(&format!("{name}.shared.{key}"), owner.buffer, owner.buffer)?;
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn validate_artifact(directory: &Path) -> Result<()> {
         let meta: Manifest = serde_json::from_slice(&std::fs::read(directory.join("v41_exl3.json"))?)?;
         meta.validate_native_contract()
@@ -686,7 +727,7 @@ impl<'a> Exl3Execution<'a> {
                 pointers.insert(name.clone(), buffer);
                 continue;
             }
-            let allocation = DeviceAllocation::new(library, spec.bytes.max(16))?;
+            let allocation = DeviceAllocation::new(library, spec.bytes.max(16), Tag::workspace("experts/exl3-scratch"))?;
             if spec.zero_on_create {
                 library.copy_h2d(allocation.buffer, &vec![0; spec.bytes])?;
             }
@@ -713,7 +754,7 @@ impl<'a> Exl3Execution<'a> {
                 && format!("{:x}", Sha256::digest(&lut)) == meta.trellis_lut.sha256,
             "EXL3 LUT artifact mismatch"
         );
-        let lut_buffer = DeviceAllocation::new(library, lut.len())?;
+        let lut_buffer = DeviceAllocation::new(library, lut.len(), Tag::weights("experts/exl3-lut"))?;
         library.copy_h2d(lut_buffer.buffer, &lut)?;
         pointers.insert("trellis_lut_ptr".into(), lut_buffer.buffer);
         storage.push(lut_buffer);
@@ -832,7 +873,7 @@ impl<'a> Exl3Execution<'a> {
             }
         }
         let wire = if modules.owner.wire.is_some() {
-            Some(DeviceAllocation::new(library, meta.capacity * meta.hidden * 2)?)
+            Some(DeviceAllocation::new(library, meta.capacity * meta.hidden * 2, Tag::workspace("experts/exl3-wire"))?)
         } else { None };
         Ok(Self {
             wire,
@@ -1053,6 +1094,26 @@ mod tests {
             let path = root.path().join("v41_exl3.json");
             std::fs::write(&path, serde_json::to_vec(&metadata)?)?;
             Exl3Execution::validate_planned_residency(root.path(), &layout, geometry)?;
+            // Exercise the worker's full capacity preflight with only metadata:
+            // no native library, weight files, or device arenas exist here.
+            let worker = root.path().join("worker");
+            let capacities = cuteafd_core::Exl3RowPolicy::active().capacities(16)?;
+            for capacity in &capacities {
+                let directory = worker.join(format!("m{capacity}"));
+                std::fs::create_dir_all(&directory)?;
+                std::fs::write(directory.join("v41_exl3.json"), serde_json::to_vec(&metadata)?)?;
+            }
+            super::super::worker::Exl3Worker::validate_planned_residency(
+                &worker, 16, Exl3Schedule::Default, &layout, geometry)?;
+            for capacity in &capacities {
+                let path = worker.join(format!("m{capacity}/v41_exl3.json"));
+                let mut changed = metadata.clone();
+                changed["hidden"] = serde_json::json!(128);
+                std::fs::write(&path, serde_json::to_vec(&changed)?)?;
+                assert!(super::super::worker::Exl3Worker::validate_planned_residency(
+                    &worker, 16, Exl3Schedule::Default, &layout, geometry).is_err(), "m{capacity}");
+                std::fs::write(&path, serde_json::to_vec(&metadata)?)?;
+            }
             for (field, value) in [("intermediate", serde_json::json!(256)),
                 ("hidden", serde_json::json!(128)), ("experts", serde_json::json!(1)),
                 ("bits", serde_json::json!([3,4])), ("top_k", serde_json::json!(1)),

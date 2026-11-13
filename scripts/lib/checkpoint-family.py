@@ -18,6 +18,7 @@ both implementations are checked against.
 from __future__ import annotations
 
 import json
+from pathlib import Path
 import re
 import sys
 
@@ -33,6 +34,7 @@ FAMILIES = {
     "step5_vl": "step5",
     "step5": "step5",
     "kimi_k3": "kimi_k3",
+    "kimi_k31": "kimi_k3",
     "muse_spark": "muse_spark",
     "mistral_large4": "mistral_large4",
 }

@@ -26,15 +26,17 @@
 //! Drafts only steer speculation: the
 //! verify step keeps output identical to plain greedy decoding.
 //! python/reference/families/glm5_flash/dspark/reference.py is the oracle.
+use crate::shared::draft::resource;
 use crate::shared::speculation::dflash::{ContextRow, Draft, DraftSeq, ReplayDrafter, TargetHead};
 use crate::shared::fp8_linear;
 use crate::shared::token_io::TokenEmbedding;
 use cuteafd_loader::families::glm5::draft_representation::GlmDraftRepresentation;
 use cuteafd_ffi::NativeLibrary;
-use anyhow::{ensure, Result};
+use anyhow::{ensure, Context, Result};
 use std::path::Path;
 use std::ffi::c_void;
 use crate::shared::speculation::dflash::DraftHead;
+use cuteafd_core::memory_layout::ArenaTag;
 pub(crate) use crate::shared::speculation::block_dspark::{
     is_dspark, check_checkpoint, prefetch, DsparkConfig, DsparkDrafter, MAX_SEQUENCES,
 };
@@ -48,37 +50,96 @@ pub(crate) use crate::shared::speculation::block_dspark::{
 pub(crate) enum DraftRead {
     Dspark(std::thread::JoinHandle<Result<std::collections::HashMap<String, Vec<u8>>>>),
     Dflash(std::thread::JoinHandle<std::io::Result<Vec<u8>>>),
+    /// A SparkNest snapshot: its standalone push group streams the payload, so
+    /// nothing is read here (a prefetch would read every byte twice).
+    Pushed { dspark: bool },
 }
 
 impl DraftRead {
     /// Starts reading the drafter snapshot `snapshot` names (the family's
-    /// `prefetch` for whichever drafter it holds).
+    /// `prefetch` for whichever drafter it holds), unless it is pushed.
     pub(crate) fn start(snapshot: &Path) -> Result<Self> {
-        Ok(if is_dspark(snapshot)? { Self::Dspark(prefetch(snapshot)) }
+        use crate::shared::experts::rtx::push::PushPolicy;
+        let dspark = is_dspark(snapshot)?;
+        Ok(if PushPolicy::for_snapshot(snapshot)? == PushPolicy::Required { Self::Pushed { dspark } }
+            else if dspark { Self::Dspark(prefetch(snapshot)) }
             else { Self::Dflash(crate::shared::speculation::dflash::prefetch(snapshot)) })
     }
 
-    /// The DFlash2 file bytes, for a read started with [`Self::start`]; errors
-    /// when the snapshot is a dSpark drafter.
+    /// The DFlash2 file bytes, for a read started with [`Self::start`] (empty when
+    /// pushed); errors when the snapshot is a dSpark drafter.
     pub(crate) fn join_dflash(self) -> Result<Vec<u8>> {
         match self {
             Self::Dflash(handle) => Ok(handle.join().map_err(|_| anyhow::anyhow!("drafter read panicked"))??),
-            Self::Dspark(_) => anyhow::bail!("the drafter read was started for dSpark, not DFlash2"),
+            Self::Pushed { dspark: false } => Ok(Vec::new()),
+            Self::Dspark(_) | Self::Pushed { dspark: true } =>
+                anyhow::bail!("the drafter read was started for dSpark, not DFlash2"),
         }
     }
+
+    /// The prefetched dSpark tensors (empty when pushed).
+    fn join_dspark(self) -> Result<Option<std::collections::HashMap<String, Vec<u8>>>> {
+        match self {
+            Self::Dspark(handle) => Ok(Some(handle.join().map_err(|_| anyhow::anyhow!("drafter read panicked"))??)),
+            Self::Pushed { dspark: true } => Ok(Some(Default::default())),
+            Self::Dflash(_) | Self::Pushed { dspark: false } => Ok(None),
+        }
+    }
+}
+
+pub(super) fn dflash_arenas<'a>(library: &'a NativeLibrary, snapshot: &Path,
+    representation: GlmDraftRepresentation, devices: &[i32])
+    -> Result<std::collections::BTreeMap<i32, crate::shared::memory::weight_arena::DeviceWeightArena<'a>>> {
+    use crate::shared::memory::{device::Device, weight_arena::DeviceWeightArena};
+    crate::shared::speculation::dflash::DflashDrafter::arena_requests(snapshot, representation, devices, 0)?
+        .into_iter().map(|(id, requests)| {
+            let layout = cuteafd_loader::serving_capacity::WeightArenaLayout::new(format!("glm5_flash/draft/{id}"), requests)?;
+            Ok((id, DeviceWeightArena::new(Device { library, id }, layout, ArenaTag::drafter_weights("glmf/draft"))?))
+        }).collect()
+}
+
+pub(super) fn draft_allocation<'a>(library: &'a NativeLibrary,
+    arenas: &std::collections::BTreeMap<i32, crate::shared::memory::weight_arena::DeviceWeightArena<'a>>,
+    device: i32, name: &str, bytes: usize) -> Result<crate::shared::memory::device::Allocation<'a>> {
+    crate::shared::memory::weight_arena::weight_allocation(crate::shared::memory::device::Device { library, id: device },
+        Some(arenas.get(&device).context("Flash draft arena absent")?), name, bytes, ArenaTag::drafter_weights("glmf/draft"))
 }
 
 /// The GLM 5.3 Flash drafter: DFlash2 or dSpark, behind one interface the
 /// engine (taps), the serve loop and glmf-golden use.
 pub(crate) enum Drafter<'a> {
     Dflash2(crate::shared::speculation::dflash::DflashDrafter<'a>),
-    RemoteDflash(super::remote_dflash::RemoteDflash<'a>),
+    RemoteDflash(crate::shared::draft::remote_dflash::RemoteDflash<'a>),
     Dspark(DsparkDrafter<'a>),
 }
 
 impl<'a> Drafter<'a> {
+    pub(super) fn allocation_receipts(&self,
+        devices: cuteafd_loader::placement::planner::CoordinatorDevices<'_>)
+        -> Result<Vec<cuteafd_loader::placement::planner::Receipt>> {
+        let mut receipts = match self {
+            Self::Dflash2(draft) => draft.allocation_receipts(devices, "glm5_flash.draft")?,
+            Self::RemoteDflash(draft) => draft.draft.allocation_receipts(devices, "glm5_flash.draft")?,
+            Self::Dspark(draft) => {
+                let mut inventory = crate::shared::memory::receipts::Inventory::new(devices,
+                    "glm5_flash.draft", cuteafd_loader::placement::planner::Lifetime::RESIDENT,
+                    cuteafd_core::memory_layout::Category::Weights, "draft weights");
+                draft.allocation_receipts(&mut inventory, "weights")?;
+                inventory.receipts
+            }
+        };
+        for receipt in &mut receipts {
+            use cuteafd_loader::placement::planner::{Lifetime, Phase};
+            if receipt.allocation.id.starts_with("glm5_flash/draft/")
+                || receipt.allocation.view.as_ref().is_some_and(|view| view.backing.starts_with("glm5_flash/draft/")) {
+                receipt.allocation.lifetime = Lifetime { first: Phase::DraftLoad, last: Phase::Growth };
+            }
+        }
+        Ok(receipts)
+    }
+
     pub fn require_live(&self) -> Result<()> {
-        match self { Self::RemoteDflash(d) => d.require_live(), _ => Ok(()) }
+        match self { Self::RemoteDflash(d) => d.require_live(), Self::Dflash2(d) => d.require_live(), _ => Ok(()) }
     }
 
     pub fn publish_abort(&self) -> Result<()> {
@@ -99,11 +160,11 @@ impl<'a> Drafter<'a> {
 
     /// The shared draft policy's prior: DFlash2's keyed selector fit, or the
     /// dSpark confidence head blended with the history rate.
-    pub fn draft_prior(&self, fp8_head: bool) -> Result<super::draft_binding::Prior> {
+    pub fn draft_prior(&self, fp8_head: bool) -> Result<resource::Prior> {
         Ok(match self {
-            Self::Dflash2(d) => super::draft_binding::Prior::Selector(d.selector_fit("glm5_flash", fp8_head)?),
-            Self::RemoteDflash(d) => super::draft_binding::Prior::Selector(d.draft.selector_fit("glm5_flash", fp8_head)?),
-            Self::Dspark(_) => super::draft_binding::Prior::Head,
+            Self::Dflash2(d) => resource::Prior::Selector(d.selector_fit("glm5_flash", fp8_head)?),
+            Self::RemoteDflash(d) => resource::Prior::Selector(d.draft.selector_fit("glm5_flash", fp8_head)?),
+            Self::Dspark(_) => resource::Prior::Head,
         })
     }
 
@@ -111,28 +172,42 @@ impl<'a> Drafter<'a> {
     /// else DFlash2) for a target of `hidden` x `vocab` with `layers` layers:
     /// `slots` ring contexts, draft steps of up to `sequences` sequences.
     #[allow(clippy::too_many_arguments)]
-    pub fn load(library: &'a NativeLibrary, programs: &'a cuteafd_ffi::programs::Programs<'a>, snapshot: &Path, stream: *mut c_void, slots: usize, sequences: usize,
+    pub fn load(library: &'a NativeLibrary, programs: &'a cuteafd_ffi::programs::Programs<'a>, target_projection: crate::shared::speculation::dflash::TargetProjection, snapshot: &Path, stream: *mut c_void, slots: usize, sequences: usize,
         embedding: &TokenEmbedding<'_>, hidden: usize, vocab: usize, layers: usize,
         representation: GlmDraftRepresentation, scales: fp8_linear::Fp8Scales, fp8_rows: fp8_linear::Fp8Rows, kv_cache: cuteafd_loader::families::qwen4::Qwen4KvCache, read: DraftRead)
         -> Result<Self> {
-        if let DraftRead::Dspark(handle) = read {
+        let read = match read {
+            DraftRead::Dspark(_) | DraftRead::Pushed { dspark: true } => Err(read),
+            other => Ok(other),
+        };
+        if let Err(read) = read {
             let cfg = DsparkConfig::read(snapshot)?;
             ensure!(cfg.hidden == hidden && cfg.vocab == vocab && cfg.taps.iter().all(|&l| l < layers),
                 "the dSpark drafter does not fit this target");
             let mask = embedding.host_rows(&[cfg.mask_token])?;
             tracing::info!(mask_source = "target mask_token row", mask_token = cfg.mask_token, "drafter mask source");
-            let tensors = handle.join().map_err(|_| anyhow::anyhow!("drafter read panicked"))??;
-            return Ok(Self::Dspark(DsparkDrafter::load(library, programs, snapshot, tensors, stream, slots,
-                sequences.min(MAX_SEQUENCES), mask, representation, scales, fp8_rows, kv_cache)?));
+            let tensors = read.join_dspark()?.context("dSpark drafter read")?;
+            let arenas = DsparkDrafter::arena_requests(snapshot, representation, library.cuda_get_device()?)?
+                .into_iter().map(|(id, requests)| {
+                    let layout = cuteafd_loader::serving_capacity::WeightArenaLayout::new(
+                        format!("glm5_flash/draft/{id}"), requests)?;
+                    Ok((id, crate::shared::memory::weight_arena::DeviceWeightArena::new(
+                        crate::shared::memory::device::Device { library, id }, layout, ArenaTag::drafter_weights("glmf/draft"))?))
+                }).collect::<Result<std::collections::BTreeMap<_, _>>>()?;
+            return Ok(Self::Dspark(DsparkDrafter::load_with(library, programs, target_projection, snapshot, tensors, stream, slots,
+                sequences.min(MAX_SEQUENCES), mask, representation, scales, fp8_rows, kv_cache,
+                |device, name, bytes| draft_allocation(library, &arenas, device, name, bytes))?));
         }
         let cfg = crate::shared::speculation::dflash::DflashConfig::read(snapshot)?;
         ensure!(cfg.hidden == hidden && cfg.vocab == vocab && cfg.taps.iter().all(|&l| l < layers),
             "the DFlash2 drafter does not fit this target");
         let mask = embedding.host_rows(&[cfg.mask_token])?;
         tracing::info!(mask_source = "target mask_token row", mask_token = cfg.mask_token, "drafter mask source");
-        let file = read.join_dflash()?;
-        Ok(Self::Dflash2(crate::shared::speculation::dflash::DflashDrafter::load(library, programs, snapshot, file, stream, slots,
-            sequences, mask, true, representation, scales, fp8_rows, kv_cache)?))
+        let file = read.ok().context("DFlash2 drafter read")?.join_dflash()?;
+        let arenas = dflash_arenas(library, snapshot, representation, &[library.cuda_get_device()?])?;
+        Ok(Self::Dflash2(crate::shared::speculation::dflash::DflashDrafter::load_with(library, programs, target_projection, snapshot, file, stream, slots,
+            sequences, mask, true, representation, scales, fp8_rows, kv_cache,
+            |device, name, bytes| draft_allocation(library, &arenas, device, name, bytes))?))
     }
 
     pub fn prepare_workspace(&self) -> Result<()> {
@@ -281,6 +356,45 @@ impl<'a> Drafter<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn installed_draft_admission_arenas_equal_runtime_requests() -> Result<()> {
+        use cuteafd_loader::{placement::families::glm5_flash::{admission::ProcessOwners, drafter_inventory, drafter_tp2_inventory},
+            placement::planner::allocation_granularity_forecast, serving_capacity::WeightArenaLayout};
+        let Some(snapshot) = std::env::var_os("CUTEAFD_FLASH_DRAFT_SNAPSHOT") else { return Ok(()); };
+        let snapshot = Path::new(&snapshot);
+        let config = serde_json::from_slice(&std::fs::read(snapshot.join("config.json"))?)?;
+        let block = is_dspark(snapshot)?;
+        let capacity = cuteafd_loader::families::glm5::draft_representation::flash_draft_capacity(&config, Some(8), 8)?;
+        for representation in [GlmDraftRepresentation::Fp8Only, GlmDraftRepresentation::Bf16Only] {
+            for ranks in 1..=if block { 1 } else { 2 } {
+                let mut process = ProcessOwners::new((512 << 30, 512 << 30), 8 << 30);
+                process.draft(snapshot, representation, ranks, ranks == 2)?;
+                let devices = [3, 1];
+                let mut runtime = if block { DsparkDrafter::arena_requests(snapshot, representation, devices[0])? }
+                    else { crate::shared::speculation::dflash::DflashDrafter::arena_requests(
+                        snapshot, representation, &devices[..ranks], 0)? };
+                let old = if ranks == 1 {
+                    vec![drafter_inventory(&config, capacity.context_slots, capacity.max_batch_sequences,
+                        &[188], representation, 2, cuteafd_loader::families::qwen4::Qwen4KvCache::Bf16)?.0.resident_weights.0]
+                } else {
+                    drafter_tp2_inventory(snapshot, capacity, &[188, 188], representation, 2,
+                        cuteafd_loader::families::qwen4::Qwen4KvCache::Bf16)?.iter().map(|layout| layout.resident_weights().0).collect()
+                };
+                for (rank, layout) in process.draft_arenas.iter().enumerate() {
+                    let expected = WeightArenaLayout::new(layout.id(), runtime.remove(&devices[rank]).context("runtime draft rank missing")?)?;
+                    assert_eq!(*layout, expected, "planner/runtime draft rank {rank}/{ranks}");
+                    let bytes = layout.bytes() as u64;
+                    let tail = allocation_granularity_forecast(&[bytes])?;
+                    eprintln!("FLASH_CHARGE draft={} representation={representation:?} ranks={ranks} rank={rank} old={} B={bytes} tail={tail} new={} delta={} old_rounding=no",
+                        if block { "block-dspark" } else { "DFlash" }, old[rank], bytes + tail, i128::from(bytes + tail) - i128::from(old[rank]));
+                    assert!(!layout.views().keys().any(|name| name.contains("embed_tokens") || name == "lm_head.weight"));
+                }
+                assert!(runtime.is_empty());
+            }
+        }
+        Ok(())
+    }
 
     #[test]
     fn drafter_detection_reports_missing_and_corrupt_config() {

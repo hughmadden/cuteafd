@@ -59,8 +59,23 @@ struct Group {
     /// [piece][budget x phase], precomputed once, without allocation metadata.
     costs: Vec<Vec<Cost>>,
 }
+struct Mapping {
+    model: DriverPageTableModel,
+    activation: Activation,
+    rows: Vec<usize>,
+    bytes: ByteCurve,
+}
+struct Rounded {
+    activation: Activation,
+    rows: Vec<usize>,
+    opaque: bool,
+    bytes: ByteCurve,
+}
 pub(super) struct Compiled {
     starts: Vec<u64>,
+    mappings: Vec<Mapping>,
+    rounded: Vec<Rounded>,
+    pool_page_multiple: u64,
     phase_order: PhaseOrder,
     groups: Vec<Group>,
     rows: usize,
@@ -79,6 +94,8 @@ impl Compiled {
         let memory_rows = budgets.len() * contract.phase_order.phases().len();
         let rows = memory_rows + contract.gpus;
         let mut groups = BTreeMap::<Activation, Vec<Vec<Cost>>>::new();
+        let mut mappings = Vec::new();
+        let mut rounded = Vec::new();
         for component in &contract.components {
             let (charged_rows, opaque) = if let ComponentKind::ResidentWeight(owner) = &component.kind {
                 let Device::Coordinator(gpu) = owner.location.device else { continue };
@@ -94,16 +111,35 @@ impl Compiled {
             } else {
                 continue;
             };
+            let driver = match component.kind {
+                ComponentKind::DriverPageTables { model, .. } => Some(model),
+                _ => None,
+            };
+            if let Some(model) = driver.filter(|model| component.bytes.0.iter()
+                .any(|piece| piece.bytes_per_page % model.quantum() != 0 || piece.granularity != 1)) {
+                mappings.push(Mapping { model, activation: component.activation.clone(), rows: charged_rows,
+                    bytes: component.bytes.clone() });
+                continue;
+            }
+            if component.bytes.0.iter().any(|piece| piece.granularity != 1) {
+                rounded.push(Rounded { activation: component.activation.clone(), rows: charged_rows.clone(),
+                    opaque, bytes: component.bytes.clone() });
+            }
             let costs = groups
                 .entry(component.activation.clone())
                 .or_insert_with(|| vec![vec![Cost::default(); rows]; starts.len() - 1]);
             for (index, &first) in starts[..starts.len() - 1].iter().enumerate() {
                 let piece = component.bytes.piece(first)?;
-                let bytes = component.bytes.at(first)?;
+                // Raw affine costs are a lower bound; each backing's exact
+                // round-up is applied separately when pricing a complete choice.
+                let bytes = piece.raw_at(first)?;
+                let (bytes, slope) = if let Some(model) = driver {
+                    (model.bytes(bytes), piece.bytes_per_page / model.quantum() * model.bytes_per_quantum())
+                } else { (bytes, piece.bytes_per_page) };
                 let cost = if opaque {
-                    Cost { opaque: bytes, opaque_slope: piece.bytes_per_page, ..Cost::default() }
+                    Cost { opaque: bytes, opaque_slope: slope, ..Cost::default() }
                 } else {
-                    Cost { owned: bytes, owned_slope: piece.bytes_per_page, ..Cost::default() }
+                    Cost { owned: bytes, owned_slope: slope, ..Cost::default() }
                 };
                 for &row in &charged_rows {
                     costs[index][row].add(cost)?;
@@ -112,6 +148,9 @@ impl Compiled {
         }
         Ok(Self {
             starts,
+            mappings,
+            rounded,
+            pool_page_multiple: contract.pool_page_multiple,
             phase_order: contract.phase_order,
             rows,
             memory_rows,
@@ -161,19 +200,34 @@ impl Compiled {
     fn piece(&self, pages: u64) -> usize {
         self.starts.partition_point(|&start| start <= pages) - 1
     }
+    fn exact_costs(&self, selected: &[usize], pages: u64) -> Result<Vec<Cost>, Refusal> {
+        let index = self.piece(pages);
+        let mut costs = self.costs(selected, index)?.into_iter()
+            .map(|cost| cost.at(pages - self.starts[index])).collect::<Result<Vec<_>, _>>()?;
+        for rounded in self.rounded.iter().filter(|owner| owner.activation.active(selected)) {
+            let piece = rounded.bytes.piece(pages)?;
+            let tail = piece.at(pages)? - piece.raw_at(pages)?;
+            for &row in &rounded.rows {
+                costs[row].add(if rounded.opaque { Cost { opaque: tail, ..Cost::default() } }
+                    else { Cost { owned: tail, ..Cost::default() } })?;
+            }
+        }
+        for mapping in self.mappings.iter().filter(|mapping| mapping.activation.active(selected)) {
+            let bytes = mapping.model.bytes(mapping.bytes.at(pages)?);
+            for &row in &mapping.rows {
+                costs[row].add(Cost { opaque: bytes, ..Cost::default() })?;
+            }
+        }
+        Ok(costs)
+    }
     pub(super) fn phases(
         &self,
         budgets: &[Budget],
         selected: &[usize],
         pages: u64,
     ) -> Result<Vec<PhaseBudget>, Refusal> {
-        let piece = self.piece(pages);
-        self.costs(selected, piece)?
-            .into_iter()
-            .take(self.memory_rows)
-            .enumerate()
+        self.exact_costs(selected, pages)?.into_iter().take(self.memory_rows).enumerate()
             .map(|(row, cost)| {
-                let cost = cost.at(pages - self.starts[piece])?;
                 let budget = &budgets[row / self.phase_order.phases().len()];
                 Ok(PhaseBudget {
                     budget: budget.id.clone(),
@@ -182,14 +236,11 @@ impl Compiled {
                     opaque: cost.opaque,
                     available: budget.available()?,
                 })
-            })
-            .collect()
+            }).collect()
     }
     fn weights(&self, selected: &[usize], pages: u64) -> Result<Vec<ResidentWeights>, Refusal> {
-        let piece = self.piece(pages);
-        self.costs(selected, piece)?.into_iter().skip(self.memory_rows)
-            .map(|cost| Ok(ResidentWeights(cost.at(pages - self.starts[piece])?.required()?)))
-            .collect()
+        self.exact_costs(selected, pages)?.into_iter().skip(self.memory_rows)
+            .map(|cost| Ok(ResidentWeights(cost.required()?))).collect()
     }
     pub(super) fn limit(
         &self,
@@ -200,11 +251,13 @@ impl Compiled {
     ) -> Result<Option<u64>, Refusal> {
         let mut answer = None;
         for piece in 0..self.starts.len() - 1 {
-            let first = self.starts[piece].max(lower);
+            let first = self.starts[piece].max(lower).div_ceil(self.pool_page_multiple)
+                .checked_mul(self.pool_page_multiple).ok_or(Refusal::Overflow("pool page alignment"))?;
             let mut last = (self.starts[piece + 1] - 1).min(upper);
             if first > last {
                 continue;
             }
+            let mut refine = !self.mappings.is_empty();
             for (row, cost) in self.costs(selected, piece)?.into_iter().enumerate() {
                 let cost = cost.at(first - self.starts[piece])?;
                 let available = self.available(row, budgets)?;
@@ -217,6 +270,40 @@ impl Compiled {
                 if slope != 0 {
                     last = last.min(first.saturating_add((available - required) / slope));
                 }
+                let mut rounded = self.rounded.iter()
+                    .filter(|owner| owner.activation.active(selected) && owner.rows.contains(&row));
+                if let Some(owner) = rounded.next() {
+                    let curve = owner.bytes.piece(first)?;
+                    if rounded.next().is_none() && slope == curve.bytes_per_page
+                        && curve.splits_exactly()
+                    {
+                        // A single rounded request plus fixed owners has an
+                        // exact O(1) inverse, independent of the page domain.
+                        let fixed = required - curve.raw_at(first)?;
+                        last = curve.last_affordable(available - fixed)?.map_or(0, |n| last.min(n));
+                    } else {
+                        refine = true;
+                    }
+                }
+            }
+            last = last / self.pool_page_multiple * self.pool_page_multiple;
+            if first <= last && refine {
+                // Exact per-backing rounding is a monotone staircase, not a
+                // page-rounded affine slope. Refine only the analytical bound.
+                let fits = |pages| -> Result<bool, Refusal> {
+                    Ok(self.exact_costs(selected, pages)?.into_iter().enumerate()
+                        .map(|(row, cost)| Ok(cost.required()? <= self.available(row, budgets)?))
+                        .collect::<Result<Vec<_>, Refusal>>()?.into_iter().all(|fits| fits))
+                };
+                if !fits(first)? { continue; }
+                let mut low = first / self.pool_page_multiple;
+                let mut high = last / self.pool_page_multiple;
+                while low < high {
+                    let middle = low + (high - low).div_ceil(2);
+                    if fits(middle * self.pool_page_multiple)? { low = middle; }
+                    else { high = middle - 1; }
+                }
+                last = low * self.pool_page_multiple;
             }
             if first <= last {
                 answer = Some(last);
@@ -236,7 +323,8 @@ impl Compiled {
     ) -> Result<Option<u64>, Refusal> {
         let mut answer = None;
         for piece in 0..self.starts.len() - 1 {
-            let first = self.starts[piece].max(lower);
+            let first = self.starts[piece].max(lower).div_ceil(self.pool_page_multiple)
+                .checked_mul(self.pool_page_multiple).ok_or(Refusal::Overflow("pool page alignment"))?;
             let mut last = (self.starts[piece + 1] - 1).min(upper);
             if first > last {
                 continue;
@@ -293,6 +381,7 @@ impl Compiled {
                     last = last.min(first.saturating_add((available - required) / slope));
                 }
             }
+            last = last / self.pool_page_multiple * self.pool_page_multiple;
             if first <= last {
                 answer = Some(last);
             }
@@ -318,6 +407,10 @@ impl Compiled {
         lower: u64,
         upper: u64,
     ) -> Result<Vec<u64>, Refusal> {
+        if lower == upper && domains.iter().all(|domain| domain.len() == 1) {
+            return self.exact_costs(&selected(domains), lower)?.into_iter()
+                .map(Cost::required).collect();
+        }
         let mut result = vec![0u64; self.rows];
         let mut local = BTreeMap::<usize, Vec<Vec<u64>>>::new();
         for group in &self.groups {
@@ -336,6 +429,28 @@ impl Compiled {
                         .any(|c| c[0].option == option)
                     {
                         add_bytes(costs, &minimum)?;
+                    }
+                }
+            }
+        }
+        for mapping in &self.mappings {
+            let mut minimum = u64::MAX;
+            for piece in &mapping.bytes.0 {
+                let first = lower.max(piece.first);
+                if first <= upper.min(piece.last) {
+                    minimum = minimum.min(mapping.model.bytes(mapping.bytes.at(first)?));
+                }
+            }
+            let mut bytes = vec![0; self.rows];
+            for &row in &mapping.rows { bytes[row] = minimum; }
+            if mapping.activation.guaranteed(domains) {
+                add_bytes(&mut result, &bytes)?;
+            } else if let Some(variable) = mapping.activation.local_variable() {
+                let values = local.entry(variable)
+                    .or_insert_with(|| vec![vec![0; self.rows]; domains[variable].len()]);
+                for (&option, costs) in domains[variable].iter().zip(values) {
+                    if mapping.activation.clauses.iter().any(|clause| clause[0].option == option) {
+                        add_bytes(costs, &bytes)?;
                     }
                 }
             }
@@ -459,6 +574,7 @@ fn propagate(
         costs.capacity(&costs.lower_bound(domains, lower, upper)?, budgets)?;
         let before = domains.to_vec();
         for variable in 0..domains.len() {
+            if domains[variable].len() == 1 { continue; }
             let mut retained = Vec::new();
             let mut capacity_failure = None;
             for &option in &domains[variable] {
@@ -631,7 +747,7 @@ impl Search<'_> {
         &mut self,
         mut domains: Vec<Vec<usize>>,
         pages: u64,
-        best: &mut Option<((u64, u64, u64), Vec<usize>)>,
+        best: &mut Option<((u64, u64, u64, u64), Vec<usize>)>,
     ) -> Result<(), Refusal> {
         if !self.restrict(&mut domains, pages, pages)? {
             return Ok(());
@@ -673,8 +789,11 @@ impl Search<'_> {
             .map(|(v, &o)| v.onboard(o))
             .sum();
         let phases = self.costs.phases(self.budgets, &assignment, pages)?;
+        let encoder_preference = self.contract.variables.iter().zip(&assignment).find_map(|(variable, &option)|
+            if let Variable::Encoder(values) = variable { Some((values.len() - option) as u64) } else { None }).unwrap_or(0);
         let score = (
             layers,
+            encoder_preference,
             coordinator_slack(&phases, self.budgets),
             remaining(&phases),
         );
@@ -688,16 +807,67 @@ impl Search<'_> {
     }
 }
 
+/// `GPU_RESERVE` / `SPARK_RESERVE` replace a device kind's whole reserve:
+/// anonymous runtime/reserved allocations and opaque allowances are dropped,
+/// and the budget keeps the override free instead. Physical driver costs,
+/// graph owners and named sampled occupancy survive: they are not reserves.
+pub(crate) fn apply_reserve_override(contract: &mut Contract, budgets: &mut [Budget]) {
+    use cuteafd_core::memory_policy::{DeviceKind, MemoryPolicy};
+    let policy = MemoryPolicy::current();
+    let kind = |device: Device| match device {
+        Device::Coordinator(_) => Some(DeviceKind::Gpu),
+        Device::Spark(_) => Some(DeviceKind::Spark),
+        _ => None,
+    };
+    let overridden = |location: &Location| kind(location.device)
+        .is_some_and(|kind| policy.reserve_override(kind).is_some());
+    contract.components.retain(|component| {
+        let reserve = match &component.kind {
+            ComponentKind::Allowance(allowance) if crate::placement::graph_reserve::is_source(&allowance.source)
+                || crate::placement::sampled_baseline::is_source(&allowance.source) => None,
+            ComponentKind::Allowance(allowance) => Some(allowance.location),
+            // Explicit reserve replaces anonymous reserve owners, not physical driver costs.
+            ComponentKind::DriverPageTables { .. } => None,
+            ComponentKind::Allocation { template, .. } if matches!(template.category,
+                Category::Runtime | Category::Reserved) => Some(template.location),
+            _ => None,
+        };
+        !reserve.is_some_and(|location| overridden(&location))
+    });
+    for budget in budgets.iter_mut() {
+        let Some(kind) = budget.locations.first().and_then(|location| kind(location.device)) else { continue };
+        if let Some(bytes) = policy.reserve_override(kind) { budget.headroom = bytes; }
+    }
+}
+
 pub fn solve(
     request: Request,
     budgets: Vec<Budget>,
     recipe: &impl Recipe,
 ) -> Result<ResolvedPlan, Refusal> {
+    solve_with_growth(request, budgets, recipe, true, None).map(|(plan, _)| plan)
+}
+
+/// Ranked optional residency uses the same pool policy, phases and resource
+/// vectors, with pool growth delayed until its ordered prefix is fixed.
+pub(super) fn solve_with_growth(
+    request: Request,
+    budgets: Vec<Budget>,
+    recipe: &impl Recipe,
+    grow: bool,
+    frozen: Option<&[usize]>,
+) -> Result<(ResolvedPlan, Vec<usize>), Refusal> {
     let started = std::time::Instant::now();
     let mut contract = recipe.prepare(&request)?;
+    contract.add_driver_page_tables();
     contract.resident_weight_limit = request.resident_weight_limit;
-    if request.spark_reply_format.is_some()
-        && request.spark_reply_format != contract.spark_reply_format
+    let mut budgets = budgets;
+    apply_reserve_override(&mut contract, &mut budgets);
+    let requested = request.spark_reply_formats;
+    let resolved = contract.spark_reply_formats;
+    if [(requested.prefill, resolved.and_then(|formats| formats.prefill)),
+        (requested.decode, resolved.and_then(|formats| formats.decode))]
+        .into_iter().any(|(requested, resolved)| requested.is_some() && requested != resolved)
     {
         return Err(Refusal::PinConflict);
     }
@@ -705,7 +875,7 @@ pub fn solve(
     contract.validate_home_budgets(&budgets)?;
     // Validate physical budgets independently of conditional allocation choices.
     validate(
-        &Facts { resident_weights: vec![],
+        &Facts { allocation_granularity: vec![], driver_page_tables: vec![], resident_weights: vec![],
             phase_order: contract.phase_order,
             allocations: vec![],
             deferred: vec![],
@@ -714,39 +884,50 @@ pub fn solve(
         },
         &budgets,
     )?;
-    if request.context == 0 {
+    if request.context.maximum == 0 {
         return Err(Refusal::InvalidFact("zero context".into()));
     }
+    if request.context.required() > request.context.maximum {
+        return Err(Refusal::InvalidFact("pinned context exceeds model/workspace maximum".into()));
+    }
     let page = contract.page_rows;
+    let multiple = contract.pool_page_multiple;
+    let pool_rows = page.checked_mul(multiple).ok_or(Refusal::Overflow("pool row alignment"))?;
     if let Pin::Exact(tokens) = request.pool {
-        if tokens % page != 0 {
+        if tokens % pool_rows != 0 {
             return Err(Refusal::MisalignedPool {
                 tokens,
-                page_rows: page,
+                page_rows: pool_rows,
             });
         }
-        if tokens < request.context {
+        if tokens < request.context.required() {
             return Err(Refusal::PoolBelowContext {
                 tokens,
-                context: request.context,
+                context: request.context.required(),
             });
         }
     }
     if matches!(request.prefill, Pin::Exact(s) if s.rows == 0 || s.waves == 0) {
         return Err(Refusal::InvalidPin("zero prefill shape"));
     }
-    let minimum = request.context.div_ceil(page);
-    let small = budgets.iter().any(|b| {
-        b.physical_bytes <= 34 << 30
-            && b.locations
-                .iter()
-                .any(|l| matches!(l.device, Device::Coordinator(_)))
-    });
-    let target = (if small { 1u64 << 20 } else { 2u64 << 20 })
-        .max(request.context)
-        .div_ceil(page);
+    // KV target, min and max (`cuteafd_core::memory_policy`). The layout is
+    // searched at the target; an automatic pool then grows to the max.
+    // The card class picks the default target (a capped PRO keeps the PRO
+    // target, as `PoolPolicy` and the live sample do).
+    let smallest = budgets.iter().filter(|b| b.locations.iter()
+        .any(|l| matches!(l.device, Device::Coordinator(_))))
+        .map(|b| b.physical_bytes).min().unwrap_or(u64::MAX);
+    let kv = cuteafd_core::memory_policy::MemoryPolicy::current().kv(smallest, request.context.maximum)
+        .map_err(|error| Refusal::InvalidFact(error.to_string()))?;
+    let aligned = |tokens: u64| tokens.div_ceil(page).div_ceil(multiple).checked_mul(multiple)
+        .ok_or(Refusal::Overflow("target pool pages"));
+    let floor = request.context.required().max(if matches!(request.pool, Pin::Auto) { kv.min } else { 0 });
+    let minimum = aligned(floor)?;
+    let compiled = contract.maximum_pages / multiple * multiple;
+    let target = aligned(kv.target.max(request.context.required()))?;
+    let ceiling = aligned(kv.max.max(kv.target).max(request.context.required()))?.min(compiled);
     let wanted = match request.pool {
-        Pin::Auto => target.min(contract.maximum_pages),
+        Pin::Auto => target.min(compiled),
         Pin::Exact(n) => n / page,
     };
     if wanted < minimum || wanted > contract.maximum_pages {
@@ -766,6 +947,14 @@ pub fn solve(
             domain.retain(|&o| values[o] == shape);
         }
     }
+    if let Some(selected) = frozen {
+        if selected.len() != domains.len() {
+            return Err(Refusal::InvalidFact("ranked residency changed decision domains".into()));
+        }
+        for (domain, &option) in domains.iter_mut().zip(selected) {
+            domain.retain(|&candidate| candidate == option);
+        }
+    }
     if domains.iter().any(Vec::is_empty) {
         return Err(Refusal::PinConflict);
     }
@@ -783,21 +972,68 @@ pub fn solve(
         assignments: 0,
         last: Refusal::Unsupported,
     };
+    if let Some(fallback) = contract.floor_fallback {
+        let domain = domains.get(fallback.variable)
+            .filter(|domain| domain.contains(&fallback.option))
+            .ok_or_else(|| Refusal::InvalidFact("invalid pool-floor fallback choice".into()))?;
+        let mut preferred = domains.clone();
+        preferred[fallback.variable] = domain.iter().copied()
+            .filter(|&option| option != fallback.option).collect();
+        let floor = if matches!(request.pool, Pin::Exact(_)) { wanted } else { minimum };
+        if !preferred[fallback.variable].is_empty() && search.feasible(preferred.clone(), floor)? {
+            domains = preferred;
+        }
+    }
     let pages = if search.feasible(domains.clone(), wanted)? {
         wanted
-    } else if matches!(request.pool, Pin::Exact(_)) || minimum == wanted {
+    } else if matches!(request.pool, Pin::Exact(_)) {
         return Err(search.last);
     } else {
         let mut maximum = None;
-        search.maximum(domains.clone(), minimum, wanted - 1, &mut maximum)?;
-        maximum.ok_or_else(|| search.last.clone())?
+        if wanted > multiple {
+            search.maximum(domains.clone(), multiple, wanted - multiple, &mut maximum)?;
+        }
+        maximum.unwrap_or(0)
     };
+    if pages < minimum {
+        // Reuse this search's validated facts and domains; never publish a
+        // reduced-context plan or rebuild the family recipe with another context.
+        if pages > 0 {
+            let mut best = None;
+            search.complete(domains.clone(), pages, &mut best)?;
+            let (_, assignment) = best.ok_or_else(|| search.last.clone())?;
+            // A pruning failure can describe a rejected alternative. Reprice
+            // the best feasible layout at its first infeasible pool page.
+            let next = pages + multiple;
+            let facts = contract.facts(&assignment, next)?;
+            search.last = match evaluate(&facts, &budgets) {
+                Err(error) => error,
+                Ok(_) => {
+                    let fixed: Vec<_> = assignment.into_iter().map(|option| vec![option]).collect();
+                    costs.capacity(&costs.lower_bound(&fixed, next, next)?, &budgets)
+                        .err().ok_or_else(|| Refusal::InvalidFact("pool above maximum is feasible".into()))?
+                }
+            };
+        } else {
+            search.feasible(domains.clone(), pages + multiple)?;
+        }
+        if !matches!(search.last, Refusal::Capacity { .. }) {
+            return Err(search.last);
+        }
+        return Err(Refusal::FullContextShortfall { context: floor,
+            tokens: pages.checked_mul(page).ok_or(Refusal::Overflow("feasible pool tokens"))?,
+            limiting: Box::new(search.last) });
+    }
     let mut best = None;
     search.complete(domains, pages, &mut best)?;
     tracing::trace!(target: "cuteafd::planner", surviving_assignments = search.assignments,
         components = contract.components.len(), preparation_search_us = started.elapsed().as_micros() as u64,
         "priced propagated contract assignments");
     let (_, selected) = best.ok_or(search.last)?;
+    // The layout is fixed; an automatic pool grows into what it leaves.
+    let pages = if grow && matches!(request.pool, Pin::Auto) && ceiling > pages {
+        costs.limit(&budgets, &selected, pages, ceiling)?.unwrap_or(pages).max(pages)
+    } else { pages };
     let decisions = contract.decisions(&selected)?;
     let facts = contract.facts(&selected, pages)?;
     let phases = evaluate(&facts, &budgets)?;
@@ -817,7 +1053,41 @@ pub fn solve(
             "component cost vectors differ from exact phase evaluator".into(),
         ));
     }
-    Ok(ResolvedPlan {
+    // Diagnose alternatives at this exact solution. Do not shrink the pool or
+    // rerun the optimizer merely to explain why Auto disabled image input.
+    let mut encoder_diagnostics = Vec::new();
+    for (variable, domain) in contract.variables.iter().enumerate() {
+        if !matches!(domain, Variable::Encoder(_)) { continue; }
+        for option in 0..selected[variable] {
+            let mut alternative = selected.clone();
+            alternative[variable] = option;
+            if contract.requires.iter().any(|rule| alternative[rule.when.variable] == rule.when.option
+                && !rule.any_of.iter().any(|choice| alternative[choice.variable] == choice.option)) {
+                encoder_diagnostics.push((format!("encoder candidate {option}: no active Spark worker at the admitted onboarding"), 0));
+                continue;
+            }
+            let alternate_facts = contract.facts(&alternative, pages)?;
+            let mut refusal = evaluate(&alternate_facts, &budgets).err();
+            if refusal.is_none() {
+                if let Some(limit) = request.resident_weight_limit {
+                    refusal = costs.weights(&alternative, pages)?.iter().enumerate().find_map(|(gpu, required)|
+                        (required.0 > limit.0).then_some(Refusal::ResidentWeightLimit {
+                            gpu: gpu as u8, required: required.0, limit: limit.0 }));
+                }
+            }
+            if let Some(refusal) = refusal {
+                let missing = match &refusal {
+                    Refusal::Capacity { required, available, .. } => required.saturating_sub(*available),
+                    Refusal::ResidentWeightLimit { required, limit, .. } => required.saturating_sub(*limit),
+                    _ => 0,
+                };
+                encoder_diagnostics.push((format!("encoder candidate {option}: {refusal}; short by {missing} bytes"), missing));
+            }
+        }
+    }
+    Ok((ResolvedPlan {
+        pool_page_rows: page,
+        encoder_diagnostics,
         request,
         decisions,
         pool_tokens: pages
@@ -826,5 +1096,5 @@ pub fn solve(
         budgets,
         facts,
         phases,
-    })
+    }, selected))
 }

@@ -23,7 +23,7 @@
 use super::weights::{Qwen4Head, Qwen4Layer, Qwen4Weights};
 use crate::shared::experts::fp8::{Fp8Experts, Fp8Layer};
 use crate::shared::launch_grid::Fp8QuantizeGrid;
-use crate::shared::memory::HostAllocation;
+use crate::shared::memory::{HostAllocation, Tag};
 use crate::shared::qwen::{GdnBank, LayerStateMap, REPLAY_ROWS};
 use crate::shared::memory::device::{Allocation, Device, DeviceOwner};
 use std::rc::Rc;
@@ -39,16 +39,30 @@ use cuteafd_transport::{
     ExpertProtocolV2Request, ExpertProtocolV2RouteEntry, ExpertProtocolV2RowDescriptor, ExpertV2Dtype, ExpertV2SourceKind,
 };
 use std::cell::{Cell, RefCell};
-use crate::shared::decode_graph::{check_bucket_thresholds, masked_row, real_row_moe, ProjectionThreshold};
+use crate::shared::decode_graph::{check_bucket_thresholds, masked_row, real_row_moe, GraphBank, ProjectionThreshold};
 use std::ffi::c_void;
 use std::sync::Arc;
 
 type Dev<'a> = Rc<Allocation<'a>>;
 
 pub(crate) const PAGE_ROWS: usize = 64;
+/// Views are 256-byte aligned; every record-set part is `PAGE_ROWS` rows of a
+/// 256-byte multiple (`record bytes` is 1040 or 2048), so the offsets hold.
+const INDEX_DIM_BYTES: usize = INDEX_DIM * 2;
+
+/// One pooled record set's physical request: the KV records, then the token
+/// index keys and the pool index keys at aligned offsets. One arena per record
+/// set, so admission prices a single cudaMalloc rounding for the set instead of
+/// one per part (`qwen4.rs` `pooled_backing`).
+fn record_arena_bytes(pages: usize, pool_pages: usize, record_bytes: usize) -> Result<(usize, usize, usize)> {
+    let bytes = |dim: usize, stride: usize| dim.checked_mul(PAGE_ROWS).and_then(|rows| rows.checked_mul(stride))
+        .ok_or_else(|| anyhow::anyhow!("Qwen record arena overflow"));
+    Ok((bytes(pages, record_bytes)?, bytes(pages, INDEX_DIM_BYTES)?, bytes(pool_pages, INDEX_DIM_BYTES)?))
+}
+
 /// Rows of the decode-shaped programs (`_m64`).
 pub(crate) const DECODE_ROWS: usize = cuteafd_loader::families::qwen4::VERIFY_ROWS;
-use cuteafd_loader::serving_capacity::qwen_graphs::{QWEN_PLAIN_BUCKETS as PLAIN_BUCKETS, QWEN_SPEC_BUCKETS as SPEC_BUCKETS};
+use cuteafd_loader::serving_capacity::qwen_graphs::{QWEN_PLAIN_BUCKETS as PLAIN_BUCKETS, QWEN_SPEC_BUCKETS as SPEC_BUCKETS, QwenGraphShape, QwenGraphShapeKey};
 // Keep this registry aligned with the pinned fork; script contracts check its source thresholds.
 const GLM_BF16_SKINNY_ROWS: usize = 0;
 const QWEN_WIDE_SKINNY_ROWS: usize = 24;
@@ -73,8 +87,9 @@ const DECODE_PROJECTION_THRESHOLDS: &[ProjectionThreshold] = &[
     ProjectionThreshold { name: "attention.projections.fp8", skinny_rows: FP8_PROJECTION_SKINNY_ROWS },
 ];
 
-pub(super) fn startup_graphs_enabled(graphs: Option<&str>, startup: Option<&str>) -> bool {
-    graphs != Some("0") && startup.map_or(true, |value| value == "1")
+/// Serving graphs are on unless `CUTEAFD_QWEN4_GRAPHS=0`.
+pub(super) fn graphs_enabled(graphs: Option<&str>) -> bool {
+    graphs != Some("0")
 }
 
 fn decode_bucket(rows: usize, spec: bool) -> usize {
@@ -111,28 +126,13 @@ pub(crate) fn fp8_head_spans(rows: usize) -> impl Iterator<Item = (usize, usize)
     (0..rows).step_by(FP8_HEAD_ROWS).map(move |first| (first, FP8_HEAD_ROWS.min(rows - first)))
 }
 
-/// The wave a Spark transport is bootstrapped with at start-up: `rows` zero
-/// rows in the checkpoint's own Spark input form (`bf16` for an NVFP4 expert
-/// package, whose workers quantize, else the E4M3/UE8M0 K32 wire). It is the
-/// widest wave any serving step dispatches — a rank's session rings are sized
-/// by the request that opens them — so bootstrapping with it connects every
-/// rank and publishes its installed expert grouping before the draft planner
-/// prices the workers, and no later wave has to reconnect. Nothing is
-/// dispatched with it, so the layer id is inert.
-pub(crate) fn spark_bootstrap_request(cfg: &Qwen4Config, rows: usize, bf16: bool) -> Result<ExpertProtocolV2Request> {
-    let (h, topk) = (cfg.hidden, cfg.topk);
-    let routes = (0..rows * topk).map(|i| ExpertProtocolV2RouteEntry {
-        row_index: (i / topk) as u32, expert_id: (i % cfg.experts) as u32, gate_weight: 0.0,
-    }).collect();
-    let (dtype, row_bytes) = if bf16 { (ExpertV2Dtype::Bf16, 2 * h) } else { (ExpertV2Dtype::Fp8E4m3Ue8m0K32, h + h / 32) };
-    let mut request = ExpertProtocolV2Request::new(1, 17, 0, h as u32, dtype,
-        (0..rows as u32).map(|row| ExpertProtocolV2RowDescriptor {
-            row_id: u64::from(row), source_kind: ExpertV2SourceKind::Prefill, source_request_id: 1,
-            token_position: u64::from(row), route_offset: row * topk as u32, route_count: topk as u32,
-        }).collect(),
-        routes, vec![0; rows * row_bytes])?;
-    request.header.flags |= EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16;
-    Ok(request)
+/// Widest checkpoint-native wire geometry, with no expert layer or dummy rows.
+pub(crate) fn spark_session_shape(cfg: &Qwen4Config, rows: usize, bf16: bool)
+    -> Result<cuteafd_transport::SparkSessionShape> {
+    let dtype = if bf16 { ExpertV2Dtype::Bf16 } else { ExpertV2Dtype::Fp8E4m3Ue8m0K32 };
+    let mut shape = cuteafd_transport::SparkSessionShape::new(rows as u32, cfg.hidden as u32, cfg.topk as u32, dtype)?;
+    shape.flags |= EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16;
+    Ok(shape)
 }
 
 /// Target rows a sequence may hold for its MTP canonical history before the
@@ -147,6 +147,7 @@ pub(crate) struct LocalExperts<'a> {
     pub experts: RefCell<Fp8Experts<'a>>,
     /// Mixed-format MTP owns its FP8 package separately from NVFP4 target layers.
     pub mtp_experts: Option<Fp8Experts<'a>>,
+    pub base_weights: cuteafd_loader::placement::ResidentWeights,
     pub window: Option<usize>,
     pub loads: RefCell<usize>,
 }
@@ -161,6 +162,13 @@ impl LocalExperts<'_> {
         if experts.layers.len() >= window {
             experts.layers.remove(0);
         }
+        let next = Fp8Layer::bytes(&self.tensors.for_layer(layer)?, 1)? as u64;
+        let retained = cuteafd_loader::placement::ResidentWeights(experts.resident_bytes() as u64)
+            .checked_add(cuteafd_loader::placement::ResidentWeights(
+                self.mtp_experts.as_ref().map_or(0, |e| e.resident_bytes() as u64)))?;
+        self.base_weights.checked_add(retained)?
+            .checked_add(cuteafd_loader::placement::ResidentWeights(next))?
+            .check(0, crate::shared::memory::budget::resident_weight_limit())?;
         let started = std::time::Instant::now();
         experts.layers.push(Fp8Layer::load(self.library, self.tensors, layer, 1, 0)?);
         *self.loads.borrow_mut() += 1;
@@ -184,36 +192,73 @@ pub(crate) struct LocalExl3<'a> {
     pub mtp: bool,
     pub max_rows: usize,
     pub budget: usize,
+    pub base_weights: cuteafd_loader::placement::ResidentWeights,
     pub loads: RefCell<usize>,
 }
 
 impl LocalExl3<'_> {
+    fn admit_weights(&self, layers: &[usize]) -> Result<()> {
+        use crate::shared::experts::{exl3::Exl3Weights, layer::ExpertLayer};
+        use cuteafd_loader::placement::ResidentWeights;
+        let mut selections = (0..usize::from(self.mtp)).map(|stage| ExpertLayer::Dspark { stage })
+            .chain(layers.iter().map(|&layer| ExpertLayer::BackboneFull { layer }));
+        let weights = selections.try_fold(self.base_weights, |sum, selection|
+            sum.checked_add(ResidentWeights(Exl3Weights::plan(self.catalog, selection)?.resident_bytes as u64))
+                .map_err(anyhow::Error::from))?;
+        weights.check(0, crate::shared::memory::budget::resident_weight_limit())?;
+        Ok(())
+    }
     /// Pushes the first window (layers from 0, and the MTP stage) in a push
     /// group of this GPU alone, as the first [`Self::ensure`] would load it
-    /// through the mount; on any fallback the window stays lazy and later
-    /// windows always reload through the mount. Returns whether it committed.
-    pub(super) fn push_window(&self, snapshot: &std::path::Path, device: i32) -> Result<bool> {
-        if self.resident.borrow().is_some() { return Ok(true); }
+    /// through the mount. Non-namespace windows stay lazy; a Required push
+    /// failure refuses startup. Later windows reload through the mount.
+    /// The first window's selections and coordinator push host envelope, from
+    /// headers only, so the recipe can admit them before any push allocation.
+    pub(super) fn push_envelope(&self) -> Result<(Vec<crate::shared::experts::layer::ExpertLayer>, usize,
+        cuteafd_loader::push_load::PushHostEnvelope)> {
+        use crate::shared::experts::rtx::push::{CoordinatorExperts, WholeOwner};
         let backbone: Vec<_> = (0..self.window.min(self.layers)).collect();
-        let Some((selections, weights_budget)) = crate::families::deepseek_v4::local::LocalExperts::exl3_selections(
+        let (selections, weights_budget) = crate::families::deepseek_v4::local::LocalExperts::exl3_selections(
             &self.native_lib, self.catalog, usize::from(self.mtp), &backbone, self.max_rows, self.budget)?
-            else { return Ok(false) };
-        if selections.is_empty() { return Ok(false); }
-        let started = std::time::Instant::now();
-        let experts = crate::shared::experts::rtx::push::CoordinatorExperts::Whole { owners: vec![crate::shared::experts::rtx::push::WholeOwner { rank: 0,
+            .context("Qwen EXL3 expert window lacks a pushable package")?;
+        anyhow::ensure!(!selections.is_empty(), "Qwen EXL3 expert window has no selected layers");
+        let experts = CoordinatorExperts::Whole { owners: vec![WholeOwner { rank: 0,
             selections: selections.clone(), budget: weights_budget }] };
-        let push = match crate::shared::experts::rtx::push::CoordinatorPush::prepare_alone(snapshot, Some(self.catalog), 1,
-            Some(experts)) {
-            Ok(push) => push,
-            Err(error) => {
-                tracing::warn!(%error, "Qwen EXL3 expert window push unavailable; it loads through the mount");
-                return Ok(false);
-            }
-        };
+        let envelope = experts.host_envelope(self.catalog, 1, &[])?;
+        Ok((selections, weights_budget, envelope))
+    }
+
+    pub(super) fn push_window(&self, snapshot: &std::path::Path, device: i32,
+        admitted: Option<&cuteafd_loader::push_load::PushHostEnvelope>) -> Result<bool> {
+        if self.resident.borrow().is_some() { return Ok(true); }
+        use crate::shared::experts::rtx::push::{CoordinatorExperts, CoordinatorPush, PushPolicy, WholeOwner};
+        let policy = PushPolicy::for_snapshot(snapshot)?;
+        let started = std::time::Instant::now();
+        let planned = policy.plan(|| {
+            let (selections, weights_budget, envelope) = self.push_envelope()?;
+            let selected_layers = selections.iter().filter_map(|s| match s {
+                crate::shared::experts::layer::ExpertLayer::BackboneFull { layer } => Some(*layer), _ => None,
+            }).collect::<Vec<_>>();
+            self.admit_weights(&selected_layers)?;
+            let experts = CoordinatorExperts::Whole { owners: vec![WholeOwner { rank: 0,
+                selections: selections.clone(), budget: weights_budget }] };
+            // The recipe admitted this envelope before allocation; without a
+            // recipe solve (a fixed diagnostic pool) the legacy check remains.
+            let push = match admitted {
+                Some(admitted) => {
+                    admitted.validate_usage(&envelope)?;
+                    CoordinatorPush::prepare_alone_admitted(snapshot, Some(self.catalog), 1, Some(experts), admitted.clone())?
+                }
+                None => CoordinatorPush::prepare_alone(snapshot, Some(self.catalog), 1, Some(experts))?,
+            };
+            Ok((push, selections))
+        }).context("Qwen EXL3 expert window push planning")?;
+        let Some((push, selections)) = planned else { return Ok(false) };
         let devices = vec![crate::shared::memory::device::Device { library: self.library, id: device }];
         let (pushed, ()) = push.receive_with::<crate::shared::experts::rtx::push::NoDense, _>(devices, Some(self.catalog),
             0, None, || ());
-        let Some(mut ranks) = pushed? else { return Ok(false) };
+        let mut ranks = policy.committed(pushed).context("Qwen EXL3 expert window push delivery")?
+            .context("Qwen required EXL3 expert window payload")?;
         let weights = ranks.pop().context("one coordinator rank")?.exl3()?;
         let local = crate::families::deepseek_v4::local::LocalExperts::from_exl3_weights(self.library, &self.native_lib,
             self.catalog, &selections, weights, self.max_rows)?.context("pushed EXL3 expert window")?;
@@ -235,6 +280,9 @@ impl LocalExl3<'_> {
         unsafe { self.library.cuda_stream_synchronize(stream)? };
         *self.resident.borrow_mut() = None;
         let layers: Vec<_> = (layer..layer + self.window.min(self.layers.saturating_sub(layer))).collect();
+        let planned = crate::families::deepseek_v4::local::plan(self.library, &self.native_lib, self.catalog,
+            usize::from(self.mtp), &layers, self.max_rows, self.budget)?;
+        self.admit_weights(&planned.layers)?;
         let started = std::time::Instant::now();
         let local = crate::families::deepseek_v4::local::LocalExperts::load(self.library, &self.native_lib, self.catalog,
             usize::from(self.mtp), &layers, self.max_rows, self.budget, stream)?
@@ -274,7 +322,7 @@ fn extend_padded(table: &mut Vec<i32>, pages: &[i32], stride: usize) {
 }
 
 /// Host tables of one step.
-#[derive(Default)]
+#[derive(Default, Clone)]
 struct StepTables {
     decode: bool,
     /// A speculative verify: GDN and PLE record replay inputs instead of
@@ -423,6 +471,43 @@ fn ngram_history(eos: u32, ngram_size: usize, tokens: &[u32]) -> NgramHistory {
     NgramHistory(history.split_off(history.len() - context))
 }
 
+/// Actual future host owners against the admitted recipe owners (see
+/// `Qwen4Engine::admit_host_memory`); `units` is the engine's pool pages.
+pub(super) fn validate_admitted_host(host: &cuteafd_loader::placement::families::qwen4::QwenHost,
+    tables: &[(String, u64)], prefix_bytes: u64, units: u64) -> Result<()> {
+    let mut logits = 0u64;
+    for (name, bytes) in tables {
+        let parts: Vec<_> = name.split('/').collect();
+        let bound = match parts.as_slice() {
+            ["qwen4", "owner-0", "mtp-prefill", "pinned-logits"] => host.mtp_pinned_logits,
+            ["qwen4", _, _, "pinned-logits"] => {
+                logits = logits.checked_add(*bytes).context("Qwen pinned logits overflow")?;
+                continue;
+            }
+            ["qwen4", owner, kind, "staging"] => {
+                let owner: usize = owner.strip_prefix("owner-").context("Qwen upload owner")?.parse()?;
+                let bounds = host.uploads.get(owner).context("Qwen upload owner was not admitted")?;
+                match *kind {
+                    "prefill" => bounds[0],
+                    "decode" => bounds[1],
+                    "mtp-prefill" => host.mtp_upload.context("Qwen MTP prefill uploads were not admitted")?,
+                    other => anyhow::bail!("unadmitted Qwen upload owner {other}"),
+                }.at(units).context("Qwen upload bound overflow")?
+            }
+            ["staging", "mapped-table-worker"] => host.ple.context("Qwen PLE was not admitted")?.worker,
+            ["mapped-table", "row-cache"] => host.ple.context("Qwen PLE was not admitted")?.row_cache,
+            _ => anyhow::bail!("unadmitted Qwen host owner {name}"),
+        };
+        ensure!(*bytes <= bound, "Qwen host owner {name} needs {bytes} bytes, admitted {bound}");
+    }
+    ensure!(logits <= host.pinned_logits,
+        "Qwen pinned logits need {logits} bytes, admitted {}", host.pinned_logits);
+    ensure!(prefix_bytes <= host.prefix_quota,
+        "Qwen host prefix needs {prefix_bytes} bytes, admitted {}", host.prefix_quota);
+    tracing::info!(owners = tables.len(), prefix_bytes, "Qwen host owners within the admitted recipe");
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use cuteafd_loader::families::qwen4::NgramHasher;
@@ -464,13 +549,11 @@ mod tests {
     }
 
     #[test]
-    fn startup_graphs_default_on_but_respect_both_explicit_opt_outs() {
-        use super::startup_graphs_enabled;
-        assert!(startup_graphs_enabled(None, None));
-        assert!(startup_graphs_enabled(None, Some("1")));
-        assert!(!startup_graphs_enabled(None, Some("0")));
-        assert!(!startup_graphs_enabled(Some("0"), None));
-        assert!(!startup_graphs_enabled(Some("0"), Some("1")));
+    fn serving_graphs_default_on_and_respect_the_explicit_opt_out() {
+        use super::graphs_enabled;
+        assert!(graphs_enabled(None));
+        assert!(graphs_enabled(Some("1")));
+        assert!(!graphs_enabled(Some("0")));
     }
 
     #[test]
@@ -489,7 +572,6 @@ mod tests {
     #[test]
     fn serving_graph_inventory_covers_every_reachable_c64_plain_shape() {
         use super::*;
-        use cuteafd_loader::serving_capacity::qwen_graphs::qwen_startup_graphs;
         for concurrency in [1, 16, 17, 32, 64] {
             for speculation in [false, true] {
                 let shapes = serving_graph_shapes(32768, 512, 2051, concurrency, speculation);
@@ -498,9 +580,6 @@ mod tests {
                         assert!(shapes.contains(&(decode_bucket(live, false), false, geometry)));
                     }
                 }
-                let graphs = qwen_startup_graphs(32768, 32768, 2051, concurrency, speculation, 48).unwrap();
-                assert_eq!(graphs.shapes, shapes.len() as u64);
-                assert_eq!(graphs.ranks[0].executables, (shapes.len() * 49) as u64);
             }
         }
     }
@@ -563,6 +642,60 @@ mod tests {
             let unique: std::collections::HashSet<_> = geometries.iter().collect();
             assert_eq!(unique.len(), geometries.len());
         }
+    }
+
+    #[test]
+    fn normalized_graph_keys_preserve_every_checked_in_prewarm_identity() {
+        use super::*;
+        use cuteafd_loader::serving_capacity::qwen_graphs::*;
+        for layout in [QwenGraphShapeKey::Single0Spark, QwenGraphShapeKey::SingleSparks,
+            QwenGraphShapeKey::Dual0Spark, QwenGraphShapeKey::DualSparks] {
+            let prewarm = qwen_shape_prewarm(layout);
+            let entries = prewarm.trace.as_ref().map_or(&qwen_prewarm_list().bootstrap.entries,
+                |trace| &trace.entries);
+            let pages = match layout { QwenGraphShapeKey::Single0Spark => 10_744,
+                QwenGraphShapeKey::Dual0Spark => 32_768, _ => 8192 };
+            let retained = qwen_prewarm_shapes(layout, 262_144, pages, 2051, 16, true);
+            let tables = |shape: QwenGraphShape| StepTables { spec: shape.spec, long: shape.long,
+                page_width: shape.page_stride, page_stride: shape.page_stride,
+                pool_stride: shape.pool_stride, pool_width: shape.pool_width, ..Default::default() };
+            for attention in [Some(Qwen4Attention::Full), Some(Qwen4Attention::Gdn), None] {
+                for entry in entries {
+                    let old = GraphKey::new(3, entry.shape.rows, attention, &tables(entry.shape));
+                    assert!(retained.iter().any(|&shape| old == GraphKey::new(3, shape.rows, attention,
+                        &tables(shape))), "{layout:?}/{attention:?}/{:?}", entry.shape);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn graph_keys_retain_only_baked_attention_scalars() {
+        use super::*;
+        let tables = StepTables { spec: true, long: true, page_width: 64, page_stride: 64,
+            pool_width: 8, pool_stride: 16, ..Default::default() };
+        let mut changed = tables.clone();
+        changed.pool_width = 32;
+        for attention in [Some(Qwen4Attention::Full), Some(Qwen4Attention::Gdn), None] {
+            let key = |tables: &StepTables| GraphKey::new(3, 8, attention, tables);
+            assert_eq!(key(&tables), key(&changed));
+            let mut geometry = tables.clone();
+            geometry.page_width *= 2;
+            geometry.page_stride *= 2;
+            geometry.pool_stride *= 2;
+            assert_eq!(key(&tables) == key(&geometry), attention != Some(Qwen4Attention::Full));
+            let mut spec = tables.clone();
+            spec.spec = false;
+            assert_eq!(key(&tables) == key(&spec), attention.is_none());
+        }
+        let mut short = tables.clone();
+        short.long = false;
+        let mut other = short.clone();
+        other.pool_stride *= 2;
+        assert_eq!(GraphKey::new(3, 8, Some(Qwen4Attention::Full), &short),
+            GraphKey::new(3, 8, Some(Qwen4Attention::Full), &other));
+        assert_ne!(GraphKey::new(3, 8, Some(Qwen4Attention::Gdn), &other),
+            GraphKey::new(3, 8, None, &other));
     }
 
     #[test]
@@ -790,7 +923,7 @@ struct Workspace<'a> {
     staging: RefCell<crate::shared::token_table::RetainedUploads<'a>>,
     /// Pinned landing of the logits rows.
     logits_host: RefCell<HostAllocation<'a>>,
-    head: VocabularyHead<'a>,
+    head: Option<VocabularyHead<'a>>,
     _head_workspace: Dev<'a>,
 }
 
@@ -942,8 +1075,8 @@ impl<'a> QwenTp2<'a> {
         }
         let layout = Tp2Rows::new(hidden, topk, max_rows, wire, experts[0].partial())?;
         let devices = ranks.map(|rank| Device { library, id: rank.device });
-        let zero = |rank: usize, bytes| -> Result<Allocation<'a>> {
-            let allocation = Allocation::new(devices[rank], bytes)?;
+        let zero = |rank: usize, bytes, tag| -> Result<Allocation<'a>> {
+            let allocation = Allocation::new(devices[rank], bytes, tag)?;
             devices[rank].run(|| library.cuda_zero_bytes(allocation.buffer, bytes))?;
             Ok(allocation)
         };
@@ -954,8 +1087,12 @@ impl<'a> QwenTp2<'a> {
                 decode.transfer_bytes()
             })?;
         let combine = [devices[0].run(|| library.rtx_tp2_combine())?, devices[1].run(|| library.rtx_tp2_combine())?];
-        let send = [zero(0, layout.bytes)?, zero(1, layout.bytes)?];
-        let reduced = [zero(0, layout.reduction_bytes)?, zero(1, layout.reduction_bytes)?];
+        // Local wire-packing scratch for this rank's routed rows, and the reduce output of both
+        // ranks' partials. The exchange's own landing slots are the transport backing.
+        let send = [zero(0, layout.bytes, Tag::workspace("qwen4/tp2-send"))?,
+            zero(1, layout.bytes, Tag::workspace("qwen4/tp2-send"))?];
+        let reduced = [zero(0, layout.reduction_bytes, Tag::workspace("qwen4/tp2-reduce"))?,
+            zero(1, layout.reduction_bytes, Tag::workspace("qwen4/tp2-reduce"))?];
         let mut tp2 = Self { library, ranks: devices, experts: std::mem::ManuallyDrop::new(experts),
             exchange: std::mem::ManuallyDrop::new(exchange), combine, send, reduced,
             hidden, topk, max_rows, wire, layout };
@@ -1117,6 +1254,8 @@ pub(crate) struct Qwen4Engine<'a> {
     pub(super) prefill_shape: Option<cuteafd_loader::serving_capacity::PrefillShape>,
     pub(super) host_prefix_config: Option<cuteafd_hostcache::config::Config>,
     host_memory_admitted: bool,
+    /// Host owners the recipe admitted before allocation; None without a solve.
+    pub(super) admitted_host: Option<cuteafd_loader::placement::families::qwen4::QwenHost>,
     request_id: Cell<u64>,
     pub pages: usize,
     pub kv_format: cuteafd_loader::families::qwen4::Qwen4KvCache,
@@ -1150,14 +1289,21 @@ pub(crate) struct Qwen4Engine<'a> {
     decode_workspace: RefCell<Option<Workspace<'a>>>,
     peer_workspace: RefCell<Option<Workspace<'a>>>,
     peer_decode_workspace: RefCell<Option<Workspace<'a>>>,
+    workspaces_prepared: Cell<bool>,
     experts: Option<Experts<'a>>,
     hops: Option<crate::shared::peer_split::hop::HopLink<'a>>,
     /// Host seconds: GPU wait before expert exchanges, the exchanges.
     pub profile: RefCell<[f64; 2]>,
     draft_probes: RefCell<Vec<DeviceOwner<'a, crate::shared::draft::probe::RoundProbe<'a>>>>,
-    graphs: RefCell<std::collections::HashMap<GraphKey, GraphExec<'a>>>,
+    graphs: RefCell<Vec<GraphBank<GraphKey, GraphExec<'a>>>>,
     use_graphs: bool,
-    startup_graphs: bool,
+    /// The bounded graph cache is configured for this launch: bucketing, lazy
+    /// capture and miss accounting are on. Cleared only by `CUTEAFD_QWEN4_GRAPHS=0`.
+    graph_capture: Cell<bool>,
+    graph_pins: RefCell<Vec<QwenGraphShape>>,
+    /// The capture pass of the startup prewarm has completed.
+    graph_warmed: Cell<bool>,
+    /// The startup warm-up (never a request) is running.
     warming_graphs: Cell<bool>,
     /// Prefill programs over FP8-only projections quantize their activations
     /// (W8A8, `fp8_rows` 1) instead of W8A16 (`--fp8-prefill-w8a8`).
@@ -1173,21 +1319,15 @@ pub(crate) struct Qwen4Engine<'a> {
     pub(super) attention_plan: cuteafd_core::coordinator_programs::AttentionReductionPlan,
 }
 
+#[cfg(test)]
 type GraphGeometry = cuteafd_loader::serving_capacity::qwen_graphs::QwenGraphGeometry;
 
+#[cfg(test)]
 fn graph_geometries(context: usize, pages: usize, dense: usize) -> Vec<GraphGeometry> {
     cuteafd_loader::serving_capacity::qwen_graphs::qwen_graph_geometries(context, pages, dense)
 }
 
-pub(super) fn serving_graph_count(context: usize, pool_tokens: usize, dense: usize,
-    sequences: usize, speculation: bool, layers: usize) -> Result<usize> {
-    let pages = cuteafd_loader::serving_capacity::qwen_graphs::qwen_pool_pages(pool_tokens)
-        .context("Qwen graph page count overflow")?;
-    serving_graph_shapes(context, pages, dense, sequences, speculation).len()
-        .checked_mul(layers.checked_add(1).context("Qwen graph segment count overflow")?)
-        .context("Qwen graph count overflow")
-}
-
+#[cfg(test)]
 fn serving_graph_shapes(context: usize, pages: usize, dense: usize, sequences: usize, speculation: bool)
     -> Vec<(usize, bool, GraphGeometry)> {
     cuteafd_loader::serving_capacity::qwen_graphs::qwen_serving_graph_shapes(context, pages, dense, sequences, speculation)
@@ -1216,10 +1356,22 @@ struct GraphKey {
     segment: usize,
     rows: usize,
     spec: bool,
+    head: bool,
     long: bool,
-    pool_width: usize,
+    page_width: usize,
     page_stride: usize,
     pool_stride: usize,
+}
+
+impl GraphKey {
+    fn new(segment: usize, rows: usize, attention: Option<Qwen4Attention>, tables: &StepTables) -> Self {
+        let full = attention == Some(Qwen4Attention::Full);
+        Self { segment, rows, spec: attention.is_some() && tables.spec, head: attention.is_none(),
+            long: full && tables.long,
+            page_width: if full { tables.page_width } else { 0 },
+            page_stride: if full { tables.page_stride } else { 0 },
+            pool_stride: if full && tables.long { tables.pool_stride } else { 0 } }
+    }
 }
 
 struct GraphExec<'a>(*mut c_void, Device<'a>);
@@ -1289,8 +1441,8 @@ impl<'a> Qwen4Engine<'a> {
                 }
             }
         }
-        let zeroed = |bytes: usize| -> Result<Dev<'a>> {
-            let allocation = Rc::new(Allocation::new(Device { library, id: library.cuda_get_device()? }, bytes.max(256))?);
+        let zeroed = |bytes: usize, tag: Tag| -> Result<Dev<'a>> {
+            let allocation = Rc::new(Allocation::new(Device { library, id: library.cuda_get_device()? }, bytes.max(256), tag)?);
             library.cuda_zero_bytes(allocation.buffer, allocation.buffer.bytes)?;
             Ok(allocation)
         };
@@ -1306,9 +1458,11 @@ impl<'a> Qwen4Engine<'a> {
             let _layer_scope = device.enter()?;
             match layer.attention {
                 Qwen4Attention::Full => {
-                    kv.push(Some(zeroed(pages * PAGE_ROWS * kv_record_bytes)?));
-                    index.push(Some((zeroed(pages * PAGE_ROWS * INDEX_DIM * 2)?,
-                        zeroed(pool_pages * PAGE_ROWS * INDEX_DIM * 2)?)));
+                    let (records, keys, pooled) = record_arena_bytes(pages, pool_pages, kv_record_bytes)?;
+                    let arena = zeroed(records + keys + pooled, Tag::kv("qwen4/kv-arena"))?;
+                    kv.push(Some(Rc::new(Allocation::view(&arena, 0, records)?)));
+                    index.push(Some((Rc::new(Allocation::view(&arena, records, keys)?),
+                        Rc::new(Allocation::view(&arena, records + keys, pooled)?))));
                 }
                 Qwen4Attention::Gdn => {
                     kv.push(None);
@@ -1331,38 +1485,125 @@ impl<'a> Qwen4Engine<'a> {
         }
         let (ple_state, ple_replay) = if weights.layers.len() > cfg.ple_layers.first().copied().unwrap_or(usize::MAX) {
             let _ple_scope = ranks[ple_owner.context("Qwen PLE state owner")?].0.enter()?;
-            (Some(zeroed(slots * PLE_STATE_ROWS * cfg.hc_width() * 2)?),
-             Some(zeroed(REPLAY_ROWS * cfg.hc_width() * 2)?))
+            (Some(zeroed(slots * PLE_STATE_ROWS * cfg.hc_width() * 2, Tag::kv("qwen4/ple-state"))?),
+             Some(zeroed(REPLAY_ROWS * cfg.hc_width() * 2, Tag::kv("qwen4/ple-replay"))?))
         } else {
             (None, None)
         };
+        // The MTP layer's own attention cache and its per-slot stash of target
+        // rows (snapshotted with the rest of a slot's state) are drafter state.
         let (mtp_kv, mtp_pending) = if weights.mtp.is_some() {
-            (Some((zeroed(pages * PAGE_ROWS * kv_record_bytes)?, zeroed(pages * PAGE_ROWS * INDEX_DIM * 2)?,
-                zeroed(pool_pages * PAGE_ROWS * INDEX_DIM * 2)?)),
-             Some(zeroed(slots * MTP_PENDING_ROWS * HC * cfg.hidden * 2)?))
+            let (records, keys, pooled) = record_arena_bytes(pages, pool_pages, kv_record_bytes)?;
+            let arena = zeroed(records + keys + pooled, Tag::drafter_kv("qwen4/mtp-kv-arena"))?;
+            (Some((Rc::new(Allocation::view(&arena, 0, records)?),
+                Rc::new(Allocation::view(&arena, records, keys)?),
+                Rc::new(Allocation::view(&arena, records + keys, pooled)?))),
+             Some(zeroed(slots * MTP_PENDING_ROWS * HC * cfg.hidden * 2, Tag::drafter_kv("qwen4/mtp-stash"))?))
         } else {
             (None, None)
         };
-        Ok(Self { terminal: Cell::new(crate::shared::peer_split::TerminalState::Active), quantize_grids, active_owner: Cell::new(0), library, programs, cfg, weights, ple, stream, max_context, prefill_rows, prefill_shape: None, host_prefix_config: None, host_memory_admitted: false, request_id: Cell::new(1), pages, slots, kv_format, kv_record_bytes, kv, state_map, gdn_banks, index, ple_state, ple_replay, ple_pending: RefCell::new(None),
+        let graphs = (0..gdn_banks.len()).map(|_| GraphBank::new(None)).collect::<Vec<_>>();
+        Ok(Self { terminal: Cell::new(crate::shared::peer_split::TerminalState::Active), quantize_grids, active_owner: Cell::new(0), library, programs, cfg, weights, ple, stream, max_context, prefill_rows, prefill_shape: None, host_prefix_config: None, host_memory_admitted: false, admitted_host: None, request_id: Cell::new(1), pages, slots, kv_format, kv_record_bytes, kv, state_map, gdn_banks, index, ple_state, ple_replay, ple_pending: RefCell::new(None),
             mtp_kv, mtp_pending,
             last_streams: std::cell::Cell::new((false, 0)), last_stream_offset: Cell::new(0), mtp_streams: std::cell::Cell::new((false, 0)),
             pool_pages, workspace: RefCell::new(None), mtp_prefill_workspace: RefCell::new(None),
             decode_workspace: RefCell::new(None), peer_workspace: RefCell::new(None),
-            peer_decode_workspace: RefCell::new(None), experts: None, hops: None, profile: RefCell::new([0.0; 2]), draft_probes: RefCell::new(Vec::new()),
-            graphs: RefCell::new(std::collections::HashMap::new()),
-            use_graphs: std::env::var("CUTEAFD_QWEN4_GRAPHS").map_or(true, |v| v != "0"),
-            startup_graphs: false,
-            warming_graphs: Cell::new(false), w8a8_prefill: false, spark_bf16: false, full_prefill_logits: false,
+            peer_decode_workspace: RefCell::new(None), workspaces_prepared: Cell::new(false), experts: None, hops: None, profile: RefCell::new([0.0; 2]), draft_probes: RefCell::new(Vec::new()),
+            graphs: RefCell::new(graphs),
+            use_graphs: graphs_enabled(std::env::var("CUTEAFD_QWEN4_GRAPHS").ok().as_deref()),
+            graph_capture: Cell::new(false),
+            graph_pins: RefCell::new(Vec::new()),
+            graph_warmed: Cell::new(false),
+            warming_graphs: Cell::new(false),
+            w8a8_prefill: false, spark_bf16: false, full_prefill_logits: false,
             packed_row_cap: Cell::new(None),
             l2: None, embedding,
-            mtp_drafts: zeroed(MTP_DEFERRED_STEPS * DECODE_ROWS * 4)?,
+            mtp_drafts: zeroed(MTP_DEFERRED_STEPS * DECODE_ROWS * 4, Tag::drafter_workspace("qwen4/mtp-drafts"))?,
             attention_plan: cuteafd_core::coordinator_programs::AttentionReductionPlan::new(DECODE_ROWS, None, None)? })
     }
 
-    pub(super) fn enable_startup_graphs(&mut self) {
-        self.startup_graphs = startup_graphs_enabled(
-            std::env::var("CUTEAFD_QWEN4_GRAPHS").ok().as_deref(),
-            std::env::var("CUTEAFD_QWEN4_STARTUP_GRAPHS").ok().as_deref());
+    /// The resolved capture shape: one or two layer owners, and whether Sparks
+    /// are attached (a 0-Spark card captures no onboarding graphs; a TP1 card
+    /// captures no TP2 peer segments).
+    fn graph_shape(&self) -> QwenGraphShapeKey {
+        QwenGraphShapeKey::resolve(self.gdn_banks.len(),
+            matches!(self.experts(), Some(Experts::Spark { .. })))
+    }
+
+    /// Attach the per-owner graph banks: one bounded cache per physical device,
+    /// charged to the family's graph reserve before KV sizing. Returns each
+    /// device's resolved reserve.
+    pub fn configure_graph_cache(&self) -> Result<Vec<u64>> {
+        use crate::shared::decode_graph::device::{Basis, Cycle, Preference, Site};
+        let shape = self.graph_shape();
+        let prewarm = cuteafd_loader::serving_capacity::qwen_graphs::qwen_shape_prewarm(shape);
+        tracing::warn!(site = "qwen4.segment", "Qwen graph cache uses per-site byte estimates: no #1612 node calibration for this route");
+        let mut reserves = Vec::new();
+        for (owner, bank) in self.graphs.borrow_mut().iter_mut().enumerate() {
+            let (base, extra) = cuteafd_loader::serving_capacity::qwen_graphs::qwen_reserve(shape, owner)
+                .with_context(|| format!("Qwen {shape:?} graph reserve has no rank {owner}"))?;
+            let resolved = cuteafd_loader::placement::graph_reserve::current(owner, false, base, extra)
+                .map_err(anyhow::Error::msg)?;
+            bank.attach_device(self.library, self.gdn_banks[owner].device.id, resolved.bytes, Site {
+                name: "qwen4.segment", cycle: Cycle::Decode, preference: Preference::Adaptive,
+                bootstrap: cuteafd_loader::serving_capacity::qwen_graphs::QWEN_GRAPH_BYTES_PER_GRAPH,
+                basis: Basis::Bytes,
+                spans_devices: self.gdn_banks.len() > 1,
+            })?;
+            crate::shared::decode_graph::device::set_reserve_policy(self.gdn_banks[owner].device.id, resolved)?;
+            tracing::info!(rank = owner, reserve = resolved.bytes, source = resolved.source,
+                base = resolved.base_bytes, base_source = resolved.base_source,
+                extra = resolved.effective_extra_bytes, extra_source = resolved.extra_source,
+                bootstrap = cuteafd_loader::serving_capacity::qwen_graphs::QWEN_GRAPH_BYTES_PER_GRAPH,
+                prewarm_shapes = prewarm.trace.as_ref().map_or(
+                    cuteafd_loader::serving_capacity::qwen_graphs::qwen_prewarm_list().bootstrap.entries.len(),
+                    |trace| trace.entries.len()),
+                shape = ?shape, "Qwen graph reserve");
+            reserves.push(resolved.bytes);
+        }
+        *self.graph_pins.borrow_mut() = cuteafd_loader::serving_capacity::qwen_graphs::qwen_prewarm_pinned(shape);
+        self.graph_capture.set(self.use_graphs);
+        Ok(reserves)
+    }
+
+    /// Visit every owner's bank (the shared observer's pass interface).
+    fn visit_graphs(&self, visit: &mut crate::shared::decode_graph::device::GraphVisitor<'_>) -> Result<()> {
+        let mut graphs = self.graphs.borrow_mut();
+        for (owner, bank) in graphs.iter_mut().enumerate() {
+            visit(self.gdn_banks[owner].device.id, "qwen4.segment", self.gdn_banks.len() > 1, bank)?;
+        }
+        Ok(())
+    }
+
+    /// The capture-pass boundary of one submitted step: every owner's launches
+    /// are drained, each physical device's graph growth is measured once, and
+    /// executables the policy retired are destroyed. Without pending work the
+    /// banks only flush their hit clocks.
+    fn graph_completed(&self) -> Result<()> {
+        let needs_boundary = self.graphs.borrow().iter().any(|bank| bank.cache_needs_boundary());
+        if !needs_boundary {
+            for bank in self.graphs.borrow_mut().iter_mut() { bank.cache_tick(); }
+            return Ok(());
+        }
+        // A capture's growth is only observable once every owner's stream has
+        // completed its queued launches: this is the step boundary.
+        self.drain_state()?;
+        // SAFETY: Qwen graph owners pin only borrowed, persistent engine storage
+        // (weights, KV/state pools, workspaces and their owner streams); the
+        // GraphExec owns no allocation its segments captured, so destroying an
+        // executable needs no lane drain.
+        unsafe { crate::shared::decode_graph::device::observe_completed(self.library, |visit| self.visit_graphs(visit)) }
+            .context("Qwen graph boundary observation")
+    }
+
+    /// Attribute the whole step's replay work to its cycle.
+    fn graph_cycle(&self, tables: &StepTables) {
+        use crate::shared::decode_graph::device::Cycle;
+        let cycle = if self.warming_graphs.get() { Cycle::Other }
+            else if !tables.decode { Cycle::Prefill }
+            else if tables.spec { Cycle::Verify }
+            else { Cycle::Decode };
+        for bank in self.graphs.borrow_mut().iter_mut() { bank.cache_cycle(cycle); }
     }
 
     pub fn set_experts(&mut self, experts: Experts<'a>) {
@@ -1416,12 +1657,29 @@ impl<'a> Qwen4Engine<'a> {
                 self.prefill_rows as u64, self.cfg.vocab_size as u64).context("Qwen host scoring overflow")?, 0),
         };
         let tables = self.future_host_workspaces(args.full_prefill_logits)?;
-        let views: Vec<_> = tables.iter().map(|(name, bytes)| (name.as_str(), *bytes)).collect();
-        crate::shared::memory::budget::admit_host_memory(config.as_ref().map_or(0, |c| c.bytes),
-            &views, scoring, headroom)?;
+        match &self.admitted_host {
+            // The recipe charged every host owner against one host sample before
+            // allocation; check the actual owners fit what it admitted.
+            Some(host) => self.validate_admitted_host(host, &tables, config.as_ref().map_or(0, |c| c.bytes))?,
+            None => {
+                let views: Vec<_> = tables.iter().map(|(name, bytes)| (name.as_str(), *bytes)).collect();
+                crate::shared::memory::budget::admit_host_memory(config.as_ref().map_or(0, |c| c.bytes),
+                    &views, scoring, headroom)?;
+            }
+        }
         self.host_prefix_config = config;
         self.host_memory_admitted = true;
         Ok(())
+    }
+
+    /// Actual future host owners against the admitted recipe owners: retained
+    /// uploads within their page-linear bounds, pinned logits within the
+    /// admitted landing, the PLE table's own staging and cache exactly, and the
+    /// resolved host prefix within its admitted quota.
+    fn validate_admitted_host(&self, host: &cuteafd_loader::placement::families::qwen4::QwenHost,
+        tables: &[(String, u64)], prefix_bytes: u64) -> Result<()> {
+        // One pool unit per 256-token pool page, the host curves' page domain.
+        validate_admitted_host(host, tables, prefix_bytes, self.pool_pages as u64)
     }
 
     fn future_host_workspaces(&self, full_logits: bool) -> Result<Vec<(String, u64)>> {
@@ -1466,73 +1724,102 @@ impl<'a> Qwen4Engine<'a> {
                 if self.full_prefill_logits { self.prefill_rows } else { 1 }, shape.slot_rows() as usize,
                 if self.weights.mtp.is_some() { self.prefill_rows } else { 0 }, shape.waves as usize)?);
         }
+        if self.weights.mtp.is_some() && self.mtp_prefill_workspace.borrow().is_none() {
+            *self.mtp_prefill_workspace.borrow_mut() = Some(self.on_owner(0, ||
+                self.workspace(self.mtp_prefill_rows(), false, 1))?);
+        }
         Ok(())
     }
 
-    /// Pre-capture every reachable bucket/geometry on no-storage rows, without expert traffic.
+    /// Retain every admitted serving workspace and private Lt plan before capture or Ready.
+    pub(crate) fn prepare_serving_workspaces(&self) -> Result<()> {
+        self.prepare_prefill_units()?;
+        for owner in 0..self.gdn_banks.len() {
+            for decode in [false, true] {
+                self.on_owner(owner, || {
+                    let slot = self.workspace_slot(owner, decode)?;
+                    if slot.borrow().is_none() {
+                        let rows = if decode { DECODE_ROWS } else { self.prefill_rows };
+                        let logits = if decode { DECODE_ROWS } else if self.full_prefill_logits { self.prefill_rows } else { 1 };
+                        *slot.borrow_mut() = Some(self.workspace(rows, decode, logits)?);
+                    }
+                    Ok(())
+                })?;
+            }
+        }
+        self.drain_state()?;
+        self.workspaces_prepared.set(true);
+        Ok(())
+    }
+
+    fn allow_workspace_creation(&self) -> Result<()> {
+        ensure!(!self.workspaces_prepared.get(), "Qwen serving workspace was not prepared before Ready");
+        Ok(())
+    }
+
+    /// Prewarm the checked-in prewarm set for this launch's layout inside the
+    /// graph reserve. Unlisted or uncaptured request shapes run eagerly or
+    /// capture lazily on a permitted miss; nothing here refuses. Capture is
+    /// charged at its completed step boundaries against an observer seeded
+    /// immediately before the first capture. Returns the resident graph count.
     pub fn warm_decode_graphs(&self, sequences: usize, speculation: bool) -> Result<usize> {
-        if !self.use_graphs || !self.startup_graphs { return Ok(0); }
+        ensure!(!self.graph_warmed.get(), "Qwen prewarm already captured");
+        if !self.use_graphs { return Ok(0); }
+        ensure!(self.graph_capture.get(), "Qwen graphs must be configured before the prewarm");
         cuteafd_core::concurrency::validate("qwen4", sequences as u64)?;
         check_bucket_thresholds(PLAIN_BUCKETS, DECODE_PROJECTION_THRESHOLDS)?;
         check_bucket_thresholds(SPEC_BUCKETS, DECODE_PROJECTION_THRESHOLDS)?;
-        let shapes = serving_graph_shapes(self.max_context, self.pages, self.cfg.dense_context(), sequences, speculation);
-        let segments = self.weights.layers.len() + if self.gdn_banks.len() == 2 { 3 } else { 1 };
-        let expected = shapes.len() * segments;
-        tracing::info!(graphs = expected, shapes = shapes.len(), plain_rows = ?PLAIN_BUCKETS, spec_rows = ?SPEC_BUCKETS,
-            "Qwen startup decode graph admission");
-        if self.decode_workspace.borrow().is_none() {
-            *self.decode_workspace.borrow_mut() = Some(self.on_owner(0, || self.workspace(DECODE_ROWS, true, DECODE_ROWS))?);
-        }
-        if self.gdn_banks.len() == 2 && self.peer_decode_workspace.borrow().is_none() {
-            *self.peer_decode_workspace.borrow_mut() = Some(self.on_owner(1, || self.workspace(DECODE_ROWS, true, DECODE_ROWS))?);
-        }
-        self.drain_state()?;
-        let sample = || self.gdn_banks.iter().map(|bank| bank.device.run(|| {
-            Ok(self.library.cuda_allocatable_memory_info()?.0)
-        })).collect::<Result<Vec<_>>>();
-        let before = sample()?;
+        let shape = self.graph_shape();
+        let shapes = cuteafd_loader::serving_capacity::qwen_graphs::qwen_prewarm_shapes(shape,
+            self.max_context, self.pages, self.cfg.dense_context(), sequences, speculation);
+        let segments = self.weights.layers.len() + 1;
+        tracing::info!(shape = ?shape, shapes = shapes.len(), graphs = shapes.len() * segments,
+            plain_rows = ?PLAIN_BUCKETS, spec_rows = ?SPEC_BUCKETS, "Qwen prewarm admission");
         let started = std::time::Instant::now();
+        // Seed each device's observer before capture: only growth from here on
+        // is charged to the startup shapes. The decode path allocates nothing
+        // inside a capture (v5 captured this set the same way), so no eager
+        // first-touch pass is needed.
+        self.drain_state()?;
+        for bank in &self.gdn_banks {
+            crate::shared::decode_graph::device::observe_device(self.library, bank.device.id)?;
+        }
         self.warming_graphs.set(true);
         let captured = (|| -> Result<()> {
-            for &(rows, spec, geometry) in &shapes {
-                let mut tables = StepTables { decode: true, spec, long: geometry.long,
+            for shape in &shapes {
+                let geometry = shape.geometry();
+                let mut tables = StepTables { decode: true, spec: shape.spec, long: geometry.long,
                     pool_width: geometry.pool_width, page_stride: geometry.page_stride,
                     page_width: geometry.page_stride, pool_stride: geometry.pool_stride, ..Default::default() };
                 let mut tokens = Vec::new();
-                pad_decode_tables(&mut tables, &mut tokens, rows, self.ple.as_ref().map_or(0, |_| self.cfg.ple_rows()));
-                self.step(&Arc::new(tables), &tokens, rows, None, None, &Default::default(), true)?;
+                pad_decode_tables(&mut tables, &mut tokens, shape.rows, self.ple.as_ref().map_or(0, |_| self.cfg.ple_rows()));
+                self.step(&Arc::new(tables), &tokens, shape.rows, None, None, &Default::default(), true)?;
                 // Startup shapes reuse an arena admitted for one serving step.
                 self.drain_state()?;
             }
-            // SAFETY: queued captures/replays drain before reporting memory or publishing readiness.
-            self.drain_state()
+            Ok(())
         })();
-        let drained = self.drain_state();
         self.warming_graphs.set(false);
+        let drained = self.drain_state();
         captured?;
         drained?;
-        let graphs = self.captured_graphs();
-        ensure!(graphs == expected, "Qwen startup captured {graphs} graphs, expected {expected}");
-        for &(rows, spec, geometry) in &shapes {
-            for segment in 0..segments {
-                ensure!(self.graphs.borrow().contains_key(&GraphKey { segment, rows, spec,
-                    long: geometry.long, pool_width: geometry.pool_width, page_stride: geometry.page_stride,
-                    pool_stride: geometry.pool_stride }), "Qwen startup graph coverage missing");
-            }
+        for bank in &self.gdn_banks {
+            crate::shared::decode_graph::device::observe_device(self.library, bank.device.id)?;
         }
-        let after = sample()?;
-        let bytes: Vec<_> = before.iter().zip(&after).map(|(&before, &after)| before as i64 - after as i64).collect();
-        tracing::info!(graphs, elapsed_ms = started.elapsed().as_millis() as u64,
-            graph_bytes = bytes.iter().sum::<i64>(), graph_bytes_by_owner = ?bytes,
-            "Qwen decode graphs captured at startup");
+        self.graph_warmed.set(true);
+        let graphs = self.captured_graphs();
+        let snapshots = crate::shared::decode_graph::device::snapshots();
+        tracing::info!(graphs, shapes = shapes.len(), elapsed_ms = started.elapsed().as_millis() as u64,
+            arenas = ?snapshots.iter().map(|s| (s.device, s.charged, s.reserve)).collect::<Vec<_>>(),
+            "Qwen prewarm captured");
         Ok(graphs)
     }
 
     /// Compare real logits and persistent cache/state bytes, including unused storage.
     /// Run only before serving: this diagnostic owns its allocator and state slots.
     pub fn check_decode_padding(&self, tokens: &[u32]) -> Result<()> {
-        ensure!(self.use_graphs && self.startup_graphs && self.weights.layers.len() == self.cfg.layers,
-            "Qwen padding check needs all layers and startup graphs");
+        ensure!(self.use_graphs && self.graph_capture.get() && self.weights.layers.len() == self.cfg.layers,
+            "Qwen padding check needs all layers and configured graphs");
         ensure!(tokens.len() >= 69 && self.max_context >= 69 && self.slots >= 10 && self.pages >= 40,
             "Qwen padding check needs 69 tokens, ten slots and forty pages");
         let snapshot = |buffers: &[cuteafd_ffi::CuteafdDeviceBuffer]| -> Result<Vec<Vec<u8>>> {
@@ -1633,34 +1920,36 @@ impl<'a> Qwen4Engine<'a> {
 
     /// Copy proposals may shrink to a lower spec bucket, never dropping a sequence.
     pub(crate) fn copy_verify_row_limit(&self, rows: usize, sequences: usize, diagnostic: bool) -> usize {
-        if self.startup_graphs && self.use_graphs && !diagnostic {
+        if self.use_graphs && self.graph_capture.get() && !diagnostic {
             copy_row_limit(rows, sequences)
         } else { rows }
     }
 
     /// Physical row extent for an ordinary serving verify; diagnostics are ungraphed.
     pub(crate) fn verify_bucket_rows(&self, rows: usize, spec: bool, diagnostic: bool) -> usize {
-        if self.startup_graphs && self.use_graphs && !diagnostic { decode_bucket(rows, spec) } else { rows }
+        if self.use_graphs && self.graph_capture.get() && !diagnostic { decode_bucket(rows, spec) } else { rows }
     }
 
     /// Logical record traffic, not measured DRAM traffic (GQA reuse and L2 can reduce it).
     /// Called only for the opt-in per-cycle trace, after the device work completes.
-    pub(crate) fn verify_attention_trace(&self, contexts: &[Vec<usize>], rows: usize) -> serde_json::Value {
+    pub(crate) fn verify_attention_trace(&self, contexts: &[Vec<usize>], rows: usize) -> crate::shared::speculation_trace::Deferred {
         let full_layers = self.weights.layers.iter().filter(|l| l.attention == Qwen4Attention::Full).count();
         let records: usize = contexts.iter().flatten().map(|&n| n.min(SPARSE_TOPK)).sum();
         let hint = self.attention_plan.rows();
         let splits = if hint == 1 { 64 } else if hint <= 4 { 32 } else { 16 };
-        serde_json::json!({"program": format!("qwen4_{}_m64", self.kv_stem("sparse_gqa")),
+        let program = self.kv_stem("sparse_gqa");
+        let record_bytes = self.kv_record_bytes;
+        crate::shared::speculation_trace::Deferred::new(move || serde_json::json!({"program": format!("qwen4_{program}_m64"),
             "route": "selected_split", "physical_rows": rows, "splits": splits,
             "qk_tile": [16, 32, 16], "pv_tile": [16, 256, 16], "kv_warps": 2,
-            "record_bytes": self.kv_record_bytes, "target_full_layers": full_layers,
+            "record_bytes": record_bytes, "target_full_layers": full_layers,
             "logical_records_per_layer_upper_bound": records,
-            "logical_record_bytes_upper_bound": records as u64 * self.kv_record_bytes as u64 * full_layers as u64,
-            "traffic_scope": "target verify; exact for dense contexts, upper bound for sparse; excludes index/query, padding and MTP draft; not DRAM bytes"})
+            "logical_record_bytes_upper_bound": records as u64 * record_bytes as u64 * full_layers as u64,
+            "traffic_scope": "target verify; exact for dense contexts, upper bound for sparse; excludes index/query, padding and MTP draft; not DRAM bytes"}))
     }
 
     pub fn captured_graphs(&self) -> usize {
-        self.graphs.borrow().len()
+        self.graphs.borrow().iter().map(|bank| bank.len()).sum()
     }
 
     pub fn experts(&self) -> Option<&Experts<'a>> {
@@ -1795,8 +2084,17 @@ impl<'a> Qwen4Engine<'a> {
         let mut probes = self.draft_probes.borrow_mut();
         if probes.is_empty() { return None; }
         if !probes[0].collects_routes() {
-            for probe in probes.iter_mut() { probe.finish()?; }
-            return Some(observe(&crate::shared::draft::routes::RoundRoutes::new(0, 0), &[]));
+            let mut times = Vec::new();
+            for (owner, probe) in probes.iter_mut().enumerate() {
+                let _scope = probe.device.enter().ok()?;
+                let (_, elapsed) = probe.finish()?;
+                if elapsed.is_empty() { continue; }
+                times.resize(self.cfg.layers, None);
+                for (index, _) in self.state_map.layers.iter().enumerate().filter(|(_, layer)| layer.owner == owner) {
+                    times[index] = elapsed[index];
+                }
+            }
+            return Some(observe(&crate::shared::draft::routes::RoundRoutes::new(0, 0), &times));
         }
         if probes.len() == 1 {
             let probe = &mut probes[0];
@@ -1907,7 +2205,9 @@ impl<'a> Qwen4Engine<'a> {
             },
             graphs: || {
                 if let Some(Experts::Spark { transport, .. }) = &self.experts { transport.try_borrow_mut()?.terminal_release()?; }
-                self.graphs.borrow_mut().clear(); Ok(())
+                // The ranks above drained every consumer; captured storage is persistent engine storage.
+                for bank in self.graphs.borrow_mut().iter_mut() { bank.cache_clear_drained(); }
+                Ok(())
             },
             finish: |drained| {
                 self.terminal.set(if drained { TerminalState::Drained } else { TerminalState::Retained });
@@ -1915,6 +2215,38 @@ impl<'a> Qwen4Engine<'a> {
             },
         });
         crate::shared::decode_graph::fatal_drain(result, "Qwen submission shutdown"); Ok(())
+    }
+
+    /// Request-local cancellation (#1817, `pair::submit_recoverable`). A
+    /// host-gather timeout is raised at its consumer before that consumer
+    /// queued anything, but earlier layers of the step are already queued.
+    /// With one owner and coordinator-local experts they are plain stream work:
+    /// drop the step's unconsumed table tickets, drain the execution stream,
+    /// then the table's upload stream (returning its copied slots), and
+    /// observe the graph boundary a capture in the step may have opened.
+    /// TP2 and Spark layouts hold peer or Spark waits that only the terminal
+    /// abort words can release, so they refuse and retire as before (#1842).
+    fn cancel_submission(&self, kind: crate::shared::experts::rtx::pair::Recovery) -> Result<()> {
+        use crate::shared::experts::rtx::pair::Recovery;
+        if kind == Recovery::HostGather {
+            ensure!(self.gdn_banks.len() == 1 && self.hops.is_none()
+                && matches!(self.experts, None | Some(Experts::Local(_) | Experts::LocalExl3(_) | Experts::SharedOnly)),
+                "Qwen host-gather recovery needs one owner without peer or Spark work in flight");
+        }
+        drop(self.ple_pending.borrow_mut().take());
+        self.drain_state()?;
+        if let Some(ple) = &self.ple { ple.mapped().drain()?; }
+        // An early return skipped the step's own cursor resets; no later step may
+        // inherit a packed member view, unit slot offset or stale MTP terminal rows.
+        for slot in [&self.workspace, &self.mtp_prefill_workspace, &self.decode_workspace,
+            &self.peer_workspace, &self.peer_decode_workspace] {
+            if let Some(w) = slot.try_borrow()?.as_ref() {
+                w.table_view.set(None); w.row_offset.set(0); w.logit_offset.set(0); w.position.set(0);
+                w.units.set(false); w.terminal_valid.set(false);
+            }
+        }
+        self.last_stream_offset.set(0);
+        self.graph_completed()
     }
 
     pub(crate) fn drain_state(&self) -> Result<()> {
@@ -2038,8 +2370,13 @@ impl<'a> Qwen4Engine<'a> {
         }
     }
 
+    /// Per-step scratch of the executing step's workspace.
     fn alloc(&self, bytes: usize) -> Result<Dev<'a>> {
-        Ok(Rc::new(Allocation::new(Device { library: self.library, id: self.library.cuda_get_device()? }, bytes.max(256))?))
+        self.alloc_tagged(bytes, Tag::workspace("qwen4/step-workspace"))
+    }
+
+    fn alloc_tagged(&self, bytes: usize, tag: Tag) -> Result<Dev<'a>> {
+        Ok(Rc::new(Allocation::new(Device { library: self.library, id: self.library.cuda_get_device()? }, bytes.max(256), tag)?))
     }
 
     fn run(&self, name: &str, pointers: &[(&str, *mut c_void)], scalars: &[Scalar]) -> Result<()> {
@@ -2061,6 +2398,7 @@ impl<'a> Qwen4Engine<'a> {
 
     fn workspace_rows(&self, t: usize, decode: bool, logit_rows: usize, span: usize, terminal_rows: usize, units: usize)
         -> Result<Workspace<'a>> {
+        self.allow_workspace_creation()?;
         let _memory_scope = cuteafd_ffi::memory_ledger::scope("workspace");
         let h = self.cfg.hidden;
         let cap = if decode { "m64" } else { "m4096" };
@@ -2117,7 +2455,7 @@ impl<'a> Qwen4Engine<'a> {
                     let n = t * self.cfg.ple_rows();
                     let local = self.alloc(n * 8)?;
                     self.put(&local, &(0..n as i64).collect::<Vec<i64>>())?;
-                    Some((self.alloc(n * ple.row_bytes)?, local))
+                    Some((self.alloc_tagged(n * ple.row_bytes, Tag::staging("qwen4/ple-gather-rows"))?, local))
                 }
                 None => None,
             },
@@ -2146,12 +2484,16 @@ impl<'a> Qwen4Engine<'a> {
             argmax: self.alloc(logit_rows * 8)?,
             ids: self.alloc(tables.ids)?,
             select: self.alloc(logit_rows * 8)?,
-            logits_host: RefCell::new(HostAllocation::new(self.library, usize::try_from(host.logits)?)?),
+            logits_host: RefCell::new(HostAllocation::new(self.library,
+                usize::try_from(host.logits)?, Tag::staging("qwen4/logits-host"))?),
             staging: RefCell::new(crate::shared::token_table::RetainedUploads::new(
                 Device { library: self.library, id: self.library.cuda_get_device()? }, host.uploads)?),
+            // Target and MTP logits return to owner zero; peer workspaces never project.
             // SAFETY: the workspace buffer lives in the same struct and drops after the head.
-            head: unsafe { self.library.vocabulary_head_rows(head_workspace.buffer.ptr, h as u32, logit_rows as u32,
-                self.cfg.vocab_size as u32)? },
+            head: if self.active_owner.get() == 0 && matches!(self.weights.head, Qwen4Head::Bf16(_)) {
+                Some(unsafe { self.library.vocabulary_head_rows(head_workspace.buffer.ptr, h as u32, logit_rows as u32,
+                    self.cfg.vocab_size as u32, crate::shared::target_head::TargetHead::configured().native_mode())? })
+            } else { None },
             _head_workspace: head_workspace,
         })
     }
@@ -2301,8 +2643,8 @@ impl<'a> Qwen4Engine<'a> {
     pub fn prefill_device(&self, placement: &mut Qwen4Placement, tokens: &[u32], on_layer: LayerHook<'_>,
         forced: Forced<'_>, logit_rows: usize) -> Result<Option<DeviceLogits>> {
         if self.prefill_shape.is_some() && on_layer.is_none() && forced.is_none() {
-            return crate::shared::experts::rtx::pair::submit(|| self.require_live(), || self.shutdown_submission(),
-                || self.prefill_units(placement, tokens, logit_rows));
+            return crate::shared::experts::rtx::pair::submit_recoverable(|| self.require_live(), |kind| self.cancel_submission(kind), || self.shutdown_submission(),
+                |_| self.prefill_units(placement, tokens, logit_rows));
         }
         self.last_stream_offset.set(0);
         let (t, start) = (tokens.len(), placement.len);
@@ -2320,8 +2662,36 @@ impl<'a> Qwen4Engine<'a> {
         Ok(logits)
     }
 
+    pub(crate) fn prefill_scoring(&self, placement: &mut Qwen4Placement, tokens: &[u32], logit_rows: usize,
+        position: usize, probe: &crate::shared::probe::ProbeRef)
+        -> Result<Option<crate::shared::probe::ScoreLogits>> {
+        if logit_rows <= 1 || self.full_prefill_logits {
+            return Ok(self.prefill_device(placement, tokens, None, None, logit_rows)?
+                .map(crate::shared::probe::ScoreLogits::Device));
+        }
+        ensure!(logit_rows <= tokens.len(), "Qwen scoring logits extent");
+        crate::shared::experts::rtx::pair::submit_recoverable(|| self.require_live(), |kind| self.cancel_submission(kind), || self.shutdown_submission(), |_| {
+            let scoring = crate::shared::probe::ScoringRows { probe, position };
+            if self.prefill_shape.is_some() {
+                if self.prefill_units_with(placement, tokens, logit_rows, Some(scoring))?.is_none() { return Ok(None); }
+            } else {
+                if self.prefill_device(placement, tokens, None, None, 1)?.is_none() { return Ok(None); }
+                let workspace = self.workspace.borrow();
+                let w = workspace.as_ref().context("Qwen scoring workspace")?;
+                let (_, cur) = self.last_streams.get();
+                self.on_owner(0, || self.record_head(w, &w.streams[cur], tokens.len(), logit_rows, scoring))?;
+            }
+            Ok(Some(crate::shared::probe::ScoreLogits::Recorded))
+        })
+    }
+
     fn prefill_units(&self, placement: &mut Qwen4Placement, tokens: &[u32], logit_rows: usize)
         -> Result<Option<DeviceLogits>> {
+        self.prefill_units_with(placement, tokens, logit_rows, None)
+    }
+
+    fn prefill_units_with(&self, placement: &mut Qwen4Placement, tokens: &[u32], logit_rows: usize,
+        scoring: Option<crate::shared::probe::ScoringRows<'_>>) -> Result<Option<DeviceLogits>> {
         use crate::shared::prefill_pipeline::{sequence_units, run_prefill_units};
         let shape = self.prefill_shape.context("Qwen prefill unit shape")?.validate()?;
         ensure!(self.gdn_banks.len() == 1 && self.hops.is_none(),
@@ -2339,12 +2709,14 @@ impl<'a> Qwen4Engine<'a> {
         // Keep the cuts independent of wave count for same-cut identity checks.
         let mut units = sequence_units(t, shape.unit_rows as usize, 1, self.weights.layers.len())?;
         for unit in &mut units { unit.slot = unit.index % waves; }
+        let retained_rows = if scoring.is_some() { 1 } else { logit_rows };
         let replace = self.workspace.borrow().as_ref().is_none_or(|w| w.rows != shape.unit_rows as usize
-            || w.slot_rows != shape.slot_rows() as usize || w.logit_rows < logit_rows);
+            || w.slot_rows != shape.slot_rows() as usize || w.logit_rows < retained_rows);
         if replace {
+            self.allow_workspace_creation()?;
             self.drain_state()?;
             *self.workspace.borrow_mut() = Some(self.workspace_rows(shape.unit_rows as usize, false,
-                if self.full_prefill_logits { self.prefill_rows } else { logit_rows }, shape.slot_rows() as usize,
+                if self.full_prefill_logits { self.prefill_rows } else { retained_rows }, shape.slot_rows() as usize,
                 if self.weights.mtp.is_some() { self.prefill_rows } else { 0 }, shape.waves as usize)?);
             self.prepare_prefill_units()?;
         }
@@ -2359,7 +2731,7 @@ impl<'a> Qwen4Engine<'a> {
         let run = |transport: Option<&mut crate::shared::spark_waves::Waves<'_>>| {
             let mut hooks = UnitHooks { engine: self, transport, w, placement, tokens, tables: unit_tables, ple_batch,
                 current: vec![0; units.len()], entered: vec![false; units.len()],
-                pending: (0..units.len()).map(|_| None).collect(), logit_rows };
+                pending: (0..units.len()).map(|_| None).collect(), logit_rows, scoring };
             run_prefill_units(&mut hooks, &units, waves)
         };
         // Spark waves build, post and land on the link's exchange worker
@@ -2385,7 +2757,7 @@ impl<'a> Qwen4Engine<'a> {
             self.drain_partial_step()?;
             return Ok(None);
         }
-        Ok(Some(self.device_logits(w, logit_rows, false)))
+        Ok(Some(self.device_logits(w, retained_rows, false)))
     }
 
     pub(crate) fn configure_packing(&self, mode: crate::shared::prefill_packing::PackingMode) -> Result<()> {
@@ -2429,7 +2801,7 @@ impl<'a> Qwen4Engine<'a> {
         Qwen4Placement, super::speculate::MtpSeq>],
         on_logits: &mut dyn FnMut(usize, DeviceLogits) -> crate::shared::prefill_packing::MemberOutcome)
         -> Result<Vec<Result<()>>> {
-        crate::shared::experts::rtx::pair::submit(|| self.require_live(), || self.shutdown_submission(), || {
+        crate::shared::experts::rtx::pair::submit_recoverable(|| self.require_live(), |kind| self.cancel_submission(kind), || self.shutdown_submission(), |_| {
             ensure!(self.gdn_banks.len() == 1 && self.hops.is_none(), "packed Qwen requires one attention owner");
             let limits = self.packed_limits().context("Qwen packing limits")?;
             let segments = crate::shared::prefill_packing::plan(&sequences.iter()
@@ -2593,7 +2965,7 @@ impl<'a> Qwen4Engine<'a> {
             let media_rows: Vec<_> = sequences.iter().map(|(p, t)| (&**p, p.len, t.len())).collect();
             embedding_media(&media_rows)?
         } else { Default::default() };
-        let bucketed = self.startup_graphs && self.use_graphs && graphs && on_layer.is_none() && media.indices.is_empty();
+        let bucketed = self.use_graphs && self.graph_capture.get() && graphs && on_layer.is_none() && media.indices.is_empty();
         if bucketed {
             pad_decode_tables(&mut tables, &mut tokens, decode_bucket(rows, spec), self.ple.as_ref().map_or(0, |_| self.cfg.ple_rows()));
         }
@@ -2918,13 +3290,17 @@ impl<'a> Qwen4Engine<'a> {
 
     fn step(&self, tables: &Arc<StepTables>, tokens: &[u32], logit_rows: usize, on_layer: LayerHook<'_>,
         forced: Forced<'_>, media: &cuteafd_engine::media::MediaChunk, graphs: bool) -> Result<Option<DeviceLogits>> {
-        crate::shared::experts::rtx::pair::submit(|| self.require_live(), || self.shutdown_submission(),
-            || self.step_inner(tables, tokens, logit_rows, on_layer, forced, media, graphs))
+        crate::shared::experts::rtx::pair::submit_recoverable(|| self.require_live(), |kind| self.cancel_submission(kind), || self.shutdown_submission(), |_| {
+            let output = self.step_inner(tables, tokens, logit_rows, on_layer, forced, media, graphs)?;
+            self.graph_completed()?;
+            Ok(output)
+        })
     }
 
     fn step_inner(&self, tables: &Arc<StepTables>, tokens: &[u32], logit_rows: usize, mut on_layer: LayerHook<'_>,
         forced: Forced<'_>, media: &cuteafd_engine::media::MediaChunk, graphs: bool) -> Result<Option<DeviceLogits>> {
         self.last_stream_offset.set(0);
+        self.graph_cycle(tables);
         if let Some(w) = self.workspace.borrow().as_ref() {
             w.row_offset.set(0); w.logit_offset.set(0); w.units.set(false);
             w.terminal_valid.set(false);
@@ -2937,6 +3313,7 @@ impl<'a> Qwen4Engine<'a> {
         let (h, t) = (self.cfg.hidden, tables.kv_slots.len());
         let (slot, capacity) = if tables.decode { (&self.decode_workspace, DECODE_ROWS) } else { (&self.workspace, self.prefill_rows) };
         if slot.borrow().as_ref().is_some_and(|w| w.logit_rows < logit_rows || w.rows < capacity) {
+            self.allow_workspace_creation()?;
             *slot.borrow_mut() = None;
         }
         if slot.borrow().is_none() {
@@ -2969,7 +3346,8 @@ impl<'a> Qwen4Engine<'a> {
         // Streams start as four copies of the embedding.
         let row = h * 2;
         ensure!(tokens.len() == t, "{} tokens for a {t}-row step", tokens.len());
-        let graphed = graphs && self.use_graphs && tables.decode && on_layer.is_none() && forced.is_none() && media.indices.is_empty();
+        let graphed = graphs && self.use_graphs && self.graph_capture.get() && tables.decode
+            && on_layer.is_none() && forced.is_none() && media.indices.is_empty();
         self.stage_embedding(w, tokens, HC, &w.streams[0], graphed)?;
         self.inject_media(w, media, &tables.seq_first, &w.streams[0], t, HC)?;
         let rows = Scalar::I32(t as i32);
@@ -3067,6 +3445,7 @@ impl<'a> Qwen4Engine<'a> {
             self.on_owner(owner, || {
                 let slot = self.workspace_slot(owner, tables.decode)?;
                 if slot.borrow().as_ref().is_some_and(|w| w.logit_rows < logit_rows || w.rows < capacity) {
+                    self.allow_workspace_creation()?;
                     self.drain_state()?;
                     *slot.borrow_mut() = None;
                 }
@@ -3171,23 +3550,21 @@ impl<'a> Qwen4Engine<'a> {
         let n = layers.len();
         let hops = self.hops.as_ref().context("Qwen graph residual hops")?;
         let head = n == self.cfg.layers && logit_rows == t;
-        let real_rows = if self.startup_graphs {
-            tables.positions.iter().take_while(|&&position| position >= 0).count()
-        } else { t };
+        // Bucket tails are a contiguous masked suffix; expert batches keep native geometry.
+        let real_rows = tables.positions.iter().take_while(|&&position| position >= 0).count();
         ensure!(tables.positions[real_rows..].iter().all(|&position| position < 0), "Qwen decode mask tail");
         let expert_rows = Scalar::I32(i32::try_from(real_rows)?);
-        let key = |segment| GraphKey { segment, rows: t, spec: tables.spec, long: tables.long,
-            pool_width: tables.pool_width, page_stride: tables.page_stride, pool_stride: tables.pool_stride };
+        let key = |segment| GraphKey::new(segment, t, layers.get(segment).map(|layer| layer.attention), tables);
         let mut cur = [0; 2];
         for (index, layer) in layers.iter().enumerate() {
             let owner = self.state_map.layers[index].owner;
             let w = work[owner];
             let boundary = index > 0 && self.state_map.layers[index - 1].owner != owner;
             if boundary {
-                self.on_owner(0, || self.replay(key(n + 1), || {
+                self.on_owner(0, || {
                     let mut c = cur[0];
                     self.post(work[0], &mut c, rows)
-                }))?;
+                })?;
                 cur[0] ^= 1;
                 let ticket = hops.send(0, 0, work[0].streams[cur[0]].buffer.ptr, t)?;
                 let landed = hops.land(ticket)?;
@@ -3223,7 +3600,8 @@ impl<'a> Qwen4Engine<'a> {
                         Qwen4Attention::Full => self.full(w, index, layer, rows, "m64", tables)?,
                     }
                     self.post_pre(w, c, layer, "mlp", rows)?;
-                    if self.startup_graphs { Ok(()) } else { self.moe_front(w, index, layer, t, rows) }
+                    // Routed experts run between segments (and outside capture).
+                    Ok(())
                 })?;
                 if index == 0 || boundary { cur[owner] ^= 1; }
                 let clear_tail = |tail: std::ops::Range<usize>| -> Result<()> {
@@ -3231,13 +3609,15 @@ impl<'a> Qwen4Engine<'a> {
                     // SAFETY: suffix zeroing precedes graph consumption on the owner stream.
                     unsafe { self.library.cuda_zero_bytes_async(buffer, buffer.bytes, self.execution_stream()) }
                 };
-                if self.warming_graphs.get() { ensure!(real_rows == 0, "Qwen startup real expert rows"); clear_tail(0..t)?; }
-                else if self.startup_graphs {
+                if self.warming_graphs.get() {
+                    ensure!(real_rows == 0, "Qwen prewarm MoE rows must all be masked");
+                    clear_tail(0..t)?;
+                } else {
                     real_row_moe(real_rows, t, |real| {
                         self.moe_front(w, index, layer, real, expert_rows)?;
                         self.moe_experts(w, index, real, expert_rows, true)
                     }, clear_tail)?;
-                } else { self.moe_experts(w, index, t, rows, true)?; }
+                }
                 Ok(())
             })?;
             if !self.warming_graphs.get() {
@@ -3245,10 +3625,10 @@ impl<'a> Qwen4Engine<'a> {
                 self.on_owner(self.state_map.layers[index].owner, || self.probe_layer(w, index, real_rows))?;
             }
         }
-        self.on_owner(1, || self.replay(key(n + 2), || {
+        self.on_owner(1, || {
             let mut c = cur[1];
             self.post(work[1], &mut c, rows)
-        }))?;
+        })?;
         cur[1] ^= 1;
         let ticket = hops.send(1, 0, work[1].streams[cur[1]].buffer.ptr, t)?;
         let landed = hops.land(ticket)?;
@@ -3257,13 +3637,12 @@ impl<'a> Qwen4Engine<'a> {
             let src = cuteafd_ffi::CuteafdDeviceBuffer { ptr: landed, ..dst };
             // SAFETY: exit land precedes persistent root stream copy/head graph.
             unsafe { crate::shared::memory::device::copy_device_ordered(self.library, dst, src, t * HC * self.cfg.hidden * 2, self.execution_stream())?; }
-            self.replay(key(n), || {
-                if head {
+            if head {
+                self.replay(key(n), || {
                     self.head(work[0], &work[0].streams[cur[0]], t, rows, t)?;
-                    self.select_greedy(work[0], t)?;
-                }
-                Ok(())
-            })?;
+                    self.select_greedy(work[0], t)
+                })?;
+            }
             self.last_streams.set((true, cur[0]));
             if n < self.cfg.layers { self.drain_partial_step()?; return Ok(None); }
             if !head { self.head(work[0], &work[0].streams[cur[0]], t, rows, logit_rows)?; }
@@ -3273,16 +3652,35 @@ impl<'a> Qwen4Engine<'a> {
 
     /// The stream mixer and lm_head over the last `logit_rows` rows, and with
     /// `greedy` the rows' greedy tokens into `select` (decode graphs).
-    fn head(&self, w: &Workspace<'_>, streams: &Dev<'_>, t: usize, rows: Scalar, logit_rows: usize) -> Result<()> {
-        let h = self.cfg.hidden;
+    fn mix_head(&self, w: &Workspace<'_>, streams: &Dev<'_>, rows: Scalar) -> Result<()> {
         let [norm, down, up] = &self.weights.mixer;
         self.run("qwen4_head", &[("streams", w.live(streams, HC * self.cfg.hidden * 2)), ("norm", norm.buffer.ptr),
             ("w_down", down.buffer.ptr), ("w_up", up.buffer.ptr), ("out", w.live(&w.x, self.cfg.hidden * 2)),
-            ("scratch", w.scratch.buffer.ptr)], &[rows])?;
+            ("scratch", w.scratch.buffer.ptr)], &[rows])
+    }
+
+    fn head(&self, w: &Workspace<'_>, streams: &Dev<'_>, t: usize, rows: Scalar, logit_rows: usize) -> Result<()> {
+        self.mix_head(w, streams, rows)?;
         ensure!(logit_rows <= t, "{logit_rows} logits rows of a {t}-row step");
-        // SAFETY: row t - logit_rows of the [t, H] mixer output lies inside `x`.
-        let x = unsafe { w.live(&w.x, self.cfg.hidden * 2).cast::<u8>().add((t - logit_rows) * h * 2) }.cast();
+        let x = w.live(&w.x, self.cfg.hidden * 2).cast::<u8>()
+            .wrapping_add((t - logit_rows) * self.cfg.hidden * 2).cast();
         self.logits(w, x, logit_rows)
+    }
+
+    fn record_head(&self, w: &Workspace<'_>, streams: &Dev<'_>, rows: usize, logit_rows: usize,
+        scoring: crate::shared::probe::ScoringRows<'_>) -> Result<()> {
+        ensure!(logit_rows > 0 && logit_rows <= rows, "Qwen scoring head extent");
+        self.mix_head(w, streams, Scalar::I32(i32::try_from(rows)?))?;
+        // The ordinary prefill plane can be just one row. Consume each tile
+        // before reuse without growing that admitted plane or changing unit cuts.
+        w.logit_offset.set(0);
+        for span in crate::shared::probe::head_spans(logit_rows, w.logit_rows.min(DECODE_ROWS))? {
+            let x = w.live(&w.x, self.cfg.hidden * 2).cast::<u8>()
+                .wrapping_add((rows - logit_rows + span.start) * self.cfg.hidden * 2).cast();
+            self.logits(w, x, span.len())?;
+            scoring.record(self.library, span.start, &self.device_logits(w, span.len(), false))?;
+        }
+        Ok(())
     }
 
     /// FP32 logits of `rows` BF16 head inputs at `x` (rows of `[*, H]`) into the
@@ -3297,7 +3695,7 @@ impl<'a> Qwen4Engine<'a> {
         match &self.weights.head {
             // SAFETY: `x` holds `rows` head inputs; the head and the logits rows are live buffers of these shapes.
             Qwen4Head::Bf16(head) => unsafe {
-                crate::shared::target_head::launch(crate::shared::target_head::TargetHead::configured(), &w.head,
+                crate::shared::target_head::launch(crate::shared::target_head::TargetHead::configured(), w.head.as_ref().context("BF16 head not constructed")?,
                     x.cast_const(), head.buffer.ptr.cast_const(), Self::region(&w.logits, w.logit_offset.get() * vocab * 4, rows * vocab * 4).ptr.cast(), rows, self.execution_stream())
             },
             Qwen4Head::Fp8 { values, scales } => {
@@ -3358,21 +3756,18 @@ impl<'a> Qwen4Engine<'a> {
         let head = layers.len() == self.cfg.layers && logit_rows == t;
         let gather = self.embedding.device_gather();
         // Bucket tails are a contiguous suffix; expert batches must retain native geometry.
-        let real_rows = if self.startup_graphs {
-            tables.positions.iter().take_while(|&&position| position >= 0).count()
-        } else { t };
+        let real_rows = tables.positions.iter().take_while(|&&position| position >= 0).count();
         ensure!(tables.positions[real_rows..].iter().all(|&position| position < 0),
             "Qwen decode mask is not a contiguous tail");
         let expert_rows = Scalar::I32(real_rows as i32);
         let mut cur = 0usize;
         for index in 0..=layers.len() {
-            let key = GraphKey { segment: index, rows: t, spec: tables.spec, long: tables.long, pool_width: tables.pool_width,
-                page_stride: tables.page_stride, pool_stride: tables.pool_stride };
+            let key = GraphKey::new(index, t, layers.get(index).map(|layer| layer.attention), tables);
             let start = cur;
             if self.cfg.ple_layers.contains(&index) {
                 self.finish_ple(w)?;
             }
-            self.replay(key, || -> Result<()> {
+            let segment = || -> Result<()> {
                 let mut c = start;
                 let Some(layer) = layers.get(index) else {
                     self.post(w, &mut c, rows)?;
@@ -3402,34 +3797,32 @@ impl<'a> Qwen4Engine<'a> {
                     Qwen4Attention::Full => self.full(w, index, layer, rows, "m64", tables)?,
                 }
                 self.post_pre(w, c, layer, "mlp", rows)?;
-                if self.startup_graphs { Ok(()) } else { self.moe_front(w, index, layer, t, rows) }
-            })?;
+                // Routed experts run between segments (and outside capture).
+                Ok(())
+            };
+            if index == layers.len() && !head { segment()?; } else { self.replay(key, segment)?; }
             cur ^= if index == 0 || index == layers.len() { 1 } else { 0 };
             if index < layers.len() {
-                if self.startup_graphs {
-                    let clear_tail = |tail: std::ops::Range<usize>| -> Result<()> {
-                        let tail = Self::region(&w.delta, tail.start * self.cfg.hidden * 2,
-                            tail.len() * self.cfg.hidden * 2);
-                        // SAFETY: the masked suffix is inside persistent delta; the next graph
-                        // consumes it on this same stream after the zero and expert output.
-                        unsafe { self.library.cuda_zero_bytes_async(tail, tail.bytes, self.execution_stream()) }
-                    };
-                    if self.warming_graphs.get() {
-                        ensure!(real_rows == 0, "Qwen startup MoE rows must all be masked");
-                        clear_tail(0..t)?;
-                    } else {
-                        real_row_moe(real_rows, t, |real_rows| {
-                            self.moe_front(w, index, &layers[index], real_rows, expert_rows)?;
-                            self.moe_experts(w, index, real_rows, expert_rows, true)
-                        }, clear_tail)?;
-                    }
-                } else if !self.warming_graphs.get() {
-                    self.moe_experts(w, index, t, rows, true)?;
+                let clear_tail = |tail: std::ops::Range<usize>| -> Result<()> {
+                    let tail = Self::region(&w.delta, tail.start * self.cfg.hidden * 2,
+                        tail.len() * self.cfg.hidden * 2);
+                    // SAFETY: the masked suffix is inside persistent delta; the next graph
+                    // consumes it on this same stream after the zero and expert output.
+                    unsafe { self.library.cuda_zero_bytes_async(tail, tail.bytes, self.execution_stream()) }
+                };
+                if self.warming_graphs.get() {
+                    ensure!(real_rows == 0, "Qwen prewarm MoE rows must all be masked");
+                    clear_tail(0..t)?;
+                } else {
+                    real_row_moe(real_rows, t, |real_rows| {
+                        self.moe_front(w, index, &layers[index], real_rows, expert_rows)?;
+                        self.moe_experts(w, index, real_rows, expert_rows, true)
+                    }, clear_tail)?;
                 }
                 if !self.warming_graphs.get() {
-                crate::shared::console::layer_mark(index);
-                self.on_owner(self.state_map.layers[index].owner, || self.probe_layer(w, index, real_rows))?;
-            }
+                    crate::shared::console::layer_mark(index);
+                    self.on_owner(self.state_map.layers[index].owner, || self.probe_layer(w, index, real_rows))?;
+                }
             }
         }
         self.last_streams.set((true, cur));
@@ -3443,41 +3836,108 @@ impl<'a> Qwen4Engine<'a> {
         Ok(Some(self.device_logits(w, logit_rows, head)))
     }
 
-    fn replay(&self, key: GraphKey, segment: impl FnOnce() -> Result<()>) -> Result<()> {
+    fn replay(&self, key: GraphKey, segment: impl Fn() -> Result<()>) -> Result<()> {
         self.require_live()?;
-        if let Some(graph) = self.graphs.borrow().get(&key) {
+        let owner = self.active_owner.get();
+        if let Some(graph) = self.graphs.borrow_mut()[owner].cached_launch(&key).map(|graph| graph.0) {
             // SAFETY: the graph's pointers are persistent engine buffers.
-            unsafe { self.library.cuda_graph_launch(graph.0, self.execution_stream())?; }
-            if self.cfg.ple_layers.contains(&key.segment) {
-                if let Some(ple) = &self.ple {
-                    // SAFETY: this replay contains the PLE reader; no later layer is queued yet.
-                    unsafe { ple.mapped().consumed(self.execution_stream())?; }
-                }
-            }
-            return Ok(());
+            unsafe { self.library.cuda_graph_launch(graph, self.execution_stream())?; }
+            return self.ple_consumed(&key);
         }
-        ensure!(!self.startup_graphs || self.warming_graphs.get(),
-            "Qwen serving graph was not captured at startup: {key:?}");
+        // Graphs unconfigured, or a step before the prewarm: run the segment
+        // ungraphed without recording a miss.
+        if !self.graph_capture.get() || (!self.graph_warmed.get() && !self.warming_graphs.get()) {
+            segment()?;
+            return self.ple_consumed(&key);
+        }
+        let pinned = self.graph_pinned(&key);
+        let ticket = self.graphs.borrow_mut()[owner].cache_ticket(&key, pinned, None);
+        let Some(ticket) = ticket else {
+            // The policy ran it eagerly (reserve/headroom or no headroom counted):
+            // record the shape once so the next trace can add it.
+            if !self.warming_graphs.get() { self.miss_graph(key); }
+            segment()?;
+            return self.ple_consumed(&key);
+        };
         // SAFETY: capture records this stream's launches; nothing in a segment
         // synchronizes the host or allocates.
-        unsafe { self.library.cuda_graph_begin_capture(self.execution_stream())? };
+        if let Err(error) = unsafe { self.library.cuda_graph_begin_capture(self.execution_stream()) } {
+            if self.graphs.borrow_mut()[owner].cache_ticket_failed(ticket, &error) {
+                tracing::warn!(%error, "Qwen graph capture unavailable; running eagerly");
+            }
+            segment()?;
+            return self.ple_consumed(&key);
+        }
         let captured = segment();
         // SAFETY: ends the capture begun above on the same stream.
-        let device = Device { library: self.library, id: self.library.cuda_get_device()? };
-        let exec = unsafe { self.library.cuda_graph_end_capture(self.execution_stream()) }
-            .map(|exec| GraphExec(exec, device));
-        captured?;
-        let exec = exec?;
+        let exec = unsafe { self.library.cuda_graph_end_capture_topology(self.execution_stream()) };
+        if let Err(error) = captured {
+            self.graphs.borrow_mut()[owner].cache_ticket_failed(ticket, exec.as_ref().err().unwrap_or(&error));
+            if let Ok((raw, _, _, _, _)) = exec {
+                // SAFETY: the unlaunched executable owns no queued work.
+                unsafe { let _ = self.library.cuda_graph_exec_destroy(raw); }
+            }
+            return Err(error);
+        }
+        let (raw, nodes, width, spans_devices, inspection_error) = match exec {
+            Ok(info) => info,
+            Err(error) => {
+                if self.graphs.borrow_mut()[owner].cache_ticket_failed(ticket, &error) {
+                    tracing::warn!(%error, "Qwen graph instantiation unavailable; running eagerly");
+                }
+                segment()?;
+                return self.ple_consumed(&key);
+            }
+        };
+        if let Some(error) = inspection_error {
+            static WARNED: std::sync::Once = std::sync::Once::new();
+            WARNED.call_once(|| tracing::warn!(site = "qwen4.segment", %error,
+                "graph topology unknown; retaining executable without chain reuse"));
+        }
+        crate::shared::decode_graph::census::capture_key("qwen4", "decode",
+            self.graphs.as_ptr() as usize, owner as i32, Some(0), &key, raw);
+        let graph = GraphExec(raw, Device { library: self.library, id: self.library.cuda_get_device()? });
+        self.graphs.borrow_mut()[owner].cache_commit(key, graph, ticket, nodes as u64, width, spans_devices);
+        let graph = self.graphs.borrow()[owner].get(&key).context("inserted Qwen graph")?.0;
         // SAFETY: the new graph reads and writes persistent engine buffers.
-        unsafe { self.library.cuda_graph_launch(exec.0, self.execution_stream())? };
-        self.graphs.borrow_mut().insert(key, exec);
+        unsafe { self.library.cuda_graph_launch(graph, self.execution_stream())?; }
+        self.ple_consumed(&key)
+    }
+
+    /// The PLE reader of a graphed layer segment has just been launched: its
+    /// mapped rows are consumed, and no later layer is queued yet.
+    fn ple_consumed(&self, key: &GraphKey) -> Result<()> {
         if self.cfg.ple_layers.contains(&key.segment) {
             if let Some(ple) = &self.ple {
-                // SAFETY: newly launched PLE segment owns the current destination.
+                // SAFETY: this segment is the last work queued on the stream.
                 unsafe { ple.mapped().consumed(self.execution_stream())?; }
             }
         }
         Ok(())
+    }
+
+    /// Whether the resolved shape's prewarm pins this key.
+    fn graph_pinned(&self, key: &GraphKey) -> bool {
+        let attention = self.weights.layers.get(key.segment).map(|layer| layer.attention);
+        self.graph_pins.borrow().iter().any(|shape| {
+            let tables = StepTables { spec: shape.spec, long: shape.long,
+                page_width: shape.page_stride, page_stride: shape.page_stride,
+                pool_stride: shape.pool_stride, ..Default::default() };
+            GraphKey::new(key.segment, shape.rows, attention, &tables) == *key
+        })
+    }
+
+    /// Record and warn about one ungraphed decode shape. The warning names the
+    /// family, the shape key and the engine's request context exactly once per
+    /// variant; every occurrence joins the process-wide `/v1/stats`
+    /// `graph_missing_variants` inventory that `probe::graph_capture_stats`
+    /// publishes.
+    fn miss_graph(&self, key: GraphKey) {
+        let variant = format!("rows={} spec={} head={} long={} page_width={} page_stride={} pool_stride={}",
+            key.rows, key.spec, key.head, key.long, key.page_width, key.page_stride, key.pool_stride);
+        crate::shared::decode_graph::note_eager("qwen4", &variant, || format!(
+            "segment={} max_context={} slots={} pages={}",
+            key.segment, self.max_context, self.slots, self.pages));
     }
 
     fn site<'l>(layer: &'l Qwen4Layer<'_>, site: &str) -> Result<[*mut c_void; 3]> {
@@ -3985,6 +4445,7 @@ struct UnitHooks<'e, 'w, 'p, 't, 'a, 'r, 'n> {
     entered: Vec<bool>,
     pending: Vec<Option<crate::shared::mapped_table::PendingRows>>,
     logit_rows: usize,
+    scoring: Option<crate::shared::probe::ScoringRows<'t>>,
 }
 
 impl UnitHooks<'_, '_, '_, '_, '_, '_, '_> {
@@ -4101,8 +4562,14 @@ impl crate::shared::prefill_pipeline::PrefillHooks for UnitHooks<'_, '_, '_, '_,
         let first = self.tokens.len() - self.logit_rows;
         let count = unit.rows.end.saturating_sub(unit.rows.start.max(first));
         if count > 0 && engine.weights.layers.len() == engine.cfg.layers {
-            self.w.logit_offset.set(unit.rows.start.max(first) - first);
-            engine.head(self.w, &self.w.streams[cur], unit.rows.len(), Scalar::I32(unit.rows.len() as i32), count)?;
+            let offset = unit.rows.start.max(first) - first;
+            if let Some(scoring) = self.scoring {
+                engine.record_head(self.w, &self.w.streams[cur], unit.rows.len(), count,
+                    crate::shared::probe::ScoringRows { position: scoring.position + offset, ..scoring })?;
+            } else {
+                self.w.logit_offset.set(offset);
+                engine.head(self.w, &self.w.streams[cur], unit.rows.len(), Scalar::I32(unit.rows.len() as i32), count)?;
+            }
         }
         engine.last_streams.set((false, cur));
         Ok(())
@@ -4122,10 +4589,73 @@ fn validate_prefill_span(rows: usize, start: usize, admitted_span: usize, max_co
 }
 
 #[cfg(test)]
+mod gather_recovery_tests {
+    /// #1817: every Qwen submission boundary takes the request-local path,
+    /// and host-gather recovery is refused unless one owner holds no peer or
+    /// Spark work (TP2 and Spark retire terminally; #1842).
+    #[test]
+    fn qwen_boundaries_recover_host_gathers_only_without_peer_or_spark_work() {
+        let source = include_str!("engine.rs");
+        let body = source.split("\n#[cfg(test)]\nmod gather_recovery_tests").next().unwrap();
+        assert!(!body.contains("pair::submit(") && !body.contains("pair::submit_scoped("));
+        assert_eq!(body.matches("pair::submit_recoverable(|| self.require_live(), |kind| self.cancel_submission(kind), || self.shutdown_submission(),").count(), 4);
+        let cancel = body.split("    fn cancel_submission(").nth(1).unwrap().split("    pub(crate) fn drain_state(").next().unwrap();
+        assert!(cancel.contains("self.gdn_banks.len() == 1 && self.hops.is_none()"));
+        assert!(cancel.contains("None | Some(Experts::Local(_) | Experts::LocalExl3(_) | Experts::SharedOnly)"));
+        assert!(!cancel.contains("Experts::Tp2") && !cancel.contains("Experts::Spark"));
+        // Drop tickets, drain the consumers, then the table's own copies, then the graph boundary.
+        let order = ["self.ple_pending.borrow_mut().take()", "self.drain_state()?", "ple.mapped().drain()?",
+            "w.terminal_valid.set(false)", "self.graph_completed()"];
+        let at: Vec<_> = order.iter().map(|needle| cancel.find(needle).unwrap_or_else(|| panic!("{needle}"))).collect();
+        assert!(at.windows(2).all(|pair| pair[0] < pair[1]), "cancellation order {at:?}");
+    }
+}
+
+#[cfg(test)]
 mod prefill_unit_tests {
     use super::*;
     use crate::shared::prefill_pipeline::{prefill_schedule, sequence_units, FfnRoute, Step};
     use std::ops::Range;
+
+    #[test]
+    fn streamed_head_tiles_respect_the_existing_one_row_plane() -> Result<()> {
+        for rows in [1usize, 63, 64, 65, 511, 4096, 8192] {
+            for wanted in [1, rows.div_ceil(2), rows] {
+                for capacity in [1, 64] {
+                    let first = rows - wanted;
+                    let mut positions = Vec::new();
+                    for unit in sequence_units(rows, 2048, 1, 2)? {
+                        let begin = unit.rows.start.max(first);
+                        let count = unit.rows.end.saturating_sub(begin);
+                        if count == 0 { continue; }
+                        for span in crate::shared::probe::head_spans(count, capacity)? {
+                            assert!(span.len() <= capacity);
+                            positions.extend(span.map(|row| 1000 + begin - first + row));
+                        }
+                    }
+                    assert_eq!(positions, (1000..1000 + wanted).collect::<Vec<_>>());
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn streamed_scoring_preserves_units_and_consumes_head_before_reuse() {
+        let source = include_str!("engine.rs");
+        let units = source.split_once("    fn prefill_units_with(").unwrap().1
+            .split_once("    pub(crate) fn configure_packing").unwrap().0;
+        assert!(units.contains("let retained_rows = if scoring.is_some() { 1 } else { logit_rows }"));
+        assert!(units.contains("sequence_units(t, shape.unit_rows as usize, 1, self.weights.layers.len())"));
+        let head = source.split_once("    fn record_head(").unwrap().1.split_once("    /// FP32 logits").unwrap().0;
+        assert!(head.contains("head_spans(logit_rows, w.logit_rows.min(DECODE_ROWS))"));
+        assert!(head.find("self.mix_head").unwrap() < head.find("head_spans").unwrap());
+        assert!(head.find("self.logits(").unwrap() < head.find("scoring.record(").unwrap());
+        assert!(!head.contains("workspace("));
+        let hooks = source.split_once("struct UnitHooks<").unwrap().1
+            .split_once("fn validate_prefill_span(").unwrap().0;
+        assert!(hooks.contains("engine.record_head(self.w, &self.w.streams[cur]"));
+    }
 
     #[test]
     fn unit_tables_keep_absolute_addresses_and_reset_sequence_rows() -> Result<()> {

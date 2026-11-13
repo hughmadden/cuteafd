@@ -17,6 +17,7 @@
 #[path = "dense/records.rs"]
 mod records;
 pub(crate) use records::*;
+use crate::shared::memory::Tag;
 use crate::shared::memory::{device::Device, push_consumer::PushDestination,
     weight_arena::{Coverage, ExpectedCoverage}, HostAllocation};
 use crate::shared::fp8_load_quant::LoadKernels;
@@ -45,14 +46,12 @@ pub(crate) struct HostStaging {
 }
 
 impl HostStaging {
-    /// Bound retained transforms from the receiver ring, not the source's send
-    /// concurrency. A missing slot retains its payload plus at most two boundary
-    /// steps. Each file may additionally hold one step at its stream frontier.
-    /// Mixed-file or overlapping source intervals cannot use this argument;
-    /// charge their entire footprint separately.
+    /// Bound open transforms and their reusable pool from the receiver ring.
+    /// Overlapping source windows multiply the ring/frontier bound by their
+    /// simultaneous fanout, not the footprint of a transitively overlapping chain.
+    /// Cross-file transforms still charge their entire footprint separately.
     pub fn for_steps<'s>(steps: impl IntoIterator<Item = &'s [Rect]>, table_bytes: usize) -> Result<Self> {
-        use std::collections::{BTreeMap, BTreeSet};
-        let mut files = BTreeSet::new();
+        use std::collections::BTreeMap;
         let mut extents = BTreeMap::<std::path::PathBuf, Vec<(u64, u64, usize)>>::new();
         let (mut total, mut fallback, mut largest) = (0usize, 0usize, 0usize);
         for rects in steps {
@@ -60,47 +59,54 @@ impl HostStaging {
                 .context("dense step size overflow"))?;
             total = total.checked_add(bytes).context("dense staging footprint overflow")?;
             largest = largest.max(bytes);
-            let mut contiguous = !rects.is_empty();
+            let mut same_file = !rects.is_empty();
+            let mut start = u64::MAX;
             let mut end = 0;
             for (i, rect) in rects.iter().enumerate() {
                 ensure!(!rect.rows.is_empty() && !rect.cols.is_empty() && rect.cols.end <= rect.row_bytes,
                     "invalid staged rectangle");
                 let first = rect.base.checked_add((rect.rows.start * rect.row_bytes + rect.cols.start) as u64)
                     .context("dense source start overflow")?;
-                if i > 0 && (rect.path != rects[0].path || first != end) { contiguous = false; }
-                end = rect.base.checked_add(((rect.rows.end - 1) * rect.row_bytes + rect.cols.end) as u64)
-                    .context("dense source end overflow")?;
+                if i > 0 && rect.path != rects[0].path { same_file = false; }
+                start = start.min(first);
+                end = end.max(rect.base.checked_add(((rect.rows.end - 1) * rect.row_bytes + rect.cols.end) as u64)
+                    .context("dense source end overflow")?);
             }
-            if contiguous {
-                let rect = &rects[0];
-                files.insert(rect.path.clone());
-                let first = rect.base + (rect.rows.start * rect.row_bytes + rect.cols.start) as u64;
-                extents.entry(rect.path.clone()).or_default().push((first, end, bytes));
+            if same_file {
+                // A strided or multi-rectangle transform stays open throughout
+                // its source envelope; holes can only make this bound larger.
+                extents.entry(rects[0].path.clone()).or_default().push((start, end, bytes));
             } else {
                 fallback = fallback.checked_add(bytes).context("dense fallback staging overflow")?;
             }
         }
-        // Any overlapping intervals are conservatively charged in full. Such
-        // steps may remain open while all later source rows are delivered.
-        for entries in extents.values_mut() {
-            entries.sort_unstable_by_key(|entry| entry.0);
-            let (mut end, mut group_bytes, mut count) = (0, 0usize, 0usize);
-            for &(first, last, bytes) in entries.iter() {
-                if first >= end {
-                    if count > 1 { fallback = fallback.checked_add(group_bytes).context("dense overlap staging overflow")?; }
-                    group_bytes = 0;
-                    count = 0;
-                }
-                group_bytes = group_bytes.checked_add(bytes).context("dense overlap footprint overflow")?;
-                count += 1;
-                end = end.max(last);
+        let (mut fanout, mut frontiers) = (0usize, 0usize);
+        for entries in extents.values() {
+            // End events precede starts: touching half-open windows do not overlap.
+            let mut events = Vec::with_capacity(entries.len() * 2);
+            for &(first, last, bytes) in entries {
+                events.push((first, true, bytes));
+                events.push((last, false, bytes));
             }
-            if count > 1 { fallback = fallback.checked_add(group_bytes).context("dense overlap staging overflow")?; }
+            events.sort_unstable();
+            let (mut active, mut bytes, mut peak) = (0usize, 0usize, 0usize);
+            for (_, start, size) in events {
+                if start {
+                    active += 1;
+                    bytes = bytes.checked_add(size).context("dense overlap staging overflow")?;
+                    fanout = fanout.max(active);
+                    peak = peak.max(bytes);
+                } else { active -= 1; bytes -= size; }
+            }
+            frontiers = frontiers.checked_add(peak).context("dense frontier staging overflow")?;
         }
+        // A delayed ring slot can strand windows on either side of its source
+        // interval for each overlapping recipe. Completed buffers stay in the
+        // pool only while the same bound has room; allocation evicts them first.
         let window = cuteafd_ffi::push_ring::DEFAULT_SLOT_BYTES.checked_add(largest.checked_mul(2)
             .context("dense boundary staging overflow")?).and_then(|bytes|
-                bytes.checked_mul(cuteafd_ffi::push_ring::DEFAULT_SLOTS)).context("dense ring staging overflow")?;
-        let frontiers = files.len().checked_mul(largest).context("dense frontier staging overflow")?;
+                bytes.checked_mul(cuteafd_ffi::push_ring::DEFAULT_SLOTS)).and_then(|bytes|
+                bytes.checked_mul(fanout)).context("dense ring staging overflow")?;
         let staging_bytes = fallback.checked_add(window).and_then(|bytes| bytes.checked_add(frontiers))
             .context("dense pinned staging overflow")?.min(total);
         let bound = Self { staging_bytes, largest_step: largest, table_bytes };
@@ -117,6 +123,7 @@ pub(crate) struct RankLayout {
     pub device: i32,
     /// (logical start, operand), ascending, device space `[0, base)`.
     pub operands: Vec<(u64, Operand)>,
+    pub host_operands: Vec<(u64, HostOperand)>,
     /// (start relative to `base`, step), ascending.
     pub steps: Vec<(u64, Step)>,
     pub base: u64,
@@ -191,6 +198,7 @@ impl RankLayout {
                     // BF16 -> F32 input, coefficient pairs, then two output vectors.
                     Job::ResidualGate { .. } => step.bytes().checked_mul(10)
                         .context("residual coefficient host scratch overflow")?,
+                    Job::NarrowI64I32 { .. } => 4,
                     Job::ScaleCodes { .. } => crate::shared::fp8_load_quant::scale_code_table_bytes(1)?,
                     _ => 0,
                 };
@@ -199,8 +207,18 @@ impl RankLayout {
         }
         let host_staging = HostStaging::for_steps(staged.iter().map(|(_, step)| step.rects.as_slice()), table_bytes)?;
         host_staging.bytes()?;
-        Ok(Self { device, operands: placed, steps: staged, base, host_bytes: if cursor == 0 { 0 } else { cursor },
+        Ok(Self { device, host_operands: Vec::new(), operands: placed, steps: staged, base, host_bytes: if cursor == 0 { 0 } else { cursor },
             finishes: Vec::new(), host_staging })
+    }
+
+    pub fn with_hosts(mut self, hosts: Vec<HostOperand>) -> Result<Self> {
+        for host in hosts {
+            ensure!(host.device == self.device, "host operand belongs to another receiver");
+            let at = self.host_bytes.next_multiple_of(256);
+            self.host_bytes = at.checked_add(host.rect.bytes() as u64 + 1).context("host landing overflow")?;
+            self.host_operands.push((at, host));
+        }
+        Ok(self)
     }
 
     /// [`Self::new`] with `device`'s finishes from `finishes`.
@@ -215,11 +233,13 @@ impl RankLayout {
         let operands: Vec<(u64, Vec<(Rect, usize)>)> = self.operands.iter()
             .map(|(start, o)| (*start, o.lands.clone())).collect();
         let steps: Vec<(u64, Vec<Rect>)> = self.steps.iter().map(|(start, s)| (*start, s.rects.clone())).collect();
+        let hosts = self.host_operands.iter().map(|(at, host)| (*at, host.rect.clone())).collect::<Vec<_>>();
         super::push::DensePlan { base: self.base, host_bytes: self.host_bytes, host_staging: self.host_staging, peer_copies: Vec::new(),
             append: Box::new(move |builder, rank, host_base| {
                 for (start, lands) in &operands {
                     for (rect, at) in lands { append(rect, builder, rank, start + *at as u64)?; }
                 }
+                for (at, rect) in &hosts { append(rect, builder, rank, host_base + at)?; }
                 for (start, rects) in &steps {
                     let mut at = host_base + start;
                     for rect in rects { append(rect, builder, rank, at)?; at += rect.bytes() as u64; }
@@ -289,6 +309,15 @@ impl<'a> DenseArena<'a> {
         Ok((operand.buffer, at))
     }
 
+    fn host(&self, offset: u64, bytes: u64) -> Option<(&HostOperand, usize)> {
+        let relative = offset.checked_sub(self.layout.base)?;
+        let index = self.layout.host_operands.partition_point(|(start, _)| *start <= relative).checked_sub(1)?;
+        let (start, host) = &self.layout.host_operands[index];
+        let at = usize::try_from(relative - start).ok()?;
+        at.checked_add(usize::try_from(bytes).ok()?).filter(|&end| end <= host.rect.bytes())?;
+        Some((host, at))
+    }
+
     fn step(&self, offset: u64, bytes: u64) -> Result<(usize, usize)> {
         let relative = offset.checked_sub(self.layout.base).context("host fragment below the steps")?;
         let index = self.layout.steps.partition_point(|(start, _)| *start <= relative).checked_sub(1)
@@ -315,6 +344,9 @@ impl Drop for DenseArena<'_> {
 }
 
 impl PushDestination for DenseArena<'_> {
+    fn host_ready(&self) -> Vec<std::sync::Arc<std::sync::atomic::AtomicBool>> {
+        self.layout.host_operands.iter().map(|(_, host)| host.landing.ready.clone()).collect()
+    }
     type Delivered = ();
     fn belongs_to(&self, device: Device<'_>) -> bool {
         self.device.id == device.id && std::ptr::eq(self.device.library, device.library)
@@ -323,7 +355,7 @@ impl PushDestination for DenseArena<'_> {
     fn device_bytes(&self) -> usize { self.layout.base as usize }
     fn check_fragment(&self, offset: u64, bytes: u64) -> Result<()> {
         ensure!(bytes > 0 && self.expected.contains(offset, bytes), "fragment outside checked footprint");
-        if offset < self.layout.base { self.operand(offset, bytes).map(|_| ()) } else { self.step(offset, bytes).map(|_| ()) }
+        if offset < self.layout.base { self.operand(offset, bytes).map(|_| ()) } else if self.host(offset, bytes).is_some() { Ok(()) } else { self.step(offset, bytes).map(|_| ()) }
     }
     fn destination(&self, offset: usize, bytes: usize) -> Result<CuteafdDeviceBuffer> {
         let (buffer, at) = self.operand(offset as u64, bytes as u64)?;
@@ -333,6 +365,10 @@ impl PushDestination for DenseArena<'_> {
     fn copy_validation(&mut self, offset: u64, bytes: &[u8]) -> Result<()> {
         let length = bytes.len() as u64;
         ensure!(self.expected.contains(offset, length), "staged fragment outside checked footprint");
+        if let Some((host, at)) = self.host(offset, length) {
+            crate::shared::memory::load_timing::push(bytes.len(), || host.landing.copy(at, bytes))?;
+            return self.expected.record(&mut self.coverage, offset, length);
+        }
         let (index, at) = self.step(offset, length)?;
         let need = self.layout.steps[index].1.bytes();
         if !self.open.contains_key(&index) {
@@ -350,7 +386,7 @@ impl PushDestination for DenseArena<'_> {
                     ensure!(self.held + need as u64 <= self.layout.host_staging.staging_bytes as u64,
                         "dense rank GPU {} needs {} pinned staging bytes, beyond admitted ring/step bound {}",
                         self.device.id, self.held + need as u64, self.layout.host_staging.staging_bytes);
-                    let allocation = HostAllocation::named(self.device.library, need, "staging/coordinator-dense")?;
+                    let allocation = HostAllocation::new(self.device.library, need, crate::shared::memory::tag(crate::shared::memory::MemoryKind::Staging, "staging/coordinator-dense"))?;
                     self.held += need as u64;
                     self.peak_held = self.peak_held.max(self.held);
                     allocation
@@ -361,7 +397,8 @@ impl PushDestination for DenseArena<'_> {
             self.open.insert(index, (staging, 0));
         }
         let (staging, delivered) = self.open.get_mut(&index).context("open step")?;
-        staging.bytes_mut()[at..at + bytes.len()].copy_from_slice(bytes);
+        crate::shared::memory::load_timing::push(bytes.len(), ||
+            staging.bytes_mut()[at..at + bytes.len()].copy_from_slice(bytes));
         *delivered += length;
         self.expected.record(&mut self.coverage, offset, length)?;
         if *delivered == need as u64 {
@@ -392,6 +429,8 @@ impl PushDestination for DenseArena<'_> {
         })?;
         let finish_ms = finished.elapsed().as_secs_f64() * 1e3;
         tracing::info!(device = self.device.id, operands = self.layout.operands.len(), steps = self.run,
+            host_operands = self.layout.host_operands.len(),
+            host_operand_bytes = self.layout.host_operands.iter().map(|(_, h)| h.rect.bytes() as u64).sum::<u64>(),
             finishes = self.layout.finishes.len(), finish_ms,
             peak_staged_mib = self.peak as f64 / (1u64 << 20) as f64,
             peak_pinned_mib = self.peak_held as f64 / (1u64 << 20) as f64, "coordinator dense rank delivered");
@@ -415,7 +454,7 @@ pub(crate) fn plan_ranks<'a>(snapshot: &std::path::Path, operands: Vec<Operand>,
 pub(crate) fn plan_records<'a>(snapshot: &std::path::Path, records: Records,
     devices: &[Device<'a>], sparks: usize)
     -> Result<(Vec<super::push::DensePlan>, Vec<DenseArena<'a>>)> {
-    let Records { operands, steps, finishes, peer_copies } = records;
+    let Records { operands, host_operands, steps, finishes, peer_copies } = records;
     ensure!(peer_copies.iter().all(|copy| devices.iter().any(|d| d.id == copy.source_device)
         && devices.iter().any(|d| d.id == copy.destination_device)), "peer load copy outside the push group");
     ensure!(finishes.iter().all(|f| devices.iter().any(|d| d.id == f.device())),
@@ -423,6 +462,7 @@ pub(crate) fn plan_records<'a>(snapshot: &std::path::Path, records: Records,
     let (root, _) = cuteafd_loader::push_load::namespace(snapshot)?;
     let world = sparks + devices.len();
     let mut operands = operands;
+    let mut hosts = host_operands;
     let mut steps = steps;
     let mut out = (Vec::new(), Vec::new());
     for (gpu, device) in devices.iter().enumerate() {
@@ -430,7 +470,9 @@ pub(crate) fn plan_records<'a>(snapshot: &std::path::Path, records: Records,
         operands = rest;
         let (my_steps, rest): (Vec<_>, Vec<_>) = steps.into_iter().partition(|s| s.device == device.id);
         steps = rest;
-        let layout = RankLayout::new(mine, my_steps, device.id)?.with_finishes(&finishes);
+        let (my_hosts, rest): (Vec<_>, Vec<_>) = hosts.into_iter().partition(|h| h.device == device.id);
+        hosts = rest;
+        let layout = RankLayout::new(mine, my_steps, device.id)?.with_finishes(&finishes).with_hosts(my_hosts)?;
         let checked = layout.checked(&root, world, sparks + gpu)?;
         ensure!(checked.plan.files.iter().all(|f| cuteafd_loader::push_load::is_push_shard(&root.join(f))),
             "coordinator dense source is not a SparkNest shard");
@@ -440,7 +482,7 @@ pub(crate) fn plan_records<'a>(snapshot: &std::path::Path, records: Records,
         out.0.push(plan);
         out.1.push(DenseArena::new(*device, layout, expected)?);
     }
-    ensure!(operands.is_empty() && steps.is_empty(), "dense records on a GPU outside the push group");
+    ensure!(operands.is_empty() && steps.is_empty() && hosts.is_empty(), "dense records on a GPU outside the push group");
     Ok(out)
 }
 
@@ -453,6 +495,105 @@ pub(crate) mod testing {
         pub(crate) static PEAKS: std::cell::RefCell<Vec<(u64, u64)>> = const { std::cell::RefCell::new(Vec::new()) };
     }
     use std::os::unix::fs::FileExt;
+
+    #[test]
+    fn streamed_overlap_reverse_and_random_slots_keep_real_arena_within_charge() -> Result<()> {
+        use anyhow::Context;
+        use cuteafd_ffi::native_library_lifetime_fixture::Fixture;
+        use std::path::PathBuf;
+        let root = PathBuf::from(std::env::var_os("HOME").context("HOME")?)
+            .join(".cache/cuteafd/builds/dense-staging-order-fixture");
+        let fixture = Fixture::build_in(&root)?;
+        let library = fixture.load()?;
+        fixture.configure_memory(&library, 0, 1 << 30)?;
+        fixture.quiet_events(&library, true)?;
+        let source = tempfile::tempdir_in(fixture.directory())?;
+        let path = source.path().join("overlapping-k6");
+        let file = std::fs::File::create(&path)?;
+        let (count, bytes, stride) = (1024usize, 2usize << 20, 1usize << 20);
+        file.set_len((count * stride + 2 * bytes) as u64)?;
+        for (random, multi, strided) in [(false, false, false), (true, false, false),
+            (false, true, false), (true, true, false), (false, true, true), (true, false, true)] {
+            let steps = (0..count).map(|i| super::Step { device: 0,
+                rects: if multi { (0..2).map(|half| super::Rect { name: format!("K6-{i}-{half}"),
+                    path: path.clone(), base: (i * stride) as u64,
+                    row_bytes: if strided { bytes } else { bytes / 2 },
+                    rows: half..half + 1, cols: 0..bytes / 2 }).collect() }
+                else { vec![super::Rect { name: format!("K6-{i}"), path: path.clone(),
+                    base: (i * stride) as u64, row_bytes: if strided { bytes } else { bytes / 2 },
+                    rows: 0..2, cols: 0..bytes / 2 }] },
+                jobs: Vec::new() }).collect();
+            let layout = super::RankLayout::new(Vec::new(), steps, 0)?;
+            let charged = layout.host_staging.staging_bytes as u64;
+            assert!(charged < (count * bytes) as u64);
+            let checked = layout.checked(source.path(), 1, 0)?;
+            let expected = super::ExpectedCoverage::from_plan(&checked, 0)?;
+            let mut fragments = Vec::new();
+            for (i, (offset, _)) in layout.steps.iter().enumerate() {
+                for half in 0..2 {
+                    fragments.push((i * stride + half * if strided { bytes } else { bytes / 2 },
+                        layout.base + offset + (half * bytes / 2) as u64));
+                }
+            }
+            fragments.sort_unstable();
+            let device = super::Device { library: &library, id: 0 };
+            let mut arena = super::DenseArena::new(device, layout, expected)?;
+            let payload = vec![0u8; bytes / 2];
+            let mut state = 0x517cc1b727220a95u64;
+            let per_slot = cuteafd_ffi::push_ring::DEFAULT_SLOT_BYTES / payload.len();
+            let slots = fragments.chunks(per_slot).collect::<Vec<_>>();
+            let deliver = |arena: &mut super::DenseArena<'_>, slot: usize| -> Result<()> {
+                for &(_, offset) in slots[slot] {
+                    super::PushDestination::copy_validation(arena, offset, &payload)?;
+                    assert_eq!(arena.held, arena.staged + arena.pool.iter().map(|p| p.buffer.bytes as u64).sum::<u64>());
+                    assert!(arena.held <= charged, "open plus reusable pool exceeds admitted charge");
+                }
+                Ok(())
+            };
+            // Delay one actual 1 MiB slot across every refill. The remaining
+            // 127 slots keep cycling; the hole's partial windows stay open.
+            let delayed = 1;
+            let mut pending = (0..slots.len()).filter(|&i| i != delayed).collect::<Vec<_>>();
+            for batch in pending.chunks_mut(cuteafd_ffi::push_ring::DEFAULT_SLOTS - 1) {
+                if random {
+                    for i in (1..batch.len()).rev() {
+                        state ^= state << 13; state ^= state >> 7; state ^= state << 17;
+                        batch.swap(i, state as usize % (i + 1));
+                    }
+                } else { batch.reverse(); }
+                for &slot in batch.iter() { deliver(&mut arena, slot)?; }
+                assert!(!arena.open.is_empty() && arena.staged >= bytes as u64,
+                    "delayed slot must retain partial windows through every refill");
+            }
+            let minimum_peak = if random { 32 * bytes } else { 2 * bytes };
+            assert!(arena.peak >= minimum_peak as u64, "reordered slots must open a meaningful window");
+            deliver(&mut arena, delayed)?;
+            assert_eq!(arena.run, count);
+            super::PushDestination::done(arena)?;
+            PEAKS.with(|p| { p.take(); });
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn strided_and_multi_rect_staging_use_source_window_bounds() -> Result<()> {
+        use crate::shared::experts::rtx::dense::{HostStaging, Rect};
+        let make = |path: &str, base, rows, cols| Rect { name: "slice".into(), path: path.into(),
+            base, row_bytes: 4096, rows, cols };
+        let strided = (0..65536).map(|i| vec![make("shard", 0, i * 8..i * 8 + 8, 0..2048)])
+            .collect::<Vec<_>>();
+        let bound = HostStaging::for_steps(strided.iter().map(Vec::as_slice), 0)?;
+        assert!(bound.staging_bytes < strided.len() * 16384 / 2);
+        let multi = (0..65536).map(|i| vec![make("shard", 0, i * 8..i * 8 + 4, 0..1024),
+            make("shard", 0, i * 8 + 4..i * 8 + 8, 2048..3072)]).collect::<Vec<_>>();
+        let bound = HostStaging::for_steps(multi.iter().map(Vec::as_slice), 0)?;
+        assert!(bound.staging_bytes < multi.len() * 8192 / 2);
+        let cross = (0..8192).map(|i| vec![make("first", 0, i..i + 1, 0..1024),
+            make("second", 0, i..i + 1, 0..1024)]).collect::<Vec<_>>();
+        assert_eq!(HostStaging::for_steps(cross.iter().map(Vec::as_slice), 0)?.staging_bytes,
+            cross.len() * 2048, "independent files keep the safe complete-footprint fallback");
+        Ok(())
+    }
 
     /// A one-source fake SparkNest for one rank: packs the rank's planned runs
     /// into ring slots in plan order, Filled per slot (each written only after its
@@ -531,7 +672,7 @@ pub(crate) mod testing {
         let expected = crate::shared::memory::weight_arena::ExpectedCoverage::from_plan(&checked, rank as u32)?;
         device.run(|| -> Result<()> {
             let ring = cuteafd_ffi::push_ring::RegisteredRing::new(device.library, 8,
-                cuteafd_ffi::push_ring::DEFAULT_SLOT_BYTES)?;
+                cuteafd_ffi::push_ring::DEFAULT_SLOT_BYTES, crate::shared::memory::TEST)?;
             let fake = FakeRank::new(&checked, root, rank as u32, &ring)?;
             let arena = super::DenseArena::new(device, layout, expected)?;
             crate::shared::memory::push_consumer::consume(device, arena, ring, fake, 8)

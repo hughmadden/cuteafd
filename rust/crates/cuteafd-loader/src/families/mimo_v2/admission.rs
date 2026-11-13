@@ -29,9 +29,11 @@ pub fn allocation_bytes(label: &str, dimensions: &[usize]) -> Result<u64> {
 }
 
 pub struct DraftReservations {
+    pub arena: super::capacity::MimoWeightArena,
+    pub resident_weights: crate::placement::ResidentWeights,
     pub steady: Vec<MemoryReservation>,
-    /// Selected weights and FP8 scratch coexist with one drained source
-    /// matrix during packing, after target KV but before target workspaces.
+    /// FP8 scratch and one drained source matrix coexist with the separate
+    /// immutable arena after target KV but before target workspaces.
     /// Empty for BF16-only, which needs no conversion staging.
     pub packing: Vec<MemoryReservation>,
 }
@@ -63,8 +65,22 @@ pub fn draft_reservations_with(
     headers: &[crate::SafetensorsTensorMetadata],
     mode: crate::families::mimo_v2::draft_representation::MimoDraftRepresentation,
     capacity: crate::families::mimo_v2::draft_representation::MimoDraftCapacity,
+    scratch: impl FnMut(DraftScratch) -> Result<usize>,
+) -> Result<DraftReservations> {
+    draft_rank_reservations_with(cfg, headers, mode, capacity, 0, 1, scratch)
+}
+
+pub fn draft_rank_reservations_with(
+    source_cfg: &super::draft_config::DflashConfig,
+    headers: &[crate::SafetensorsTensorMetadata],
+    mode: crate::families::mimo_v2::draft_representation::MimoDraftRepresentation,
+    capacity: crate::families::mimo_v2::draft_representation::MimoDraftCapacity,
+    rank: usize,
+    ranks: usize,
     mut scratch: impl FnMut(DraftScratch) -> Result<usize>,
 ) -> Result<DraftReservations> {
+    ensure!(rank < ranks, "invalid DFlash rank {rank}/{ranks}");
+    let cfg = source_cfg;
     use super::draft_config::{RING, TAP_ROWS};
     use cuteafd_core::DType;
     const VOCABULARY_HEAD_WORKSPACE: usize = 4 << 20;
@@ -101,8 +117,6 @@ pub fn draft_reservations_with(
             .ok_or_else(|| anyhow::anyhow!("DFlash head width overflows"))
     };
     let (attention, kv) = (width(cfg.heads)?, width(cfg.kv_heads)?);
-    let two_kv = kv.checked_mul(2).context("DFlash KV width")?;
-    let qkv = attention.checked_add(two_kv).context("DFlash QKV width")?;
     let taps = cfg.taps.len().checked_mul(h).context("DFlash tap width")?;
     let source = |name: &str, shape: &[usize]| -> Result<()> {
         let t = headers
@@ -141,24 +155,25 @@ pub fn draft_reservations_with(
         }
         source(&format!("{p}.mlp.down_proj.weight"), &[h, inter])?;
     }
+    let local = source_cfg.for_tp(ranks)?;
+    let cfg = &local;
+    let inter = cfg.intermediate;
+    let (attention, kv) = (width(cfg.heads)?, width(cfg.kv_heads)?);
+    let qkv = attention.checked_add(kv.checked_mul(2).context("DFlash local KV width")?)
+        .context("DFlash local QKV width")?;
     let layout = cfg.runtime_layout(mode, capacity)?;
     layout.weights.loading_peak_bytes()?;
-    let mut costs = [
-        ("bf16_values", layout.weights.bf16_values),
-        ("fp8_values", layout.weights.fp8_values),
-        ("fp8_scales", layout.weights.fp8_scales),
-        ("small_bf16", layout.weights.small_bf16),
-        ("head_fp8_values", layout.weights.head_fp8_values),
-        ("head_fp8_scales", layout.weights.head_fp8_scales),
-    ]
-    .into_iter()
-    .filter(|(_, bytes)| *bytes > 0)
-    .map(|(name, bytes)| MemoryReservation {
-        name: format!("draft.weights.{name}"),
-        bytes,
-    })
-    .collect::<Vec<_>>();
-    let mut packing = costs.clone();
+    let arena = super::capacity::MimoWeightArena {
+        kind: cuteafd_core::memory_layout::MemoryKind::DrafterWeights,
+        layout: super::weight_arena::dflash_arena_requests(source_cfg, mode, rank, ranks)?,
+        lifetime: crate::placement::planner::Lifetime {
+            first: crate::placement::planner::Phase::DraftLoad,
+            last: crate::placement::planner::Phase::Growth,
+        },
+    };
+    let resident_weights = crate::placement::ResidentWeights(arena.layout.bytes() as u64);
+    let mut costs = Vec::new();
+    let mut packing = Vec::new();
     if let Some(fp8) = &layout.fp8_scratch {
         let bytes = fp8
             .shapes
@@ -249,17 +264,30 @@ pub fn draft_reservations_with(
         ),
         (
             "topk_workspace",
-            vec![scratch(DraftScratch::Topk { rows: drafted })?],
+            vec![if rank == 0 { scratch(DraftScratch::Topk { rows: drafted })? } else { 0 }],
         ),
     ] {
-        reserve(format!("draft.workspace.{name}"), &dims)?;
+        if rank == 0 || !matches!(name, "head_workspace" | "logits" | "unary" | "candidates" | "topk_workspace") {
+            reserve(format!("draft.workspace.{name}"), &dims)?;
+        }
+    }
+    if ranks == 2 {
+        reserve("draft.workspace.reduced".into(), &[rows, h, 2])?;
     }
     drop(reserve);
     costs
         .iter()
         .try_fold(0u64, |sum, r| sum.checked_add(r.bytes))
         .context("DFlash reservation sum")?;
+    // Every steady owner above is its own device allocation, so each rounds an
+    // SM120 backing on its own. Charge that slack once, outside every payload
+    // (the rings and workspaces above 1 MiB plus the FP8 scratch).
+    let tail = crate::placement::planner::independent_backing_slack(costs.iter().map(|cost| cost.bytes))
+        .context("DFlash backing granularity")?;
+    costs.push(MemoryReservation { name: "draft.backing.tail".into(), bytes: tail });
     Ok(DraftReservations {
+        arena,
+        resident_weights,
         steady: costs,
         packing,
     })
@@ -322,12 +350,6 @@ pub fn peer_slot_bytes(rows: usize, waves: usize, hidden: usize) -> Result<Vec<u
     Ok(std::iter::repeat_n(decode, 4).chain(std::iter::repeat_n(prefill, 4 * waves)).collect())
 }
 
-/// The 97% occupancy ceiling and Spark's drained 64 MiB startup probe.
-pub fn headroom_bytes(total: u64, spark_probe: bool) -> u64 {
-    (total - total * 97 / 100 + if spark_probe { 64 << 20 } else { 0 })
-        .max(cuteafd_core::serving_capacity::small_card_headroom_bytes(total))
-}
-
 pub fn spark_intake_probe_bytes(spark: bool, configured: Option<&str>) -> Result<u64> {
     if !spark { return Ok(0); }
     match configured {
@@ -380,13 +402,23 @@ pub fn transport_reservations(cfg: &MimoV2Config, ranks: usize, rank: usize,
         costs.push(MemoryReservation { name: "transport.peer_control".into(), bytes: ((peer_slots(lanes) + 1) * 16).max(256) as u64 + 256 });
     }
     if rank == 0 && spark_ranks > 0 {
+        use cuteafd_core::serving_capacity::spark_intake_allocation_bytes;
         use crate::serving_capacity::{prefill_return_bytes_with_format, spark_intake_bytes};
+        let decode_rows = super::decode_graph::MIMO_DECODE_ROWS as u64;
+        let prefill_rows = rows.max(super::decode_graph::MIMO_DECODE_ROWS) as u64;
         costs.push(MemoryReservation { name: "transport.spark_intake_planes".into(),
-            bytes: prefill_return_bytes_with_format(lanes as u64, rows.max(super::decode_graph::MIMO_DECODE_ROWS) as u64,
+            bytes: prefill_return_bytes_with_format(lanes as u64, prefill_rows,
                 spark_ranks as u64, cfg.hidden as u64, format)?
-                .checked_add(spark_intake_bytes(1, spark_ranks as u64,
-                    super::decode_graph::MIMO_DECODE_ROWS as u64, cfg.hidden as u64))
+                .checked_add(spark_intake_bytes(1, spark_ranks as u64, decode_rows, cfg.hidden as u64))
                 .context("MiMo intake planes overflow")? });
+        // One whole-rank plane allocation per rank and plane, each rounding an
+        // SM120 backing on its own. The decode planes stay under 1 MiB and share
+        // driver blocks, so only the prefill planes carry attributable slack.
+        let planes = spark_intake_allocation_bytes(
+            lanes as u64 * prefill_rows * cfg.hidden as u64 * 2)?;
+        let tail = crate::placement::planner::independent_backing_slack(
+            std::iter::repeat_n(planes, spark_ranks)).context("MiMo intake backing granularity")?;
+        costs.push(MemoryReservation { name: "transport.spark_intake_planes.tail".into(), bytes: tail });
     }
     Ok(costs)
 }

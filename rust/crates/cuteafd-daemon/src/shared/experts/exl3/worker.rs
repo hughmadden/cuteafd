@@ -139,7 +139,7 @@ pub(crate) struct Exl3Worker<'a> {
     /// Per-expert partial replies (models with a per-expert output norm): the
     /// epilogue that replaces the weighted top-k sum for flagged requests.
     partial: Option<super::partial::PartialEpilogue<'a>>,
-    reply_fused: super::super::reply::Exl3Reply<'a>,
+    reply_fused: Option<super::super::reply::Exl3Reply<'a>>,
 }
 
 impl<'a> Exl3Worker<'a> {
@@ -281,16 +281,16 @@ impl<'a> Exl3Worker<'a> {
         }
         let topk = Self::topk();
         let weights_offset = capacity as usize * topk * 4;
-        let staging = (0..1).map(|_| HostAllocation::named(library,
-            weights_offset + capacity as usize * topk * 4, "experts/workspace/route_staging"))
+        let staging = (0..1).map(|_| HostAllocation::new(library,
+            weights_offset + capacity as usize * topk * 4, crate::shared::memory::tag(crate::shared::memory::MemoryKind::Workspace, "experts/workspace/route_staging")))
             .collect::<Result<Vec<_>>>()?;
         let host_path = HostPath::from_env()?;
         let executor_id = cuteafd_transport::expert::SparkWorld::canonical(first.layout.world)?.topology().executor_id(rank)?;
         let route_dump = RouteDump::from_env(executor_id)?;
         let inputs = [
-            DeviceAllocation::named(library, capacity as usize * Self::wire_row_bytes(), "experts/workspace/hidden")?,
-            DeviceAllocation::named(library, capacity as usize * topk * 4, "experts/workspace/routes")?,
-            DeviceAllocation::named(library, capacity as usize * topk * 4, "experts/workspace/routes")?,
+            DeviceAllocation::new(library, capacity as usize * Self::wire_row_bytes(), crate::shared::memory::tag(crate::shared::memory::MemoryKind::Workspace, "experts/workspace/hidden"))?,
+            DeviceAllocation::new(library, capacity as usize * topk * 4, crate::shared::memory::tag(crate::shared::memory::MemoryKind::Workspace, "experts/workspace/routes"))?,
+            DeviceAllocation::new(library, capacity as usize * topk * 4, crate::shared::memory::tag(crate::shared::memory::MemoryKind::Workspace, "experts/workspace/routes"))?,
         ];
         ensure!(
             executions
@@ -312,8 +312,8 @@ impl<'a> Exl3Worker<'a> {
                 id: library.cuda_get_device()?,
             };
             Some([
-                crate::shared::memory::device::Event::new(device)?,
-                crate::shared::memory::device::Event::new(device)?,
+                crate::shared::memory::device::Event::timing(device)?,
+                crate::shared::memory::device::Event::timing(device)?,
             ])
         } else {
             None
@@ -338,7 +338,7 @@ impl<'a> Exl3Worker<'a> {
             deferred: false,
             pending: super::super::execution::timing::PendingUnits::new(library, 1)?,
             partial: None,
-            reply_fused: super::super::reply::Exl3Reply::load(library)?,
+            reply_fused: (epilogue == Exl3Epilogue::Sum).then(|| super::super::reply::Exl3Reply::load(library)).transpose()?,
         })
     }
 
@@ -351,8 +351,8 @@ impl<'a> Exl3Worker<'a> {
             .context("EXL3 route staging overflow")?;
         self.staging.clear();
         for _ in 0..units {
-            self.staging.push(HostAllocation::named(self.library,
-                self.weights_offset * 2, "experts/workspace/route_staging")?);
+            self.staging.push(HostAllocation::new(self.library,
+                self.weights_offset * 2, crate::shared::memory::tag(crate::shared::memory::MemoryKind::Workspace, "experts/workspace/route_staging"))?);
         }
         self.deferred = true;
         Ok(())
@@ -559,7 +559,7 @@ impl<'a> Exl3Worker<'a> {
             match (destination, partial.as_ref()) {
                 (Some(output), None) if compressed => {
                     let sources = execution.launch_layer_core(self.layer, inputs, request.rows() as usize, self.stream.raw)?;
-                    self.reply_fused.launch(request, sources, inputs, output, request.rows() as usize, self.stream.raw)?;
+                    self.reply_fused.as_ref().context("combined reply reached a partial-only worker")?.launch(request, sources, inputs, output, request.rows() as usize, self.stream.raw)?;
                     output
                 }
                 // Partial replies: the core, then the per-region epilogue into the reply slot.

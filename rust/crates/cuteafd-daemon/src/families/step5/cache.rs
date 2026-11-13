@@ -1,5 +1,5 @@
 //! Committed state only. Proposal workspaces never alias these planes.
-use crate::shared::memory::device::{Allocation, Device, Event, Stream};
+use crate::shared::memory::{device::{Allocation, Device, Event, Stream}, Tag};
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::CuteafdDeviceBuffer;
 use cuteafd_loader::serving_capacity::step5::{ByteSpan, Step5CacheLayout};
@@ -52,10 +52,14 @@ impl<'a> CacheRank<'a> {
         let stream = Stream::new(device)?;
         // Allocate all storage before enqueueing initialization: failed allocation
         // cannot release an earlier plane still being initialized asynchronously.
-        let active = Allocation::new(device, reservation.active)?;
-        let marks = if reservation.marks > 0 { Some(Rc::new(Allocation::new(device, reservation.marks)?)) } else { None };
+        let active = Allocation::new(device, reservation.active, Tag::kv("step5/kv-active"))?;
+        let marks = if reservation.marks > 0 {
+            Some(Rc::new(Allocation::new(device, reservation.marks, Tag::prefix("step5/prefix-marks"))?))
+        } else { None };
         let page_count = pages;
-        let pages = if reservation.pages > 0 { Some(Rc::new(Allocation::new(device, reservation.pages)?)) } else { None };
+        let pages = if reservation.pages > 0 {
+            Some(Rc::new(Allocation::new(device, reservation.pages, Tag::kv("step5/kv-pages"))?))
+        } else { None };
         let predictor_evidence = (0..sequences).map(|_|
             (0..layout.ranks[rank].mtp_lengths.len()).map(|_| Cell::new(0)).collect()).collect();
         let landed = RefCell::new(Event::new(device)?);

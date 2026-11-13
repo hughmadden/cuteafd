@@ -1,7 +1,7 @@
 //! TP2/TP3/TP4/TP6 dispatch through persistent RoCE QPs; TCP is used only for bootstrap.
 #[cfg(test)]
 use super::BackboneRequest;
-use super::{SparkTopology, SparkWorld, V41Tp4ChunkReceiver, V41_NATIVE_GROUP_REQUEST_FLAG};
+use super::{SparkWorld, V41Tp4ChunkReceiver};
 use crate::verbs::LocalTp4Client;
 use crate::{
     DeviceLanding, ExpertProtocolV2Request, ExpertProtocolV2RowDescriptor, ExpertV2SourceKind,
@@ -124,13 +124,9 @@ impl SparkExperts {
         world: SparkWorld,
     ) -> Result<Self> {
         ensure!(peers.len() == executors.len() && (1..=cuteafd_core::MAX_SPARK_WORLD).contains(&peers.len()),
-            "native TP/EP requires 1..=8 matching peers and executors");
-        if let Some(topology) = world.ownership_topology() {
-            ensure!(
-                peers.len() == topology.world_size(),
-                "native group topology requires exactly its physical rank count"
-            );
-        }
+            "native TP requires 1..=8 matching peers and executors");
+        ensure!(peers.len() == world.topology().world_size(),
+            "Spark world requires exactly its physical rank count");
         ensure!(
             capacity > 0 && capacity <= 4096,
             "invalid native TP capacity"
@@ -195,6 +191,14 @@ impl SparkExperts {
     pub fn max_waves(&self) -> usize { self.clients.max_waves() }
     /// The response deadline every wave is held to.
     pub fn timeout(&self) -> std::time::Duration { self.clients.timeout() }
+
+    /// Startup/test-only observation of already bootstrapped coordinator storage.
+    pub fn allocation_census(&self) -> crate::TransportAllocationCensus {
+        if !self.open_waves.is_empty() {
+            return crate::TransportAllocationCensus::unavailable("transport", "expert waves are in flight");
+        }
+        self.clients.allocation_census()
+    }
     pub fn open_waves(&self) -> usize { self.open_waves.len() }
     /// Immutable metadata returned by the workers' completed persistent bootstrap.
     pub fn installed_grouping(&self) -> Result<Vec<crate::worker_selection::InstalledExpertGrouping>> {
@@ -209,18 +213,15 @@ impl SparkExperts {
     /// `request` sizes the registered rings, so it must be the widest wave this
     /// transport will dispatch — the same one its start-up warm-up sends. Only
     /// the control bootstrap reaches a worker; the rows are never sent.
-    pub fn bootstrap(&mut self, request: &ExpertProtocolV2Request) -> Result<()> {
+    pub fn bootstrap(&mut self, shape: &crate::SparkSessionShape) -> Result<()> {
         ensure!(self.open_waves.is_empty(), "cannot bootstrap a Spark transport with a wave in flight");
-        ensure!(request.header.row_count <= self.capacity,
+        ensure!(shape.row_count <= self.capacity,
             "Spark bootstrap request of {} rows exceeds the transport's {}-row capacity",
-            request.header.row_count, self.capacity);
-        self.clients.bootstrap(request)
+            shape.row_count, self.capacity);
+        self.clients.bootstrap(shape)
     }
-    /// Physical ownership and request wire bound before any connection.
+    /// Physical rank world bound before any connection.
     pub fn world(&self) -> SparkWorld { self.world }
-    pub fn ownership_topology(&self) -> Option<SparkTopology> {
-        self.world.ownership_topology()
-    }
     /// Reset persistent QPs. Detached wave queue entries are retained; reusable
     /// intake owners use `reset_drained` after dropping every detached ticket.
     pub fn reset_connections(&mut self) {
@@ -331,9 +332,6 @@ impl SparkExperts {
 
     /// Post every active rank's request directly from the inference owner. Remote work
     /// overlaps the shared FFN; dispatch completion is not send completion.
-    ///
-    /// Request flags must match the declared wire: ownership worlds require
-    /// native group requests, while canonical worlds reject ownership flags.
     pub async fn dispatch<'c, 'r>(
         &'c mut self,
         request: &'r ExpertProtocolV2Request,
@@ -520,42 +518,20 @@ impl SparkExperts {
             self.open_waves.clear();
             self.reset_connections();
         }
-        let flagged = request.header.flags & V41_NATIVE_GROUP_REQUEST_FLAG != 0;
-        let receiver = match self.world.ownership_topology() {
-            Some(topology) => {
-                ensure!(
-                    flagged,
-                    "topology-bound native transport requires a native group request"
-                );
-                V41Tp4ChunkReceiver::from_owned_topology(
-                    request,
-                    self.capacity,
-                    &self.executors,
-                    topology,
-                    self.max_frame_bytes,
-                )?
-            }
-            None => {
-                ensure!(
-                    !flagged,
-                    "native group request requires a topology-bound transport"
-                );
-                if self.executors.len() == 4 {
-                    V41Tp4ChunkReceiver::from_owned(
-                        request,
-                        self.capacity,
-                        self.executors.as_slice().try_into().expect("four executors"),
-                        self.max_frame_bytes,
-                    )?
-                } else {
-                    V41Tp4ChunkReceiver::from_owned_ranks(
-                        request,
-                        self.capacity,
-                        &self.executors,
-                        self.max_frame_bytes,
-                    )?
-                }
-            }
+        let receiver = if self.executors.len() == 4 {
+            V41Tp4ChunkReceiver::from_owned(
+                request,
+                self.capacity,
+                self.executors.as_slice().try_into().expect("four executors"),
+                self.max_frame_bytes,
+            )?
+        } else {
+            V41Tp4ChunkReceiver::from_owned_ranks(
+                request,
+                self.capacity,
+                &self.executors,
+                self.max_frame_bytes,
+            )?
         };
         self.clients.dispatch(request, landing)?;
         if let Some(tap) = &mut self.route_tap {

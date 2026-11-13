@@ -1,7 +1,7 @@
 //! Routed-expert layer identity and native resident weights; one GPU worker owns
 //! each layer and its buffers. The layer selects the native kernel family (V4.1
 //! MXFP4, NVFP4 W4A4) that the expert service, V4 local experts and V4.1 run.
-use crate::shared::memory::{DeviceAllocation, HostAllocation, LoadStream};
+use crate::shared::memory::{DeviceAllocation, HostAllocation, LoadStream, Tag};
 pub(crate) mod nvfp4;
 #[cfg(test)]
 pub(crate) mod tp2_half_tests;
@@ -118,15 +118,13 @@ pub(crate) enum ExpertLayer {
     Backbone { layer: usize, rank: usize },
     BackboneFull { layer: usize },
     BackboneTp2 { layer: usize, rank: usize },
-    /// Explicit replicated-group native Spark shard. `world` is this group's
-    /// tensor-parallel degree (2 through 8) and `rank` is the shard index
-    /// inside the group (`global_rank % world`). Native checkpoints support
-    /// replicated groups; NVFP4 uses pure TP3/TP6 only. `world: 6`
-    /// is the pure unreplicated `TP6EP1` layout: six disjoint intermediate
-    /// slices of every expert, so every rank sees every route.
-    BackboneReplicatedTp { layer: usize, rank: usize, world: usize },
-    /// EXL3 compact TP shard: one rank of an implicit (no `--spark-tp/--spark-ep`
-    /// keys), unreplicated intermediate split of the compressed checkpoint,
+    /// Native Spark TP shard: `world` is the Spark rank count (2 through 8)
+    /// and `rank` the shard index. Each rank holds one disjoint intermediate
+    /// slice of every expert of its layers and sees every route. Native MXFP4
+    /// checkpoints use every packaged width; NVFP4 uses TP3/TP6 only.
+    BackboneSparkTp { layer: usize, rank: usize, world: usize },
+    /// EXL3 compact TP shard: one rank of an intermediate split of the
+    /// compressed checkpoint,
     /// carved on whole H128 blocks. `world` is 1 (Qwen whole experts), 3 or 6;
     /// the two-rank compact profile keeps the dedicated
     /// `BackboneTp2` layer so its published behavior is unchanged. This layer
@@ -154,7 +152,7 @@ impl ExpertLayer {
             },
             Self::BackboneFull { layer } => V41ExpertSelection::BackboneFull { layer, expert },
             Self::BackboneTp2 { layer, rank } => V41ExpertSelection::BackboneTp2 { layer, expert, rank },
-            Self::BackboneReplicatedTp { layer, rank, world } =>
+            Self::BackboneSparkTp { layer, rank, world } =>
                 V41ExpertSelection::BackboneTp { layer, expert, rank, world },
             Self::BackboneExl3Tp { .. } => unreachable!(
                 "EXL3 Spark shards never stage native expert weights"
@@ -170,7 +168,7 @@ impl ExpertLayer {
             | Self::BackboneFull { layer }
             | Self::BackboneTp2 { layer, .. }
             | Self::BackboneExl3Tp { layer, .. }
-            | Self::BackboneReplicatedTp { layer, .. } => layer,
+            | Self::BackboneSparkTp { layer, .. } => layer,
             Self::Dspark { .. } | Self::DsparkTp2 { .. } => usize::MAX,
         }
     }
@@ -184,7 +182,7 @@ impl ExpertLayer {
             Self::Backbone { layer, rank } => (layer, 4, rank),
             Self::BackboneFull { layer } => (layer, 1, 0),
             Self::BackboneTp2 { layer, rank } => (layer, 2, rank),
-            Self::BackboneReplicatedTp { layer, rank, world } => (layer, world, rank),
+            Self::BackboneSparkTp { layer, rank, world } => (layer, world, rank),
             _ => anyhow::bail!("not a native backbone shard: {self:?}"),
         };
         let unit = cuteafd_core::mxfp4_layouts::ownership_unit(geometry.intermediate as usize, world);
@@ -193,7 +191,7 @@ impl ExpertLayer {
     }
 
     fn unequal_width(self, geometry: cuteafd_core::ExpertGeometry) -> Option<usize> {
-        let Self::BackboneReplicatedTp { world, .. } = self else { return None; };
+        let Self::BackboneSparkTp { world, .. } = self else { return None; };
         let unit = cuteafd_core::mxfp4_layouts::ownership_unit(geometry.intermediate as usize, world);
         if world == 0 || (geometry.intermediate as usize / unit) % world == 0 { return None; }
         self.shard_for_geometry(geometry).ok().map(|shard| shard.width)
@@ -211,13 +209,13 @@ impl ExpertLayer {
             Self::Backbone { .. } => 1,
             Self::BackboneFull { .. } => 2,
             Self::BackboneTp2 { .. } => 3,
-            // Explicit replicated shards publish their own native roles; TP4 is
-            // only reachable through the legacy `Backbone` layer.
-            Self::BackboneReplicatedTp { world: 2, .. } => 5,
-            Self::BackboneReplicatedTp { world: 3, .. } => 6,
-            Self::BackboneReplicatedTp { world: 6, .. } => 7,
-            Self::BackboneReplicatedTp { world: 8, .. } => 8,
-            Self::BackboneReplicatedTp { .. } => 1,
+            // Spark TP shards publish their own native roles; TP4 is only
+            // reachable through the legacy `Backbone` layer.
+            Self::BackboneSparkTp { world: 2, .. } => 5,
+            Self::BackboneSparkTp { world: 3, .. } => 6,
+            Self::BackboneSparkTp { world: 6, .. } => 7,
+            Self::BackboneSparkTp { world: 8, .. } => 8,
+            Self::BackboneSparkTp { .. } => 1,
             // Compressed shards have no native role; see the sentinel doc.
             Self::BackboneExl3Tp { world, .. } => EXL3_SHARD_ROLE_SENTINEL + world as u32,
             Self::DsparkTp2 { .. } => 4,
@@ -239,14 +237,14 @@ impl ExpertLayer {
             library.v41_tp2_expert_info(capacity)
         } else if matches!(self,Self::DsparkTp2 { .. }) {
             library.v41_dspark_tp2_expert_info(capacity)
-        } else if let Self::BackboneReplicatedTp { world, .. } = self {
+        } else if let Self::BackboneSparkTp { world, .. } = self {
             match world {
                 2 => library.v41_spark_tp2_expert_info(capacity),
                 3 => library.v41_spark_tp3_expert_info(capacity),
                 4 => library.v41_expert_info(capacity),
                 6 => library.v41_spark_tp6_expert_info(capacity),
                 8 => library.v41_spark_tp8_expert_info(capacity),
-                other => anyhow::bail!("unsupported replicated Spark TP degree {other}"),
+                other => anyhow::bail!("unsupported Spark TP degree {other}"),
             }
         } else { library.v41_expert_info(capacity) }
     }
@@ -263,14 +261,14 @@ impl ExpertLayer {
             library.v41_tp2_expert_kernel(capacity)
         } else if matches!(self,Self::DsparkTp2 { .. }) {
             library.v41_dspark_tp2_expert_kernel(capacity)
-        } else if let Self::BackboneReplicatedTp { world, .. } = self {
+        } else if let Self::BackboneSparkTp { world, .. } = self {
             match world {
                 2 => library.v41_spark_tp2_expert_kernel(capacity),
                 3 => library.v41_spark_tp3_expert_kernel(capacity),
                 4 => library.v41_expert_kernel(capacity),
                 6 => library.v41_spark_tp6_expert_kernel(capacity),
                 8 => library.v41_spark_tp8_expert_kernel(capacity),
-                other => anyhow::bail!("unsupported replicated Spark TP degree {other}"),
+                other => anyhow::bail!("unsupported Spark TP degree {other}"),
             }
         } else { library.v41_expert_kernel(capacity) }
     }
@@ -290,7 +288,7 @@ impl ExpertLayer {
             Self::Backbone { .. } => library.v41_nvfp4_expert_kernel(capacity),
             Self::BackboneTp2 { .. } => library.v41_nvfp4_tp2_expert_kernel(capacity),
             Self::BackboneFull { .. } => library.v41_nvfp4_local_expert_kernel(capacity),
-            Self::BackboneReplicatedTp { world: tp @ (3 | 6), .. } =>
+            Self::BackboneSparkTp { world: tp @ (3 | 6), .. } =>
                 library.v41_nvfp4_spark_expert_kernel(capacity, tp),
             // Raw publications keep draft experts at source MXFP4 precision.
             other => other.kernel(library, capacity),
@@ -302,7 +300,7 @@ impl ExpertLayer {
             Self::Backbone { .. } => library.v41_nvfp4_expert_info(capacity),
             Self::BackboneTp2 { .. } => library.v41_nvfp4_tp2_expert_info(capacity),
             Self::BackboneFull { .. } => library.v41_nvfp4_local_expert_info(capacity),
-            Self::BackboneReplicatedTp { world: tp @ (3 | 6), .. } =>
+            Self::BackboneSparkTp { world: tp @ (3 | 6), .. } =>
                 library.v41_nvfp4_spark_expert_info(capacity, tp),
             other => other.info(library, capacity),
         }
@@ -348,7 +346,7 @@ impl ExpertLayer {
                 Self::Backbone { .. }
                     | Self::BackboneTp2 { .. }
                     | Self::BackboneFull { .. }
-                    | Self::BackboneReplicatedTp { world: 3 | 6, .. }
+                    | Self::BackboneSparkTp { world: 3 | 6, .. }
             )
     }
 }
@@ -406,14 +404,14 @@ mod format_dispatch_tests {
             let mut fused = vec![0; stored * 5120];
             fused[..sources[1].1.len()].copy_from_slice(&sources[1].1);
             fused[stored * 2560..stored * 2560 + sources[0].1.len()].copy_from_slice(&sources[0].1);
-            let raw = DeviceAllocation::new(library, fused.len())?;
+            let raw = DeviceAllocation::new(library, fused.len(), crate::shared::memory::TEST)?;
             library.copy_h2d(raw.buffer, &fused)?;
-            let raw_down = DeviceAllocation::new(library, sources[2].1.len())?;
+            let raw_down = DeviceAllocation::new(library, sources[2].1.len(), crate::shared::memory::TEST)?;
             library.copy_h2d(raw_down.buffer, &sources[2].1)?;
             for plane in [0u32, 2] {
                 let bytes = if plane == 0 { stored * 5120 } else { stored * 2560 };
-                let mounted = DeviceAllocation::new(library, bytes)?;
-                let pushed = DeviceAllocation::new(library, bytes)?;
+                let mounted = DeviceAllocation::new(library, bytes, crate::shared::memory::TEST)?;
+                let pushed = DeviceAllocation::new(library, bytes, crate::shared::memory::TEST)?;
                 library.copy_h2d(pushed.buffer, &vec![0xa5; bytes])?;
                 // SAFETY: live disjoint buffers on this device; drained before reads.
                 unsafe {
@@ -494,7 +492,7 @@ mod format_dispatch_tests {
                 for rank in 0..world {
                     let mut roles = std::collections::BTreeSet::new();
                     for layer in 0..world * 2 {
-                        let selected = ExpertLayer::BackboneReplicatedTp { layer, world, rank };
+                        let selected = ExpertLayer::BackboneSparkTp { layer, world, rank };
                         let shard = LayerShard::new(geometry.intermediate as usize, unit, layer, world, rank).unwrap();
                         assert_eq!(selected.shard_for_geometry(geometry).unwrap(), shard);
                         let role = selected.role_for_geometry(geometry);
@@ -515,11 +513,11 @@ mod format_dispatch_tests {
             (ExpertLayer::Backbone { layer: 2, rank: 0 }, true),
             (ExpertLayer::BackboneFull { layer: 2 }, true),
             (ExpertLayer::BackboneTp2 { layer: 2, rank: 0 }, true),
-            (ExpertLayer::BackboneReplicatedTp { layer: 2, rank: 0, world: 3 }, true),
-            (ExpertLayer::BackboneReplicatedTp { layer: 2, rank: 0, world: 6 }, true),
-            (ExpertLayer::BackboneReplicatedTp { layer: 2, rank: 0, world: 2 }, false),
-            (ExpertLayer::BackboneReplicatedTp { layer: 2, rank: 0, world: 4 }, false),
-            (ExpertLayer::BackboneReplicatedTp { layer: 2, rank: 0, world: 5 }, false),
+            (ExpertLayer::BackboneSparkTp { layer: 2, rank: 0, world: 3 }, true),
+            (ExpertLayer::BackboneSparkTp { layer: 2, rank: 0, world: 6 }, true),
+            (ExpertLayer::BackboneSparkTp { layer: 2, rank: 0, world: 2 }, false),
+            (ExpertLayer::BackboneSparkTp { layer: 2, rank: 0, world: 4 }, false),
+            (ExpertLayer::BackboneSparkTp { layer: 2, rank: 0, world: 5 }, false),
             (ExpertLayer::BackboneExl3Tp { layer: 2, rank: 0, world: 3 }, false),
             (ExpertLayer::BackboneExl3Tp { layer: 2, rank: 0, world: 6 }, false),
             (ExpertLayer::Dspark { stage: 0 }, false),
@@ -578,6 +576,14 @@ impl<'a> From<DeviceAllocation<'a>> for ResidentPlane<'a> {
     }
 }
 impl<'a> ResidentPlane<'a> {
+    pub(crate) fn allocation_receipts(&self, inventory: &mut crate::shared::memory::receipts::Inventory<'_>,
+        name: &str) -> Result<()> {
+        match &self._owner {
+            PlaneOwner::Mount { _allocation } => _allocation.inventory(inventory, name),
+            PlaneOwner::Push { _rank } => inventory.backed_device(name, self.buffer, _rank.allocation_buffer()),
+        }
+    }
+
     fn pushed(library: &'a NativeLibrary,
         rank: std::rc::Rc<crate::shared::memory::weight_arena::ReadyArena<'a>>,
         region: usize, offset: usize, bytes: usize) -> Result<Self> {
@@ -612,13 +618,14 @@ pub(crate) struct RawScales<'a> {
 impl<'a> RawScales<'a> {
     fn none() -> Self { Self { library: None, buffer: std::cell::Cell::new(None) } }
     fn owned(allocation: DeviceAllocation<'a>) -> Self {
+        assert!(allocation.backing.is_none(), "temporary raw scales must own their allocation");
         let allocation = std::mem::ManuallyDrop::new(allocation);
         Self { library: Some(allocation.library), buffer: std::cell::Cell::new(Some(allocation.buffer)) }
     }
     /// Frees the images (their packs ran).
     pub(crate) fn release(&self) {
         if let (Some(library), Some(buffer)) = (self.library, self.buffer.take()) {
-            drop(DeviceAllocation { library, buffer });
+            drop(DeviceAllocation { library, buffer, backing: None });
         }
     }
 }
@@ -626,6 +633,21 @@ impl Drop for RawScales<'_> {
     fn drop(&mut self) { self.release(); }
 }
 impl<'a> ExpertWeights<'a> {
+    pub(crate) fn allocation_receipts(&self, inventory: &mut crate::shared::memory::receipts::Inventory<'_>,
+        name: &str) -> Result<()> {
+        for (index, plane) in self.buffers.iter().enumerate() {
+            plane.allocation_receipts(inventory, &format!("{name}.plane.{index}"))?;
+        }
+        if let Some(side) = &self.nvfp4 {
+            for (key, plane) in [("alphas", &side.alphas), ("down_alphas", &side.down_alphas),
+                ("input_scales", &side.input_scales), ("down_input_scales", &side.down_input_scales)] {
+                plane.allocation_receipts(inventory, &format!("{name}.{key}"))?;
+            }
+        }
+        if let Some(raw) = self.raw_scales.buffer.get() { inventory.device(&format!("{name}.raw_scales"), raw)?; }
+        Ok(())
+    }
+
     /// Frees raw scale images kept for recorded plane packs (after they ran).
     pub(crate) fn release_raw_scales(&self) { self.raw_scales.release(); }
 
@@ -694,6 +716,32 @@ impl<'a> ExpertWeights<'a> {
         Ok(Self::layout(library, catalog, layer)?.0)
     }
 
+    pub(crate) fn arena<'b>(device: crate::shared::memory::device::Device<'b>,
+        catalog: &OfficialV41Catalog, layers: impl IntoIterator<Item = ExpertLayer>)
+        -> Result<crate::shared::memory::weight_arena::DeviceWeightArena<'b>> {
+        let layout = Self::arena_layout(device, catalog, layers)?;
+        crate::shared::memory::weight_arena::DeviceWeightArena::new(device, layout, cuteafd_core::memory_layout::ArenaTag::experts("experts/native"))
+    }
+
+    pub(crate) fn arena_layout(device: crate::shared::memory::device::Device<'_>,
+        catalog: &OfficialV41Catalog, layers: impl IntoIterator<Item = ExpertLayer>)
+        -> Result<cuteafd_loader::serving_capacity::WeightArenaLayout> {
+        let mut regions = Vec::new();
+        for layer in layers {
+            let (_, mut sizes, _, experts) = device.run(|| Self::layout(device.library, catalog, layer))?;
+            if layer.is_quantized_nvfp4(catalog) {
+                for bytes in &mut sizes { *bytes = bytes.checked_mul(experts).context("NVFP4 slab overflow")?; }
+            }
+            for (index, bytes) in sizes.into_iter().enumerate() {
+                regions.push((super::weight_layout::name(layer, index), bytes));
+            }
+            if layer.is_quantized_nvfp4(catalog) {
+                for index in 4..8 { regions.push((super::weight_layout::name(layer, index), experts * 4)); }
+            }
+        }
+        super::weight_layout::layout(device.id, "native", regions)
+    }
+
     /// W4A4 layout: the four per-expert planes replace the packed W4A8 slabs.
     fn nvfp4_layout(
         library: &NativeLibrary,
@@ -742,7 +790,7 @@ impl<'a> ExpertWeights<'a> {
         let mut owned = Vec::with_capacity(4);
         for (plane, stride) in strides.into_iter().enumerate() {
             let bytes = stride.checked_mul(experts).context("synthetic expert plane overflow")?;
-            let allocation = DeviceAllocation::new(library, bytes)?;
+            let allocation = DeviceAllocation::new(library, bytes, crate::shared::memory::TEST)?;
             let mut state = seed ^ (plane as u64 + 1).wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1;
             let tile: Vec<u8> = (0..bytes.min(1 << 20)).map(|_| {
                 state ^= state << 13;
@@ -774,12 +822,23 @@ impl<'a> ExpertWeights<'a> {
         layer: ExpertLayer,
         available_device_bytes: usize,
     ) -> Result<Self> {
+        let device = crate::shared::memory::device::Device { library, id: library.cuda_get_device()? };
+        let layout = Self::arena_layout(device, catalog, [layer])?;
+        let staging = Self::plan(library, catalog, layer)?.device_staging_bytes;
+        super::weight_layout::admit(&layout, staging, 0, available_device_bytes)?;
+        let arena = crate::shared::memory::weight_arena::DeviceWeightArena::new(device, layout, cuteafd_core::memory_layout::ArenaTag::experts("experts/native"))?;
+        Self::load_into(library, catalog, layer, available_device_bytes, &arena)
+    }
+
+    pub(crate) fn load_into(library: &'a NativeLibrary, catalog: &OfficialV41Catalog,
+        layer: ExpertLayer, available_device_bytes: usize,
+        arena: &crate::shared::memory::weight_arena::DeviceWeightArena<'a>) -> Result<Self> {
         if layer.is_quantized_nvfp4(catalog) {
-            return Self::load_nvfp4(library, catalog, layer, available_device_bytes);
+            return Self::load_nvfp4(library, catalog, layer, available_device_bytes, arena);
         }
         let (budget, sizes, intermediate, experts) = Self::layout(library, catalog, layer)?;
         Self::load_slots(library, catalog, layer, &(0..experts).collect::<Vec<_>>(), None,
-            (budget, sizes, intermediate), available_device_bytes)
+            (budget, sizes, intermediate), available_device_bytes, arena)
     }
 
     /// A subset of `layer`'s experts in compact planes: slot `i` holds expert
@@ -795,12 +854,51 @@ impl<'a> ExpertWeights<'a> {
         ids: &[usize],
         available_device_bytes: usize,
     ) -> Result<Self> {
+        let device = crate::shared::memory::device::Device { library, id: library.cuda_get_device()? };
+        let (layout, staging) = Self::resident_arena_layout(device, catalog, [(layer, ids)])?;
+        super::weight_layout::admit(&layout, staging, 0, available_device_bytes)?;
+        let arena = crate::shared::memory::weight_arena::DeviceWeightArena::new(device, layout,
+            cuteafd_core::memory_layout::ArenaTag::experts("experts/native-tier"))?;
+        Self::load_resident_into(library, catalog, layer, ids, available_device_bytes, &arena)
+    }
+
+    /// One backing allocation across every selected resident layer on a GPU;
+    /// loading is sequential, so only the largest layer staging is live.
+    pub(crate) fn resident_arena_layout<'b>(device: crate::shared::memory::device::Device<'_>,
+        catalog: &OfficialV41Catalog, layers: impl IntoIterator<Item = (ExpertLayer, &'b [usize])>)
+        -> Result<(cuteafd_loader::serving_capacity::WeightArenaLayout, usize)> {
+        device.run(|| Self::resident_arena_layout_current(device.library, device.id, catalog, layers))
+    }
+
+    /// Size-only aggregate recipe on the already-current device. `rank` names
+    /// the backing, not a CUDA ordinal to enter; TP ownership comes from each
+    /// `ExpertLayer`. Native metadata retains the current architecture's sizes.
+    pub(crate) fn resident_arena_layout_current<'b>(library: &NativeLibrary, rank: i32,
+        catalog: &OfficialV41Catalog, layers: impl IntoIterator<Item = (ExpertLayer, &'b [usize])>)
+        -> Result<(cuteafd_loader::serving_capacity::WeightArenaLayout, usize)> {
+        let mut regions = Vec::new();
+        let mut staging = 0;
+        for (layer, ids) in layers {
+            ensure!(!layer.is_quantized_nvfp4(catalog), "resident expert subsets take the native MXFP4 layout");
+            let (budget, sizes, _, experts) = Self::layout(library, catalog, layer)?;
+            let (sizes, budget) = resident_subset(&sizes, budget, experts, ids)?;
+            staging = staging.max(budget.device_staging_bytes);
+            regions.extend(sizes.into_iter().enumerate()
+                .map(|(plane, bytes)| (super::weight_layout::name(layer, plane), bytes)));
+        }
+        Ok((super::weight_layout::layout(rank, "native-tier", regions)?, staging))
+    }
+
+    /// Load compact views into the already admitted aggregate tier arena.
+    pub(crate) fn load_resident_into(library: &'a NativeLibrary, catalog: &OfficialV41Catalog,
+        layer: ExpertLayer, ids: &[usize], available_device_bytes: usize,
+        arena: &crate::shared::memory::weight_arena::DeviceWeightArena<'a>) -> Result<Self> {
         ensure!(!layer.is_quantized_nvfp4(catalog), "resident expert subsets take the native MXFP4 layout");
         let (budget, sizes, intermediate, experts) = Self::layout(library, catalog, layer)?;
         let (sizes, budget) = resident_subset(&sizes, budget, experts, ids)?;
         let resident = ids.iter().map(|&id| u16::try_from(id)).collect::<Result<std::rc::Rc<[u16]>, _>>()?;
         Self::load_slots(library, catalog, layer, ids, Some(resident), (budget, sizes, intermediate),
-            available_device_bytes)
+            available_device_bytes, arena)
     }
 
     /// Expert ids by plane slot when these planes hold a subset of the layer
@@ -821,7 +919,7 @@ impl<'a> ExpertWeights<'a> {
         let (sizes, budget) = resident_subset(&sizes, self.budget, self.experts, ids)?;
         let mut owned = Vec::with_capacity(4);
         for (plane, &size) in sizes.iter().enumerate() {
-            let allocation = DeviceAllocation::new(library, size)?;
+            let allocation = DeviceAllocation::new(library, size, crate::shared::memory::TEST)?;
             let source = self.buffers[plane].buffer;
             let stride = source.bytes / self.experts;
             for (slot, &id) in ids.iter().enumerate() {
@@ -848,6 +946,7 @@ impl<'a> ExpertWeights<'a> {
         resident: Option<std::rc::Rc<[u16]>>,
         (budget, sizes, intermediate): (ExpertLoadBudget, [usize; 4], u32),
         available_device_bytes: usize,
+        arena: &crate::shared::memory::weight_arena::DeviceWeightArena<'a>,
     ) -> Result<Self> {
         let experts = ids.len();
         let packer = library.v41_expert_packer(intermediate)?;
@@ -863,8 +962,8 @@ impl<'a> ExpertWeights<'a> {
         };
         let load_started = std::time::Instant::now();
         let mut owned = Vec::with_capacity(4);
-        for size in sizes {
-            owned.push(DeviceAllocation::new(library, size)?);
+        for (index, size) in sizes.into_iter().enumerate() {
+            owned.push(DeviceAllocation::from_allocation(arena.view(&super::weight_layout::name(layer, index), size)?));
         }
         let buffers: [DeviceAllocation<'a>; 4] =
             owned.try_into().ok().expect("four packed buffers");
@@ -890,9 +989,9 @@ impl<'a> ExpertWeights<'a> {
             drained?;
             queued?;
         }
-        let device_staging = DeviceAllocation::new(library, budget.device_staging_bytes)?;
+        let device_staging = DeviceAllocation::new(library, budget.device_staging_bytes, Tag::staging("experts/native-load"))?;
         let mut hosts = (0..EXPERT_READ_LANES)
-            .map(|_| HostAllocation::new(library, budget.device_staging_bytes))
+            .map(|_| HostAllocation::new(library, budget.device_staging_bytes, Tag::staging("experts/native-load")))
             .collect::<Result<Vec<_>>>()?;
         let mut read_scratch = (0..EXPERT_READ_LANES)
             .map(|_| vec![0; budget.read_scratch_bytes / EXPERT_READ_LANES])
@@ -1064,7 +1163,7 @@ impl<'a> ExpertWeights<'a> {
         let first = native_expert_rects(catalog, layer.expert(ids[0]))?;
         let (gate_scale, down_scale) = (first[3].bytes() + first[4].bytes(), first[5].bytes());
         let per = (gate_scale + down_scale).next_multiple_of(256);
-        let raw = DeviceAllocation::new(library, per * experts)?;
+        let raw = DeviceAllocation::new(library, per * experts, Tag::experts("experts/native"))?;
         for (slot, &expert) in ids.iter().enumerate() {
             let rects = native_expert_rects(catalog, layer.expert(expert))?;
             for projection in 0..3 {
@@ -1104,6 +1203,18 @@ impl<'a> ExpertWeights<'a> {
         let started = std::time::Instant::now();
         let lanes = EXPERT_READ_LANES / 2;
         let mut weights = [devices[0].own(|| Ok(Vec::new()))?, devices[1].own(|| Ok(Vec::new()))?];
+        let layouts = (0..2).map(|rank| {
+            let layout = Self::arena_layout(devices[rank], catalog,
+                layers.iter().map(|&layer| ExpertLayer::BackboneTp2 { layer, rank }))?;
+            let staging = layers.iter().map(|&layer| devices[rank].run(||
+                Self::plan(devices[rank].library, catalog, ExpertLayer::BackboneTp2 { layer, rank })))
+                .collect::<Result<Vec<_>>>()?.iter().map(|p| p.device_staging_bytes).max().unwrap_or(0);
+            super::weight_layout::admit(&layout, staging, 0, available[rank])?;
+            Ok(layout)
+        }).collect::<Result<Vec<_>>>()?;
+        let arenas = layouts.into_iter().enumerate().map(|(rank, layout)|
+            crate::shared::memory::weight_arena::DeviceWeightArena::new(devices[rank], layout, cuteafd_core::memory_layout::ArenaTag::experts("experts/native-pair")))
+            .collect::<Result<Vec<_>>>()?;
         let mut staging_bytes = [0; 2];
         let mut pinned_admitted = 0;
         let mut full_bytes = 0;
@@ -1121,7 +1232,9 @@ impl<'a> ExpertWeights<'a> {
                 remaining[rank] -= budget.resident_bytes;
                 devices[rank].run(|| {
                     let mut owned = Vec::with_capacity(4);
-                    for bytes in sizes { owned.push(DeviceAllocation::new(devices[rank].library, bytes)?); }
+                    for (index, bytes) in sizes.into_iter().enumerate() {
+                        owned.push(DeviceAllocation::from_allocation(arenas[rank].view(&super::weight_layout::name(selection, index), bytes)?));
+                    }
                     weights[rank].push(Self { buffers: <[DeviceAllocation<'a>; 4]>::try_from(owned).ok().expect("four native slabs").map(Into::into),
                         layer: selection, experts, budget, nvfp4: None, format: ExpertFormat::Native, raw_scales: RawScales::none(), resident: None });
                     Ok(())
@@ -1155,8 +1268,8 @@ impl<'a> ExpertWeights<'a> {
                 })?;
             }
         }
-        let staging = [devices[0].own(|| DeviceAllocation::new(devices[0].library, staging_bytes[0]))?,
-            devices[1].own(|| DeviceAllocation::new(devices[1].library, staging_bytes[1]))?];
+        let staging = [devices[0].own(|| DeviceAllocation::new(devices[0].library, staging_bytes[0], Tag::staging("experts/native-pair-load")))?,
+            devices[1].own(|| DeviceAllocation::new(devices[1].library, staging_bytes[1], Tag::staging("experts/native-pair-load")))?];
         let table_bytes = if coded { 2 << 20 } else { 0 };
         let bank_admitted = pinned_admitted.checked_sub(table_bytes).context("paired scale tables under-admitted")?;
         let mut hosts = paired_load::banks(devices[0], lanes, full_bytes, bank_admitted)?;
@@ -1278,8 +1391,9 @@ impl<'a> ExpertWeights<'a> {
         catalog: &OfficialV41Catalog,
         layer: ExpertLayer,
         available_device_bytes: usize,
+        arena: &crate::shared::memory::weight_arena::DeviceWeightArena<'a>,
     ) -> Result<Self> {
-        let (buffers, side) = nvfp4::Nvfp4Side::load(library, catalog, layer, available_device_bytes)?;
+        let (buffers, side) = nvfp4::Nvfp4Side::load(library, catalog, layer, available_device_bytes, arena)?;
         let budget = nvfp4::Nvfp4Side::plan(library, catalog, layer)?;
         let (_, experts) = nvfp4::Nvfp4Side::rank_planes(layer, catalog)?;
         Ok(Self {

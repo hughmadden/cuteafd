@@ -46,6 +46,7 @@ pub const EXPERT_PROTOCOL_V2_FLAG_RESPONSE_ROW_CAPACITY_ERROR: u32 = 1 << 17;
 // unit on its prefill owner, two LE u32 at bytes 88..96. Never combined with
 // the debug checksum, which occupies those bytes.
 pub const EXPERT_PROTOCOL_V2_FLAG_RESPONSE_UNIT_PACE: u32 = 1 << 19;
+// Bit 18 is reserved (free for future use) and rejected by `validate_flags`.
 pub const EXPERT_PROTOCOL_V2_FLAG_SPARK_ROW_SHARDED_REDUCTION: u32 = 1 << 11;
 /// Per-expert partial replies (models whose experts carry a per-expert output
 /// norm): the worker returns each routed (row, slot)'s unweighted partial in the
@@ -313,6 +314,48 @@ pub struct ExpertProtocolV2RequestHeader {
     pub flags: u32,
 }
 
+/// Layer-free geometry for opening persistent expert sessions. No rows are dispatched.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SparkSessionShape {
+    pub row_count: u32,
+    pub hidden_dim: u32,
+    pub hidden_dtype: ExpertV2Dtype,
+    pub route_count: u32,
+    pub hidden_row_stride_bytes: u32,
+    pub hidden_payload_bytes: u64,
+    pub flags: u32,
+    pub request_wire_bytes: usize,
+    pub response_wire_bytes: usize,
+}
+
+impl SparkSessionShape {
+    pub fn new(rows: u32, hidden: u32, topk: u32, dtype: ExpertV2Dtype) -> Result<Self> {
+        anyhow::ensure!(rows > 0 && hidden > 0 && topk > 0, "invalid Spark session geometry");
+        let stride = dtype.row_bytes(hidden as usize)?;
+        let routes = rows.checked_mul(topk).context("Spark session route overflow")?;
+        let payload = (rows as usize).checked_mul(stride).context("Spark session payload overflow")?;
+        let request = cuteafd_core::expert_geometry::expert_request_payload_offset(
+            EXPERT_PROTOCOL_V2_REQUEST_HEADER_LEN, rows as usize * EXPERT_PROTOCOL_V2_ROW_DESCRIPTOR_LEN,
+            routes as usize * EXPERT_PROTOCOL_V2_ROUTE_ENTRY_LEN).context("Spark session prefix overflow")?;
+        let response = (rows as usize).checked_mul(stride.max(hidden as usize * 2) + 4)
+            .and_then(|n| n.checked_add(EXPERT_PROTOCOL_V2_RESPONSE_HEADER_LEN))
+            .context("Spark session response overflow")?;
+        Ok(Self { row_count: rows, hidden_dim: hidden, hidden_dtype: dtype, route_count: routes,
+            hidden_row_stride_bytes: u32::try_from(stride)?, hidden_payload_bytes: payload as u64,
+            flags: 0, request_wire_bytes: request.checked_add(payload).context("Spark session wire overflow")?,
+            response_wire_bytes: response })
+    }
+
+    pub fn from_request(request: &ExpertProtocolV2Request) -> Result<Self> {
+        let h = &request.header;
+        Ok(Self { row_count: h.row_count, hidden_dim: h.hidden_dim, hidden_dtype: h.hidden_dtype,
+            route_count: h.route_count, hidden_row_stride_bytes: h.hidden_row_stride_bytes,
+            hidden_payload_bytes: h.hidden_payload_bytes, flags: h.flags,
+            request_wire_bytes: request.wire_stats().wire_bytes,
+            response_wire_bytes: crate::verbs::verbs_host_expected_response_wire_bytes(request)? })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExpertProtocolV2RowDescriptor {
     pub row_id: u64,
@@ -372,12 +415,15 @@ impl PartialWire {
         match value { 1 => Ok(Self::Nvfp4), 2 => Ok(Self::Fp8),
             other => bail!("ExpertProtocolV2 partial wide format {other} is neither nvfp4 (1) nor fp8 (2)") }
     }
+    pub fn other(self) -> Self {
+        match self { Self::Nvfp4 => Self::Fp8, Self::Fp8 => Self::Nvfp4 }
+    }
     pub fn record_bytes(self, width: usize) -> usize {
         match self { Self::Nvfp4 => width / 2 + width / 16, Self::Fp8 => width + width / 32 }
     }
 }
 
-/// Region of every request row (0: BF16, 1: wide), computed by the coordinator
+/// Region of every request row (0: BF16, 1: wide, 2: the other compressed format), computed by the coordinator
 /// and carried in each row descriptor; the worker never derives it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PartialReplyPlan {
@@ -420,30 +466,49 @@ impl PartialReplyPlan {
         if self.regions.len() != rows {
             bail!("ExpertProtocolV2 partial plan has {} region bits for {rows} rows", self.regions.len());
         }
-        if let Some(bad) = self.regions.iter().find(|&&r| r > 1) {
-            bail!("ExpertProtocolV2 partial region bit {bad} is neither 0 (BF16) nor 1 (wide)");
+        if let Some(bad) = self.regions.iter().find(|&&r| r > 2) {
+            bail!("ExpertProtocolV2 partial region {bad} is outside 0 (BF16), 1 (wide), 2 (other compressed)");
         }
         Ok(())
     }
 
-    /// (BF16 rows, wide rows).
-    pub fn counts(&self) -> (usize, usize) {
-        let wide = self.regions.iter().filter(|&&r| r == 1).count();
-        (self.regions.len() - wide, wide)
+    /// Each non-empty region starts at a 256-byte boundary. Empty regions do
+    /// not extend the payload. The format of region 2 is `wide.other()`.
+    pub fn layout(&self, topk: usize, width: usize) -> Result<PartialReplyLayout> {
+        self.validate(self.regions.len())?;
+        anyhow::ensure!(topk > 0 && width > 0 && width % 32 == 0, "invalid partial reply geometry");
+        let records = [width.checked_mul(2).context("partial BF16 record overflow")?,
+            self.wide.record_bytes(width), self.wide.other().record_bytes(width)];
+        let mut offsets = [0; 3];
+        let mut bytes = [0; 3];
+        let mut total = 0usize;
+        for region in 0..3 {
+            offsets[region] = total.checked_add(EXPERT_PROTOCOL_V2_PARTIAL_REGION_ALIGN - 1)
+                .context("partial alignment overflow")? / EXPERT_PROTOCOL_V2_PARTIAL_REGION_ALIGN
+                * EXPERT_PROTOCOL_V2_PARTIAL_REGION_ALIGN;
+            bytes[region] = self.regions.iter().filter(|&&r| r as usize == region).count()
+                .checked_mul(topk).and_then(|n| n.checked_mul(records[region]))
+                .context("partial region overflow")?;
+            if bytes[region] != 0 {
+                total = offsets[region].checked_add(bytes[region]).context("partial payload overflow")?;
+            }
+        }
+        Ok(PartialReplyLayout { offsets, bytes, total })
     }
 
-    /// Reply payload: the BF16 region then the wide region, each 256-byte aligned.
-    /// `(bf16 bytes, wide offset, wide bytes, total)`.
+    /// The first two regions and the complete payload extent. Call `layout`
+    /// for all three offsets; existing two-region consumers use this summary.
     pub fn payload(&self, topk: usize, width: usize) -> Result<(usize, usize, usize, usize)> {
-        let (bf16_rows, wide_rows) = self.counts();
-        let bf16 = bf16_rows.checked_mul(topk).and_then(|n| n.checked_mul(width * 2))
-            .context("partial BF16 region overflow")?;
-        let wide_at = bf16.next_multiple_of(EXPERT_PROTOCOL_V2_PARTIAL_REGION_ALIGN);
-        let wide = wide_rows.checked_mul(topk).and_then(|n| n.checked_mul(self.wide.record_bytes(width)))
-            .context("partial wide region overflow")?;
-        let total = if wide == 0 { bf16 } else { wide_at.checked_add(wide).context("partial payload overflow")? };
-        Ok((bf16, wide_at, wide, total))
+        let layout = self.layout(topk, width)?;
+        Ok((layout.bytes[0], layout.offsets[1], layout.bytes[1], layout.total))
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PartialReplyLayout {
+    pub offsets: [usize; 3],
+    pub bytes: [usize; 3],
+    pub total: usize,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -603,11 +668,8 @@ fn response_header_len_from_flags(flags: u32) -> usize {
     }
 }
 
-// The GPU expert tier's coordinator-owner request flag aliases no other
-// request or response flag (it once shared bit 21 with the FP8 K32 format).
-const _: () = assert!(crate::expert::V41_NATIVE_COORDINATOR_REQUEST_FLAG
-    & (crate::expert::V41_NATIVE_GROUP_REQUEST_FLAG
-        | EXPERT_PROTOCOL_V2_FLAG_DEBUG_CHECKSUM
+const _: () = assert!(crate::expert::V41_COORDINATOR_ROUTES_REQUEST_FLAG
+    & (EXPERT_PROTOCOL_V2_FLAG_DEBUG_CHECKSUM
         | EXPERT_PROTOCOL_V2_FLAG_PRECOMPILE_WARMUP
         | EXPERT_PROTOCOL_V2_FLAG_RESPONSE_ROW_INDICES
         | EXPERT_PROTOCOL_V2_FLAG_RESPONSE_MORE_CHUNKS
@@ -617,19 +679,18 @@ const _: () = assert!(crate::expert::V41_NATIVE_COORDINATOR_REQUEST_FLAG
         | EXPERT_PROTOCOL_V2_FLAG_STREAM_DATA
         | EXPERT_PROTOCOL_V2_FLAG_STREAM_FINAL
         | EXPERT_PROTOCOL_V2_FLAG_SPARK_REDUCTION
-        | EXPERT_PROTOCOL_V2_FLAG_SPARK_ROW_SHARDED_REDUCTION
-        | EXPERT_PROTOCOL_V2_SPARK_COLLECTIVE_PART_COUNT_MASK
         | EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16
         | EXPERT_PROTOCOL_V2_FLAG_RESPONSE_ROW_CAPACITY_ERROR
         | EXPERT_PROTOCOL_V2_FLAG_RESPONSE_UNIT_PACE
+        | EXPERT_PROTOCOL_V2_FLAG_SPARK_ROW_SHARDED_REDUCTION
         | EXPERT_PROTOCOL_V2_FLAG_PARTIAL_REPLIES
-        | EXPERT_PROTOCOL_V2_FLAG_RESPONSE_FP8_E4M3_UE8M0_K32) == 0);
+        | EXPERT_PROTOCOL_V2_FLAG_RESPONSE_FP8_E4M3_UE8M0_K32
+        | EXPERT_PROTOCOL_V2_SPARK_COLLECTIVE_PART_COUNT_MASK) == 0);
 
 fn validate_flags(flags: u32, label: &str) -> Result<()> {
     let allowed = match label {
         "request" => {
-            crate::expert::V41_NATIVE_GROUP_REQUEST_FLAG
-                | crate::expert::V41_NATIVE_COORDINATOR_REQUEST_FLAG
+            crate::expert::V41_COORDINATOR_ROUTES_REQUEST_FLAG
                 | EXPERT_PROTOCOL_V2_FLAG_DEBUG_CHECKSUM
                 | EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16
                 | EXPERT_PROTOCOL_V2_FLAG_RESPONSE_FP8_E4M3_UE8M0_K32
@@ -657,25 +718,14 @@ fn validate_flags(flags: u32, label: &str) -> Result<()> {
         }
         _ => EXPERT_PROTOCOL_V2_FLAG_DEBUG_CHECKSUM,
     };
-    // Native replicated-group ownership: same compact request contract as the
-    // canonical native batch, and
-    // never present in a response.
-    if label == "request" && flags & crate::expert::V41_NATIVE_GROUP_REQUEST_FLAG != 0 {
-        let native_allowed = crate::expert::V41_NATIVE_GROUP_REQUEST_FLAG
-            | crate::expert::V41_NATIVE_COORDINATOR_REQUEST_FLAG
+    if label == "request" && flags & crate::expert::V41_COORDINATOR_ROUTES_REQUEST_FLAG != 0 {
+        let native_allowed = crate::expert::V41_COORDINATOR_ROUTES_REQUEST_FLAG
+            | EXPERT_PROTOCOL_V2_FLAG_DEBUG_CHECKSUM | EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16
             | EXPERT_PROTOCOL_V2_FLAG_RESPONSE_FP8_E4M3_UE8M0_K32
-            | EXPERT_PROTOCOL_V2_FLAG_RESPONSE_NVFP4_E2M1_FP8_E4M3
-            | EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16
-            | EXPERT_PROTOCOL_V2_FLAG_DEBUG_CHECKSUM;
+            | EXPERT_PROTOCOL_V2_FLAG_RESPONSE_NVFP4_E2M1_FP8_E4M3;
         if flags & !native_allowed != 0 || flags & EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16 == 0 {
-            bail!("native group ownership requires the native compact request contract");
+            bail!("coordinator routes require the native compact request contract");
         }
-    }
-    // The coordinator owner extends the native group owner field: it is
-    // meaningless without it.
-    if label == "request" && flags & crate::expert::V41_NATIVE_COORDINATOR_REQUEST_FLAG != 0
-        && flags & crate::expert::V41_NATIVE_GROUP_REQUEST_FLAG == 0 {
-        bail!("the coordinator route owner requires native group ownership");
     }
     let unknown = flags & !allowed;
     if unknown != 0 {

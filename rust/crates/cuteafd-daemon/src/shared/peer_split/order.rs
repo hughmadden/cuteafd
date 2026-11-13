@@ -181,7 +181,7 @@ pub(crate) fn check_terminal(schedule: &Schedule, aborted: bool) -> Result<(), D
 /// unfinished generations and releases waits for producers never enqueued.
 #[cfg(test)]
 pub(crate) fn check_submission_faults(schedule: &Schedule) -> Result<(), Deadlock> {
-    use crate::shared::experts::rtx::pair::{submit, teardown, TerminalStepError, TestSubmission};
+    use crate::shared::experts::rtx::pair::{submit, teardown, StepFailure, TestSubmission};
     use std::cell::{Cell, RefCell};
     check(schedule)?;
     for rank in 0..2 {
@@ -206,7 +206,7 @@ pub(crate) fn check_submission_faults(schedule: &Schedule) -> Result<(), Deadloc
                         || teardown(&mut *owners.borrow_mut()),
                         || anyhow::bail!("rank {rank} enqueue {at}"),
                     );
-                    assert!(result.unwrap_err().downcast_ref::<TerminalStepError>().is_some());
+                    assert!(StepFailure::is_terminal(&result.unwrap_err()));
                 }
                 owners.borrow().verify_retired().unwrap();
                 let replayed = Cell::new(false);

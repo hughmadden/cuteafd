@@ -171,6 +171,7 @@ fn select_entries(manifest: &serde_json::Value, selection: &DenseSelection, reco
                 Op::TrellisInput { features, .. } | Op::Mx8Quant { features } =>
                     (!matches!(op, Op::Mx8Quant { .. }) || a8)
                         && required.iter().filter(trellis).any(|r| r.k == features as usize),
+                Op::Mx8QuantBf16 { .. } => false,
                 Op::TrellisOutput { features } => required.iter().filter(trellis).any(|r| r.n == features as usize),
                 Op::SwigluSplit { inter } => required.iter().filter(trellis).any(|r| r.n == inter as usize),
                 Op::NarrowPack { width, .. } => required.iter().any(|r| r.n == width as usize),

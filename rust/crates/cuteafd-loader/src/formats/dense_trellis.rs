@@ -42,9 +42,9 @@ impl DenseTrellisCheckpoint<'_> {
         -> Result<NativeTrellisShard, DenseTrellisError> {
         use DenseTrellisError::{Extent, Geometry};
         let [n, k] = self.shape;
-        if !matches!(self.bits, 2..=6) || !matches!(ranks, 1 | 2) || rank >= ranks
+        if !matches!(self.bits, 4 | 6 | 8) || !matches!(ranks, 1 | 2) || rank >= ranks
             || n == 0 || k == 0 || n % 128 != 0 || k % 128 != 0 {
-            return Err(Geometry("K2-K6, TP1/TP2 and nonempty H128-aligned dimensions required"));
+            return Err(Geometry("K4/K6/K8, TP1/TP2 and nonempty H128-aligned dimensions required"));
         }
         let bytes = n.checked_mul(k).and_then(|v| v.checked_mul(self.bits))
             .map(|v| v / 8).ok_or(Geometry("payload size overflow"))?;
@@ -139,7 +139,7 @@ mod tests {
         let (n, k) = (512, 768);
         let suh = (0..k as u16).flat_map(u16::to_le_bytes).collect::<Vec<_>>();
         let svh = (0..n as u16).map(|v| v | 0x8000).flat_map(u16::to_le_bytes).collect::<Vec<_>>();
-        for bits in 2..=6 {
+        for bits in [4, 6, 8] {
             let tile_bytes = 32 * bits;
             let payload = (0..n * k * bits / 8).map(|i| (i ^ (i >> 8)) as u8).collect::<Vec<_>>();
             let source = DenseTrellisCheckpoint { shape: [n, k], bits, payload: &payload, suh: &suh, svh: &svh };

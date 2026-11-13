@@ -1,0 +1,4424 @@
+{
+  "schema_version": 1,
+  "family": "kimi_k3",
+  "layouts": [
+    {
+      "core": "bf16",
+      "ranks": 2,
+      "layout": "bf16-2rtx-6spark-adaptive",
+      "reserve_base_bytes": [
+        1281359872,
+        1279262720
+      ],
+      "reserve_extra_bytes": 2097152,
+      "entries": [
+        {
+          "rows": 3,
+          "speculative": false,
+          "op": "ffn",
+          "pin": true,
+          "capture_bytes": [
+            11652063,
+            11652063
+          ]
+        },
+        {
+          "rows": 7,
+          "speculative": false,
+          "op": "ffn",
+          "pin": true,
+          "capture_bytes": [
+            11652063,
+            11652063
+          ]
+        },
+        {
+          "rows": 3,
+          "speculative": true,
+          "op": "attention",
+          "pin": true,
+          "capture_bytes": [
+            8645079,
+            8645079
+          ]
+        },
+        {
+          "rows": 4,
+          "speculative": false,
+          "op": "ffn",
+          "pin": true,
+          "capture_bytes": [
+            11652063,
+            11652063
+          ]
+        },
+        {
+          "rows": 5,
+          "speculative": false,
+          "op": "ffn",
+          "pin": true,
+          "capture_bytes": [
+            11652063,
+            11652063
+          ]
+        },
+        {
+          "rows": 7,
+          "speculative": true,
+          "op": "attention",
+          "pin": true,
+          "capture_bytes": [
+            8645079,
+            8645079
+          ]
+        },
+        {
+          "rows": 4,
+          "speculative": true,
+          "op": "attention",
+          "pin": true,
+          "capture_bytes": [
+            8645079,
+            8645079
+          ]
+        },
+        {
+          "rows": 5,
+          "speculative": true,
+          "op": "attention",
+          "pin": true,
+          "capture_bytes": [
+            8645079,
+            8645079
+          ]
+        },
+        {
+          "rows": 13,
+          "speculative": false,
+          "op": "ffn",
+          "pin": true,
+          "capture_bytes": [
+            11652063,
+            11652063
+          ]
+        },
+        {
+          "rows": 1,
+          "speculative": false,
+          "op": "context",
+          "pin": true,
+          "capture_bytes": [
+            3006984,
+            3006984
+          ]
+        },
+        {
+          "rows": 13,
+          "speculative": true,
+          "op": "attention",
+          "pin": true,
+          "capture_bytes": [
+            8645079,
+            8645079
+          ]
+        },
+        {
+          "rows": 3,
+          "speculative": true,
+          "op": "context",
+          "pin": true,
+          "capture_bytes": [
+            3006984,
+            3006984
+          ]
+        },
+        {
+          "rows": 25,
+          "speculative": false,
+          "op": "ffn",
+          "pin": true,
+          "capture_bytes": [
+            11652063,
+            11652063
+          ]
+        },
+        {
+          "rows": 4,
+          "speculative": true,
+          "op": "context",
+          "pin": true,
+          "capture_bytes": [
+            3006984,
+            3006984
+          ]
+        },
+        {
+          "rows": 25,
+          "speculative": true,
+          "op": "attention",
+          "pin": true,
+          "capture_bytes": [
+            8645079,
+            8645079
+          ]
+        },
+        {
+          "rows": 5,
+          "speculative": true,
+          "op": "context",
+          "pin": true,
+          "capture_bytes": [
+            3006984,
+            3006984
+          ]
+        },
+        {
+          "rows": 7,
+          "speculative": true,
+          "op": "context",
+          "pin": true,
+          "capture_bytes": [
+            3006984,
+            3006984
+          ]
+        },
+        {
+          "rows": 1,
+          "speculative": false,
+          "op": "ffn",
+          "pin": true,
+          "capture_bytes": [
+            11652063,
+            11652063
+          ]
+        },
+        {
+          "rows": 1,
+          "speculative": false,
+          "op": "attention",
+          "pin": true,
+          "capture_bytes": [
+            8645079,
+            8645079
+          ]
+        },
+        {
+          "rows": 56,
+          "speculative": false,
+          "op": "ffn",
+          "pin": true,
+          "capture_bytes": [
+            12039129,
+            10835316
+          ]
+        },
+        {
+          "rows": 56,
+          "speculative": true,
+          "op": "attention",
+          "pin": true,
+          "capture_bytes": [
+            8932391,
+            8039052
+          ]
+        },
+        {
+          "rows": 11,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            11652063,
+            11652063
+          ]
+        },
+        {
+          "rows": 10,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            11652063,
+            11652063
+          ]
+        },
+        {
+          "rows": 64,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            11652063,
+            11652063
+          ]
+        },
+        {
+          "rows": 6,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            11652063,
+            11652063
+          ]
+        },
+        {
+          "rows": 12,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            11652063,
+            11652063
+          ]
+        },
+        {
+          "rows": 19,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            11652063,
+            11652063
+          ]
+        },
+        {
+          "rows": 11,
+          "speculative": true,
+          "op": "attention",
+          "pin": false,
+          "capture_bytes": [
+            8645079,
+            8645079
+          ]
+        },
+        {
+          "rows": 8,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            11652063,
+            11652063
+          ]
+        },
+        {
+          "rows": 38,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            11652063,
+            11652063
+          ]
+        },
+        {
+          "rows": 10,
+          "speculative": true,
+          "op": "attention",
+          "pin": false,
+          "capture_bytes": [
+            8645079,
+            8645079
+          ]
+        },
+        {
+          "rows": 20,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            11652063,
+            11652063
+          ]
+        },
+        {
+          "rows": 6,
+          "speculative": true,
+          "op": "attention",
+          "pin": false,
+          "capture_bytes": [
+            8645079,
+            8645079
+          ]
+        },
+        {
+          "rows": 12,
+          "speculative": true,
+          "op": "attention",
+          "pin": false,
+          "capture_bytes": [
+            8645079,
+            8645079
+          ]
+        },
+        {
+          "rows": 64,
+          "speculative": true,
+          "op": "attention",
+          "pin": false,
+          "capture_bytes": [
+            8645079,
+            8645079
+          ]
+        },
+        {
+          "rows": 37,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            11652063,
+            11652063
+          ]
+        },
+        {
+          "rows": 19,
+          "speculative": true,
+          "op": "attention",
+          "pin": false,
+          "capture_bytes": [
+            8645079,
+            8645079
+          ]
+        },
+        {
+          "rows": 8,
+          "speculative": true,
+          "op": "attention",
+          "pin": false,
+          "capture_bytes": [
+            8645079,
+            8645079
+          ]
+        },
+        {
+          "rows": 2,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            11652063,
+            11652063
+          ]
+        },
+        {
+          "rows": 38,
+          "speculative": true,
+          "op": "attention",
+          "pin": false,
+          "capture_bytes": [
+            8645079,
+            8645079
+          ]
+        },
+        {
+          "rows": 20,
+          "speculative": true,
+          "op": "attention",
+          "pin": false,
+          "capture_bytes": [
+            8645079,
+            8645079
+          ]
+        },
+        {
+          "rows": 13,
+          "speculative": true,
+          "op": "context",
+          "pin": false,
+          "capture_bytes": [
+            3006984,
+            3006984
+          ]
+        },
+        {
+          "rows": 9,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            11652063,
+            11652063
+          ]
+        },
+        {
+          "rows": 17,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            11652063,
+            11652063
+          ]
+        },
+        {
+          "rows": 27,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            11652063,
+            11652063
+          ]
+        },
+        {
+          "rows": 37,
+          "speculative": true,
+          "op": "attention",
+          "pin": false,
+          "capture_bytes": [
+            8645079,
+            8645079
+          ]
+        },
+        {
+          "rows": 18,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            11652063,
+            11652063
+          ]
+        },
+        {
+          "rows": 2,
+          "speculative": true,
+          "op": "attention",
+          "pin": false,
+          "capture_bytes": [
+            8645079,
+            8645079
+          ]
+        },
+        {
+          "rows": 64,
+          "speculative": false,
+          "op": "context",
+          "pin": false,
+          "capture_bytes": [
+            3006984,
+            3006984
+          ]
+        },
+        {
+          "rows": 15,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            11652063,
+            11652063
+          ]
+        },
+        {
+          "rows": 21,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            11652063,
+            11652063
+          ]
+        },
+        {
+          "rows": 9,
+          "speculative": true,
+          "op": "attention",
+          "pin": false,
+          "capture_bytes": [
+            8645079,
+            8645079
+          ]
+        },
+        {
+          "rows": 17,
+          "speculative": true,
+          "op": "attention",
+          "pin": false,
+          "capture_bytes": [
+            8645079,
+            8645079
+          ]
+        },
+        {
+          "rows": 14,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            11652063,
+            11652063
+          ]
+        },
+        {
+          "rows": 22,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            11652063,
+            11652063
+          ]
+        },
+        {
+          "rows": 26,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            11652063,
+            11652063
+          ]
+        },
+        {
+          "rows": 27,
+          "speculative": true,
+          "op": "attention",
+          "pin": false,
+          "capture_bytes": [
+            8645079,
+            8645079
+          ]
+        },
+        {
+          "rows": 18,
+          "speculative": true,
+          "op": "attention",
+          "pin": false,
+          "capture_bytes": [
+            8645079,
+            8645079
+          ]
+        },
+        {
+          "rows": 39,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            11652063,
+            11652063
+          ]
+        },
+        {
+          "rows": 9,
+          "speculative": true,
+          "op": "context",
+          "pin": false,
+          "capture_bytes": [
+            3006984,
+            3006984
+          ]
+        },
+        {
+          "rows": 25,
+          "speculative": true,
+          "op": "context",
+          "pin": false,
+          "capture_bytes": [
+            3006984,
+            3006984
+          ]
+        },
+        {
+          "rows": 29,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            11652063,
+            11652063
+          ]
+        },
+        {
+          "rows": 40,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            11652063,
+            11652063
+          ]
+        },
+        {
+          "rows": 41,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            11652063,
+            11652063
+          ]
+        },
+        {
+          "rows": 11,
+          "speculative": true,
+          "op": "context",
+          "pin": false,
+          "capture_bytes": [
+            3006984,
+            3006984
+          ]
+        },
+        {
+          "rows": 15,
+          "speculative": true,
+          "op": "attention",
+          "pin": false,
+          "capture_bytes": [
+            8645079,
+            8645079
+          ]
+        },
+        {
+          "rows": 21,
+          "speculative": true,
+          "op": "attention",
+          "pin": false,
+          "capture_bytes": [
+            8645079,
+            8645079
+          ]
+        },
+        {
+          "rows": 10,
+          "speculative": true,
+          "op": "context",
+          "pin": false,
+          "capture_bytes": [
+            3006984,
+            3006984
+          ]
+        },
+        {
+          "rows": 14,
+          "speculative": true,
+          "op": "attention",
+          "pin": false,
+          "capture_bytes": [
+            8645079,
+            8645079
+          ]
+        },
+        {
+          "rows": 22,
+          "speculative": true,
+          "op": "attention",
+          "pin": false,
+          "capture_bytes": [
+            8645079,
+            8645079
+          ]
+        },
+        {
+          "rows": 26,
+          "speculative": true,
+          "op": "attention",
+          "pin": false,
+          "capture_bytes": [
+            8645079,
+            8645079
+          ]
+        },
+        {
+          "rows": 35,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            11652063,
+            11652063
+          ]
+        },
+        {
+          "rows": 36,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            11652063,
+            11652063
+          ]
+        },
+        {
+          "rows": 39,
+          "speculative": true,
+          "op": "attention",
+          "pin": false,
+          "capture_bytes": [
+            8647194,
+            8645079
+          ]
+        },
+        {
+          "rows": 6,
+          "speculative": true,
+          "op": "context",
+          "pin": false,
+          "capture_bytes": [
+            3006984,
+            3006984
+          ]
+        },
+        {
+          "rows": 12,
+          "speculative": true,
+          "op": "context",
+          "pin": false,
+          "capture_bytes": [
+            3006984,
+            3006984
+          ]
+        },
+        {
+          "rows": 64,
+          "speculative": true,
+          "op": "context",
+          "pin": false,
+          "capture_bytes": [
+            3006984,
+            3006984
+          ]
+        },
+        {
+          "rows": 29,
+          "speculative": true,
+          "op": "attention",
+          "pin": false,
+          "capture_bytes": [
+            8645079,
+            8645079
+          ]
+        },
+        {
+          "rows": 8,
+          "speculative": true,
+          "op": "context",
+          "pin": false,
+          "capture_bytes": [
+            3006984,
+            3006984
+          ]
+        },
+        {
+          "rows": 19,
+          "speculative": true,
+          "op": "context",
+          "pin": false,
+          "capture_bytes": [
+            3006984,
+            3006984
+          ]
+        },
+        {
+          "rows": 50,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            10835316,
+            10835316
+          ]
+        },
+        {
+          "rows": 41,
+          "speculative": true,
+          "op": "attention",
+          "pin": false,
+          "capture_bytes": [
+            8645079,
+            8645079
+          ]
+        },
+        {
+          "rows": 38,
+          "speculative": true,
+          "op": "context",
+          "pin": false,
+          "capture_bytes": [
+            3006984,
+            3006984
+          ]
+        },
+        {
+          "rows": 35,
+          "speculative": true,
+          "op": "attention",
+          "pin": false,
+          "capture_bytes": [
+            8645079,
+            8645079
+          ]
+        },
+        {
+          "rows": 36,
+          "speculative": true,
+          "op": "attention",
+          "pin": false,
+          "capture_bytes": [
+            8645079,
+            8645079
+          ]
+        },
+        {
+          "rows": 40,
+          "speculative": true,
+          "op": "attention",
+          "pin": false,
+          "capture_bytes": [
+            8645079,
+            8645079
+          ]
+        },
+        {
+          "rows": 20,
+          "speculative": true,
+          "op": "context",
+          "pin": false,
+          "capture_bytes": [
+            3006984,
+            3006984
+          ]
+        },
+        {
+          "rows": 28,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            11652063,
+            11652063
+          ]
+        },
+        {
+          "rows": 2,
+          "speculative": true,
+          "op": "context",
+          "pin": false,
+          "capture_bytes": [
+            3006984,
+            3006984
+          ]
+        },
+        {
+          "rows": 49,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            11652063,
+            11652063
+          ]
+        },
+        {
+          "rows": 37,
+          "speculative": true,
+          "op": "context",
+          "pin": false,
+          "capture_bytes": [
+            3006984,
+            3006984
+          ]
+        },
+        {
+          "rows": 50,
+          "speculative": true,
+          "op": "attention",
+          "pin": false,
+          "capture_bytes": [
+            8039052,
+            8039052
+          ]
+        },
+        {
+          "rows": 23,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            11652063,
+            11652063
+          ]
+        },
+        {
+          "rows": 33,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            11652063,
+            11652063
+          ]
+        },
+        {
+          "rows": 42,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            11652063,
+            11652063
+          ]
+        },
+        {
+          "rows": 28,
+          "speculative": true,
+          "op": "attention",
+          "pin": false,
+          "capture_bytes": [
+            8645079,
+            8645079
+          ]
+        },
+        {
+          "rows": 17,
+          "speculative": true,
+          "op": "context",
+          "pin": false,
+          "capture_bytes": [
+            3006984,
+            3006984
+          ]
+        },
+        {
+          "rows": 49,
+          "speculative": true,
+          "op": "attention",
+          "pin": false,
+          "capture_bytes": [
+            8645079,
+            8645079
+          ]
+        },
+        {
+          "rows": 27,
+          "speculative": true,
+          "op": "context",
+          "pin": false,
+          "capture_bytes": [
+            3006984,
+            3006984
+          ]
+        },
+        {
+          "rows": 34,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            11652063,
+            11652063
+          ]
+        },
+        {
+          "rows": 55,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            10835316,
+            10835316
+          ]
+        },
+        {
+          "rows": 18,
+          "speculative": true,
+          "op": "context",
+          "pin": false,
+          "capture_bytes": [
+            3006984,
+            3006984
+          ]
+        },
+        {
+          "rows": 23,
+          "speculative": true,
+          "op": "attention",
+          "pin": false,
+          "capture_bytes": [
+            8645079,
+            8645079
+          ]
+        },
+        {
+          "rows": 33,
+          "speculative": true,
+          "op": "attention",
+          "pin": false,
+          "capture_bytes": [
+            8645079,
+            8645079
+          ]
+        },
+        {
+          "rows": 42,
+          "speculative": true,
+          "op": "attention",
+          "pin": false,
+          "capture_bytes": [
+            8645079,
+            8645079
+          ]
+        },
+        {
+          "rows": 15,
+          "speculative": true,
+          "op": "context",
+          "pin": false,
+          "capture_bytes": [
+            3006984,
+            3006984
+          ]
+        },
+        {
+          "rows": 21,
+          "speculative": true,
+          "op": "context",
+          "pin": false,
+          "capture_bytes": [
+            3006984,
+            3006984
+          ]
+        },
+        {
+          "rows": 16,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            11652063,
+            11652063
+          ]
+        },
+        {
+          "rows": 44,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            11652063,
+            11652063
+          ]
+        },
+        {
+          "rows": 54,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            12039129,
+            12039263
+          ]
+        },
+        {
+          "rows": 14,
+          "speculative": true,
+          "op": "context",
+          "pin": false,
+          "capture_bytes": [
+            3006984,
+            3006984
+          ]
+        },
+        {
+          "rows": 22,
+          "speculative": true,
+          "op": "context",
+          "pin": false,
+          "capture_bytes": [
+            3006984,
+            3006984
+          ]
+        },
+        {
+          "rows": 26,
+          "speculative": true,
+          "op": "context",
+          "pin": false,
+          "capture_bytes": [
+            3006984,
+            3006984
+          ]
+        },
+        {
+          "rows": 34,
+          "speculative": true,
+          "op": "attention",
+          "pin": false,
+          "capture_bytes": [
+            8645079,
+            8645079
+          ]
+        },
+        {
+          "rows": 55,
+          "speculative": true,
+          "op": "attention",
+          "pin": false,
+          "capture_bytes": [
+            8039052,
+            8039052
+          ]
+        },
+        {
+          "rows": 39,
+          "speculative": true,
+          "op": "context",
+          "pin": false,
+          "capture_bytes": [
+            3006984,
+            3006984
+          ]
+        },
+        {
+          "rows": 29,
+          "speculative": true,
+          "op": "context",
+          "pin": false,
+          "capture_bytes": [
+            3006984,
+            3006984
+          ]
+        },
+        {
+          "rows": 41,
+          "speculative": true,
+          "op": "context",
+          "pin": false,
+          "capture_bytes": [
+            3006984,
+            3006984
+          ]
+        },
+        {
+          "rows": 24,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            11652063,
+            11652063
+          ]
+        },
+        {
+          "rows": 43,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            11652063,
+            11652063
+          ]
+        },
+        {
+          "rows": 16,
+          "speculative": true,
+          "op": "attention",
+          "pin": false,
+          "capture_bytes": [
+            8645079,
+            8645079
+          ]
+        },
+        {
+          "rows": 44,
+          "speculative": true,
+          "op": "attention",
+          "pin": false,
+          "capture_bytes": [
+            8645079,
+            8645079
+          ]
+        },
+        {
+          "rows": 54,
+          "speculative": true,
+          "op": "attention",
+          "pin": false,
+          "capture_bytes": [
+            8932391,
+            8932257
+          ]
+        },
+        {
+          "rows": 35,
+          "speculative": true,
+          "op": "context",
+          "pin": false,
+          "capture_bytes": [
+            3006984,
+            3006984
+          ]
+        },
+        {
+          "rows": 36,
+          "speculative": true,
+          "op": "context",
+          "pin": false,
+          "capture_bytes": [
+            3006984,
+            3006984
+          ]
+        },
+        {
+          "rows": 40,
+          "speculative": true,
+          "op": "context",
+          "pin": false,
+          "capture_bytes": [
+            3006984,
+            3006984
+          ]
+        },
+        {
+          "rows": 50,
+          "speculative": true,
+          "op": "context",
+          "pin": false,
+          "capture_bytes": [
+            3006984,
+            3006984
+          ]
+        },
+        {
+          "rows": 24,
+          "speculative": true,
+          "op": "attention",
+          "pin": false,
+          "capture_bytes": [
+            8645079,
+            8645079
+          ]
+        },
+        {
+          "rows": 43,
+          "speculative": true,
+          "op": "attention",
+          "pin": false,
+          "capture_bytes": [
+            8645079,
+            8645079
+          ]
+        },
+        {
+          "rows": 64,
+          "speculative": false,
+          "op": "attention",
+          "pin": false,
+          "capture_bytes": [
+            8645079,
+            8645079
+          ]
+        },
+        {
+          "rows": 28,
+          "speculative": true,
+          "op": "context",
+          "pin": false,
+          "capture_bytes": [
+            3006984,
+            3006984
+          ]
+        },
+        {
+          "rows": 31,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            11652063,
+            11652063
+          ]
+        },
+        {
+          "rows": 45,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            11652063,
+            11652063
+          ]
+        },
+        {
+          "rows": 53,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            10835316,
+            10835316
+          ]
+        },
+        {
+          "rows": 49,
+          "speculative": true,
+          "op": "context",
+          "pin": false,
+          "capture_bytes": [
+            3006984,
+            3006984
+          ]
+        },
+        {
+          "rows": 23,
+          "speculative": true,
+          "op": "context",
+          "pin": false,
+          "capture_bytes": [
+            3006984,
+            3006984
+          ]
+        },
+        {
+          "rows": 33,
+          "speculative": true,
+          "op": "context",
+          "pin": false,
+          "capture_bytes": [
+            3006984,
+            3006984
+          ]
+        },
+        {
+          "rows": 42,
+          "speculative": true,
+          "op": "context",
+          "pin": false,
+          "capture_bytes": [
+            3006984,
+            3006984
+          ]
+        },
+        {
+          "rows": 55,
+          "speculative": true,
+          "op": "context",
+          "pin": false,
+          "capture_bytes": [
+            3006984,
+            3006984
+          ]
+        },
+        {
+          "rows": 31,
+          "speculative": true,
+          "op": "attention",
+          "pin": false,
+          "capture_bytes": [
+            8645079,
+            8645079
+          ]
+        },
+        {
+          "rows": 45,
+          "speculative": true,
+          "op": "attention",
+          "pin": false,
+          "capture_bytes": [
+            8645079,
+            8645079
+          ]
+        },
+        {
+          "rows": 53,
+          "speculative": true,
+          "op": "attention",
+          "pin": false,
+          "capture_bytes": [
+            8039052,
+            8039052
+          ]
+        },
+        {
+          "rows": 34,
+          "speculative": true,
+          "op": "context",
+          "pin": false,
+          "capture_bytes": [
+            3006984,
+            3006984
+          ]
+        },
+        {
+          "rows": 54,
+          "speculative": true,
+          "op": "context",
+          "pin": false,
+          "capture_bytes": [
+            3006984,
+            3006984
+          ]
+        },
+        {
+          "rows": 56,
+          "speculative": true,
+          "op": "context",
+          "pin": false,
+          "capture_bytes": [
+            3006984,
+            3006984
+          ]
+        },
+        {
+          "rows": 16,
+          "speculative": true,
+          "op": "context",
+          "pin": false,
+          "capture_bytes": [
+            3006984,
+            3006984
+          ]
+        },
+        {
+          "rows": 44,
+          "speculative": true,
+          "op": "context",
+          "pin": false,
+          "capture_bytes": [
+            3006984,
+            3006984
+          ]
+        },
+        {
+          "rows": 46,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            10835316,
+            10835316
+          ]
+        },
+        {
+          "rows": 48,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            10835316,
+            10835244
+          ]
+        },
+        {
+          "rows": 58,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            10835316,
+            10835244
+          ]
+        },
+        {
+          "rows": 59,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            10835244,
+            10835316
+          ]
+        },
+        {
+          "rows": 24,
+          "speculative": true,
+          "op": "context",
+          "pin": false,
+          "capture_bytes": [
+            3006984,
+            3006984
+          ]
+        },
+        {
+          "rows": 43,
+          "speculative": true,
+          "op": "context",
+          "pin": false,
+          "capture_bytes": [
+            3006984,
+            3006984
+          ]
+        },
+        {
+          "rows": 53,
+          "speculative": true,
+          "op": "context",
+          "pin": false,
+          "capture_bytes": [
+            3006984,
+            3006984
+          ]
+        },
+        {
+          "rows": 40,
+          "speculative": false,
+          "op": "attention",
+          "pin": false,
+          "capture_bytes": [
+            8388608,
+            8388608
+          ]
+        },
+        {
+          "rows": 46,
+          "speculative": true,
+          "op": "attention",
+          "pin": false,
+          "capture_bytes": [
+            8039052,
+            8039052
+          ]
+        },
+        {
+          "rows": 48,
+          "speculative": true,
+          "op": "attention",
+          "pin": false,
+          "capture_bytes": [
+            8039052,
+            8039124
+          ]
+        },
+        {
+          "rows": 58,
+          "speculative": true,
+          "op": "attention",
+          "pin": false,
+          "capture_bytes": [
+            8039052,
+            8039124
+          ]
+        },
+        {
+          "rows": 59,
+          "speculative": true,
+          "op": "attention",
+          "pin": false,
+          "capture_bytes": [
+            8039124,
+            8039052
+          ]
+        },
+        {
+          "rows": 31,
+          "speculative": true,
+          "op": "context",
+          "pin": false,
+          "capture_bytes": [
+            3006984,
+            3006984
+          ]
+        },
+        {
+          "rows": 45,
+          "speculative": true,
+          "op": "context",
+          "pin": false,
+          "capture_bytes": [
+            3006984,
+            3006984
+          ]
+        },
+        {
+          "rows": 46,
+          "speculative": true,
+          "op": "context",
+          "pin": false,
+          "capture_bytes": [
+            3006984,
+            3009099
+          ]
+        },
+        {
+          "rows": 48,
+          "speculative": false,
+          "op": "context",
+          "pin": false,
+          "capture_bytes": [
+            3788400,
+            3788400
+          ]
+        },
+        {
+          "rows": 48,
+          "speculative": true,
+          "op": "context",
+          "pin": false,
+          "capture_bytes": [
+            3006984,
+            3006984
+          ]
+        },
+        {
+          "rows": 58,
+          "speculative": true,
+          "op": "context",
+          "pin": false,
+          "capture_bytes": [
+            3006984,
+            3006984
+          ]
+        },
+        {
+          "rows": 59,
+          "speculative": true,
+          "op": "context",
+          "pin": false,
+          "capture_bytes": [
+            3006984,
+            3006984
+          ]
+        },
+        {
+          "rows": 47,
+          "speculative": true,
+          "op": "context",
+          "pin": false,
+          "capture_bytes": [
+            3006984,
+            3006984
+          ]
+        },
+        {
+          "rows": 51,
+          "speculative": true,
+          "op": "context",
+          "pin": false,
+          "capture_bytes": [
+            3006984,
+            3006984
+          ]
+        }
+      ]
+    },
+    {
+      "ranks": 1,
+      "layout": "kimi-k3-min",
+      "reserve_base_bytes": [
+        1830813696
+      ],
+      "reserve_extra_bytes": 2097152,
+      "entries": [
+        {
+          "rows": 3,
+          "speculative": false,
+          "op": "ffn",
+          "pin": true,
+          "capture_bytes": [
+            14842893
+          ]
+        },
+        {
+          "rows": 64,
+          "speculative": false,
+          "op": "ffn",
+          "pin": true,
+          "capture_bytes": [
+            14842893
+          ]
+        },
+        {
+          "rows": 7,
+          "speculative": false,
+          "op": "ffn",
+          "pin": true,
+          "capture_bytes": [
+            14842893
+          ]
+        },
+        {
+          "rows": 6,
+          "speculative": false,
+          "op": "ffn",
+          "pin": true,
+          "capture_bytes": [
+            14842893
+          ]
+        },
+        {
+          "rows": 3,
+          "speculative": true,
+          "op": "attention",
+          "pin": true,
+          "capture_bytes": [
+            14842893
+          ]
+        },
+        {
+          "rows": 4,
+          "speculative": false,
+          "op": "ffn",
+          "pin": true,
+          "capture_bytes": [
+            14842893
+          ]
+        },
+        {
+          "rows": 17,
+          "speculative": false,
+          "op": "ffn",
+          "pin": true,
+          "capture_bytes": [
+            14842893
+          ]
+        },
+        {
+          "rows": 9,
+          "speculative": false,
+          "op": "ffn",
+          "pin": true,
+          "capture_bytes": [
+            14842893
+          ]
+        },
+        {
+          "rows": 13,
+          "speculative": false,
+          "op": "ffn",
+          "pin": true,
+          "capture_bytes": [
+            14842893
+          ]
+        },
+        {
+          "rows": 5,
+          "speculative": false,
+          "op": "ffn",
+          "pin": true,
+          "capture_bytes": [
+            14842893
+          ]
+        },
+        {
+          "rows": 64,
+          "speculative": true,
+          "op": "attention",
+          "pin": true,
+          "capture_bytes": [
+            14842893
+          ]
+        },
+        {
+          "rows": 7,
+          "speculative": true,
+          "op": "attention",
+          "pin": true,
+          "capture_bytes": [
+            14842893
+          ]
+        },
+        {
+          "rows": 6,
+          "speculative": true,
+          "op": "attention",
+          "pin": true,
+          "capture_bytes": [
+            14842893
+          ]
+        },
+        {
+          "rows": 4,
+          "speculative": true,
+          "op": "attention",
+          "pin": true,
+          "capture_bytes": [
+            14842893
+          ]
+        },
+        {
+          "rows": 17,
+          "speculative": true,
+          "op": "attention",
+          "pin": true,
+          "capture_bytes": [
+            14842893
+          ]
+        },
+        {
+          "rows": 9,
+          "speculative": true,
+          "op": "attention",
+          "pin": true,
+          "capture_bytes": [
+            14842893
+          ]
+        },
+        {
+          "rows": 13,
+          "speculative": true,
+          "op": "attention",
+          "pin": true,
+          "capture_bytes": [
+            14842893
+          ]
+        },
+        {
+          "rows": 1,
+          "speculative": false,
+          "op": "ffn",
+          "pin": true,
+          "capture_bytes": [
+            14842893
+          ]
+        },
+        {
+          "rows": 1,
+          "speculative": false,
+          "op": "attention",
+          "pin": true,
+          "capture_bytes": [
+            14842893
+          ]
+        },
+        {
+          "rows": 11,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            14842893
+          ]
+        },
+        {
+          "rows": 49,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            14842893
+          ]
+        },
+        {
+          "rows": 18,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            14842893
+          ]
+        },
+        {
+          "rows": 19,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            14842893
+          ]
+        },
+        {
+          "rows": 21,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            14842893
+          ]
+        },
+        {
+          "rows": 8,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            14842893
+          ]
+        },
+        {
+          "rows": 12,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            14842893
+          ]
+        },
+        {
+          "rows": 5,
+          "speculative": true,
+          "op": "attention",
+          "pin": false,
+          "capture_bytes": [
+            14842893
+          ]
+        },
+        {
+          "rows": 11,
+          "speculative": true,
+          "op": "attention",
+          "pin": false,
+          "capture_bytes": [
+            14842893
+          ]
+        },
+        {
+          "rows": 33,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            14842893
+          ]
+        },
+        {
+          "rows": 2,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            14842893
+          ]
+        },
+        {
+          "rows": 20,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            14842893
+          ]
+        },
+        {
+          "rows": 25,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            14842893
+          ]
+        },
+        {
+          "rows": 34,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            14842893
+          ]
+        },
+        {
+          "rows": 10,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            14842893
+          ]
+        },
+        {
+          "rows": 37,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            14842893
+          ]
+        },
+        {
+          "rows": 49,
+          "speculative": true,
+          "op": "attention",
+          "pin": false,
+          "capture_bytes": [
+            14842893
+          ]
+        },
+        {
+          "rows": 15,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            14842893
+          ]
+        },
+        {
+          "rows": 36,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            14842893
+          ]
+        },
+        {
+          "rows": 18,
+          "speculative": true,
+          "op": "attention",
+          "pin": false,
+          "capture_bytes": [
+            14842893
+          ]
+        },
+        {
+          "rows": 19,
+          "speculative": true,
+          "op": "attention",
+          "pin": false,
+          "capture_bytes": [
+            14842893
+          ]
+        },
+        {
+          "rows": 38,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            14842893
+          ]
+        },
+        {
+          "rows": 21,
+          "speculative": true,
+          "op": "attention",
+          "pin": false,
+          "capture_bytes": [
+            14842893
+          ]
+        },
+        {
+          "rows": 8,
+          "speculative": true,
+          "op": "attention",
+          "pin": false,
+          "capture_bytes": [
+            14842893
+          ]
+        },
+        {
+          "rows": 12,
+          "speculative": true,
+          "op": "attention",
+          "pin": false,
+          "capture_bytes": [
+            14842893
+          ]
+        },
+        {
+          "rows": 22,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            14842893
+          ]
+        },
+        {
+          "rows": 35,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            14842893
+          ]
+        },
+        {
+          "rows": 33,
+          "speculative": true,
+          "op": "attention",
+          "pin": false,
+          "capture_bytes": [
+            14842893
+          ]
+        },
+        {
+          "rows": 20,
+          "speculative": true,
+          "op": "attention",
+          "pin": false,
+          "capture_bytes": [
+            14842893
+          ]
+        },
+        {
+          "rows": 16,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            14842893
+          ]
+        },
+        {
+          "rows": 31,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            14842893
+          ]
+        },
+        {
+          "rows": 2,
+          "speculative": true,
+          "op": "attention",
+          "pin": false,
+          "capture_bytes": [
+            14842893
+          ]
+        },
+        {
+          "rows": 25,
+          "speculative": true,
+          "op": "attention",
+          "pin": false,
+          "capture_bytes": [
+            14842893
+          ]
+        },
+        {
+          "rows": 34,
+          "speculative": true,
+          "op": "attention",
+          "pin": false,
+          "capture_bytes": [
+            14842893
+          ]
+        },
+        {
+          "rows": 10,
+          "speculative": true,
+          "op": "attention",
+          "pin": false,
+          "capture_bytes": [
+            14842893
+          ]
+        },
+        {
+          "rows": 40,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            14842893
+          ]
+        },
+        {
+          "rows": 37,
+          "speculative": true,
+          "op": "attention",
+          "pin": false,
+          "capture_bytes": [
+            14842893
+          ]
+        },
+        {
+          "rows": 14,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            14842893
+          ]
+        },
+        {
+          "rows": 15,
+          "speculative": true,
+          "op": "attention",
+          "pin": false,
+          "capture_bytes": [
+            14842893
+          ]
+        },
+        {
+          "rows": 36,
+          "speculative": true,
+          "op": "attention",
+          "pin": false,
+          "capture_bytes": [
+            14842893
+          ]
+        },
+        {
+          "rows": 38,
+          "speculative": true,
+          "op": "attention",
+          "pin": false,
+          "capture_bytes": [
+            14842893
+          ]
+        },
+        {
+          "rows": 22,
+          "speculative": true,
+          "op": "attention",
+          "pin": false,
+          "capture_bytes": [
+            14842893
+          ]
+        },
+        {
+          "rows": 32,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            14842893
+          ]
+        },
+        {
+          "rows": 39,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            14842893
+          ]
+        },
+        {
+          "rows": 57,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            14842893
+          ]
+        },
+        {
+          "rows": 35,
+          "speculative": true,
+          "op": "attention",
+          "pin": false,
+          "capture_bytes": [
+            14842893
+          ]
+        },
+        {
+          "rows": 16,
+          "speculative": true,
+          "op": "attention",
+          "pin": false,
+          "capture_bytes": [
+            14842893
+          ]
+        },
+        {
+          "rows": 31,
+          "speculative": true,
+          "op": "attention",
+          "pin": false,
+          "capture_bytes": [
+            14842893
+          ]
+        },
+        {
+          "rows": 44,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            14842893
+          ]
+        },
+        {
+          "rows": 40,
+          "speculative": true,
+          "op": "attention",
+          "pin": false,
+          "capture_bytes": [
+            14842893
+          ]
+        },
+        {
+          "rows": 14,
+          "speculative": true,
+          "op": "attention",
+          "pin": false,
+          "capture_bytes": [
+            14842893
+          ]
+        },
+        {
+          "rows": 41,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            14842893
+          ]
+        },
+        {
+          "rows": 43,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            14842893
+          ]
+        },
+        {
+          "rows": 32,
+          "speculative": true,
+          "op": "attention",
+          "pin": false,
+          "capture_bytes": [
+            14842893
+          ]
+        },
+        {
+          "rows": 39,
+          "speculative": true,
+          "op": "attention",
+          "pin": false,
+          "capture_bytes": [
+            14842893
+          ]
+        },
+        {
+          "rows": 57,
+          "speculative": true,
+          "op": "attention",
+          "pin": false,
+          "capture_bytes": [
+            16777216
+          ]
+        },
+        {
+          "rows": 50,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            14842893
+          ]
+        },
+        {
+          "rows": 62,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            14842893
+          ]
+        },
+        {
+          "rows": 63,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            14842893
+          ]
+        },
+        {
+          "rows": 44,
+          "speculative": true,
+          "op": "attention",
+          "pin": false,
+          "capture_bytes": [
+            16777216
+          ]
+        },
+        {
+          "rows": 23,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            14842893
+          ]
+        },
+        {
+          "rows": 26,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            14842893
+          ]
+        },
+        {
+          "rows": 27,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            14842893
+          ]
+        },
+        {
+          "rows": 29,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            14842893
+          ]
+        },
+        {
+          "rows": 60,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            14842893
+          ]
+        },
+        {
+          "rows": 41,
+          "speculative": true,
+          "op": "attention",
+          "pin": false,
+          "capture_bytes": [
+            14842893
+          ]
+        },
+        {
+          "rows": 47,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            12582900
+          ]
+        },
+        {
+          "rows": 43,
+          "speculative": true,
+          "op": "attention",
+          "pin": false,
+          "capture_bytes": [
+            18874368
+          ]
+        },
+        {
+          "rows": 62,
+          "speculative": true,
+          "op": "attention",
+          "pin": false,
+          "capture_bytes": [
+            14842893
+          ]
+        },
+        {
+          "rows": 63,
+          "speculative": true,
+          "op": "attention",
+          "pin": false,
+          "capture_bytes": [
+            14842893
+          ]
+        },
+        {
+          "rows": 24,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            14842893
+          ]
+        },
+        {
+          "rows": 28,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            14842893
+          ]
+        },
+        {
+          "rows": 30,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            14842893
+          ]
+        },
+        {
+          "rows": 42,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            14842893
+          ]
+        },
+        {
+          "rows": 48,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            14842893
+          ]
+        },
+        {
+          "rows": 23,
+          "speculative": true,
+          "op": "attention",
+          "pin": false,
+          "capture_bytes": [
+            14842893
+          ]
+        },
+        {
+          "rows": 27,
+          "speculative": true,
+          "op": "attention",
+          "pin": false,
+          "capture_bytes": [
+            14842893
+          ]
+        },
+        {
+          "rows": 50,
+          "speculative": true,
+          "op": "attention",
+          "pin": false,
+          "capture_bytes": [
+            16777216
+          ]
+        },
+        {
+          "rows": 64,
+          "speculative": false,
+          "op": "attention",
+          "pin": false,
+          "capture_bytes": [
+            14842893
+          ]
+        },
+        {
+          "rows": 56,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            15728655
+          ]
+        },
+        {
+          "rows": 24,
+          "speculative": true,
+          "op": "attention",
+          "pin": false,
+          "capture_bytes": [
+            14842893
+          ]
+        },
+        {
+          "rows": 26,
+          "speculative": true,
+          "op": "attention",
+          "pin": false,
+          "capture_bytes": [
+            16777216
+          ]
+        },
+        {
+          "rows": 29,
+          "speculative": true,
+          "op": "attention",
+          "pin": false,
+          "capture_bytes": [
+            16777216
+          ]
+        },
+        {
+          "rows": 47,
+          "speculative": true,
+          "op": "attention",
+          "pin": false,
+          "capture_bytes": [
+            12582924
+          ]
+        },
+        {
+          "rows": 46,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            14848722
+          ]
+        },
+        {
+          "rows": 52,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            14842893
+          ]
+        },
+        {
+          "rows": 53,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            14842893
+          ]
+        },
+        {
+          "rows": 28,
+          "speculative": true,
+          "op": "attention",
+          "pin": false,
+          "capture_bytes": [
+            85982464
+          ]
+        },
+        {
+          "rows": 30,
+          "speculative": true,
+          "op": "attention",
+          "pin": false,
+          "capture_bytes": [
+            16777216
+          ]
+        },
+        {
+          "rows": 42,
+          "speculative": true,
+          "op": "attention",
+          "pin": false,
+          "capture_bytes": [
+            18874368
+          ]
+        },
+        {
+          "rows": 48,
+          "speculative": true,
+          "op": "attention",
+          "pin": false,
+          "capture_bytes": [
+            16777216
+          ]
+        },
+        {
+          "rows": 56,
+          "speculative": true,
+          "op": "attention",
+          "pin": false,
+          "capture_bytes": [
+            15728625
+          ]
+        },
+        {
+          "rows": 60,
+          "speculative": false,
+          "op": "attention",
+          "pin": false,
+          "capture_bytes": [
+            16777216
+          ]
+        },
+        {
+          "rows": 60,
+          "speculative": true,
+          "op": "attention",
+          "pin": false,
+          "capture_bytes": [
+            14842893
+          ]
+        },
+        {
+          "rows": 45,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            14680050
+          ]
+        },
+        {
+          "rows": 51,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            15728625
+          ]
+        },
+        {
+          "rows": 55,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            14680050
+          ]
+        },
+        {
+          "rows": 58,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            15728625
+          ]
+        }
+      ],
+      "core": "k6"
+    },
+    {
+      "ranks": 2,
+      "layout": "kimi-k3-max",
+      "reserve_base_bytes": [
+        1537212416,
+        1541406720
+      ],
+      "reserve_extra_bytes": 2097152,
+      "entries": [
+        {
+          "rows": 3,
+          "speculative": false,
+          "op": "ffn",
+          "pin": true,
+          "capture_bytes": [
+            14446992,
+            14446992
+          ]
+        },
+        {
+          "rows": 64,
+          "speculative": false,
+          "op": "ffn",
+          "pin": true,
+          "capture_bytes": [
+            14446992,
+            14446992
+          ]
+        },
+        {
+          "rows": 3,
+          "speculative": true,
+          "op": "attention",
+          "pin": true,
+          "capture_bytes": [
+            10718736,
+            10718736
+          ]
+        },
+        {
+          "rows": 64,
+          "speculative": true,
+          "op": "attention",
+          "pin": true,
+          "capture_bytes": [
+            8388608,
+            9230336
+          ]
+        },
+        {
+          "rows": 9,
+          "speculative": false,
+          "op": "ffn",
+          "pin": true,
+          "capture_bytes": [
+            14446992,
+            14446992
+          ]
+        },
+        {
+          "rows": 4,
+          "speculative": false,
+          "op": "ffn",
+          "pin": true,
+          "capture_bytes": [
+            14446992,
+            14446992
+          ]
+        },
+        {
+          "rows": 6,
+          "speculative": false,
+          "op": "ffn",
+          "pin": true,
+          "capture_bytes": [
+            14446992,
+            14446992
+          ]
+        },
+        {
+          "rows": 13,
+          "speculative": false,
+          "op": "ffn",
+          "pin": true,
+          "capture_bytes": [
+            14446992,
+            14446992
+          ]
+        },
+        {
+          "rows": 64,
+          "speculative": true,
+          "op": "context",
+          "pin": true,
+          "capture_bytes": [
+            3728256,
+            3728256
+          ]
+        },
+        {
+          "rows": 1,
+          "speculative": false,
+          "op": "context",
+          "pin": true,
+          "capture_bytes": [
+            3728256,
+            3728256
+          ]
+        },
+        {
+          "rows": 5,
+          "speculative": false,
+          "op": "ffn",
+          "pin": true,
+          "capture_bytes": [
+            14446992,
+            14446992
+          ]
+        },
+        {
+          "rows": 4,
+          "speculative": true,
+          "op": "attention",
+          "pin": true,
+          "capture_bytes": [
+            10718736,
+            10718736
+          ]
+        },
+        {
+          "rows": 9,
+          "speculative": true,
+          "op": "attention",
+          "pin": true,
+          "capture_bytes": [
+            10485760,
+            10485760
+          ]
+        },
+        {
+          "rows": 6,
+          "speculative": true,
+          "op": "attention",
+          "pin": true,
+          "capture_bytes": [
+            10718736,
+            10718736
+          ]
+        },
+        {
+          "rows": 13,
+          "speculative": true,
+          "op": "attention",
+          "pin": true,
+          "capture_bytes": [
+            10485760,
+            10485760
+          ]
+        },
+        {
+          "rows": 3,
+          "speculative": true,
+          "op": "context",
+          "pin": true,
+          "capture_bytes": [
+            3728256,
+            3728256
+          ]
+        },
+        {
+          "rows": 5,
+          "speculative": true,
+          "op": "attention",
+          "pin": true,
+          "capture_bytes": [
+            10718736,
+            10722560
+          ]
+        },
+        {
+          "rows": 4,
+          "speculative": true,
+          "op": "context",
+          "pin": true,
+          "capture_bytes": [
+            3728256,
+            3728256
+          ]
+        },
+        {
+          "rows": 5,
+          "speculative": true,
+          "op": "context",
+          "pin": true,
+          "capture_bytes": [
+            3728256,
+            3728256
+          ]
+        },
+        {
+          "rows": 6,
+          "speculative": true,
+          "op": "context",
+          "pin": true,
+          "capture_bytes": [
+            3728256,
+            3728256
+          ]
+        },
+        {
+          "rows": 13,
+          "speculative": true,
+          "op": "context",
+          "pin": true,
+          "capture_bytes": [
+            3728256,
+            3728256
+          ]
+        },
+        {
+          "rows": 1,
+          "speculative": false,
+          "op": "ffn",
+          "pin": true,
+          "capture_bytes": [
+            14446992,
+            14446992
+          ]
+        },
+        {
+          "rows": 1,
+          "speculative": false,
+          "op": "attention",
+          "pin": true,
+          "capture_bytes": [
+            10718736,
+            10718736
+          ]
+        },
+        {
+          "rows": 7,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            14446992,
+            14446992
+          ]
+        },
+        {
+          "rows": 10,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            14446992,
+            14446992
+          ]
+        },
+        {
+          "rows": 17,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            14446992,
+            14446992
+          ]
+        },
+        {
+          "rows": 11,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            14446992,
+            14446992
+          ]
+        },
+        {
+          "rows": 7,
+          "speculative": true,
+          "op": "attention",
+          "pin": false,
+          "capture_bytes": [
+            10718736,
+            10718736
+          ]
+        },
+        {
+          "rows": 10,
+          "speculative": true,
+          "op": "attention",
+          "pin": false,
+          "capture_bytes": [
+            8388608,
+            8388608
+          ]
+        },
+        {
+          "rows": 17,
+          "speculative": true,
+          "op": "attention",
+          "pin": false,
+          "capture_bytes": [
+            10485760,
+            10485760
+          ]
+        },
+        {
+          "rows": 21,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            14446992,
+            14446992
+          ]
+        },
+        {
+          "rows": 11,
+          "speculative": true,
+          "op": "attention",
+          "pin": false,
+          "capture_bytes": [
+            10485760,
+            12582912
+          ]
+        },
+        {
+          "rows": 7,
+          "speculative": true,
+          "op": "context",
+          "pin": false,
+          "capture_bytes": [
+            3728256,
+            3728256
+          ]
+        },
+        {
+          "rows": 9,
+          "speculative": true,
+          "op": "context",
+          "pin": false,
+          "capture_bytes": [
+            3728256,
+            3728256
+          ]
+        },
+        {
+          "rows": 19,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            14446992,
+            14446992
+          ]
+        },
+        {
+          "rows": 20,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            14446992,
+            14446992
+          ]
+        },
+        {
+          "rows": 8,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            14446992,
+            14446992
+          ]
+        },
+        {
+          "rows": 21,
+          "speculative": true,
+          "op": "attention",
+          "pin": false,
+          "capture_bytes": [
+            10485760,
+            10485760
+          ]
+        },
+        {
+          "rows": 15,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            14446992,
+            14446992
+          ]
+        },
+        {
+          "rows": 33,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            14446992,
+            14446992
+          ]
+        },
+        {
+          "rows": 34,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            14446992,
+            14446992
+          ]
+        },
+        {
+          "rows": 12,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            14446992,
+            14446992
+          ]
+        },
+        {
+          "rows": 17,
+          "speculative": true,
+          "op": "context",
+          "pin": false,
+          "capture_bytes": [
+            3728256,
+            3728256
+          ]
+        },
+        {
+          "rows": 14,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            14446992,
+            14446992
+          ]
+        },
+        {
+          "rows": 37,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            14446992,
+            14446992
+          ]
+        },
+        {
+          "rows": 19,
+          "speculative": true,
+          "op": "attention",
+          "pin": false,
+          "capture_bytes": [
+            10485760,
+            10485760
+          ]
+        },
+        {
+          "rows": 20,
+          "speculative": true,
+          "op": "attention",
+          "pin": false,
+          "capture_bytes": [
+            8388608,
+            8388608
+          ]
+        },
+        {
+          "rows": 41,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            14446992,
+            14446992
+          ]
+        },
+        {
+          "rows": 8,
+          "speculative": true,
+          "op": "attention",
+          "pin": false,
+          "capture_bytes": [
+            79757312,
+            81853696
+          ]
+        },
+        {
+          "rows": 16,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            14446992,
+            14446992
+          ]
+        },
+        {
+          "rows": 22,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            14446992,
+            14446992
+          ]
+        },
+        {
+          "rows": 15,
+          "speculative": true,
+          "op": "attention",
+          "pin": false,
+          "capture_bytes": [
+            10485760,
+            8388608
+          ]
+        },
+        {
+          "rows": 2,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            14446992,
+            14446992
+          ]
+        },
+        {
+          "rows": 33,
+          "speculative": true,
+          "op": "attention",
+          "pin": false,
+          "capture_bytes": [
+            12582912,
+            12582912
+          ]
+        },
+        {
+          "rows": 34,
+          "speculative": true,
+          "op": "attention",
+          "pin": false,
+          "capture_bytes": [
+            8388608,
+            8388608
+          ]
+        },
+        {
+          "rows": 12,
+          "speculative": true,
+          "op": "attention",
+          "pin": false,
+          "capture_bytes": [
+            8388608,
+            8388608
+          ]
+        },
+        {
+          "rows": 64,
+          "speculative": false,
+          "op": "context",
+          "pin": false,
+          "capture_bytes": [
+            3728256,
+            3728256
+          ]
+        },
+        {
+          "rows": 14,
+          "speculative": true,
+          "op": "attention",
+          "pin": false,
+          "capture_bytes": [
+            10485760,
+            10485760
+          ]
+        },
+        {
+          "rows": 37,
+          "speculative": true,
+          "op": "attention",
+          "pin": false,
+          "capture_bytes": [
+            10485760,
+            10485760
+          ]
+        },
+        {
+          "rows": 18,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            14446992,
+            14446992
+          ]
+        },
+        {
+          "rows": 36,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            14446992,
+            14446992
+          ]
+        },
+        {
+          "rows": 8,
+          "speculative": true,
+          "op": "context",
+          "pin": false,
+          "capture_bytes": [
+            3728256,
+            3728256
+          ]
+        },
+        {
+          "rows": 41,
+          "speculative": true,
+          "op": "attention",
+          "pin": false,
+          "capture_bytes": [
+            10485760,
+            12582912
+          ]
+        },
+        {
+          "rows": 21,
+          "speculative": true,
+          "op": "context",
+          "pin": false,
+          "capture_bytes": [
+            3728256,
+            3728256
+          ]
+        },
+        {
+          "rows": 19,
+          "speculative": true,
+          "op": "context",
+          "pin": false,
+          "capture_bytes": [
+            3728256,
+            3728256
+          ]
+        },
+        {
+          "rows": 10,
+          "speculative": true,
+          "op": "context",
+          "pin": false,
+          "capture_bytes": [
+            3728256,
+            3728256
+          ]
+        },
+        {
+          "rows": 2,
+          "speculative": true,
+          "op": "attention",
+          "pin": false,
+          "capture_bytes": [
+            10718736,
+            10718736
+          ]
+        },
+        {
+          "rows": 22,
+          "speculative": true,
+          "op": "attention",
+          "pin": false,
+          "capture_bytes": [
+            12582912,
+            12582912
+          ]
+        },
+        {
+          "rows": 11,
+          "speculative": true,
+          "op": "context",
+          "pin": false,
+          "capture_bytes": [
+            3728256,
+            3728256
+          ]
+        },
+        {
+          "rows": 14,
+          "speculative": true,
+          "op": "context",
+          "pin": false,
+          "capture_bytes": [
+            3728256,
+            3728256
+          ]
+        },
+        {
+          "rows": 15,
+          "speculative": true,
+          "op": "context",
+          "pin": false,
+          "capture_bytes": [
+            3728256,
+            3728256
+          ]
+        },
+        {
+          "rows": 39,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            14446992,
+            14446992
+          ]
+        },
+        {
+          "rows": 40,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            14446992,
+            14446992
+          ]
+        },
+        {
+          "rows": 16,
+          "speculative": true,
+          "op": "attention",
+          "pin": false,
+          "capture_bytes": [
+            8388608,
+            8388608
+          ]
+        },
+        {
+          "rows": 25,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            14446992,
+            14446992
+          ]
+        },
+        {
+          "rows": 16,
+          "speculative": true,
+          "op": "context",
+          "pin": false,
+          "capture_bytes": [
+            3728256,
+            3728256
+          ]
+        },
+        {
+          "rows": 18,
+          "speculative": true,
+          "op": "attention",
+          "pin": false,
+          "capture_bytes": [
+            10485760,
+            12582912
+          ]
+        },
+        {
+          "rows": 36,
+          "speculative": true,
+          "op": "attention",
+          "pin": false,
+          "capture_bytes": [
+            8388608,
+            8388608
+          ]
+        },
+        {
+          "rows": 20,
+          "speculative": true,
+          "op": "context",
+          "pin": false,
+          "capture_bytes": [
+            3728256,
+            3728256
+          ]
+        },
+        {
+          "rows": 22,
+          "speculative": true,
+          "op": "context",
+          "pin": false,
+          "capture_bytes": [
+            3728256,
+            3728256
+          ]
+        },
+        {
+          "rows": 12,
+          "speculative": true,
+          "op": "context",
+          "pin": false,
+          "capture_bytes": [
+            3728256,
+            3728256
+          ]
+        },
+        {
+          "rows": 42,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            14446992,
+            14446992
+          ]
+        },
+        {
+          "rows": 39,
+          "speculative": true,
+          "op": "attention",
+          "pin": false,
+          "capture_bytes": [
+            10485760,
+            10485760
+          ]
+        },
+        {
+          "rows": 40,
+          "speculative": true,
+          "op": "attention",
+          "pin": false,
+          "capture_bytes": [
+            10485760,
+            10485760
+          ]
+        },
+        {
+          "rows": 18,
+          "speculative": true,
+          "op": "context",
+          "pin": false,
+          "capture_bytes": [
+            3728256,
+            3728256
+          ]
+        },
+        {
+          "rows": 35,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            14446992,
+            14446992
+          ]
+        },
+        {
+          "rows": 25,
+          "speculative": true,
+          "op": "attention",
+          "pin": false,
+          "capture_bytes": [
+            10485760,
+            8388608
+          ]
+        },
+        {
+          "rows": 43,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            14446992,
+            14446992
+          ]
+        },
+        {
+          "rows": 34,
+          "speculative": true,
+          "op": "context",
+          "pin": false,
+          "capture_bytes": [
+            3728256,
+            3728256
+          ]
+        },
+        {
+          "rows": 37,
+          "speculative": true,
+          "op": "context",
+          "pin": false,
+          "capture_bytes": [
+            3728256,
+            3728256
+          ]
+        },
+        {
+          "rows": 33,
+          "speculative": true,
+          "op": "context",
+          "pin": false,
+          "capture_bytes": [
+            3728256,
+            3728256
+          ]
+        },
+        {
+          "rows": 41,
+          "speculative": true,
+          "op": "context",
+          "pin": false,
+          "capture_bytes": [
+            3728256,
+            3728256
+          ]
+        },
+        {
+          "rows": 23,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            14446992,
+            14446992
+          ]
+        },
+        {
+          "rows": 24,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            14446992,
+            14446992
+          ]
+        },
+        {
+          "rows": 38,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            14446992,
+            14446992
+          ]
+        },
+        {
+          "rows": 42,
+          "speculative": true,
+          "op": "attention",
+          "pin": false,
+          "capture_bytes": [
+            8388608,
+            8388608
+          ]
+        },
+        {
+          "rows": 2,
+          "speculative": true,
+          "op": "context",
+          "pin": false,
+          "capture_bytes": [
+            3728256,
+            3728256
+          ]
+        },
+        {
+          "rows": 36,
+          "speculative": true,
+          "op": "context",
+          "pin": false,
+          "capture_bytes": [
+            3728256,
+            3728256
+          ]
+        },
+        {
+          "rows": 32,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            14446992,
+            14446992
+          ]
+        },
+        {
+          "rows": 49,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            14446992,
+            14446992
+          ]
+        },
+        {
+          "rows": 35,
+          "speculative": true,
+          "op": "attention",
+          "pin": false,
+          "capture_bytes": [
+            12582912,
+            10485760
+          ]
+        },
+        {
+          "rows": 43,
+          "speculative": true,
+          "op": "attention",
+          "pin": false,
+          "capture_bytes": [
+            10485760,
+            10485760
+          ]
+        },
+        {
+          "rows": 52,
+          "speculative": true,
+          "op": "context",
+          "pin": false,
+          "capture_bytes": [
+            3728256,
+            3728256
+          ]
+        },
+        {
+          "rows": 30,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            14446992,
+            14446992
+          ]
+        },
+        {
+          "rows": 31,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            14446992,
+            14446992
+          ]
+        },
+        {
+          "rows": 39,
+          "speculative": true,
+          "op": "context",
+          "pin": false,
+          "capture_bytes": [
+            3728256,
+            3728256
+          ]
+        },
+        {
+          "rows": 23,
+          "speculative": true,
+          "op": "attention",
+          "pin": false,
+          "capture_bytes": [
+            10485760,
+            10485760
+          ]
+        },
+        {
+          "rows": 24,
+          "speculative": true,
+          "op": "attention",
+          "pin": false,
+          "capture_bytes": [
+            10485760,
+            12582912
+          ]
+        },
+        {
+          "rows": 38,
+          "speculative": true,
+          "op": "attention",
+          "pin": false,
+          "capture_bytes": [
+            8388608,
+            8388608
+          ]
+        },
+        {
+          "rows": 40,
+          "speculative": true,
+          "op": "context",
+          "pin": false,
+          "capture_bytes": [
+            3728256,
+            3728256
+          ]
+        },
+        {
+          "rows": 32,
+          "speculative": true,
+          "op": "context",
+          "pin": false,
+          "capture_bytes": [
+            3728256,
+            3728256
+          ]
+        },
+        {
+          "rows": 26,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            14446992,
+            14446992
+          ]
+        },
+        {
+          "rows": 27,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            14446992,
+            14446992
+          ]
+        },
+        {
+          "rows": 28,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            14446992,
+            14446992
+          ]
+        },
+        {
+          "rows": 50,
+          "speculative": true,
+          "op": "context",
+          "pin": false,
+          "capture_bytes": [
+            3728256,
+            3728256
+          ]
+        },
+        {
+          "rows": 32,
+          "speculative": true,
+          "op": "attention",
+          "pin": false,
+          "capture_bytes": [
+            8388608,
+            10485760
+          ]
+        },
+        {
+          "rows": 49,
+          "speculative": true,
+          "op": "attention",
+          "pin": false,
+          "capture_bytes": [
+            12582912,
+            10485760
+          ]
+        },
+        {
+          "rows": 23,
+          "speculative": true,
+          "op": "context",
+          "pin": false,
+          "capture_bytes": [
+            3728256,
+            3728256
+          ]
+        },
+        {
+          "rows": 35,
+          "speculative": true,
+          "op": "context",
+          "pin": false,
+          "capture_bytes": [
+            3728256,
+            3728256
+          ]
+        },
+        {
+          "rows": 51,
+          "speculative": true,
+          "op": "context",
+          "pin": false,
+          "capture_bytes": [
+            3728256,
+            3728256
+          ]
+        },
+        {
+          "rows": 25,
+          "speculative": true,
+          "op": "context",
+          "pin": false,
+          "capture_bytes": [
+            3728256,
+            3728256
+          ]
+        },
+        {
+          "rows": 53,
+          "speculative": true,
+          "op": "context",
+          "pin": false,
+          "capture_bytes": [
+            3728256,
+            3728256
+          ]
+        },
+        {
+          "rows": 62,
+          "speculative": true,
+          "op": "context",
+          "pin": false,
+          "capture_bytes": [
+            3728256,
+            3728256
+          ]
+        },
+        {
+          "rows": 29,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            14446992,
+            14446992
+          ]
+        },
+        {
+          "rows": 44,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            14446992,
+            14446992
+          ]
+        },
+        {
+          "rows": 30,
+          "speculative": true,
+          "op": "attention",
+          "pin": false,
+          "capture_bytes": [
+            10891664,
+            10891664
+          ]
+        },
+        {
+          "rows": 31,
+          "speculative": true,
+          "op": "attention",
+          "pin": false,
+          "capture_bytes": [
+            10485760,
+            10485760
+          ]
+        },
+        {
+          "rows": 42,
+          "speculative": true,
+          "op": "context",
+          "pin": false,
+          "capture_bytes": [
+            3728256,
+            3728256
+          ]
+        },
+        {
+          "rows": 43,
+          "speculative": true,
+          "op": "context",
+          "pin": false,
+          "capture_bytes": [
+            3728256,
+            3728256
+          ]
+        },
+        {
+          "rows": 55,
+          "speculative": true,
+          "op": "context",
+          "pin": false,
+          "capture_bytes": [
+            4194304,
+            6291456
+          ]
+        },
+        {
+          "rows": 38,
+          "speculative": true,
+          "op": "context",
+          "pin": false,
+          "capture_bytes": [
+            3728256,
+            3728256
+          ]
+        },
+        {
+          "rows": 45,
+          "speculative": true,
+          "op": "context",
+          "pin": false,
+          "capture_bytes": [
+            3788400,
+            3788400
+          ]
+        },
+        {
+          "rows": 49,
+          "speculative": true,
+          "op": "context",
+          "pin": false,
+          "capture_bytes": [
+            3728256,
+            3728256
+          ]
+        },
+        {
+          "rows": 26,
+          "speculative": true,
+          "op": "attention",
+          "pin": false,
+          "capture_bytes": [
+            10485760,
+            8388608
+          ]
+        },
+        {
+          "rows": 27,
+          "speculative": true,
+          "op": "attention",
+          "pin": false,
+          "capture_bytes": [
+            8388608,
+            8388608
+          ]
+        },
+        {
+          "rows": 28,
+          "speculative": true,
+          "op": "attention",
+          "pin": false,
+          "capture_bytes": [
+            10485760,
+            10485760
+          ]
+        },
+        {
+          "rows": 64,
+          "speculative": false,
+          "op": "attention",
+          "pin": false,
+          "capture_bytes": [
+            10722560,
+            10718736
+          ]
+        },
+        {
+          "rows": 24,
+          "speculative": true,
+          "op": "context",
+          "pin": false,
+          "capture_bytes": [
+            3728256,
+            3728256
+          ]
+        },
+        {
+          "rows": 61,
+          "speculative": true,
+          "op": "context",
+          "pin": false,
+          "capture_bytes": [
+            3728256,
+            3728256
+          ]
+        },
+        {
+          "rows": 45,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            14680078,
+            14680078
+          ]
+        },
+        {
+          "rows": 31,
+          "speculative": true,
+          "op": "context",
+          "pin": false,
+          "capture_bytes": [
+            3728256,
+            3728256
+          ]
+        },
+        {
+          "rows": 54,
+          "speculative": true,
+          "op": "context",
+          "pin": false,
+          "capture_bytes": [
+            6291456,
+            6291456
+          ]
+        },
+        {
+          "rows": 63,
+          "speculative": true,
+          "op": "context",
+          "pin": false,
+          "capture_bytes": [
+            3728256,
+            3728256
+          ]
+        },
+        {
+          "rows": 60,
+          "speculative": true,
+          "op": "context",
+          "pin": false,
+          "capture_bytes": [
+            3728256,
+            3728256
+          ]
+        },
+        {
+          "rows": 29,
+          "speculative": true,
+          "op": "attention",
+          "pin": false,
+          "capture_bytes": [
+            10485760,
+            10485760
+          ]
+        },
+        {
+          "rows": 44,
+          "speculative": true,
+          "op": "attention",
+          "pin": false,
+          "capture_bytes": [
+            8388608,
+            8388608
+          ]
+        },
+        {
+          "rows": 45,
+          "speculative": true,
+          "op": "attention",
+          "pin": false,
+          "capture_bytes": [
+            10891650,
+            10891650
+          ]
+        },
+        {
+          "rows": 29,
+          "speculative": true,
+          "op": "context",
+          "pin": false,
+          "capture_bytes": [
+            3728256,
+            3728256
+          ]
+        },
+        {
+          "rows": 30,
+          "speculative": true,
+          "op": "context",
+          "pin": false,
+          "capture_bytes": [
+            3788400,
+            3788400
+          ]
+        },
+        {
+          "rows": 44,
+          "speculative": true,
+          "op": "context",
+          "pin": false,
+          "capture_bytes": [
+            3728256,
+            3728256
+          ]
+        },
+        {
+          "rows": 26,
+          "speculative": true,
+          "op": "context",
+          "pin": false,
+          "capture_bytes": [
+            3728256,
+            3728256
+          ]
+        },
+        {
+          "rows": 27,
+          "speculative": true,
+          "op": "context",
+          "pin": false,
+          "capture_bytes": [
+            3728256,
+            3728256
+          ]
+        },
+        {
+          "rows": 28,
+          "speculative": true,
+          "op": "context",
+          "pin": false,
+          "capture_bytes": [
+            3728256,
+            3728256
+          ]
+        },
+        {
+          "rows": 47,
+          "speculative": true,
+          "op": "context",
+          "pin": false,
+          "capture_bytes": [
+            3517800,
+            3517800
+          ]
+        },
+        {
+          "rows": 56,
+          "speculative": true,
+          "op": "context",
+          "pin": false,
+          "capture_bytes": [
+            3728256,
+            3728256
+          ]
+        },
+        {
+          "rows": 57,
+          "speculative": true,
+          "op": "context",
+          "pin": false,
+          "capture_bytes": [
+            4194304,
+            4194304
+          ]
+        },
+        {
+          "rows": 59,
+          "speculative": true,
+          "op": "context",
+          "pin": false,
+          "capture_bytes": [
+            3728256,
+            3728256
+          ]
+        },
+        {
+          "rows": 60,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            12039263,
+            12039129
+          ]
+        },
+        {
+          "rows": 61,
+          "speculative": false,
+          "op": "ffn",
+          "pin": false,
+          "capture_bytes": [
+            14446992,
+            14446992
+          ]
+        },
+        {
+          "rows": 48,
+          "speculative": true,
+          "op": "context",
+          "pin": false,
+          "capture_bytes": [
+            3728256,
+            3728256
+          ]
+        },
+        {
+          "rows": 16,
+          "speculative": false,
+          "op": "attention",
+          "pin": false,
+          "capture_bytes": [
+            12447600,
+            12447616
+          ]
+        },
+        {
+          "rows": 60,
+          "speculative": false,
+          "op": "attention",
+          "pin": false,
+          "capture_bytes": [
+            8932257,
+            8932391
+          ]
+        },
+        {
+          "rows": 16,
+          "speculative": false,
+          "op": "context",
+          "pin": false,
+          "capture_bytes": [
+            4329616,
+            4329600
+          ]
+        },
+        {
+          "rows": 46,
+          "speculative": true,
+          "op": "context",
+          "pin": false,
+          "capture_bytes": [
+            4059000,
+            4059000
+          ]
+        },
+        {
+          "rows": 58,
+          "speculative": true,
+          "op": "context",
+          "pin": false,
+          "capture_bytes": [
+            4194304,
+            2097152
+          ]
+        }
+      ],
+      "core": "k6"
+    }
+  ]
+}

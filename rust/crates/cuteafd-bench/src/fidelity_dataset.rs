@@ -45,12 +45,18 @@ pub const V41_1017_MANIFEST_SHA256: &str = "0eb4afedef4561ac86876d6c8285e2e0ab73
 pub const KIMI_K3_REVISION: &str = "a98e1b9d6b622eec1ccc66fd21b5d48ff11d7c01";
 pub const KIMI_K3_CONFIG: &str = "kimi-k3-v2_20261019_own-text-effort-matched-mxfp4-f32";
 pub const KIMI_K3_MANIFEST_SHA256: &str = "815442612c25cd1fb5c3b1eb9dde2deb93e395b7d98bcbbdd5a52c829c9fd5cd";
+pub const KIMI_K31_REVISION: &str = "777591fb926da184844a9d44fa95017cd9128133";
+pub const KIMI_K31_CONFIG: &str = "kimi-k31-v1_20261105_own-text-effort-matched-mxfp4-f32";
+pub const KIMI_K31_MANIFEST_SHA256: &str = "59f2c71b10474fb702308fa8b180bc394ef61bc070270fdb6f147a207f5d8fa1";
 pub const MUSE_SPARK_REVISION: &str = "d18a3b292cc0a279998123f2ddd16999869bb658";
 pub const MUSE_SPARK_CONFIG: &str = "muse-spark-v1_20261031_own-text-bf16";
 pub const MUSE_SPARK_MANIFEST_SHA256: &str = "b9ec12b2e008a87d20f88edfe731252b5298d8f4da31cb34a96e5451a92bc717";
 pub const MISTRAL_LARGE4_REVISION: &str = "71eb39bd490cfa1af7a32edc94476a35eb475c01";
 pub const MISTRAL_LARGE4_CONFIG: &str = "mistral-large4-v1_20261031_own-text-fp8";
 pub const MISTRAL_LARGE4_MANIFEST_SHA256: &str = "2b5e0490bf433bf62adeaade9c1d4c782bf39704ba2dd94c9b201cec4c5d38ff";
+pub const MINIMAX_M3_REVISION: &str = "87e0e905e8cf787e4471dfb1ae92eb9219c90fbf";
+pub const MINIMAX_M3_CONFIG: &str = "minimax-m3_1-flash-v1_20261105_own-text-native";
+pub const MINIMAX_M3_MANIFEST_SHA256: &str = "6bb6ea8153f0484aa711ed932573092ea781f955cc34a7e3b48d4ac84b9465da";
 
 /// Sealed bench subset v1: agentic A at three context lengths, human code C,
 /// structured/tool D, plain E and the frozen context anchor. Never resample.
@@ -166,8 +172,9 @@ pub fn standard_balance(reference: &Reference) -> Value {
 }
 
 pub fn prefill_admitted(settings: &[crate::report::Setting]) -> bool {
-    settings.iter().any(|s| s.name == "full-prefill-logits"
+    settings.iter().any(|s| (s.name == "full-prefill-logits"
         && s.value.as_deref().is_some_and(|v| matches!(v, "true" | "on" | "1")))
+        || (s.name == "prefill-scoring" && s.source == "resolved" && s.value.as_deref() == Some("streamed")))
 }
 
 /// V4.1 scores selected prefill rows without the all-row workspace switch.
@@ -354,8 +361,10 @@ pub fn download(agent: &ureq::Agent, cache: &Path, repo: &str, commit: &str, con
             (STEP5_REVISION, STEP5_CONFIG) => Some(STEP5_MANIFEST_SHA256),
             (V41_1017_REVISION, V41_1017_CONFIG) => Some(V41_1017_MANIFEST_SHA256),
             (KIMI_K3_REVISION, KIMI_K3_CONFIG) => Some(KIMI_K3_MANIFEST_SHA256),
+            (KIMI_K31_REVISION, KIMI_K31_CONFIG) => Some(KIMI_K31_MANIFEST_SHA256),
             (MUSE_SPARK_REVISION, MUSE_SPARK_CONFIG) => Some(MUSE_SPARK_MANIFEST_SHA256),
             (MISTRAL_LARGE4_REVISION, MISTRAL_LARGE4_CONFIG) => Some(MISTRAL_LARGE4_MANIFEST_SHA256),
+            (MINIMAX_M3_REVISION, MINIMAX_M3_CONFIG) => Some(MINIMAX_M3_MANIFEST_SHA256),
             (MIMO_PRO_MEDIA_REVISION, MIMO_PRO_MEDIA_CONFIG) => Some(MIMO_PRO_MEDIA_MANIFEST_SHA256),
             (GLM_REVISION, GLM_CONFIG) => Some("cc973cec8df82119ccd53367d014c73b271808a561f81d3629b06093de3b00e0"),
             (V4PRO_REVISION, V4PRO_CONFIG) => Some("7b4fd7b51670ff03fbfab6a21b72d999163ddee9bd3eec34c89f1d6c2f83488f"),
@@ -471,6 +480,10 @@ pub fn load(root: &Path, manifest: &Value) -> Result<Reference> {
     Ok(reference)
 }
 
+// Independent MiniMax decoder/harness and upstream arithmetic source pins.
+const MINIMAX_SOURCE_DIGESTS: [&str; 7] = ["model_sha256", "golden_sha256", "shape_invariant_sha256",
+    "fidelity_windows_sha256", "transformers_sources_sha256", "vllm_sources_sha256", "cache_programs_sha256"];
+
 fn qualification_label(qualification: &Value, manifest: &Value) -> Result<&'static str> {
     ensure!(qualification["set_sha256"] == manifest["set_sha256"] && qualification["qualifies"] == true,
         "unqualified or mismatched dataset set");
@@ -505,7 +518,7 @@ fn qualification_label(qualification: &Value, manifest: &Value) -> Result<&'stat
             source["revision"] == manifest["root_checkpoint"]["revision"]
                 && ["model_py_sha256", "kernel_torch_sha256", "golden_sha256", "inference_config_sha256"]
                     .iter().all(|key| hash(&source[key], 64))
-        } else if manifest["family"] == "kimi_k3" {
+        } else if manifest["family"] == "kimi_k3" || manifest["family"] == "kimi_k31" {
             let padding = &provenance["gates"]["kda_a_log_zero_padding"];
             // The native 93-layer decoder has 69 KDA layers with 32 unused F32 heads.
             let expected: std::collections::BTreeSet<_> = (0..92).filter(|i| i % 4 != 3)
@@ -520,13 +533,36 @@ fn qualification_label(qualification: &Value, manifest: &Value) -> Result<&'stat
                         && entry["tail_bitwise_zero"] == true
                         && entry["tail_sha256"] == digest(&[0u8; 32 * 4]))
                 });
-            manifest["root_checkpoint"]["id"] == "moonshotai/Kimi-K3"
+            let k31 = manifest["family"] == "kimi_k31";
+            let decoder = if k31 { &source["base_decoder"] } else { source };
+            let decoder_valid = ["configuration_kimi_k3_sha256", "modeling_kimi_k3_sha256", "modeling_kimi_linear_sha256"]
+                .iter().all(|key| hash(&decoder[key], 64));
+            let dsa_valid = !k31 || {
+                let upstream = &source["upstream"];
+                source["checkpoint"] == "moonshotai/Kimi-K3.1-Pro"
+                    && source["revision"] == "6d0a0202956796543364d666ab19c6ad1a494ee1"
+                    && decoder["checkpoint"] == "moonshotai/Kimi-K3"
+                    && decoder["revision"] == "f831ab66814297da540d832a5235f8e904f29d06"
+                    && provenance["transformers"] == "4.57.6"
+                    && ["dsa_adapter_sha256", "indexer_ops_sha256", "shape_invariant_sha256"]
+                        .iter().all(|key| hash(&source[key], 64))
+                    && [("vllm", "4414f472fb1dd5722b6468c2057943a8c45f83dc", 2),
+                        ("sglang", "1305b1830a1285fdfa9e4f6dbe40f51563d5576e", 3)]
+                        .iter().all(|(name, revision, count)| upstream[*name]["revision"] == *revision
+                            && upstream[*name]["files"].as_object().is_some_and(|files|
+                                files.len() == *count && files.values().all(|value| hash(value, 64))))
+            };
+            manifest["root_checkpoint"]["id"] == if k31 { "moonshotai/Kimi-K3.1-Pro" } else { "moonshotai/Kimi-K3" }
                 && source["revision"] == manifest["root_checkpoint"]["revision"]
-                && ["configuration_kimi_k3_sha256", "modeling_kimi_k3_sha256", "modeling_kimi_linear_sha256",
-                    "reference_adapter_sha256", "reference_runner_sha256", "fla_source_sha256",
+                && ["reference_adapter_sha256", "reference_runner_sha256", "fla_source_sha256",
                     "transformers_source_sha256", "compressed_tensors_source_sha256"]
                     .iter().all(|key| hash(&source[key], 64))
-                && padding_valid
+                && decoder_valid && dsa_valid && padding_valid
+        } else if manifest["family"] == "minimax_m3" {
+            manifest["root_checkpoint"]["id"] == "MiniMaxAI/MiniMax-M3.1-Flash"
+                && source["revision"] == manifest["root_checkpoint"]["revision"]
+                && ["transformers_revision", "vllm_revision"].iter().all(|key| hash(&source[key], 40))
+                && MINIMAX_SOURCE_DIGESTS.iter().all(|key| hash(&source[key], 64))
         } else if manifest["family"] == "muse_spark" || manifest["family"] == "mistral_large4" {
             // Official transformers 5.22.1 modeling (pinned file hashes), our adapter and runner.
             let family = manifest["family"].as_str().unwrap_or_default();
@@ -681,6 +717,47 @@ mod tests {
     }
 
     #[test]
+    fn kimi_k31_qualification_requires_its_root_sources_and_dependencies() {
+        let (mut qualification, mut manifest) = kimi_reference_qualification();
+        let root = "moonshotai/Kimi-K3.1-Pro";
+        let revision = "6d0a0202956796543364d666ab19c6ad1a494ee1";
+        manifest["family"] = json!("kimi_k31");
+        manifest["root_checkpoint"] = json!({"id":root, "revision":revision});
+        for path in ["reference_provenance", "prefix_qualification"] {
+            qualification[path]["snapshot_identity"]["checkpoint"] = json!(root);
+            qualification[path]["snapshot_identity"]["snapshot_revision"] = json!(revision);
+        }
+        qualification["reference_provenance"]["transformers"] = json!("4.57.6");
+        let source = &mut qualification["reference_provenance"]["source_pin"];
+        let mut base = source.clone();
+        base["checkpoint"] = json!("moonshotai/Kimi-K3");
+        base["revision"] = json!("f831ab66814297da540d832a5235f8e904f29d06");
+        source["base_decoder"] = base;
+        source["checkpoint"] = json!(root);
+        source["revision"] = json!(revision);
+        for key in ["dsa_adapter_sha256", "indexer_ops_sha256", "shape_invariant_sha256"] {
+            source[key] = json!("d".repeat(64));
+        }
+        for (name, rev, count) in [("vllm", "4414f472fb1dd5722b6468c2057943a8c45f83dc", 2),
+            ("sglang", "1305b1830a1285fdfa9e4f6dbe40f51563d5576e", 3)] {
+            let files: serde_json::Map<_, _> = (0..count).map(|i| (format!("file{i}"), json!("e".repeat(64)))).collect();
+            source["upstream"][name] = json!({"revision":rev, "files":files});
+        }
+        assert!(qualification_label(&qualification, &manifest).is_ok());
+        for path in ["/reference_provenance/source_pin/dsa_adapter_sha256",
+            "/reference_provenance/source_pin/indexer_ops_sha256",
+            "/reference_provenance/source_pin/base_decoder/modeling_kimi_linear_sha256",
+            "/reference_provenance/source_pin/upstream/vllm/revision",
+            "/reference_provenance/transformers"] {
+            let mut bad = qualification.clone();
+            *bad.pointer_mut(path).unwrap() = json!("invalid");
+            assert!(qualification_label(&bad, &manifest).is_err(), "{path}");
+        }
+        manifest["root_checkpoint"]["id"] = json!("moonshotai/Kimi-K3");
+        assert!(qualification_label(&qualification, &manifest).is_err());
+    }
+
+    #[test]
     fn published_qualification_kinds_keep_their_labels_and_evidence() {
         let (reference, manifest) = kimi_reference_qualification();
         for (kind, label) in [("reference", "reference"), ("reference_only", "reference-only qualified")] {
@@ -811,6 +888,11 @@ mod tests {
     fn prefill_admission_uses_resolved_launch_setting_only() {
         use crate::report::Setting;
         assert!(!prefill_admitted(&[]));
+        for source in ["resolved", "cli", "default"] {
+            let setting = Setting { name: "prefill-scoring".into(), value: Some("streamed".into()),
+                source: source.into(), ..Default::default() };
+            assert_eq!(prefill_admitted(&[setting]), source == "resolved");
+        }
         for value in ["false", "off", "0", "true", "on", "1"] {
             let setting = Setting { name:"full-prefill-logits".into(), value:Some(value.into()),
                 default:Some("false".into()), source:"cli".into() };
@@ -980,7 +1062,9 @@ mod tests {
             (MIMO_PRO_MEDIA_REVISION, MIMO_PRO_MEDIA_CONFIG), (QWEN35_9B_REVISION, QWEN35_9B_CONFIG),
             (QWEN38_27B_REVISION, QWEN38_27B_CONFIG), (STEP5_REVISION, STEP5_CONFIG),
             (V41_1017_REVISION, V41_1017_CONFIG), (KIMI_K3_REVISION, KIMI_K3_CONFIG),
-            (MUSE_SPARK_REVISION, MUSE_SPARK_CONFIG), (MISTRAL_LARGE4_REVISION, MISTRAL_LARGE4_CONFIG)] {
+            (KIMI_K31_REVISION, KIMI_K31_CONFIG),
+            (MUSE_SPARK_REVISION, MUSE_SPARK_CONFIG), (MISTRAL_LARGE4_REVISION, MISTRAL_LARGE4_CONFIG),
+            (MINIMAX_M3_REVISION, MINIMAX_M3_CONFIG)] {
             let root = temporary.path().join("wrldsuksgo2mars--cuteafd-fidelity").join(revision);
             std::fs::create_dir_all(root.join(config)).unwrap();
             let manifest = b"{}";
@@ -1052,6 +1136,25 @@ mod tests {
             let balance = standard_balance(&reference);
             assert_eq!(balance["decode"]["generated_positions"], 11435);
             assert_eq!(balance["prefill"]["generated_positions"], 10678);
+        }
+        if commit == MINIMAX_M3_REVISION && config == MINIMAX_M3_CONFIG {
+            assert_eq!(reference.checkpoint, "MiniMaxAI/MiniMax-M3.1-Flash");
+            assert_eq!(reference.windows.len(), 72);
+            assert_eq!(identity["qualification"], "reference");
+            assert_eq!(identity["text_checkpoint"], "MiniMaxAI/MiniMax-M3.1-Flash");
+            let balance = standard_balance(&reference);
+            assert_eq!(balance["decode"]["generated_positions"], 12679);
+            assert_eq!(balance["prefill"]["generated_positions"], 12080);
+        }
+        if commit == KIMI_K31_REVISION && config == KIMI_K31_CONFIG {
+            assert_eq!(reference.checkpoint, "moonshotai/Kimi-K3.1-Pro");
+            assert_eq!(reference.windows.len(), 72);
+            assert_eq!(identity["qualification"], "reference");
+            assert_eq!(identity["text_checkpoint"], "moonshotai/Kimi-K3.1-Pro");
+            assert_eq!((reference.expect.top1_min, reference.expect.kl_max), (0.90, 0.06));
+            let balance = standard_balance(&reference);
+            assert_eq!(balance["decode"]["generated_positions"], 12493);
+            assert_eq!(balance["prefill"]["generated_positions"], 11848);
         }
         if commit == KIMI_K3_REVISION && config == KIMI_K3_CONFIG {
             assert_eq!(reference.checkpoint, "moonshotai/Kimi-K3");
@@ -1348,6 +1451,59 @@ mod tests {
         assert_eq!(qualification_label(&paired, &manifest).unwrap(), "paired qualified");
         paired["shapes"]["decode"]["delta_difference"] = json!(0.01);
         assert!(qualification_label(&paired, &manifest).is_err());
+    }
+
+    #[test]
+    fn minimax_reference_pins_its_decoder_sources_at_the_root_revision() {
+        let revision = "5".repeat(40);
+        let root = "MiniMaxAI/MiniMax-M3.1-Flash";
+        let identity = json!({"checkpoint":root, "snapshot_revision":revision,
+            "config_sha256":"b".repeat(64), "tokenizer_sha256":"c".repeat(64)});
+        let manifest = json!({"family":"minimax_m3", "set_sha256":"set", "vocab":200064,
+            "root_checkpoint":{"id":root, "revision":revision}, "files":vec![json!({});64]});
+        let mut source = json!({"revision":revision, "transformers_revision":"6".repeat(40),
+            "vllm_revision":"7".repeat(40)});
+        for key in MINIMAX_SOURCE_DIGESTS { source[key] = json!("d".repeat(64)); }
+        let qualification = json!({"schema":"cuteafd.fidelity.qualification/1", "kind":"reference",
+            "qualifies":true, "engine_parity":false, "set_sha256":"set", "nll":0.9, "scored_tokens":32768,
+            "reference_validation":{"passed":true, "engine_parity":false, "set_sha256":"set",
+                "scored_tokens":32768, "nll":0.9, "golden_seal_sha256":"e".repeat(64), "full_seal_sha256":"f".repeat(64)},
+            "prefix_qualification":{"passed":true, "finite":true, "rows":512, "different_rows":[],
+                "argmax_disagreements":0, "set_sha256":"set", "snapshot_identity":identity, "fixed_rows":128,
+                "vocab":200064, "lengths":[576,640], "score_from":64, "logits_sha256":["1".repeat(64),"2".repeat(64)]},
+            "reference_provenance":{"snapshot_identity":identity, "source_pin":source, "tokenizers":"0.22.1",
+                "platform":{"gpu":"reference GPU"}, "mtp":false, "use_cache":false, "attention":"eager"}});
+        assert_eq!(qualification_label(&qualification, &manifest).unwrap(), "reference");
+        for key in ["revision", "transformers_revision", "vllm_revision"] {
+            for invalid in [Value::Null, json!("g".repeat(40)), json!("a".repeat(39)), json!("a".repeat(64))] {
+                let mut bad = qualification.clone();
+                bad["reference_provenance"]["source_pin"][key] = invalid;
+                assert!(qualification_label(&bad, &manifest).is_err(), "{key}");
+            }
+        }
+        for key in MINIMAX_SOURCE_DIGESTS {
+            for invalid in [Value::Null, json!("g".repeat(64)), json!("A".repeat(64)), json!("a".repeat(63))] {
+                let mut bad = qualification.clone();
+                bad["reference_provenance"]["source_pin"][key] = invalid;
+                assert!(qualification_label(&bad, &manifest).is_err(), "{key}");
+            }
+        }
+        let mut bad = qualification.clone();
+        bad["reference_provenance"]["source_pin"]["revision"] = json!("9".repeat(40));
+        assert!(qualification_label(&bad, &manifest).is_err(), "pinned sources must be the root revision's");
+        // A dense Transformers pin does not stand in for the decoder's own sources.
+        let mut dense = qualification.clone();
+        dense["reference_provenance"]["source_pin"] = json!({"revision":revision,
+            "modeling_sha256":"1".repeat(64), "source_tree_sha256":"2".repeat(64)});
+        assert!(qualification_label(&dense, &manifest).is_err());
+        // Another checkpoint published under the MiniMax family fails closed.
+        let other = "someone/MiniMax-M3.1-Flash";
+        let (mut changed, mut renamed) = (qualification.clone(), manifest.clone());
+        renamed["root_checkpoint"]["id"] = json!(other);
+        for path in ["/reference_provenance/snapshot_identity/checkpoint", "/prefix_qualification/snapshot_identity/checkpoint"] {
+            *changed.pointer_mut(path).unwrap() = json!(other);
+        }
+        assert!(qualification_label(&changed, &renamed).is_err());
     }
 
     #[test]

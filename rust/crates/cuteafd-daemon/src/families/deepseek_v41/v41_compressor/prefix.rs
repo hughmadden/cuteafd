@@ -13,25 +13,6 @@ fn slice(mut buffer: CuteafdDeviceBuffer, offset: usize, bytes: usize) -> Cuteaf
 }
 
 impl CompressorState<'_> {
-    /// Start a fresh lease at the complete-group frontier `end` of pages the prefix engine
-    /// forked and bound: no pending group exists there, so no carry is read. This is the global
-    /// backing for a later bounded local-window reconstruction.
-    pub fn restore_compressed_prefix(&mut self, lease: CompressorLease, end: u64) -> Result<()> {
-        let slot = self.validate(lease)?;
-        let step = ratio(self.layer)? as u64;
-        let rows = (end / step) as usize;
-        ensure!(
-            end % step == 0
-                && self.slots[slot].end == 0
-                && self.slots[slot].version == 0
-                && self.index.binding(slot).1 == rows,
-            "unaligned or nonfresh compressed prefix restore, or bound rows differ"
-        );
-        self.slots[slot].end = end;
-        self.slots[slot].version = 1;
-        Ok(())
-    }
-
     /// # Safety
     /// Producers are drained. Destination remains live until stream completion,
     /// including on error. Only odd ratio-two frontiers have a live pending row.
@@ -108,78 +89,12 @@ mod tests {
     use super::*;
     #[test]
     #[ignore = "requires CUTEAFD_NATIVE_LIB and CUDA"]
-    fn compressed_prefix_restore_requires_complete_groups_and_bounds_views() -> Result<()> {
-        let lib = unsafe { NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?)? };
-        let device = crate::shared::memory::device::cache_test_device(&lib)?;
-        let saved = DeviceAllocation::new(&lib, COMPRESSOR_PREFIX_BYTES)?;
-        let stream = LoadStream {
-            library: &lib,
-            raw: lib.cuda_stream_create()?,
-        };
-        for layer in [2, 20] {
-            let mut state = device.own(|| CompressorState::new(&lib, layer, 2, 4, usize::MAX))?;
-            assert_eq!(state.index.kv_values.buffer.device_id,device.id);
-            assert_eq!(saved.buffer.device_id,0);
-            let original = state.begin_request(0, 1)?;
-            let rows = 601 / ratio(layer)?;
-            let pages: Vec<u32> = (0..rows.div_ceil(PAGE_ROWS) as u32).collect();
-            state.bind(original, &pages, 0)?;
-            let plan = state.index.reserve(&[(0, 0, rows)])?;
-            for buffer in [
-                state.index.packed.buffer,
-                state.index.scales.buffer,
-                state.index.kv_values.buffer,
-                state.index.kv_scales.buffer,
-            ] {
-                lib.copy_h2d(buffer, &vec![0x11; buffer.bytes])?;
-            }
-            unsafe {
-                state.index.upload(&plan, stream.raw)?;
-                lib.cuda_stream_synchronize(stream.raw)?;
-            }
-            state.index.apply(plan);
-            state.slots[0].end = 601;
-            if let Some(pending) = &state.pending {
-                for buffer in pending {
-                    lib.copy_h2d(buffer.buffer, &vec![0x33; buffer.buffer.bytes])?;
-                }
-            }
-            assert_eq!(unsafe { state.retain_prefix(original, saved.buffer, stream.raw)? }, 601);
-            unsafe {
-                lib.cuda_stream_synchronize(stream.raw)?;
-            }
-            state.release(original)?;
-            let resumed = state.begin_request(1, 2)?;
-            let end = if layer == 2 { 514 } else { 513 };
-            // The engine forks the snapshot's pages through `end` (shared full pages).
-            state.bind(resumed, &pages, end as usize / ratio(layer)?)?;
-            assert!(state.restore_compressed_prefix(resumed, 602).is_err());
-            if layer == 2 {
-                assert!(state.restore_compressed_prefix(resumed, 513).is_err());
-            }
-            state.restore_compressed_prefix(resumed, end)?;
-            assert_eq!(state.committed_end(resumed)?, end);
-            assert_eq!(
-                state.index_cache(resumed)?.rows,
-                end as usize / ratio(layer)?
-            );
-            assert_eq!(state.kv_cache(resumed)?.rows, end as usize / ratio(layer)?);
-            assert!(state.committed_proposal(resumed, 0..end + 1, 1).is_err());
-            assert!(state.committed_proposal(resumed, end - 128..end, 1).is_ok());
-            assert!(state.restore_compressed_prefix(resumed, end).is_err());
-            state.release(resumed)?;
-        }
-        Ok(())
-    }
-
-    #[test]
-    #[ignore = "requires CUTEAFD_NATIVE_LIB and CUDA"]
     fn native_compressor_prefix_preserves_pending_odd_row() -> Result<()> {
         let lib = unsafe { NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?)? };
         let device = crate::shared::memory::device::cache_test_device(&lib)?;
         let mut state = device.own(|| CompressorState::new(&lib, 2, 2, 4, usize::MAX))?;
         assert_eq!(state.index.kv_values.buffer.device_id,device.id);
-        let saved = DeviceAllocation::new(&lib, COMPRESSOR_PREFIX_BYTES)?;
+        let saved = DeviceAllocation::new(&lib, COMPRESSOR_PREFIX_BYTES, crate::shared::memory::TEST)?;
         let stream = LoadStream {
             library: &lib,
             raw: lib.cuda_stream_create()?,

@@ -35,9 +35,22 @@ pub struct CoreRankLayout {
     pub target_head: Option<ProjectionScratchLayout>,
     pub draft_head: Option<ProjectionScratchLayout>,
     pub retained_rows: usize,
+    /// The rank's independent device requests behind [`Self::bytes`], in bytes: every
+    /// projection scratch owner, every stage extent and every retained slot buffer.
+    /// The receive suffix is a view inside the peer exchange slot that the transport
+    /// charges, so it is none of them (their sum is `bytes(hidden) - receive_suffix`).
+    pub allocations: Vec<u64>,
     pub receive_suffix: usize,
 }
 impl CoreRankLayout {
+    /// The rank's own device requests: [`Self::bytes`] without the receive suffix,
+    /// which is a view inside the peer exchange slot the transport charges. Exactly
+    /// the sum of [`Self::allocations`], so admission charges this rank once.
+    pub fn owned_bytes(&self, hidden: usize) -> Result<u64> {
+        self.bytes(hidden)?.checked_sub(self.receive_suffix as u64)
+            .context("Flash K6 owned extent below its receive suffix")
+    }
+
     pub fn bytes(&self, hidden: usize) -> Result<u64> {
         let mut bytes = self.receive_suffix;
         for layout in self.decode.iter().chain(&self.prefill).chain(&self.target_head).chain(&self.draft_head) {
@@ -76,18 +89,42 @@ impl CoreCharges {
             && owners.is_none_or(|o| ranks == 2 && o.len() == layers), "Flash K6 admission geometry");
         let owned = owned_mla(cfg, layers, ranks, owners.is_some());
         let mut bodies = vec![Vec::new(); ranks];
+        let mut native_names = vec![[BTreeSet::new(), BTreeSet::new()]; ranks];
+        let mut bf16_shapes = BTreeSet::new();
+        let mut native_bodies = vec![false; ranks];
+        let mut native_split = false;
         for layer in 0..layers {
             let owner = owners.and_then(|o| (cfg.attention[layer] == super::GlmNextAttention::Mla).then_some(o[layer]));
             for (rank, weights) in core.layer_weights(cfg, layer, ranks, owner)?.into_iter().enumerate() {
                 bodies[rank].extend(weights.into_values());
             }
+            for (rank, weights) in core.layer_native(cfg, layer, ranks, owner)?.into_iter().enumerate() {
+                for weight in weights.values() {
+                    native_bodies[rank] = true;
+                    native_split |= weight.ranks > 1 && weight.split == super::core::CoreSplit::Input;
+                    if !weight.fp8 {
+                        bf16_shapes.insert((weight.shape[1], weight.shape[0]));
+                        continue;
+                    }
+                    let prefix = fp8_projection_prefix(weight);
+                    for (index, caps) in [vec![64, decode_rows], vec![4096]].into_iter().enumerate() {
+                        for cap in caps {
+                            native_names[rank][index].insert(fp8_projection_name(prefix, weight.shape, cap));
+                        }
+                    }
+                }
+            }
         }
         let head = core.get_weight("lm_head").map(|p| CoreWeightLayout::new(p, TrellisSide::Output, 0, 1)).transpose()?;
         let mut programs = BTreeSet::new();
+        for (k, n) in bf16_shapes {
+            programs.insert(cuteafd_ffi::draft_projection::validate_package_geometry(
+                manifest, k, n, unit.max(decode_rows))?);
+        }
         for weight in bodies.iter().flatten().chain(head.iter()) {
             let book = weight.codebook.marker();
-            programs.extend(cuteafd_ffi::dense_trellis::validate_package_geometry(manifest,
-                weight.shape[1], weight.shape[0], if weight.side == TrellisSide::Input { 2 } else { 1 }, book,
+            programs.extend(cuteafd_ffi::dense_trellis::validate_package_geometry_bits(manifest,
+                weight.shape[1], weight.shape[0], if weight.side == TrellisSide::Input { 2 } else { 1 }, weight.bits, book,
                 if weight.stem == "lm_head" { decode_rows.max(draft_rows.unwrap_or(1)) } else { unit.max(decode_rows) },
                 if weight.stem == "lm_head" { cuteafd_ffi::dense_trellis::TrellisDType::F32 }
                 else { cuteafd_ffi::dense_trellis::TrellisDType::Bf16 })?);
@@ -98,20 +135,26 @@ impl CoreCharges {
             ensure!(matches.len() == 1, "Flash K6 requires one {name}");
             Ok(matches[0]["scratch_bytes_at_capacity"]["scratch"].as_u64().unwrap_or(0).try_into()?)
         };
-        let scratch = |decode: bool| -> Result<usize> {
+        if core.native.get("lm_head").is_some_and(|head| head.fp8) {
+            lookup("glmf_head_block_fp8")?;
+            programs.insert("glmf_head_block_fp8".into());
+        }
+        let scratch = |rank: usize, decode: bool| -> Result<usize> {
             let mut bytes = 0;
-            for name in route_stage_names(cfg, ranks, owned, decode, decode_rows) {
-                bytes = bytes.max(lookup(&name)?);
+            for name in route_stage_names(cfg, ranks, owned, decode, decode_rows).iter()
+                .chain(native_names[rank][usize::from(!decode)].iter()) {
+                bytes = bytes.max(lookup(name)?);
             }
             Ok(bytes)
         };
-        if bodies.iter().any(|b| !b.is_empty()) {
+        if bodies.iter().any(|b| !b.is_empty()) || native_bodies.iter().any(|&b| b) {
             for decode in [true, false] {
                 for name in route_stage_names(cfg, ranks, owned, decode, decode_rows) {
                     lookup(&name)?; programs.insert(name);
                 }
             }
         }
+        for name in native_names.iter().flatten().flatten() { lookup(name)?; programs.insert(name.clone()); }
         let projection = |body: &[CoreWeightLayout], rows| -> Result<Option<ProjectionScratchLayout>> {
             let mut result: Option<ProjectionScratchLayout> = None;
             for w in body {
@@ -121,21 +164,42 @@ impl CoreCharges {
             Ok(result)
         };
         let head_scratch = |rows| head.as_ref().map(|h| ProjectionScratchLayout::new(h.shape[1], h.shape[0], rows)).transpose();
-        let split = bodies.iter().flatten().any(|w| w.side == TrellisSide::Input);
+        let split = ranks > 1 && (native_split || bodies.iter().flatten().any(|w| w.side == TrellisSide::Input));
         let retained_rows = decode_rows.checked_add(unit.checked_mul(slots).context("Flash K6 live rows overflow")?)
             .context("Flash K6 live rows overflow")?;
         let receive = receive_suffix_bytes(unit.max(decode_rows), cfg.hidden, slots, output_shard)?;
+        // Retained slot buffers: `[rows, rows, 2 * rows]` of `hidden * 8` bytes, one slot
+        // at the decode width and `slots` at the prefill width (`glmf/core-retained`).
+        let retained = |rows: usize| -> Result<Vec<u64>> {
+            let row = rows.checked_mul(cfg.hidden).and_then(|n| n.checked_mul(2))
+                .context("Flash K6 retained row overflow")? as u64;
+            Ok(vec![row, row, row.checked_mul(2).context("Flash K6 retained row overflow")?])
+        };
         let mut layouts = Vec::new();
         for (rank, body) in bodies.into_iter().enumerate() {
+            let active = !body.is_empty() || native_bodies[rank];
+            let stages = if !active { None } else { Some([
+                CoreStageLayout::new(cfg, decode_rows, ranks, owned, scratch(rank, true)?)?,
+                CoreStageLayout::new(cfg, unit, ranks, owned, scratch(rank, false)?)?]) };
+            let (decode, prefill) = (projection(&body, decode_rows)?, projection(&body, unit)?);
+            let target_head = if rank == 0 { head_scratch(decode_rows)? } else { None };
+            let draft_head = if rank == 0 { draft_rows.map(head_scratch).transpose()?.flatten() } else { None };
+            let mut allocations = Vec::new();
+            for layout in decode.iter().chain(&prefill).chain(&target_head).chain(&draft_head) {
+                allocations.extend(layout.storage()?.owners.values().map(|&bytes| bytes as u64));
+            }
+            if let Some(stages) = &stages {
+                allocations.extend(stages.iter().flat_map(|stage|
+                    stage.extents.values().map(|&bytes| bytes as u64)));
+            }
+            if active {
+                allocations.extend(retained(decode_rows)?);
+                for _ in 0..slots { allocations.extend(retained(unit)?); }
+            }
             layouts.push(CoreRankLayout {
-                stages: if body.is_empty() { None } else { Some([
-                    CoreStageLayout::new(cfg, decode_rows, ranks, owned, scratch(true)?)?,
-                    CoreStageLayout::new(cfg, unit, ranks, owned, scratch(false)?)?]) },
-                decode: projection(&body, decode_rows)?, prefill: projection(&body, unit)?,
-                target_head: if rank == 0 { head_scratch(decode_rows)? } else { None },
-                draft_head: if rank == 0 { draft_rows.map(head_scratch).transpose()?.flatten() } else { None },
-                retained_rows: if body.is_empty() { 0 } else { retained_rows },
-                receive_suffix: if split { receive } else { 0 }, body,
+                stages, decode, prefill, target_head, draft_head,
+                retained_rows: if !active { 0 } else { retained_rows },
+                allocations, receive_suffix: if split { receive } else { 0 }, body,
             });
         }
         let result = Self { ranks: layouts, programs: programs.into_iter().collect() };
@@ -143,6 +207,22 @@ impl CoreCharges {
         Ok(result)
     }
     pub fn bytes(&self, hidden: usize) -> Result<Vec<u64>> { self.ranks.iter().map(|r| r.bytes(hidden)).collect() }
+
+    /// Each rank's independently allocated extent, exactly its [`Self::requests`] sum.
+    pub fn owned_bytes(&self, hidden: usize) -> Result<Vec<u64>> { self.ranks.iter().map(|r| r.owned_bytes(hidden)).collect() }
+
+    /// Each rank's independent device requests, paired with [`Self::bytes`] per rank.
+    pub fn requests(&self) -> impl Iterator<Item = &[u64]> {
+        self.ranks.iter().map(|rank| rank.allocations.as_slice())
+    }
+}
+
+pub fn fp8_projection_prefix(layout: &super::core::NativeLayout) -> &'static str {
+    if layout.ranks == 1 { "glmf_stage" } else { "glmf2_stage" }
+}
+
+pub fn fp8_projection_name(prefix: &str, [n, k]: [usize; 2], cap: usize) -> String {
+    format!("{prefix}_fp8_linear_k{k}_n{n}_m{cap}")
 }
 
 /// Decode and prefill stages differ even when their live row counts coincide.
@@ -195,7 +275,7 @@ mod tests {
         let stage = CoreStageLayout::new(&cfg, 64, 2, false, 4096)?;
         let rank = CoreRankLayout { body: vec![], stages: Some([stage.clone(), stage.clone()]),
             decode: Some(p.clone()), prefill: Some(p.clone()), target_head: Some(p.clone()), draft_head: Some(p.clone()),
-            retained_rows: 64 + 3 * 4096, receive_suffix: 4 * 3 * 4096 * 4096 * 2 };
+            retained_rows: 64 + 3 * 4096, allocations: vec![], receive_suffix: 4 * 3 * 4096 * 4096 * 2 };
         assert_eq!(rank.bytes(4096)?, (4 * p.bytes()? + 2 * stage.bytes()? + rank.receive_suffix
             + rank.retained_rows * 4096 * 8) as u64);
         let mut overflow = rank; overflow.retained_rows = usize::MAX;

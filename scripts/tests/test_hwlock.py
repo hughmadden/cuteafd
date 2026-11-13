@@ -29,10 +29,20 @@ def spawn(lockdir, locks, seconds, marker):
 
 def wait_for(path, timeout=10):
     end = time.time() + timeout
-    while not path.exists():
+    while True:
+        # write_text creates the marker before publishing its timestamp.
+        text = path.read_text() if path.exists() else ''
+        if text:
+            return float(text)
         assert time.time() < end, f'{path} never appeared'
         time.sleep(0.02)
-    return float(path.read_text())
+
+
+def test_wait_for_retries_an_empty_marker(tmp_path, monkeypatch):
+    marker = tmp_path / 'marker'
+    marker.write_text('')
+    monkeypatch.setattr(time, 'sleep', lambda _: marker.write_text('123.5'))
+    assert wait_for(marker) == 123.5
 
 
 @pytest.mark.parametrize('gate', [False, True])

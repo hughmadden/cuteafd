@@ -315,7 +315,10 @@ fn an_unreadable_argument_key_returns_its_whole_call_as_content() {
 }
 
 /// A repeated key keeps its last value, in the place of its first, so the
-/// arguments stay a JSON object without duplicate keys.
+/// arguments stay a JSON object without duplicate keys. Last-wins matches
+/// standard JSON and is the hold path's rule; the streaming path keeps the
+/// first value because a streamed value cannot be retracted once it has
+/// reached the client.
 #[test]
 fn a_repeated_argument_keeps_its_last_value() {
     let text = concat!("<tool_call>\n<function=search>\n<parameter=query>\nfirst\n</parameter>\n",
@@ -323,6 +326,127 @@ fn a_repeated_argument_keeps_its_last_value() {
         "<parameter=limit>\n2\n</parameter>\n</function>\n</tool_call>");
     let projection = parse_everywhere(&options(false, Some(tools())), text);
     assert_eq!(projection.calls, vec![("search".into(), json!({"query": "second", "limit": 2}))]);
+}
+
+// ------------------------------------------------------- streamed args
+
+mod streamed_args {
+    use super::*;
+
+    /// The assembled arguments of a parse: the `ToolCall` opener's bytes plus
+    /// every `ToolArgumentsDelta`, exactly as a client concatenates them.
+    fn assembled(chunks: &[OutputChunk]) -> String {
+        let mut text = String::new();
+        for chunk in chunks {
+            match chunk {
+                OutputChunk::ToolCall { arguments, .. } => text.push_str(arguments),
+                OutputChunk::ToolArgumentsDelta { content } => text.push_str(content),
+                _ => {}
+            }
+        }
+        text
+    }
+
+    fn parse_streaming(parser_options: &QwenParserOptions, text: &str, streaming: bool) -> (Vec<OutputChunk>, usize) {
+        let mut parser = QwenOutputParser::with_stream_args(parser_options.clone(), streaming);
+        let mut chunks = Vec::new();
+        for character in text.chars() {
+            chunks.extend(parser.push(&character.to_string()));
+        }
+        chunks.extend(parser.finish());
+        (chunks, parser.tool_calls())
+    }
+
+    /// Every two-way split, including one inside a close tag, must stream the
+    /// same bytes the hold path assembles.
+    fn assert_streamed_matches_hold(shape: &str, text: &str) {
+        let parser_options = options(false, Some(tools()));
+        let (hold, hold_calls) = parse_streaming(&parser_options, text, false);
+        let (streamed, streamed_calls) = parse_streaming(&parser_options, text, true);
+        assert_eq!((hold_calls, streamed_calls), (1, 1), "{shape}");
+        assert_eq!(assembled(&streamed), assembled(&hold), "{shape}: streamed == held, byte for byte");
+        for split in text.char_indices().map(|(index, _)| index).chain([text.len()]) {
+            let mut parser = QwenOutputParser::with_stream_args(parser_options.clone(), true);
+            let mut chunks = parser.push(&text[..split]);
+            chunks.extend(parser.push(&text[split..]));
+            chunks.extend(parser.finish());
+            assert_eq!(assembled(&chunks), assembled(&hold), "{shape}: split at {split}");
+        }
+        // A buffering constructor would pass every check above; prove a delta
+        // actually arrives before the call closes.
+        let close = text.find("</tool_call>").expect("the call closes");
+        let mut parser = QwenOutputParser::with_stream_args(parser_options.clone(), true);
+        let mut saw_delta_before_close = false;
+        for (index, character) in text.char_indices() {
+            let chunks = parser.push(&character.to_string());
+            if index < close
+                && chunks.iter().any(|chunk| matches!(chunk, OutputChunk::ToolArgumentsDelta { .. }))
+            {
+                saw_delta_before_close = true;
+            }
+        }
+        parser.finish();
+        assert!(saw_delta_before_close, "{shape}: a delta must arrive before the call closes");
+    }
+
+    #[test]
+    fn multiple_string_parameters_stream_byte_for_byte() {
+        assert_streamed_matches_hold("two strings", concat!("<tool_call>\n<function=search>\n",
+            "<parameter=query>\ncats\n</parameter>\n<parameter=note>\nhello world\n</parameter>\n",
+            "</function>\n</tool_call>"));
+    }
+
+    #[test]
+    fn a_chunk_boundary_inside_the_close_tag_does_not_leak() {
+        // The close tag is split at every byte, including inside `</parameter>`.
+        assert_streamed_matches_hold("split close tag", concat!("<tool_call>\n<function=search>\n",
+            "<parameter=query>\ncats\n</parameter>\n</function>\n</tool_call>"));
+    }
+
+    #[test]
+    fn object_arguments_stream_byte_for_byte() {
+        assert_streamed_matches_hold("object", concat!("<tool_call>\n<function=get_weather>\n",
+            "<parameter=detail>\n{\"a\": 1, \"b\": [2, 3]}\n</parameter>\n</function>\n</tool_call>"));
+    }
+
+    /// A repeated key is the one case the two paths cannot agree on: the hold
+    /// path keeps the last value (standard JSON), the streaming path keeps the
+    /// first because a streamed value cannot be retracted. Both stay a valid
+    /// JSON object with no duplicate keys.
+    #[test]
+    fn repeated_keys_keep_the_last_value_in_hold_and_the_first_when_streamed() {
+        let text = concat!("<tool_call>\n<function=search>\n",
+            "<parameter=query>\nfirst\n</parameter>\n<parameter=limit>\n1\n</parameter>\n",
+            "<parameter=query>\nsecond\n</parameter>\n<parameter=limit>\n2\n</parameter>\n",
+            "</function>\n</tool_call>");
+        let parser_options = options(false, Some(tools()));
+        let (hold, hold_calls) = parse_streaming(&parser_options, text, false);
+        let (streamed, streamed_calls) = parse_streaming(&parser_options, text, true);
+        assert_eq!((hold_calls, streamed_calls), (1, 1));
+        assert_eq!(assembled(&hold), r#"{"query":"second","limit":2}"#);
+        assert_eq!(assembled(&streamed), r#"{"query":"first","limit":1}"#);
+        for split in text.char_indices().map(|(index, _)| index).chain([text.len()]) {
+            let mut parser = QwenOutputParser::with_stream_args(parser_options.clone(), true);
+            let mut chunks = parser.push(&text[..split]);
+            chunks.extend(parser.push(&text[split..]));
+            chunks.extend(parser.finish());
+            assert_eq!(assembled(&chunks), r#"{"query":"first","limit":1}"#, "split at {split}");
+        }
+    }
+
+    /// A malformed call that is lost before any argument byte is streamed (an
+    /// unreadable name) comes back as content in both modes, so the streamed
+    /// deltas are empty exactly as the hold path's are.
+    #[test]
+    fn a_malformed_envelope_streams_no_arguments() {
+        let text = "<tool_call>\n<function=se<arch>\n<parameter=query>\ncats\n</parameter>\n</function>\n</tool_call>";
+        let parser_options = options(false, Some(tools()));
+        let (hold, hold_calls) = parse_streaming(&parser_options, text, false);
+        let (streamed, streamed_calls) = parse_streaming(&parser_options, text, true);
+        assert_eq!((hold_calls, streamed_calls), (0, 0));
+        assert_eq!(assembled(&streamed), assembled(&hold));
+        assert_eq!(assembled(&streamed), "");
+    }
 }
 
 #[test]
@@ -395,8 +519,8 @@ mod router {
             .filter(|data| *data != "[DONE]").map(|data| serde_json::from_str(data).unwrap()).collect()
     }
 
-    /// An unreadable call comes back as content, whole or streamed; the finish
-    /// is `tool_calls` only when a call parsed, never a failed request.
+    /// A call lost before any argument byte is streamed (an unreadable name)
+    /// comes back as content in both response modes.
     #[tokio::test]
     async fn unreadable_calls_come_back_as_content_in_both_response_modes() {
         let tools = json!([{"type": "function", "function": {"name": "search", "parameters": {"type": "object",
@@ -406,13 +530,6 @@ mod router {
             ("Plan.\n<tool_call>\nsearch cats\n</tool_call>".to_owned(),
                 "Plan.\n<tool_call>\nsearch cats\n</tool_call>".to_owned(), 0, "stop"),
             (format!("Plan.\n{parsed}"), "Plan.".to_owned(), 1, "tool_calls"),
-            ("Plan.\n<tool_call>\n<function=search>\n<parameter=query>\ncut".to_owned(),
-                "Plan.\n<tool_call>\n<function=search>\n<parameter=query>\ncut".to_owned(), 0, "stop"),
-            // An unreadable parameter key loses the whole call: content, stop,
-            // never a tool call.
-            ("Plan.\n<tool_call>\n<function=search>\n<parameter=<bad>\n1\n</parameter>\n</function>\n</tool_call>".to_owned(),
-                "Plan.\n<tool_call>\n<function=search>\n<parameter=<bad>\n1\n</parameter>\n</function>\n</tool_call>".to_owned(),
-                0, "stop"),
         ] {
             for streaming in [false, true] {
                 let body = json!({"model": MODEL, "stream": streaming, "enable_thinking": false, "tools": tools,
@@ -436,6 +553,41 @@ mod router {
                 assert_eq!((reply.as_str(), names.len(), reason.as_str()), (content.as_str(), calls, Some(finish)),
                     "{text} streaming={streaming}");
             }
+        }
+    }
+
+    /// A call that streams its name and some arguments, then turns out
+    /// unreadable, cannot be retracted: the hold path returns it as content,
+    /// the streaming path ends with a clean error frame (never partial JSON).
+    #[tokio::test]
+    async fn a_call_that_streams_then_fails_is_a_clean_error() {
+        let tools = json!([{"type": "function", "function": {"name": "search", "parameters": {"type": "object",
+            "properties": {"query": {"type": "string"}}}}}]);
+        for (text, content) in [
+            ("Plan.\n<tool_call>\n<function=search>\n<parameter=query>\ncut".to_owned(),
+                "Plan.\n<tool_call>\n<function=search>\n<parameter=query>\ncut".to_owned()),
+            // An unreadable parameter key loses the whole call.
+            ("Plan.\n<tool_call>\n<function=search>\n<parameter=<bad>\n1\n</parameter>\n</function>\n</tool_call>".to_owned(),
+                "Plan.\n<tool_call>\n<function=search>\n<parameter=<bad>\n1\n</parameter>\n</function>\n</tool_call>".to_owned()),
+        ] {
+            let body = json!({"model": MODEL, "stream": false, "enable_thinking": false, "tools": tools,
+                "messages": [{"role": "user", "content": "Search for cats."}]});
+            let (status, bytes) = serve(body, &text).await;
+            assert_eq!(status, StatusCode::OK);
+            let value: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(value["choices"][0]["message"]["content"].as_str(), Some(content.as_str()), "{text}");
+
+            let body = json!({"model": MODEL, "stream": true, "enable_thinking": false, "tools": tools,
+                "messages": [{"role": "user", "content": "Search for cats."}]});
+            let (status, bytes) = serve(body, &text).await;
+            assert_eq!(status, StatusCode::OK);
+            let text = std::str::from_utf8(&bytes).unwrap();
+            assert!(!text.split("\n\n").any(|frame| frame == "data: [DONE]"),
+                "a failed stream must not finish successfully: {text}");
+            let frames: Vec<Value> = text.split("\n\n").filter_map(|frame| frame.strip_prefix("data: "))
+                .map(|data| serde_json::from_str(data).unwrap()).collect();
+            assert_eq!(frames.iter().filter(|frame| frame.get("error").is_some()).count(), 1, "{text}");
+            assert_eq!(frames.last().unwrap()["error"]["type"], "native_v41_error", "{text}");
         }
     }
 }

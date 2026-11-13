@@ -19,10 +19,113 @@ import time
 
 ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(ROOT / "python/reference"))
-from fidelity_windows import (canonical, finish_golden, load_set, verify_snapshot,
-                              write_scored_logits)
+from fidelity_windows import (admit_reference_memory, canonical, finish_golden, load_set,
+                              verify_snapshot, write_scored_logits)
 from families.kimi_k3.model import (LayerWeights, configure_f32, geometry, load_official,
                                     package_source_identity, source_identity)
+
+
+QUICK_WINDOWS = ("legacy", "a00", "a04", "a08", "a20", "c00", "d00", "e00")
+
+
+def execution_windows(panel, *, skip_routed=False, prefix_probe=False, diagnostic_window=None):
+    windows = copy.deepcopy(panel["windows"])
+    if diagnostic_window is not None:
+        if not skip_routed or prefix_probe:
+            raise ValueError("arithmetic diagnostic requires skipped experts and no prefix probe")
+        ids = diagnostic_window.split(",")
+        selected = [window for window in windows if window["id"] in ids]
+        if (any(not wid for wid in ids) or len(set(ids)) != len(ids)
+                or len(selected) != len(ids) or {window["id"] for window in selected} != set(ids)):
+            raise ValueError("diagnostic window absent or duplicated")
+        return selected
+    if not skip_routed or prefix_probe:
+        return windows
+    selected = [window for window in windows if window["id"] in QUICK_WINDOWS]
+    if len(selected) != 8 or {w["id"] for w in selected} != set(QUICK_WINDOWS):
+        raise ValueError("skipped-routed quick diagnostic requires the sealed eight windows")
+    if any(len(w["tokens"]) - w["score_from"] != 512 for w in selected):
+        raise ValueError("skipped-routed quick diagnostic requires 512 scored rows per window")
+    if not any(w["score_from"] >= 8192 for w in selected):
+        raise ValueError("skipped-routed quick diagnostic requires sparse DSA beyond 8K history")
+    return selected
+
+
+def diagnostic_rows(value):
+    try:
+        first, end = map(int, value.split(":"))
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("capture rows require FIRST:END") from error
+    if first < 0 or not first < end <= first + 64:
+        raise argparse.ArgumentTypeError("capture requires 1..64 nonnegative input rows")
+    return first, end
+
+
+def diagnostic_options(a):
+    window = getattr(a, "diagnostic_window", None)
+    arithmetic = getattr(a, "diagnostic_arithmetic", None)
+    rows = getattr(a, "diagnostic_capture_rows", None)
+    if window is None and arithmetic is None and rows is None:
+        return None
+    if (window is None or arithmetic not in ("f32", "bf16")
+            or not getattr(a, "skip_routed_experts", False)
+            or any(getattr(a, key, None) is not None and getattr(a, key) is not False
+                   for key in ("stop_after_layer", "diagnose_layer", "diagnose_official_noise",
+                               "diagnose_blas", "diagnose_linear_variants", "probe_state"))
+            or getattr(a, "_prefix_probe", False)):
+        raise ValueError("arithmetic diagnostic requires skipped experts, window, arithmetic and no other diagnostic")
+    return {"window": window, "arithmetic": arithmetic, "capture_rows": rows}
+
+
+class DiagnosticCapture:
+    """Retain small residual slices without changing decoder operands."""
+    def __init__(self, root, layer, index, rows):
+        self.root, self.layer, self.index, self.rows = root, layer, index, rows
+        self.handles = []
+        self.prefix = None
+
+    def save(self, kind, value, *, selected=False):
+        import torch
+        first, end = self.rows
+        value = value.reshape(-1, value.shape[-1])
+        value = (value if selected else value[first:end]).detach().float().cpu()
+        if value.shape[0] != end - first or not torch.isfinite(value).all():
+            raise ValueError("nonfinite or truncated diagnostic capture")
+        folder = self.root / ("layer-%02d-%s" % (self.index, kind))
+        folder.mkdir(parents=True, exist_ok=True)
+        path = folder / "residual.bin"
+        temporary = path.with_suffix(".pending")
+        with temporary.open("wb") as stream:
+            value.numpy().astype("<f4").tofile(stream)
+            stream.flush()
+            os.fsync(stream.fileno())
+        temporary.replace(path)
+        atomic_json(folder / "meta.json", {"diagnostic_only": True, "layer": self.index,
+            "attention_kind": "KDA" if self.layer.is_linear_attn else "DSA-MLA",
+            "ffn_kind": "shared" if hasattr(self.layer, "block_sparse_moe") else "dense",
+            "rows": list(self.rows), "dtype": "F32", "shape": list(value.shape),
+            "path": path.name, "sha256": digest(path)})
+
+    def __enter__(self):
+        def before(module, args, kwargs):
+            hidden = args[0] if args else kwargs["hidden_states"]
+            first, end = self.rows
+            self.prefix = hidden[:, first:end].detach().clone()
+
+        def attended(module, args, output):
+            first, end = self.rows
+            selected = output[:, first:end]
+            if self.index % self.layer.attn_res_block_size:
+                selected = self.prefix + selected
+            self.save("post-attention", selected, selected=True)
+
+        self.handles = [self.layer.register_forward_pre_hook(before, with_kwargs=True),
+                        self.layer.self_attn.register_forward_hook(attended)]
+        return self
+
+    def __exit__(self, *_):
+        for handle in self.handles:
+            handle.remove()
 
 
 def digest(path):
@@ -152,10 +255,26 @@ class LayerState:
             shutil.rmtree(self.root / ("layer%03d" % previous["layer"]))
 
 
-def native_layer(reference, config, weights, index):
+def admit_layer_memory(cuda, config, index, required, largest, max_length):
+    if getattr(config, "dsa_config", None) is not None:
+        from families.kimi_k3.k31 import execution_memory
+        buffers = execution_memory(config, max_length, index)
+        print("K3.1 live-buffer admission: " + json.dumps(buffers, sort_keys=True), flush=True)
+        admit_reference_memory(cuda, required + largest * 5 + buffers["peak"],
+                               margin_bytes=buffers["margin"])
+    else:
+        # Preserve K3's established reserve, but allow GB10 to reclaim file cache.
+        admit_reference_memory(cuda, required + largest * 5 + 64 * 1024 ** 3,
+                               margin_bytes=0)
+
+
+def native_layer(reference, config, weights, index, *, max_length=16384, skip_routed=False):
     import torch
     with torch.device("meta"):
         layer = reference.KimiDecoderLayer(config, index)
+    if skip_routed:
+        from families.kimi_k3.k31 import skip_routed_experts
+        skip_routed_experts(layer)
     prefix = f"language_model.model.layers.{index}"
     if getattr(weights, "dtype", None) == torch.float32:
         weights.release_experts()
@@ -170,10 +289,7 @@ def native_layer(reference, config, weights, index):
                 largest = max(largest, parameter.numel() * 4)
             else:
                 required += parameter.numel() * 4
-        free, _ = torch.cuda.mem_get_info()
-        # Admission covers all 16K-window state/combine/KDA buffers plus slack.
-        if required + largest * 5 + 64 * 1024 ** 3 > free:
-            raise ValueError("packed layer plus strict F32 execution reserve does not fit")
+        admit_layer_memory(torch.cuda, config, index, required, largest, max_length)
         return weights.load_module(layer, prefix, stream_experts=True)
     required = 0
     for name, parameter in layer.named_parameters():
@@ -186,9 +302,7 @@ def native_layer(reference, config, weights, index):
             required += parameter.numel() * sizes[descriptor["dtype"]]
         else:
             required += parameter.numel() * 2
-    free, _ = torch.cuda.mem_get_info()
-    if required + 16 * 1024 ** 3 > free:
-        raise ValueError("native layer plus 16 GiB execution reserve does not fit")
+    admit_reference_memory(torch.cuda, required + 16 * 1024 ** 3, margin_bytes=0)
     return weights.load_module(layer, prefix)
 
 
@@ -200,7 +314,7 @@ def official_mask(hidden):
     return mask[None, None]
 
 
-def official_check(out, arrays, per_layer):
+def official_check(out, arrays, per_layer, *, comparison=None):
     import numpy as np
     native, adapted = arrays
     logp = native.astype(np.float64)
@@ -213,7 +327,7 @@ def official_check(out, arrays, per_layer):
     result = {"schema": "cuteafd.kimi.official-forward/1", "tokens": len(native),
               "top1": top1, "kl": kl, "relative_logit_l2": relative,
               "max_abs_logit_difference": float(np.abs(native - adapted).max()),
-              "comparison": "independent native decoder streams; original eager versus fixed-M128 causal tiles; same exact native weights and F32 output head",
+              "comparison": comparison or "independent native decoder streams; original eager versus fixed-M128 causal tiles; same exact native weights and F32 output head",
               "passed": top1 >= .99 and kl <= 1e-4 and relative <= .01,
               "limits": {"top1_min": .99, "kl_max": 1e-4, "relative_logit_l2_max": .01},
               "layers": per_layer}
@@ -225,6 +339,7 @@ def official_check(out, arrays, per_layer):
 
 def execute(a):
     stop = getattr(a, "stop_after_layer", None)
+    diagnostic = diagnostic_options(a)
     state_root = (a._kimi_probe_state if getattr(a, "_prefix_probe", False) else
                   a.out.parent / (a.out.name + "-layer-state"))
     latest = state_root / "latest.json"
@@ -244,21 +359,37 @@ def execute(a):
 
     started = time.monotonic()
     a.out.mkdir(parents=True, exist_ok=True)
-    arithmetic = configure_f32()
+    if getattr(a, "check_only", False):
+        torch.set_default_dtype(torch.float32)
+        arithmetic = None
+    else:
+        arithmetic = configure_f32()
+    if diagnostic and diagnostic["arithmetic"] == "bf16":
+        torch.set_default_dtype(torch.bfloat16)
+        torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = False
+        arithmetic = {**arithmetic, "dtype": "bfloat16", "bf16_reduced_precision_reduction": False}
     torch.manual_seed(0)
     manifest = load_set(a.windows)
-    if manifest["family"] != "kimi_k3" or any(w.get("media") for w in manifest["windows"]):
+    if manifest["family"] not in ("kimi_k3", "kimi_k31") or any(w.get("media") for w in manifest["windows"]):
         raise ValueError("Kimi oracle supports only its own text panel")
     snapshot = verify_snapshot(manifest, a.snapshot)
     reference, config, quantization = load_official(a.snapshot)
+    is_k31 = getattr(config, "dsa_config", None) is not None
+    skip_routed = getattr(a, "skip_routed_experts", False)
+    if (manifest["family"] == "kimi_k31") != is_k31:
+        raise ValueError("Kimi panel family differs from checkpoint")
     if stop is not None and not 0 <= stop < config.num_hidden_layers:
         raise ValueError("diagnostic stop layer is outside checkpoint")
-    weights = LayerWeights(a.snapshot, quantization, dtype=torch.float32,
+    weights = LayerWeights(a.snapshot, quantization,
+                           dtype=None if diagnostic and diagnostic["arithmetic"] == "bf16" else torch.float32,
                            kda_num_heads=config.linear_attn_config["num_heads"])
     # Check every layer shape and only the small A_log tails before GPU admission.
     for index in range(config.num_hidden_layers):
         with torch.device("meta"):
             layer = reference.KimiDecoderLayer(config, index)
+        if skip_routed:
+            from families.kimi_k3.k31 import skip_routed_experts
+            skip_routed_experts(layer)
         weights.validate_module(layer, f"language_model.model.layers.{index}")
         weights.close()
         del layer
@@ -272,13 +403,20 @@ def execute(a):
         weights.validate_module(module, prefix)
     del outer, module
     print(f"native shape preflight passed; {len(weights.narrowed_a_log)} zero-padded KDA A_log tensors", flush=True)
+    if getattr(a, "check_only", False):
+        return
     pins = {**source_identity(a.snapshot), "fla_source_sha256": package_source_identity(fla),
             "transformers_source_sha256": package_source_identity(transformers),
             "compressed_tensors_source_sha256": package_source_identity(compressed_tensors),
             "reference_adapter_sha256": digest(Path(__file__).with_name("model.py")),
             "reference_runner_sha256": digest(Path(__file__))}
+    if is_k31:
+        if transformers.__version__ != "4.57.6":
+            raise ValueError("K3.1 oracle requires explicitly installed transformers 4.57.6")
+        pins["indexer_ops_sha256"] = digest(Path(__file__).parents[1] / "mistral_large4/ops.py")
+        pins["shape_invariant_sha256"] = digest(ROOT / "python/reference/shape_invariant.py")
     checking = getattr(a, "_prefix_probe", False)
-    if not checking and stop is None:
+    if not checking and stop is None and diagnostic is None:
         a._kimi_probe_state = a.out.parent / (a.out.name + "-prefix-state")
         # Keep interrupted evidence, but leave exactly one raw probe in the seal.
         for previous in a.out.glob("prefix-gate-*"):
@@ -286,8 +424,15 @@ def execute(a):
             archive.mkdir(exist_ok=True)
             previous.rename(archive / previous.name)
     # A diagnostic prefix is never passed to qualification or output scoring.
-    proof = qualify(a, manifest, execute) if stop is None else None
-    windows = copy.deepcopy(manifest["windows"])
+    proof = qualify(a, manifest, execute, route_forcing=is_k31) if stop is None and diagnostic is None else None
+    forced_routes = checking and getattr(a, "_route_forced_qualification", False)
+    windows = execution_windows(manifest, skip_routed=skip_routed, prefix_probe=checking,
+                                diagnostic_window=diagnostic["window"] if diagnostic else None)
+    if diagnostic and diagnostic["capture_rows"]:
+        if len(windows) != 1:
+            raise ValueError("diagnostic capture requires exactly one explicit window")
+        if diagnostic["capture_rows"][1] > len(windows[0]["tokens"]) - 1:
+            raise ValueError("diagnostic capture rows exceed prediction inputs")
     if checking:
         for name in ("official_short", "adapted_short"):
             source = copy.deepcopy(windows[0])
@@ -299,10 +444,16 @@ def execute(a):
                "compressed_tensors": compressed_tensors.__version__,
                "compute_capability": list(torch.cuda.get_device_capability()),
                "image_sha256": os.environ.get("CUTEAFD_REFERENCE_IMAGE_SHA256", ""),
-               "state_dtype": "float32", "arithmetic": arithmetic,
-               "expert_storage": "GPU packed cache; one F32 matrix resident per native Linear call",
+               "state_dtype": "bfloat16" if diagnostic and diagnostic["arithmetic"] == "bf16" else "float32",
+               "arithmetic": arithmetic,
+               **({"arithmetic_diagnostic": diagnostic} if diagnostic else {}),
+               "skip_routed_experts": skip_routed,
+               "expert_storage": ("diagnostic: router+shared-experts; routed contribution zero; no routed weights loaded"
+                                  if skip_routed else "GPU packed cache; one F32 matrix resident per native Linear call"),
                "state_bytes_per_layer": sum(len(w["tokens"]) * config.hidden_size * 4 for w in windows),
                "windows": {w["id"]: hashlib.sha256(canonical(w["tokens"])).hexdigest() for w in windows}}
+    if forced_routes:
+        binding["qualification_routing"] = "eager IDs; adapted native weights; relative cutoff margin <=1e-5"
     state = LayerState(a._kimi_probe_state if checking else
                        a.out.parent / (a.out.name + "-layer-state"), binding,
                        diagnostic_prefix=stop)
@@ -319,21 +470,46 @@ def execute(a):
         print(f"resume after layer {state.latest['layer']}; {len(windows)} streams", flush=True)
         for index in range(state.latest["layer"] + 1, config.num_hidden_layers if stop is None else stop + 1):
             tick = time.monotonic()
-            layer = native_layer(reference, config, weights, index)
+            layer = native_layer(reference, config, weights, index,
+                                 max_length=max(len(window["tokens"]) for window in windows), skip_routed=skip_routed)
             pending = state.begin(index)
             short_outputs = {}
+            from contextlib import nullcontext
+            from shape_invariant import ForcedRouteQualification
+            routing = ForcedRouteQualification() if forced_routes and hasattr(layer, "block_sparse_moe") else None
+            gate = layer.block_sparse_moe.gate if routing else None
+            if gate and (gate.moe_router_activation_func != "sigmoid" or gate.num_expert_group != 1):
+                raise ValueError("Kimi forced routing requires ungrouped sigmoid gate")
+
+            def choices(logits):
+                return logits.sigmoid() + gate.e_score_correction_bias.unsqueeze(0)
+
+            def route_weights(logits, ids):
+                values = logits.sigmoid().gather(1, ids)
+                if gate.top_k > 1 and gate.moe_renormalize:
+                    values = values / (values.sum(dim=-1, keepdim=True) + 1e-20)
+                return values * gate.routed_scaling_factor
+
             for window in windows:
                 wid = window["id"]
                 hidden, blocks = state.load(wid, config.hidden_size)
                 original_blocks = blocks.shape[1]
                 if wid == "official_short":
                     mask = None if layer.is_linear_attn else official_mask(hidden)
-                    result, history = layer(hidden, attention_mask=mask, block_residual=blocks,
-                                            use_cache=False, output_attentions=False)
-                else:
-                    with geometry(reference):
-                        result, history = layer(hidden, attention_mask=None, block_residual=blocks,
+                    with routing.observe(gate, choices=choices) if routing else nullcontext():
+                        result, history = layer(hidden, attention_mask=mask, block_residual=blocks,
                                                 use_cache=False, output_attentions=False)
+                else:
+                    forced = routing and wid == "adapted_short"
+                    capture = (DiagnosticCapture(a.out / "capture", layer, index, diagnostic["capture_rows"])
+                               if diagnostic and diagnostic["capture_rows"] else None)
+                    with capture if capture else nullcontext():
+                        with geometry(reference):
+                            with routing.observe(gate, choices=choices, weights=route_weights) if forced else nullcontext():
+                                result, history = layer(hidden, attention_mask=None, block_residual=blocks,
+                                                        use_cache=False, output_attentions=False)
+                        if capture:
+                            capture.save("post-ffn", result)
                 append = index % config.attn_res_block_size == 0
                 if history.shape[1] != original_blocks + int(append):
                     raise ValueError("official block-residual count differs")
@@ -347,7 +523,13 @@ def execute(a):
                 difference = short_outputs["official_short"] - short_outputs["adapted_short"]
                 pending["checks"].append({"layer": index, "max_abs_hidden_difference": difference.abs().max().item(),
                                           "relative_hidden_l2": (difference.norm() /
-                                              short_outputs["official_short"].norm().clamp_min(1e-30)).item()})
+                                              short_outputs["official_short"].norm().clamp_min(1e-30)).item(),
+                                          **({"natural_routing": routing.report} if routing else {})})
+                if routing:
+                    atomic_json(a.out / "route-qualification.json", {
+                        "schema": "cuteafd.reference.forced-routes/1", "layers": pending["checks"],
+                        "forced_ids_only": True, "published_scoring": "unforced fixed-M128"})
+                    routing.require_valid()
             pending["native_fp32_parameters"] = sorted(set(pending["native_fp32_parameters"]) | weights.native_fp32)
             state.commit(pending)
             del layer
@@ -359,6 +541,9 @@ def execute(a):
             print(f"diagnostic only: retained layer {state.latest['layer']}; no scores or publication", flush=True)
             return
         state.require_scoring()
+        if diagnostic:
+            # Both arms use exactly the same F32 final residual mix, norm and head.
+            weights.dtype = torch.float32
         with torch.device("meta"):
             norm = reference.KimiRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
             output_norm = reference.KimiRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -373,6 +558,8 @@ def execute(a):
         for window in windows:
             wid = window["id"]
             hidden, blocks = state.load(wid, config.hidden_size)
+            if diagnostic:
+                hidden, blocks = hidden.float(), blocks.float()
             hidden = reference._apply_attn_res(hidden[0], blocks, output_proj, output_norm)[None]
             hidden = norm(hidden)
             start = window["score_from"]
@@ -390,9 +577,39 @@ def execute(a):
                 total_nll += F.cross_entropy(torch.from_numpy(logits).double(), targets, reduction="sum").item()
                 total_rows += len(logits)
             del hidden, blocks, selected, logits
+        if diagnostic:
+            write_arithmetic_reference(a.out, manifest, config, windows, entries)
+            shutil.copyfile(a.snapshot / "config.json", a.out / "checkpoint-config.json")
+            from fidelity_windows import collect_runtime_platform
+            platform = collect_runtime_platform()
+            atomic_json(a.out / "platform.json", platform)
+            atomic_json(a.out / "manifest.json", {
+                "schema": "cuteafd.kimi.arithmetic-diagnostic/1", "diagnostic_only": True,
+                "revision": a.snapshot.name, "checkpoint": manifest["checkpoint"],
+                "set_sha256": manifest["set_sha256"], "source_pin": pins, "snapshot_identity": snapshot,
+                "qualification_reference": False, "diagnostic": diagnostic,
+                "treatment": "router+shared-experts; routed contribution zero",
+                "checkpoint_config": json.loads((a.snapshot / "config.json").read_bytes()),
+                "checkpoint_config_sha256": digest(a.snapshot / "config.json"),
+                "binding": binding, "platform": platform, "platform_sha256": digest(a.out / "platform.json"),
+                "vocab": config.vocab_size, "windows": entries,
+                "nll": total_nll / total_rows, "scored_tokens": total_rows,
+                "reference_sha256": digest(a.out / "reference.json"),
+                "logits_sha256": {entry["id"]: digest(a.out / entry["path"] / "logits.bin") for entry in entries},
+                "captures": {str(path.relative_to(a.out)): digest(path)
+                             for path in sorted((a.out / "capture").glob("*/meta.json"))}})
+            print(f"arithmetic diagnostic {diagnostic['arithmetic']}: NLL {total_nll / total_rows:.12f}; "
+                  f"{total_rows} rows; NOT a qualification reference", flush=True)
+            return
         comparison = None
         if checking:
-            comparison = official_check(a.out, [short_logits["official_short"], short_logits["adapted_short"]], state.latest["checks"])
+            description = None
+            if is_k31:
+                description = ("K3.1 eager versus fixed-M128 arithmetic with teacher-forced eager expert IDs, "
+                               "candidate-native combine weights; natural choice flips/margins reported per layer; "
+                               "both DSA arms share the source-pinned adapter; published scoring remains unforced")
+            comparison = official_check(a.out, [short_logits["official_short"], short_logits["adapted_short"]],
+                                        state.latest["checks"], comparison=description)
         else:
             evidence = next(a.out.glob("prefix-gate-*/official-forward.json"), None)
             if evidence is None:
@@ -400,6 +617,12 @@ def execute(a):
             comparison = json.loads(evidence.read_bytes())
             shutil.copyfile(evidence, a.out / "official-forward.json")
         finish_golden(a.out, manifest, entries, snapshot_identity=snapshot, source_pin=pins,
+                      skip_routed_experts=skip_routed,
+                      diagnostic_only=skip_routed,
+                      **({"diagnostic_tier": "quick", "diagnostic_windows": list(QUICK_WINDOWS)}
+                         if skip_routed and not checking else {}),
+                      treatment=("router+shared-experts; routed contribution zero" if skip_routed else "full-model"),
+                      **({"source_identity_provider": "families.kimi_k3.k31"} if is_k31 else {}),
                       nll=total_nll / total_rows, scored_tokens=total_rows, seconds=time.monotonic() - started,
                       torch=torch.__version__, transformers=transformers.__version__, tokenizers=tokenizers.__version__,
                       attention="eager", mtp=False, use_cache=False, prefix_qualification=proof,
@@ -411,22 +634,108 @@ def execute(a):
                              "kda_a_log_zero_padding": weights.padding_provenance()},
                       official_forward=comparison, arithmetic=arithmetic,
                       expert_storage=binding["expert_storage"],
-                      root_arithmetic={"source": "official checkpoint Python decoder; exact E2M1/E8M0 group-32 MXFP4 decoded directly to F32",
-                          "arithmetic": "Reference computed entirely in F32 from the native checkpoint: exact group-32 MXFP4 to F32; shipped BF16/F32 dense tensors upcast to F32; F32 activations, block history, router, norms, KDA recurrence and eager attention; TF32 disabled in Torch and Triton, highest matmul precision; one expert matrix dequantized at a time from a per-layer packed GPU cache; fixed-M128 linears; MTP/cache off.\n\nCheckpoint-format note: the release zero-pads native KDA A_log from 96 active heads to 128. Each affected tensor is narrowed to the first 96 only after all 32 unused F32 values are verified bit-exact positive zero. Per-layer shapes and tail SHA256 checks are recorded in reference_provenance.gates.kda_a_log_zero_padding; all other tensor shapes remain strict."},
+                      root_arithmetic={"source": ("hash-checked official K3 decoder plus isolated K3.1 DSA adapter, cross-checked against pinned vLLM and SGLang; F32 indexer does not emulate serving E4M3/UE8M0 QDQ; original/fixed-row comparison shares the DSA adapter" if is_k31 else "official checkpoint Python decoder; exact E2M1/E8M0 group-32 MXFP4 decoded directly to F32"),
+                          "arithmetic": ("Diagnostic computed entirely in F32 from shipped BF16/F32 dense tensors; router and shared experts run, routed contribution is zero, and no routed payload is loaded; F32 activations, block history, norms, KDA recurrence and eager attention; TF32 disabled, fixed-M128 linears; MTP/cache off.\n\nCheckpoint-format note:" if skip_routed else "Reference computed entirely in F32 from the native checkpoint: exact group-32 MXFP4 to F32; shipped BF16/F32 dense tensors upcast to F32; F32 activations, block history, router, norms, KDA recurrence and eager attention; TF32 disabled in Torch and Triton, highest matmul precision; one expert matrix dequantized at a time from a per-layer packed GPU cache; fixed-M128 linears; MTP/cache off.\n\nCheckpoint-format note:") + " the release zero-pads native KDA A_log from 96 active heads to 128. Each affected tensor is narrowed to the first 96 only after all 32 unused F32 values are verified bit-exact positive zero. Per-layer shapes and tail SHA256 checks are recorded in reference_provenance.gates.kda_a_log_zero_padding; all other tensor shapes remain strict."},
                       platform={"capability": list(torch.cuda.get_device_capability()),
                                 "gpu": torch.cuda.get_device_name(), "cuda": torch.version.cuda})
+    if skip_routed and not checking:
+        write_skipped_reference(a.out, manifest, a.snapshot, config, pins, proof)
     print(f"reference NLL {total_nll / total_rows:.12f}; {total_rows} scored rows", flush=True)
+
+
+def write_arithmetic_reference(out, panel, config, windows, entries):
+    """Compact comparison operands; only the capture-specific consumer accepts these."""
+    import numpy as np
+    packed = []
+    for raw in windows:
+        entry = next(row for row in entries if row["id"] == raw["id"])
+        rows = np.memmap(out / entry["path"] / "logits.bin", dtype="<f4", mode="r",
+                         shape=(len(entry["positions"]), config.vocab_size))
+        positions = []
+        topk = min(1024, config.vocab_size - 1)
+        for pos, row in zip(entry["positions"], rows):
+            logits = np.asarray(row, dtype=np.float64)
+            lp = logits - np.logaddexp.reduce(logits)
+            ids = np.argsort(-lp, kind="stable")[:topk]
+            rest = np.ones(config.vocab_size, dtype=bool)
+            rest[ids] = False
+            positions.append(dict(pos=pos, next=raw["tokens"][pos], next_lp=float(lp[raw["tokens"][pos]]),
+                top=[dict(id=int(i), lp=float(lp[i])) for i in ids],
+                tail_lp=float(np.logaddexp.reduce(lp[rest]))))
+        packed.append({**raw, "top_k": topk, "positions": positions})
+    atomic_json(out / "reference.json", dict(name="Kimi arithmetic diagnostic ONLY",
+        schema="cuteafd.fidelity.reference/2", checkpoint=panel["checkpoint"],
+        models=[panel["checkpoint"]], vocab=config.vocab_size, set_sha256=panel["set_sha256"],
+        expect=dict(kl_max=0.03, top1_min=0.95),
+        quick_windows=[window["id"] for window in windows], windows=packed))
+
+
+def write_skipped_reference(out, panel, snapshot, config, pins, proof):
+    """Produce a locally hash-bound diagnostic, never a full-model publication."""
+    import numpy as np
+    from families.kimi_k3.k31 import SKIPPED_ROUTED_TREATMENT
+    from fidelity_windows import validate_qualification
+    meta = json.loads((out / "meta.json").read_bytes())
+    validate_qualification(proof, panel, meta["snapshot_identity"])
+    windows = []
+    for raw in execution_windows(panel, skip_routed=True):
+        entry = next(row for row in meta["windows"] if row["id"] == raw["id"])
+        rows = np.memmap(out / entry["path"] / "logits.bin", dtype="<f4", mode="r",
+                         shape=(len(entry["positions"]), config.vocab_size))
+        positions = []
+        for pos, row in zip(entry["positions"], rows):
+            logits = np.asarray(row, dtype=np.float64)
+            peak = logits.max()
+            lp = logits - (peak + np.log(np.exp(logits - peak).sum()))
+            ids = np.argsort(-lp, kind="stable")[:1024]
+            rest = np.ones(config.vocab_size, dtype=bool)
+            rest[ids] = False
+            tail = lp[rest]
+            tmax = tail.max()
+            positions.append(dict(pos=pos, next=raw["tokens"][pos], next_lp=float(lp[raw["tokens"][pos]]),
+                top=[dict(id=int(i), lp=float(lp[i])) for i in ids],
+                tail_lp=float(tmax + np.log(np.exp(tail - tmax).sum()))))
+        windows.append({**raw, "top_k": 1024, "positions": positions})
+    reference = dict(name="Kimi quick dense/attention/DSA diagnostic; routed experts skipped",
+        models=[panel["checkpoint"]], vocab=config.vocab_size, expect=dict(kl_max=0.03, top1_min=0.95),
+        schema="cuteafd.fidelity.reference/2", checkpoint=panel["checkpoint"],
+        set_sha256=panel["set_sha256"], quick_windows=list(QUICK_WINDOWS), windows=windows)
+    atomic_json(out / "reference.json", reference)
+    config_bytes = (snapshot / "config.json").read_bytes()
+    config_copy = out / "checkpoint-config.pending"
+    with config_copy.open("wb") as stream:
+        stream.write(config_bytes)
+        stream.flush()
+        os.fsync(stream.fileno())
+    config_copy.replace(out / "checkpoint-config.json")
+    sync_directory(out)
+    atomic_json(out / "manifest.json", dict(schema="cuteafd.kimi.skipped-routed/1",
+        config=panel["family"] + "-dense-attention-dsa-skipped-routed", revision=snapshot.name,
+        checkpoint=panel["checkpoint"], vocab=config.vocab_size, treatment=SKIPPED_ROUTED_TREATMENT,
+        diagnostic_only=True, tier="quick", windows=list(QUICK_WINDOWS),
+        checkpoint_config=json.loads(config_bytes),
+        checkpoint_config_sha256=hashlib.sha256(config_bytes).hexdigest(),
+        snapshot_identity=meta["snapshot_identity"], source_pin=pins, prefix_qualification=proof,
+        set_sha256=panel["set_sha256"], reference_sha256=digest(out / "reference.json")))
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     for name in ("snapshot", "windows", "out"):
         parser.add_argument("--" + name, type=Path, required=True)
+    parser.add_argument("--skip-routed-experts", action="store_true",
+                        help="quick sealed-eight diagnostic: router and shared expert, zero routed contribution; not full-model fidelity")
+    parser.add_argument("--diagnostic-window", help="skipped-only explicit window ID or comma-separated IDs; never qualification")
+    parser.add_argument("--diagnostic-arithmetic", choices=("f32", "bf16"),
+                        help="diagnostic decoder arithmetic; identical fixed-M128 geometry and F32 head")
+    parser.add_argument("--diagnostic-capture-rows", type=diagnostic_rows,
+                        help="retain 1..64 input rows after attention and FFN at every layer")
+    parser.add_argument("--check-only", action="store_true", help="CPU checkpoint source/header/shape validation; no golden or device allocation")
     parser.add_argument("--layers", type=int, default=None)
     parser.add_argument("--stop-after-layer", type=int, default=None,
                         help="diagnostic only: retain residual at this zero-based layer; never score or publish")
     parser.add_argument("--diagnose-layer", type=int, default=None,
-                        help="compare native/fixed sub-ops at layer 1 without running a golden")
+                        help="diagnostic only: layer 1 sub-ops, otherwise replay through this zero-based layer and stop at the first route flip")
     parser.add_argument("--diagnose-official-noise", action="store_true",
                         help="compare unmodified native batch 2 with retained batch-1 probe states")
     parser.add_argument("--diagnose-blas", choices=("cublas", "cublaslt"),
@@ -436,6 +745,7 @@ def main():
     parser.add_argument("--probe-state", type=Path,
                         help="saved probe state containing exact block000 short-stream embeddings")
     args = parser.parse_args()
+    diagnostic_options(args)
     if args.layers is not None:
         raise ValueError("partial layers cannot qualify a Kimi reference")
     if args.stop_after_layer is not None and (args.stop_after_layer < 0

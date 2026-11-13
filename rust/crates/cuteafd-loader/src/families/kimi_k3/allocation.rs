@@ -1,6 +1,6 @@
 //! CPU allocation layouts shared by Kimi checkpoint planning and native owners.
 use super::config::{KimiAttention, KimiK3Config};
-use crate::placement::{Demand, GraphSet, Lifetime};
+use crate::placement::{Demand, GraphRank, GraphSet, Lifetime};
 use crate::serving_capacity::Exl3Epilogue;
 use anyhow::{ensure, Context, Result};
 use cuteafd_core::memory_layout::{Basis, Category};
@@ -77,6 +77,49 @@ pub const ATTENTION_METADATA: [&str; 6] = ["KDA slots", "KDA first", "MLA slots"
 /// Consumed entirely on the lane stream inside route/latent_up. Neither peer
 /// exchange nor a pending Spark wave retains these intermediates.
 pub const HOOK_SCRATCH: [&str; 3] = ["router logits", "latent input", "latent normalized"];
+/// Index metadata survives every layer of its unit, including independently
+/// addressed full-history index pages when MLA uses compact Context pages.
+pub const DSA_METADATA: [&str; 6] = ["DSA positions", "DSA slots", "DSA page table",
+    "DSA lengths", "DSA query offsets", "DSA selected lengths"];
+/// Unit-local index temporaries are not lane row planes. Keep their backing
+/// distinct from projected-core scratch until all index and attention readers end.
+pub const DSA_SCRATCH: [&str; 6] = ["DSA query", "DSA head weights", "DSA indices", "DSA scores",
+    "DSA producer scratch", "DSA selector scratch"];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DsaScratch {
+    pub producer: usize,
+    pub selector: usize,
+}
+
+impl DsaScratch {
+    pub fn from_manifest(manifest: &serde_json::Value) -> Result<Self> {
+        let mut required = Self { producer: 0, selector: 0 };
+        for rows in [64, 4096] {
+            required.producer = required.producer.max(program_scratch(manifest,
+                &format!("kimik31_index_producer_m{rows}"), rows)?);
+            let mode = if rows == 64 { "decode" } else { "prefill" };
+            for stem in ["index_topk", "scored_index_topk"] {
+                required.selector = required.selector.max(program_scratch(manifest,
+                    &format!("kimik31_{stem}_{mode}_m{rows}"), rows)?);
+            }
+        }
+        ensure!(required.producer > 0 && required.selector > 0, "Kimi DSA scratch must be declared");
+        Ok(required)
+    }
+}
+
+fn program_scratch(manifest: &serde_json::Value, name: &str, rows: usize) -> Result<usize> {
+    let entries = manifest["programs"].as_array().context("Kimi program inventory missing")?;
+    let mut found = entries.iter().filter(|entry| entry["name"] == name);
+    let entry = found.next().with_context(|| format!("Kimi missing {name} scratch inventory"))?;
+    ensure!(found.next().is_none(), "Kimi duplicate {name} scratch inventory");
+    ensure!(entry["capacity_rows"].as_u64() == Some(rows as u64), "Kimi {name} scratch capacity differs");
+    let scratch = entry["scratch_bytes_at_capacity"].as_object().context("Kimi scratch inventory missing")?;
+    ensure!(scratch.len() == 1, "Kimi {name} scratch inventory has undeclared owners");
+    usize::try_from(scratch.get("scratch").and_then(serde_json::Value::as_u64).context("Kimi scratch byte extent missing")?)
+        .context("Kimi scratch byte extent overflow")
+}
 
 impl NativeLaneLayout {
     fn metadata_banks_for(rows: usize, unit: usize) -> usize {
@@ -88,7 +131,7 @@ impl NativeLaneLayout {
 
     /// Each bank has the decode-capable extent; unit tails can be <=64 rows.
     pub fn metadata_extent(&self, name: &str, bank: usize) -> Result<(usize, usize)> {
-        ensure!(ATTENTION_METADATA.contains(&name) && bank < self.metadata_banks(),
+        ensure!((ATTENTION_METADATA.contains(&name) || DSA_METADATA.contains(&name)) && bank < self.metadata_banks(),
             "Kimi attention metadata bank outside admission");
         let bytes = self.operands.get(name).context("Kimi metadata plane absent")?;
         ensure!(bytes % self.metadata_banks() == 0, "Kimi metadata bank stride");
@@ -175,11 +218,38 @@ impl NativeLaneLayout {
         Ok(layout)
     }
 
+    /// Add exact index owners without changing any existing BF16 or core phase
+    /// offsets. Context candidate exchange/partial owners are admitted separately.
+    pub fn with_dsa(mut self, cfg: &KimiK3Config, scratch: DsaScratch) -> Result<Self> {
+        ensure!(cfg.dsa.is_some_and(|index| (index.heads, index.head_dim, index.topk) == (32, 128, 2048)),
+            "Kimi DSA lane requires the native 32x128/top2048 indexer");
+        ensure!(scratch.producer > 0 && scratch.selector > 0, "Kimi DSA scratch missing");
+        let rows = self.unit;
+        let requests = rows.min(64);
+        for (name, bytes) in [("DSA query", rows * 4096), ("DSA head weights", rows * 32 * 4),
+            ("DSA indices", rows * 2048 * 4), ("DSA scores", rows * 2048 * 4),
+            ("DSA producer scratch", scratch.producer),
+            ("DSA selector scratch", scratch.selector)] {
+            ensure!(self.operands.insert(name, bytes).is_none(), "duplicate Kimi DSA scratch owner {name}");
+        }
+        for (name, bytes) in [("DSA positions", rows * 8), ("DSA slots", rows * 8),
+            ("DSA page table", requests * self.max_context.div_ceil(64) * 4),
+            ("DSA lengths", rows * 4), ("DSA query offsets", (rows + 1) * 4),
+            ("DSA selected lengths", rows * 4)] {
+            let stride = bytes.checked_add(15).context("Kimi DSA metadata alignment overflow")? / 16 * 16;
+            let bytes = stride.checked_mul(self.metadata_banks()).context("Kimi DSA metadata banks overflow")?;
+            ensure!(self.operands.insert(name, bytes).is_none(), "duplicate Kimi DSA metadata owner {name}");
+        }
+        self.bytes()?;
+        Ok(self)
+    }
+
     /// Preserve every BF16 offset. Place transient K6 operands into holes whose
     /// previous reader has completed on the same lane stream. Peer meet outputs
     /// remain separate allocations because the exchange stream reads them.
     pub fn with_core_stages(mut self, stages: BTreeMap<&'static str, usize>) -> Result<Self> {
-        let mut transient = stages.iter().filter(|(name, _)| !CORE_MEET_PLANES.contains(name))
+        let mut transient = stages.iter().filter(|(name, _)| !CORE_MEET_PLANES.contains(name)
+            && !matches!(**name, "native attention F32 partial" | "native attention FP8 scratch"))
             .map(|(&name, &bytes)| (name, bytes)).collect::<Vec<_>>();
         transient.sort_by_key(|&(name, bytes)| (std::cmp::Reverse(bytes), name));
         ensure!(stages.keys().all(|name| !self.operands.contains_key(name)), "duplicate Kimi core arena operand");
@@ -232,6 +302,26 @@ impl NativeLaneLayout {
 }
 
 impl NativeScratch {
+    pub fn from_manifest_for_config(manifest: &serde_json::Value, cfg: &KimiK3Config,
+        ranks: usize) -> Result<Self> {
+        if cfg.dsa.is_none() { return Self::from_manifest_for_ranks(manifest, ranks); }
+        ensure!(matches!(ranks, 1 | 2), "Kimi native scratch physical rank count");
+        let mut mla = Vec::new();
+        for rows in [64, 4096] { for suffix in ["", "_h96"] { for cache in ["", "_fp8"] {
+            let output = program_scratch(manifest, &format!("kimik31_mla_output{suffix}_m{rows}"), rows)?;
+            let producer = program_scratch(manifest, &format!("kimik31_mla_producer{suffix}{cache}_m{rows}"), rows)?;
+            mla.push([producer, program_scratch(manifest,
+                &format!("kimik31_sparse_mla{suffix}{cache}_m{rows}"), rows)?, output]);
+            if suffix == "_h96" { for begin in [0, 48] {
+                mla.push([producer, program_scratch(manifest,
+                    &format!("kimik31_sparse_mla_partial{cache}_h{begin}_m{rows}"), rows)?, output]);
+            }}
+        }}}
+        let prefix = if ranks == 1 { "kda_fused_h96" } else { "kimik31_kda" };
+        Self::combine([program_scratch(manifest, &format!("{prefix}_m64"), 64)?,
+            program_scratch(manifest, &format!("{prefix}_m4096"), 4096)?], mla)
+    }
+
     pub fn from_manifest(manifest: &serde_json::Value) -> Result<Self> {
         Self::from_manifest_for_ranks(manifest, 2)
     }
@@ -258,21 +348,48 @@ impl NativeScratch {
     }
 }
 
-pub const GRAPH_RESERVE: &str = "Kimi startup graph reserve";
+pub const GRAPH_RESERVE: &str = "graph reserve";
+/// Header-only plans calibrate the CUDA context and loaded modules as one
+/// Estimated owner; the runtime replaces it with the measured post-module
+/// baseline under `CONTEXT_MEASURED`. Neither is a single driver request.
+pub const CONTEXT_ESTIMATE: &str = "CUDA context (estimated)";
+pub const CONTEXT_MEASURED: &str = "CUDA context and loaded modules";
+/// Measured SM120 startup capture for the Kimi K3 HQA min config on one
+/// coordinator GPU (2026-11-09 census): 530,579,456 B over 3,961 executables.
+/// The estimate scales that observation by executable count with no padding;
+/// the synchronized capture at Ready is the exact owner.
+pub const GRAPH_CENSUS_BYTES: u64 = 530_579_456;
+pub const GRAPH_CENSUS_EXECUTABLES: u64 = 3_961;
+/// The same capture on two coordinator GPUs (2026-11-09 2x census), as
+/// `(bytes, executables)` per rank. A rank's kernels differ from the other
+/// rank's, so each rank keeps its own observation; one shared ratio would
+/// under-reserve the higher rank.
+pub const GRAPH_CENSUS_TP2: [(u64, u64); 2] = [(761_266_176, 5_367), (763_363_328, 5_377)];
+
+/// The measured `(bytes, executables)` startup capture for `rank` of a
+/// `ranks`-GPU coordinator layout.
+pub fn graph_census(ranks: usize, rank: usize) -> (u64, u64) {
+    match (ranks, rank) {
+        (2, 0) => GRAPH_CENSUS_TP2[0],
+        (2, _) => GRAPH_CENSUS_TP2[1],
+        _ => (GRAPH_CENSUS_BYTES, GRAPH_CENSUS_EXECUTABLES),
+    }
+}
 pub const GRAPH_ROWS: [usize; 5] = [1, 4, 16, 64, 4096];
 
-/// Speculative verify rows replay at their exact width (no padding: every
-/// row writes KDA replay records and MLA cache slots). `verify` is the
-/// drafter's block (anchor + drafts), 0 without speculation.
-pub fn verify_graph_rows(verify: usize, capacity: usize) -> std::ops::RangeInclusive<usize> {
-    2..=verify.min(64).min(capacity)
+/// Speculative verify rows replay at their exact flattened batch width (no
+/// padding: every row writes KDA replay records and MLA cache slots). Each of
+/// `slots` requests can supply `verify` rows, capped by the native 64-row step.
+/// Zero disables speculation; one slot retains the diagnostic verify widths.
+pub fn verify_graph_rows(verify: usize, slots: usize, capacity: usize) -> std::ops::RangeInclusive<usize> {
+    2..=verify.saturating_mul(slots).min(64).min(capacity)
 }
 
 /// Every captured row count: the plain buckets plus each exact verify width.
-/// Plain attention (and multi-sequence KDA) keys stay on the plain buckets; the
-/// added widths capture speculative single-sequence attention, residual and FFN.
+/// Plain attention stays on the plain buckets; the added widths capture
+/// speculative attention and FFN sections. Residuals have no standalone keys.
 pub fn graph_rows(verify: usize, capacity: usize) -> Vec<usize> {
-    let mut rows = GRAPH_ROWS.into_iter().chain(verify_graph_rows(verify, capacity))
+    let mut rows = GRAPH_ROWS.into_iter().chain(verify_graph_rows(verify, 1, capacity))
         .filter(|&r| r <= capacity).collect::<Vec<_>>();
     rows.sort_unstable();
     rows.dedup();
@@ -286,26 +403,48 @@ pub fn graphs(cfg: &KimiK3Config, lanes: usize, capacity: usize, slots: usize, v
 
 pub fn graphs_for_ranks(cfg: &KimiK3Config, lanes: usize, capacity: usize, slots: usize, verify: usize,
     ranks: usize, resident: impl Fn(usize, usize) -> bool) -> Result<GraphSet> {
+    graphs_with_context(cfg, lanes, capacity, slots, verify, ranks, resident, |_| false, None)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn graphs_with_context(cfg: &KimiK3Config, lanes: usize, capacity: usize, slots: usize, verify: usize,
+    ranks: usize, resident: impl Fn(usize, usize) -> bool, context: impl Fn(usize) -> bool,
+    decode: Option<&super::context::DecodeBuckets>) -> Result<GraphSet> {
     ensure!(matches!(ranks, 1 | 2) && (1..=2).contains(&lanes) && (1..=UNIT_ROWS_MAX).contains(&capacity)
         && (1..=cuteafd_core::concurrency::state_slots(cuteafd_core::concurrency::MAX_CONCURRENCY) as usize).contains(&slots) && verify <= 64, "Kimi graph geometry");
+    ensure!((0..cfg.layers).all(|layer| !context(layer)
+        || (ranks == 2 && cfg.attention[layer] == KimiAttention::Mla && (0..2).all(|rank| resident(rank, layer)))),
+        "Kimi context graph residency differs from two-rank MLA");
+    ensure!(!(0..cfg.layers).any(&context) || decode.is_some(),
+        "Kimi context graph inventory needs package-derived decode buckets");
     let mut counts = vec![0; ranks];
     for (rank, count) in counts.iter_mut().enumerate() {
         for rows in graph_rows(verify, capacity) {
-            *count += (3 * cfg.layers + usize::from(rank == ranks - 1)) as u64;
+            *count += cfg.layers as u64;
             for layer in 0..cfg.layers {
-                if resident(rank, layer) {
+                if resident(rank, layer) && !context(layer) {
                     if GRAPH_ROWS.contains(&rows) {
-                        *count += 1 + u64::from(cfg.attention[layer] == KimiAttention::Kda
-                            && (2..=slots).contains(&rows));
+                        *count += 1;
                     }
-                    *count += u64::from(verify_graph_rows(verify, capacity).contains(&rows));
+                    if verify_graph_rows(verify, 1, capacity).contains(&rows) { *count += 1; }
                 }
+            }
+        }
+        if let Some(decode) = decode {
+            for rows in decode.graph_rows(verify, slots, capacity) {
+                let variants = u64::from(decode.plain().contains(&rows))
+                    + u64::from(verify_graph_rows(verify, slots, capacity).contains(&rows));
+                *count += (0..cfg.layers).filter(|&layer| context(layer) && resident(rank, layer)).count() as u64
+                    * variants;
             }
         }
         *count *= lanes as u64;
     }
-    Ok(GraphSet::new(&counts, 256 << 10, 10, 64 << 20,
-        counts.iter().sum(), Lifetime::Startup))
+    let inventory = counts.iter().enumerate().map(|(rank, &count)| {
+        let (observed_bytes, observed_executables) = graph_census(ranks, rank);
+        GraphRank::estimate(count, observed_bytes, observed_executables).map_err(|error| anyhow::anyhow!(error))
+    }).collect::<Result<Vec<_>>>()?;
+    Ok(GraphSet { ranks: inventory, lifetime: Lifetime::Startup, shapes: counts.iter().sum() })
 }
 
 pub fn graph_demand(set: &GraphSet, rank: usize) -> Demand {
@@ -313,6 +452,19 @@ pub fn graph_demand(set: &GraphSet, rank: usize) -> Demand {
     demand.group = GRAPH_RESERVE.into();
     demand.basis = Basis::Estimated;
     demand
+}
+
+/// The configured graph arena, one Demand per physical rank. Admission owns
+/// the whole reserve before KV sizing; the bounded device cache grows into it
+/// lazily and evicts, rather than re-planning memory, when it is full.
+pub fn graph_reserve_demands(core: crate::serving_capacity::kimi_prewarm::KimiCoreFormat, ranks: usize) -> anyhow::Result<Vec<Demand>> {
+    (0..ranks).map(|rank| {
+        let (base, extra) = crate::placement::graph_reserve::kimi_default(core, ranks, rank);
+        let reserve = crate::placement::graph_reserve::current(rank, false, base, extra)?;
+        tracing::info!(rank, reserve = reserve.bytes, source = %reserve.source,
+            "Kimi GPU_GRAPH_RESERVE");
+        Ok(Demand::new(rank as u8, Category::Runtime, GRAPH_RESERVE, reserve.bytes, Basis::Estimated))
+    }).collect()
 }
 
 pub fn kda_demands(cfg: &KimiK3Config, slots: usize, marks: usize, lanes: usize,
@@ -344,9 +496,15 @@ pub fn io_extents(vocab: usize, rank: usize, rows: usize, core_head: bool) -> [u
 
 pub fn io_extents_for_ranks(vocab: usize, rank: usize, rows: usize, core_head: bool,
     ranks: usize) -> Result<[usize; 3]> {
+    io_extents_with_logits(vocab, rank, rows, rows.min(64), core_head, ranks)
+}
+
+pub fn io_extents_with_logits(vocab: usize, rank: usize, rows: usize, logit_rows: usize,
+    core_head: bool, ranks: usize) -> Result<[usize; 3]> {
     ensure!(matches!(ranks, 1 | 2) && rank < ranks, "Kimi token IO physical rank count");
+    ensure!((1..=rows).contains(&logit_rows), "Kimi token IO logit rows exceed lane");
     Ok([if rank == 0 { rows * 4 } else { 0 },
-        if rank == ranks - 1 { rows.min(64) * vocab * 4 } else { 0 },
+        if rank == ranks - 1 { logit_rows * vocab * 4 } else { 0 },
         if rank == ranks - 1 && !core_head { 4 << 20 } else { 0 }])
 }
 
@@ -384,17 +542,11 @@ pub fn exchange_demand(rows: usize, rank: u8, progress: usize) -> Result<Demand>
     Ok(Demand::new(rank, Category::Workspace, "Kimi peer/abort/hop controls", bytes as u64, Basis::Exact))
 }
 
-pub fn code_demand(rank: usize, pending: u64, cublas_bytes: u64, lanes: usize) -> Result<Demand> {
-    code_demand_for_ranks(rank, pending, cublas_bytes, lanes, 2)
-}
+pub const CODE_OWNER: &str = "Kimi selected-program loaded code";
 
-pub fn code_demand_for_ranks(rank: usize, pending: u64, cublas_bytes: u64, lanes: usize,
-    ranks: usize) -> Result<Demand> {
-    ensure!(matches!(ranks, 1 | 2) && rank < ranks && (1..=2).contains(&lanes),
-        "Kimi code allowance physical rank/lane geometry");
-    let bytes = pending.checked_add(if rank == ranks - 1 { lanes as u64 * cublas_bytes } else { 0 })
-        .context("Kimi future code/handle allowance overflow")?;
-    Ok(Demand::new(rank as u8, Category::Workspace, "Kimi future loaded code and private head handles", bytes, Basis::Formula))
+pub fn code_demand(rank: usize, pending: u64, ranks: usize) -> Result<Demand> {
+    ensure!(matches!(ranks, 1 | 2) && rank < ranks, "Kimi code physical rank geometry");
+    Ok(Demand::new(rank as u8, Category::Runtime, CODE_OWNER, pending, Basis::Estimated))
 }
 
 /// Exact FirstCapacity owner, using the shared EXL3 capacity arenas.
@@ -455,22 +607,30 @@ pub fn baseline_demands_for_ranks(cfg: &KimiK3Config, manifest: &serde_json::Val
     let shape = shape.validate()?;
     let unit = usize::try_from(shape.unit_rows)?;
     prefill_shape_with(rows, usize::try_from(shape.waves)?, Some(unit))?;
-    let layout = NativeLaneLayout::for_ranks(cfg, rows, unit, context,
-        NativeScratch::from_manifest_for_ranks(manifest, physical_ranks)?, physical_ranks)?;
+    let mut layout = NativeLaneLayout::for_ranks(cfg, rows, unit, context,
+        NativeScratch::from_manifest_for_config(manifest, cfg, physical_ranks)?, physical_ranks)?;
+    if cfg.dsa.is_some() { layout = layout.with_dsa(cfg, DsaScratch::from_manifest(manifest)?)?; }
     let owners = crate::placement::attention::alternating_owners(
         cfg.attention.iter().map(|kind| (*kind == KimiAttention::Mla, None)), 0)?;
-    let graphs = graphs_for_ranks(cfg, 1, unit, slots, verify, physical_ranks,
+    // Enumerate and validate every capturable key; memory is the configured
+    // arena below, not this census row.
+    graphs_for_ranks(cfg, 1, unit, slots, verify, physical_ranks,
         |rank, layer| physical_ranks == 1 || cfg.attention[layer] == KimiAttention::Kda
             || heads || rank == usize::from(owners[layer]))?;
     let mut demands = vec![spark_demand_on(shape, 0, spark_ranks, (physical_ranks - 1) as u8, format)?];
+    demands.extend(graph_reserve_demands(crate::serving_capacity::kimi_prewarm::KimiCoreFormat::from_inventory(core), physical_ranks)?);
     for rank in 0..physical_ranks {
         demands.push(Demand::new(rank as u8, Category::Workspace, "Kimi lane 0 native operands",
             layout.bytes()? as u64, Basis::Exact));
         demands.push(Demand::new(rank as u8, Category::Workspace, "Kimi lane 0 token IO",
             io_extents_for_ranks(cfg.vocab_size, rank, rows, core.get_weight("language_model.lm_head").is_some(), physical_ranks)?
                 .into_iter().sum::<usize>() as u64, Basis::Exact));
-        demands.push(graph_demand(&graphs, rank));
-        if physical_ranks == 2 { demands.push(exchange_demand(unit, rank as u8, 0)?); }
+        if physical_ranks == 2 {
+            demands.push(exchange_demand(unit, rank as u8, 0)?);
+            if core.native_attention_split(physical_ranks) {
+                demands.push(core.native_attention_receive_demand(unit, rank as u8, physical_ranks)?);
+            }
+        }
         // Active state and retained marks are charged by the caller's mark policy.
         demands.extend(kda_demands_for_heads(cfg.kda_layers(), slots, 1, 1, rank as u8,
             cfg.kda_heads / physical_ranks)?.into_iter()
@@ -485,6 +645,85 @@ mod tests {
 
     fn cfg() -> KimiK3Config {
         KimiK3Config::from_hf(&crate::plan::testing::kimi_k3_config()).unwrap()
+    }
+
+    fn k31_manifest() -> serde_json::Value {
+        let mut programs = Vec::new();
+        let mut add = |name: String, rows, bytes| programs.push(serde_json::json!({
+            "name": name, "capacity_rows": rows, "scratch_bytes_at_capacity": {"scratch": bytes}}));
+        for rows in [64, 4096] {
+            for name in ["kimik31_kda", "kda_fused_h96"] { add(format!("{name}_m{rows}"), rows, rows); }
+            add(format!("kimik31_index_producer_m{rows}"), rows, rows * 8512);
+            let mode = if rows == 64 { "decode" } else { "prefill" };
+            for (stem, bytes) in [("index_topk", rows * 128), ("scored_index_topk", rows * 256)] {
+                add(format!("kimik31_{stem}_{mode}_m{rows}"), rows, bytes);
+            }
+            for suffix in ["", "_h96"] {
+                add(format!("kimik31_mla_output{suffix}_m{rows}"), rows, rows * 1024);
+                for cache in ["", "_fp8"] {
+                    add(format!("kimik31_mla_producer{suffix}{cache}_m{rows}"), rows, rows * 2048);
+                    add(format!("kimik31_sparse_mla{suffix}{cache}_m{rows}"), rows, rows * 4096);
+                    if suffix == "_h96" { for begin in [0, 48] {
+                        add(format!("kimik31_sparse_mla_partial{cache}_h{begin}_m{rows}"), rows, rows * 3072);
+                    }}
+                }
+            }
+        }
+        serde_json::json!({"programs": programs})
+    }
+
+    #[test]
+    fn k31_scratch_uses_selected_manifests_not_k3_dense_fallback() -> Result<()> {
+        let mut cfg = cfg();
+        cfg.dsa = Some(super::super::config::KimiDsaConfig { heads: 32, head_dim: 128, topk: 2048 });
+        let manifest = k31_manifest();
+        for ranks in [1, 2] {
+            let scratch = NativeScratch::from_manifest_for_config(&manifest, &cfg, ranks)?;
+            assert_eq!(scratch, NativeScratch { kda: 4096, mla: [4096 * 2048, 4096 * 4096, 4096 * 1024] });
+        }
+        assert_eq!(DsaScratch::from_manifest(&manifest)?, DsaScratch { producer: 4096 * 8512, selector: 4096 * 256 });
+        assert!(NativeScratch::from_manifest_for_ranks(&manifest, 2).is_err());
+        for index in 0..manifest["programs"].as_array().unwrap().len() {
+            let mut missing = manifest.clone(); missing["programs"].as_array_mut().unwrap().remove(index);
+            assert!(NativeScratch::from_manifest_for_config(&missing, &cfg, 1).is_err()
+                || NativeScratch::from_manifest_for_config(&missing, &cfg, 2).is_err()
+                || DsaScratch::from_manifest(&missing).is_err(), "missing program {index}");
+        }
+        for bad in [serde_json::json!({}), serde_json::json!({"extra":16}), serde_json::json!({"scratch":"4096"})] {
+            let mut wrong = manifest.clone(); wrong["programs"][2]["scratch_bytes_at_capacity"] = bad;
+            assert!(DsaScratch::from_manifest(&wrong).is_err());
+        }
+        let mut duplicate = manifest.clone();
+        duplicate["programs"].as_array_mut().unwrap().push(manifest["programs"][2].clone());
+        assert!(DsaScratch::from_manifest(&duplicate).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn k31_index_lane_owners_preserve_phase_offsets_and_bank_causal_frontiers() -> Result<()> {
+        let mut cfg = cfg();
+        cfg.dsa = Some(super::super::config::KimiDsaConfig { heads: 32, head_dim: 128, topk: 2048 });
+        let manifest = k31_manifest();
+        let scratch = NativeScratch::from_manifest_for_config(&manifest, &cfg, 2)?;
+        let index = DsaScratch::from_manifest(&manifest)?;
+        for unit in [64, 2752, 4096] {
+            let base = NativeLaneLayout::new(&cfg, unit * 2, unit, 1_048_576, scratch)?;
+            let lane = base.clone().with_dsa(&cfg, index)?;
+            assert_eq!(lane.arena_offsets, base.arena_offsets);
+            assert_eq!(lane.arena_bytes, base.arena_bytes);
+            assert_eq!(lane.operands["DSA indices"], unit * 2048 * 4);
+            for name in DSA_METADATA {
+                let (first, stride) = lane.metadata_extent(name, 0)?;
+                assert_eq!(first, 0);
+                assert_eq!(stride % 16, 0);
+                assert_eq!(lane.metadata_extent(name, 1)?, (stride, stride));
+            }
+            assert_eq!(lane.metadata_extent("DSA lengths", 0)?.1, unit * 4);
+            let extra = DSA_METADATA.into_iter().chain(DSA_SCRATCH).map(|name| lane.operands[name]).sum::<usize>();
+            assert_eq!(lane.bytes()? - base.bytes()?, extra);
+            assert!(lane.with_dsa(&cfg, index).is_err());
+        }
+        Ok(())
     }
 
     #[test]
@@ -524,6 +763,24 @@ mod tests {
     }
 
     #[test]
+    fn startup_graph_census_keeps_a_separate_observation_per_rank() -> Result<()> {
+        assert_eq!(graph_census(1, 0), (GRAPH_CENSUS_BYTES, GRAPH_CENSUS_EXECUTABLES));
+        assert_eq!(graph_census(2, 0), GRAPH_CENSUS_TP2[0]);
+        assert_eq!(graph_census(2, 1), GRAPH_CENSUS_TP2[1]);
+        // The first 2x launch scaled the 1x ratio by both ranks' executable
+        // count and under-reserved rank 0 by 5.9%; each rank now keeps its own.
+        let (bytes, executions) = graph_census(2, 0);
+        let shared = GraphRank::estimate(executions, GRAPH_CENSUS_BYTES, GRAPH_CENSUS_EXECUTABLES)
+            .map_err(|error| anyhow::anyhow!(error))?;
+        let observed = GraphRank::estimate(executions, bytes, executions)
+            .map_err(|error| anyhow::anyhow!(error))?;
+        assert!(shared.bytes < bytes, "shared ratio under-reserves the lead rank");
+        assert_eq!(observed.bytes, bytes);
+        assert_eq!(observed.basis, Basis::Estimated);
+        Ok(())
+    }
+
+    #[test]
     fn single_owner_baseline_charges_full_state_io_and_no_peer_controls() -> Result<()> {
         let cfg = cfg();
         let mut programs = Vec::new();
@@ -558,10 +815,10 @@ mod tests {
         let lane = NativeLaneLayout::for_ranks(&cfg, 8256, 2752, 262144,
             NativeScratch::from_manifest_for_ranks(&manifest, 1)?, 1)?;
         assert_eq!(bytes(&single, "Kimi lane 0 native operands"), lane.bytes()? as u64);
-        assert_eq!(code_demand_for_ranks(0, 100, 200, 2, 1)?.bytes, 500);
-        assert_eq!(code_demand(0, 100, 200, 2)?.bytes, 100);
-        assert_eq!(code_demand(1, 100, 200, 2)?.bytes, 500);
-        assert!(code_demand_for_ranks(1, 0, 0, 1, 1).is_err());
+        assert_eq!(code_demand(0, 100, 1)?.bytes, 100);
+        assert_eq!(code_demand(0, 100, 2)?.basis, Basis::Estimated);
+        assert_eq!(code_demand(1, 100, 2)?.bytes, 100);
+        assert!(code_demand(1, 0, 1).is_err());
         assert!(baseline_demands_for_ranks(&cfg, &manifest, 8256, shape, 262144, 16, 8,
             &core, false, 6, 0, cuteafd_core::SparkReplyFormat::Bf16).is_err());
         Ok(())

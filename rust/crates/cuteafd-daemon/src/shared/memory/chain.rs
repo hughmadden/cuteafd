@@ -504,6 +504,19 @@ pub(crate) async unsafe fn finish_cooperative(stream: &LoadStream<'_>) -> Result
     }
 }
 
+/// Complete an issued stage either on the chain or at its existing host wait.
+/// # Safety
+/// Same as [`finish`]; the caller retains all stage storage through completion.
+#[inline(always)]
+pub(crate) async unsafe fn finish_or_wait(stream: &LoadStream<'_>, chain_only: bool) -> Result<()> {
+    if chain_only {
+        // SAFETY: forwarded from this function's contract.
+        unsafe { finish(stream.library, stream.raw) }
+    } else {
+        stream.wait().await
+    }
+}
+
 /// The device whose event is the chain head (None outside a scope or before
 /// any stage finished).
 pub(crate) fn head_device() -> Option<i32> {
@@ -619,7 +632,7 @@ mod tests {
             std::fs::write(std::env::var("CUTEAFD_FATAL_CHAIN_EVIDENCE")?,
                 fixture.directory().join("events").to_str().unwrap())?;
             let library = fixture.load()?;
-            let allocation = Allocation::new(Device { library: &library, id: 0 }, 256)?;
+            let allocation = Allocation::new(Device { library: &library, id: 0 }, 256, crate::shared::memory::TEST)?;
             fixture.configure_pack(&library, 0, 1)?;
             if path == "fence" { fixture.configure_drain_after(&library, 1)?; }
             let chain = StageChain {
@@ -692,11 +705,11 @@ mod tests {
         // allocation, stream and chain until their destruction.
         let library = unsafe { NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?)? };
         library.cuda_set_device(0)?;
-        let mut staging = HostAllocation::new(&library, BYTES)?;
-        let mut landing = device_ids.iter().map(|_| HostAllocation::new(&library, BYTES))
+        let mut staging = HostAllocation::new(&library, BYTES, crate::shared::memory::TEST)?;
+        let mut landing = device_ids.iter().map(|_| HostAllocation::new(&library, BYTES, crate::shared::memory::TEST))
             .collect::<Result<Vec<_>>>()?;
         let devices = device_ids.iter().map(|&id| Device { library: &library, id }).collect::<Vec<_>>();
-        let output = devices.iter().map(|&device| Allocation::new(device, BYTES)).collect::<Result<Vec<_>>>()?;
+        let output = devices.iter().map(|&device| Allocation::new(device, BYTES, crate::shared::memory::TEST)).collect::<Result<Vec<_>>>()?;
         let streams = devices.iter().map(|&device| Stream::new(device)).collect::<Result<Vec<_>>>()?;
         let chain = StageChain::on_devices(&library, device_ids)?;
         let mut context = Context::from_waker(Waker::noop());
@@ -800,9 +813,9 @@ mod tests {
         let library = unsafe { NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?)? };
         library.cuda_set_device(0)?;
         let device = Device { library: &library, id: 0 };
-        let mut source = HostAllocation::new(&library, 4096)?;
-        let target = Allocation::new(device, 4096)?;
-        let output = HostAllocation::new(&library, 4096)?;
+        let mut source = HostAllocation::new(&library, 4096, crate::shared::memory::TEST)?;
+        let target = Allocation::new(device, 4096, crate::shared::memory::TEST)?;
+        let output = HostAllocation::new(&library, 4096, crate::shared::memory::TEST)?;
         let stream = Stream::new(device)?;
         let chain = StageChain::new(&library)?;
         source.bytes_mut().fill(81);

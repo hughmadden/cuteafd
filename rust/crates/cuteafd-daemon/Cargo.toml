@@ -14,6 +14,9 @@ path = "src/main.rs"
 # allocator so the coordinator's host heap can be measured with jemalloc's
 # stats.  Off by default; the default build keeps glibc + malloc_tune.
 jemalloc = ["dep:tikv-jemallocator", "dep:tikv-jemalloc-ctl"]
+# Test-only request-local fault hooks (#1817, src/shared/fault.rs) for WIP
+# hardware checks via CUTEAFD_WIP_CARGO_FEATURES; release builds refuse dev-*.
+dev-fault-hooks = []
 
 [dependencies]
 anyhow.workspace = true
@@ -44,6 +47,9 @@ tikv-jemalloc-ctl = { version = "0.6.1", optional = true, features = ["stats", "
 tikv-jemallocator = { version = "0.6.1", optional = true, features = ["stats"] }
 
 [dev-dependencies]
+async-stream.workspace = true
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
+cuteafd-bench = { path = "../cuteafd-bench", features = ["test-support"] }
 cuteafd-loader = { path = "../cuteafd-loader", features = ["test-support"] }
 cuteafd-ffi = { path = "../cuteafd-ffi", features = ["test-support"] }
 tempfile.workspace = true

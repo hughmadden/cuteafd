@@ -3,7 +3,7 @@
 use super::{device::{LocalLane, SequenceRows, TokenIo}, layers::Execution, spark::RoutedLane};
 use crate::shared::{experts::rtx::pair::{submit_scoped, teardown, Teardown},
     peer_split::{hop::HopLink, PeerExchange, TerminalState}};
-use anyhow::{ensure, Result};
+use anyhow::{ensure, Context, Result};
 use cuteafd_loader::placement::LayerExecutionPlan;
 use std::{cell::{Cell, RefCell}, rc::Rc};
 use crate::shared::memory::device::Stream;
@@ -15,18 +15,24 @@ struct Lanes<'a> {
     experts: Vec<Vec<Option<crate::shared::experts::rtx::exl3::Exl3Tp2<'a>>>>,
 }
 
+pub(crate) struct GraphWarmup {
+    pub captured: usize,
+    pub before_capture: Vec<u64>,
+}
+
 pub(crate) struct Engine<'a> {
     pub max_pool_tokens_no_onboard: Option<u64>,
+    pub host_prefix: Option<cuteafd_hostcache::config::Config>,
+    target_view: cuteafd_loader::plan::checkpoint::CheckpointView,
     draft: Option<Rc<super::draft::NativeDraft<'a>>>,
     draft_probe: RefCell<Option<crate::shared::memory::device::DeviceOwner<'a,
         crate::shared::draft::probe::RoundProbe<'a>>>>,
     execution: Execution<'a>,
     lanes: RefCell<Lanes<'a>>,
     prefix: RefCell<Option<super::prefix::KimiPrefix<'a>>>,
-    startup_captures: Cell<Option<u64>>,
     provisional: RefCell<Option<super::state::Provisional>>,
     hops: Option<HopLink<'a>>,
-    peer: Option<PeerExchange<'a>>,
+    peer: Option<Rc<PeerExchange<'a>>>,
     terminal: Cell<TerminalState>,
     // PeerExchange and HopLink borrow raw handles; keep their exact streams
     // after both links and their terminal abort storage have been released.
@@ -35,6 +41,8 @@ pub(crate) struct Engine<'a> {
     prefill: PrefillUnits,
     packed_row_cap: Cell<Option<usize>>,
     coordinator_packing_cap: usize,
+    /// Admission's API/scheduler limit; physical lane and prefix owners stay compiled-wide.
+    served_context: usize,
     /// The same shape as the shared prefill depth.
     depth: crate::shared::prefill_depth::PrefillDepth,
 }
@@ -156,19 +164,34 @@ impl<'a> Engine<'a> {
         exchange_streams: [Rc<Stream<'a>>; RANKS],
         lane_streams: [Rc<Stream<'a>>; RANKS],
         mut draft: Option<super::draft::NativeDraft<'a>>,
+        draft_records: crate::shared::experts::rtx::dense::Records,
         mut admission: super::admission::Admission<'a>,
+        usage_reader: cuteafd_core::expert_usage::Reader,
         checkpoint: &cuteafd_loader::plan::Checkpoint,
         programs: [std::rc::Rc<super::device::NativePrograms<'a>>; RANKS],
-        peer: Option<PeerExchange<'a>>, hops: Option<HopLink<'a>>, peers: Vec<std::net::SocketAddr>,
+        context_programs: [Option<Rc<super::context::Programs<'a>>>; RANKS],
+        peer: Option<Rc<PeerExchange<'a>>>, hops: Option<HopLink<'a>>, peers: Vec<std::net::SocketAddr>,
         config: cuteafd_transport::TcpTransportConfig,
-        mut expert_modules: [Option<Vec<crate::shared::experts::exl3::execution::Exl3Modules<'a>>>; RANKS]) -> Result<Self> {
+        mut expert_modules: [Option<Vec<crate::shared::experts::exl3::execution::Exl3Modules<'a>>>; RANKS],
+        memory: &mut crate::shared::inventory::StartupMemoryPhases<'_>) -> Result<Self> {
         use crate::shared::placement::{spark_rings, SparkAdmission};
         use cuteafd_core::{ExpertGeometry, SparkEndpoint, SparkIngress};
         use cuteafd_transport::{expert::SparkWorld, worker_selection::ModelAdmission};
-        ensure!(cuteafd_core::expert_geometry() == ExpertGeometry::KIMI_K3 && (1..=8).contains(&peers.len()),
+        let skip_routed_experts = admission.skip_routed_experts;
+        ensure!(if skip_routed_experts { peers.is_empty() } else { !peers.is_empty() },
+            "Kimi expert peer inventory differs from admitted golden treatment");
+        ensure!(cuteafd_core::expert_geometry() == ExpertGeometry::KIMI_K3 && peers.len() <= 8,
             "Kimi startup needs process latent geometry and 1..8 real expert ranks");
         let coordinator_packing_cap = programs.iter().map(|programs| programs.packing_cap).min().unwrap_or(0);
         let plan = admission.execution_plan()?;
+        let expert_usage = admission.expert_usage.take().map(|geometry| {
+            let devices = cuteafd_loader::placement::families::kimi::usage_devices(&geometry, RANKS)
+                .into_iter().map(|logical| cuteafd_ffi::expert_usage::UsageDevice {
+                    logical, cuda: programs[usize::from(logical)].device.id }).collect::<Vec<_>>();
+            cuteafd_ffi::expert_usage::ExpertUsage::new(library, geometry, &devices, usage_reader)
+                .map(Rc::new)
+        }).transpose()?;
+        memory.sample("expert-usage")?;
         cuteafd_bench::context::set_rtx_expert_layers(admission.placement.onboard_layers);
         ensure!(matches!(RANKS, 1 | 2), "Kimi startup physical rank count");
         let devices = programs.each_ref().map(|programs| programs.device);
@@ -186,27 +209,51 @@ impl<'a> Engine<'a> {
             (None, None) if RANKS == 1 => ensure!(plan.hops().is_empty(), "Kimi single owner cannot have hops"),
             _ => anyhow::bail!("Kimi exchange inventory differs from physical rank count"),
         }
+        let (pending, expert_weights, weights) = if skip_routed_experts {
+            ensure!(draft.is_none(), "Kimi skipped-routed golden cannot use a drafter");
+            let weights = admission.load_skipped_routed(devices, checkpoint,
+                exchange_streams.each_ref().map(|stream| stream.raw), memory)?;
+            (None, (0..RANKS).map(|_| None).collect::<Vec<_>>(), weights)
+        } else {
         let rows = u32::try_from(admission.unit_rows())?;
         let endpoints = vec![SparkEndpoint { ring_depth: None, capacity: rows, ingress: SparkIngress::Fp8K32, partial_reply_bytes: None };
             plan.spec().lanes as usize];
-        let catalog = cuteafd_loader::read_expert_catalog(&checkpoint.snapshot)?;
+        let catalog = cuteafd_loader::read_expert_catalog_view(checkpoint.view.as_ref()
+            .context("Kimi engine requires the immutable selected checkpoint view")?)?;
         let executions = cuteafd_loader::plan::spark_executions::admit_family("kimi_k3",
             &cuteafd_loader::plan::spark_executions::SparkBackend::for_catalog(&catalog)?.exports(), None,
             u64::from(rows), admission.waves() as u64)?;
         let model = ModelAdmission::new(endpoints, spark_rings(config.max_frame_bytes)?, executions)?;
         model.validate(ExpertGeometry::KIMI_K3)?;
-        let spark = SparkAdmission::plan(&checkpoint.snapshot, ExpertGeometry::KIMI_K3,
-            Some(&catalog), &admission.working_set(), peers.len(), None, model)?;
+        let spark = SparkAdmission::plan_view(checkpoint.view.as_ref()
+            .context("Kimi bootstrap requires the immutable selected checkpoint view")?, ExpertGeometry::KIMI_K3,
+            Some(&catalog), &admission.working_set(), peers.len(), model, None)?;
         // Dense operands and TP2 halves land inside the Spark load (pushed as
         // coordinator ranks when the group pushes, else through the mount).
         let (pending, expert_weights, weights) = admission.start_and_load(spark, &peers, devices, checkpoint, &catalog,
-            exchange_streams.each_ref().map(|stream| stream.raw))?;
+            exchange_streams.each_ref().map(|stream| stream.raw), draft_records, memory)?;
+        (Some(pending), expert_weights, weights)
+        };
         let lanes = usize::try_from(plan.spec().lanes)?;
         let allocated = (0..lanes).map(|lane| (0..RANKS).map(|rank|
             admission.allocate_lane_on(devices[rank], rank, lane, lane_streams[rank].clone()))
             .collect::<Result<Vec<_>>>()).collect::<Result<Vec<_>>>()?;
+        memory.sample("lane-workspaces")?;
         let kda = (0..RANKS).map(|rank| admission.allocate_kda(devices[rank], rank)).collect::<Result<Vec<_>>>()?;
+        memory.sample("kda-state")?;
         let mla = (0..RANKS).map(|rank| admission.allocate_mla(devices[rank], rank)).collect::<Result<Vec<_>>>()?;
+        memory.sample("mla-kv")?;
+        ensure!(context_programs.iter().all(Option::is_some) == admission.context_layout().is_some()
+            && (admission.context_layout().is_some() || context_programs.iter().all(Option::is_none)),
+            "Kimi context programs differ from admitted storage");
+        let context = if admission.context_layout().is_some() {
+            let peer = peer.as_deref().context("Kimi context missing ordinary peer abort owner")?;
+            Some(admission.allocate_context(library,
+                [lane_streams[0].clone(), lane_streams[1].clone()],
+                [peer.abort_word(0)?.context("Kimi context missing rank 0 abort word")?,
+                    peer.abort_word(1)?.context("Kimi context missing rank 1 abort word")?])?)
+        } else { None };
+        memory.sample("context-workspace")?;
         let mut experts = Vec::with_capacity(lanes);
         let mut local = Vec::with_capacity(lanes);
         let mut io = Vec::with_capacity(lanes);
@@ -214,11 +261,18 @@ impl<'a> Engine<'a> {
             experts.push((0..RANKS).map(|rank| expert_weights[rank].as_ref()
                 .map(|owner| owner.execution_with_modules(expert_modules[rank].take())).transpose())
                 .collect::<Result<Vec<_>>>()?);
-            local.push(allocated.into_iter().enumerate().map(|(rank, allocated)|
-                admission.bind_local(rank, lane, allocated, programs[rank].clone())).collect::<Result<Vec<_>>>()?);
+            local.push(allocated.into_iter().enumerate().map(|(rank, allocated)| {
+                let mut local = admission.bind_local(rank, lane, allocated, programs[rank].clone())?;
+                if let Some(owner) = &context {
+                    local.bind_context(owner.clone(), context_programs[rank].as_ref()
+                        .context("Kimi context missing rank programs")?.clone())?;
+                }
+                Ok(local)
+            }).collect::<Result<Vec<_>>>()?);
             io.push((0..RANKS).map(|rank| admission.allocate_io(devices[rank], rank, lane))
                 .collect::<Result<Vec<_>>>()?);
         }
+        memory.sample("expert-execution-and-target-io")?;
         for owners in &experts {
             use crate::shared::experts::rtx::RtxExpertLayer;
             check_expert_owners(&admission.placement.layers,
@@ -231,15 +285,28 @@ impl<'a> Engine<'a> {
         // Weak admission registries must not outlive these strong startup owners
         // until every persistent local binding has acquired the same operands.
         if let Some(draft) = draft.as_mut() { draft.bind_target_ranks(weights.global.clone(), programs[RANKS - 1].clone())?; }
+        memory.sample("draft-probe-and-target-bind")?;
         drop((weights, kda, mla));
-        pending.wait()?;
-        let world = SparkWorld::canonical(peers.len())?;
-        let routed = local.iter().map(|owners| admission.connect_spark(library, &owners[RANKS - 1],
-            world, peers.clone(), config.clone())).collect::<Result<Vec<_>>>()?;
+        if let Some(pending) = pending { pending.wait()?; }
+        memory.sample("workers-loaded")?;
+        let routed = if skip_routed_experts {
+            local.iter().map(|owners| RoutedLane::skipped_golden(library, &owners[RANKS - 1],
+                admission.waves(), admission.unit_rows())).collect::<Result<Vec<_>>>()?
+        } else {
+            let world = SparkWorld::canonical(peers.len())?;
+            local.iter().map(|owners| admission.connect_spark(library, &owners[RANKS - 1],
+                world, peers.clone(), config.clone())).collect::<Result<Vec<_>>>()?
+        };
+        memory.sample("registered-transport-egress-staging")?;
         let prefill = PrefillUnits { unit_rows: admission.unit_rows(), waves: admission.waves() };
+        let target_view = checkpoint.view.as_ref()
+            .context("Kimi engine requires the immutable selected checkpoint view")?.clone();
         let mut engine = Self::bind(exchange_streams.into(), plan, peer, hops,
-            local, routed, io, experts, prefill, coordinator_packing_cap)?;
-        engine.max_pool_tokens_no_onboard = Some(admission.placement.max_pool_tokens_no_onboard);
+            local, routed, io, experts, prefill, coordinator_packing_cap, target_view)?;
+        engine.execution.expert_usage = expert_usage;
+        engine.execution.skip_routed_experts = skip_routed_experts;
+        engine.max_pool_tokens_no_onboard = admission.placement.max_pool_tokens_no_onboard;
+        engine.host_prefix = admission.host_prefix.take();
         engine.draft = draft.map(Rc::new);
         *engine.draft_probe.borrow_mut() = draft_probe;
         Ok(engine)
@@ -248,11 +315,12 @@ impl<'a> Engine<'a> {
     /// Bind only exact owners already allocated through Admission. No device
     /// allocations or program loading occur after this constructor returns.
     pub(crate) fn bind(exchange_streams: Vec<Rc<Stream<'a>>>,
-        plan: LayerExecutionPlan, peer: Option<PeerExchange<'a>>, hops: Option<HopLink<'a>>,
+        plan: LayerExecutionPlan, peer: Option<Rc<PeerExchange<'a>>>, hops: Option<HopLink<'a>>,
         local: Vec<Vec<LocalLane<'a>>>, routed: Vec<RoutedLane<'a>>,
         io: Vec<Vec<TokenIo<'a>>>,
         experts: Vec<Vec<Option<crate::shared::experts::rtx::exl3::Exl3Tp2<'a>>>>,
-        prefill: PrefillUnits, coordinator_packing_cap: usize) -> Result<Self> {
+        prefill: PrefillUnits, coordinator_packing_cap: usize,
+        target_view: cuteafd_loader::plan::checkpoint::CheckpointView) -> Result<Self> {
         ensure!(matches!(exchange_streams.len(), 1 | 2) && !local.is_empty()
             && local.len() == routed.len() && local.len() == io.len() && local.len() == experts.len(),
             "Kimi engine physical ranks or local/Spark/IO lane counts differ");
@@ -269,11 +337,23 @@ impl<'a> Engine<'a> {
             }
         }
         let streams = local.iter().map(|ranks| ranks.iter().map(|local| local.stream().clone()).collect()).collect();
-        let execution = Execution::new(plan, peer.as_ref(), hops.as_ref(), exchange_streams.clone(), streams)?;
+        let execution = Execution::new(plan, peer.as_deref(), hops.as_ref(), exchange_streams.clone(), streams)?;
         let depth = crate::shared::prefill_depth::PrefillDepth::new(prefill.waves, prefill.unit_rows)?;
-        Ok(Self { max_pool_tokens_no_onboard: None, depth, draft: None, draft_probe: RefCell::new(None), execution, lanes: RefCell::new(Lanes { local, routed, io, experts }),
-            prefix: RefCell::new(None), startup_captures: Cell::new(None), provisional: RefCell::new(None),
-            hops, peer, terminal: Cell::new(TerminalState::Active), exchange_streams, prefill, packed_row_cap: Cell::new(None), coordinator_packing_cap })
+        let served_context = local[0][0].max_context();
+        Ok(Self { host_prefix: None, max_pool_tokens_no_onboard: None, target_view, depth, draft: None, draft_probe: RefCell::new(None), execution, lanes: RefCell::new(Lanes { local, routed, io, experts }),
+            prefix: RefCell::new(None), provisional: RefCell::new(None),
+            hops, peer, terminal: Cell::new(TerminalState::Active), exchange_streams, prefill, packed_row_cap: Cell::new(None), coordinator_packing_cap, served_context })
+    }
+
+    pub(crate) fn with_served_context(mut self, context: usize) -> Result<Self> {
+        ensure!(context > 0 && context <= self.served_context,
+            "Kimi served context exceeds compiled lane extent");
+        self.served_context = context;
+        Ok(self)
+    }
+
+    pub(crate) fn target_view(&self) -> &cuteafd_loader::plan::checkpoint::CheckpointView {
+        &self.target_view
     }
 
     pub(crate) fn prefix_family(&self) -> Result<super::prefix::KimiPrefix<'a>> {
@@ -301,10 +381,10 @@ impl<'a> Engine<'a> {
         let local = &lanes.local[0][0];
         let (state, _) = local.prefix_banks();
         Ok(crate::shared::qwen::scheduler::Geometry { family: "kimi_k3",
-            vocab_size: local.config().vocab_size, max_context: local.max_context(),
+            vocab_size: local.config().vocab_size, max_context: self.served_context,
             // A call is the slots' units.
             slots: state.slots(), prefill_rows: local.rows().min(self.depth.call_rows()), decode_rows: local.rows().min(64),
-            full_prefill_logits: false })
+            full_prefill_logits: lanes.io[0][self.head()].full_prefill_logits() })
     }
 
     pub(crate) fn configure_packing(&self, mode: crate::shared::prefill_packing::PackingMode) -> Result<()> {
@@ -357,13 +437,16 @@ impl<'a> Engine<'a> {
         if let Some(draft) = &self.draft { draft.prepare_target()?; }
         submit_scoped(|| self.require_live(), || self.shutdown(), |scope| {
             let mut lanes = self.lanes.try_borrow_mut()?;
+            for local in lanes.local.iter_mut().flatten() {
+                local.graph_cycle(crate::shared::decode_graph::device::Cycle::Prefill);
+            }
             let metadata = sequences.iter().map(|(p, tokens)| SequenceRows {
                 slot: p.slot, start: p.len, rows: tokens.len(), pages: &p.units,
             }).collect::<Vec<_>>();
             let tokens = sequences.iter().flat_map(|(_, tokens)| tokens.iter().copied()).collect::<Vec<_>>();
             lanes.io[0][0].embed(&tokens, lanes.local[0][0].buffer("delta")?)?;
             let Lanes { local, routed, io, experts } = &mut *lanes;
-            let normalized = self.execution.run_packed(scope, self.peer.as_ref(), self.hops.as_ref(),
+            let normalized = self.execution.run_packed(scope, self.peer.as_deref(), self.hops.as_ref(),
                 &mut local[0], &mut routed[0], &mut experts[0], &metadata, pool, self.draft.as_deref())?;
             drop(metadata);
             for (placement, tokens) in sequences.iter_mut() {
@@ -413,7 +496,8 @@ impl<'a> Engine<'a> {
     pub(crate) fn draft_geometry(&self, snapshot: &std::path::Path, width: usize)
         -> Result<cuteafd_core::PolicyGeometry> {
         use crate::shared::{draft::resource::{self, LayerHome}, experts::rtx::RtxExpertLayer};
-        let catalog = cuteafd_loader::read_expert_catalog(snapshot)?;
+        ensure!(snapshot == self.target_view.snapshot(), "Kimi draft target snapshot differs from selected view");
+        let catalog = cuteafd_loader::read_expert_catalog_view(&self.target_view)?;
         let manifest = catalog.exl3().ok_or_else(|| anyhow::anyhow!("Kimi draft needs EXL3 headers"))?;
         let lanes = self.lanes.try_borrow()?;
         let cfg = lanes.local[0][0].config();
@@ -452,9 +536,15 @@ impl<'a> Engine<'a> {
         ensure!(self.terminal.get() == TerminalState::Active, "Kimi engine is terminal ({:?})", self.terminal.get());
         if let Some(peer) = &self.peer { peer.require_live()?; }
         if let Some(draft) = &self.draft { draft.require_live()?; }
-        if let Some(startup) = self.startup_captures.get() {
-            super::graphs::check_captures(startup, cuteafd_ffi::graph_captures())?;
-        }
+        Ok(())
+    }
+
+    pub(crate) fn attach_capture(&self, capture: Rc<super::golden::Capture>) -> Result<()> {
+        self.require_live()?;
+        let mut lanes = self.lanes.try_borrow_mut()?;
+        ensure!(lanes.local.len() == 1 && self.provisional.borrow().is_none(),
+            "Kimi capture requires one idle diagnostic lane after startup");
+        for local in &mut lanes.local[0] { local.capture = Some(capture.clone()); }
         Ok(())
     }
 
@@ -467,21 +557,91 @@ impl<'a> Engine<'a> {
         Ok(())
     }
 
-    pub(crate) fn warm_graphs(&self, keys: &[super::graphs::Key]) -> Result<()> {
-        ensure!(self.startup_captures.get().is_none(), "Kimi startup graphs already sealed");
+    pub(crate) fn usage_phase(&self, phase: cuteafd_ffi::expert_usage::UsagePhase) {
+        self.execution.usage_phase.set(phase);
+    }
+
+    pub(crate) fn graph_free_bytes(&self) -> Result<Vec<u64>> {
+        self.exchange_streams.iter().map(|stream| stream.device.run(||
+            Ok(stream.device.library.cuda_physical_memory_info()?.0 as u64))).collect()
+    }
+
+    /// Prewarm the pinned geometry on every lane and measure the startup arena
+    /// once. `reserves` is one bounded graph reserve per physical rank.
+    pub(crate) fn warm_graphs(&self, keys: &[super::graphs::Key], reserves: &[u64]) -> Result<GraphWarmup> {
+        ensure!(reserves.len() == self.exchange_streams.len(), "Kimi graph reserve per physical rank");
+        // No route for this family has calibrated node/executable coefficients,
+        // so the whole device selects capture from measured bytes.
+        tracing::warn!("Kimi graph cache uses per-site byte estimates: no calibrated node rates for this route");
         let mut lanes = self.lanes.try_borrow_mut()?;
         let mut consumed = 0;
         for (lane, pair) in lanes.local.iter_mut().enumerate() {
             for (rank, local) in pair.iter_mut().enumerate() {
                 let binding = keys.iter().copied().filter(|key| key.lane == lane && key.rank == rank).collect::<Vec<_>>();
-                ensure!(!binding.is_empty(), "Kimi graph inventory omits a binding");
-                local.warm_graphs(&binding, rank)?;
+                if binding.is_empty() { continue }
+                local.prewarm_kda_graphs(&binding, rank)?;
+                // KDA has no peer waits. Serialize the startup bindings that
+                // share slot0 before another lane can write that state bank.
+                local.stream().drain()?;
                 consumed += binding.len();
             }
         }
         ensure!(consumed == keys.len(), "Kimi startup graph inventory has unbound keys");
-        self.startup_captures.set(Some(cuteafd_ffi::graph_captures()));
-        Ok(())
+
+        // No zero may race another lane's warm writes to the shared bank;
+        // restore drains all retained readers before capture begins.
+        for local in lanes.local.first().into_iter().flatten() { local.restore_startup_kda()?; }
+        let before_capture = self.graph_free_bytes()?;
+        // Seed after eager first-touch, before any graph allocates driver storage.
+        // Otherwise the first completed boundary loses the whole startup arena.
+        let mut controllers = Vec::with_capacity(reserves.len());
+        for (rank, stream) in self.exchange_streams.iter().enumerate() {
+            controllers.push(crate::shared::decode_graph::device::device_cache(stream.device.library,
+                stream.device.id, reserves[rank], crate::shared::decode_graph::device::Basis::Bytes)?);
+            let (base, tail) = cuteafd_loader::placement::graph_reserve::kimi_default(lanes.local[0][0].graph_core(), reserves.len(), rank);
+            let policy = cuteafd_loader::placement::graph_reserve::current(rank, false, base, tail)?;
+            crate::shared::decode_graph::device::set_reserve_policy(stream.device.id, policy)?;
+            crate::shared::decode_graph::device::observe_device(stream.device.library, stream.device.id)?;
+        }
+        let mut captured = 0;
+        for (lane, pair) in lanes.local.iter_mut().enumerate() {
+            for (rank, local) in pair.iter_mut().enumerate() {
+                let binding = keys.iter().copied().filter(|key| key.lane == lane && key.rank == rank).collect::<Vec<_>>();
+                // Even an empty prewarm list must attach its lazy cache.
+                captured += local.warm_graphs(&binding, rank, reserves[rank])?;
+            }
+        }
+        // Lane banks now retain every controller seeded before startup capture.
+        drop(controllers);
+        drop(lanes);
+        // Startup activity is attributed to Other and charged once, here,
+        // before the first serving step can see the arenas as its own.
+        self.graph_settle()?;
+        Ok(GraphWarmup { captured, before_capture })
+    }
+
+    /// Completed-step graph boundary. Every rank's step is queued and no lane is
+    /// mid-segment, so each physical device is sampled once and growth charged.
+    fn graph_settle(&self) -> Result<()> {
+        let mut lanes = self.lanes.try_borrow_mut()?;
+        let boundary = lanes.local.iter().flatten().any(|lane| lane.graph_needs_boundary());
+        if !boundary {
+            for lane in lanes.local.iter_mut().flatten() { lane.graph_tick(); }
+            return Ok(());
+        }
+        let library = self.library();
+        // SAFETY: Kimi owners pin `()`; a capture references only the lane's
+        // persistent buffers and admitted weights, never a per-graph allocation,
+        // and those outlive every queued launch.
+        unsafe { crate::shared::decode_graph::device::observe_completed(library, |visit| {
+            for lane in lanes.local.iter_mut().flatten() {
+                let spans = lane.graph_spans_devices();
+                let Some(device) = lane.graph_device() else { continue };
+                let Some(owner) = lane.graph_owner() else { continue };
+                visit(device, "kimi_k3", spans, owner)?;
+            }
+            Ok(())
+        }) }
     }
 
     /// Scheduler submission keeps full logits on the terminal device. Page
@@ -490,7 +650,7 @@ impl<'a> Engine<'a> {
         sequences: &mut [(&mut super::prefix::Placement, &[u32])],
         pool: &cuteafd_engine::prefix::RefPagePool, logit_rows: usize, graphed: bool)
         -> Result<crate::shared::token_io::DeviceLogits> {
-        self.step_device_mode(sequences, pool, logit_rows, graphed, false)
+        self.step_device_mode(sequences, pool, logit_rows, graphed, false, None)
     }
 
     pub(crate) fn verify_device(&self, sequences: &mut [(&mut super::prefix::Placement, &[u32])],
@@ -498,11 +658,19 @@ impl<'a> Engine<'a> {
         -> Result<crate::shared::token_io::DeviceLogits> {
         let rows = sequences.iter().try_fold(0usize, |rows, (_, tokens)|
             rows.checked_add(tokens.len()).ok_or_else(|| anyhow::anyhow!("Kimi verify rows overflow")))?;
-        self.step_device_mode(sequences, pool, rows, graphed, true)
+        self.step_device_mode(sequences, pool, rows, graphed, true, None)
+    }
+
+    pub(crate) fn prefill_scoring(&self, placement: &mut super::prefix::Placement, tokens: &[u32],
+        logit_rows: usize, pool: &cuteafd_engine::prefix::RefPagePool,
+        consume: &mut dyn FnMut(usize, crate::shared::token_io::DeviceLogits) -> Result<()>) -> Result<()> {
+        self.step_device_mode(&mut [(placement, tokens)], pool, logit_rows, true, false, Some(consume))?;
+        Ok(())
     }
 
     fn step_device_mode(&self, sequences: &mut [(&mut super::prefix::Placement, &[u32])],
-        pool: &cuteafd_engine::prefix::RefPagePool, logit_rows: usize, graphed: bool, speculative: bool)
+        pool: &cuteafd_engine::prefix::RefPagePool, logit_rows: usize, graphed: bool, speculative: bool,
+        mut consume: Option<&mut dyn FnMut(usize, crate::shared::token_io::DeviceLogits) -> Result<()>>)
         -> Result<crate::shared::token_io::DeviceLogits> {
         self.require_live()?;
         ensure!(self.provisional.borrow().is_none(), "Kimi pending verify must be accepted or discarded before reuse");
@@ -511,7 +679,10 @@ impl<'a> Engine<'a> {
             else { None };
         let rows = sequences.iter().try_fold(0usize, |rows, (_, tokens)|
             rows.checked_add(tokens.len()).ok_or_else(|| anyhow::anyhow!("Kimi submission rows overflow")))?;
-        ensure!(!sequences.is_empty() && logit_rows > 0 && logit_rows <= rows && logit_rows <= 64,
+        let geometry = self.geometry()?;
+        let logit_capacity = if consume.is_some() || geometry.full_prefill_logits { geometry.prefill_rows }
+            else { geometry.decode_rows };
+        ensure!(!sequences.is_empty() && logit_rows > 0 && logit_rows <= rows && logit_rows <= logit_capacity,
             "Kimi device submission logit extent");
         // Validate every frontier before enqueue: a failed batch cannot publish
         // only some requests' state. Non-speculative execution commits all rows.
@@ -522,6 +693,10 @@ impl<'a> Engine<'a> {
         let output = submit_scoped(|| self.require_live(), || self.shutdown(), |scope| {
             let mut lanes = self.lanes.try_borrow_mut()?;
             lanes.local[0][self.head()].config().release_geometry()?;
+            let cycle = if rows > 64 { crate::shared::decode_graph::device::Cycle::Prefill }
+                else if speculative { crate::shared::decode_graph::device::Cycle::Verify }
+                else { crate::shared::decode_graph::device::Cycle::Decode };
+            for local in &mut lanes.local[0] { local.graph_cycle(cycle); }
             let metadata = sequences.iter().map(|(placement, tokens)| SequenceRows {
                 slot: placement.slot, start: placement.len, rows: tokens.len(), pages: &placement.units,
             }).collect::<Vec<_>>();
@@ -535,12 +710,12 @@ impl<'a> Engine<'a> {
             for binding in &mut local[0] { binding.enable_replay(graphed); }
             let result = if unit_call {
                 let units = self.prefill_units(rows)?;
-                self.execution.run_units(scope, self.peer.as_ref(), self.hops.as_ref(), &mut local[0],
+                self.execution.run_units(scope, self.peer.as_deref(), self.hops.as_ref(), &mut local[0],
                     &mut routed[0], &mut experts[0], &units, self.depth.waves, &metadata[0], pool,
                     self.draft.as_deref()).map(|output| vec![output])
             } else {
                 ensure!(rows <= self.prefill.unit_rows, "Kimi {rows}-row multi-sequence step exceeds one prefill unit");
-                self.execution.run(scope, self.peer.as_ref(), self.hops.as_ref(),
+                self.execution.run(scope, self.peer.as_deref(), self.hops.as_ref(),
                     &mut local[..1], &mut routed[..1], &mut experts[..1], &[rows], speculative,
                     super::layers::Output::Normalized, self.draft.as_deref(), Some(&self.draft_probe))
             };
@@ -548,12 +723,27 @@ impl<'a> Engine<'a> {
             let normalized = result?[0];
             let input = crate::shared::prefix::view(normalized,
                 (rows - logit_rows) * 7168 * 2, logit_rows * 7168 * 2)?;
-            let logits = io[0][self.head()].project(input, logit_rows, &local[0][self.head()])?;
-            let stream = local[0][self.head()].stream();
-            Ok(crate::shared::token_io::DeviceLogits { ptr: logits.ptr.cast_const(), rows: logit_rows,
-                vocab: local[0][self.head()].config().vocab_size, stride: local[0][self.head()].config().vocab_size,
-                stream: stream.raw, greedy: None })
+            let head = &local[0][self.head()];
+            let describe = |logits: cuteafd_ffi::CuteafdDeviceBuffer, rows| crate::shared::token_io::DeviceLogits {
+                ptr: logits.ptr.cast_const(), rows, vocab: head.config().vocab_size,
+                stride: head.config().vocab_size, stream: head.stream().raw, greedy: None };
+            if let Some(consume) = consume.as_mut() {
+                let mut last = None;
+                for span in crate::shared::probe::head_spans(logit_rows, 64)? {
+                    let (first, rows) = (span.start, span.len());
+                    let span = crate::shared::prefix::view(input, first * 7168 * 2, rows * 7168 * 2)?;
+                    let logits = io[0][self.head()].project(span, rows, head)?;
+                    // Consume the exact head tile before its scratch is overwritten.
+                    consume(first, describe(logits, rows))?;
+                    last = Some(describe(logits, rows));
+                }
+                last.context("Kimi scoring produced no head spans")
+            } else {
+                let logits = io[0][self.head()].project(input, logit_rows, head)?;
+                Ok(describe(logits, logit_rows))
+            }
         })?;
+        if let Err(error) = self.graph_settle() { self.shutdown()?; return Err(error); }
         // A nested native operator capturing here is a contract violation too.
         // Abort/drain before propagating it, never release live graph operands.
         if let Err(error) = self.require_live() { self.shutdown()?; return Err(error); }
@@ -620,7 +810,7 @@ impl<'a> Engine<'a> {
         let result = teardown(&mut Teardown {
             abort: || {
                 self.terminal.set(TerminalState::Aborting);
-                self.peer.as_ref().map_or(Ok(()), PeerExchange::publish_abort)
+                self.peer.as_deref().map_or(Ok(()), PeerExchange::publish_abort)
             },
             ranks: || {
                 if let Some(peer) = &self.peer { peer.drain_compute()?; }
@@ -677,10 +867,13 @@ impl<'a> Engine<'a> {
             ensure!(!tokens.is_empty() && tokens.len() <= self.prefill.unit_rows,
                 "Kimi diagnostic prefix has no tokens or exceeds one prefill unit");
             let sequences = [SequenceRows { slot: 0, start: 0, rows: tokens.len(), pages }];
-            for local in &mut lanes.local[0] { local.stage_attention(&sequences, pool)?; }
+            for local in &mut lanes.local[0] {
+                local.graph_cycle(crate::shared::decode_graph::device::Cycle::Other);
+                local.stage_attention(&sequences, pool)?;
+            }
             lanes.io[0][0].embed(tokens, lanes.local[0][0].buffer("delta")?)?;
             let Lanes { local, routed, experts, .. } = &mut *lanes;
-            let outputs = self.execution.run(scope, self.peer.as_ref(), self.hops.as_ref(),
+            let outputs = self.execution.run(scope, self.peer.as_deref(), self.hops.as_ref(),
                 &mut local[..1], &mut routed[..1], &mut experts[..1], &[tokens.len()], false,
                 super::layers::Output::Residual, None, None)?;
             let stream = local[0][self.head()].stream();
@@ -729,6 +922,7 @@ impl<'a> Engine<'a> {
             for (lane, ids) in tokens.iter().enumerate() {
                 ensure!(!ids.is_empty(), "Kimi forward has an empty lane");
                 for local in &mut lanes.local[lane] {
+                    local.graph_cycle(crate::shared::decode_graph::device::Cycle::Other);
                     ensure!(sequences[lane].iter().map(|sequence| sequence.rows).sum::<usize>() == ids.len(),
                         "Kimi forward sequence rows differ from tokens");
                     // Unit calls stage all metadata banks before the pipeline.
@@ -739,12 +933,12 @@ impl<'a> Engine<'a> {
             let Lanes { local, routed, io, experts } = &mut *lanes;
             let normalized = if unit_call {
                 let units = self.prefill_units(rows[0])?;
-                vec![self.execution.run_units(scope, self.peer.as_ref(), self.hops.as_ref(), &mut local[0],
+                vec![self.execution.run_units(scope, self.peer.as_deref(), self.hops.as_ref(), &mut local[0],
                     &mut routed[0], &mut experts[0], &units, self.depth.waves, &sequences[0][0], pool, None)?]
             } else {
                 ensure!(rows.iter().sum::<usize>() <= self.prefill.unit_rows,
                     "Kimi multi-sequence diagnostic step exceeds one prefill unit");
-                self.execution.run(scope, self.peer.as_ref(), self.hops.as_ref(),
+                self.execution.run(scope, self.peer.as_deref(), self.hops.as_ref(),
                     &mut local[..tokens.len()], &mut routed[..tokens.len()], &mut experts[..tokens.len()], &rows, false,
                     super::layers::Output::Normalized, None, None)?
             };

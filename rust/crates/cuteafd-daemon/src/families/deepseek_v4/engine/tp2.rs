@@ -8,6 +8,9 @@ use std::collections::BTreeMap;
 use std::ops::Range;
 use crate::shared::peer_split::order::{self, Schedule};
 
+/// Pinned host landings for the TP2 route diagnostic's device downloads.
+const ROUTE_CHECK: Tag = Tag::staging("v4/tp2/route-check");
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ExchangePolicy { Auto, Bf16, F32 }
 
@@ -75,6 +78,7 @@ pub(super) struct Tp2State<'a> {
     pub(super) layers: Vec<usize>,
     ranks: [RefCell<Box<dyn RtxExpertLayer + 'a>>; 2],
     combine: [FusedCombine<'a>; 2],
+    add: cuteafd_ffi::Bf16Add<'a>,
     routes: PeerExchange<'a>,
     source: Cell<RouteSource>,
     pub(super) checking: Cell<bool>,
@@ -90,6 +94,11 @@ pub(super) struct Tp2State<'a> {
 }
 
 impl Tp2State<'_> {
+    pub(super) fn has_stages(&self, first: usize, stages: usize) -> bool {
+        let ranks = self.ranks[0].borrow();
+        stages > 0 && (first..first + stages).all(|id| ranks.layers().contains(&id))
+    }
+
     pub(super) fn broadcast(&self) -> bool { self.source.get() == RouteSource::Broadcast }
 
     pub(super) fn group_rows(&self, rows: usize) -> Result<usize> {
@@ -104,9 +113,16 @@ impl<'a> Engine<'a> {
         ensure!(self.tp2.is_none(), "TP2 experts already installed");
         let peer = self.peer()?;
         let layers = ranks[0].layers().to_vec();
-        ensure!(layers == ranks[1].layers() && !layers.is_empty() && layers.iter().all(|&id| id < self.cfg.n_layers),
-            "TP2 ranks must hold the same nonempty backbone prefix");
-        ensure!(layers.iter().copied().eq(0..layers.len()), "V4 TP2 currently requires a prefix starting at layer 0");
+        let stages = self.weights.dspark.as_ref().map_or(0, |d| d.stages.len());
+        ensure!(layers == ranks[1].layers() && !layers.is_empty()
+            && layers.windows(2).all(|pair| pair[0] < pair[1])
+            && layers.iter().all(|&id| id < self.cfg.n_layers + stages),
+            "TP2 ranks must hold the same ordered backbone/stage inventory");
+        let draft = layers.iter().copied().filter(|&id| id >= self.cfg.n_layers).collect::<Vec<_>>();
+        ensure!(draft.is_empty() || draft.iter().copied().eq(self.cfg.n_layers..self.cfg.n_layers + stages),
+            "TP2 draft inventory must include every retained stage");
+        let backbone = layers.iter().copied().take_while(|&id| id < self.cfg.n_layers).collect::<Vec<_>>();
+        ensure!(backbone.iter().copied().eq(0..backbone.len()), "V4 TP2 backbone requires a prefix starting at layer 0");
         for (rank, experts) in ranks.iter().enumerate() {
             ensure!(experts.shard() == RtxShard::Tp2 { rank: rank as u8 }
                 && experts.partial() == PartialDtype::F32
@@ -126,13 +142,67 @@ impl<'a> Engine<'a> {
             .transpose()?.unwrap_or(0);
         let combine = [FusedCombine::new(self.library, ExchangeDtype::Bf16)?,
             FusedCombine::new(self.library, ExchangeDtype::F32)?];
-        self.tp2 = Some(Tp2State { layers: layers.clone(), ranks: ranks.map(RefCell::new), combine, routes,
+        self.tp2 = Some(Tp2State { layers: backbone.clone(), ranks: ranks.map(RefCell::new), combine, add: self.library.bf16_add()?, routes,
             source: Cell::new(RouteSource::Replicated), checking: Cell::new(false), check_units: RefCell::new(Vec::new()), checks: RefCell::new(BTreeMap::new()),
             schedule: RefCell::new(None), identity: RefCell::new(RouteIdentity::default()),
             interval, steps: Cell::new(0), fallbacks: Cell::new(0),
             streams: [self.stream, peer.stream], output_pending: [Cell::new(false), Cell::new(false)] });
         tracing::info!(layers = ?layers, "V4 RTX TP2 expert halves resident on both GPUs");
         cuteafd_bench::context::set_resolved("rtx-tp2-layers", &format!("{layers:?}"));
+        Ok(())
+    }
+
+    /// Stage transformers and their full shared expert stay on GPU0. Both routed
+    /// halves borrow the backbone's serialized scratch, payload and exchange.
+    pub(super) fn draft_tp2_experts(&self, layer: usize, rows: usize, w: &Workspace<'_>, lane: &UnitSlot<'_>) -> Result<()> {
+        use cuteafd_ffi::peer_exchange::PeerPlane;
+        let tp2 = self.tp2.as_ref().context("dSpark TP2 arena")?;
+        let peer_workspace = self.peer()?.decode_workspace.borrow();
+        let peer = peer_workspace.as_ref().context("dSpark peer workspace")?;
+        let inputs = [(&w.wire, &peer.wire, rows * (self.cfg.dim + self.cfg.dim / 32)),
+            (&w.route_ids, &peer.route_ids, rows * self.cfg.n_activated_experts * 4),
+            (&w.route_weights, &peer.route_weights, rows * self.cfg.n_activated_experts * 4)];
+        let planes = inputs.into_iter().map(|(source, destination, bytes)| {
+            let bytes = bytes.next_multiple_of(16);
+            ensure!(bytes <= source.buffer.bytes && bytes <= destination.buffer.bytes, "dSpark TP2 input exceeds workspace");
+            Ok(PeerPlane { source: source.buffer.ptr, destination: destination.buffer.ptr,
+                rows: 1, row_bytes: bytes as u64, source_pitch: bytes as u64, destination_pitch: bytes as u64 })
+        }).collect::<Result<Vec<_>>>()?;
+        tp2.routes.push_planes(0, 0, &planes)?;
+        tp2.routes.wait(1, 0)?;
+        for (rank, workspace) in [(0, w), (1, peer)] {
+            self.on(rank, || {
+                let mut experts = tp2.ranks[rank].borrow_mut();
+                // SAFETY: published inputs/routes remain live on each rank's
+                // serialized stream through its output publication below.
+                unsafe { experts.enqueue(layer, rows, ExpertInput::Fp8K32(workspace.wire.buffer.ptr),
+                    Routes { ids: workspace.route_ids.buffer.ptr, weights: workspace.route_weights.buffer.ptr },
+                    self.stream_of(rank), &mut || self.abort_tp2_or_terminate())?; }
+                if rank == 1 {
+                    self.exchange()?.push(1, 0, experts.output(), rows * self.cfg.dim * 4)?;
+                }
+                Ok(())
+            })?;
+        }
+        self.exchange()?.wait(0, 0)?;
+        self.on(0, || {
+            let experts = tp2.ranks[0].borrow();
+            // SAFETY: rank1's FP32 token sums have landed; rank0 sums and
+            // shared/output buffers remain live on the owner stream.
+            unsafe {
+                tp2.combine[1].sum(experts.output(), self.exchange()?.recv(0, 0)?,
+                    w.sum.buffer.ptr.cast(), rows, self.cfg.dim, self.stream)?;
+                tp2.add.launch(w.sum.buffer, lane.shared.buffer, w.delta.buffer, rows * self.cfg.dim, self.stream)?;
+            }
+            Ok(())
+        })?;
+        // A distinct flag keeps the next input publication from satisfying this
+        // completion wait early. GPU1 cannot overwrite the receive slot before
+        // GPU0's reduction, and GPU0 cannot overwrite inputs before GPU1 reads.
+        tp2.routes.signal(0, 1)?;
+        tp2.routes.wait(1, 1)?;
+        tp2.routes.signal(1, 1)?;
+        tp2.routes.wait(0, 1)?;
         Ok(())
     }
 
@@ -208,9 +278,11 @@ impl<'a> Engine<'a> {
             graphs: || {
                 for link in transports.borrow_mut().iter_mut() { link.terminal_release()?; }
                 for rank in 0..(1 + usize::from(self.peer.is_some())) {
+                    // Every queued launch drained above, so dropping the
+                    // bank's entries releases only retired executables.
                     self.on(rank, || {
-                        if rank == 0 { self.graphs.borrow_mut().clear(); }
-                        else { self.peer()?.graphs.borrow_mut().clear(); }
+                        if rank == 0 { self.graphs.borrow_mut().cache_clear_drained(); }
+                        else { self.peer()?.graphs.borrow_mut().cache_clear_drained(); }
                         Ok(())
                     })?;
                 }
@@ -340,8 +412,8 @@ impl<'a> Engine<'a> {
         for &layer in &tp2.layers {
             for (lane, &rows) in rows.iter().enumerate() {
                 let bytes = rows * self.cfg.n_activated_experts * 8;
-                let ranks = [Some(self.on(0, || HostAllocation::new(self.library, bytes))?),
-                    Some(self.on(1, || HostAllocation::new(self.library, bytes))?)];
+                let ranks = [Some(self.on(0, || HostAllocation::new(self.library, bytes, ROUTE_CHECK))?),
+                    Some(self.on(1, || HostAllocation::new(self.library, bytes, ROUTE_CHECK))?)];
                 checks.insert((layer, lane), PendingCheck { rows, ranks });
             }
         }
@@ -356,7 +428,8 @@ impl<'a> Engine<'a> {
 
     fn collect_routes(&self, rank: usize, layer: usize, lane: usize, rows: usize, w: &Workspace<'_>) -> Result<()> {
         let tp2 = self.tp2.as_ref().context("TP2 experts")?;
-        if !tp2.checking.get() || self.capture_only.get() { return Ok(()); }
+        // A warmed step runs a synthetic placement: its routes are no diagnostic.
+        if !tp2.checking.get() || self.capture_only.get() || self.graph_warming.get() { return Ok(()); }
         self.on(rank, || {
             let bytes = rows * self.cfg.n_activated_experts * 4;
             let checks = tp2.checks.borrow();
@@ -390,7 +463,8 @@ impl<'a> Engine<'a> {
 
     pub(super) fn count_route_fallback(&self, layer: usize) {
         if let Some(tp2) = self.tp2.as_ref().filter(|t| t.layers.contains(&layer)
-            && t.source.get() == RouteSource::Broadcast && !self.capture_only.get()) {
+            && t.source.get() == RouteSource::Broadcast && !self.graph_warming.get()
+            && !self.capture_only.get()) {
             // Count host-enqueued units, including graph replays (not graph construction).
             tp2.fallbacks.set(tp2.fallbacks.get() + 1);
         }
@@ -406,7 +480,6 @@ impl<'a> Engine<'a> {
 
     pub(super) fn finish_route_step(&self) -> Result<()> {
         let Some(tp2) = &self.tp2 else { return Ok(()) };
-        self.publish_route_source();
         if !tp2.checking.replace(false) { return Ok(()); }
         for rank in 0..2 {
             self.on(rank, || {
@@ -421,7 +494,7 @@ impl<'a> Engine<'a> {
                     rank1.context("rank1 route check missing")?.bytes().to_vec()] })
         }).collect::<Result<Vec<_>>>()?;
         let identity = RouteIdentity::check(&checks);
-        if identity.source() == RouteSource::Broadcast { tp2.source.set(RouteSource::Broadcast); }
+        tp2.source.set(tp2.source.get().checked(&identity, cuteafd_bench::context::readiness_s().is_some())?);
         tracing::info!(layers_checked = identity.layers_checked, rows_checked = identity.rows_checked,
             first_mismatch = ?identity.first_mismatch, source = ?tp2.source.get(), fallbacks = tp2.fallbacks.get(),
             "V4 TP2 route identity");
@@ -429,10 +502,7 @@ impl<'a> Engine<'a> {
         aggregate.layers_checked += identity.layers_checked;
         aggregate.rows_checked += identity.rows_checked;
         if aggregate.first_mismatch.is_none() { aggregate.first_mismatch = identity.first_mismatch; }
-        cuteafd_bench::context::set_resolved("route-identity", &format!("layers={} rows={} mismatch={:?}",
-            aggregate.layers_checked, aggregate.rows_checked, aggregate.first_mismatch));
         drop(aggregate);
-        self.publish_route_source();
         if let Some(schedule) = tp2.schedule.borrow_mut().take() {
             order::check(&schedule).map_err(|e| anyhow::anyhow!("V4 TP2 recorded schedule: {e}"))?;
             tracing::info!(ops = schedule.streams.iter().map(Vec::len).sum::<usize>(),
@@ -441,14 +511,18 @@ impl<'a> Engine<'a> {
         Ok(())
     }
 
-    fn publish_route_source(&self) {
-        cuteafd_bench::context::set_resolved("v4-graph-captures", &self.graph_captures.get().to_string());
-        cuteafd_bench::context::set_resolved("tp2-expert-graph-captures", &self.expert_graph_captures.get().to_string());
-        if let Some(tp2) = &self.tp2 {
-            cuteafd_bench::context::set_resolved("route-source",
-                if tp2.source.get() == RouteSource::Replicated { "replicated" } else { "broadcast" });
-            cuteafd_bench::context::set_resolved("route-fallbacks", &tp2.fallbacks.get().to_string());
-        }
+    pub(crate) fn runtime_stats(&self) -> serde_json::Value {
+        serde_json::json!({
+            "v4-graph-captures": self.graph_captures.get(),
+            "tp2-expert-graph-captures": self.expert_graph_captures.get(),
+            "v4-graph-eager": self.graph_eager.get(),
+            "routes": self.tp2.as_ref().map(|tp2| {
+                let identity = tp2.identity.borrow();
+                serde_json::json!({"source": tp2.source.get().label(), "fallbacks": tp2.fallbacks.get(),
+                    "layers_checked": identity.layers_checked, "rows_checked": identity.rows_checked,
+                    "first_mismatch": identity.first_mismatch})
+            })
+        })
     }
 
     pub fn check_routes(&self, transports: &mut [SparkLink<'_>], runtime: &tokio::runtime::Runtime) -> Result<()> {
@@ -466,7 +540,7 @@ impl<'a> Engine<'a> {
         allocator.release(placement);
         // Cache/state writes were to scratch placement; released slots are overwritten on admission.
         self.warm_broadcast_graphs()?;
-        self.publish_route_source();
+        cuteafd_bench::context::set_resolved("route-source", tp2.source.get().label());
         Ok(())
     }
 
@@ -511,6 +585,11 @@ impl<'a> Engine<'a> {
                             1, self.cfg.dim, self.stream_of(rank))?;
                     }
                 }
+                // Prime the draft's owner-local shared-expert addition before
+                // any peer wait can make lazy CUDA module loading synchronize.
+                // SAFETY: zero shared/sum rows and persistent disjoint output.
+                unsafe { tp2.add.launch(w.sum.buffer, lane.shared.buffer, w.delta.buffer,
+                    self.cfg.dim, self.stream_of(rank))?; }
                 // SAFETY: startup-only independent work; neither stream has a peer wait yet.
                 unsafe { self.library.cuda_stream_synchronize(self.stream_of(rank)) }
             })?;
@@ -637,6 +716,35 @@ mod tests {
             }
         }
         Ok(())
+    }
+
+    #[test]
+    fn draft_stages_between_target_submissions_drain_on_shared_flags() {
+        for layers in [43, 61] {
+            for local in [0, 1, layers] {
+                for broadcast in [false, true] {
+                    let mut combined = Schedule::default();
+                    for _ in 0..3 {
+                        let target = schedule(layers, local, 1, true, broadcast);
+                        for (stream, ops) in combined.streams.iter_mut().zip(target.streams) {
+                            stream.extend(ops);
+                        }
+                        for _ in 0..3 {
+                            combined.push(0, "routes", 0, "draft input planes");
+                            combined.wait(1, "routes", 0, "draft inputs ready");
+                            combined.push(1, "ffn", 0, "draft FP32 routed partial");
+                            combined.wait(0, "ffn", 0, "draft owner reduction");
+                            combined.push(0, "routes", 1, "draft reduction complete");
+                            combined.wait(1, "routes", 1, "draft receive reusable");
+                            combined.push(1, "routes", 1, "draft peer released inputs");
+                            combined.wait(0, "routes", 1, "draft input reusable");
+                        }
+                        combined.end_request();
+                    }
+                    assert_eq!(order::check_submission_faults(&combined), Ok(()));
+                }
+            }
+        }
     }
 
     #[test]

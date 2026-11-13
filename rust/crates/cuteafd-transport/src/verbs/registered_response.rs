@@ -15,6 +15,12 @@ pub(super) struct RegisteredResponseFrame {
 unsafe impl Send for RegisteredResponseFrame {}
 unsafe impl Sync for RegisteredResponseFrame {}
 impl RegisteredResponseFrame {
+    pub(super) fn allocation_census(&self, owner: &str) -> TransportAllocationCensus {
+        let mut census = TransportAllocationCensus::default();
+        census.endpoint_view(format!("{owner}.endpoint.send"), self._endpoint.send_buffer_view());
+        census.endpoint_view(format!("{owner}.endpoint.receive"), self._endpoint.recv_buffer_view());
+        census
+    }
     pub(super) fn as_slice(&self) -> &[u8] {
         unsafe { std::slice::from_raw_parts(self.buffer.ptr.cast(), self.buffer.bytes) }
     }

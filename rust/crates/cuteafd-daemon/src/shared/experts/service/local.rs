@@ -127,14 +127,14 @@ mod selection_tests {
         use cuteafd_transport::worker_selection::{WorkerIdentity, WorkerSelection};
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("config.json"), "{}").unwrap();
-        std::fs::write(dir.path().join("model.safetensors.index.json"), "{}").unwrap();
+        std::fs::write(dir.path().join("model.safetensors.index.json"), r#"{"weight_map":{}}"#).unwrap();
         let geometry = cuteafd_core::ExpertGeometry::MIMO_V26_PRO;
         let identity = WorkerIdentity::from_snapshot(dir.path(), geometry, cuteafd_transport::expert::SparkWorld::canonical(6).unwrap()).unwrap();
         // Every backend consumes the same exact selected IDs within checkpoint bounds.
-        let mut config = NativeExpertServiceConfig { encoder: None, audio_encoder: None,
+        let mut config = NativeExpertServiceConfig { attention: Default::default(), encoder: None, audio_encoder: None,
             library: "/native.so".into(), exl3_aot_dir: None, exl3_schedule: Default::default(), fp8_package: None,
             snapshot: dir.path().into(), exlr8_manifest: None, exlr8_prefill_activations: Default::default(), rank: 0, world: 6, model_admission: None, selected_layers: None, capacity: 4096, device_budget: 121 << 30, max_frame_bytes: 64 << 20,
-            rdma_endpoints: 3, declared_world: cuteafd_transport::expert::SparkWorld::canonical(6).unwrap(), native_spark_roles: false, bf16_ingress: false };
+            rdma_endpoints: 3, declared_world: cuteafd_transport::expert::SparkWorld::canonical(6).unwrap(), native_spark_roles: super::NativeSparkRoles::None, bf16_ingress: false };
         let model = cuteafd_transport::worker_selection::ModelAdmission {
             executions: cuteafd_core::SparkExecutions::admit(&[80], 80, 80, 1, &[80]).unwrap(),
             endpoints: vec![cuteafd_core::SparkEndpoint { ring_depth: None, capacity: 80,
@@ -214,8 +214,26 @@ fn retained_workspace(before_device: usize, after_device: usize, resident: u64,
     Ok((workspace, u64::try_from(pinned)?))
 }
 
+fn worker_reconciliation_provenance(config: &NativeExpertServiceConfig) -> serde_json::Value {
+    use sha2::{Digest, Sha256};
+    let hash = |path: &std::path::Path| -> Option<String> {
+        let mut file = std::fs::File::open(path).ok()?;
+        let mut digest = Sha256::new();
+        std::io::copy(&mut file, &mut digest).ok()?;
+        Some(format!("{:x}", digest.finalize()))
+    };
+    let programs = config.library.parent().map(|path| path.join("../share/PROGRAMS.json"));
+    serde_json::json!({"native_sha256": hash(&config.library),
+        "programs_sha256": programs.as_deref().and_then(hash),
+        "snapshot": config.snapshot, "rank": config.rank, "world": config.world,
+        "capacity": config.capacity, "selected_layers": config.selected_layers,
+        "source_commit": env!("CUTEAFD_BUILD_COMMIT"), "source_dirty": env!("CUTEAFD_BUILD_DIRTY"),
+        "toolchain": env!("CUTEAFD_BUILD_TOOLCHAIN")})
+}
+
 fn measured_worker_runtime(library: &NativeLibrary,
-    baseline: &cuteafd_ffi::memory_ledger::Snapshot, resident: u64, census: &super::census::Census)
+    baseline: &cuteafd_ffi::memory_ledger::Snapshot, resident: u64, census: &super::census::Census,
+    config: &NativeExpertServiceConfig, baseline_allocatable: Option<(usize, usize)>)
     -> Result<cuteafd_core::SparkRuntimeInventory> {
     use cuteafd_ffi::memory_ledger::{self, Space};
     let device = library.cuda_get_device()?;
@@ -225,8 +243,27 @@ fn measured_worker_runtime(library: &NativeLibrary,
     let (workspace_bytes, pinned_workspace_bytes) = retained_workspace(
         baseline.total(Space::Device, device), retained.total(Space::Device, device), resident,
         baseline.total(Space::Pinned, -1), retained.total(Space::Pinned, -1))?;
-    Ok(cuteafd_core::SparkRuntimeInventory { detail: census.detail(baseline, &retained, device)?, sample: inventory.gpus.into_iter().next()
-        .context("worker runtime sample missing")?, workspace_bytes, pinned_workspace_bytes })
+    let sample = inventory.gpus.into_iter().next().context("worker runtime sample missing")?;
+    let mut detail = census.detail(baseline, &retained, device)?;
+    let (free, total) = library.cuda_physical_memory_info()?;
+    detail.memory_reconciliation = Some(serde_json::json!({"schema_version": 1,
+        "cuda_free_bytes": free, "cuda_total_bytes": total, "cuda_used_bytes": total.saturating_sub(free),
+        "admission_free_bytes": sample.free_bytes, "admission_total_bytes": sample.total_bytes,
+        "baseline_allocatable_free_bytes": baseline_allocatable.map(|(free, _)| free),
+        "baseline_allocatable_total_bytes": baseline_allocatable.map(|(_, total)| total),
+        "baseline_phase": "post-media before expert modules and weights; same boundary as retained-owner ledger",
+        "baseline_unavailable_reason": baseline_allocatable.is_none().then_some("pre-weight allocatable sample unavailable"),
+        "sample_phase": "retained owners before endpoint rings",
+        "endpoint_rings_allocated": false,
+        "admission_measurement": "GB10 MemAvailable/cgroup-bounded headroom; discrete CUDA allocatable",
+        "cuda_measurement": "raw CUDA physical total minus free; not NVML; page cache may differ",
+        "device": device, "arch": sample.arch, "driver": sample.driver,
+        "source_commit": env!("CUTEAFD_BUILD_COMMIT"), "source_dirty": env!("CUTEAFD_BUILD_DIRTY"),
+        "toolchain": env!("CUTEAFD_BUILD_TOOLCHAIN"),
+        "provenance": worker_reconciliation_provenance(config),
+        "graph_capture_sites": [], "graph_status": "live worker Execution::launch uses eager execution; no capture/replay call sites"
+    }));
+    Ok(cuteafd_core::SparkRuntimeInventory { detail, sample, workspace_bytes, pinned_workspace_bytes })
 }
 
 struct Admission {
@@ -245,17 +282,20 @@ pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result
     );
     // The checkpoint fixes the process expert geometry before the native
     // library loads, so its helpers and every wire size agree with it.
-    let inventory = cuteafd_loader::plan::Checkpoint::inventory(&config.snapshot)?;
-    let v41 = cuteafd_loader::plan::family::detect(&inventory).is_some_and(|family| family.id() == "deepseek_v41");
+    let view = config.attention.select(&config.snapshot)?;
+    let inventory = cuteafd_loader::plan::Checkpoint::inventory_view(&view)?;
+    let family = cuteafd_loader::plan::family::detect(&inventory).map_or("", |family| family.id());
+    config.attention.validate_view(&view)?;
+    let v41 = family == "deepseek_v41";
     let mut catalog = if v41 {
         cuteafd_loader::read_official_v41_spark_catalog(&config.snapshot, config.rank, config.world)?
     } else {
-        cuteafd_loader::read_expert_catalog(&config.snapshot)?
+        cuteafd_loader::read_expert_catalog_view(&view)?
     };
     catalog.select_draft(cuteafd_loader::plan::spec::DraftOwnership::None)?;
     crate::shared::spark_topology::require_wire(config.spark_world()?, &catalog)?;
     let geometry = catalog.routed_experts().geometry()?;
-    config.native_spark_roles = catalog.exl3().is_none() && catalog.nvfp4().is_none() && catalog.fp8().is_none();
+    config.native_spark_roles = super::NativeSparkRoles::of(&catalog);
     cuteafd_core::set_expert_geometry(geometry).map_err(|fixed| {
         anyhow::anyhow!("expert geometry is already {fixed:?}; the checkpoint needs {geometry:?}")
     })?;
@@ -277,7 +317,7 @@ pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result
     // The vision owner loads in this process/device's primary CUDA context,
     // never beside expertd in a second process. Charge it before expert admission.
     let (_encoder, _audio_encoder, reserved) = crate::shared::vision::worker::start_encoders(
-        config.encoder.as_ref(), config.audio_encoder.as_ref(), &config.snapshot,
+        config.encoder.as_ref(), config.audio_encoder.as_ref(), &view,
         config.library.clone(), config.device_budget as u64)?;
     census.sample("after_media_owners_before_expert_bootstrap", None)?;
     config.device_budget = config.device_budget.checked_sub(usize::try_from(reserved)?)
@@ -303,8 +343,8 @@ pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result
             }
         };
         let selected = (|| -> Result<_> {
-            let identity = cuteafd_transport::worker_selection::WorkerIdentity::from_snapshot_manifest(
-                &config.snapshot, geometry, config.spark_world()?, config.exlr8_manifest.as_deref())?;
+            let identity = cuteafd_transport::worker_selection::WorkerIdentity::from_view(
+                &view, geometry, config.spark_world()?, config.exlr8_manifest.as_deref())?;
             selection.validate_for(&identity)?;
             admit_worker_selection(&mut config, &selection, &catalog)?;
             Ok(selection)
@@ -322,7 +362,7 @@ pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result
                     library.release_sync_h2d_staging()?;
                     let baseline = cuteafd_ffi::memory_ledger::snapshot();
                     Some(cuteafd_core::ModelAdmissionResponse { rank: u32::try_from(config.rank)?,
-                        resident_bytes: 0, slices: vec![], runtime: measured_worker_runtime(&library, &baseline, 0, &census)?,
+                        resident_bytes: 0, slices: vec![], runtime: measured_worker_runtime(&library, &baseline, 0, &census, &config, None)?,
                         mapped_ring_bytes: 0, host_exchange_bytes: 0, row_indices_bytes: 0 })
                 };
                 cuteafd_transport::worker_selection::InstalledModelAdmission::new(config.rank, selection, report)
@@ -349,6 +389,7 @@ pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result
     library.release_sync_h2d_staging()?;
     // Existing media owners belong to the baseline, not expert residency/workspace.
     let baseline = cuteafd_ffi::memory_ledger::snapshot();
+    let baseline_allocatable = library.cuda_allocatable_memory_info().ok();
     census.sample("before_expert_modules", Some(&library))?;
     // Experts with a per-expert output norm reply per-expert partials through the
     // shared epilogue programs, which the image's PROGRAMS.json carries. The same
@@ -357,7 +398,8 @@ pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result
     let epilogue = Exl3Epilogue::for_catalog(&catalog);
     let partial_replies = epilogue == Exl3Epilogue::PartialReplies;
     let programs = (|| -> Result<_> {
-        if catalog.format() == cuteafd_loader::plan::checkpoint::CheckpointFormat::Exlr8 || partial_replies {
+        if catalog.format() == cuteafd_loader::plan::checkpoint::CheckpointFormat::Exlr8 || partial_replies
+            || cuteafd_core::spark_reply::requested().can_compress() {
             let path = config.library.parent().context("native library directory")?
                 .join("../share/PROGRAMS.json");
             Ok(Some(library.programs()?.with_manifest(&path)?))
@@ -478,7 +520,7 @@ pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result
                 let model = selection.model().context("worker selection requires typed model admission")?;
                 weights.validate_ingress(&library, model)?;
                 let (resident_bytes, slices) = weights.loaded_residency(&library, config.compiled_capacity()?)?;
-                let mut runtime = measured_worker_runtime(&library, &baseline, resident_bytes, &census)?;
+                let mut runtime = measured_worker_runtime(&library, &baseline, resident_bytes, &census, &config, baseline_allocatable)?;
                 runtime.detail.load_transient = weights.load_inventory();
                 runtime.detail.allocations.extend(weights.retained_host_inventory()?);
                 tracing::info!(target: "cuteafd::spark_memory", rank = config.rank,
@@ -574,6 +616,7 @@ pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result
     // logical intermediate this worker actually loaded. A captured log can then
     // be hashed and checked against the declared topology, instead of trusting a
     // hand-written value; the role comes from the same selection the loader used.
+    let reconciliation_provenance = worker_reconciliation_provenance(&config);
     let role = if config.exlr8_manifest.is_some() {
         None
     } else if catalog.exl3().is_some() {
@@ -668,7 +711,7 @@ pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result
             let mut received = false;
             let wait = (intake == 0 && !executions.iter().any(Execution::has_staged)
                 && wait_index == Some(index)).then_some(idle_wait);
-            let mut serve = Serve { config: &config, executor_id, spark_world: &spark_world, resident: &resident,
+            let mut serve = Serve { config: &config, executor_id, resident: &resident,
                 weights: &weights, exchange: &mut exchange, row_indices: &mut row_indices, skip_compute,
                 log_ingress: pending_steady_log };
             let result = {
@@ -676,7 +719,7 @@ pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result
                 // independently of each connection's required reply order.
                 let finished = match holding[index].front().copied() {
                     Some(unit) if queues.ready(unit) => connections[index].finish_deferred(|view, mapped, emit| {
-                        let response = Serve::device_response(view, mapped, executor_id, &config, &spark_world)?
+                        let response = Serve::device_response(view, mapped, executor_id, &config)?
                             .with_pace(queues.pace(unit));
                         emit(ProtocolV2ExecutorResponseRef::Device(response))
                     }).and_then(|()| {
@@ -741,7 +784,7 @@ pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result
                                 executions[earlier.owner].synchronize()?;
                                 queues.complete_ready(earlier.owner, &mut executions[earlier.owner])?;
                                 connections[index].finish_deferred(|view, mapped, emit| {
-                                    let response = Serve::device_response(view, mapped, executor_id, &config, &spark_world)?;
+                                    let response = Serve::device_response(view, mapped, executor_id, &config)?;
                                     emit(ProtocolV2ExecutorResponseRef::Device(response))
                                 })?;
                                 holding[index].pop_front();
@@ -767,6 +810,27 @@ pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result
                 Ok(processed) => {
                     progressed |= processed;
                     if processed && executed && pending_steady_log {
+                        if let (Ok((free, total)), Ok((admission_free, admission_total)), Ok(device)) = (
+                            library.cuda_physical_memory_info(), library.cuda_allocatable_memory_info(), library.cuda_get_device()) {
+                        let ledger = cuteafd_ffi::memory_ledger::snapshot();
+                        let charged = ledger.total(cuteafd_ffi::memory_ledger::Space::Device, device)
+                            + ledger.total(cuteafd_ffi::memory_ledger::Space::Managed, device);
+                        let measured = total.saturating_sub(free);
+                        tracing::info!(target: "cuteafd::spark_memory", record = %serde_json::json!({
+                            "schema_version": 1, "stage": "first_request", "rank": config.rank,
+                            "cuda_free_bytes": free, "cuda_total_bytes": total, "measured_bytes": measured,
+                            "admission_free_bytes": admission_free, "admission_total_bytes": admission_total,
+                            "charged_bytes": charged, "padding_bytes": 0,
+                            "measured_minus_charged_bytes": i128::try_from(measured).unwrap() - i128::try_from(charged).unwrap(),
+                            "charge_basis": "worker ledger backing owners only; planner charge available only at coordinator Ready",
+                            "planner_measured_minus_charged_bytes": null,
+                            "provenance": reconciliation_provenance,
+                            "graph_status": "eager worker execution; no live capture/replay sites",
+                            "method": "raw CUDA physical and admission allocatable samples side by side; no NVML"
+                        }), "Spark first-request memory reconciliation");
+                        } else {
+                            tracing::warn!(rank = config.rank, "Spark first-request CUDA reconciliation sample unavailable");
+                        }
                         if census.enabled() {
                             library.cuda_device_synchronize()?;
                             census.sample("steady_after_first_expert_request", Some(&library))?;
@@ -1006,7 +1070,6 @@ impl From<anyhow::Error> for ServeFailure {
 struct Serve<'s, 'w, 'a> {
     config: &'s NativeExpertServiceConfig,
     executor_id: u64,
-    spark_world: &'s SparkWorld,
     resident: &'s [usize],
     weights: &'w Weights<'a>,
     exchange: &'s mut HostExpertExchange,
@@ -1016,22 +1079,17 @@ struct Serve<'s, 'w, 'a> {
 }
 
 impl<'w, 'a> Serve<'_, 'w, 'a> {
-    fn parse<'v>(view: &'v cuteafd_transport::ExpertProtocolV2RequestView<'_>, config: &NativeExpertServiceConfig,
-        spark_world: &SparkWorld) -> Result<BackboneRequest<'v>> {
-        // A topology-bound worker admits only the ownership-aware request
-        // contract; every other family is a protocol mismatch, not a fallback.
-        match spark_world.ownership_topology() {
-            Some(topology) => BackboneRequest::parse_native_group(view.frame_bytes(), config.capacity, topology),
-            None => BackboneRequest::parse(view.frame_bytes(), config.capacity),
-        }
+    fn parse<'v>(view: &'v cuteafd_transport::ExpertProtocolV2RequestView<'_>, config: &NativeExpertServiceConfig)
+        -> Result<BackboneRequest<'v>> {
+        BackboneRequest::parse(view.frame_bytes(), config.capacity)
     }
 
     /// The device response a launched request writes into its send slot.
     fn device_response(view: &cuteafd_transport::ExpertProtocolV2RequestView<'_>,
         mapped: cuteafd_transport::ProtocolV2RequestDevicePayload, executor_id: u64,
-        config: &NativeExpertServiceConfig, spark_world: &SparkWorld)
+        config: &NativeExpertServiceConfig)
         -> Result<cuteafd_transport::ExpertProtocolV2DeviceResponseRef<'static>> {
-        let request = Self::parse(view, config, spark_world)?;
+        let request = Self::parse(view, config)?;
         let slot = mapped.response_slot.context("deferred request lost its response slot")?;
         let prefix = cuteafd_transport::EXPERT_PROTOCOL_V2_RESPONSE_HEADER_LEN;
         let bytes = request.plane_bytes()?;
@@ -1051,7 +1109,7 @@ impl<'w, 'a> Serve<'_, 'w, 'a> {
         if view.header.row_count > self.config.capacity || self.skip_compute || mapped.response_slot.is_none() {
             return Ok(false);
         }
-        let request = Self::parse(view, self.config, self.spark_world)?;
+        let request = Self::parse(view, self.config)?;
         if !request.permits_device_response() { return Ok(false); }
         let layer = self.resident.binary_search(&(request.layer() as usize))
             .map_err(|_| anyhow::anyhow!("requested expert layer is not resident on this Spark"))?;
@@ -1080,7 +1138,7 @@ impl<'w, 'a> Serve<'_, 'w, 'a> {
             emit(ProtocolV2ExecutorResponseRef::Host(response))?;
             return Ok(Served { executed: false });
         }
-        let request = Self::parse(view, config, self.spark_world)?;
+        let request = Self::parse(view, config)?;
         if self.log_ingress {
             tracing::info!(rank = config.rank, ingress_dtype = ?view.header.hidden_dtype,
                 capacity = config.capacity, "Spark endpoint ingress geometry");

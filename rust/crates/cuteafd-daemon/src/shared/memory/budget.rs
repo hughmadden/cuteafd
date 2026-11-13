@@ -1,54 +1,28 @@
 //! Checked byte and reservation inputs shared by native startup admission.
 use anyhow::{Context, Result, ensure};
-use std::{fmt, str::FromStr};
+use std::{fmt, str::FromStr, sync::OnceLock};
+use cuteafd_loader::placement::ResidentWeights;
 
+static RESIDENT_WEIGHT_LIMIT: OnceLock<ResidentWeights> = OnceLock::new();
+
+pub(crate) fn set_resident_weight_limit(limit: ResidentWeights) -> Result<()> {
+    ensure!(limit.0 > 0, "coordinator resident-weight limit must be positive");
+    RESIDENT_WEIGHT_LIMIT.set(limit)
+        .map_err(|_| anyhow::anyhow!("coordinator resident-weight limit is already installed"))
+}
+
+pub(crate) fn resident_weight_limit() -> ResidentWeights {
+    RESIDENT_WEIGHT_LIMIT.get().copied().unwrap_or(ResidentWeights::DEFAULT_LIMIT)
+}
+
+/// A positive byte size (`--kv-pool-size`), through the one shared memory-size
+/// parser (`cuteafd_core::memory_policy::Size`: B, MB, GB, MiB, GiB).
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ByteSize(pub usize);
-#[derive(Clone, Copy, Debug)]
-pub(crate) enum Reservation {
-    Bytes(ByteSize),
-    Percent(u64), // millionths of one percent
-}
-fn decimal(value: &str) -> Result<u64> {
-    let (whole, fraction) = value.split_once('.').unwrap_or((value, ""));
-    ensure!(
-        !whole.is_empty()
-            && whole.bytes().all(|c| c.is_ascii_digit())
-            && fraction.len() <= 6
-            && fraction.bytes().all(|c| c.is_ascii_digit()),
-        "expected a positive decimal with at most six fractional digits"
-    );
-    let whole: u64 = whole.parse()?;
-    let fractional: u64 = if fraction.is_empty() {
-        0
-    } else {
-        fraction.parse()?
-    };
-    let scaled = whole
-        .checked_mul(1_000_000)
-        .and_then(|v| v.checked_add(fractional * 10u64.pow(6 - fraction.len() as u32)))
-        .context("memory size overflow")?;
-    ensure!(scaled > 0, "memory size must be positive");
-    Ok(scaled)
-}
 impl FromStr for ByteSize {
     type Err = anyhow::Error;
     fn from_str(value: &str) -> Result<Self> {
-        let value = value.trim();
-        let end = value
-            .find(|c: char| !c.is_ascii_digit() && c != '.')
-            .unwrap_or(value.len());
-        let amount = decimal(&value[..end])?;
-        let unit = value[end..].trim().to_ascii_lowercase();
-        let multiplier: u128 = match unit.as_str() {
-            "" | "b" => 1,
-            "mb" => 1_000_000,
-            "gb" => 1_000_000_000,
-            "mib" => 1_048_576,
-            "gib" => 1_073_741_824,
-            _ => anyhow::bail!("memory size unit must be B, MB, GB, MiB or GiB"),
-        };
-        let bytes = usize::try_from(u128::from(amount) * multiplier / 1_000_000)?;
+        let bytes = usize::try_from(value.parse::<cuteafd_core::memory_policy::Size>()?.0)?;
         ensure!(bytes > 0, "memory size rounds to zero bytes");
         Ok(Self(bytes))
     }
@@ -56,34 +30,6 @@ impl FromStr for ByteSize {
 impl fmt::Display for ByteSize {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}B", self.0)
-    }
-}
-impl FromStr for Reservation {
-    type Err = anyhow::Error;
-    fn from_str(value: &str) -> Result<Self> {
-        if let Some(percent) = value.trim().strip_suffix('%') {
-            let percent = decimal(percent.trim())?;
-            ensure!(
-                percent <= 100_000_000,
-                "memory percentage must be in (0,100]"
-            );
-            Ok(Self::Percent(percent))
-        } else {
-            Ok(Self::Bytes(value.parse()?))
-        }
-    }
-}
-impl Reservation {
-    pub(crate) fn bytes(self, total: usize) -> Result<usize> {
-        let bytes = match self {
-            Self::Bytes(size) => size.0,
-            Self::Percent(percent) => (total as u128 * u128::from(percent) / 100_000_000) as usize,
-        };
-        ensure!(
-            bytes > 0 && bytes <= total,
-            "memory reservation exceeds device total or rounds to zero"
-        );
-        Ok(bytes)
     }
 }
 
@@ -131,6 +77,7 @@ pub(crate) fn serving_concurrency(requested: Option<usize>, native_lib: &std::pa
         let library = unsafe { cuteafd_ffi::NativeLibrary::load(native_lib) }?;
         Ok(library.cuda_device_info(device)?.total_memory_bytes)
     })?;
+    cuteafd_bench::context::set_resolved("max-sequences", &concurrency.to_string());
     tracing::info!(concurrency, "resolved boot-time serving concurrency");
     Ok(concurrency)
 }
@@ -160,15 +107,30 @@ pub(crate) fn admit_host_memory_with_resident_formulas(cache: u64, tables: &[(&s
     -> Result<cuteafd_core::memory_layout::HostLayout> {
     let memory = cuteafd_loader::formats::mapped_preload::host_memory()?;
     let snapshot = cuteafd_ffi::memory_ledger::snapshot();
-    let mut resident = host_resident_items(snapshot.by_scope(cuteafd_ffi::memory_ledger::Space::Pinned, -1), formulas);
+    let mut resident = host_resident_items(pinned_by_label(&snapshot), formulas);
     // One singleton serves every mapped table and GPU owner in this process.
     // Its reusable buffers are lazy, so retain the full future reservation.
     append_table_reactor(&mut resident, usize::from(
         cuteafd_loader::formats::mapped_table::table_reactor_started()));
     let ledger = host_admission(memory, resident, cache, tables, deferred_logits, headroom)?;
+    cuteafd_ffi::memory_ledger::fault::set_inputs(serde_json::json!({"host_admission": ledger}));
     tracing::info!(host_budget_bytes = cache, host_ledger = %serde_json::to_string(&ledger)?,
         "coordinator host memory admitted");
     Ok(ledger)
+}
+
+/// Pinned bytes by ledger label, each with its kind's planner category: the
+/// recorded tag is mandatory for every physical backing.
+fn pinned_by_label(snapshot: &cuteafd_ffi::memory_ledger::Snapshot)
+    -> std::collections::BTreeMap<&'static str, (cuteafd_core::memory_layout::Category, usize)> {
+    use cuteafd_core::memory_layout::Category;
+    let mut out = std::collections::BTreeMap::new();
+    for row in snapshot.rows.iter().filter(|r| r.key.space == cuteafd_ffi::memory_ledger::Space::Pinned) {
+        let category = row.key.tag.kind.category();
+        let entry = out.entry(row.key.scope).or_insert((category, 0));
+        entry.1 += row.bytes;
+    }
+    out
 }
 
 fn append_table_reactor(items: &mut Vec<cuteafd_core::memory_layout::Item>, mapped_tables: usize) {
@@ -180,12 +142,12 @@ fn append_table_reactor(items: &mut Vec<cuteafd_core::memory_layout::Item>, mapp
     }
 }
 
-fn host_resident_items(pinned: std::collections::BTreeMap<&'static str, usize>, formulas: &[(&str, u64)])
-    -> Vec<cuteafd_core::memory_layout::Item> {
+fn host_resident_items(pinned: std::collections::BTreeMap<&'static str, (cuteafd_core::memory_layout::Category, usize)>,
+    formulas: &[(&str, u64)]) -> Vec<cuteafd_core::memory_layout::Item> {
     use cuteafd_core::memory_layout::{Basis, Category, Item};
     let mut items: Vec<_> = pinned.into_iter()
         .filter(|(scope, _)| !formulas.iter().any(|&(name, _)| name == *scope))
-        .map(|(scope, bytes)| Item::new(Category::of_scope(scope), scope, "pinned", bytes as u64, Basis::Exact))
+        .map(|(scope, (category, bytes))| Item::new(category, scope, "pinned", bytes as u64, Basis::Exact))
         .collect();
     items.extend(formulas.iter().map(|&(name, bytes)| Item::new(Category::Staging, name,
         "pinned payload + pageable sort tuples", bytes, Basis::Formula)));
@@ -252,7 +214,7 @@ mod tests {
                 let payload = shape.slot_bytes().sum::<usize>() as u64;
                 let workspace = shape.workspace_bytes as u64;
                 let items = host_resident_items(std::collections::BTreeMap::from([
-                    ("mapped-table", payload as usize)]), &[]);
+                    ("mapped-table", (Category::Staging, payload as usize))]), &[]);
                 let demands = [("staging/mapped-table-worker", workspace)];
                 let ledger = host_admission((2 << 30, 1 << 30), items.clone(), 0, &demands, 0, 0)?;
                 assert_eq!((ledger.resident_bytes, ledger.deferred_bytes), (payload, workspace));
@@ -275,9 +237,9 @@ mod tests {
             let formulas = [("v41/engram-prefill", shape.host_resident_bytes() as u64),
                 ("v41/engram-decode", shape.decode_host_resident_bytes() as u64)];
             let pinned = std::collections::BTreeMap::from([
-                ("v41/engram-prefill", shape.host_slots() * rows * 6337),
-                ("v41/engram-decode", shape.decode_slots() * shape.decode_rows() * 6337),
-                ("unrelated/pinned", 7)]);
+                ("v41/engram-prefill", (Category::Staging, shape.host_slots() * rows * 6337)),
+                ("v41/engram-decode", (Category::Staging, shape.decode_slots() * shape.decode_rows() * 6337)),
+                ("unrelated/pinned", (Category::Staging, 7))]);
             let items = host_resident_items(pinned, &formulas);
             assert_eq!(items.len(), 3);
             for &(name, bytes) in &formulas {
@@ -391,17 +353,6 @@ mod tests {
             "18446744073709551616GB",
         ] {
             assert!(value.parse::<ByteSize>().is_err(), "{value}");
-        }
-        assert_eq!(
-            "87.5%"
-                .parse::<Reservation>()
-                .unwrap()
-                .bytes(8_000_000_000)
-                .unwrap(),
-            7_000_000_000
-        );
-        for value in ["0%", "100.1%", "inf%"] {
-            assert!(value.parse::<Reservation>().is_err());
         }
     }
 }

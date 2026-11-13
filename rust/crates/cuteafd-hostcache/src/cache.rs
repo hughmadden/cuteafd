@@ -746,6 +746,11 @@ impl<E: CopyEngine, P> HostCache<E, P> {
         &self.config
     }
 
+    /// Read retained copy-provider storage without polling or mutating the cache.
+    pub fn engine(&self) -> &E {
+        &self.engine
+    }
+
     pub fn engine_mut(&mut self) -> &mut E {
         &mut self.engine
     }

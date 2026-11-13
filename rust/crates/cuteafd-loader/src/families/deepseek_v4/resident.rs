@@ -2,7 +2,7 @@
 //! the CUDA loader. Attention ownership never moves the split FFN operands.
 use super::DeepseekV4Config;
 use anyhow::{ensure, Context, Result};
-use crate::{placement::{FfnMode, LayerMode, ModeBytes}, SafetensorsTensorMetadata};
+use crate::{placement::{FfnMode, LayerMode}, SafetensorsTensorMetadata};
 use std::collections::BTreeMap;
 
 #[derive(Debug, Clone, Copy)]
@@ -259,39 +259,6 @@ pub fn resident_operands<'a>(cfg: &DeepseekV4Config, modes: &[LayerMode], ranks:
     Ok(out)
 }
 
-/// C4 attention costs, independent of the invariant FFN/head/drafter baseline.
-/// Feeding these to the shared solver balances real owner-local weights.
-pub fn attention_costs<'a>(cfg: &DeepseekV4Config, ranks: usize,
-    tensors: impl IntoIterator<Item = &'a SafetensorsTensorMetadata>) -> Result<Vec<ModeBytes>> {
-    let tensors = tensors.into_iter().collect::<Vec<_>>();
-    let modes = vec![if ranks == 1 { LayerMode::Whole { gpu: 0, ffn: FfnMode::Owner } }
-        else { LayerMode::HeadSplit }; cfg.n_layers];
-    let split = resident_operands(cfg, &modes, ranks, false, tensors.iter().copied())?;
-    let mut modes_whole = modes;
-    if ranks == 2 {
-        for (layer, &ratio) in cfg.compress_ratios.iter().enumerate() {
-            if ratio == 4 { modes_whole[layer] = LayerMode::Whole { gpu: 0, ffn: FfnMode::Split }; }
-        }
-    }
-    let whole = resident_operands(cfg, &modes_whole, ranks, false, tensors)?;
-    let mut costs = vec![ModeBytes::default(); cfg.n_layers];
-    for item in split.iter().filter(|i| i.attention) {
-        let layer = item.layer.context("V4 attention without layer")?;
-        if cfg.compress_ratios[layer] == 4 {
-            costs[layer].split[item.rank] = costs[layer].split[item.rank].checked_add(item.bytes)
-                .context("V4 split attention weight overflow")?;
-        }
-    }
-    for item in whole.iter().filter(|i| i.attention && i.rank == 0) {
-        let layer = item.layer.context("V4 attention without layer")?;
-        if cfg.compress_ratios[layer] == 4 {
-            costs[layer].whole = costs[layer].whole.checked_add(item.bytes)
-                .context("V4 whole attention weight overflow")?;
-        }
-    }
-    Ok(costs)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -340,6 +307,67 @@ mod tests {
     }
 
     #[test]
+    fn arenas_cover_selected_tp1_tp2_modes_and_final_formats() -> Result<()> {
+        use super::super::weight_arena::{coordinator_arena, operand_name};
+        let (cfg, tensors) = fixture();
+        for ranks in [1, 2] {
+            for owner in 0..ranks {
+                let mut modes = vec![if ranks == 1 {
+                    LayerMode::Whole { gpu: 0, ffn: FfnMode::Owner }
+                } else { LayerMode::HeadSplit }; cfg.n_layers];
+                if ranks == 2 { modes[1] = LayerMode::Whole { gpu: owner as u8, ffn: FfnMode::Split }; }
+                for draft in [false, true] {
+                    let operands = resident_operands(&cfg, &modes, ranks, draft, &tensors)?;
+                    for rank in 0..ranks {
+                        for scope in [false, true] {
+                            let arena = coordinator_arena(&operands, rank, scope, true)?;
+                            let items = operands.iter().filter(|i| i.rank == rank && (i.group == "speculator") == scope)
+                                .collect::<Vec<_>>();
+                            assert_eq!(arena.is_some(), !items.is_empty());
+                            if let Some(arena) = arena {
+                                assert_eq!(arena.views().len(), items.len());
+                                for item in items {
+                                    assert_eq!(arena.view(&operand_name(item)).unwrap().bytes() as u64, item.bytes);
+                                }
+                                assert!(!arena.views().keys().any(|k| k.contains("confidence_head")));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "header-only installed V4 CPU allocation inventory; set CUTEAFD_V4_ARENA_SNAPSHOT"]
+    fn installed_v4_arena_cpu_inventory() -> Result<()> {
+        use super::super::weight_arena::coordinator_arena;
+        let snapshot = std::path::PathBuf::from(std::env::var("CUTEAFD_V4_ARENA_SNAPSHOT")?);
+        let cfg = DeepseekV4Config::read(&snapshot, 1)?;
+        let catalog = crate::read_expert_catalog(&snapshot)?;
+        for ranks in [1, 2] {
+            let modes = vec![if ranks == 1 { LayerMode::Whole { gpu: 0, ffn: FfnMode::Owner } }
+                else { LayerMode::HeadSplit }; cfg.n_layers];
+            let operands = resident_operands(&cfg, &modes, ranks, true, catalog.tensors().iter().map(|t| &t.metadata))?;
+            for rank in 0..ranks {
+                for draft in [false, true] {
+                    let Some(arena) = coordinator_arena(&operands, rank, draft, true)? else { continue; };
+                    let extents = arena.views().values().map(|v| v.bytes()).collect::<Vec<_>>();
+                    let large = extents.iter().copied().filter(|&b| b > 1 << 20).collect::<Vec<_>>();
+                    let tail = |bytes: usize| if bytes > 1 << 20 { bytes.next_multiple_of(2 << 20) - bytes } else { 0 };
+                    let charged = crate::placement::planner::allocation_granularity_forecast(&[arena.bytes() as u64])
+                        .map_err(|e| anyhow::anyhow!("{e}"))?;
+                    println!("V4_ARENA ranks={ranks} rank={rank} draft={draft} count={} payload={} large_count={} large_bytes={} old_tail={} arena={} padding={} final_tail={} charged_tail={charged}",
+                        extents.len(), arena.payload_bytes(), large.len(), large.iter().sum::<usize>(),
+                        large.iter().map(|&b| tail(b)).sum::<usize>(), arena.bytes(), arena.padding_bytes(), tail(arena.bytes()));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
     fn whole_c4_keeps_ffn_halves_and_removes_every_nonowner_attention_operand() -> Result<()> {
         let (cfg, tensors) = fixture();
         let split_modes = vec![LayerMode::HeadSplit; cfg.n_layers];
@@ -381,46 +409,143 @@ mod tests {
     }
 
     #[test]
-    fn c4_mode_costs_are_real_inventory_not_hidden_baseline() -> Result<()> {
+    fn admitted_arenas_equal_every_mode_the_runtime_can_select() -> Result<()> {
+        use super::super::weight_arena::coordinator_arena;
         let (cfg, tensors) = fixture();
-        let costs = attention_costs(&cfg, 2, &tensors)?;
-        for (layer, cost) in costs.iter().enumerate() {
-            if cfg.compress_ratios[layer] == 4 {
-                assert!(cost.whole > cost.split[0]);
-                assert!(cost.whole < cost.split.iter().sum());
-                assert_eq!(cost.split[0], cost.split[1]);
-            } else { assert_eq!(*cost, ModeBytes::default()); }
+        for ranks in [1, 2] {
+            for dspark in [false, true] {
+                for embedding in [false, true] {
+                    let weights = WeightInventory::from_headers(&cfg, ranks, dspark, embedding, &tensors)?;
+                    assert_eq!(weights.target.len(), ranks);
+                    assert_eq!(weights.draft.is_some(), dspark);
+                    let mut selected = vec![admitted_modes(&cfg, ranks)];
+                    if ranks == 2 {
+                        selected.push(cfg.compress_ratios.iter().map(|&ratio| if ratio == 4 {
+                            LayerMode::ContextSplit } else { LayerMode::HeadSplit }).collect());
+                    }
+                    for modes in selected {
+                        let operands = resident_operands(&cfg, &modes, ranks, dspark, &tensors)?;
+                        for (rank, admitted) in weights.target.iter().enumerate() {
+                            assert_eq!(coordinator_arena(&operands, rank, false, embedding)?.as_ref(), Some(admitted));
+                            assert_eq!(admitted.id(), format!("v4/target/{rank}"));
+                        }
+                        assert_eq!(coordinator_arena(&operands, 0, true, false)?, weights.draft);
+                    }
+                    let totals = (0..ranks).map(|rank| weights.target[rank].bytes() as u64
+                        + if rank == 0 { weights.draft.as_ref().map_or(0, |d| d.bytes() as u64) } else { 0 })
+                        .collect::<Vec<_>>();
+                    assert_eq!(weights.loaded_bytes()?, totals);
+                    assert!(weights.target.iter().enumerate().all(|(rank, arena)|
+                        arena.views().contains_key("embedding.table") == (embedding && rank == 0)));
+                }
+            }
         }
         Ok(())
     }
 
     #[test]
-    fn explicit_weight_demands_equal_upload_inventory_under_both_owners() -> Result<()> {
+    fn startup_keeps_host_owners_out_of_gpu_and_charges_only_device_scratch() {
+        use crate::shared::dense_read::STEP_BYTES;
         let (cfg, tensors) = fixture();
-        let weights = WeightInventory::from_headers(&cfg, 2, true, &tensors)?;
-        assert!(weights.fixed.iter().any(|d| d.gpu == 0 && d.group == "V4 speculator weights"));
-        assert!(!weights.fixed.iter().any(|d| d.gpu == 1 && d.group == "V4 speculator weights"));
-        for owner in 0..2 {
-            let mut modes = vec![LayerMode::HeadSplit; cfg.n_layers];
-            modes[1] = LayerMode::Whole { gpu: owner, ffn: FfnMode::Split };
-            let inventory = resident_operands(&cfg, &modes, 2, true, &tensors)?;
-            let totals = (0..2).map(|rank| inventory.iter().filter(|i|
-                i.rank == rank && i.group != "embedding").map(|i| i.bytes).sum()).collect::<Vec<u64>>();
-            assert_eq!(weights.loaded_bytes(&modes, 2)?, totals);
+        for ranks in [1, 2] {
+            for dspark in [false, true] {
+                let weights = WeightInventory::from_headers(&cfg, ranks, dspark, true, &tensors).unwrap();
+                let phases = weights.startup.device_phases(ranks).unwrap();
+                assert_eq!(phases.len(), ranks);
+                for rank in 0..ranks {
+                    assert_eq!(phases[rank].bytes, STEP_BYTES as u64);
+                }
+                assert_eq!(weights.startup.host.iter().filter(|item| item.name == "weight-push").count(), ranks);
+                assert!(weights.startup.host_bytes().unwrap() >= ranks as u64 * 128 * 1024 * 1024);
+                assert!(weights.startup.host.iter().any(|item| item.name == "staging/coordinator-dense-status" && item.bytes == 4));
+            }
         }
+    }
+
+    #[test]
+    fn expert_startup_names_native_draft_and_tp2_groups_without_charging_gpu() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        crate::plan::testing::write_v4_snapshot_with_dspark(root.path(), 3);
+        let input = crate::plan::PlanInput::open(root.path())?;
+        let catalog = input.expert_catalog()?;
+        let tp2 = crate::placement::Tp2Range { first: 1, layers: 2, peak_bytes: [0; 2] };
+        let ring = (cuteafd_ffi::push_ring::DEFAULT_SLOTS * cuteafd_ffi::push_ring::DEFAULT_SLOT_BYTES) as u64;
+        for stages in [0, 3] {
+            for ranks in [1, 2] {
+                let whole = if ranks == 1 { vec![vec![1, 3]] } else { vec![vec![], vec![]] };
+                let mut startup = StartupInventory::default();
+                startup.add_selected_experts(catalog, stages, &whole, if ranks == 2 { Some(&tp2) } else { None }, false)?;
+                assert!(startup.device.is_empty());
+                assert!(startup.host.iter().filter(|item| item.name != "weight-push/coordinator-experts")
+                    .all(|item| item.bytes == 0)); // Native V4 lands scale bytes directly, without scale-code staging.
+                assert_eq!(startup.host_bytes()?, ring * (ranks as u64 + u64::from(ranks == 2 && stages > 0)));
+                assert!(startup.notes()?.iter().any(|note| note.contains("validation/coordinator-experts")));
+            }
+        }
+        let mut split = StartupInventory::default();
+        let stages_only = crate::placement::Tp2Range { layers: 0, ..tp2 };
+        split.add_selected_experts(catalog, 3, &[vec![], vec![]], Some(&stages_only), true)?;
+        assert_eq!(split.host_bytes()?, 2 * ring);
+        assert_eq!(split.host.iter().filter(|item| item.name == "weight-push/coordinator-experts")
+            .map(|item| item.bytes).collect::<Vec<_>>(), vec![ring; 2]);
+        let mut empty = StartupInventory::default();
+        empty.add_selected_experts(catalog, 0, &[vec![]], None, false)?;
+        assert!(empty.host.is_empty());
+        assert!(empty.add_selected_experts(catalog, 4, &[vec![]], None, false).is_err());
+        let bad = crate::placement::Tp2Range { first: usize::MAX, layers: 2, peak_bytes: [0; 2] };
+        assert!(empty.add_selected_experts(catalog, 0, &[vec![], vec![]], Some(&bad), false).is_err());
         Ok(())
     }
 
     #[test]
-    fn inventory_rejects_aggregate_weight_overflow() {
+    fn expert_startup_exl3_validation_matches_each_rank_residency() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        crate::plan::testing::write_v4_pro_exl3_snapshot(root.path());
+        let input = crate::plan::PlanInput::open(root.path())?;
+        let catalog = input.expert_catalog()?;
+        let tp2 = crate::placement::Tp2Range { first: 1, layers: 1, peak_bytes: [0; 2] };
+        let mut startup = StartupInventory::default();
+        startup.add_selected_experts(catalog, 0, &[vec![], vec![]], Some(&tp2), false)?;
+        for rank in 0..2 {
+            let residency = catalog.exl3().unwrap().residency(crate::V41Exl3Layer::Backbone(1), 2, rank)?;
+            let expected = residency.loads.iter().filter(|load| load.tensor.ends_with(".trellis")).count() as u64 * 4;
+            assert_eq!(startup.host.iter().find(|item| item.rank == rank
+                && item.name == "validation/coordinator-experts").unwrap().bytes, expected);
+        }
+        assert!(startup.device.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn expert_startup_coded_scales_bound_full_sources_and_per_group_tables() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        crate::plan::testing::write_v41_snapshot(root.path());
+        let input = crate::plan::PlanInput::open(root.path())?;
+        let catalog = input.expert_catalog()?;
+        assert!(catalog.mxfp4_scale_codes());
+        let layer = catalog.routed_experts().first_layer;
+        let mut startup = StartupInventory::default();
+        startup.add_selected_experts(catalog, 0, &[vec![layer]], None, false)?;
+        let mut expected = 0;
+        for expert in 0..catalog.routed_experts().experts {
+            let staging = catalog.expert_staging(crate::V41ExpertSelection::BackboneFull { layer, expert })?;
+            for slot in [4, 3, 5] { expected += catalog.tensor(&staging.tensor_names()[slot])?.metadata.byte_length; }
+        }
+        assert!(expected > 0);
+        assert_eq!(startup.host.iter().find(|item| item.name == "staging/coordinator-expert-scales").unwrap().bytes, expected);
+        assert_eq!(startup.host.iter().find(|item| item.name == "staging/coordinator-expert-scale-table").unwrap().bytes, 1 << 20);
+        assert!(startup.device.is_empty());
+        startup.host.push(StartupItem { rank: 0, name: "overflow", bytes: u64::MAX });
+        assert!(startup.host_bytes().is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn inventory_rejects_arena_extent_overflow() {
         let (cfg, mut tensors) = fixture();
-        tensors.iter_mut().find(|t| t.name == "layers.1.hc_attn_fn").unwrap().byte_length = u64::MAX - 1024;
-        let error = attention_costs(&cfg, 2, &tensors).unwrap_err();
-        assert!(error.to_string().contains("attention weight overflow"), "{error:#}");
-        tensors.iter_mut().find(|t| t.name == "layers.1.hc_attn_fn").unwrap().byte_length = 65_536;
         tensors.iter_mut().find(|t| t.name == "layers.0.hc_ffn_fn").unwrap().byte_length = u64::MAX - 1024;
-        let error = WeightInventory::from_headers(&cfg, 2, false, &tensors).unwrap_err();
-        assert!(error.to_string().contains("invariant weight overflow"), "{error:#}");
+        let error = WeightInventory::from_headers(&cfg, 2, false, true, &tensors).unwrap_err();
+        assert!(format!("{error:#}").contains("overflow"), "{error:#}");
     }
 
     #[test]
@@ -443,59 +568,187 @@ mod tests {
     }
 }
 
-/// Invariant weights are named fixed demands (head/drafter only on lead,
-/// shared FFN on both); C4 attention is a per-mode layer charge, not baseline.
-#[derive(Debug, Clone)]
+/// The retained coordinator weights admission charges: one target arena per
+/// rank and the optional lead-GPU dSpark arena, each exactly the layout the
+/// loader allocates. C4 attention ownership (whole vs split) never changes
+/// these extents: every admitted mode slices the same final operands.
+#[derive(Debug, Clone, Default)]
 pub struct WeightInventory {
-    pub c4_attention: Vec<ModeBytes>,
-    pub fixed: Vec<crate::placement::Demand>,
+    /// Target arena per rank: core, globals and the GPU embedding when selected.
+    pub target: Vec<crate::serving_capacity::WeightArenaLayout>,
+    /// The separately admitted and retired dSpark dense arena (lead GPU).
+    pub draft: Option<crate::serving_capacity::WeightArenaLayout>,
+    pub startup: StartupInventory,
+}
+
+/// Loading-only owners; host mappings must never consume the GPU budget.
+#[derive(Debug, Clone, Default)]
+pub struct StartupInventory {
+    pub device: Vec<StartupItem>,
+    pub host: Vec<StartupItem>,
+}
+
+#[derive(Debug, Clone)]
+pub struct StartupItem {
+    pub rank: usize,
+    pub name: &'static str,
+    pub bytes: u64,
+}
+
+impl StartupInventory {
+    fn from_operands(operands: &[ResidentOperand], ranks: usize) -> Result<Self> {
+        let mut inventory = Self::default();
+        for rank in 0..ranks {
+            let mut staged = 0u64;
+            let mut scratch = 0;
+            let mut status = 0;
+            for item in operands.iter().filter(|item| item.rank == rank) {
+                let source = if item.format == "fp8-mma-scale" {
+                    scratch = crate::shared::dense_read::STEP_BYTES as u64;
+                    item.bytes / 512
+                } else if item.operand == "gate.tid2eid" {
+                    status = 4;
+                    item.bytes.checked_mul(2).context("V4 startup IDs overflow")?
+                } else { 0 };
+                staged = staged.checked_add(source).context("V4 startup staging overflow")?;
+            }
+            // Retained operands are views of the RESIDENT arena admitted beside
+            // this group; only the device-side scale scratch is Load-only.
+            inventory.device.push(StartupItem { rank, name: "staging/coordinator-dense-device", bytes: scratch });
+            inventory.host.extend([
+                StartupItem { rank, name: "staging/coordinator-dense", bytes: staged },
+                StartupItem { rank, name: "staging/coordinator-dense-status", bytes: status },
+                StartupItem { rank, name: "weight-push", bytes:
+                    (cuteafd_ffi::push_ring::DEFAULT_SLOTS * cuteafd_ffi::push_ring::DEFAULT_SLOT_BYTES) as u64 },
+            ]);
+        }
+        Ok(inventory)
+    }
+
+    /// Sum independent startup groups conservatively, even though dense, whole
+    /// experts and TP2 experts receive sequentially. Host owners never enter VRAM.
+    pub fn add_experts(&mut self, catalog: &crate::OfficialV41Catalog, draft_stages: usize,
+        placement: &crate::placement::Placement, tp2_draft: bool) -> Result<()> {
+        let whole = (0..placement.expert_ranges.len()).map(|rank| placement.layers.iter().enumerate()
+            .filter_map(|(layer, home)| (home.experts == crate::placement::ExpertHome::RtxWhole { gpu: rank as u8 })
+                .then_some(layer)).collect::<Vec<_>>()).collect::<Vec<_>>();
+        self.add_selected_experts(catalog, draft_stages, &whole, placement.tp2.as_ref(), tp2_draft)
+    }
+
+    fn add_selected_experts(&mut self, catalog: &crate::OfficialV41Catalog, draft_stages: usize,
+        whole: &[Vec<usize>], tp2: Option<&crate::placement::Tp2Range>, tp2_draft: bool) -> Result<()> {
+        ensure!((1..=2).contains(&whole.len()), "V4 startup experts need one or two ranks");
+        ensure!(draft_stages <= catalog.routed_experts().draft_stages, "V4 startup draft stage out of range");
+        ensure!(tp2.is_none_or(|t| t.layers == 0 || whole.len() == 2), "V4 startup TP2 needs two ranks");
+        ensure!(!tp2_draft || (whole.len() == 2 && tp2.is_some() && draft_stages > 0), "V4 startup split draft needs two TP2 ranks and retained stages");
+        let ring = (cuteafd_ffi::push_ring::DEFAULT_SLOTS as u64)
+            .checked_mul(cuteafd_ffi::push_ring::DEFAULT_SLOT_BYTES as u64).context("V4 expert ring overflow")?;
+        for (rank, layers) in whole.iter().enumerate() {
+            let mut selections = layers.iter().map(|&layer| (false, layer)).collect::<Vec<_>>();
+            if rank == 0 && !tp2_draft { selections.extend((0..draft_stages).map(|stage| (true, stage))); }
+            let local_group = !selections.is_empty();
+            if tp2_draft { selections.extend((0..draft_stages).map(|stage| (true, stage))); }
+            if let Some(t) = tp2.filter(|t| t.layers > 0) {
+                let end = t.first.checked_add(t.layers).context("V4 expert range overflow")?;
+                ensure!(end <= catalog.routed_experts().layers, "V4 startup expert range out of bounds");
+                selections.extend((t.first..end).map(|layer| (false, layer)));
+            }
+            if selections.is_empty() { continue; }
+            let (mut scales, mut validation) = (0u64, 0u64);
+            for (draft, layer) in selections {
+                if let Some(manifest) = catalog.exl3() {
+                    ensure!(layer < if draft { manifest.experts.draft_stages } else { manifest.experts.layers },
+                        "V4 startup EXL3 layer out of bounds");
+                    // Every residency loads three trellis projections per expert;
+                    // ValidationLayout retains one four-byte multiplier for each.
+                    let experts = if draft { manifest.experts.draft_experts } else { manifest.experts.experts };
+                    let bytes = (experts as u64).checked_mul(3 * 4).context("V4 expert validation overflow")?;
+                    validation = validation.checked_add(bytes).context("V4 expert validation overflow")?;
+                } else if catalog.mxfp4_scale_codes() {
+                    let layer = if draft { catalog.routed_experts().layers.checked_add(layer)
+                        .context("V4 draft expert layer overflow")? } else { layer };
+                    // Full source tensors bound every TP slice and any receive order.
+                    for expert in 0..catalog.routed_experts().experts {
+                        let staging = catalog.expert_staging(crate::V41ExpertSelection::BackboneFull { layer, expert })?;
+                        for slot in [4, 3, 5] {
+                            scales = scales.checked_add(catalog.tensor(&staging.tensor_names()[slot])?.metadata.byte_length)
+                                .context("V4 expert scale source overflow")?;
+                        }
+                    }
+                }
+            }
+            let table = if scales == 0 { 0 } else {
+                (std::mem::size_of::<cuteafd_ffi::V41ScaleCodeJob>() as u64)
+                    .checked_add(8).context("V4 expert scale table overflow")?.max(1 << 20)
+            };
+            let groups = u64::from(local_group) + u64::from(tp2_draft || tp2.is_some_and(|t| t.layers > 0));
+            self.host.extend([
+                StartupItem { rank, name: "staging/coordinator-expert-scales", bytes: scales },
+                StartupItem { rank, name: "staging/coordinator-expert-scale-table", bytes: table.checked_mul(groups)
+                    .context("V4 expert scale tables overflow")? },
+                StartupItem { rank, name: "validation/coordinator-experts", bytes: validation },
+                StartupItem { rank, name: "weight-push/coordinator-experts", bytes: ring.checked_mul(groups)
+                    .context("V4 expert rings overflow")? },
+            ]);
+        }
+        self.host_bytes()?;
+        Ok(())
+    }
+
+    pub fn device_bytes(&self, rank: usize) -> Result<u64> {
+        self.device.iter().filter(|item| item.rank == rank).try_fold(0u64, |sum, item|
+            sum.checked_add(item.bytes).context("V4 startup device overflow"))
+    }
+
+    pub fn device_phases(&self, ranks: usize) -> Result<Vec<crate::placement::Demand>> {
+        use cuteafd_core::memory_layout::{Basis, Category};
+        (0..ranks).map(|rank| Ok(crate::placement::Demand::new(rank as u8, Category::Weights,
+            "V4 coordinator dense loading", self.device_bytes(rank)?, Basis::Exact))).collect()
+    }
+
+    pub fn host_bytes(&self) -> Result<u64> {
+        self.host.iter().try_fold(0u64, |sum, item|
+            sum.checked_add(item.bytes).context("V4 startup host overflow"))
+    }
+
+    pub fn notes(&self) -> Result<Vec<String>> {
+        let mut notes = self.device.iter().map(|item| format!(
+            "V4 startup device rtx{} {}: {} bytes (loading only)", item.rank, item.name, item.bytes))
+            .chain(self.host.iter().map(|item| format!(
+                "V4 startup host rank{} {}: {} bytes (loading only)", item.rank, item.name, item.bytes)))
+            .collect::<Vec<_>>();
+        notes.push(format!("V4 startup host bound: {} bytes; conservative staged source footprint, exact physical extents admitted at receive", self.host_bytes()?));
+        Ok(notes)
+    }
 }
 
 impl WeightInventory {
-    pub fn from_headers<'a>(cfg: &DeepseekV4Config, ranks: usize, dspark: bool,
+    /// The admitted arenas and startup owners. Every V4 mode on `ranks` GPUs
+    /// uploads the same final operands (head and context splits share one
+    /// slicing; TP1 is whole), so the layouts admission charges are the ones
+    /// the runtime allocates after selection.
+    pub fn from_headers<'a>(cfg: &DeepseekV4Config, ranks: usize, dspark: bool, device_embedding: bool,
         tensors: impl IntoIterator<Item = &'a SafetensorsTensorMetadata>) -> Result<Self> {
-        use cuteafd_core::memory_layout::{Basis, Category};
-        let tensors = tensors.into_iter().collect::<Vec<_>>();
-        let modes = vec![if ranks == 1 { LayerMode::Whole { gpu: 0, ffn: FfnMode::Owner } }
-            else { LayerMode::HeadSplit }; cfg.n_layers];
-        let operands = resident_operands(cfg, &modes, ranks, dspark, tensors.iter().copied())?;
-        let c4_attention = attention_costs(cfg, ranks, tensors)?;
-        let mut groups = BTreeMap::<(usize, String), u64>::new();
-        for item in operands {
-            if item.group == "embedding" || item.layer.is_some_and(|layer|
-                item.attention && cfg.compress_ratios[layer] == 4) { continue; }
-            let bytes = groups.entry((item.rank, format!("V4 {} weights", item.group))).or_default();
-            *bytes = bytes.checked_add(item.bytes).context("V4 invariant weight overflow")?;
-        }
-        let fixed = groups.into_iter().map(|((gpu, group), bytes)|
-            crate::placement::Demand::new(gpu as u8, Category::Weights, group, bytes, Basis::Exact)).collect();
-        Ok(Self { c4_attention, fixed })
+        let operands = resident_operands(cfg, &admitted_modes(cfg, ranks), ranks, dspark, tensors)?;
+        let target = (0..ranks).map(|rank| super::weight_arena::coordinator_arena(&operands, rank, false, device_embedding)?
+            .context("V4 target weight arena absent")).collect::<Result<Vec<_>>>()?;
+        let draft = super::weight_arena::coordinator_arena(&operands, 0, true, false)?;
+        let startup = StartupInventory::from_operands(&operands, ranks)?;
+        Ok(Self { target, draft, startup })
     }
 
-    /// Final uploaded non-embedding bytes for the selected owners. A post-load
-    /// CUDA sample is rebased by these exact bytes to avoid charging twice.
-    pub fn loaded_bytes(&self, modes: &[LayerMode], ranks: usize) -> Result<Vec<u64>> {
-        ensure!(modes.len() == self.c4_attention.len(), "V4 loaded weight mode count differs");
-        let mut bytes = vec![0u64; ranks];
-        for demand in &self.fixed {
-            let gpu = usize::from(demand.gpu);
-            ensure!(gpu < ranks, "V4 fixed weight on missing rank");
-            bytes[gpu] = bytes[gpu].checked_add(demand.bytes).context("V4 fixed weight overflow")?;
-        }
-        for (&mode, cost) in modes.iter().zip(&self.c4_attention) {
-            match mode {
-                LayerMode::HeadSplit | LayerMode::ContextSplit => {
-                    ensure!(ranks == 2, "V4 split weights need two ranks");
-                    for rank in 0..ranks { bytes[rank] = bytes[rank].checked_add(cost.split[rank])
-                        .context("V4 split weight overflow")?; }
-                }
-                LayerMode::Whole { gpu, .. } => {
-                    let gpu = usize::from(gpu);
-                    ensure!(gpu < ranks, "V4 weight owner absent");
-                    bytes[gpu] = bytes[gpu].checked_add(cost.whole).context("V4 owned weight overflow")?;
-                }
-            }
+    /// Retained arena bytes per rank, embedding included. A post-load CUDA
+    /// sample is rebased by these exact bytes to avoid charging twice.
+    pub fn loaded_bytes(&self) -> Result<Vec<u64>> {
+        let mut bytes = self.target.iter().map(|arena| arena.bytes() as u64).collect::<Vec<_>>();
+        if let Some(draft) = &self.draft {
+            bytes[0] = bytes[0].checked_add(draft.bytes() as u64).context("V4 drafter arena overflow")?;
         }
         Ok(bytes)
     }
+}
+
+/// The one mode set every V4 placement on `ranks` GPUs shares for weights.
+pub fn admitted_modes(cfg: &DeepseekV4Config, ranks: usize) -> Vec<LayerMode> {
+    vec![if ranks == 1 { LayerMode::Whole { gpu: 0, ffn: FfnMode::Owner } } else { LayerMode::HeadSplit }; cfg.n_layers]
 }

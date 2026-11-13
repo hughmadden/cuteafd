@@ -213,8 +213,10 @@ impl V41Exl3Manifest {
         ensure!((1..=8).contains(&world) && rank < world, "invalid EXL3 TP rank/world");
         let (draft, index, experts) = match layer {
             V41Exl3Layer::Backbone(index) => {
-                ensure!(index < self.experts.layers, "EXL3 backbone layer out of range");
-                (false, index, self.experts.experts)
+                if index < self.experts.layers { (false, index, self.experts.experts) } else {
+                    ensure!(self.experts.draft_experts == self.experts.experts && index - self.experts.layers < self.experts.draft_stages, "EXL3 backbone layer out of range");
+                    (true, index - self.experts.layers, self.experts.draft_experts)
+                }
             }
             V41Exl3Layer::Dspark(index) => {
                 ensure!(index < self.experts.draft_stages, "EXL3 dSpark stage out of range");
@@ -340,8 +342,10 @@ impl V41Exl3Manifest {
         let shape = self.experts;
         let (draft, index, experts) = match layer {
             V41Exl3Layer::Backbone(layer) => {
-                ensure!(layer < shape.layers, "EXL3 backbone layer out of range");
-                (false, layer, shape.experts)
+                if layer < shape.layers { (false, layer, shape.experts) } else {
+                    ensure!(shape.draft_experts == shape.experts && layer - shape.layers < shape.draft_stages, "EXL3 backbone layer out of range");
+                    (true, layer - shape.layers, shape.draft_experts)
+                }
             }
             V41Exl3Layer::Dspark(stage) => {
                 ensure!(stage < shape.draft_stages, "EXL3 dSpark stage out of range");
@@ -543,6 +547,35 @@ pub(super) mod tests {
             assert_eq!(manifest.resident_arena_bytes(layer, 1, 0, false)?,
                 manifest.residency(layer, 1, 0)?.device_arena_layout()?.1 as u64);
         }
+        Ok(())
+    }
+
+    #[test]
+    fn same_geometry_stage_absolute_ids_match_explicit_draft_residency() -> Result<()> {
+        let mut manifest = fixture_geometry(&[2, 3], 7168, 3072, 16);
+        manifest.experts.draft_stages = 1;
+        manifest.experts.draft_experts = manifest.experts.experts;
+        let draft = manifest.projections.values().cloned().map(|mut projection| {
+            projection.name = projection.name.replacen("layers.", "mtp.", 1);
+            (projection.name.clone(), projection)
+        }).collect::<Vec<_>>();
+        manifest.projections.extend(draft);
+        let absolute = V41Exl3Layer::Backbone(manifest.experts.layers);
+        let explicit = V41Exl3Layer::Dspark(0);
+        for rank in 0..2 {
+            let actual = manifest.residency(absolute, 2, rank)?;
+            let expected = manifest.residency(explicit, 2, rank)?;
+            assert!(matches!(actual.layer, V41Exl3Layer::Backbone(id) if id == manifest.experts.layers));
+            assert_eq!(actual.loads.iter().map(|l| &l.tensor).collect::<Vec<_>>(),
+                expected.loads.iter().map(|l| &l.tensor).collect::<Vec<_>>());
+            assert!(actual.loads.iter().all(|l| l.tensor.starts_with("mtp.0.")));
+            assert_eq!(manifest.resident_arena_bytes(absolute, 2, rank, false)?,
+                expected.device_arena_layout()?.1 as u64);
+        }
+        assert!(manifest.residency(V41Exl3Layer::Backbone(manifest.experts.layers + 1), 2, 0).is_err());
+        manifest.experts.draft_experts -= 1;
+        assert!(manifest.residency(absolute, 2, 0).is_err());
+        assert!(manifest.resident_arena_bytes(absolute, 2, 0, false).is_err());
         Ok(())
     }
 

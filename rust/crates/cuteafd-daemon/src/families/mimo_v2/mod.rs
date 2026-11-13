@@ -33,6 +33,12 @@ use std::time::Instant;
 /// What every MiMo command needs to stand up the engine.
 #[derive(Debug, Clone, clap::Args)]
 pub(crate) struct EngineArgs {
+    /// Count executed backbone expert routes by phase (disable with =false).
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set, num_args = 0..=1,
+        default_missing_value = "true", require_equals = true)]
+    pub expert_usage: bool,
+    #[arg(skip)]
+    pub expert_usage_reader: cuteafd_core::expert_usage::Reader,
     /// Packed prefill arithmetic policy. Unset: unrestricted serving, exact --packed-check.
     #[arg(long, value_enum)]
     pub prefill_packing: Option<crate::shared::prefill_packing::PackingMode>,
@@ -51,6 +57,9 @@ pub(crate) struct EngineArgs {
     pub manifest: PathBuf,
     #[arg(long, default_value_t = 0)]
     pub device: i32,
+    /// Already-loaded local media checkpoint owners, keyed by physical CUDA ordinal.
+    #[arg(skip)]
+    pub planner_media_weights: Option<(i32, cuteafd_loader::placement::ResidentWeights)>,
     /// Split every layer's attention heads (and the dense MLP) over --device
     /// and this second GPU (MiMo V2.6 Pro: 64 query / 4 KV heads each, KV
     /// partitioned), one hidden all-reduce per layer over peer memory. Routed
@@ -60,8 +69,8 @@ pub(crate) struct EngineArgs {
     /// Run only the first N layers (layer 0 is the only dense layer).
     #[arg(long)]
     pub layers: Option<usize>,
-    /// Longest sequence; 0 selects the checkpoint's full context.
-    #[arg(long, default_value_t = 0)]
+    /// Served context: auto fits the admitted pool; a positive count pins it.
+    #[arg(long = "max-context-tokens", default_value = "auto", value_parser = crate::shared::context::parse_tokens::<usize>)]
     pub max_context: usize,
     /// Tokens the full-attention record pool holds across sequences; 0 sizes
     /// it from what every GPU has left after weights, workspaces, graphs and
@@ -94,13 +103,6 @@ pub(crate) struct EngineArgs {
     /// Modules belong to the measured baseline; this cap is not reserved storage.
     #[arg(long, default_value_t = 1024)]
     pub runtime_reserve_mib: usize,
-    /// Calibrated conservative storage envelope per retained decode graph.
-    /// Different graph composition still needs its own startup memory gate.
-    #[arg(long, default_value_t = (cuteafd_loader::families::mimo_v2::decode_graph::MIMO_GRAPH_EXEC_BOUND_BYTES >> 10) as usize)]
-    pub decode_graph_reserve_kib: usize,
-    /// Separate provisional driver/rounding margin for the graph arena.
-    #[arg(long, default_value_t = (cuteafd_loader::families::mimo_v2::decode_graph::MIMO_GRAPH_DRIVER_MARGIN_BYTES >> 20) as usize)]
-    pub decode_graph_driver_reserve_mib: usize,
     /// Spark ranks in TP order (HOST:PORT,...) serving the fp8 expert family, for MoE layers.
     #[arg(long, conflicts_with = "local_experts")]
     pub peers: Option<String>,
@@ -117,6 +119,9 @@ pub(crate) struct EngineArgs {
     /// layers and drafts on this GPU.
     #[arg(long)]
     pub draft: Option<PathBuf>,
+    /// Split DFlash attention and FFN over both RTX ranks (default on with --split-device and --draft).
+    #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
+    pub tp2_dflash: bool,
     /// Native MTP drafter: run this many of the checkpoint's MTP stages
     /// (`model.mtp.layers.*`, 0 = off) after each next token.
     #[arg(long, default_value_t = 0)]
@@ -181,11 +186,11 @@ pub(crate) struct EngineArgs {
     #[arg(long, action = clap::ArgAction::Set)]
     pub fp8_o_proj: Option<bool>,
     /// Decode and verify steps replay one captured CUDA graph per layer segment
-    /// between the Spark exchanges (every 1..=64-row shape captured at startup).
-    /// Off by default: with the host-driven exchange the GPU, not the launches,
-    /// bounds each segment (same C1/C4 and step times, +0.4-1.2 GiB of graphs);
-    /// the segments are what a device-driven exchange captures as one step.
-    #[arg(long, default_value_t = false, action = clap::ArgAction::Set, env = "CUTEAFD_MIMO_DECODE_GRAPHS")]
+    /// between the Spark exchanges. Startup captures the checked-in prewarm
+    /// list for the checkpoint and layout inside one bounded reserve per device;
+    /// any other shape captures on a miss or runs eagerly. On by default after
+    /// clean adaptive mixed-content qualification; explicit false disables it.
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set, env = "CUTEAFD_MIMO_DECODE_GRAPHS")]
     pub decode_graphs: bool,
     /// Expert input rows sent to the Spark ranks: FP8 K32 wire rows, BF16
     /// (the ranks load the `fp8-mimo-bf16` package too), or BF16 for decode
@@ -217,6 +222,10 @@ pub(crate) enum DraftRepresentationArg {
 pub(crate) enum WeightPolicyArg { Auto, Checkpoint }
 
 impl EngineArgs {
+    fn expert_usage_enabled(&self) -> Result<bool> {
+        self.expert_usage_reader.configure(self.expert_usage, self.skip_experts).map_err(anyhow::Error::msg)
+    }
+
     fn draft_storage(&self) -> Result<MimoDraftRepresentation> {
         match self.draft_representation {
             Some(DraftRepresentationArg::Checkpoint) => {
@@ -271,6 +280,23 @@ mod draft_storage_tests {
     }
 
     #[test]
+    fn expert_usage_defaults_on_and_explicit_off_or_skipped_stays_disabled() {
+        let default = args(&[]);
+        assert!(default.expert_usage);
+        assert!(default.expert_usage_enabled().unwrap());
+        assert_eq!(default.expert_usage_reader.snapshot()["enabled"], false);
+        let off = args(&["--expert-usage=false"]);
+        assert!(!off.expert_usage_enabled().unwrap());
+        assert!(off.expert_usage_reader.require_enabled().is_err());
+        assert_eq!(off.expert_usage_reader.snapshot()["enabled"], false);
+        assert!(args(&["--expert-usage"]).expert_usage);
+        let skipped = args(&["--skip-experts"]);
+        assert!(!skipped.expert_usage_enabled().unwrap());
+        assert!(skipped.expert_usage_reader.require_enabled().is_err());
+        assert_eq!(skipped.expert_usage_reader.snapshot()["enabled"], false);
+    }
+
+    #[test]
     fn second_decode_view_is_refused_before_checkpoint_or_native_loading() {
         let args = args(&["--decode-lanes", "2"]);
         let error = match open(&args) {
@@ -321,7 +347,7 @@ mod draft_storage_tests {
         assert_eq!(automatic.pool_tokens, 0);
         assert_eq!(automatic.prefill_span_rows, 16384);
         assert_eq!(automatic.token_io.embed_placement, None);
-        let explicit = args(&["--max-context", "32768", "--pool-tokens", "131072", "--embed-placement", "gpu"]);
+        let explicit = args(&["--max-context-tokens", "32768", "--pool-tokens", "131072", "--embed-placement", "gpu"]);
         assert_eq!(explicit.max_context, 32768);
         assert_eq!(explicit.pool_tokens, 131072);
         assert_eq!(explicit.token_io.embed_placement, Some(crate::shared::token_io::EmbedPlacement::Gpu));
@@ -411,12 +437,95 @@ mod draft_storage_tests {
 #[cfg(test)]
 mod source_format_tests {
     use super::*;
+
+    #[test]
+    fn push_expert_selection_uses_admitted_whole_and_tp2_bytes_without_fp8_headers() -> Result<()> {
+        use cuteafd_loader::placement::{ExpertRange, Tp2Range};
+        use crate::shared::experts::rtx::push::CoordinatorExperts;
+        let range = ExpertRange { first: 1, layers: 2, peak_bytes: 8192 };
+        let Some(CoordinatorExperts::Whole { owners }) = coordinator_push_experts(None,
+            &[range], &[1, 2], [4096, 0], 1)? else { panic!("whole push missing") };
+        assert_eq!(owners[0].budget, 4096);
+        assert_eq!(owners[0].selections.len(), 2);
+        let tp2 = Tp2Range { first: 1, layers: 2, peak_bytes: [8192, 9216] };
+        let Some(CoordinatorExperts::Tp2 { layers, budgets }) = coordinator_push_experts(Some(tp2),
+            &[], &[1, 2], [4096, 5120], 2)? else { panic!("TP2 push missing") };
+        assert_eq!(layers, [1, 2]);
+        assert_eq!(budgets, [4096, 5120]);
+        assert!(coordinator_push_experts(Some(tp2), &[], &[1, 2], [8193, 5120], 2).is_err());
+        assert!(coordinator_push_experts(None, &[range], &[2, 3], [4096, 0], 1).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn dense_only_standalone_push_has_no_expert_destinations() -> Result<()> {
+        assert!(coordinator_push_experts(None, &[], &[], [0; 2], 1)?.is_none());
+        assert!(coordinator_push_experts(None, &[], &[], [0; 2], 2)?.is_none());
+        Ok(())
+    }
     use clap::Parser;
     use cuteafd_core::DType;
     use cuteafd_loader::{SafetensorsTensorMetadata, plan::checkpoint::CheckpointTensor};
 
     #[derive(Parser)]
     struct Command { #[command(flatten)] engine: EngineArgs }
+
+    fn check_opened_push_catalog(installed: bool) -> Result<()> {
+        const CHILD: &str = "CUTEAFD_MIMO_OPEN_PUSH_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let name = if installed { "installed_open_checked_prepares_admitted_selected_push" }
+                else { "open_checked_preserves_selected_expert_catalog" };
+            // Expert geometry is process-wide; exercise the real startup in isolation.
+            let mut command = std::process::Command::new("timeout");
+            command.args(["--kill-after=5s", "60s"]).arg(std::env::current_exe()?)
+                .args(["--exact", &format!("families::mimo_v2::source_format_tests::{name}"),
+                    "--nocapture", "--test-threads=1"]).env(CHILD, "1");
+            if installed { command.arg("--ignored"); }
+            let output = command.output()?;
+            ensure!(output.status.success(), "MiMo startup catalog regression: {}\n{}\n{}",
+                output.status, String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+            return Ok(());
+        }
+        let fixture = cuteafd_ffi::native_library_lifetime_fixture::Fixture::build_for_tests()?;
+        let snapshot = if installed {
+            PathBuf::from(std::env::var_os("CUTEAFD_PUSH_MIMO").context("set CUTEAFD_PUSH_MIMO")?)
+        } else {
+            let snapshot = fixture.directory().join("snapshot");
+            cuteafd_loader::plan::testing::write_snapshot(&snapshot,
+                &cuteafd_loader::plan::testing::mimo_flash_mopd_config(),
+                &cuteafd_loader::plan::testing::mimo_flash_mopd_tensors(), Some(4));
+            snapshot
+        };
+        let mut args = Command::try_parse_from(["mimo", "--snapshot", "/missing",
+            "--native-lib", "/missing.so", "--mtp", "0"])?.engine;
+        args.snapshot = snapshot;
+        args.native_lib = fixture.module_path().into();
+        let opened = open_checked(&args, false)?;
+        let view = opened.checkpoint.view.as_ref().context("selected attention view")?;
+        let catalog = opened.catalog.as_ref().context("selected expert catalog")?;
+        let selected = catalog.selected_view().context("startup reopened a default expert catalog")?;
+        assert_eq!(selected.fingerprint(), view.fingerprint());
+        assert_eq!(selected.snapshot(), view.snapshot());
+        if installed {
+            use crate::shared::experts::rtx::push::{CoordinatorPush, push_host_envelope};
+            let envelope = push_host_envelope(&[None], &[])?;
+            let (_push, streams, _ranks) = CoordinatorPush::prepare_view_admitted(
+                view, Some(catalog), 1, None, envelope)?;
+            assert_eq!(streams.len(), 1);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn open_checked_preserves_selected_expert_catalog() -> Result<()> {
+        check_opened_push_catalog(false)
+    }
+
+    #[test]
+    #[ignore = "requires installed MiMo SparkNest headers via CUTEAFD_PUSH_MIMO; CPU only"]
+    fn installed_open_checked_prepares_admitted_selected_push() -> Result<()> {
+        check_opened_push_catalog(true)
+    }
 
     fn fixture() -> (EngineArgs, Checkpoint, MimoV2Config) {
         let args = Command::try_parse_from(["mimo", "--snapshot", "/missing", "--native-lib", "/missing.so", "--mtp", "1"])
@@ -445,7 +554,7 @@ mod source_format_tests {
                 meta: SafetensorsTensorMetadata { name:name.into(), dtype, shape, byte_offset:0, byte_length:0 } });
         }
         tensors.sort_by(|a,b| a.meta.name.cmp(&b.meta.name));
-        let checkpoint = Checkpoint { snapshot:"/missing".into(), config:serde_json::json!({}),
+        let checkpoint = Checkpoint { view: None, snapshot:"/missing".into(), config:serde_json::json!({}),
             quantize_config:None, weight_map: Default::default(), tensors, missing_shards:Vec::new(), shard_bytes:0 };
         (args, checkpoint, cfg)
     }
@@ -476,23 +585,34 @@ mod source_format_tests {
         }).collect();
         tensors.sort_by(|a,b| a.meta.name.cmp(&b.meta.name));
         let cfg = MimoV2Config::from_hf(&value["target_config"]).unwrap();
-        let checkpoint = Checkpoint { snapshot:directory.path().into(), config:value["target_config"].clone(),
+        let checkpoint = Checkpoint { view: None, snapshot:directory.path().into(), config:value["target_config"].clone(),
             quantize_config:None, weight_map: Default::default(), tensors, missing_shards:Vec::new(), shard_bytes:0 };
         (directory, args, checkpoint, cfg)
     }
 
     #[test]
-    fn qualified_default_matches_explicit_fp8_bundle_in_a_renamed_local_copy() {
+    fn target_defaults_preserve_bf16_and_drafter_fp8_is_independent() {
         let (_directory, mut args, checkpoint, cfg) = qualified_fixture();
-        let automatic = resolve_weight_formats(&args, &checkpoint, &cfg).unwrap();
-        assert_eq!(automatic.default_policy, MimoDefaultPolicy::Fp8);
-        assert_eq!(automatic.head, MimoProjectionRepresentation::Fp8);
+        let automatic = crate::commands::bench::assert_resolved_family_seam("mimo_v2",
+            &["max-context-tokens", "pool-tokens", "prefill-rows", "prefill-waves", "prefill-span-rows",
+                "onboard", "split-device", "embedding-placement"], || {
+                crate::commands::bench::fixture_prefix().resolve_entries(16);
+                serve::resolve_serving_capacity(&mut args, 16, false);
+                serve::serving_queue_depth(None, 16);
+                let shape = admission::resolved_prefill_shape(4, 0, 0)?;
+                assert!(shape.unit_rows > 0);
+                resolve_weight_formats(&args, &checkpoint, &cfg)
+            }).unwrap();
+        assert_eq!(automatic.default_policy, MimoDefaultPolicy::Checkpoint);
+        assert_eq!(automatic.head, MimoProjectionRepresentation::Bf16);
         assert_eq!(automatic.draft, MimoDraftRepresentation::Fp8Only);
         assert_eq!(automatic.output.len(), 70);
-        assert!(automatic.output.values().all(|&format| format == MimoProjectionRepresentation::Fp8));
+        assert!(automatic.output.values().all(|&format| format == MimoProjectionRepresentation::Bf16));
         args.fp8_head = Some(true); args.fp8_o_proj = Some(true); args.draft_fp8 = Some(true);
-        assert_eq!(resolve_weight_formats(&args, &checkpoint, &cfg).unwrap(), automatic);
-        assert!(validate_resolved_replay(&automatic, true).unwrap_err().to_string().contains("--weight-policy checkpoint"));
+        let explicit = resolve_weight_formats(&args, &checkpoint, &cfg).unwrap();
+        assert_eq!(explicit.head, MimoProjectionRepresentation::Fp8);
+        assert!(explicit.output.values().all(|&format| format == MimoProjectionRepresentation::Fp8));
+        assert!(validate_resolved_replay(&automatic, true).is_err(), "FP8-only drafter has no BF16 replay fallback");
     }
 
     #[test]
@@ -525,7 +645,7 @@ mod source_format_tests {
         }
         args.draft = Some(external.path().into());
         let selected = resolve_weight_formats(&args, &checkpoint, &cfg).unwrap();
-        assert_eq!(selected.head, MimoProjectionRepresentation::Fp8);
+        assert_eq!(selected.head, MimoProjectionRepresentation::Bf16);
         assert_eq!(selected.draft, MimoDraftRepresentation::Fp8Only);
     }
 
@@ -549,8 +669,8 @@ mod source_format_tests {
         checkpoint.tensors.sort_by(|a,b| a.meta.name.cmp(&b.meta.name));
         let selected = resolve_weight_formats(&args, &checkpoint, &cfg).unwrap();
         assert_eq!(selected.draft, MimoDraftRepresentation::Fp8Only);
-        assert_eq!(selected.output["model.mtp.layers.0.self_attn.o_proj.weight"], MimoProjectionRepresentation::Fp8);
-        assert_eq!(selected.output.values().filter(|&&format| format == MimoProjectionRepresentation::Fp8).count(), 71);
+        assert_eq!(selected.output["model.mtp.layers.0.self_attn.o_proj.weight"], MimoProjectionRepresentation::Bf16);
+        assert_eq!(selected.output.values().filter(|&&format| format == MimoProjectionRepresentation::Fp8).count(), 0);
     }
 
     #[test]
@@ -560,7 +680,7 @@ mod source_format_tests {
         checkpoint.tensors[at].meta.shape[1] = 6100;
         let selected = resolve_weight_formats(&args, &checkpoint, &cfg).unwrap();
         assert_eq!(selected.default_policy, MimoDefaultPolicy::Checkpoint);
-        assert_eq!((selected.head, selected.draft), (MimoProjectionRepresentation::Bf16, MimoDraftRepresentation::Bf16Only));
+        assert_eq!((selected.head, selected.draft), (MimoProjectionRepresentation::Bf16, MimoDraftRepresentation::Fp8Only));
         assert!(selected.output.values().all(|&format| format == MimoProjectionRepresentation::Bf16));
     }
 
@@ -645,6 +765,39 @@ mod source_format_tests {
                 assert!(resolve_weight_formats(&target_only, &checkpoint, &cfg).is_ok());
             }
         }
+    }
+
+    #[test]
+    fn native_modules_load_inside_the_measured_pre_baseline_window() {
+        let source = include_str!("mod.rs");
+        // The markers are assembled at compile time: written whole here they
+        // would also match this test's own source text, which include_str!
+        // reads back.
+        let start = concat!("// Load only selected modules, then measure the admission",
+            " baseline before tensors.");
+        let end = concat!("let preflight = admission", "::preflight");
+        let window = source.split_once(start).expect("module window start").1;
+        let window = window.split_once(end).expect("module window end").0;
+        let sampled = window.find("let after = self.library.cuda_memory_info()").unwrap();
+        let native = window.find("crate::shared::inventory::preload_native_modules(&self.library)?").unwrap();
+        assert!(native < sampled, "Spark intake native modules must be sampled on TP1 too (#1554)");
+        assert_eq!(window.matches("preload_native_modules").count(), 1);
+        assert!(include_str!("../../shared/inventory.rs").contains("library.tp2_native_initialize()"));
+    }
+
+    #[test]
+    fn serving_decode_graph_misses_go_through_the_bounded_cache() {
+        let source = include_str!("engine.rs");
+        let miss = source.split_once("let crate::shared::decode_graph::device::Miss::Capture(ticket) =")
+            .expect("the serving miss asks the bounded cache").1;
+        assert!(miss.trim_start().starts_with("graphs.borrow_mut().cache_miss(&key, pinned, None)"),
+            "a miss is admitted by the device cache, not a sealed startup inventory");
+        let capture = source.split_once("fn graph(&self, rank: usize, key: GraphKey")
+            .expect("graph body").1;
+        assert!(capture.contains("cache_cancel(ticket)"),
+            "every failed capture path cancels its ticket");
+        assert!(!source.contains(concat!("note", "_eager(\"mimo_v2\"")),
+            "the sealed startup policy and its miss inventory are gone");
     }
 }
 
@@ -783,6 +936,14 @@ pub(crate) struct ResolvedWeightFormats {
 }
 
 impl ResolvedWeightFormats {
+    fn resolved_settings(&self) -> cuteafd_bench::context::ResolvedSettings {
+        cuteafd_bench::context::ResolvedSettings::default()
+            .value("fp8-head", self.head == MimoProjectionRepresentation::Fp8)
+            .value("fp8-o-proj", if self.output.values().all(|v| *v == MimoProjectionRepresentation::Fp8) { "true" }
+                else if self.any_fp8_output() { "mixed" } else { "false" })
+            .value("draft-fp8", self.draft == MimoDraftRepresentation::Fp8Only)
+            .value("draft-representation", if self.draft == MimoDraftRepresentation::Fp8Only { "fp8-only" } else { "bf16-only" })
+    }
     pub fn any_fp8_output(&self) -> bool {
         self.output.values().any(|&format| format == MimoProjectionRepresentation::Fp8)
     }
@@ -865,11 +1026,14 @@ fn resolve_weight_formats(args: &EngineArgs, checkpoint: &Checkpoint, cfg: &Mimo
         // Drafter precision cannot change committed tokens; FP8 drafts are faster
         // (measured with the target default above), so BF16 drafters convert.
         match native_draft.unwrap_or(MimoDraftRepresentation::Bf16Only) {
-            MimoDraftRepresentation::Bf16Only if default_fp8.is_some() => MimoDraftRepresentation::Fp8Only,
+            MimoDraftRepresentation::Bf16Only if args.weight_policy != WeightPolicyArg::Checkpoint
+                && weight_policy::default_draft_fp8(cfg) => MimoDraftRepresentation::Fp8Only,
             native => native,
         }
     } else { args.draft_storage()? };
-    Ok(ResolvedWeightFormats { default_policy, head, output, draft })
+    let selected = ResolvedWeightFormats { default_policy, head, output, draft };
+    selected.resolved_settings().publish();
+    Ok(selected)
 }
 
 pub(crate) struct Opened {
@@ -908,7 +1072,8 @@ fn open_checked(args: &EngineArgs, bf16_replay: bool) -> Result<Opened> {
     // The expert geometry is process-wide and must be fixed before the native
     // library loads (its expert helpers size rows from it).
     let catalog = (!args.skip_experts).then(|| {
-        let mut catalog = cuteafd_loader::read_expert_catalog(&args.snapshot)?;
+        let mut catalog = cuteafd_loader::read_expert_catalog_view(checkpoint.view.as_ref()
+            .context("MiMo coordinator checkpoint has no selected view")?)?;
         catalog.select_draft(cuteafd_loader::plan::spec::DraftOwnership::selected("mimo_v2",
             if args.mtp > 0 { "mtp" } else { "off" }))?;
         Ok::<_, anyhow::Error>(catalog)
@@ -940,7 +1105,13 @@ impl Opened {
     pub fn with_engine_reserved<T>(&self, args: &EngineArgs,
         serving: Option<(&crate::shared::prefix::PrefixArgs, usize)>, prefill_output: MimoPrefillOutput,
         body: impl FnOnce(&engine::MimoEngine<'_>, Option<cuteafd_hostcache::config::Config>) -> Result<T>) -> Result<T> {
-        let automatic_context = args.max_context == 0;
+        self.with_engine_reserved_media(args, serving, Default::default(), prefill_output, body)
+    }
+    pub(super) fn with_engine_reserved_media<T>(&self, args: &EngineArgs,
+        serving: Option<(&crate::shared::prefix::PrefixArgs, usize)>, media: crate::shared::experts::rtx::dense::Records,
+        prefill_output: MimoPrefillOutput,
+        body: impl FnOnce(&engine::MimoEngine<'_>, Option<cuteafd_hostcache::config::Config>) -> Result<T>) -> Result<T> {
+        let requested_context = (args.max_context > 0).then_some(args.max_context as u64);
         let shape = admission::resolved_prefill_shape(usize::from(args.peers.is_some()),
             args.prefill_rows, args.prefill_waves)?;
         let depth = shape.waves as usize;
@@ -966,6 +1137,7 @@ impl Opened {
         let split_device = split::requested_device(&self.cfg, args.device, args.split_device,
             |name| programs.spec(name).is_ok())?;
         let split_device = crate::shared::peer_split::probed_device(&self.library, args.device, split_device)?;
+        cuteafd_bench::context::set_resolved("split-device", &split_device.map_or_else(|| "none".into(), |device| device.to_string()));
         let manifest: serde_json::Value = serde_json::from_slice(&std::fs::read(&args.manifest)?)?;
         self.cfg.validate_program_manifest(&manifest, if split_device.is_some() { 2 } else { 1 })?;
         if split_device.is_some() {
@@ -1009,6 +1181,7 @@ impl Opened {
                     family, split_family: Some(split_cfg.program_family()?),
                 };
                 programs.load_matching(|name| selected.contains(name))?;
+                crate::shared::inventory::preload_native_modules(&self.library)?;
                 let after = self.library.cuda_memory_info()?.0;
                 let module_bytes = before.saturating_sub(after) as u64;
                 ensure!(module_bytes <= module_bound,
@@ -1019,14 +1192,22 @@ impl Opened {
                 Ok(())
             })?;
         }
-        let preflight = admission::preflight(self, args, &programs, split_device, serving, prefill_output, prefix_draft, automatic_context)?;
+        let preflight = admission::preflight(self, args, &programs, split_device, serving, prefill_output, prefix_draft, cuteafd_loader::placement::planner::Context::resolve(resolved.max_context as u64, requested_context))?;
         resolved.max_context = usize::try_from(preflight.capacity.effective_max_context_tokens)?;
         cuteafd_bench::context::set_rtx_expert_layers(preflight.placement.onboard_layers);
         resolved.prefill_rows = preflight.prefill_rows;
         resolved.prefill_waves = usize::try_from(preflight.working_set.prefill_lanes)?;
+        cuteafd_bench::context::ResolvedSettings::placement(&preflight.placement).publish();
+        cuteafd_bench::context::ResolvedSettings::default()
+            .value("max-context-tokens", resolved.max_context).value("prefill-rows", resolved.prefill_rows)
+            .value("prefill-waves", resolved.prefill_waves).value("prefill-span-rows", resolved.prefill_span_rows)
+            .value("embedding-placement", format!("{:?}", resolved.token_io.embed_placement.unwrap()).to_lowercase()).publish();
         let args = &resolved;
         let draft_dir = args.draft.as_deref().map(dflash::drafter_dir);
-        let draft_file = draft_dir.as_deref().map(dflash::prefetch);
+        let push_policy = PushPolicy::for_snapshot(&args.snapshot)?;
+        let draft_file = draft_dir.as_deref().map(|dir| -> Result<_> {
+            Ok(if PushPolicy::for_snapshot(dir)? == PushPolicy::Mount { Some(dflash::prefetch(dir)) } else { None })
+        }).transpose()?.flatten();
         let stream = self.library.cuda_stream_create()?;
 
         let peer_stream = match split_device {
@@ -1049,9 +1230,8 @@ impl Opened {
             fp8_scales: args.fp8_scales, device: args.device,
             peers: peer_stream.iter().map(|&(device, stream)| crate::shared::peer_split::RankDevice { device, stream }).collect(),
             dense: std::rc::Rc::new(crate::shared::experts::rtx::dense::DenseLoad::mount(&self.library)),
-            transient: Default::default() };
-        use crate::shared::experts::rtx::push::{CoordinatorExperts, CoordinatorPush, PushPolicy};
-        let push_policy = PushPolicy::for_snapshot(&args.snapshot)?;
+            transient: Default::default(), arenas: Default::default() };
+        use crate::shared::experts::rtx::push::{CoordinatorPush, PushPolicy};
         let mut pushed_experts = None;
         let embed_placement = args.token_io.embed_placement.context("MiMo embedding placement must resolve before admission")?;
         let prepare_push = |sparks: usize| -> Result<_> {
@@ -1062,31 +1242,18 @@ impl Opened {
             let (loaded, mut records) = crate::shared::experts::rtx::dense::recording(||
                 planning.with_embedding(&self.cfg, layers, args.mtp, self.embed_source()?, embed_placement))?;
             records.extend(load.sink.as_ref().context("push sink")?.take_all());
+            records.extend(media.clone());
             let dense = crate::shared::experts::rtx::dense::plan_records(&args.snapshot, records, &devices, sparks)?;
-            let experts = if let Some(tp2) = preflight.placement.tp2 {
-                let tensors = self.catalog.as_ref().and_then(|c| c.fp8()).context("MiMo expert headers")?;
-                let directory = preflight.expert_directory.as_deref().context("MiMo expert package")?;
-                let budgets = (0..2).map(|rank| {
-                    let plan = crate::shared::experts::rtx::fp8moe::Fp8MoeTp2::plan(tensors, directory, rank,
-                        args.prefill_rows.max(engine::DECODE_ROWS))?;
-                    (tp2.peak_bytes[rank] as usize).checked_sub(plan.workspace_bytes)
-                        .context("MiMo TP2 workspace exceeds admitted peak")
-                }).collect::<Result<Vec<_>>>()?;
-                Some(CoordinatorExperts::Tp2 { layers: (tp2.first..tp2.first + tp2.layers).collect(), budgets })
-            } else if preflight.placement.onboard_layers > 0 {
-                let range = preflight.placement.expert_ranges[0];
-                let tensors = self.catalog.as_ref().and_then(|c| c.fp8()).context("MiMo expert headers")?.for_coordinator();
-                let resident = crate::shared::experts::fp8::Fp8Layer::bytes_for(&tensors, 1, 0, tensors.exact_slicing(1))?
-                    .checked_mul(range.layers).context("MiMo whole expert size overflow")?;
-                ensure!(resident <= range.peak_bytes as usize, "MiMo whole expert residency exceeds admission");
-                Some(CoordinatorExperts::Whole { owners: vec![crate::shared::experts::rtx::push::WholeOwner { rank: 0,
-                    selections: (range.first..range.first + range.layers)
-                        .map(|layer| crate::shared::experts::layer::ExpertLayer::BackboneFull { layer }).collect(), budget: resident }] })
-            } else { None };
+            let experts = coordinator_push_experts(preflight.placement.tp2,
+                &preflight.placement.expert_ranges, &preflight.working_set.rtx_layers,
+                preflight.expert_resident_bytes, devices.len())?;
+            let view = self.checkpoint.view.as_ref().context("MiMo push requires selected checkpoint view")?;
+            let envelope = preflight.push_host.clone().context("MiMo push host receipt")?;
             let prepared = if sparks == 0 {
-                (CoordinatorPush::prepare_alone(&args.snapshot, self.catalog.as_ref(), devices.len(), experts)?, None)
+                (CoordinatorPush::prepare_alone_view_admitted(view, self.catalog.as_ref(), devices.len(), experts, envelope)?, None)
             } else {
-                let (push, streams, ranks) = CoordinatorPush::prepare(&args.snapshot, self.catalog.as_ref(), devices.len(), experts)?;
+                let (push, streams, ranks) = CoordinatorPush::prepare_view_admitted(view,
+                    self.catalog.as_ref(), devices.len(), experts, envelope)?;
                 (push, Some((streams, ranks)))
             };
             Ok((prepared, (loaded, planning.transient.clone(), dense, devices)))
@@ -1109,22 +1276,23 @@ impl Opened {
                 cuteafd_loader::families::mimo_v2::admission::spark_endpoints(
                     args.prefill_rows, args.expert_input.into())?.to_vec(),
                 crate::shared::placement::spark_rings(64 << 20)?, executions)?;
-            let admission = crate::shared::placement::SparkAdmission::plan(&args.snapshot, geometry, self.catalog.as_ref(),
-                &preflight.working_set, peers.len(), None, model)?;
-            let ranks = push_policy.plan(|| {
-                ensure!(admission.coordinator_pushes(), "MiMo Spark admission did not select required push");
+            let admission = crate::shared::placement::SparkAdmission::plan_view(self.checkpoint.view.as_ref().context("MiMo Spark admission requires selected checkpoint view")?, geometry, self.catalog.as_ref(),
+                &preflight.working_set, peers.len(), model, None)?;
+            let ranks = if admission.coordinator_pushes() { push_policy.plan(|| {
                 prepare_push(peers.len())
-            })?.and_then(|((push, ranks), planned)| {
+            })? } else { None }.and_then(|((push, ranks), planned)| {
                 coordinator_push = Some((push, peers.len(), planned));
                 ranks
             });
             Some(admission.start_with(&peers, ranks)?)
-        } else {
+        } else { None };
+        // Idle peers still acknowledge the model identity. If every routed layer
+        // is onboarded, coordinator operands form their own standalone group.
+        if coordinator_push.is_none() {
             if let Some(((push, _), planned)) = push_policy.plan(|| prepare_push(0))? {
                 coordinator_push = Some((push, 0, planned));
             }
-            None
-        };
+        }
         let (embedding, ((model, mut shares), mtp_weights)) = crate::shared::placement::load_while_admitting(admission, || {
             let Some((push, sparks, (loaded, transient, dense, devices))) = coordinator_push.take() else {
                 return loader.with_embedding(&self.cfg, layers, args.mtp, self.embed_source()?, embed_placement);
@@ -1138,26 +1306,38 @@ impl Opened {
             Ok(loaded)
         })?;
         loader.release_transient();
+        if crate::shared::inventory::startup_probe_enabled() {
+            let physical = std::iter::once(args.device).chain(peer_stream.map(|(d, _)| d)).collect::<Vec<_>>();
+            let devices = cuteafd_loader::placement::planner::CoordinatorDevices::new(&physical)?;
+            let mut census = crate::shared::memory::receipts::Census::default();
+            census.owners(model.allocation_receipts(&shares, &mtp_weights, devices)?);
+            census.owners(embedding.allocation_receipts(devices, "mimo.embedding")?);
+            census.normalize(cuteafd_loader::placement::planner::PhaseOrder::TARGET_THEN_DRAFT)?;
+            crate::shared::inventory::startup_probe(&self.library, &physical, "mimo_v2/weights-loaded",
+                crate::shared::inventory::StartupEvidence { census: Some(&census), ..Default::default() })?;
+        }
         let mtp = if args.mtp > 0 {
             let started = Instant::now();
-            let zeroed = |bytes: usize| -> Result<crate::shared::memory::DeviceAllocation<'_>> {
-                let allocation = crate::shared::memory::DeviceAllocation::new(&self.library, bytes.max(256))?;
+            let zeroed = |bytes: usize, tag: crate::shared::memory::Tag| -> Result<crate::shared::memory::DeviceAllocation<'_>> {
+                let allocation = crate::shared::memory::DeviceAllocation::new(&self.library, bytes.max(256), tag)?;
                 self.library.cuda_zero_bytes(allocation.buffer, allocation.buffer.bytes)?;
                 Ok(allocation)
             };
+            let scratch = |bytes: usize| zeroed(bytes, crate::shared::memory::Tag::drafter_workspace("mimo/mtp-workspace"));
             let (h, record) = (self.cfg.hidden, self.cfg.record_bytes(cuteafd_loader::families::mimo_v2::MimoAttention::Sliding,
                 args.kv_formats()));
             let stages = mtp_weights.into_iter().map(|weights| -> Result<mtp::MtpStage<'_>> {
                 let [eh, enorm, hnorm, final_norm] = weights.extras;
                 Ok(mtp::MtpStage { layer: weights.layer, eh, enorm, hnorm, final_norm,
-                    ring: zeroed(args.rings * engine::RING_ROWS * record)? })
+                    ring: zeroed(args.rings * engine::RING_ROWS * record, crate::shared::memory::Tag::drafter_kv("mimo/mtp-rings"))? })
             }).collect::<Result<Vec<_>>>()?;
             let rows = engine::DECODE_ROWS;
-            let drafter = mtp::MtpDrafter { projection: cuteafd_ffi::draft_projection::DraftProjections::load(&programs, &[(2 * h, h)], rows)?, stages, hidden: zeroed(args.rings * mtp::HIDDEN_ROWS * h * 2)?,
-                embed: zeroed(rows * h * 2)?, rows_h: zeroed(rows * h * 2)?, normed_e: zeroed(rows * h * 2)?,
-                normed_h: zeroed(rows * h * 2)?, cat: zeroed(rows * 2 * h * 2)?,
+            let drafter = mtp::MtpDrafter { projection: cuteafd_ffi::draft_projection::DraftProjections::load(&programs, &[(2 * h, h)], rows)?, stages,
+                hidden: zeroed(args.rings * mtp::HIDDEN_ROWS * h * 2, crate::shared::memory::Tag::drafter_kv("mimo/mtp-hidden-rings"))?,
+                embed: scratch(rows * h * 2)?, rows_h: scratch(rows * h * 2)?, normed_e: scratch(rows * h * 2)?,
+                normed_h: scratch(rows * h * 2)?, cat: scratch(rows * 2 * h * 2)?,
                 ext: std::cell::RefCell::new(vec![vec![0; args.mtp]; args.rings]),
-                ids: zeroed((1 + args.mtp) * rows * 4)?, index: zeroed(rows * 4)? };
+                ids: scratch((1 + args.mtp) * rows * 4)?, index: scratch(rows * 4)? };
             tracing::info!(stages = args.mtp, elapsed_ms = started.elapsed().as_millis() as u64, "MTP drafter resident");
             Some(drafter)
         } else {
@@ -1173,16 +1353,18 @@ impl Opened {
         let pages = usize::try_from(preflight.capacity.allocated_gpu_kv_tokens)? / engine::PAGE_ROWS;
         let mut engine = engine::MimoEngine::new(&self.library, &programs, self.cfg.clone(), model, stream,
             args.max_context, args.prefill_rows, args.prefill_span_rows, pages, args.rings, embedding, args.kv_formats(), prefill_output)?;
-        engine.max_pool_tokens_no_onboard = Some(preflight.placement.max_pool_tokens_no_onboard);
+        engine.max_pool_tokens_no_onboard = preflight.placement.max_pool_tokens_no_onboard;
         engine.prefill_unit_waves = args.prefill_waves;
         // Once an engine exists, setup and body failures share the same terminal
         // retirement path. Pre-engine loader ownership is a separate boundary.
         let result = (|| -> Result<T> {
+            engine.expert_usage = preflight.expert_usage.map(|geometry| cuteafd_ffi::expert_usage::ExpertUsage::new(
+                &self.library, geometry, &[cuteafd_ffi::expert_usage::UsageDevice { logical: 0, cuda: args.device }],
+                args.expert_usage_reader.clone())).transpose()?;
             engine.prefill_w8a8 = !args.prefill_w8a16;
             engine.output_fp8_decode = args.fp8_decode;
-            engine.decode_graphs = args.decode_graphs;
-            engine.graph_storage_plan = Some(preflight.graph_plan.clone());
-            engine.graph_storage_bound_bytes = Some(preflight.graph_bound_bytes.clone());
+            engine.graph_layout = Some(preflight.graph_layout.clone());
+            engine.decode_graphs = preflight.graph_layout.enabled;
             {
                 use cuteafd_loader::families::mimo_v2::MimoAttention;
                 let kv = args.kv_formats();
@@ -1198,21 +1380,43 @@ impl Opened {
                 engine.attach_peer(device, stream, shares.pop().context("head-split shares")?,
                     usize::try_from(preflight.working_set.prefill_lanes)?)?;
             }
+            if preflight.graph_layout.enabled {
+                engine.configure_graph_cache(&preflight.graph_layout.reserves,
+                    &preflight.graph_layout.bootstraps, &preflight.graph_layout.policies)?;
+            }
             engine.mtp = mtp;
             if let Some(dir) = &draft_dir {
                 let started = Instant::now();
                 let cfg = dflash::DflashConfig::read(dir)?;
                 ensure!(cfg.hidden == self.cfg.hidden && cfg.vocab == self.cfg.vocab_size
                     && cfg.taps.iter().all(|&l| l < self.cfg.layers), "the DFlash drafter does not fit this target");
-                let mask = dflash::mask_embedding(dir, cfg.hidden)?;
-                let file = draft_file.context("drafter prefetch")?.join()
-                    .map_err(|_| anyhow::anyhow!("drafter prefetch panicked"))??;
+                let file = match draft_file {
+                    Some(file) => file.join().map_err(|_| anyhow::anyhow!("drafter prefetch panicked"))??,
+                    None => Vec::new(),
+                };
                 let capacity = args.draft_capacity(cfg.block)?;
                 let representation = self.weight_formats.draft;
-                let drafter = dflash::MimoDrafter::load(&self.library, &programs, dir, file, stream, capacity.context_slots,
-                    capacity.max_batch_sequences, mask, representation, args.fp8_scales, args.draft_kv_cache)?;
+                let device = crate::shared::memory::device::Device { library: &self.library, id: args.device };
+                let exchange = args.tp2_dflash.then(|| engine.draft_exchange()).transpose()?;
+                let mut devices = vec![device];
+                if let Some(exchange) = &exchange {
+                    devices.push(crate::shared::memory::device::Device { library: &self.library, id: exchange.device(1) });
+                }
+                let drafter = crate::shared::experts::rtx::push::load_alone(dir, &devices, ||
+                    dflash::MimoDrafter::load(&self.library, &programs, dir, file, stream, capacity.context_slots,
+                        capacity.max_batch_sequences, representation, self.weight_formats.head == MimoProjectionRepresentation::Bf16,
+                        args.fp8_scales, args.draft_kv_cache, exchange))?;
                 engine.drafter = Some(drafter);
                 tracing::info!(elapsed_ms = started.elapsed().as_millis() as u64, "DFlash drafter resident");
+                if crate::shared::inventory::startup_probe_enabled() {
+                    let physical = devices.iter().map(|device| device.id).collect::<Vec<_>>();
+                    let mut census = crate::shared::memory::receipts::Census::default();
+                    census.owners(engine.drafter.as_ref().context("DFlash drafter just loaded")?
+                        .allocation_receipts(cuteafd_loader::placement::planner::CoordinatorDevices::new(&physical)?)?);
+                    census.normalize(cuteafd_loader::placement::planner::PhaseOrder::TARGET_THEN_DRAFT)?;
+                    crate::shared::inventory::startup_probe(&self.library, &physical, "mimo_v2/drafter-loaded",
+                        crate::shared::inventory::StartupEvidence { census: Some(&census), ..Default::default() })?;
+                }
             }
             let moe_layers = (0..layers).filter(|&l| !self.cfg.dense[l]).collect::<Vec<_>>();
             engine.expert_input = args.expert_input;
@@ -1265,6 +1469,7 @@ impl Opened {
                 engine.l2 = Some(crate::shared::l2_prefetch::L2Prefetch::new(&self.library, budget, &engine.decode_read_order())?);
             }
             engine.configure_packing(args.prefill_packing.unwrap_or_default())?;
+            if let Some(drafter) = &engine.drafter { drafter.prepare_workspace()?; }
             body(&engine, preflight.host_config)
         })();
         let submission_failed = engine.submission_failed();
@@ -1369,28 +1574,18 @@ impl Opened {
         // Bootstrap each endpoint with its own widest dtype/row shape so ring
         // admission and BF16 package validation finish before serving starts.
         let (h, topk) = (self.cfg.hidden, self.cfg.topk);
-        let warm = |rows: usize, bf16: bool| -> Result<cuteafd_transport::ExpertProtocolV2Request> {
-            let routes = (0..rows * topk).map(|i| cuteafd_transport::ExpertProtocolV2RouteEntry {
-                row_index: (i / topk) as u32, expert_id: (i % self.cfg.experts) as u32, gate_weight: 0.0,
-            }).collect();
-            let (dtype, row_bytes) = if bf16 { (cuteafd_transport::ExpertV2Dtype::Bf16, 2 * h) }
-                else { (cuteafd_transport::ExpertV2Dtype::Fp8E4m3Ue8m0K32, h + h / 32) };
-            let mut request = cuteafd_transport::ExpertProtocolV2Request::new(1, 17, moe_layers[0] as u32, h as u32,
-                dtype,
-                (0..rows as u32).map(|row| cuteafd_transport::ExpertProtocolV2RowDescriptor {
-                    row_id: u64::from(row), source_kind: cuteafd_transport::ExpertV2SourceKind::Prefill,
-                    source_request_id: 1, token_position: u64::from(row), route_offset: row * topk as u32,
-                    route_count: topk as u32,
-                }).collect(),
-                routes, vec![0; rows * row_bytes])?;
-            request.header.flags |= cuteafd_transport::expert::EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16;
-            Ok(request)
+        let shape = |rows: usize, bf16: bool| -> Result<cuteafd_transport::SparkSessionShape> {
+            let dtype = if bf16 { cuteafd_transport::ExpertV2Dtype::Bf16 }
+                else { cuteafd_transport::ExpertV2Dtype::Fp8E4m3Ue8m0K32 };
+            let mut shape = cuteafd_transport::SparkSessionShape::new(rows as u32, h as u32, topk as u32, dtype)?;
+            shape.flags |= cuteafd_transport::expert::EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16;
+            Ok(shape)
         };
         let endpoints = cuteafd_loader::families::mimo_v2::admission::spark_endpoints(
             args.prefill_rows, args.expert_input.into())?;
-        let decode_warm = warm(engine::DECODE_ROWS, args.expert_input.bf16(true))?;
-        let prefill_warm = warm(engine::expert_capacity(args.prefill_rows), args.expert_input.bf16(false))?;
-        let link = |endpoint: u32, waves: usize, request: &cuteafd_transport::ExpertProtocolV2Request|
+        let decode_shape = shape(engine::DECODE_ROWS, args.expert_input.bf16(true))?;
+        let prefill_shape = shape(engine::expert_capacity(args.prefill_rows), args.expert_input.bf16(false))?;
+        let link = |endpoint: u32, waves: usize, request: &cuteafd_transport::SparkSessionShape|
             -> Result<crate::shared::spark_intake::SparkLink<'_>> {
             let capacity = endpoints[endpoint as usize].capacity;
             let label = format!("mimo/transport/endpoint-{endpoint}");
@@ -1407,12 +1602,12 @@ impl Opened {
             link.bind_model_endpoint(endpoint)?;
             link.enable_terminal_ownership(self.library.clone())?;
             // Bootstrap with this endpoint's widest request, never prefill on decode.
-            link.bootstrap(&request)?;
+            link.bootstrap(request)?;
             let actual = cuteafd_ffi::memory_ledger::snapshot()
                 .by_owner(cuteafd_ffi::memory_ledger::Space::Device, args.device)
                 .get(label.as_str()).copied().unwrap_or(0);
             let format = if endpoint == 0 { cuteafd_core::SparkReplyFormat::Bf16 }
-                else { cuteafd_core::SparkReplyFormat::resolve(cuteafd_core::spark_reply::requested(), false) };
+                else { cuteafd_core::SparkReplyFormat::resolve(cuteafd_core::spark_reply::requested().prefill, false) };
             let planned = cuteafd_loader::serving_capacity::prefill_return_bytes_with_format(
                 waves as u64, capacity as u64, peers.len() as u64, self.cfg.hidden as u64, format)?;
             anyhow::ensure!(actual as u64 == planned,
@@ -1422,19 +1617,13 @@ impl Opened {
         crate::shared::memory_report::release_load_staging(&self.library)?;
         // Decode keeps fixed graph-safe planes and the probed landing path;
         // only prefill owns overlapping waves and per-slot GPU landing planes.
-        let mut decode = link(0, 1, &decode_warm)?;
-        let mut prefill = link(1, lanes, &prefill_warm)?;
-        tracing::info!(waves = lanes, rows = args.prefill_rows, "MiMo shared prefill units");
+        let mut decode = link(0, 1, &decode_shape)?;
+        let mut prefill = link(1, lanes, &prefill_shape)?;
         let started = Instant::now();
-        let warm_stream = crate::shared::spark_intake::WarmStream::new(&*self.library)?;
-        for (transport, request) in [(&mut decode, &decode_warm), (&mut prefill, &prefill_warm)] {
-            let exchange = transport.exchange()?;
-            let payload_bytes = exchange.compact_payload(request.header.row_count as usize);
-            let wave = exchange.send_request(request.clone(), payload_bytes)?;
-            exchange.land_drained(wave, warm_stream.raw())?;
-        }
-        warm_stream.finish()?;
-        tracing::info!(ranks = peers.len(), elapsed_ms = started.elapsed().as_millis() as u64, "Spark expert transport warm");
+        decode.warm_experts(&decode_shape, moe_layers[0], self.cfg.experts, cuteafd_transport::ExpertV2SourceKind::Decode)?;
+        prefill.warm_experts(&prefill_shape, moe_layers[0], self.cfg.experts, cuteafd_transport::ExpertV2SourceKind::Prefill)?;
+        tracing::info!(elapsed_ms = started.elapsed().as_millis() as u64, "Spark expert transports warm");
+        tracing::info!(waves = lanes, rows = args.prefill_rows, "MiMo shared prefill units");
         Ok(Some(engine::Experts::Spark { decode: std::cell::RefCell::new(decode),
             prefill: std::cell::RefCell::new(prefill) }))
     }
@@ -1449,6 +1638,27 @@ impl Opened {
         let tensor = &self.checkpoint.tensors[at];
         crate::shared::token_io::EmbedSource::new(&self.checkpoint.snapshot, &tensor.shard, &tensor.meta, self.cfg.hidden)
     }
+}
+
+fn coordinator_push_experts(tp2: Option<cuteafd_loader::placement::Tp2Range>,
+    ranges: &[cuteafd_loader::placement::ExpertRange], layers: &[usize], resident: [usize; 2], ranks: usize)
+    -> Result<Option<crate::shared::experts::rtx::push::CoordinatorExperts>> {
+    use crate::shared::experts::rtx::push::{CoordinatorExperts, WholeOwner};
+    ensure!((1..=2).contains(&ranks), "MiMo push coordinator rank count");
+    if layers.is_empty() { return Ok(None); }
+    if let Some(tp2) = tp2 {
+        ensure!(ranks == 2 && layers.iter().copied().eq(tp2.first..tp2.first + tp2.layers),
+            "MiMo pushed TP2 layers differ from admission");
+        ensure!(resident.iter().zip(tp2.peak_bytes).all(|(&bytes, peak)| bytes as u64 <= peak),
+            "MiMo pushed TP2 residency exceeds admission");
+        return Ok(Some(CoordinatorExperts::Tp2 { layers: layers.to_vec(), budgets: resident.to_vec() }));
+    }
+    let range = ranges.first().context("MiMo whole expert range")?;
+    ensure!(ranks == 1 && layers.iter().copied().eq(range.first..range.first + range.layers)
+        && resident[0] as u64 <= range.peak_bytes, "MiMo pushed whole experts differ from admission");
+    Ok(Some(CoordinatorExperts::Whole { owners: vec![WholeOwner { rank: 0,
+        selections: layers.iter().map(|&layer| crate::shared::experts::layer::ExpertLayer::BackboneFull { layer }).collect(),
+        budget: resident[0] }] }))
 }
 
 fn bf16s(bytes: &[u8]) -> Vec<f32> {
@@ -1494,11 +1704,7 @@ fn golden_run(args: &GoldenArgs, opened: &Opened, engine: &engine::MimoEngine<'_
         println!("decode graphs: {graphs} captured in {:.2} s", started.elapsed().as_secs_f64());
     }
     engine.check_tp2_routers()?;
-    let result = golden_body(args, opened, engine);
-    if args.capture_graphs {
-        println!("decode graphs captured after startup: {}", engine.late_captures());
-    }
-    result
+    golden_body(args, opened, engine)
 }
 
 fn read_golden_logits(dir: &std::path::Path, allow_missing: bool) -> Result<Option<Vec<f32>>> {

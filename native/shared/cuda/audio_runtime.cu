@@ -1,3 +1,4 @@
+#include "memory_failure.h"
 // FP32 native MiMo audio qualification path. CUDA library plans and caller-
 // admitted CuTe modules are resolved once; encode owns no allocation/capture.
 #include "cuteafd_audio.h"
@@ -5,6 +6,7 @@
 #include "audio_tables.h"
 #include "audio_identity.h"
 #include <cuda_runtime.h>
+#include "blas_owner.h"
 #include <cublas_v2.h>
 #include <cufft.h>
 #include <algorithm>
@@ -28,6 +30,7 @@ struct Owner {
   cuteafd_audio_ledger ledger{};
   int device=0, mel_capacity=0, codec_capacity=0, patch_capacity=0;
   cudaStream_t stream=nullptr;
+  std::shared_ptr<cuteafd::BlasOwner> blas_owner;
   cublasHandle_t blas=nullptr;
   cufftHandle fft=0;
   void* support=nullptr;
@@ -103,7 +106,12 @@ int support(Owner* o,int operation,int width,const float* x,const float* weight,
   return cuteafd_audio_support_launch(o->support,operation,width,const_cast<float*>(x),const_cast<float*>(weight),
       const_cast<float*>(bias),out,const_cast<float*>(aux),codes,rows,length,offset,parameter,o->stream);
 }
+int bind_audio(Owner* o) {
+  return bs(cuteafd::bind_blas(o->blas_owner,o->stream,o->blas_workspace,BLAS_BYTES,
+      CUBLAS_PEDANTIC_MATH,CUBLAS_ATOMICS_NOT_ALLOWED));
+}
 int linear(Owner* o,const float* x,uint64_t weight,int m,int n,int k,float* y) {
+  int e=bind_audio(o);if(e)return e;
   const float one=1,zero=0;
   return bs(cublasSgemm(o->blas,CUBLAS_OP_T,CUBLAS_OP_N,n,m,k,&one,w(o,weight),k,x,k,&zero,y,n));
 }
@@ -122,9 +130,11 @@ int attention(Owner* o,int rows,int length,int window,const float* rotary) {
   e=support(o,AUDIO_PACK_HEADS,1024,o->v,nullptr,nullptr,o->packed_v,nullptr,nullptr,rows,length);if(e)return e;
   const float one=1,zero=0;
   int batches=rows/length*16;
+  e=bind_audio(o);if(e)return e;
   e=bs(cublasSgemmStridedBatched(o->blas,CUBLAS_OP_T,CUBLAS_OP_N,length,length,64,&one,
       o->packed_k,64,int64_t(length)*64,o->packed_q,64,int64_t(length)*64,&zero,o->scores,length,int64_t(length)*length,batches));if(e)return e;
   e=support(o,AUDIO_SOFTMAX,1024,o->scores,nullptr,nullptr,o->scores,nullptr,nullptr,batches*length,length,window,.125f);if(e)return e;
+  e=bind_audio(o);if(e)return e;
   e=bs(cublasSgemmStridedBatched(o->blas,CUBLAS_OP_N,CUBLAS_OP_N,64,length,length,&one,
       o->packed_v,64,int64_t(length)*64,o->scores,length,int64_t(length)*length,&zero,o->attention,64,int64_t(length)*64,batches));if(e)return e;
   return support(o,AUDIO_UNPACK_HEADS,1024,o->attention,nullptr,nullptr,o->projected,nullptr,nullptr,rows,length);
@@ -138,6 +148,7 @@ int encode_segment(Owner* o,int samples,int mel_frames,int global_frame,int code
   e=fs(cufftExecR2C(o->fft,o->frames,reinterpret_cast<cufftComplex*>(o->complex)));if(e)return e;
   e=support(o,AUDIO_MAGNITUDE,481,o->complex,nullptr,nullptr,o->magnitude,nullptr,nullptr,mel_frames);if(e)return e;
   const float one=1,zero=0;
+  e=bind_audio(o);if(e)return e;
   e=bs(cublasSgemm(o->blas,CUBLAS_OP_N,CUBLAS_OP_N,128,mel_frames,481,&one,o->filter,128,o->magnitude,481,&zero,o->mel,128));if(e)return e;
   e=support(o,AUDIO_LOG,128,o->mel,nullptr,nullptr,o->mel,nullptr,nullptr,mel_frames);if(e)return e;
   e=observe(o,cb,ctx,0,global_frame,o->mel,mel_frames,128);if(e)return e;
@@ -238,22 +249,45 @@ extern "C" int32_t cuteafd_audio_required(const cuteafd_audio_spec* s,cuteafd_au
   uint64_t bytes=scratch(&o);
   *out={s->weight_bytes,bytes-BLAS_BYTES-FFT_BYTES,BLAS_BYTES,FFT_BYTES,0,0};return 0;
 }
-extern "C" int32_t cuteafd_audio_destroy(void* opaque) {
-  if(!opaque)return 0;
+extern "C" int32_t cuteafd_audio_get_backings(void* opaque, cuteafd_media_backings* out) {
+  if(!opaque || !out)return cudaErrorInvalidValue;
   auto* o=static_cast<Owner*>(opaque);
+  *out={o->weights, o->weights ? o->ledger.weights : 0, o->arena,
+    o->arena ? o->ledger.scratch+BLAS_BYTES+FFT_BYTES : 0};
+  return 0;
+}
+extern "C" int32_t cuteafd_audio_destroy(void* opaque) {
+  uint32_t released=0; return cuteafd_audio_destroy_backings(opaque, &released);
+}
+// Release everything releasable, nulling exactly what was freed; the owner and
+// any backing whose free failed are kept for a later attempt.
+static int32_t release_owner(Owner* o, uint32_t* released) {
+  *released=0;
   int previous=-1;cudaGetDevice(&previous);int first=cudaSetDevice(o->device);
   if(o->stream)first=drain(o,first);
-  if(o->support) { int e=cuteafd_audio_support_destroy(o->support);if(!first)first=e; }
-  if(o->fft) { int e=fs(cufftDestroy(o->fft));if(!first)first=e; }
-  if(o->blas) { int e=bs(cublasDestroy(o->blas));if(!first)first=e; }
-  if(o->weights) { int e=cudaFree(o->weights);if(!first)first=e; }
-  if(o->arena) { int e=cudaFree(o->arena);if(!first)first=e; }
-  if(o->stream) { int e=cudaStreamDestroy(o->stream);if(!first)first=e; }
+  if(o->support) { int e=cuteafd_audio_support_destroy(o->support);if(!first)first=e;o->support=nullptr; }
+  if(o->fft) { int e=fs(cufftDestroy(o->fft));if(!first)first=e;o->fft=0; }
+  o->blas_owner.reset(); o->blas=nullptr;
+  if(o->weights) { int e=cudaFree(o->weights);if(!e){*released|=CUTEAFD_MEDIA_RELEASED_WEIGHTS;o->weights=nullptr;}if(!first)first=e; }
+  if(o->arena) { int e=cudaFree(o->arena);if(!e){*released|=CUTEAFD_MEDIA_RELEASED_WORKSPACE;o->arena=nullptr;}if(!first)first=e; }
+  if(o->stream) { int e=cudaStreamDestroy(o->stream);if(!first)first=e;o->stream=nullptr; }
   if(previous>=0 && previous!=o->device)cudaSetDevice(previous);
-  delete o;return first;
+  return first;
 }
-extern "C" int32_t cuteafd_audio_create(const cuteafd_audio_spec* s,int32_t device,uint64_t admitted,void** out) {
-  if(!out)return cudaErrorInvalidValue;*out=nullptr;
+extern "C" int32_t cuteafd_audio_destroy_backings(void* opaque, uint32_t* released) {
+  if(released)*released=0;
+  if(!opaque)return 0;
+  if(!released)return cudaErrorInvalidValue;
+  auto* o=static_cast<Owner*>(opaque);
+  int first=release_owner(o,released);
+  // A backing still held after a failed free keeps its owner alive so the
+  // caller's ledger entry stays true; retrying destroy frees it later.
+  if(!o->weights && !o->arena) delete o;
+  return first;
+}
+extern "C" int32_t cuteafd_audio_create(const cuteafd_audio_spec* s,int32_t device,uint64_t admitted,
+    const cuteafd_media_tags* tags,void** out) {
+  if(!out||!tags)return cudaErrorInvalidValue;*out=nullptr;
   cuteafd_audio_ledger ledger{};int e=cuteafd_audio_required(s,&ledger);if(e)return e;
   if(admitted<ledger.weights+ledger.scratch+ledger.blas_workspace+ledger.fft_workspace)return cudaErrorMemoryAllocation;
   e=cudaSetDevice(device);if(e)return e;
@@ -263,14 +297,18 @@ extern "C" int32_t cuteafd_audio_create(const cuteafd_audio_spec* s,int32_t devi
   if(major*10+minor!=CUTEAFD_AUDIO_AOT_SM)return cudaErrorInvalidDevice;
   auto* o=new(std::nothrow)Owner;if(!o)return cudaErrorMemoryAllocation;
   o->s=*s;o->device=device;o->ledger=ledger;
-  auto fail=[&](int rc){cuteafd_audio_destroy(o);return rc;};
+  // Failure returns the owner only when a backing could not be freed, holding
+  // exactly the still-live backings the caller must record and destroy later.
+  auto fail=[&](int rc){uint32_t released=0;release_owner(o,&released);
+    if(o->weights||o->arena)*out=o;else delete o;return rc;};
   int low,high;e=cudaDeviceGetStreamPriorityRange(&low,&high);if(e)return fail(e);
   e=cudaStreamCreateWithPriority(&o->stream,cudaStreamNonBlocking,low);if(e)return fail(e);
-  e=cudaMalloc(reinterpret_cast<void**>(&o->weights),ledger.weights);if(e)return fail(e);++o->ledger.device_allocations;
-  e=cudaMalloc(reinterpret_cast<void**>(&o->arena),ledger.scratch+BLAS_BYTES+FFT_BYTES);if(e)return fail(e);++o->ledger.device_allocations;
+  e=cuteafd_media_allocate(reinterpret_cast<void**>(&o->weights),ledger.weights,tags->weight_kind,tags->weight_owner);if(e)return fail(e);++o->ledger.device_allocations;
+  e=cuteafd_media_allocate(reinterpret_cast<void**>(&o->arena),ledger.scratch+BLAS_BYTES+FFT_BYTES,tags->workspace_kind,tags->workspace_owner);if(e)return fail(e);++o->ledger.device_allocations;
   scratch(o);
   e=cuteafd_audio_support_create(&o->support);if(e)return fail(e);
-  e=bs(cublasCreate(&o->blas));if(e)return fail(e);
+  e=bs(cuteafd::borrow_blas(false,o->blas_owner,"shared/blas/media"));if(e)return fail(e);
+  o->blas=o->blas_owner->gemm;
   e=bs(cublasSetMathMode(o->blas,CUBLAS_PEDANTIC_MATH));if(e)return fail(e);
   e=bs(cublasSetAtomicsMode(o->blas,CUBLAS_ATOMICS_NOT_ALLOWED));if(e)return fail(e);
   e=bs(cublasSetStream(o->blas,o->stream));if(e)return fail(e);
@@ -306,6 +344,25 @@ extern "C" int32_t cuteafd_audio_upload(void* opaque,const void* weights,uint64_
   for(int book=0;book<20 && !rc;++book)rc=support(o,AUDIO_SUM_SQUARE,1024,w(o,o->s.codebooks[book]),nullptr,nullptr,o->book_square+book*1024,nullptr,nullptr,BOOKS[book]);
   rc=drain(o,rc);o->uploaded=rc==0;return rc;
 }
+extern "C" int32_t cuteafd_audio_weight_arena(void* opaque,void** arena) {
+  if(!opaque || !arena)return cudaErrorInvalidValue;
+  auto* o=static_cast<Owner*>(opaque);if(o->uploaded)return cudaErrorInvalidValue;
+  int device=-1;int e=cudaGetDevice(&device);if(e)return e;if(device!=o->device)return cudaErrorInvalidDevice;
+  e=drain(o,cudaMemsetAsync(o->weights,0,o->s.weight_bytes,o->stream));
+  if(!e)*arena=o->weights;return e;
+}
+extern "C" int32_t cuteafd_audio_commit_weights(void* opaque) {
+  if(!opaque)return cudaErrorInvalidValue;
+  auto* o=static_cast<Owner*>(opaque);if(o->uploaded)return cudaErrorInvalidValue;
+  int device=-1;int e=cudaGetDevice(&device);if(e)return e;if(device!=o->device)return cudaErrorInvalidDevice;
+  auto copy=[&](void* dst,const void* src,size_t n){return int(cudaMemcpyAsync(dst,src,n,cudaMemcpyHostToDevice,o->stream));};
+  int rc=copy(o->hann,cuteafd_audio_hann,960*4);
+  if(!rc)rc=copy(o->filter,cuteafd_audio_filterbank,481*128*4);
+  if(!rc)rc=copy(o->codec_rope,cuteafd_audio_codec_rotary,size_t(o->codec_capacity)*64*4);
+  if(!rc)rc=copy(o->patch_rope,cuteafd_audio_patch_rotary,4*64*4);
+  for(int book=0;book<20 && !rc;++book)rc=support(o,AUDIO_SUM_SQUARE,1024,w(o,o->s.codebooks[book]),nullptr,nullptr,o->book_square+book*1024,nullptr,nullptr,BOOKS[book]);
+  rc=drain(o,rc);o->uploaded=rc==0;return rc;
+}
 extern "C" int32_t cuteafd_audio_encode(void* opaque,const float* pcm,uint32_t samples,
     float* output,uint64_t output_bytes,int32_t* codes,uint64_t code_bytes,cuteafd_audio_observer cb,void* ctx) {
   if(!opaque || !pcm || !output)return cudaErrorInvalidValue;
@@ -317,6 +374,7 @@ extern "C" int32_t cuteafd_audio_encode(void* opaque,const float* pcm,uint32_t s
   for(uint32_t i=0;i<samples;++i)if(!std::isfinite(pcm[i]))return cudaErrorInvalidValue;
   int device=-1;auto status=cudaGetDevice(&device);if(status)return status;
   if(device!=o->device)return cudaErrorInvalidDevice;
+  int bound=bind_audio(o);if(bound)return bound;
   int e=cudaMemcpyAsync(o->pcm,pcm,size_t(samples)*4,cudaMemcpyHostToDevice,o->stream);
   int remaining=samples/240+1,global=0,offset=0;
   while(remaining>0 && !e) {

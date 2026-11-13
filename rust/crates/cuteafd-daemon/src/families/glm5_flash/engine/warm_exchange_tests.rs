@@ -11,17 +11,15 @@ fn masked_warming_has_matching_pushes_and_waits_on_every_ffn_path() {
     let core = include_str!("core.rs");
     let peer = body(engine, "fn peer_attention(", "fn peer_post(");
     assert!(peer.contains("(true, true) => self.ffn_on(1"));
-    let masks_shared = peer.contains("if !layer.dense && self.startup_graphs && self.capturing.get() { return Ok(()); }");
+    let masks_shared = peer.contains("if !layer.dense && self.capturing.get() { return Ok(()); }");
     assert!(peer.contains("if self.tp2_layer(index) || self.unit_prefill.get() { return Ok(()) }"));
     let graph = body(engine, "fn decode_graphed(", "/// The vocabulary projection");
-    let masked = body(graph, "if self.warming_graphs.get() {", "} else if self.startup_graphs {");
-    assert!(!masked.contains("self.ffn(") && !masked.contains("self.tp2_pair("));
-    assert!(masked.contains("cuda_zero_bytes_async(w.delta.buffer"));
-    assert!(masked.contains("if self.tp2_layer(index) { w1.delta.buffer } else { w1.shared.buffer }"));
+    // The captured segment leaves routed FFN work to `begin_ffn`'s masked path.
+    assert!(!graph.contains("self.ffn_on(") && !graph.contains("self.tp2_pair("));
     assert!(graph.contains("if layer.dense {\n                    self.ffn("));
     assert!(graph.contains("self.tp2_publish(index, 0, t, w1)?"));
     let wrapper = body(engine, "fn peer_segment(", "fn decode_primitive(");
-    assert!(wrapper.contains("if self.startup_graphs && !layer.dense && !self.tp2_layer(index)"));
+    assert!(wrapper.contains("if !layer.dense && !self.tp2_layer(index)"));
     let warm_wrapper = body(wrapper, "if self.warming_graphs.get() {", "} else {");
     assert!(!warm_wrapper.contains("self.ffn_on("));
     assert!(warm_wrapper.contains("cuda_zero_bytes_async(w1.shared.buffer"));
@@ -81,7 +79,7 @@ fn masked_warming_has_matching_pushes_and_waits_on_every_ffn_path() {
 fn captured_replay_plus_wrapper_matches_eager_before_consumers() {
     let source = include_str!("../engine.rs");
     let peer = body(source, "fn peer_attention(", "fn peer_post(");
-    let guard = peer.find("if !layer.dense && self.startup_graphs && self.capturing.get() { return Ok(()); }").unwrap();
+    let guard = peer.find("if !layer.dense && self.capturing.get() { return Ok(()); }").unwrap();
     assert!(guard < peer.find("self.ffn_on(1").unwrap());
     let wrapper = body(source, "fn peer_segment(", "fn decode_primitive(");
     assert!(wrapper.find("self.peer_attention(").unwrap() < wrapper.find("})?;").unwrap());

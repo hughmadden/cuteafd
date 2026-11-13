@@ -49,7 +49,8 @@ impl<'a> Engine<'a> {
     /// Stages whose experts are resident here (drafting needs all of them).
     pub(super) fn draft_ready(&self) -> bool {
         let stages = self.weights.dspark.as_ref().map_or(0, |d| d.stages.len());
-        stages > 0 && self.local.borrow().as_ref().is_some_and(|l| l.stages() == stages)
+        stages > 0 && (self.local.borrow().as_ref().is_some_and(|l| l.stages() == stages)
+            || self.tp2.as_ref().is_some_and(|tp2| tp2.has_stages(self.cfg.n_layers, stages)))
     }
 
     /// Records `layer`'s output for the lane's last rows when it is a target.
@@ -97,6 +98,17 @@ impl<'a> Engine<'a> {
         Ok(())
     }
 
+    #[cfg(test)]
+    pub(crate) fn last_draft_logits(&self, sequences: usize) -> Result<Vec<f32>> {
+        let slot = self.decode_workspace.borrow();
+        let w = slot.as_ref().context("no V4 draft step ran")?;
+        let bytes = sequences.checked_mul(self.draft_block()).and_then(|n| n.checked_mul(self.cfg.vocab_size))
+            .and_then(|n| n.checked_mul(4)).context("V4 draft logit readback overflow")?;
+        ensure!(bytes > 0 && bytes <= w.vocab_logits.buffer.bytes, "V4 draft logit readback exceeds arena");
+        Ok(self.download(&w.vocab_logits, bytes)?.chunks_exact(4)
+            .map(|word| f32::from_le_bytes(word.try_into().unwrap())).collect())
+    }
+
     /// Proposes `draft_block()` tokens after each request's next token.
     /// `inputs` holds the block's input tokens per request: the token, then
     /// the noise token (embedded on the device).
@@ -106,6 +118,11 @@ impl<'a> Engine<'a> {
 
     /// Runtime width uses the same installed stages and decode-sized workspace.
     pub fn draft_width(&self, requests: &[DraftRequest<'_>], inputs: &[u32], block: usize) -> Result<Vec<Vec<u32>>> {
+        crate::shared::experts::rtx::pair::submit(|| self.require_live(),
+            || self.shutdown_submission(&mut []), || self.draft_width_inner(requests, inputs, block))
+    }
+
+    fn draft_width_inner(&self, requests: &[DraftRequest<'_>], inputs: &[u32], block: usize) -> Result<Vec<Vec<u32>>> {
         let dspark = self.weights.dspark.as_ref().context("the checkpoint has no dSpark drafter")?;
         ensure!(self.draft_ready(), "dSpark stage experts are not resident on the coordinator");
         let h = self.cfg.dim;
@@ -202,16 +219,20 @@ impl<'a> Engine<'a> {
                 ("scale_rows_ptr", offset(&w.wire, h)), ("scale_mma_ptr", w.dummy.buffer.ptr),
             ], &[scalar, Scalar::I32(grid as i32)])?;
             self.shared_ffn(layer, w, lane, scalar, cap, weights)?;
-            {
-                let mut local = self.local.borrow_mut();
-                let local = local.as_mut().context("local experts")?;
+            if self.tp2.as_ref().is_some_and(|tp2| tp2.has_stages(self.cfg.n_layers, dspark.stages.len())) {
+                self.draft_tp2_experts(layer, rows, w, lane)?;
+                self.post(w, lane, 1, scalar, layer)?;
+            } else {
+                let mut owner = self.local.borrow_mut();
+                let local = owner.as_mut().context("local experts")?;
                 // SAFETY: wire, routes and shared rows are complete in stream order.
                 unsafe {
                     local.run(LocalLayer::Stage(stage), rows, w.wire.buffer.ptr, w.route_ids.buffer.ptr,
                         w.route_weights.buffer.ptr, lane.shared.buffer.ptr, self.stream)?;
                 }
+                drop(owner);
+                self.post(w, lane, LOCAL_EXPERTS, scalar, layer)?;
             }
-            self.post(w, lane, LOCAL_EXPERTS, scalar, layer)?;
         }
         self.run("mhc_head", &[
             ("residual", lane.stream_a.buffer.ptr), ("fn", dspark.head_fn.buffer.ptr),
@@ -219,11 +240,17 @@ impl<'a> Engine<'a> {
             ("norm", dspark.norm.buffer.ptr), ("collapsed", w.delta.buffer.ptr), ("out", w.y.buffer.ptr),
         ], &[scalar])?;
         let rank = self.cfg.dspark_markov_rank;
+        // The draft block's logits come from the same head handle the target uses, so they must
+        // take its configured route: the handle is created for `TargetHead::configured()`, and the
+        // pedantic GEMM entry point refuses a tensor-core handle (and the reverse) with a CUDA
+        // invalid-value error. The Markov head then picks drafts greedily from these rows, which
+        // the target verifies; the invariant route costs one fixed tile at draft row counts.
         // SAFETY: y, head weights, logits, Markov weights, tokens and the
         // argmax workspace are live buffers of these shapes.
         unsafe {
-            w.head.as_ref().context("LM head")?.launch(w.y.buffer.ptr.cast(), self.weights.head.buffer.ptr.cast(),
-                w.vocab_logits.buffer.ptr.cast(), rows as u32, self.stream)?;
+            crate::shared::target_head::launch(crate::shared::target_head::TargetHead::configured(),
+                w.head.as_ref().context("LM head")?, w.y.buffer.ptr.cast_const(),
+                self.weights.head.buffer.ptr.cast_const(), w.vocab_logits.buffer.ptr.cast(), rows, self.stream)?;
             self.library.dsv4_markov_drafts(w.vocab_logits.buffer.ptr, dspark.markov_w1.buffer.ptr,
                 dspark.markov_w2.buffer.ptr, w.first_tokens.buffer.ptr, w.drafts.buffer.ptr, w.markov.buffer.ptr,
                 requests.len(), block, self.cfg.vocab_size, rank, self.stream)?;
@@ -238,6 +265,67 @@ impl<'a> Engine<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "requires sealed V4 checkpoint, real Spark peers and CUTEAFD_PUSH_DUMP via golden-run --native-test"]
+    fn native_push_dumps_each_requested_batch() -> Result<()> {
+        use crate::families::deepseek_v4::{self as family, pool::PoolAllocator};
+        use crate::shared::{golden_scores::push_regression as regression, experts::rtx::push::PushPolicy};
+        use clap::Parser;
+        use std::path::PathBuf;
+        let _ = tracing_subscriber::fmt().with_ansi(false)
+            .with_env_filter(tracing_subscriber::EnvFilter::from_default_env()).with_test_writer().try_init();
+        #[derive(Parser)]
+        struct Args { #[command(flatten)] engine: family::EngineArgs }
+        let env = |key| std::env::var(key).with_context(|| format!("V4 push regression needs {key}"));
+        let snapshot = env("CUTEAFD_GOLDEN_SNAPSHOT")?;
+        let output = PathBuf::from(env("CUTEAFD_PUSH_DUMP")?);
+        ensure!(PushPolicy::for_snapshot(std::path::Path::new(&snapshot))? == PushPolicy::Required,
+            "V4 push regression requires a push namespace");
+        let peers = env("CUTEAFD_GOLDEN_PEERS")?;
+        ensure!(!peers.is_empty(), "V4 push regression needs real Spark peers");
+        let mut argv = vec!["v4-push-regression".into(), "--snapshot".into(), snapshot,
+            "--peers".into(), peers, "--native-lib".into(), env("CUTEAFD_NATIVE_LIB")?,
+            "--manifest".into(), env("CUTEAFD_PROGRAM_MANIFEST")?, "--dspark".into(),
+            "--max-sequences".into(), "2".into(), "--pool-tokens".into(), "16384".into()];
+        for (key, flag) in [("CUTEAFD_TEST_RTX_EXPERT_LAYERS", "--rtx-expert-layers"),
+            ("CUTEAFD_TEST_SPLIT_DEVICE", "--split-device")] {
+            if let Ok(value) = std::env::var(key) { argv.extend([flag.into(), value]); }
+        }
+        let args = Args::try_parse_from(argv)?.engine;
+        let loaded = family::load(&args)?;
+        family::with_engine(&loaded, &args, None, |_| Ok(0), |engine, transports, runtime, _| {
+            let mut pool = PoolAllocator::for_engine(engine)?;
+            let width = engine.draft_block();
+            ensure!(width > 0, "V4 push regression needs resident draft stages");
+            for sequences in [1, 2] {
+                let prompts = regression::prompts(sequences);
+                let mut placements = Vec::new();
+                for prompt in &prompts {
+                    let mut placement = pool.admit(prompt.len() + width + 16)?;
+                    for chunk in prompt.chunks(engine.prefill_capacity().min(1024)) {
+                        engine.prefill(&mut placement, chunk, transports, runtime, 0, None)?;
+                    }
+                    placements.push(placement);
+                }
+                regression::draft_dump(&output, sequences, width, width, loaded.cfg.vocab_size, || {
+                    let requests = placements.iter().enumerate().map(|(slot, placement)| DraftRequest {
+                        placement, token: 42 + slot as u32 }).collect::<Vec<_>>();
+                    let inputs = requests.iter().flat_map(|request| std::iter::once(request.token)
+                        .chain(std::iter::repeat_n(loaded.cfg.dspark_noise_token_id as u32, width - 1)))
+                        .collect::<Vec<_>>();
+                    Ok((engine.draft(&requests, &inputs)?, engine.last_draft_logits(sequences)?))
+                })?;
+                let teacher = regression::teacher_rows();
+                let mut batch = placements.iter_mut().map(|placement| (placement, teacher.as_slice())).collect::<Vec<_>>();
+                let values = engine.verify(&mut batch, transports, runtime)?;
+                regression::target_dump(&output, sequences, loaded.cfg.vocab_size, &values)?;
+                engine.drain_state()?;
+                for placement in placements { pool.release(placement); }
+            }
+            Ok(())
+        })
+    }
 
     #[test]
     fn checked_draft_extent_accepts_only_installed_widths_and_live_rows() {

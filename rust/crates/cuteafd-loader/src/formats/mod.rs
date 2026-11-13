@@ -20,3 +20,5 @@ pub mod modelopt;
 
 pub mod native_dense;
 pub mod scale_codes;
+
+pub mod native_attention;

@@ -45,9 +45,9 @@ fn explicit_stream_pushes_land_exact_bytes() -> Result<()> {
     const LANE: usize = 64 << 10;
     let exchange = PeerExchange::new_flags(&library, [0, 1], 2, LANE)?;
     let streams = [Stream::new(devices[0])?, Stream::new(devices[1])?];
-    let source = Allocation::new(devices[0], 2 << 20)?;
-    let destination = Allocation::new(devices[1], 2 << 20)?;
-    let check = Allocation::new(devices[1], 2 << 20)?;
+    let source = Allocation::new(devices[0], 2 << 20, crate::shared::memory::TEST)?;
+    let destination = Allocation::new(devices[1], 2 << 20, crate::shared::memory::TEST)?;
+    let check = Allocation::new(devices[1], 2 << 20, crate::shared::memory::TEST)?;
     for (round, bytes) in [16usize, 4096, LANE, LANE + 16, 2 << 20].into_iter().enumerate() {
         let data = pattern(bytes, round);
         write(devices[0], source.buffer, &data)?;
@@ -92,10 +92,10 @@ fn explicit_stream_pushes_land_exact_bytes() -> Result<()> {
         ensure!(landed == expected, "planes by {} differ", if round == 0 { "SM" } else { "copy engine" });
     }
     // Positional pairing across many publications, both directions.
-    let back = Allocation::new(devices[0], 16 * 1000)?;
-    let forth = Allocation::new(devices[1], 16 * 1000)?;
-    let slots = [Allocation::new(devices[0], 16)?, Allocation::new(devices[1], 16)?];
-    let landing = [Allocation::new(devices[0], 16)?, Allocation::new(devices[1], 16)?];
+    let back = Allocation::new(devices[0], 16 * 1000, crate::shared::memory::TEST)?;
+    let forth = Allocation::new(devices[1], 16 * 1000, crate::shared::memory::TEST)?;
+    let slots = [Allocation::new(devices[0], 16, crate::shared::memory::TEST)?, Allocation::new(devices[1], 16, crate::shared::memory::TEST)?];
+    let landing = [Allocation::new(devices[0], 16, crate::shared::memory::TEST)?, Allocation::new(devices[1], 16, crate::shared::memory::TEST)?];
     for i in 0..1000usize {
         let from = i % 2;
         let to = 1 - from;
@@ -129,10 +129,10 @@ fn pushed_transfer(wait: bool) -> Result<()> {
     let devices = [Device { library: &library, id: 0 }, Device { library: &library, id: 1 }];
     const BYTES: usize = 655_360;
     let producer = Stream::new(devices[0])?;
-    let fresh = Allocation::new(devices[0], BYTES)?;
-    let source = Allocation::new(devices[0], BYTES)?;
-    let mut staging = Allocation::new(devices[1], BYTES)?;
-    let check = Allocation::new(devices[1], BYTES)?;
+    let fresh = Allocation::new(devices[0], BYTES, crate::shared::memory::TEST)?;
+    let source = Allocation::new(devices[0], BYTES, crate::shared::memory::TEST)?;
+    let mut staging = Allocation::new(devices[1], BYTES, crate::shared::memory::TEST)?;
+    let check = Allocation::new(devices[1], BYTES, crate::shared::memory::TEST)?;
     let mut pushing = PeerTransfer::new(devices[0], devices[1])?;
     pushing.enable_push(Box::new(FlagRoute::new(&library, [0, 1], BYTES)?));
     let mut pulling = PeerTransfer::new(devices[0], devices[1])?;
@@ -193,7 +193,7 @@ fn adopted_head(wait: bool) -> Result<()> {
     let [held, sender] = [Stream::new(devices[0])?, Stream::new(devices[0])?];
     let [receiver, later] = [Stream::new(devices[1])?, Stream::new(devices[1])?];
     let exchange = PeerExchange::new_flags(&library, [0, 1], 1, 4096)?;
-    let token = [Allocation::new(devices[0], 16)?, Allocation::new(devices[1], 16)?];
+    let token = [Allocation::new(devices[0], 16, crate::shared::memory::TEST)?, Allocation::new(devices[1], 16, crate::shared::memory::TEST)?];
     let done = devices[1].run(|| library.cuda_event_create_ordering())?;
     let chain = StageChain::on_devices(&library, &[0, 1])?;
     chain.set_device_order(true);
@@ -278,11 +278,11 @@ fn q0_held_streams_stall_independent_work() -> Result<()> {
     let connections = std::env::var("CUDA_DEVICE_MAX_CONNECTIONS").unwrap_or_else(|_| "8 (default)".into());
     let streams = (0..STREAMS).map(|_| Stream::new(devices[0])).collect::<Result<Vec<_>>>()?;
     let release_stream = Stream::new(devices[1])?;
-    let operands = [Allocation::new(devices[0], 512)?, Allocation::new(devices[0], 512)?];
-    let outputs = (0..STREAMS).map(|_| Allocation::new(devices[0], 512)).collect::<Result<Vec<_>>>()?;
+    let operands = [Allocation::new(devices[0], 512, crate::shared::memory::TEST)?, Allocation::new(devices[0], 512, crate::shared::memory::TEST)?];
+    let outputs = (0..STREAMS).map(|_| Allocation::new(devices[0], 512, crate::shared::memory::TEST)).collect::<Result<Vec<_>>>()?;
     let events = (0..STREAMS).map(|_| devices[0].run(|| library.cuda_event_create_ordering())).collect::<Result<Vec<_>>>()?;
-    let host = HostAllocation::new(&library, 64 << 10)?;
-    let landings = (0..STREAMS).map(|_| Allocation::new(devices[0], 64 << 10)).collect::<Result<Vec<_>>>()?;
+    let host = HostAllocation::new(&library, 64 << 10, crate::shared::memory::TEST)?;
+    let landings = (0..STREAMS).map(|_| Allocation::new(devices[0], 64 << 10, crate::shared::memory::TEST)).collect::<Result<Vec<_>>>()?;
     let queue = |work: &str, stream: usize| devices[0].run(|| unsafe {
         if work == "kernel" {
             library.peer_add_bf16(operands[0].buffer.ptr, operands[1].buffer.ptr, outputs[stream].buffer.ptr, 256,
@@ -294,7 +294,7 @@ fn q0_held_streams_stall_independent_work() -> Result<()> {
     // Warm every kernel, copy and stream before any wait exists.
     for stream in 0..STREAMS { queue("kernel", stream)?; queue("copy", stream)?; }
     library.cuda_device_synchronize()?;
-    let mut word = HostAllocation::new(&library, 64)?;
+    let mut word = HostAllocation::new(&library, 64, crate::shared::memory::TEST)?;
     let exchange = PeerExchange::new_flags(&library, [0, 1], 4, 4096)?;
     let mut report = Vec::new();
     for (work, hold) in ["kernel", "copy"].into_iter().flat_map(|work|

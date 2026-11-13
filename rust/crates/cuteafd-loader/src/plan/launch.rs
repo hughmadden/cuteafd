@@ -64,7 +64,7 @@ pub fn describe(config: &Value) -> Result<LaunchDescription> {
             // The bundled mtp_dspark drafter is dense: Sparks serve backbone layers only.
             ("mistral_large4", cfg.first_moe_layer, Some(cfg.layers - 1))
         }
-        "kimi_k3" => {
+        "kimi_k3" | "kimi_k31" => {
             let (first, last) = kimi_routed(text_config(config))?;
             ("kimi_k3", first, Some(last))
         }

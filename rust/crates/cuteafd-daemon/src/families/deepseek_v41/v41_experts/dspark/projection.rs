@@ -70,6 +70,7 @@ pub(super) fn wave_bytes(library: &NativeLibrary, capacity: u32) -> Result<usize
 pub(super) fn pack_scales<'a>(
     library: &'a NativeLibrary,
     tensors: &NativeRtxTensors<'a>,
+    arena: &crate::shared::memory::weight_arena::DeviceWeightArena<'a>,
 ) -> Result<[DeviceAllocation<'a>; 13]> {
     let mut scales = Vec::with_capacity(13);
     // On error the stream drains before the vector releases pending destinations.
@@ -80,8 +81,9 @@ pub(super) fn pack_scales<'a>(
     for kind in KINDS {
         let (_, name, k, n) = kind.binding()?;
         let kernel = library.v41_fp8_matrix_kernel(16, k, n)?;
-        scales.push(DeviceAllocation::new(
-            library,
+        scales.push(crate::families::deepseek_v41::weight_layout::allocation(
+            library, Some(arena),
+            &crate::families::deepseek_v41::weight_layout::packed_scale_name(&format!("{name}.weight")),
             kernel.info().packed_weight_scale_bytes as usize,
         )?);
         unsafe {
@@ -101,7 +103,7 @@ pub(super) fn pack_scales<'a>(
         .context("expected thirteen dSpark projection scales")
 }
 pub(crate) struct DsparkProjection<'weights, 'library> {
-    stream: LoadStream<'library>,
+    standalone: &'weights crate::shared::memory::StandaloneStream<'library>,
     kernel: V41Fp8Plan<'library>,
     _weights: &'weights DsparkWeights<'library>,
     weight: CuteafdDeviceBuffer,
@@ -143,36 +145,44 @@ impl<'library> DsparkWeights<'library> {
         );
         let (index, name, k, n) = kind.binding()?;
         let kernel = library.v41_fp8_matrix_plan(capacity, k, n)?;
-        let owned_input = if external.is_none() { Some(DeviceAllocation::new(library, capacity as usize*k as usize*2)?) } else { None };
+        let arena = crate::shared::memory::weight_arena::workspace_arena(library,
+            cuteafd_loader::serving_capacity::v41_workspace::projection(capacity as usize, k as usize,
+                n as usize, kernel.info().scratch_bytes as usize, external.is_none())?,
+            cuteafd_core::memory_layout::ArenaTag::drafter_workspace("v41/draft-projection"))?;
+        let plane = |name| -> Result<_> {
+            let bytes = arena.layout().view(name).context("draft projection plane")?.bytes();
+            Ok(DeviceAllocation::from_allocation(arena.view(name, bytes)?))
+        };
+        let owned_input = if external.is_none() { Some(plane("input")?) } else { None };
         let input = external.unwrap_or_else(|| owned_input.as_ref().unwrap().buffer);
         ensure!(!input.ptr.is_null() && input.bytes >= capacity as usize*k as usize*2
             && input.device_id == self.tensor(&format!("{name}.weight"))?.device_id,
             "projection input extent or device differs");
         let value = DsparkProjection {
-            stream: LoadStream {
-                library,
-                raw: library.cuda_stream_create()?,
-            },
-            scratch: DeviceAllocation::new(library, kernel.info().scratch_bytes as usize)?,
+            standalone: &self.standalone,
+            scratch: plane("scratch")?,
             kernel,
             _weights: self,
             weight: self.tensor(&format!("{name}.weight"))?,
             scales: self.projection_scales[index].buffer,
-            alpha: DeviceAllocation::new(library, 4)?,
+            alpha: plane("alpha")?,
             input,
             _owned_input: owned_input,
-            output: DeviceAllocation::new(library, capacity as usize * n as usize * 2)?,
-            graph: BindingGraphs::new(library)?,
+            output: plane("output")?,
+            graph: BindingGraphs::new(library, "dspark_projection")?,
             ready: None,
         };
+        let stream = LoadStream { library, raw: library.cuda_stream_create()? };
+        // SAFETY: load-only stream drains before projection scratch can be released.
         unsafe {
             value.kernel.initialize_scratch(
                 value.scratch.buffer,
                 value.alpha.buffer,
-                value.stream.raw,
+                stream.raw,
             )?;
         }
-        value.synchronize()?;
+        // SAFETY: initialization and its storage belong to this load scope.
+        unsafe { library.cuda_stream_synchronize(stream.raw)?; }
         Ok(value)
     }
 }
@@ -184,15 +194,14 @@ impl DsparkProjection<'_, '_> {
     ) -> Result<usize> {
         let (_, _, k, n) = kind.binding()?;
         let info = library.v41_fp8_matrix_plan_info(capacity, k, n)?;
-        usize::try_from(
-            info.scratch_bytes + u64::from(capacity) * (u64::from(k) + u64::from(n)) * 2 + 4,
-        )
-        .context("dSpark projection workspace overflow")
+        Ok(cuteafd_loader::serving_capacity::v41_workspace::projection(capacity as usize,
+            k as usize, n as usize, info.scratch_bytes as usize, true)?.bytes())
     }
     pub fn external_input_bytes(library: &NativeLibrary, kind: ProjectionKind, capacity: u32) -> Result<usize> {
-        let (_, _, k, _) = kind.binding()?;
-        Self::device_bytes(library, kind, capacity)?
-            .checked_sub(capacity as usize*k as usize*2).context("projection input budget underflow")
+        let (_, _, k, n) = kind.binding()?;
+        let info = library.v41_fp8_matrix_plan_info(capacity, k, n)?;
+        Ok(cuteafd_loader::serving_capacity::v41_workspace::projection(capacity as usize,
+            k as usize, n as usize, info.scratch_bytes as usize, false)?.bytes())
     }
     // Storage access for an exclusive containing owner that tracks completion itself.
     pub(super) fn output_storage(&self) -> CuteafdDeviceBuffer {
@@ -202,7 +211,7 @@ impl DsparkProjection<'_, '_> {
         self.input
     }
     fn synchronize(&self) -> Result<()> {
-        unsafe { self.stream.library.cuda_stream_synchronize(self.stream.raw) }
+        self.standalone.drain()
     }
     /// For a containing attention owner: supplied views must be distinct initialized
     /// buffers on the stream device; drain before releasing this exclusive borrow.
@@ -231,60 +240,24 @@ impl DsparkProjection<'_, '_> {
     /// Initialize finite BF16 input rows and finish producer writes; serialize view reuse.
     pub unsafe fn execute(&mut self, rows: u32) -> Result<CuteafdDeviceBuffer> {
         let launched =
-            unsafe { self.enqueue(self.input, self.output.buffer, rows, self.stream.raw) };
+            unsafe { self.enqueue(self.input, self.output.buffer, rows, self.standalone.get()?.raw) };
         let drained = self.synchronize();
         launched.and(drained)?;
         self.ready = Some(rows);
         self.output()
     }
     /// # Safety
-    /// Same initialized input contract as execute; captures only owned addresses.
-    pub unsafe fn capture(&mut self, rows: u32) -> Result<()> {
-        ensure!(
-            self.graph.is_none(),
-            "dSpark projection graph already captured"
-        );
-        unsafe {
-            self.execute(rows)?;
-        }
-        self.ready = None;
-        unsafe {
-            self.stream
-                .library
-                .cuda_graph_begin_capture(self.stream.raw)?;
-        }
-        let launched =
-            unsafe { self.enqueue(self.input, self.output.buffer, rows, self.stream.raw) };
-        let captured = unsafe { self.stream.library.cuda_graph_end_capture(self.stream.raw) };
-        match (launched, captured) {
-            (Ok(()), Ok(graph)) => {
-                // SAFETY: wave pins captured storage through drained teardown.
-                unsafe { self.graph.insert(rows, graph)?; }
-                Ok(())
-            }
-            (Err(error), Ok(graph)) => {
-                if let Err(cleanup) = unsafe { self.stream.library.cuda_graph_exec_destroy(graph) }
-                {
-                    tracing::error!(%cleanup,"destroying failed projection capture");
-                }
-                Err(error)
-            }
-            (Err(error), Err(_)) | (Ok(()), Err(error)) => Err(error),
-        }
-    }
-    /// # Safety
     /// Same input contract as execute, with the captured row count.
     pub unsafe fn replay(&mut self, rows: u32) -> Result<CuteafdDeviceBuffer> {
         self.ready = None;
-        let (graph, captured) = self.graph.get().context("dSpark projection was not captured")?;
-        ensure!(
-            rows == captured,
-            "dSpark projection replay rows differ from capture"
-        );
+        let Some(graph) = self.graph.cached_launch(&rows) else {
+            // SAFETY: replay and eager execution have the same input contract.
+            return unsafe { self.execute(rows) };
+        };
         let launched = unsafe {
-            self.stream
+            self.standalone.device
                 .library
-                .cuda_graph_launch(graph, self.stream.raw)
+                .cuda_graph_launch(graph, self.standalone.get()?.raw)
         };
         let drained = self.synchronize();
         launched.and(drained)?;
@@ -305,5 +278,12 @@ impl Drop for DsparkProjection<'_, '_> {
         fatal_drain(self.synchronize(), "dSpark projection");
         // SAFETY: owning stream has drained before executable retirement.
         fatal_drain(unsafe { self.graph.clear() }, "dSpark projection graphs");
+    }
+}
+
+impl DsparkProjection<'_, '_> {
+    pub(crate) fn visit_graph_banks(&mut self, f: &mut super::chain::GraphVisitor<'_>) -> Result<()> {
+        f(self.standalone.device.id, "dspark_projection", false, &mut self.graph)?;
+        Ok(())
     }
 }

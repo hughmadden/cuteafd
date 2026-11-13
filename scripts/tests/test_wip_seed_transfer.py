@@ -359,7 +359,7 @@ def test_wip_dry_run_default_seed_is_build_only_kakapo(tmp_path):
 
 
 def test_build_only_seed_gets_a_build_container_and_never_a_distribution():
-    hosts = WIP[WIP.index('# The seed builds the Spark slot; the configured Sparks'):WIP.index('# Opt-in replicated-group Spark expert roles')]
+    hosts = WIP[WIP.index('# The seed builds the Spark slot; the configured Sparks'):WIP.index('# Opt-in Spark expert roles')]
     script = 'set -euo pipefail\nwip_hosts=(ostrich dodo)\nseed_option=kakapo\n' + hosts + '''
 printf '%s|%s|%s\\n' "${wip_target_hosts[*]}" "${wip_container_hosts[*]}" "$wip_seed_serves"
 seed_option=dodo

@@ -58,6 +58,12 @@ pub trait FamilyModel: Send + Sync {
     /// Validate checkpoint-only execution requirements before checking the tensor contract.
     fn configure(&mut self) -> Result<(), ConfigError> { Ok(()) }
 
+    /// One contract owns host admission and prefill selection, including refusals.
+    fn contract_admission(&self) -> bool { false }
+
+    /// The joint recipe excludes unavailable remote packages before choosing expert homes.
+    fn admits_expert_packages(&self) -> bool { false }
+
     /// Placement accounts for executable runtime owners, not only checkpoint inventory.
     fn native_serving_admission(&self) -> bool { false }
 
@@ -83,11 +89,8 @@ pub trait FamilyModel: Send + Sync {
         Ok(None)
     }
 
-    /// A checkpoint-derived API context cap when the operator leaves it automatic.
-    fn default_context_tokens(&self) -> Option<u64> { None }
-
     /// Routed-expert weight bytes one Spark rank may hold when the operator
-    /// sets no `--spark-budget-gib`. Families whose release needs more state
+    /// sets no `--spark-memory-cap`. Families whose release needs more state
     /// the measured reason with their override.
     fn spark_budget_bytes(&self) -> u64 { super::DEFAULT_SPARK_BUDGET_BYTES }
 
@@ -201,7 +204,7 @@ pub trait Family: Sync {
     }
 }
 
-static REGISTRY: [&dyn Family; 13] = [
+static REGISTRY: [&dyn Family; 14] = [
     &super::families::deepseek::DEEPSEEK_V41,
     &super::families::deepseek::DEEPSEEK_V4,
     &super::families::glm::GLM5,
@@ -213,6 +216,7 @@ static REGISTRY: [&dyn Family; 13] = [
     &super::families::kimi::KIMI_K3,
     &super::families::muse_spark::MUSE_SPARK,
     &super::families::mistral_large4::MISTRAL_LARGE4,
+    &super::families::minimax::MINIMAX_M3,
     &super::families::dflash::DFLASH2,
     &super::families::dspark::DSPARK,
 ];
@@ -233,9 +237,7 @@ mod exlr8_execution_tests {
     #[test]
     fn dense_and_onboarding_worlds_are_independent_family_capabilities() {
         assert!(GLM5.exlr8_execution().check(1, false).is_ok());
-        let error = GLM5.exlr8_execution().check(1, true).unwrap_err();
-        assert_eq!(error.operation, "routed onboarding");
-        assert_eq!(error.supported, &[2]);
+        assert!(GLM5.exlr8_execution().check(1, true).is_ok());
         for onboarded in [false, true] {
             assert!(GLM5.exlr8_execution().check(2, onboarded).is_ok());
             assert!(GLM5_FLASH.exlr8_execution().check(1, onboarded).is_ok());

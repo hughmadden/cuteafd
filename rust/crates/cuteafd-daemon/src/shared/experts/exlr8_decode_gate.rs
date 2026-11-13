@@ -80,7 +80,9 @@ fn native_exlr8_decode_widths_finite_and_row_invariant() -> Result<()> {
     let peers = std::env::var("CUTEAFD_GOLDEN_PEERS")?.split(',')
         .map(str::parse).collect::<std::result::Result<Vec<_>, _>>()?;
     ensure!(peers.len() == world && !layers.is_empty(), "decode gate world disagrees with launched peers");
-    let catalog = cuteafd_loader::read_expert_catalog(&snapshot)?;
+    let view = cuteafd_loader::plan::checkpoint::CheckpointView::select(&snapshot,
+        cuteafd_loader::plan::checkpoint::CoreView::Original)?;
+    let catalog = cuteafd_loader::read_expert_catalog_view(&view)?;
     ensure!(catalog.format() == cuteafd_loader::plan::checkpoint::CheckpointFormat::Exlr8,
         "decode gate requires an EXLR8 checkpoint");
     let geometry = catalog.routed_experts().geometry()?;
@@ -91,25 +93,26 @@ fn native_exlr8_decode_widths_finite_and_row_invariant() -> Result<()> {
     // SAFETY: the official runner supplies the verified sealed native artifact.
     let library = Arc::new(unsafe { cuteafd_ffi::NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?)? });
     library.cuda_set_device(0)?;
+    crate::shared::inventory::preload_native_modules(&library)?;
     let config = TcpTransportConfig { max_frame_bytes:
         cuteafd_transport::expert::native_frame_budget(geometry, MAX_ROWS as u32)?, ..Default::default() };
-    let spark_world = crate::shared::spark_topology::world(None, world)?;
-    SparkAdmission::plan_manifest(&snapshot, geometry, Some(&catalog),
+    let spark_world = crate::shared::spark_topology::world(world)?;
+    SparkAdmission::plan_view(&view, geometry, Some(&catalog),
         &cuteafd_loader::placement::SparkWorkingSet { rtx_layers: vec![], spark_layers: layers.clone(),
-            spark_ranks: world, prefill_lanes: 1 }, world, None,
+            spark_ranks: world, prefill_lanes: 1 }, world,
         ModelAdmission::new(vec![SparkEndpoint { ring_depth: None, capacity: MAX_ROWS as u32,
                 ingress: SparkIngress::Fp8K32, partial_reply_bytes: None }],
             spark_rings(config.max_frame_bytes)?, super::tp_gate::gate_executions(&catalog, MAX_ROWS as u32)?)?,
         Some(&manifest))?.select(&peers)?;
-    let zero = DeviceAllocation::new(&library, MAX_ROWS * row_bytes)?;
-    let output = DeviceAllocation::new(&library, MAX_ROWS * row_bytes)?;
+    let zero = DeviceAllocation::new(&library, MAX_ROWS * row_bytes, crate::shared::memory::TEST)?;
+    let output = DeviceAllocation::new(&library, MAX_ROWS * row_bytes, crate::shared::memory::TEST)?;
     library.cuda_zero_bytes(zero.buffer, zero.buffer.bytes)?;
     let stream = LoadStream { library: &library, raw: library.cuda_stream_create()? };
     let mut link = SparkLink::new(&library, spark_world, &peers, MAX_ROWS as u32, config, row_bytes)?;
     link.enable_terminal_ownership(library.clone())?;
     let result = (|| -> Result<()> {
         let mut id = 1;
-        link.bootstrap(&request(geometry, layers[0], 0, 0, MAX_ROWS, id)?)?;
+        link.bootstrap(&cuteafd_transport::SparkSessionShape::from_request(&request(geometry, layers[0], 0, 0, MAX_ROWS, id)?)?)?;
         let out = PathBuf::from(std::env::var("CUTEAFD_GOLDEN_OUT")?);
         let mut checked = 0usize;
         for (seed, &layer) in layers.iter().enumerate() {

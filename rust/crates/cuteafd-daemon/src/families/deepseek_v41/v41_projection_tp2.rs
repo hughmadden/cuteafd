@@ -1,11 +1,13 @@
 //! Output-channel FP8 projection shards with lane-owned exchange storage.
-use crate::shared::memory::device::{Allocation, Device, Event, Stream};
+use crate::shared::memory::Tag;
+use crate::shared::memory::{device::{Allocation, Device, Event, Stream}};
 use anyhow::{ensure, Context, Result};
-use crate::shared::decode_graph::LayerGraphs;
+use crate::shared::decode_graph::{CacheAttached, LayerGraphs};
 use cuteafd_ffi::{CuteafdDeviceBuffer, V41Fp8Plan, V41PeerCopy};
 use cuteafd_loader::OfficialV41Catalog;
 use std::rc::Rc;
 use crate::shared::memory::row_window::{RowWindow, ScratchGuard};
+use cuteafd_core::memory_layout::ArenaTag;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Kind { QueryB, OutputB }
@@ -23,11 +25,15 @@ pub(crate) struct Weights<'a> {
     kind: Kind,
     weight: Allocation<'a>,
     scales: Allocation<'a>,
-    /// The raw scales until their recorded pack ran (a push lands them and
-    /// packs them at Done), then [`Weights::release_raw_scales`].
-    source_scales: std::cell::Cell<Option<Allocation<'a>>>,
 }
 impl<'a> Weights<'a> {
+    #[cfg(test)]
+    pub(crate) fn buffers(&self) -> [CuteafdDeviceBuffer; 2] { [self.weight.buffer, self.scales.buffer] }
+    pub(crate) fn inventory(&self, inventory: &mut crate::shared::memory::receipts::Inventory<'_>) -> Result<()> {
+        let name = format!("gpu{}.layers.{}.attn.{}.weight", self.device.id, self.layer, self.kind.name());
+        self.weight.inventory(inventory, &name)?;
+        self.scales.inventory(inventory, &cuteafd_loader::placement::families::deepseek_v41::weight_layout::packed_scale_name(&name))
+    }
     /// A shard's resident bytes: its FP8 weight half and packed scales, at the
     /// packed size the loaded library's export reports (SM120 expands the
     /// scale grid; SM89 keeps it).
@@ -40,14 +46,14 @@ impl<'a> Weights<'a> {
     pub fn load_peak_device_bytes(library: &cuteafd_ffi::NativeLibrary, kind: Kind) -> Result<usize> {
         let (k,n)=kind.geometry(); Ok(Self::device_bytes(library,kind)? + k*(n/2)/1024)
     }
-    /// Rank `rank`'s output-channel half of layer `layer`'s projection: the
-    /// row halves (`Rect::half`) of its FP8 weight and raw scales land
-    /// unchanged, then the scales pack. Through the mount it reads now; under
-    /// a dense recording it records for the coordinator push group, as the
-    /// shared expert's TP2 halves do.
+    #[cfg(test)]
     pub fn load(device: Device<'a>, catalog: &OfficialV41Catalog, layer: usize,
         kind: Kind, rank: usize, budget: usize) -> Result<Self> {
-        use crate::shared::experts::rtx::dense;
+        Self::load_in(device, catalog, layer, kind, rank, budget, None)
+    }
+    pub fn load_in(device: Device<'a>, catalog: &OfficialV41Catalog, layer: usize,
+        kind: Kind, rank: usize, budget: usize,
+        arena: Option<&crate::shared::memory::weight_arena::DeviceWeightArena<'a>>) -> Result<Self> {
         ensure!(layer<40 && rank<2 && budget>=Self::load_peak_device_bytes(device.library,kind)?,
             "invalid projection shard layer, rank or budget");
         let (k,n)=kind.geometry(); let n=n/2;
@@ -57,27 +63,28 @@ impl<'a> Weights<'a> {
             && catalog.tensor(&scale_name)?.metadata.shape==[2*n/32,k/32],
             "projection checkpoint geometry differs");
         let stream=Stream::new(device)?;
-        // Packed scales at the size the library's export reports (SM120 expands
-        // the grid, SM89 keeps it), as `device_bytes` charges.
-        let kernel=device.run(||device.library.v41_fp8_matrix_kernel(1,k as u32,n as u32))?;
-        let weight=Allocation::new(device,k*n)?;
-        let scales=Allocation::new(device,usize::try_from(kernel.info().packed_weight_scale_bytes)?)?;
-        let raw_scales=Allocation::new(device,k*n/1024)?;
-        let loader=dense::DenseLoad::mount(device.library);
-        for (name,target) in [(&weight_name,&weight),(&scale_name,&raw_scales)] {
-            let rect=crate::families::deepseek_v41::v41_tensors::half(catalog,name,0,rank)?;
-            ensure!(rect.bytes()==target.buffer.bytes,"projection shard payload size differs");
-            loader.operand(dense::Operand { device: device.id, buffer: target.buffer, lands: vec![(rect,0)],
-                bytes: target.buffer.bytes })?;
-        }
-        let queued=device.run(||unsafe { dense::v41_pack_scales(&kernel,raw_scales.buffer,scales.buffer,stream.raw) });
-        let drained=stream.drain();queued.and(drained)?;
-        // Through the mount the pack already drained: release the raw scales now.
-        let source_scales=std::cell::Cell::new(dense::is_recording().then_some(raw_scales));
-        Ok(Self { device,layer,rank,kind,weight,scales,source_scales })
+        let weight=crate::families::deepseek_v41::v41_tensors::weight_allocation(device,arena,&weight_name,k*n, ArenaTag::weights("v41/target"))?;
+        let scales=crate::families::deepseek_v41::v41_tensors::weight_allocation(device,arena,
+            &cuteafd_loader::placement::families::deepseek_v41::weight_layout::packed_scale_name(&weight_name),usize::try_from(device.run(|| device.library.v41_fp8_matrix_info(1,k as u32,n as u32))?.packed_weight_scale_bytes)?, ArenaTag::weights("v41/target"))?;
+        let dense = crate::shared::experts::rtx::dense::DenseLoad::mount(device.library);
+        Self::load_operands(&dense, device.id, super::v41_tensors::half(catalog, &weight_name, 0, rank)?,
+            super::v41_tensors::half(catalog, &scale_name, 0, rank)?, k, n, weight.buffer, scales.buffer, stream.raw)?;
+        Ok(Self { device,layer,rank,kind,weight,scales })
     }
-    /// Frees raw scales kept for a recorded scale pack (after it ran).
-    pub fn release_raw_scales(&self) { drop(self.source_scales.take()); }
+    #[allow(clippy::too_many_arguments)]
+    fn load_operands(dense: &crate::shared::experts::rtx::dense::DenseLoad<'_>, device: i32,
+        weight: crate::shared::experts::rtx::dense::Rect, scales: crate::shared::experts::rtx::dense::Rect,
+        k: usize, n: usize, dst: CuteafdDeviceBuffer, packed: CuteafdDeviceBuffer,
+        stream: *mut std::ffi::c_void) -> Result<()> {
+        use crate::shared::experts::rtx::dense::{Operand, Step, Job};
+        ensure!(weight.bytes() == k * n && scales.bytes() == k * n / 1024,
+            "projection shard payload size differs");
+        dense.operand(Operand { device, buffer: dst, bytes: k * n, lands: vec![(weight, 0)] })?;
+        dense.step(Step { device, rects: vec![scales], jobs: vec![Job::V41Scales {
+            k: k as u32, n: n as u32, packed,
+        }] }, stream)?;
+        Ok(())
+    }
 }
 
 /// Guarded unit-cap inputs/outputs; gathered/query fork readers finish inside
@@ -114,13 +121,13 @@ impl<'a> RankStorage<'a> {
         let plan = device.run(|| device.library.v41_fp8_matrix_plan(capacity, k as u32, (n / 2) as u32))?;
         let stream = Stream::new(device)?;
         let [scratch_bytes, alpha_bytes, input_bytes, output_bytes] = Self::allocation_sizes(plan.info().scratch_bytes as usize, kind, capacity);
-        let scratch = Allocation::new(device, scratch_bytes)?;
-        let alpha = Allocation::new(device, alpha_bytes)?;
+        let scratch = Allocation::new(device, scratch_bytes, Tag::workspace("v41/projection"))?;
+        let alpha = Allocation::new(device, alpha_bytes, Tag::workspace("v41/projection"))?;
         let initialized = device.run(|| unsafe { plan.initialize_scratch(scratch.buffer, alpha.buffer, stream.raw) });
         initialized.and(stream.drain())?;
         Ok(Rc::new(Self { stream, plan, copy: device.run(|| device.library.v41_peer_copy())?,
-            input: Allocation::new(device, input_bytes)?,
-            output: Allocation::new(device, output_bytes)?, scratch, alpha,
+            input: Allocation::new(device, input_bytes, Tag::workspace("v41/projection"))?,
+            output: Allocation::new(device, output_bytes, Tag::workspace("v41/projection"))?, scratch, alpha,
             guard: ScratchGuard::new(device.library, readers)?,
         }))
     }
@@ -139,7 +146,7 @@ impl<'w,'a> Rank<'w,'a> {
             ensure!(!weights[..index].iter().any(|other|other.layer==w.layer),"duplicate projection layer");
         }
         ensure!(storage.stream.device.id == device.id, "projection rank storage device differs");
-        let mut graphs=LayerGraphs::new(device.library, cuteafd_core::V41_VERIFY_ROWS as u32);graphs.enable_small_shapes();
+        let graphs=LayerGraphs::new(device.library, cuteafd_core::V41_VERIFY_ROWS as u32, "deepseek_v41");
         Ok(Self { graphs, weights, storage })
     }
 }
@@ -156,18 +163,23 @@ impl<'w,'a> Rank<'w,'a> {
         if !super::graph_policy::captures_shape(rows) || crate::shared::decode_graph::census::eager("layer_row")
             || self.graphs.get_shape(layer,weights,rows).is_some() { return Ok(()); }
         let device=self.storage.stream.device;
+        let Some(mut ticket) = self.graphs.cache_ticket(&(layer,rows), super::graph_policy::pinned_shape(device.id, rows), None) else {
+            super::graph_policy::note_miss(format!("projection_rank rows={rows}"), || "graph cache selected eager".into());
+            return Ok(());
+        };
         device.run(||unsafe {
-            device.library.cuda_graph_begin_capture(self.storage.stream.raw)?;
+            ticket.capture_result(device.library.cuda_graph_begin_capture(self.storage.stream.raw))?;
             let queued=self.enqueue(weights,rows);
-            let captured=device.library.cuda_graph_end_capture(self.storage.stream.raw);
+            let captured=ticket.capture_result(device.library.cuda_graph_end_capture_topology(self.storage.stream.raw));
             match (queued,captured) {
-                (Ok(()),Ok(graph)) => {
-                    if let Err(error)=self.graphs.insert(layer,weights,rows,graph) {
+                (Ok(()),Ok((graph, nodes, width, _spans, _))) => {
+                    if let Err(error)=self.graphs.cache_insert(layer,weights,rows,graph,ticket,nodes as u64,width,true) {
                         device.library.cuda_graph_exec_destroy(graph)?;return Err(error);
                     }
                     Ok(())
                 },
-                (Err(error),Ok(graph)) => { device.library.cuda_graph_exec_destroy(graph)?;Err(error) },
+                (Err(error),Ok((graph, _, _, _, _))) => { device.library.cuda_graph_exec_destroy(graph)?;Err(error) },
+                (Ok(()),Err(error)) if cuteafd_ffi::is_small_graph(&error) => Ok(()),
                 (Err(error),Err(_)) | (Ok(()),Err(error)) => Err(error),
             }
         })
@@ -206,7 +218,7 @@ impl<'a> Storage<'a> {
         for i in 0..2 { devices[i].run(|| devices[i].library.cuda_enable_peer(devices[1-i].id))?; }
         Ok(Rc::new(Self {
             ranks: [RankStorage::new(devices[0], kind, unit, &readers)?, RankStorage::new(devices[1], kind, unit, &readers)?],
-            output: Allocation::new(devices[owner], unit as usize * kind.geometry().1 * 2)?,
+            output: Allocation::new(devices[owner], unit as usize * kind.geometry().1 * 2, Tag::workspace("v41/projection"))?,
             peer_done: Event::new(devices[1-owner])?,
             input_ready: [Event::new(devices[0])?, Event::new(devices[1])?],
             guard: ScratchGuard::new(devices[0].library, &readers)?, owner, unit, kind,
@@ -234,6 +246,17 @@ impl Drop for Drain<'_,'_,'_> {
     }
 }
 impl<'w,'a> Wave<'w,'a> {
+    pub(crate) fn visit_graph_banks(&mut self, f: &mut dyn FnMut(i32, &'static str, bool, &mut dyn CacheAttached) -> Result<()>) -> Result<()> {
+        let (rank_site, gather_site) = match self.kind {
+            Kind::QueryB => ("v41.projection.query.rank", "v41.projection.query.gather"),
+            Kind::OutputB => ("v41.projection.output.rank", "v41.projection.output.gather"),
+        };
+        for rank in &mut self.ranks {
+            f(rank.storage.input.buffer.device_id, rank_site, true, &mut rank.graphs)?;
+        }
+        f(self.storage.output.buffer.device_id, gather_site, true, &mut self.gather_graphs)
+    }
+
     pub fn kind(&self) -> Kind { self.kind }
     pub(crate) fn capacity(&self) -> u32 { self.capacity }
     pub fn output_device(&self) -> Device<'a> { self.storage.output.device }
@@ -266,7 +289,7 @@ impl<'w,'a> Wave<'w,'a> {
         ensure!(weights[0].len() == weights[1].len()
             && weights[0].iter().zip(weights[1]).all(|(a,b)| a.layer == b.layer),
             "projection rank layers differ");
-        let mut gather_graphs=LayerGraphs::new(a.device.library, cuteafd_core::V41_VERIFY_ROWS as u32);gather_graphs.enable_small_shapes();
+        let gather_graphs=LayerGraphs::new(a.device.library, cuteafd_core::V41_VERIFY_ROWS as u32, "deepseek_v41");
         Ok(Self { gather_graphs,
             ranks: [Rank::on_storage(weights[0], storage.ranks[0].clone())?, Rank::on_storage(weights[1], storage.ranks[1].clone())?],
             owner: storage.owner, capacity: storage.unit, kind: storage.kind, storage, window: RowWindow::NONE })
@@ -295,18 +318,23 @@ impl<'w,'a> Wave<'w,'a> {
         if !super::graph_policy::captures_shape(rows) || crate::shared::decode_graph::census::eager("layer_row")
             || self.gather_graphs.get_shape(0,weights,rows).is_some() { return Ok(()); }
         let stream=self.ranks[self.owner].storage.stream.raw;let device=self.storage.output.device;
+        let Some(mut ticket) = self.gather_graphs.cache_ticket(&(0,rows), super::graph_policy::pinned_shape(device.id, rows), None) else {
+            super::graph_policy::note_miss(format!("projection_gather rows={rows}"), || "graph cache selected eager".into());
+            return Ok(());
+        };
         device.run(||unsafe {
-            device.library.cuda_graph_begin_capture(stream)?;
+            ticket.capture_result(device.library.cuda_graph_begin_capture(stream))?;
             let queued=self.enqueue_gather(rows);
-            let captured=device.library.cuda_graph_end_capture(stream);
+            let captured=ticket.capture_result(device.library.cuda_graph_end_capture_topology(stream));
             match (queued,captured) {
-                (Ok(()),Ok(graph)) => {
-                    if let Err(error)=self.gather_graphs.insert(0,weights,rows,graph) {
+                (Ok(()),Ok((graph, nodes, width, _spans, _))) => {
+                    if let Err(error)=self.gather_graphs.cache_insert(0,weights,rows,graph,ticket,nodes as u64,width,true) {
                         device.library.cuda_graph_exec_destroy(graph)?;return Err(error);
                     }
                     Ok(())
                 },
-                (Err(error),Ok(graph)) => { device.library.cuda_graph_exec_destroy(graph)?;Err(error) },
+                (Err(error),Ok((graph, _, _, _, _))) => { device.library.cuda_graph_exec_destroy(graph)?;Err(error) },
+                (Ok(()),Err(error)) if cuteafd_ffi::is_small_graph(&error) => Ok(()),
                 (Err(error),Err(_)) | (Ok(()),Err(error)) => Err(error),
             }
         })
@@ -341,8 +369,10 @@ impl<'w,'a> Wave<'w,'a> {
                 wave.ranks[input_rank].storage.stream.device.library.cuda_event_record(wave.storage.input_ready[input_rank].raw,producer)
             })?;
         }
-        for rank in &wave.ranks {
+        for rank in &mut wave.ranks {
             let weights=rank.weights.iter().find(|w|w.layer==layer).context("projection layer absent")?;
+            let graph = if wave.window.is_windowed() { None }
+                else { rank.graphs.cached_launch(layer,weights,rows).map(|(raw,_)|raw) };
             rank.storage.stream.device.run(||unsafe {
                 acquire(&rank.storage.guard, rank.storage.stream.raw)?;
                 if producer.is_some() {
@@ -350,18 +380,20 @@ impl<'w,'a> Wave<'w,'a> {
                 }
                 rank.storage.copy.launch_rows(rank.storage.input.buffer,input,k*2,rows as usize,k*2,k*2,rank.storage.stream.raw)?;
                 crate::shared::decode_graph::census::dispatch(rank.storage.stream.device.library, rank.storage.stream.raw,
-                    c"layer_row", rows as usize, if wave.window.is_windowed() { None } else { rank.graphs.get_shape(layer,weights,rows).map(|(raw,_)|raw) },
+                    c"layer_row", rows as usize, graph,
                     || rank.enqueue(weights,rows))
             })?;
         }
         let owner=&wave.ranks[wave.owner];let peer=&wave.ranks[1-wave.owner];
         peer.storage.stream.device.run(|| unsafe { peer.storage.stream.device.library.cuda_event_record(
             wave.storage.peer_done.raw, peer.storage.stream.raw) })?;
+        let gather_graph = if wave.window.is_windowed() { None }
+            else { wave.gather_graphs.cached_launch(0,&owner.weights[0],rows).map(|(raw,_)|raw) };
         owner.storage.stream.device.run(||unsafe {
             acquire(&wave.storage.guard, owner.storage.stream.raw)?;
             owner.storage.stream.device.library.cuda_stream_wait_event(owner.storage.stream.raw,wave.storage.peer_done.raw)?;
             crate::shared::decode_graph::census::dispatch(owner.storage.stream.device.library, owner.storage.stream.raw,
-                c"layer_row", rows as usize, if wave.window.is_windowed() { None } else { wave.gather_graphs.get_shape(0,&owner.weights[0],rows).map(|(raw,_)|raw) },
+                c"layer_row", rows as usize, gather_graph,
                 || wave.enqueue_gather(rows))
         })?;
         let output=CuteafdDeviceBuffer { bytes:rows as usize*n*2,..wave.storage.output.buffer };
@@ -389,6 +421,55 @@ mod tests {
     use super::*;
     use crate::families::deepseek_v41::v41_tensors::NativeRtxTensors;
     #[test]
+    fn tp2_query_and_output_push_record_without_mount_reads() -> Result<()> {
+        use crate::shared::experts::rtx::dense::{self, Rect, Job};
+        use cuteafd_loader::plan::testing::{t, write_snapshot};
+        let fixture = cuteafd_ffi::native_library_lifetime_fixture::Fixture::build_for_tests()?;
+        let lib = fixture.load()?;
+        let root = tempfile::tempdir_in(fixture.directory())?;
+        let k = 256;
+        let n = 64;
+        for kind in [Kind::QueryB, Kind::OutputB] {
+            let weight = format!("layers.0.attn.{}.weight", kind.name());
+            let scale = format!("layers.0.attn.{}.scale", kind.name());
+            write_snapshot(root.path(), &serde_json::json!({}), &[
+                t(&weight, "F8_E4M3", &[2 * n, k]),
+                t(&scale, "F8_E8M0", &[2 * n / 32, k / 32]),
+            ], None);
+            let checkpoint = cuteafd_loader::plan::Checkpoint::open(root.path())?;
+            let whole = Rect::tensor(&checkpoint, &weight, None, None)?;
+            let grid = Rect::tensor(&checkpoint, &scale, None, None)?;
+            let saved = whole.path.with_extension("held");
+            std::fs::rename(&whole.path, &saved)?;
+            for rank in 0..2 {
+                let device = Device { library: &lib, id: rank as i32 };
+                let requests = [(weight.clone(), k * n), (scale.clone(), k * n / 32)];
+                let arena = crate::shared::memory::weight_arena::DeviceWeightArena::new(device,
+                    cuteafd_loader::serving_capacity::WeightArenaLayout::new("projection/push", requests)?,
+                    ArenaTag::weights("v41/target"))?;
+                let dst = arena.view(&weight, k * n)?;
+                let packed = arena.view(&scale, k * n / 32)?;
+                let reads = crate::shared::memory::load_timing::Split::start();
+                let (_, records) = dense::recording(|| Weights::load_operands(&dense::DenseLoad::mount(&lib),
+                    device.id, whole.sub(rank * n..(rank + 1) * n),
+                    grid.sub(rank * n / 32..(rank + 1) * n / 32), k, n, dst.buffer, packed.buffer,
+                    std::ptr::null_mut()))?;
+                assert_eq!(reads.read_bytes(), 0);
+                assert_eq!(records.summary(), (k * n, 1, k * n / 1024, 1, k * n / 1024, 0));
+                assert_eq!(records.operands[0].buffer.ptr, dst.buffer.ptr);
+                assert_eq!(records.operands[0].lands[0].0.rows, rank * n..(rank + 1) * n);
+                assert_eq!(records.steps[0].rects[0].rows, rank * n / 32..(rank + 1) * n / 32);
+                assert!(matches!(records.steps[0].jobs[0], Job::V41Scales { packed: p, .. } if p.ptr == packed.buffer.ptr));
+                let plan = dense::RankLayout::new(records.operands, records.steps, device.id)?;
+                assert_eq!(plan.operands.len(), 1);
+                assert_eq!(plan.steps.len(), 1);
+            }
+            std::fs::rename(&saved, &whole.path)?;
+        }
+        Ok(())
+    }
+
+    #[test]
     #[ignore = "requires checkpoint, projection shard AOT and two CUDA GPUs"]
     fn checkpoint_dual_projection_lanes_match_full() -> Result<()> {
         let lib=unsafe { cuteafd_ffi::NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?)? };
@@ -405,13 +486,21 @@ mod tests {
             assert!(Wave::new(banks,capacity,0,[0,0]).is_err());
             let mut lanes=[Wave::new(banks,capacity,0,Wave::device_bytes(&lib,kind,capacity,0)?)?,
                 Wave::new(banks,capacity,1,Wave::device_bytes(&lib,kind,capacity,1)?)?];
-            let inputs=[Allocation::new(devices[0],capacity as usize*k*2)?,
-                Allocation::new(devices[1],capacity as usize*k*2)?];
+            for lane in &mut lanes {
+                lane.visit_graph_banks(&mut |device, name, spans, bank| bank.attach(&lib, device, 8 << 30,
+                    crate::shared::decode_graph::device::Site { name,
+                        cycle: crate::shared::decode_graph::device::Cycle::Other,
+                        preference: crate::shared::decode_graph::device::Preference::Capture,
+                        bootstrap: 2 << 20, basis: crate::shared::decode_graph::device::Basis::Bytes,
+                        spans_devices: spans }))?;
+            }
+            let inputs=[Allocation::new(devices[0],capacity as usize*k*2, crate::shared::memory::TEST)?,
+                Allocation::new(devices[1],capacity as usize*k*2, crate::shared::memory::TEST)?];
             let plan=devices[0].run(||lib.v41_fp8_matrix_plan(capacity,k as u32,n as u32))?;
             let stream=Stream::new(devices[0])?;
-            let scratch=Allocation::new(devices[0],plan.info().scratch_bytes as usize)?;
-            let alpha=Allocation::new(devices[0],16)?;
-            let output=Allocation::new(devices[0],capacity as usize*n*2)?;
+            let scratch=Allocation::new(devices[0],plan.info().scratch_bytes as usize, crate::shared::memory::TEST)?;
+            let alpha=Allocation::new(devices[0],16, crate::shared::memory::TEST)?;
+            let output=Allocation::new(devices[0],capacity as usize*n*2, crate::shared::memory::TEST)?;
             devices[0].run(||unsafe { plan.initialize_scratch(scratch.buffer,alpha.buffer,stream.raw) })?;
             stream.drain()?;
             for layer in [2,20] {
@@ -419,7 +508,7 @@ mod tests {
                     format!("layers.{layer}.attn.{}.scale",kind.name())];
                 let full=devices[0].own(||NativeRtxTensors::load(&lib,&catalog,&names,
                     NativeRtxTensors::plan(&catalog,&names)?,1<<20))?;
-                let scales=Allocation::new(devices[0],k*n/32)?;
+                let scales=Allocation::new(devices[0],k*n/32, crate::shared::memory::TEST)?;
                 devices[0].run(||unsafe { lib.v41_fp8_matrix_kernel(1,k as u32,n as u32)?
                     .pack_scales(full.get().get(&names[1])?,scales.buffer,stream.raw) })?;
                 stream.drain()?;
@@ -503,7 +592,7 @@ mod shared_storage_tests {
             vec![Weights::load(devices[1],&catalog,2,kind,1,Weights::load_peak_device_bytes(&lib,kind)?)?]];
         let banks=[weights[0].as_slice(),weights[1].as_slice()];
         let (rows,unit)=(13u32,16u32);let (k,n)=kind.geometry();
-        let inputs=[Allocation::new(devices[0],rows as usize*k*2)?,Allocation::new(devices[0],rows as usize*k*2)?];
+        let inputs=[Allocation::new(devices[0],rows as usize*k*2, crate::shared::memory::TEST)?,Allocation::new(devices[0],rows as usize*k*2, crate::shared::memory::TEST)?];
         for (seed,input) in inputs.iter().enumerate() {
             let host:Vec<u8>=(0..rows as usize*k).flat_map(|i| {
                 let f=((i*7+seed*11)%29) as f32/32.0-0.4;((f.to_bits()>>16) as u16).to_ne_bytes()
@@ -519,7 +608,7 @@ mod shared_storage_tests {
             slot.select_window(RowWindow::within(i*unit as usize..i*unit as usize+rows as usize,48)?)?;
             runtime.block_on(unsafe {slot.execute(2,rows,inputs[i].buffer)})?;
         }
-        let reader=Stream::new(devices[1])?;let saved=Allocation::new(devices[1],want.len())?;
+        let reader=Stream::new(devices[1])?;let saved=Allocation::new(devices[1],want.len(), crate::shared::memory::TEST)?;
         devices[1].run(||unsafe {lib.copy_peer_async(saved.buffer,storage.output.buffer,want.len(),reader.raw)})?;reader.drain()?;
         let chains=[StageChain::on_devices(&lib,&[0,1])?,StageChain::on_devices(&lib,&[0,1])?];
         let gate=devices[1].run(||unsafe {cuteafd_ffi::test_support::CudaStreamGate::new(&lib,reader.raw)})?;
@@ -562,7 +651,6 @@ mod shared_storage_tests {
 #[cfg(test)]
 #[allow(dead_code)] // the coordinator push tests read them; other test crates do not
 impl<'a> Weights<'a> {
-    pub(crate) fn buffers(&self) -> [CuteafdDeviceBuffer; 2] { [self.weight.buffer, self.scales.buffer] }
     pub(crate) fn layer_index(&self) -> usize { self.layer }
 }
 

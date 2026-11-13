@@ -10,6 +10,7 @@ use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::{CuteafdDeviceBuffer, NativeLibrary, V41Kv};
 use std::ffi::c_void;
 use std::rc::Rc;
+use crate::shared::memory::Tag;
 pub(crate) mod replica;
 
 /// Capacity failure for one entry in the caller's ordered append transaction.
@@ -102,18 +103,18 @@ impl<'a> SourceCache<'a> {
     }
     pub fn new(library: &'a NativeLibrary, pages: usize, slots: usize) -> Result<Self> {
         Self::device_bytes(pages, slots)?;
-        let lengths = DeviceAllocation::new(library, slots * 8)?;
+        let lengths = DeviceAllocation::new(library, slots * 8, Tag::kv("v41/compressed-cache"))?;
         library.copy_h2d(lengths.buffer, &vec![0; slots * 8])?;
         Ok(Self {
-            page_table: DeviceAllocation::new(library, slots * pages.min(4096) * 4)?,
+            page_table: DeviceAllocation::new(library, slots * pages.min(4096) * 4, Tag::kv("v41/compressed-cache"))?,
             lengths,
-            staging: HostAllocation::new(library, slots * 8)?,
+            staging: HostAllocation::new(library, slots * 8, Tag::staging("v41/compressed-cache"))?,
             staging_check: crate::shared::memory::staging_check::StagingCheck::new(library, "V4.1 compressor source lengths", 1),
             stride: pages.min(4096),
-            packed: DeviceAllocation::new(library, pages * PAGE_ROWS * 64)?,
-            scales: DeviceAllocation::new(library, pages * PAGE_ROWS * 4)?,
-            kv_values: DeviceAllocation::attention_plane(library, pages * PAGE_ROWS, KV_VALUES, "compressed cache values")?,
-            kv_scales: DeviceAllocation::attention_plane(library, pages * PAGE_ROWS, KV_SCALES, "compressed cache scales")?,
+            packed: DeviceAllocation::new(library, pages * PAGE_ROWS * 64, Tag::kv("v41/compressed-cache"))?,
+            scales: DeviceAllocation::new(library, pages * PAGE_ROWS * 4, Tag::kv("v41/compressed-cache"))?,
+            kv_values: DeviceAllocation::attention_plane(library, pages * PAGE_ROWS, KV_VALUES, "compressed cache values", Tag::kv("v41/compressed-cache"))?,
+            kv_scales: DeviceAllocation::attention_plane(library, pages * PAGE_ROWS, KV_SCALES, "compressed cache scales", Tag::kv("v41/compressed-cache"))?,
             capacity: pages * PAGE_ROWS,
             pages: std::array::from_fn(|_| vec![]),
             rows: [0; cuteafd_core::V41_MAX_REQUESTS],

@@ -30,6 +30,16 @@ its roughly 1.81M-token pool and onboards none. These are planner results,
 not hardware qualification. Start from the published-revision-pinned
 `examples/configs/step5-exl3-k6core-{min,max}.config`.
 
+## Core selection
+
+Plain Step-5 checkpoints use `CORE_VIEW=original`. A compact selector requires
+an explicit [MC manifest](../mc-checkpoints.md), with complete K8/K6 core views
+rather than alternate attention-only files. `fp8-compact` retains the existing
+native BF16 O-projection conversion scope, including private MTP outputs:
+row-major E4M3 weights, F32 block-128 scales and BF16 activations (W8A16).
+TP2 SWA outputs retain F32 partials and narrow once after rank-ordered reduction.
+Whole-core FP8 expansion is separate from this conversion path.
+
 ## Native MTP
 
 Native MTP is enabled by default at depth 3 for both layouts. The three
@@ -59,3 +69,9 @@ Start with `examples/configs/step5-fp8-max.config` or
 and select a sealed WIP slot containing `serve-step5`. Keep media disabled;
 Step-5's bundled vision execution is not yet qualified. Pool sizing remains
 automatic, and admission refuses configurations below the 256K context floor.
+
+## Changelog
+
+| Version | Date | Change | Basic eval |
+| --- | --- | --- | --- |
+| v5 | 2026-11-10 | Published benchmarks | <a href="../../benchmarks/step5/2026-11-10-smoke-step-5-preview-exl3-k4-core-k6-1rtx-3spark-step5-exl3-k6core-min/report.svg"><img src="../../benchmarks/step5/2026-11-10-smoke-step-5-preview-exl3-k4-core-k6-1rtx-3spark-step5-exl3-k6core-min/card.svg" width="360" alt="Step-5-Preview-EXL3-K4-Core-K6 (exl3-k4+exl3-k6) (1× RTX)"></a> <a href="../../benchmarks/step5/2026-11-10-smoke-step-5-preview-exl3-k4-core-k6-2rtx-6spark-step5-exl3-k6core-max/report.svg"><img src="../../benchmarks/step5/2026-11-10-smoke-step-5-preview-exl3-k4-core-k6-2rtx-6spark-step5-exl3-k6core-max/card.svg" width="360" alt="Step-5-Preview-EXL3-K4-Core-K6 (exl3-k4+exl3-k6) (2× RTX)"></a> |

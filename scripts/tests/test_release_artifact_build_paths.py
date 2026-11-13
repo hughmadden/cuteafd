@@ -262,6 +262,8 @@ def test_relocated_cargo_target_is_where_the_daemon_is_installed(scratch):
     )
 
     env = dict(os.environ)
+    env["CUTEAFD_EXPORT_IMAGE_ID"] = ""
+    env["CUTEAFD_EXPORT_CACHE"] = "off"
     env["PATH"] = f"{shims}:{env['PATH']}"
     env["CARGO_TARGET_DIR"] = str(relocated)
     # This stub proves relocation, not compiler-cache target suffixing.

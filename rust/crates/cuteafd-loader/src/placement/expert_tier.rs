@@ -7,7 +7,7 @@
 //! GPUs (a whole layer is a share of 100%), so both pools stream weights in
 //! parallel inside each layer. Per layer and step, an active expert runs on the
 //! GPUs when it is resident there and on the Sparks otherwise
-//! (`cuteafd_core::ReplicatedExpertScheduler::plan_resident`).
+//! (`cuteafd_core::CoordinatorExpertResidency`).
 //!
 //! - Which experts: [`optimized_order`] ranks every (layer, expert) slot by
 //!   how much its residency cuts the predicted step time, the sum over layers
@@ -635,8 +635,7 @@ mod tests {
     /// 77% of its 278 GB/s roofline.
     #[test]
     fn c1_verify_step_model_reproduces_the_tier_physics() {
-        use cuteafd_core::{ExpertResidencySet, ReplicatedExpertCostModel as Cost, ReplicatedExpertGroupSpec as Group,
-            ReplicatedExpertScheduleConfig, ReplicatedExpertScheduler};
+        use cuteafd_core::{CoordinatorExpertResidency, ExpertResidencySet};
         const LAYERS: usize = 40;
         const EXPERTS: usize = 384;
         const ACTIVE: usize = 24;
@@ -649,10 +648,23 @@ mod tests {
         assert_eq!(half, 9_131_264);
         let gpu_rate = half * 1_000_000_000 / MODEL.gpu_expert_ns;
         assert_eq!(gpu_rate / 1_000_000_000, 976);
-        let spark = Group::full(Cost::streaming(slice, spark_rate, 0, 16).unwrap()).with_call_cost(MODEL.spark_fixed_ns);
-        let gpu = Group::partial(Cost::streaming(half, gpu_rate, 0, 16).unwrap()).with_call_cost(MODEL.gpu_fixed_ns);
-        let config = ReplicatedExpertScheduleConfig::with_groups(&[gpu, spark]).unwrap();
-        let mut scheduler = ReplicatedExpertScheduler::new(config, EXPERTS).unwrap();
+        // The executor marks fixed coordinator residency directly. Price that
+        // routing with the independently measured streaming rates, including
+        // a call cost only for a pool with active experts (tile cost is zero).
+        let loads = |counts: &[u32], set: &ExpertResidencySet| {
+            let ids = set.iter().map(|id| id as u16).collect::<Vec<_>>();
+            let routes = CoordinatorExpertResidency::from_experts(&ids).unwrap();
+            let mut active = [0u64; 2];
+            for (expert, &rows) in counts.iter().enumerate() {
+                assert_eq!(routes.contains(expert as u16), set.contains(expert));
+                if rows > 0 { active[usize::from(!routes.contains(expert as u16))] += 1; }
+            }
+            let stream_ns = |bytes: u64, rate: u64| (bytes * 1_000_000_000).div_ceil(rate);
+            let cost = |active, bytes, rate, call| if active == 0 { 0 }
+                else { call + active * stream_ns(bytes, rate) };
+            [cost(active[0], half, gpu_rate, MODEL.gpu_fixed_ns),
+                cost(active[1], slice, spark_rate, MODEL.spark_fixed_ns)]
+        };
 
         // Deterministic active sets: `ACTIVE` distinct experts per layer, each
         // drawn from the resident set with probability `hit` (None: uniform).
@@ -674,7 +686,7 @@ mod tests {
                             Some(pool) => pool[(next() % pool.len() as u64) as usize] };
                         if counts[expert] == 0 { counts[expert] = 1 + (chosen % 2) as u32; chosen += 1; }
                     }
-                    total += scheduler.plan_resident(&counts, 0, &[set.words(), &[]]).unwrap().makespan();
+                    total += *loads(&counts, set).iter().max().unwrap();
                 }
             }
             total as f64 / steps as f64
@@ -703,7 +715,7 @@ mod tests {
         assert!((4.1..=4.45).contains(&tier), "uniform tier saves {tier:.2} ms");
         assert!((2.5..=2.7).contains(&whole), "the same bytes as whole layers save {whole:.2} ms");
         assert!((1.55..=1.75).contains(&(tier / whole)), "spread/whole {:.2}", tier / whole);
-        // The planner's analytic step model agrees with the scheduler.
+        // The planner's analytic step model agrees with fixed route ownership.
         let activation = ExpertActivation::uniform(LAYERS, EXPERTS, ACTIVE as u32);
         let ids = (0..81u16).collect::<Vec<_>>();
         let resident = vec![ids.as_slice(); LAYERS];
@@ -727,17 +739,17 @@ mod tests {
         // bytes in parallel, and the layer's expert phase shrinks by about it.
         let mut wide = [64u32; EXPERTS];
         wide[0] = 65;
-        let spark_only = scheduler.plan_resident(&wide, 0, &[nothing[0].words(), &[]]).unwrap().makespan();
-        let shared = scheduler.plan_resident(&wide, 0, &[uniform[0].words(), &[]]).unwrap();
-        assert!(shared.group_loads()[0].cost < shared.group_loads()[1].cost);
-        let shrink = 1.0 - shared.makespan() as f64 / spark_only as f64;
+        let spark_only = *loads(&wide, &nothing[0]).iter().max().unwrap();
+        let shared = loads(&wide, &uniform[0]);
+        assert!(shared[0] < shared[1]);
+        let shrink = 1.0 - *shared.iter().max().unwrap() as f64 / spark_only as f64;
         assert!((0.20..=0.215).contains(&shrink), "prefill expert phase shrinks {shrink:.3}");
     }
 
     #[test]
     fn per_expert_bytes_divide_the_layer_exactly() {
         let cost = ExpertCost { whole: super::super::Bytes2 { resident: 384 * 18_800_640, staging: 7 },
-            half: [super::super::Bytes2 { resident: 384 * 9_400_320, staging: 5 }; 2], tp2: true, spark_ok: true };
+            half: [super::super::Bytes2 { resident: 384 * 9_400_320, staging: 5 }; 2], tp2: true, whole_supported: true, spark_ok: true };
         assert_eq!(per_expert(&cost, true, 1, 384), Some(super::super::Bytes2 { resident: 9_400_320, staging: 5 }));
         assert_eq!(per_expert(&cost, false, 0, 384), Some(super::super::Bytes2 { resident: 18_800_640, staging: 7 }));
         assert_eq!(per_expert(&cost, true, 0, 385), None);

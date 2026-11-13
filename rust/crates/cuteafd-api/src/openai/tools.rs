@@ -120,7 +120,7 @@ impl ToolConstraints {
                     "begin":format!(" to={}<|message|><atem:function_calls>\n<atem:invoke name=\"{}\">\n",
                         muse_header(&tool.name), muse_attribute(&tool.name)),
                     "content":{"type":"muse_tool_schema", "strict":strict, "json_schema":schema},
-                    "end":"\n</atem:invoke>\n</atem:function_calls>"}),
+                    "end":"</atem:invoke>\n</atem:function_calls>"}),
             });
         }
         if !(assistance || strict_requested || required) {
@@ -177,11 +177,33 @@ impl ToolConstraints {
     }
 
     fn validate(&self, calls: &BTreeMap<u64, Call>, reason: &str) -> Result<()> {
-        if !matches!(reason, "stop" | "tool_calls") { return Ok(()); }
-        ensure!(!self.required || !calls.is_empty(), "native response omitted a required tool call");
         ensure!(self.parallel || calls.len() <= 1, "native response violated parallel_tool_calls=false");
-        ensure!(calls.is_empty() || reason == "tool_calls", "native tool response ended without tool_calls finish");
-        ensure!(reason != "tool_calls" || !calls.is_empty(), "native tool response has no calls");
+        if !matches!(reason, "stop" | "tool_calls") {
+            // A call cut at `max_tokens` (finish `length`) may have streamed
+            // argument deltas that cannot be retracted. Ignore only a trailing
+            // incomplete call so the validator does not fail the response.
+            // Malformed and truncated arguments are indistinguishable here;
+            // earlier calls still obey the index, schema and parallel rules.
+            let count = calls.len() - usize::from(calls.last_key_value()
+                .is_some_and(|(_, call)| unique_json(&call.arguments).is_err()));
+            let complete: BTreeMap<u64, Call> = calls.iter()
+                .take(count)
+                .map(|(index, call)| (*index, Call { name: call.name.clone(), arguments: call.arguments.clone() }))
+                .collect();
+            // A truncated response is not a protocol violation: an omitted or
+            // partial call is expected, so `required` does not apply here.
+            if complete.is_empty() { return Ok(()); }
+            return self.validate_complete(&complete, reason, false);
+        }
+        self.validate_complete(calls, reason, true)
+    }
+    fn validate_complete(&self, calls: &BTreeMap<u64, Call>, reason: &str, required: bool) -> Result<()> {
+        if calls.is_empty() {
+            ensure!(reason != "tool_calls", "native response claimed tool_calls without a call");
+            ensure!(!(required && self.required), "native response omitted a required tool call");
+            return Ok(());
+        }
+        ensure!(!required || reason == "tool_calls", "native response emitted tool calls without tool_calls finish");
         for (expected, (index, call)) in calls.iter().enumerate() {
             ensure!(*index == expected as u64, "native tool call indices are not contiguous");
             let validator = self.validators.get(&call.name)
@@ -286,6 +308,47 @@ mod tests {
     use tower::ServiceExt;
 
     #[test]
+    fn muse_zero_argument_constraint_matches_rendered_template_bytes() {
+        let tool = ToolDefinition { name: "refresh".into(), description: None,
+            parameters: json!({"type":"object","properties":{},"additionalProperties":false}), strict: Some(true) };
+        let constraints = ToolConstraints::new(&[tool], ToolChoice::Auto, true, false, true,
+            ToolSyntax::MuseAtem).unwrap().unwrap();
+        let tag = &constraints.format.as_ref().unwrap()["tags"][0];
+        let bytes = format!("{}{}", tag["begin"].as_str().unwrap(), tag["end"].as_str().unwrap());
+        let template = crate::openai::chat::glm5::template::ChatTemplate::new(include_str!(
+            "chat/muse/fixtures/muse_spark.jinja")).unwrap();
+        let rendered = template.render(&json!({"bos_token":"", "add_generation_prompt":false,
+            "messages":[{"role":"assistant","tool_calls":[{"function":{"name":"refresh","arguments":{}}}]}]})).unwrap();
+        let rendered = rendered.split_once("<|start|>assistant").unwrap().1;
+        let rendered = rendered.split_once("<|eot|>").unwrap().0;
+        assert_eq!(bytes.as_bytes(), rendered.as_bytes());
+        assert_eq!(bytes.as_bytes(), b" to=refresh<|message|><atem:function_calls>\n<atem:invoke name=\"refresh\">\n</atem:invoke>\n</atem:function_calls>");
+    }
+
+    #[test]
+    fn zero_argument_tags_keep_other_family_delimiters() {
+        for (syntax, begin, end) in [
+            (ToolSyntax::Dsml, "<｜DSML｜ invoke name=\"refresh\">", "</｜DSML｜ invoke>"),
+            (ToolSyntax::GlmXml, "<tool_call>refresh", "</tool_call>"),
+            (ToolSyntax::QwenXml, "<tool_call>\n<function=refresh>\n", "\n</function>\n</tool_call>"),
+            (ToolSyntax::KimiXtml, "<|open|>call tool=\"refresh\" index=\"", "<|close|>call<|sep|>"),
+            (ToolSyntax::MistralCalls, "[TOOL_CALLS]refresh[ARGS]", ""),
+        ] {
+            let tool = ToolDefinition { name:"refresh".into(), description:None,
+                parameters:json!({"type":"object","properties":{},"additionalProperties":false}), strict:Some(true) };
+            let constraints = ToolConstraints::new(&[tool], ToolChoice::Auto, true, false, true, syntax).unwrap().unwrap();
+            let format = constraints.format.as_ref().unwrap();
+            let tags = match syntax {
+                ToolSyntax::Dsml => &format["content"]["elements"][1]["tags"],
+                ToolSyntax::KimiXtml => &format["content"]["tags"],
+                _ => &format["tags"],
+            };
+            assert_eq!(tags[0]["begin"].as_str().unwrap().as_bytes(), begin.as_bytes(), "{syntax:?}");
+            assert_eq!(tags[0]["end"].as_str().unwrap().as_bytes(), end.as_bytes(), "{syntax:?}");
+        }
+    }
+
+    #[test]
     fn arguments_reject_duplicate_and_escaped_alias_keys_recursively() {
         for invalid in [r#"{"x":1,"x":2}"#, r#"{"x":1,"\u0078":2}"#,
             r#"{"a":[{"x":1,"x":2}]}"#, "{} garbage", "[NaN]"] {
@@ -337,11 +400,16 @@ mod tests {
             ("unknown-name", json!("auto"), false, block(&[invoke("unknown", &parameter("n","42",false))]), false, false),
             ("parallel-disabled", json!("auto"), false, block(&[good_call.clone(),good_call.clone()]), false, false),
             ("parallel-enabled", json!("auto"), true, block(&[good_call.clone(),good_call.clone()]), true, false),
+            ("parallel-truncated-disabled", json!("auto"), false,
+                format!("<｜DSML｜ calls>\n{}\n<｜DSML｜ invoke name=\"lookup\">", good_call), false, true),
+            ("parallel-truncated-enabled", json!("auto"), true,
+                format!("<｜DSML｜ calls>\n{}\n<｜DSML｜ invoke name=\"lookup\">", good_call), true, true),
             ("truncated", json!("required"), false, "<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"lookup\">".into(), true, true),
         ];
         for (name, choice, parallel, text, valid, truncated) in scenarios {
             for thinking in [false, true] {
                 for streaming in [false, true] {
+                    let valid = valid || (!streaming && name == "parallel-truncated-disabled");
                     let (queue, mut receive) = tokio::sync::mpsc::channel::<NativeRequest>(1);
                     let text = if thinking { format!("I will choose carefully.\n</think>{text}") } else { text.clone() };
                     let audit_text = text.clone();
@@ -374,10 +442,69 @@ mod tests {
                     if !valid && streaming {
                         crate::openai::tests::terminal_sse_error(&bytes.unwrap());
                     }
-                    else { assert!(bytes.is_ok(),"{name}/{thinking}: {bytes:?}"); }
+                    else {
+                        let bytes = bytes.unwrap_or_else(|error| panic!("{name}/{thinking}: {error}"));
+                        let text = String::from_utf8_lossy(&bytes);
+                        if valid {
+                            assert!(!text.contains("\"error\""), "{name}/{thinking}: unexpected error: {text}");
+                        }
+                        if truncated {
+                            // A truncated response is a 200 whose stream ends with
+                            // `length`; an SSE `error` inside it would still pass a
+                            // status-only check, so assert on the body.
+                            assert!(text.contains("\"finish_reason\":\"length\""),
+                                "{name}/{thinking}: a truncated response must finish with length: {text}");
+                        }
+                    }
                     worker.await.unwrap();
                 }
             }
         }
     }
+
+    #[tokio::test]
+    async fn stop_with_calls_is_a_terminal_sse_error() {
+        invalid_protocol_finish_is_terminal("{}", None, deepseek_recipe::stream::FinishReason::Stop).await;
+    }
+
+    #[tokio::test]
+    async fn length_with_nontrailing_incomplete_call_is_a_terminal_sse_error() {
+        invalid_protocol_finish_is_terminal("{", Some("{"), deepseek_recipe::stream::FinishReason::Length).await;
+    }
+
+    async fn invalid_protocol_finish_is_terminal(arguments: &str, second: Option<&str>,
+        reason: deepseek_recipe::stream::FinishReason) {
+        // Inject inconsistent terminal protocol chunks to guard the validator contract,
+        // then drive the real SSE responder rather than asserting its helper.
+        let tool = ToolDefinition { name: "lookup".into(), description: None,
+            parameters: json!({"type":"object"}), strict: None };
+        let mut validator = CompletionValidator::new(None,
+            ToolConstraints::new(&[tool], ToolChoice::Auto, false, true, false, ToolSyntax::Dsml).unwrap());
+        use deepseek_recipe::stream::{ChunkGenerator, OutputChunk, CompletionUsage};
+        use deepseek_recipe::openai::chat_completion::response::ChatCompletionChunkGenerator;
+        let mut generator = ChatCompletionChunkGenerator::new("test".into(), MODEL.into(), false, false);
+        let mut chunks = generator.generate(OutputChunk::ToolCall {
+            tool_name: "lookup".into(), arguments: arguments.into(),
+        }).await;
+        if let Some(arguments) = second {
+            chunks.extend(generator.generate(OutputChunk::ToolCall {
+                tool_name: "lookup".into(), arguments: arguments.into(),
+            }).await);
+        }
+        chunks.extend(generator.generate(OutputChunk::Finish {
+            reason, stop_sequence: None, usage: CompletionUsage::default(),
+        }).await);
+        let chunks = chunks.into_iter().map(move |chunk| {
+            validator.observe(&serde_json::to_value(&chunk).unwrap())?;
+            Ok(chunk)
+        }).collect::<Vec<_>>();
+        let response = respond(Running { chunks: Box::pin(futures::stream::iter(chunks)),
+            failure: Default::default(), image_tokens: 0, audio_tokens: 0,
+            prefix_cache_source: Default::default(), finish_detail: Default::default(),
+            tap: Default::default(), streaming: true, include_usage: false, id: "test".into(), model: MODEL.into(),
+        }).await;
+        let bytes = to_bytes(response.into_body(), 1 << 20).await.unwrap();
+        crate::openai::tests::terminal_sse_error(&bytes);
+    }
+
 }

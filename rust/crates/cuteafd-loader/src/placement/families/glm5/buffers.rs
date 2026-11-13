@@ -1,15 +1,17 @@
 //! Physical target buffers, not a placement policy or a complete family admission.
 //! Native dense/K6 hook scratch, experts, exchanges, graphs and serving owners
 //! join these components separately before the family can authorize Ready.
-use super::{GlmScratch, DECODE_ROWS, INDEX_PAGE_BYTES, PAGE_ROWS, RECORD_PAGE_BYTES};
+use super::{GlmScratch, DECODE_ROWS, INDEX_PAGE_BYTES, PAGE_ROWS};
 use crate::families::glm5::{GlmDsaConfig, GlmIndexer};
 use crate::placement::planner::{
-    Allocation, ByteCurve, BytePiece, Component, Lifetime, Location, Phase, PrefillShape, Refusal,
-    View,
+    Allocation, AllocationGranularity, ByteCurve, BytePiece, Component, GranularityBacking,
+    GranularityEvidence, Lifetime, Location, Phase, PrefillShape, Refusal, SM120_ALLOCATION_GRANULARITY_BYTES,
+    View, allocation_granularity_component, first_independent_pages,
 };
 use cuteafd_core::memory_layout::Category;
 
-const FLOOR: u64 = 256;
+/// Smallest allocation a latent slot or the pools ever request.
+pub(crate) const FLOOR: u64 = 256;
 
 /// One reusable synchronous upload backing after load staging is released.
 /// Warmup presizes it for decode lengths and the largest admitted prefill arena.
@@ -43,8 +45,9 @@ impl PrefixBuffers {
         if self.device > 1 {
             return Err(Refusal::InvalidFact("invalid GLM prefix device".into()));
         }
-        let prefix = format!("glm.prefix.gpu.{}", self.device);
-        let mut owners = vec![Allocation::buffer(format!("{prefix}.tail-scratch"),
+        // NativePrefix owns one scratch and optional mark arena on its lead,
+        // not one copy per attention rank. Match its receipt identities.
+        let mut owners = vec![Allocation::buffer("glm.prefix.scratch",
             Location::coordinator(self.device), FLOOR, lifetime, Category::Prefix, "GLM prefix storage")];
         if let Some(windows) = self.draft_windows.filter(|_| self.mark_slots > 0) {
             let mark = if windows == 0 { 0 } else {
@@ -53,7 +56,7 @@ impl PrefixBuffers {
             };
             let bytes = mul(mark, self.mark_slots)?.max(FLOOR);
             usize::try_from(bytes).map_err(|_| Refusal::Overflow("GLM prefix marks"))?;
-            owners.push(Allocation::buffer(format!("{prefix}.draft-marks"),
+            owners.push(Allocation::buffer("glm.prefix.draft_marks",
                 Location::coordinator(self.device), bytes, lifetime, Category::Prefix, "GLM prefix storage"));
         }
         Ok(owners)
@@ -90,11 +93,54 @@ pub struct TargetBuffers {
     /// Optional TP2 payload and K6 row arenas; their hook-local owners are separate.
     pub payload_row_bytes: u64,
     pub core_rows: bool,
+    pub attention_partial_bytes: u64,
+    pub down_partial_bytes: u64,
 }
 
 fn mul(a: u64, b: u64) -> Result<u64, Refusal> {
     a.checked_mul(b)
         .ok_or(Refusal::Overflow("GLM target buffers"))
+}
+
+/// One pool allocation: its resident per-solver-page stride plus the single
+/// scratch page decode rows write. Requests above the driver's shared-block
+/// boundary round to whole cudaMalloc blocks independently; smaller ones share
+/// blocks, so their curve stays exact and one granularity owner prices the
+/// block (`ByteCurve::paged` is the rounding-only form: below the boundary it
+/// would charge a block a request cannot take). Refinement splits the rounded
+/// extent back into request and tail.
+fn pool_curve(stride: u64, page: u64, maximum: u64) -> Result<ByteCurve, Refusal> {
+    let first = first_independent_pages(stride, page)?;
+    let mut pieces = Vec::new();
+    let exact_last = (first - 1).min(maximum);
+    if exact_last > 0 {
+        pieces.push(BytePiece {
+            first: 1,
+            last: exact_last,
+            bytes_at_first: pool_request(1, stride, page)?,
+            bytes_per_page: stride,
+            granularity: 1,
+            backings: 1,
+        });
+    }
+    if first <= maximum {
+        pieces.push(BytePiece {
+            first,
+            last: maximum,
+            bytes_at_first: pool_request(first, stride, page)?,
+            bytes_per_page: stride,
+            granularity: SM120_ALLOCATION_GRANULARITY_BYTES,
+            backings: 1,
+        });
+    }
+    Ok(ByteCurve(pieces))
+}
+
+/// Exact cudaMalloc request for one pool allocation at `pages` solver pages.
+fn pool_request(pages: u64, stride: u64, page: u64) -> Result<u64, Refusal> {
+    mul(pages, stride)?
+        .checked_add(page)
+        .ok_or(Refusal::Overflow("GLM pool scratch page"))
 }
 
 /// max(256, pages * stride), represented by at most two affine pieces.
@@ -106,22 +152,22 @@ fn floored(stride: u64, maximum: u64) -> Result<ByteCurve, Refusal> {
     };
     let mut pieces = Vec::new();
     if flat > 0 {
-        pieces.push(BytePiece {
+        pieces.push(BytePiece { granularity: 1,
             first: 1,
             last: flat,
             bytes_at_first: FLOOR,
-            bytes_per_page: 0,
+            bytes_per_page: 0, backings: 1,
         });
     }
     if flat < maximum {
         let first = flat
             .checked_add(1)
             .ok_or(Refusal::Overflow("GLM buffer floor"))?;
-        pieces.push(BytePiece {
+        pieces.push(BytePiece { granularity: 1,
             first,
             last: maximum,
             bytes_at_first: mul(first, stride)?,
-            bytes_per_page: stride,
+            bytes_per_page: stride, backings: 1,
         });
     }
     Ok(ByteCurve(pieces))
@@ -187,8 +233,15 @@ impl Builder {
         table_stride: u64,
     ) -> Result<(), Refusal> {
         let name = if decode { "decode" } else { "prefill" };
+        // The decode workspace is allocated by the startup warm pass. Prefill
+        // lanes are allocated by the first prefill: during startup only for
+        // scoring, otherwise by live traffic after Ready.
         let lifetime = Lifetime {
-            first: Phase::Warmup,
+            first: if decode || facts.full_prefill_logits {
+                Phase::Warmup
+            } else {
+                Phase::Growth
+            },
             last: Phase::Growth,
         };
         let span = mul(shape.rows, shape.waves)?;
@@ -201,8 +254,8 @@ impl Builder {
         }
         if facts.core_rows {
             fields.extend([
-                ("core.attention", mul(cfg.hidden as u64, 2)?),
-                ("core.down", mul(cfg.hidden as u64, 2)?),
+                ("core.attention", mul(cfg.hidden as u64, facts.attention_partial_bytes)?),
+                ("core.down", mul(cfg.hidden as u64, facts.down_partial_bytes)?),
                 ("core.reduction", mul(cfg.hidden as u64, 4)?),
             ]);
         }
@@ -377,17 +430,13 @@ impl TargetBuffers {
             maximum: self.maximum_pages,
             out: Vec::new(),
         };
+        let mut small = Vec::new();
         for (layer, &owned) in self.owned_layers.iter().enumerate() {
-            let kv = if owned {
-                let stride = mul(local_pages, RECORD_PAGE_BYTES)?;
-                ByteCurve::linear(
-                    stride
-                        .checked_add(RECORD_PAGE_BYTES)
-                        .ok_or(Refusal::Overflow("GLM KV scratch page"))?,
-                    stride,
-                    self.maximum_pages,
-                )
+            let kv = if owned && cfg.owns_kv(layer) {
+                let page = mul(PAGE_ROWS, cfg.record_bytes(layer) as u64)?;
+                pool_curve(mul(local_pages, page)?, page, self.maximum_pages)?
             } else {
+                small.push(format!("glm.target.gpu.{}.kv.{layer}", self.device));
                 ByteCurve::fixed(FLOOR, self.maximum_pages)
             };
             b.add(
@@ -398,27 +447,37 @@ impl TargetBuffers {
                 None,
             )?;
             if owned && cfg.indexers[layer] == GlmIndexer::Full {
-                let stride = mul(local_pages, INDEX_PAGE_BYTES)?;
                 b.add(
                     &format!("index.{layer}"),
-                    ByteCurve::linear(
-                        stride
-                            .checked_add(INDEX_PAGE_BYTES)
-                            .ok_or(Refusal::Overflow("GLM index scratch page"))?,
-                        stride,
-                        self.maximum_pages,
-                    ),
+                    pool_curve(mul(local_pages, INDEX_PAGE_BYTES)?, INDEX_PAGE_BYTES,
+                        self.maximum_pages)?,
                     Lifetime::TARGET,
                     Category::Kv,
                     None,
                 )?;
             }
         }
+        if !small.is_empty() {
+            // Unowned latent slots still cudaMalloc their 256-byte floor; the
+            // driver packs those sub-block requests into one shared block.
+            b.out.push(allocation_granularity_component(
+                AllocationGranularity {
+                    id: format!("glm.target.gpu.{}.kv.small-tail", self.device),
+                    location: Location::coordinator(self.device),
+                    lifetime: Lifetime::TARGET,
+                    backings: small.into_iter()
+                        .map(|backing| GranularityBacking { backing, requests: vec![FLOOR] })
+                        .collect(),
+                    evidence: GranularityEvidence::Forecast,
+                },
+                self.maximum_pages,
+            )?);
+        }
         b.fixed(
             "rope",
             mul(mul(self.context, cfg.qk_rope_head_dim as u64)?, 4)?,
             Lifetime::TARGET,
-            Category::Kv,
+            Category::Weights,
         )?;
         let tables = mul(self.page_tokens / PAGE_ROWS, 4)?;
         if let Some(scratch) = self.decode {
@@ -438,6 +497,45 @@ impl TargetBuffers {
             b.workspace(cfg, self, false, shape, scratch, tables)?;
         }
         Ok(b.out)
+    }
+
+    /// Every KV-pool cudaMalloc request this rank makes at `pages` solver
+    /// pages, in the order the executor allocates them. Identities match
+    /// `components` so the solved ledger can be split into exact requests.
+    /// Returns the real pool requests and the ids of the 256-byte latent slots
+    /// whose shared driver block `components` already prices.
+    pub fn pool_requests(&self, cfg: &GlmDsaConfig, pages: u64)
+        -> Result<(Vec<(String, u64)>, Vec<String>), Refusal> {
+        let divisor = if self.partitioned { 2 } else { 1 };
+        if self.device > 1
+            || pages == 0
+            || pages > self.maximum_pages
+            || self.page_tokens % (PAGE_ROWS * divisor) != 0
+            || self.owned_layers.len() > cfg.layers
+            || cfg.indexers.len() != cfg.layers
+        {
+            return Err(Refusal::InvalidFact("invalid GLM pool request geometry".into()));
+        }
+        let local_pages = self.page_tokens / (PAGE_ROWS * divisor);
+        let prefix = format!("glm.target.gpu.{}", self.device);
+        let mut out = Vec::new();
+        let mut floors = Vec::new();
+        for (layer, &owned) in self.owned_layers.iter().enumerate() {
+            if owned && cfg.owns_kv(layer) {
+                let page = mul(PAGE_ROWS, cfg.record_bytes(layer) as u64)?;
+                out.push((format!("{prefix}.kv.{layer}"),
+                    pool_request(pages, mul(local_pages, page)?, page)?));
+            } else {
+                floors.push(format!("{prefix}.kv.{layer}"));
+            }
+            if owned && cfg.indexers[layer] == GlmIndexer::Full {
+                out.push((
+                    format!("{prefix}.index.{layer}"),
+                    pool_request(pages, mul(local_pages, INDEX_PAGE_BYTES)?, INDEX_PAGE_BYTES)?,
+                ));
+            }
+        }
+        Ok((out, floors))
     }
 }
 

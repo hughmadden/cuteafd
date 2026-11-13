@@ -60,7 +60,7 @@ fn k6_checkpoint_load_forward_matches_dequant() -> Result<()> {
     let device=Device{library:&library,id:std::env::var("CUTEAFD_CACHE_TEST_DEVICE").unwrap_or_else(|_|"0".into()).parse()?};
     let programs=device.run(||fixture_library.programs()?.with_manifest(Path::new(&std::env::var("CUTEAFD_PROGRAM_MANIFEST")?)))?;
     let upload=|bytes: &[u8]| -> Result<Allocation<'_>> {
-        let allocation=Allocation::new(device,bytes.len().max(16))?;
+        let allocation=Allocation::new(device,bytes.len().max(16), crate::shared::memory::TEST)?;
         device.run(||library.copy_h2d(allocation.buffer,bytes))?;
         Ok(allocation)
     };
@@ -100,12 +100,12 @@ fn k6_checkpoint_load_forward_matches_dequant() -> Result<()> {
                 let w=native.workspace();
                 let input=upload(&x.bytes)?;let payload=upload(&shard.payload)?;
                 let suh=upload(&shard.suh)?;let svh=upload(&shard.svh)?;
-                let rotated=Allocation::new(device,w.rotated)?;
+                let rotated=Allocation::new(device,w.rotated, crate::shared::memory::TEST)?;
                 let table=upload(&(rotated.buffer.ptr as u64).to_le_bytes())?;
-                let scales=Allocation::new(device,w.block_scales)?;
-                let partial=Allocation::new(device,w.partial)?;
-                let accumulator=Allocation::new(device,w.accumulator)?;
-                let output=Allocation::new(device,8*256*4)?;
+                let scales=Allocation::new(device,w.block_scales, crate::shared::memory::TEST)?;
+                let partial=Allocation::new(device,w.partial, crate::shared::memory::TEST)?;
+                let accumulator=Allocation::new(device,w.accumulator, crate::shared::memory::TEST)?;
+                let output=Allocation::new(device,8*256*4, crate::shared::memory::TEST)?;
                 // Drain on every result before the per-case owners leave scope.
                 let launched=device.run(|| {
                     native.input(8,input.buffer,suh.buffer,rotated.buffer,scales.buffer,stream)?;

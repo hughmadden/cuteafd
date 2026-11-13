@@ -101,17 +101,29 @@ impl<'a> Mtp<'a> {
         bindings[0] = Some(binding);
         let layout = PageLayout { record_bytes: Qwen4KvCache::Bf16.record_bytes(cfg.kv_heads, cfg.head_dim),
             hidden_bytes: cfg.hidden * 2 };
+        // Native MTP is its own retired scope: one arena, borrowing only the target embedding/head.
+        let arena = super::super::weights::ScopeArena::new(device,
+            super::super::weights::mtp_arena(reader.checkpoint, &cfg, format)?,
+            cuteafd_core::memory_layout::ArenaTag::drafter_weights("qwen35/mtp"))?;
+        let mut allocate = |name: &str, bytes| arena.allocate(name, bytes);
+        let bf16 = |name: &str| reader.bf16_with(name, name, &mut |name: &str, bytes| arena.allocate(name, bytes));
+        let (fc, norm_hidden, norm_embedding, norm) = (bf16("mtp.fc.weight")?, bf16("mtp.pre_fc_norm_hidden.weight")?,
+            bf16("mtp.pre_fc_norm_embedding.weight")?, bf16("mtp.norm.weight")?);
+        let layer = reader.dense_layer("mtp.layers.0", HybridAttention::Full, format, &mut allocate)?;
+        arena.complete()?;
+        tracing::info!(arena = arena.layout().id(), bytes = arena.layout().bytes(),
+            views = arena.layout().views().len(), padding = arena.layout().padding_bytes(),
+            "dense Qwen native MTP weight arena allocated");
         let out = Self {
             library: device.library, stream: engine.stream.raw,
             projection: cuteafd_ffi::draft_projection::DraftProjections::load(engine.programs, &[(2 * cfg.hidden, cfg.hidden)], HEAD_ROWS)?,
-            layer: reader.dense_layer("mtp.layers.0", HybridAttention::Full, format)?,
-            fc: reader.bf16("mtp.fc.weight")?, norm_hidden: reader.bf16("mtp.pre_fc_norm_hidden.weight")?,
-            norm_embedding: reader.bf16("mtp.pre_fc_norm_embedding.weight")?, norm: reader.bf16("mtp.norm.weight")?,
-            concat: Allocation::new(device, HEAD_ROWS * 2 * cfg.hidden * 2)?,
-            hidden: Allocation::new(device, ROWS * cfg.hidden * 2)?,
-            logits: Allocation::new(device, HEAD_ROWS * cfg.vocab * 4)?,
-            kv: Allocation::new(device, engine.pool_tokens * layout.record_bytes)?,
-            sidecars: Allocation::new(device, engine.pool_tokens.div_ceil(64) * layout.hidden_bytes)?,
+            layer, fc, norm_hidden, norm_embedding, norm,
+            concat: Allocation::new(device, HEAD_ROWS * 2 * cfg.hidden * 2, Tag::drafter_workspace("qwen35/mtp-concat"))?,
+            hidden: Allocation::new(device, ROWS * cfg.hidden * 2, Tag::drafter_workspace("qwen35/mtp-hidden"))?,
+            logits: Allocation::new(device, HEAD_ROWS * cfg.vocab * 4, Tag::drafter_workspace("qwen35/mtp-logits"))?,
+            kv: Allocation::new(device, engine.pool_tokens * layout.record_bytes, Tag::drafter_kv("qwen35/mtp-kv"))?,
+            sidecars: Allocation::new(device, engine.pool_tokens.div_ceil(64) * layout.hidden_bytes,
+                Tag::drafter_kv("qwen35/mtp-sidecars"))?,
             layout, programs, cfg, homes, pool, binding, bindings,
         };
         let actual = out.layer.bytes() + [&out.fc, &out.norm_hidden, &out.norm_embedding, &out.norm, &out.concat,
@@ -293,7 +305,8 @@ impl Admission {
         let layout = PageLayout { record_bytes: Qwen4KvCache::Bf16.record_bytes(cfg.kv_heads, cfg.head_dim),
             hidden_bytes: cfg.hidden * 2 };
         let bytes = DrafterBytes::native_mtp(reader.checkpoint, cfg)?;
-        ensure!(bytes.owned == fixed + 12 && bytes.pool_unit == layout.bytes() as u64,
+        ensure!(bytes.owned == fixed + 12 && bytes.pools ==
+            [(64 * layout.record_bytes) as u64, layout.hidden_bytes as u64],
             "native MTP planner and runtime inventory differ");
         Ok(Self { format, programs, fixed, bytes })
     }
@@ -303,8 +316,10 @@ impl<'a> MtpCache<'a> {
     pub(crate) fn load(engine: &DenseEngine<'a>, reader: &WeightReader<'a>, admission: Admission) -> Result<Self> {
         ensure!(engine.planes.scratch.bytes >= admission.programs.scratch_bytes,
             "MTP scratch exceeds shared target admission");
-        Ok(Self(std::cell::RefCell::new(Mtp::load(engine, reader, admission.format,
-            admission.programs, admission.fixed)?)))
+        let mtp = crate::shared::experts::rtx::push::load_alone(&reader.checkpoint.snapshot,
+            &[engine.stream.device], || Mtp::load(engine, reader, admission.format,
+                admission.programs, admission.fixed))?;
+        Ok(Self(std::cell::RefCell::new(mtp)))
     }
 
     /// Retain canonical INPUT rows only; the sampled bonus has no target hidden yet.
@@ -516,6 +531,30 @@ impl crate::shared::prefix::cuda_copy::SnapshotOwner for MtpCache<'_> {
     }
 }
 
+impl Mtp<'_> {
+    fn weight_receipts(&self, inventory: &mut crate::shared::memory::receipts::Inventory<'_>) -> Result<()> {
+        self.layer.inventory(inventory, "layer.0")?;
+        for (name, owner) in [("fc", &self.fc), ("pre_fc_norm_hidden", &self.norm_hidden),
+            ("pre_fc_norm_embedding", &self.norm_embedding), ("norm", &self.norm)] {
+            owner.inventory(inventory, name)?;
+        }
+        Ok(())
+    }
+}
+
+impl MtpCache<'_> {
+    /// Native MTP arena receipts; its pages and planes are workspace, not weights.
+    pub(crate) fn weight_receipts(&self, devices: cuteafd_loader::placement::planner::CoordinatorDevices<'_>)
+        -> Result<Vec<cuteafd_loader::placement::planner::Receipt>> {
+        use cuteafd_loader::placement::planner::{Lifetime, Phase};
+        let mut inventory = crate::shared::memory::receipts::Inventory::new(devices, "qwen3_5.mtp",
+            Lifetime { first: Phase::DraftLoad, last: Phase::Growth },
+            cuteafd_core::memory_layout::Category::Drafter, "native MTP weights");
+        self.0.borrow().weight_receipts(&mut inventory)?;
+        Ok(inventory.receipts)
+    }
+}
+
 impl Drop for Mtp<'_> {
     fn drop(&mut self) {
         // SAFETY: the target stream outlives this owner, including partially enqueued error paths.
@@ -579,12 +618,13 @@ pub(crate) fn oracle<'a>(args: &super::super::GoldenArgs, library: &'a NativeLib
     let fixed = fixed_bytes(&reader, cfg, format)?;
     // Target planes/scratch/head stay shared; each pooled page adds just one hidden sidecar.
     let layout = PageLayout { record_bytes: Qwen4KvCache::Bf16.record_bytes(cfg.kv_heads, cfg.head_dim), hidden_bytes: width };
-    let demand = DrafterBytes { owned: fixed + (HEAD_ROWS * width) as u64, scratch: 0,
-        pool_unit: layout.bytes() as u64 };
+    let demand = DrafterBytes { owned: fixed + (HEAD_ROWS * width) as u64,
+        pools: vec![(64 * layout.record_bytes) as u64, layout.hidden_bytes as u64],
+        ..DrafterBytes::native_mtp(checkpoint, cfg)? };
     let mut engine = DenseEngine::with_prefix(library, programs, checkpoint, cfg.clone(), args.pool_tokens,
-        Some(demand), 1, None, args.kv_cache, false)?;
+        Some(demand), 1, None, args.kv_cache, false, None, false)?;
     ensure!(engine.planes.scratch.bytes >= admitted.scratch_bytes, "MTP scratch exceeds shared target admission");
-    let input = Allocation::new(engine.stream.device, HEAD_ROWS * width)?;
+    let input = Allocation::new(engine.stream.device, HEAD_ROWS * width, Tag::workspace("qwen35/mtp-oracle"))?;
     let mut mtp = Mtp::load(&engine, &reader, format, admitted, fixed)?;
     mtp.pool.admit(mtp.binding, rows, HEAD_ROWS)?;
     let (mut hidden_cos, mut logit_cos, mut agree, mut nll) = (Vec::new(), Vec::new(), 0usize, 0.);
@@ -697,11 +737,12 @@ mod tests {
             hidden_bytes: cfg.hidden * 2 };
         let engine = RefCell::new(DenseEngine::with_prefix(&library, &programs, &checkpoint, cfg.clone(),
             Some(262144), Some(DrafterBytes { owned: fixed + (HEAD_ROWS * layout.hidden_bytes) as u64,
-                scratch: 0, pool_unit: layout.bytes() as u64 }), 2,
+                pools: vec![(64 * layout.record_bytes) as u64, layout.hidden_bytes as u64],
+                ..DrafterBytes::native_mtp(&checkpoint, &cfg)? }), 2,
             Some(crate::shared::prefix::MarkRule { lanes: 2, entries: 2, budget_bytes: 1 << 30, host: false }),
-            std::env::var("CUTEAFD_DENSE_TEST_KV_CACHE").unwrap_or_else(|_| "fp8".into()).parse()?, false)?);
+            std::env::var("CUTEAFD_DENSE_TEST_KV_CACHE").unwrap_or_else(|_| "fp8".into()).parse()?, false, None, false)?);
         let mut mtp = Mtp::load(&engine.borrow(), &reader, format, admitted, fixed)?;
-        let input = Allocation::new(engine.borrow().stream.device, HEAD_ROWS * layout.hidden_bytes)?;
+        let input = Allocation::new(engine.borrow().stream.device, HEAD_ROWS * layout.hidden_bytes, crate::shared::memory::TEST)?;
         let selector = RefCell::new(crate::shared::token_io::TokenSelector::new(&library,
             crate::shared::token_io::SelectPlacement::Device, cfg.vocab, 1)?);
         let family = prefix::DensePrefix::new(&engine)?;

@@ -26,14 +26,14 @@ impl<'a> GlmEngine<'a> {
         }
         // TP2's erased backend does not publish arithmetic-route bounds yet.
         // Exact validation fails closed; unrestricted serving still packs.
-        if self.tp2.is_some() {
+        if self.tp2.is_some() || self.whole.is_some() {
             cap = 0;
             reasons.push("TP2 backend has no arithmetic-route attestation".into());
         }
         let reports = self.prefill_link.borrow().as_ref().map(|link| link.installed_grouping()).transpose()?
             .unwrap_or_default();
         for (index, layer) in self.weights.layers.iter().enumerate() {
-            if layer.dense || self.tp2_layer(index) || self.skip.is_some() { continue; }
+            if layer.dense || self.local_layer(index) || self.skip.is_some() { continue; }
             let mut found = false;
             for report in &reports {
                 if report.layers().iter().any(|range| (range.first as usize..range.end as usize).contains(&index)) {

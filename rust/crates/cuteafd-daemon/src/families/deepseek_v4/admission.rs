@@ -5,7 +5,7 @@
 use super::EngineArgs;
 use anyhow::{ensure, Context, Result};
 use cuteafd_loader::families::deepseek_v4::DeepseekV4Config;
-use cuteafd_loader::placement::{families::deepseek_v4 as v4, Baseline, Onboard, PlacementRequest};
+use cuteafd_loader::placement::{families::deepseek_v4 as v4, planner::Pin, Baseline, Onboard};
 
 pub(crate) struct Inputs<'a> {
     pub cfg: &'a DeepseekV4Config,
@@ -15,9 +15,13 @@ pub(crate) struct Inputs<'a> {
     pub family: &'a str,
     /// (total bytes, baseline) per GPU: `--device` then `--split-device`.
     pub gpus: Vec<(u64, Baseline)>,
-    /// None before uploads; exact frozen modes after uploads. Rebase measured
-    /// free bytes by their non-embedding weights, which remain explicit demands.
-    pub loaded_modes: Option<&'a [cuteafd_loader::placement::LayerMode]>,
+    /// Per GPU, selected-program code still to load by ready, measured from the
+    /// same pre-weight sample (`pending_code`). Charged as the named Runtime
+    /// `loaded code` owner, never subtracted from the free sample (#1614).
+    pub pending_code: Vec<u64>,
+    /// False before uploads. After uploads, measured free bytes are rebased by
+    /// the retained arenas (embedding included), which remain explicit demands.
+    pub weights_resident: bool,
     /// dSpark stages the loaded drafter owns caches for.
     pub cache_stages: usize,
     pub prefill_rows: usize,
@@ -30,8 +34,10 @@ pub(crate) struct Inputs<'a> {
     /// Actual per-rank TP2 expert workspace probe; None means no TP2 package.
     pub tp2_workspace: Option<[u64; 2]>,
     pub exchange_f32: bool,
-    /// The coordinator GPUs' architecture (measured on `--device`).
-    pub arch: cuteafd_core::GpuArch,
+    /// Each GPU's physical capacity beside its logical ceiling in `gpus`.
+    pub physical: Vec<u64>,
+    /// Host RAM (total, available) sampled before any allocation.
+    pub host_memory: (u64, u64),
 }
 
 #[cfg(test)]
@@ -54,6 +60,28 @@ mod spark_tests {
             }
         }
         Ok(())
+    }
+
+    #[test]
+    fn provenance_names_the_admitted_layout_and_graph_arena() {
+        let sample = cuteafd_loader::placement::RuntimeSample { device: 0, total_bytes: 96 << 30,
+            free_bytes: 80 << 30, context_bytes: 0, module_bytes: 0, sms: 188,
+            arch: "sm_120".into(), driver: "test".into() };
+        let provenance = super::Provenance { layout: "snapshot/x; context/1048576".into(),
+            native_sha256: "native".into(), programs_sha256: "programs".into(), gpus: vec![sample],
+            spark_world: 2, onboard_layers: vec![vec![0, 1]], prefill: cuteafd_loader::placement::planner::PrefillShape {
+                rows: 2752, waves: 3 }, graph_reserves: vec![1 << 20, 2 << 20], graph_bootstraps: vec![1 << 19, 1 << 19] };
+        let value = provenance.value();
+        assert_eq!(value["schema_version"], 1);
+        assert_eq!(value["family"], "deepseek_v4");
+        assert_eq!(value["devices"][0]["arch"], "sm_120");
+        assert_eq!(value["onboard_layers"][0], serde_json::json!([0, 1]));
+        assert_eq!(value["graph_reserve_bytes"], serde_json::json!([1 << 20, 2 << 20]));
+        assert_eq!(value["graph_bootstrap_bytes"], serde_json::json!([1 << 19, 1 << 19]));
+        provenance.register();
+        let registered = cuteafd_ffi::memory_ledger::fault::inputs();
+        assert_eq!(registered["memory_reconciliation_provenance"]["layout"], "snapshot/x; context/1048576");
+        assert_eq!(registered["memory_reconciliation_provenance"]["programs_sha256"], "programs");
     }
 
     #[test]
@@ -90,170 +118,101 @@ pub(crate) fn spark_model(backend: cuteafd_loader::plan::spark_executions::Spark
         crate::shared::placement::spark_rings(64 << 20)?, executions)
 }
 
-/// Future pinned owners in the coordinator process, summed across its RTX ranks.
-/// `units` includes sequence-tail padding and context parity rounding from PoolShape.
-pub(crate) struct PinnedTables {
-    pub units: u64,
-    pub prefill_rows: u64,
-    pub decode_rows: u64,
-    pub waves: u64,
-    pub ranks: u64,
-    pub c128_width: u64,
-    pub hidden: u64,
-    pub topk: u64,
-    pub host_embedding: bool,
-    /// Compiled context extent before the pool-limited user context is clamped.
-    pub context_extent: Option<u64>,
-}
-
-impl PinnedTables {
-    pub fn named_bytes(&self) -> Result<Vec<(&'static str, u64)>> {
-        let mul = |a: u64, b: u64| a.checked_mul(b).context("V4 pinned table multiplication overflow");
-        let add = |a: u64, b: u64| a.checked_add(b).context("V4 pinned table addition overflow");
-        ensure!(self.units > 0 && self.prefill_rows > 0 && self.decode_rows > 0
-            && (1..=cuteafd_loader::serving_capacity::prefill_waves::MAX_WAVES).contains(&self.waves) && (1..=2).contains(&self.ranks)
-            && self.c128_width > 0 && self.hidden > 0 && self.topk > 0,
-            "invalid V4 pinned table geometry");
-        let mut tables = Vec::new();
-        for (prefill, rows, slots) in [(false, self.decode_rows, 1), (true, self.prefill_rows, self.waves)] {
-            let copies = mul(slots, self.ranks)?;
-            let ints = mul(rows, 4)?;
-            // Match reserve_slot_uploads/step_buffers, with a floor per destination.
-            let mut bounded = [ints, mul(rows, 8)?, mul(rows, 8)?, mul(ints, 128)?, ints,
-                ints, ints, mul(ints, self.c128_width)?, ints].into_iter()
-                .try_fold(0, |sum, bytes| add(sum, bytes.max(256)))?;
-            bounded = add(bounded, mul(mul(add(rows, 2)?, 4)?.max(256), 18)?)?;
-            tables.push((if prefill { "deepseek_v4/ordered-h2d/prefill-tables" }
-                else { "deepseek_v4/ordered-h2d/decode-tables" }, mul(bounded, copies)?));
-            let lists = if prefill { 1 } else { rows };
-            tables.push((if prefill { "deepseek_v4/c4-page-table/prefill" }
-                else { "deepseek_v4/c4-page-table/decode" },
-                mul(mul(mul(self.units, lists)?, 4)?.max(256), copies)?));
-            if self.host_embedding {
-                tables.push((if prefill { "deepseek_v4/ordered-h2d/prefill-embedding" }
-                    else { "deepseek_v4/ordered-h2d/decode-embedding" },
-                    mul(mul(mul(rows, self.hidden)?, 8)?.max(256), slots)?));
-            }
-            // One HostAllocation per workspace, not per prefill slot; peer is a 256-byte dummy.
-            let router_stride = add(mul(self.topk, 8)?, add(self.hidden, self.hidden / 32)?)?;
-            tables.push((if prefill { "deepseek_v4/prefill-router-host" }
-                else { "deepseek_v4/decode-router-host" },
-                add(mul(rows, router_stride)?, mul(self.ranks - 1, 256)?)?));
-        }
-        if let Some(extent) = self.context_extent {
-            ensure!(self.ranks == 2 && extent > 0, "V4 context tables need two RTX ranks and nonzero extent");
-            let half = extent.div_ceil(256).div_ceil(2);
-            let copies = mul(self.ranks, self.waves)?;
-            // Each owner subview is reserved at its exact extent, without the device floor.
-            tables.push(("deepseek_v4/ordered-h2d/c4-context-gather", mul(mul(half, 8)?, copies)?));
-            let commits = add(self.prefill_rows.div_ceil(256), 1)?.div_ceil(2);
-            tables.push(("deepseek_v4/ordered-h2d/c4-context-commit", mul(mul(commits, 96)?.max(256), copies)?));
-        }
-        tables.iter().try_fold(0, |sum, (_, bytes)| add(sum, *bytes))?;
-        Ok(tables)
-    }
-}
-
-#[cfg(test)]
-mod pinned_tests {
-    use super::PinnedTables;
-
-    fn geometry() -> PinnedTables {
-        PinnedTables { units: 8200, prefill_rows: 4096, decode_rows: 64, waves: 2,
-            ranks: 2, c128_width: 8192, hidden: 4096, topk: 8,
-            host_embedding: false, context_extent: Some(1_048_576) }
-    }
-
-    #[test]
-    fn named_pinned_tables_match_startup_destinations() -> anyhow::Result<()> {
-        for ranks in [1, 2] {
-            for waves in [1, 2, 3] {
-                for prefill_rows in [512, 2048, 4096] {
-                    for decode_rows in [1, 64, 80] {
-                        for host_embedding in [false, true] {
-                            let g = PinnedTables { ranks, waves, prefill_rows, decode_rows, host_embedding,
-                                context_extent: (ranks == 2).then_some(1_048_576), ..geometry() };
-                            let named = g.named_bytes()?;
-                            let sum: u64 = named.iter().map(|(_, bytes)| bytes).sum();
-                            let mut expected = 0;
-                            for (rows, slots, lists) in [(decode_rows, 1, decode_rows), (prefill_rows, waves, 1)] {
-                                let buffers = [rows*4, rows*8, rows*8, rows*128*4, rows*4,
-                                    rows*4, rows*4, rows*g.c128_width*4, rows*4, lists*g.units*4];
-                                expected += ranks*slots*(buffers.into_iter().map(|b| b.max(256)).sum::<u64>()
-                                    + 18*((rows+2)*4).max(256));
-                                expected += rows*(g.topk*8+g.hidden+g.hidden/32)+(ranks-1)*256;
-                                if host_embedding { expected += slots*(rows*g.hidden*8).max(256); }
-                            }
-                            if ranks == 2 {
-                                expected += ranks*waves*(2*2048*4 + (96*(prefill_rows.div_ceil(256)+1).div_ceil(2)).max(256));
-                            }
-                            assert_eq!(sum, expected);
-                            assert_eq!(named.iter().find(|(n, _)| *n == "deepseek_v4/c4-page-table/prefill").unwrap().1,
-                                ranks*waves*8200*4);
-                        }
-                    }
-                }
-            }
-        }
-        Ok(())
-    }
-
-    #[test]
-    fn named_pinned_tables_preserve_small_destination_floors() -> anyhow::Result<()> {
-        let g = PinnedTables { units: 1, decode_rows: 1, prefill_rows: 1, c128_width: 1,
-            context_extent: Some(1), ..geometry() };
-        let tables = g.named_bytes()?;
-        let get = |name| tables.iter().find(|(n, _)| *n == name).unwrap().1;
-        assert_eq!(get("deepseek_v4/c4-page-table/decode"), 2*256);
-        assert_eq!(get("deepseek_v4/c4-page-table/prefill"), 4*256);
-        assert_eq!(get("deepseek_v4/ordered-h2d/c4-context-gather"), 4*2*4);
-        assert_eq!(get("deepseek_v4/ordered-h2d/c4-context-commit"), 4*256);
-        Ok(())
-    }
-
-    #[test]
-    fn named_pinned_tables_refuse_overflow_and_invalid_geometry() {
-        for g in [PinnedTables { units: u64::MAX, ..geometry() },
-            PinnedTables { hidden: u64::MAX, ..geometry() },
-            PinnedTables { c128_width: u64::MAX, ..geometry() },
-            PinnedTables { prefill_rows: u64::MAX, ..geometry() },
-            PinnedTables { ranks: 0, ..geometry() }, PinnedTables { waves: 0, ..geometry() },
-            PinnedTables { ranks: 1, ..geometry() }] {
-            assert!(g.named_bytes().is_err());
-        }
-    }
-}
-
-pub(crate) fn host_memory(engine: &super::engine::Engine<'_>, args: &EngineArgs,
-    prefix: Option<&crate::shared::prefix::PrefixArgs>, context_extent: usize)
+/// The retained prefix config serve-dsv4 builds for exactly the admitted quota.
+/// Admission already charged it with every pinned table and host owner.
+pub(crate) fn host_config(prefix: Option<&crate::shared::prefix::PrefixArgs>,
+    layout: cuteafd_engine::prefix::FamilyLayout, max_context: usize, sequences: usize,
+    admitted: cuteafd_loader::placement::planner::serving::HostPrefixOwners)
     -> Result<Option<cuteafd_hostcache::config::Config>> {
-    let layout = super::prefix::Dsv4Prefix::layout_of(engine)?;
-    let host_enabled = v4::host_marks_enabled(engine.ranks(), engine.context_kv(), true);
-    let config = if host_enabled {
-        prefix.map(|p| p.resolve_host_config(layout, engine.max_context, engine.shape.sequences))
-            .transpose()?.flatten()
-    } else { None };
-    let tables = PinnedTables { units: engine.shape.units as u64,
-        prefill_rows: engine.prefill_rows as u64, decode_rows: engine.decode_rows as u64,
-        waves: engine.prefill_waves as u64, ranks: engine.ranks() as u64,
-        c128_width: engine.c128_width as u64, hidden: engine.cfg.dim as u64,
-        topk: engine.cfg.n_activated_experts as u64, host_embedding: !engine.embedding.device_gather(),
-        context_extent: engine.context_kv().then_some(context_extent as u64) }.named_bytes()?;
-    let scoring_rows = if args.full_prefill_logits { engine.prefill_capacity() } else { 64 };
-    let logits = cuteafd_core::memory_layout::host_logits_bytes(scoring_rows as u64,
-        engine.prefill_rows as u64, engine.cfg.vocab_size as u64).context("V4 host logits overflow")?;
-    crate::shared::memory::budget::admit_host_memory(config.as_ref().map_or(0, |c| c.bytes),
-        &tables, logits, prefix.map_or(0, |p| p.host_cache_headroom_bytes))?;
+    let (Some(prefix), true) = (prefix, admitted.quota_bytes > 0) else { return Ok(None) };
+    let mut exact = prefix.clone();
+    exact.host_cache_bytes = crate::shared::prefix::budget::HostBudget::Bytes(admitted.quota_bytes);
+    let config = exact.resolve_host_config(layout, max_context, sequences)?;
+    ensure!(config.as_ref().is_some_and(|c| c.bytes == admitted.quota_bytes
+        && c.chunk_bytes == admitted.chunk_bytes),
+        "V4 host prefix config differs from the admitted quota {admitted:?}");
     Ok(config)
 }
 
-pub(crate) fn request(args: &EngineArgs, inputs: &Inputs<'_>) -> Result<PlacementRequest> {
+/// The graph arena admission charged on each coordinator rank, and the
+/// estimate a device uses until its first measured capture.
+pub(crate) struct GraphCache {
+    pub reserves: Vec<u64>,
+    pub bootstraps: Vec<u64>,
+}
+
+/// One admission: what was placed, what it charged, and the decisions
+/// `/v1/stats` reconciliation cites.
+pub(crate) struct Admission {
+    pub placement: cuteafd_loader::placement::Placement,
+    pub host_prefix: cuteafd_loader::placement::planner::serving::HostPrefixOwners,
+    pub expert_usage: Option<cuteafd_core::expert_usage::Geometry>,
+    pub graphs: GraphCache,
+    pub decisions: cuteafd_loader::placement::planner::Decisions,
+}
+
+/// Admit one placement from these inputs: one solve over every device and
+/// host owner, before any allocation.
+pub(crate) fn admit(inputs: &v4::V4Inputs) -> Result<Admission> {
+    let prepared = v4::prepare(inputs).map_err(anyhow::Error::msg)?;
+    let prefix = prepared.prefix().owners;
+    let expert_usage = prepared.expert_usage().cloned();
+    for note in prepared.prefix().notes(inputs.max_context, inputs.sequences) { tracing::info!("{note}"); }
+    let request = v4::production_request(inputs);
+    let admitted = prepared.admit(request).map_err(anyhow::Error::msg)?;
+    cuteafd_loader::placement::reserve::log_plan(&admitted.solved, "deepseek_v4");
+    tracing::info!(solve_us = admitted.solve_us, admissions = 1,
+        "V4 admission prepare + solve/execution (excludes checkpoint inventory)");
+    cuteafd_bench::context::ResolvedSettings::placement(&admitted.placement).publish();
+    Ok(Admission { placement: admitted.placement, host_prefix: prefix, expert_usage,
+        graphs: GraphCache { reserves: admitted.graph_reserves, bootstraps: admitted.graph_bootstraps },
+        decisions: admitted.solved.decisions })
+}
+
+/// The admitted layout identity `/v1/stats` Ready and first_request memory
+/// reconciliation rows cite. Pure data, so the CPU half can test it.
+pub(crate) struct Provenance {
+    pub layout: String,
+    pub native_sha256: String,
+    pub programs_sha256: String,
+    pub gpus: Vec<cuteafd_loader::placement::RuntimeSample>,
+    pub spark_world: usize,
+    pub onboard_layers: Vec<Vec<usize>>,
+    pub prefill: cuteafd_loader::placement::planner::PrefillShape,
+    pub graph_reserves: Vec<u64>,
+    pub graph_bootstraps: Vec<u64>,
+}
+
+impl Provenance {
+    pub fn value(&self) -> serde_json::Value {
+        serde_json::json!({
+            "schema_version": 1, "family": "deepseek_v4",
+            "source_commit": env!("CUTEAFD_BUILD_COMMIT"), "source_dirty": env!("CUTEAFD_BUILD_DIRTY"),
+            "toolchain": env!("CUTEAFD_BUILD_TOOLCHAIN"),
+            "native_sha256": self.native_sha256, "programs_sha256": self.programs_sha256,
+            "layout": self.layout, "devices": &self.gpus, "spark_world": self.spark_world,
+            "onboard_layers": &self.onboard_layers, "prefill": self.prefill,
+            "graph_basis": "per-site byte estimates; no calibrated node rates for this family",
+            "graph_reserve_bytes": &self.graph_reserves, "graph_bootstrap_bytes": &self.graph_bootstraps
+        })
+    }
+
+    /// Register with the memory ledger so every reconciliation row names it.
+    pub fn register(&self) {
+        cuteafd_ffi::memory_ledger::fault::set_inputs(
+            serde_json::json!({ "memory_reconciliation_provenance": self.value() }));
+    }
+}
+
+/// The family facts serve-dsv4 admits: the same inputs `plan --layout` builds.
+pub(crate) fn inputs(args: &EngineArgs, inputs: &Inputs<'_>) -> Result<v4::V4Inputs> {
     let gpus = inputs.gpus.len();
     let weights = cuteafd_loader::families::deepseek_v4::resident::WeightInventory::from_headers(
-        inputs.cfg, gpus, args.dspark, inputs.catalog.tensors().iter().map(|t| &t.metadata))?;
+        inputs.cfg, gpus, args.dspark, args.token_io.embed_placement == crate::shared::token_io::EmbedPlacement::Gpu,
+        inputs.catalog.tensors().iter().map(|t| &t.metadata))?;
     let mut baselines = inputs.gpus.clone();
-    if let Some(modes) = inputs.loaded_modes {
-        let loaded = weights.loaded_bytes(modes, gpus)?;
+    if inputs.weights_resident {
+        let loaded = weights.loaded_bytes()?;
         for ((total, baseline), bytes) in baselines.iter_mut().zip(loaded) {
             *baseline = match *baseline {
                 Baseline::Measured { free_bytes } => {
@@ -297,7 +256,7 @@ pub(crate) fn request(args: &EngineArgs, inputs: &Inputs<'_>) -> Result<Placemen
     let expert_workspace = match inputs.expert_workspace {
         Some(bytes) => bytes,
         // TP2 backbone executors do not need the TP1/dSpark package.
-        None if gpus == 2 && stages == 0 => 0,
+        None if gpus == 2 && (stages == 0 || args.tp2_dspark_experts) => 0,
         None => {
             ensure!(stages == 0 && !args.fixed_onboard(),
                 "V4 local expert kernels are missing: export the matching rtx_backbone package for explicit local layers/dSpark");
@@ -310,22 +269,36 @@ pub(crate) fn request(args: &EngineArgs, inputs: &Inputs<'_>) -> Result<Placemen
         match inputs.tp2_workspace {
             Some(workspace) => (v4::expert_half_costs(inputs.catalog)?, workspace),
             None => {
-                ensure!(onboard == Onboard::Auto || onboard.layers(routed.layers - routed.first_layer) == Some(0), "V4 TP2 expert kernels are missing: export the matching rtx_tp2 package for explicit local layers");
+                ensure!(!args.tp2_dspark_experts && (onboard == Onboard::Auto || onboard.layers(routed.layers - routed.first_layer) == Some(0)), "V4 TP2 expert kernels are missing: export the matching rtx_tp2 package for explicit local layers");
                 tracing::warn!("V4 TP2 expert kernels unavailable; routing all backbone layers to Sparks");
                 (Vec::new(), [0; 2])
             }
         }
     } else { (Vec::new(), [0; 2]) };
     let spark_ranks = if args.skip_routed_experts { 0 } else { args.peers.split(',').filter(|p| !p.is_empty()).count() };
-    let request = v4::request(&v4::V4Inputs { spark_reply_format: cuteafd_core::SparkReplyFormat::resolve(cuteafd_core::spark_reply::requested(), false), automatic_context: args.max_context == 0, cfg: &cache_cfg, weights, cache_stages: inputs.cache_stages,
-        gpus: baselines, headroom_floor: 0, spark_ranks,
+    Ok(v4::V4Inputs {
+        expert_usage: args.expert_usage_enabled()?,
+        resident_weight_limit: Some(crate::shared::memory::budget::resident_weight_limit()), spark_reply_format: cuteafd_core::SparkReplyFormat::resolve(cuteafd_core::spark_reply::requested().prefill, false), serving_context: cuteafd_loader::placement::planner::Context::resolve(inputs.max_context as u64, (args.max_context > 0).then_some(args.max_context as u64)), cfg: cache_cfg, weights, cache_stages: inputs.cache_stages,
+        gpus: baselines, spark_ranks,
         sequences: args.max_sequences as u64, prefill_rows: prefill, prefill_waves: shape.waves, decode_rows: decode,
-        max_context: inputs.max_context as u64, reserve_bytes: (args.reserve_gib as u64) << 30, mark_slots,
-        workspace: Some(workspace), experts, draft, expert_workspace, first_routed: routed.first_layer,
+        max_context: inputs.max_context as u64, mark_slots,
+        workspace: Some(workspace), draft_half: if args.tp2_dspark_experts { v4::draft_half_costs(inputs.catalog, stages)? } else { Vec::new() },
+        experts, draft, expert_workspace, first_routed: routed.first_layer,
         experts_half, tp2_workspace, exchange_f32: inputs.exchange_f32,
         requested_pool: (args.pool_tokens > 0).then_some(args.pool_tokens as u64),
         onboard: if args.skip_routed_experts { Onboard::Auto } else { onboard },
-        full_prefill_logits: 0, code_bytes: v4::code_bytes(inputs.cfg.dim, v4::code_experts(inputs.catalog), gpus, inputs.arch),
-        context, attention })?;
-    Ok(request)
+        full_prefill_logits: 0, pending_code: inputs.pending_code.clone(),
+        context, attention, extra: Vec::new(), physical_bytes: inputs.physical.clone(),
+        host: Some(v4::V4Host { total: inputs.host_memory.0, available: inputs.host_memory.1,
+            headroom: inputs.prefix.map_or(8 << 30, |p| p.host_cache_headroom_bytes).max(inputs.host_memory.0 / 10),
+            cache_bytes: match inputs.prefix.map(|p| p.host_cache_bytes) {
+                Some(crate::shared::prefix::budget::HostBudget::Auto) => None,
+                Some(crate::shared::prefix::budget::HostBudget::Bytes(bytes)) => Some(bytes),
+                None => Some(0),
+            },
+            prefix_entries: inputs.prefix.map_or(0, |p| p.prefix_cache_entries as u64),
+            span_rows: shape.span_rows, full_prefill_logits: args.full_prefill_logits,
+            embedding_bytes: if args.token_io.embed_placement == crate::shared::token_io::EmbedPlacement::Host {
+                inputs.catalog.tensor("embed.weight")?.metadata.byte_length } else { 0 },
+            c128_width: cuteafd_loader::serving_capacity::compiled_c128_width(inputs.manifest, inputs.family)? }) })
 }

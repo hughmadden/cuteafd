@@ -6,7 +6,9 @@
 //! o_proj columns; everything else is whole. The residual gates are packed as
 //! F32 (alpha, beta) from the contract's host function, so the device kernel
 //! only applies them.
-use crate::shared::{dense_trellis::{CoreWeightLayout, CoreWeights}, memory::device::{Allocation, Device}};
+use crate::shared::{dense_trellis::{CoreWeightLayout, CoreWeights},
+    memory::{device::{Allocation, Device, DeviceOwner}, weight_arena::DeviceWeightArena, DeviceAllocation},
+    native_attention::{attention_records, AttentionRecord, NativeAttentionWeights}};
 use anyhow::{ensure, Context, Result};
 use crate::shared::experts::rtx::dense::{DenseLoad, Job, Operand, Rect, Step};
 use cuteafd_core::DType;
@@ -16,6 +18,7 @@ use cuteafd_loader::families::muse_spark::{core::PREFIX, weight_layout::LayerLay
 use cuteafd_loader::{families::muse_spark::reference::residual_gate_coefficients,
     formats::dense_trellis::LoadedDenseTrellis, LoadedTensor};
 use std::collections::BTreeMap;
+use cuteafd_core::memory_layout::ArenaTag;
 
 /// One rank's packed host operands of one layer.
 #[cfg(test)]
@@ -142,7 +145,7 @@ fn layer_rects(checkpoint: &cuteafd_loader::plan::Checkpoint, cfg: &MuseSparkCon
         ("moe.pre_expert", "mlp.pre_expert_proj", cfg.expert_hidden, cfg.hidden, true),
         ("moe.post_expert", "mlp.post_expert_proj", cfg.hidden, cfg.expert_hidden, false),
     ] {
-        if layout.core.contains_key(name) { continue; }
+        if layout.core.contains_key(name) || layout.native.contains_key(name) { continue; }
         let (rows, cols) = if row_split { (Some(rank * n / ranks..(rank + 1) * n / ranks), None) }
             else { (None, Some(rank * k * 2 / ranks..(rank + 1) * k * 2 / ranks)) };
         let tensor_name = format!("{root}.{stem}.weight");
@@ -166,14 +169,14 @@ fn layer_rects(checkpoint: &cuteafd_loader::plan::Checkpoint, cfg: &MuseSparkCon
     Ok(rects)
 }
 
-fn allocate<'a>(device: Device<'a>, bytes: usize) -> Result<Allocation<'a>> {
-    let _scope = cuteafd_ffi::memory_ledger::scope("weights/muse dense");
-    Allocation::new(device, bytes)
+fn allocate<'a>(device: Device<'a>, arena: &DeviceWeightArena<'a>, name: &str, bytes: usize) -> Result<Allocation<'a>> {
+    crate::shared::memory::weight_arena::weight_allocation(device, Some(arena), name, bytes, ArenaTag::weights("muse/target"))
 }
 
-fn land<'a>(device: Device<'a>, dense: &DenseLoad<'a>, rect: Rect) -> Result<Allocation<'a>> {
+fn land<'a>(device: Device<'a>, arena: &DeviceWeightArena<'a>, name: &str,
+    dense: &DenseLoad<'a>, rect: Rect) -> Result<Allocation<'a>> {
     let bytes = rect.bytes();
-    let allocation = allocate(device, bytes)?;
+    let allocation = allocate(device, arena, name, bytes)?;
     dense.operand(Operand { device: device.id, buffer: allocation.buffer, lands: vec![(rect, 0)], bytes })?;
     Ok(allocation)
 }
@@ -182,15 +185,47 @@ fn land<'a>(device: Device<'a>, dense: &DenseLoad<'a>, rect: Rect) -> Result<All
 pub(crate) struct LayerWeights<'a> {
     operands: BTreeMap<&'static str, Allocation<'a>>,
     core: BTreeMap<&'static str, CoreWeights<'a>>,
+    native: BTreeMap<&'static str, NativeWeights<'a>>,
+}
+
+pub(crate) type NativeWeights<'a> = DeviceOwner<'a, NativeAttentionWeights<'a>>;
+
+fn allocate_native<'a>(device: Device<'a>, arena: &DeviceWeightArena<'a>, layout: &cuteafd_loader::formats::native_attention::NativeLayout)
+    -> Result<NativeWeights<'a>> {
+    device.own(|| {
+        let _scope = cuteafd_ffi::memory_ledger::scope("weights/muse native attention");
+        let [n, k] = layout.shape;
+        let values = DeviceAllocation::from_allocation(allocate(device, arena, &format!("{}.values", layout.stem),
+            n * k * if layout.fp8 { 1 } else { 2 })?);
+        let scales = layout.fp8.then(|| allocate(device, arena, &format!("{}.scales", layout.stem),
+            n.div_ceil(128) * k.div_ceil(128) * 4).map(DeviceAllocation::from_allocation)).transpose()?;
+        Ok(NativeAttentionWeights { layout: layout.clone(), values, scales })
+    })
 }
 
 impl<'a> LayerWeights<'a> {
+    pub(crate) fn inventory(&self, inventory: &mut crate::shared::memory::receipts::Inventory<'_>, prefix: &str)
+        -> Result<()> {
+        for (name, owner) in &self.operands { owner.inventory(inventory, &format!("{prefix}.{name}"))?; }
+        for (name, owner) in &self.core {
+            for (suffix, allocation) in [("trellis", &owner.payload), ("suh", &owner.suh), ("svh", &owner.svh)] {
+                allocation.inventory(inventory, &format!("{prefix}.{name}.{suffix}"))?;
+            }
+        }
+        for (name, owner) in &self.native {
+            owner.values.inventory(inventory, &format!("{prefix}.{name}.values"))?;
+            if let Some(scales) = &owner.scales { scales.inventory(inventory, &format!("{prefix}.{name}.scales"))?; }
+        }
+        Ok(())
+    }
+
     fn load(device: Device<'a>, checkpoint: &cuteafd_loader::plan::Checkpoint, cfg: &MuseSparkConfig,
-        layer: usize, rank: usize, ranks: usize, layout: &LayerLayout, dense: &DenseLoad<'a>) -> Result<Self> {
+        layer: usize, rank: usize, ranks: usize, layout: &LayerLayout, dense: &DenseLoad<'a>,
+        native_load: &DenseLoad<'a>, arena: &DeviceWeightArena<'a>) -> Result<Self> {
         let recipe = layer_rects(checkpoint, cfg, layer, rank, ranks, layout)?;
         let mut operands = BTreeMap::new();
         for (name, rect) in recipe {
-            operands.insert(name, land(device, dense, rect)?);
+            operands.insert(name, land(device, arena, &format!("layers.{layer}.{name}"), dense, rect)?);
         }
         for (stem, alpha, beta) in [
             ("post_attention_residual_gate", "gate.attention.alpha", "gate.attention.beta"),
@@ -199,8 +234,8 @@ impl<'a> LayerWeights<'a> {
             let rect = checked_rect(checkpoint, &format!("{PREFIX}{layer}.{stem}.gate"), DType::Bf16,
                 None, None)?;
             ensure!(rect.bytes() == cfg.hidden * 2, "Muse residual gate source extent");
-            let a = allocate(device, layout.operands[alpha])?;
-            let b = allocate(device, layout.operands[beta])?;
+            let a = allocate(device, arena, &format!("layers.{layer}.{alpha}"), layout.operands[alpha])?;
+            let b = allocate(device, arena, &format!("layers.{layer}.{beta}"), layout.operands[beta])?;
             dense.step(Step { device: device.id, rects: vec![rect], jobs: vec![Job::ResidualGate {
                 temperature: cfg.residual_gate_temperature as f32, alpha: a.buffer, beta: b.buffer,
             }] }, std::ptr::null_mut())?;
@@ -208,12 +243,25 @@ impl<'a> LayerWeights<'a> {
             operands.insert(beta, b);
         }
         let core = layout.core.iter().map(|(&name, shared)| {
-            CoreWeightLayout::from_shared(shared.clone()).load_recorded(device, checkpoint, dense,
-                std::ptr::null_mut()).map(|weights| (name, weights))
+            CoreWeightLayout::from_shared(shared.clone()).load_recorded_with(device, checkpoint, dense,
+                std::ptr::null_mut(), |name, bytes| allocate(device, arena, name, bytes)).map(|weights| (name, weights))
         }).collect::<Result<BTreeMap<_, _>>>()?;
         ensure!(operands.len() == layout.operands.len() && operands.iter().all(|(name, allocation)|
             layout.operands.get(name) == Some(&allocation.buffer.bytes)), "Muse recorded operand inventory");
-        Ok(Self { operands, core })
+        let native = layout.native.iter().map(|(&name, layout)| {
+            let weights = allocate_native(device, arena, layout)?;
+            let selected = checkpoint.projection(&layout.stem)?;
+            for record in attention_records(&checkpoint.snapshot, &selected, checkpoint.projection_view(&layout.stem), layout,
+                crate::shared::fp8_linear::Fp8Scales::Amax, weights.values.buffer,
+                weights.scales.as_ref().map(|scales| scales.buffer))? {
+                match record {
+                    AttentionRecord::Operand(operand) => native_load.operand(operand)?,
+                    AttentionRecord::Step(step) => native_load.step(step, std::ptr::null_mut())?,
+                }
+            }
+            Ok((name, weights))
+        }).collect::<Result<BTreeMap<_, _>>>()?;
+        Ok(Self { operands, core, native })
     }
 
     pub(crate) fn buffer(&self, name: &str) -> Result<CuteafdDeviceBuffer> {
@@ -221,31 +269,53 @@ impl<'a> LayerWeights<'a> {
     }
 
     pub(crate) fn core(&self, name: &str) -> Option<&CoreWeights<'a>> { self.core.get(name) }
+
+    pub(crate) fn native(&self, name: &str) -> Option<&NativeWeights<'a>> { self.native.get(name) }
 }
 
 /// One rank's share of the global weights (`GlobalLayout`) beyond the token
 /// embedding (the shared `TokenEmbedding` on the entry rank): the final norm
-/// on every rank and the K6 head on the head rank (the last).
+/// on every rank and the selected BF16/trellis head on the last rank.
 pub(crate) struct GlobalWeights<'a> {
     pub final_norm: Allocation<'a>,
     pub head: Option<CoreWeights<'a>>,
+    pub head_bf16: Option<Allocation<'a>>,
 }
 
 impl<'a> GlobalWeights<'a> {
+    pub(crate) fn inventory(&self, inventory: &mut crate::shared::memory::receipts::Inventory<'_>) -> Result<()> {
+        self.final_norm.inventory(inventory, "global.final_norm")?;
+        if let Some(head) = &self.head {
+            for (suffix, owner) in [("trellis", &head.payload), ("suh", &head.suh), ("svh", &head.svh)] {
+                owner.inventory(inventory, &format!("global.head.{suffix}"))?;
+            }
+        }
+        if let Some(head) = &self.head_bf16 { head.inventory(inventory, "global.head")?; }
+        Ok(())
+    }
+
     pub(crate) fn load(device: Device<'a>, checkpoint: &cuteafd_loader::plan::Checkpoint,
-        layout: &cuteafd_loader::families::muse_spark::weight_layout::GlobalLayout, rank: usize, ranks: usize)
+        layout: &cuteafd_loader::families::muse_spark::weight_layout::GlobalLayout, rank: usize, ranks: usize,
+        arena: &DeviceWeightArena<'a>)
         -> Result<Self> {
         let root = PREFIX.trim_end_matches("layers.");
         let name = format!("{root}norm.weight");
         let dense = DenseLoad::mount(device.library);
         let rect = checked_rect(checkpoint, &name, DType::Bf16, None, None)?;
         ensure!(rect.bytes() == layout.final_norm, "Muse final norm differs from admitted bytes");
-        let final_norm = land(device, &dense, rect)?;
-        let head = if rank + 1 == ranks {
-            let core = CoreWeightLayout::from_shared(layout.head.clone().context("Muse serves the K6 head")?);
-            Some(core.load_recorded(device, checkpoint, &dense, std::ptr::null_mut())?)
-        } else { None };
-        Ok(Self { final_norm, head })
+        let final_norm = land(device, arena, "global.final_norm", &dense, rect)?;
+        let (head, head_bf16) = if rank + 1 == ranks {
+            if let Some(core) = &layout.head {
+                let core = CoreWeightLayout::from_shared(core.clone());
+                (Some(core.load_recorded_with(device, checkpoint, &dense, std::ptr::null_mut(),
+                    |name, bytes| allocate(device, arena, name, bytes))?), None)
+            } else {
+                let rect = checked_rect(checkpoint, "lm_head.weight", DType::Bf16, None, None)?;
+                ensure!(rect.bytes() == layout.head_bf16, "Muse BF16 head differs from admitted bytes");
+                (None, Some(land(device, arena, "global.head", &dense, rect)?))
+            }
+        } else { (None, None) };
+        Ok(Self { final_norm, head, head_bf16 })
     }
 }
 
@@ -253,13 +323,16 @@ impl<'a> GlobalWeights<'a> {
 /// reader, packed to the admitted layout and uploaded. `charged[layer]` is the
 /// rank's layer bytes admission accepted (`LayerLayout::bytes`).
 pub(crate) fn load_rank<'a>(device: Device<'a>, cfg: &MuseSparkConfig, checkpoint: &cuteafd_loader::plan::Checkpoint,
-    layouts: &[Vec<LayerLayout>], rank: usize) -> Result<Vec<LayerWeights<'a>>> {
+    layouts: &[Vec<LayerLayout>], rank: usize, arena: &DeviceWeightArena<'a>) -> Result<Vec<LayerWeights<'a>>> {
     let ranks = layouts.first().map_or(0, Vec::len);
     ensure!(layouts.len() == cfg.layers && rank < ranks, "Muse rank {rank} of {ranks} over {} layers", layouts.len());
     let dense = DenseLoad::mount(device.library);
+    let native_load = DenseLoad::mount(device.library);
+    native_load.admit_mount(cuteafd_loader::families::muse_spark::weight_layout::native_mount_load(
+        layouts.iter().flat_map(|per_rank| per_rank[rank].native.values()))?)?;
     layouts.iter().enumerate().map(|(layer, per_rank)| {
         let layout = &per_rank[rank];
-        LayerWeights::load(device, checkpoint, cfg, layer, rank, ranks, layout, &dense)
+        LayerWeights::load(device, checkpoint, cfg, layer, rank, ranks, layout, &dense, &native_load, arena)
             .with_context(|| format!("Muse layer {layer} rank {rank}"))
     }).collect()
 }
@@ -276,7 +349,7 @@ mod tests {
         let record: serde_json::Value = serde_json::from_slice(&std::fs::read(root.join("official.json"))?)?;
         let cfg = MuseSparkConfig::from_hf(&record["config"])?;
         let headers = cuteafd_loader::read_safetensors_metadata(&root.join("model.safetensors"))?;
-        let mut checkpoint = Checkpoint { snapshot: root, config: record["config"].clone(), quantize_config: None,
+        let mut checkpoint = Checkpoint { view: None, snapshot: root, config: record["config"].clone(), quantize_config: None,
             weight_map: headers.iter().map(|m| (m.name.clone(), "model.safetensors".into())).collect(),
             tensors: headers.into_iter().map(|meta| CheckpointTensor { shard: "model.safetensors".into(), meta }).collect(),
             missing_shards: vec![], shard_bytes: 0 };
@@ -318,6 +391,297 @@ mod tests {
         checkpoint.weight_map.insert(format!("{PREFIX}0.self_attn.q_proj.weight"), "wrong.safetensors".into());
         let layout = LayerLayout::ranks(&cfg, 0, 1, &inventory)?.remove(0);
         assert!(layer_rects(&checkpoint, &cfg, 0, 0, 1, &layout).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn arena_layer_contents_match_unchanged_host_oracle() -> Result<()> {
+        use cuteafd_ffi::native_library_lifetime_fixture::Fixture;
+        use cuteafd_loader::plan::{Checkpoint, checkpoint::CheckpointTensor};
+        let fixture = Fixture::build_for_tests()?;
+        let library = fixture.load()?;
+        fixture.immediate_copies(&library)?;
+        fixture.strict_device_free(&library, true)?;
+        for device in 0..2 { fixture.configure_memory(&library, device, 32 << 20)?; }
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/families/muse_spark/fixtures");
+        let record: serde_json::Value = serde_json::from_slice(&std::fs::read(root.join("official.json"))?)?;
+        let cfg = MuseSparkConfig::from_hf(&record["config"])?;
+        let headers = cuteafd_loader::read_safetensors_metadata(&root.join("model.safetensors"))?;
+        let mut checkpoint = Checkpoint { view: None, snapshot: root, config: record["config"].clone(), quantize_config: None,
+            weight_map: headers.iter().map(|m| (m.name.clone(), "model.safetensors".into())).collect(),
+            tensors: headers.into_iter().map(|meta| CheckpointTensor { shard: "model.safetensors".into(), meta }).collect(),
+            missing_shards: vec![], shard_bytes: 0 };
+        checkpoint.tensors.sort_by(|a, b| a.meta.name.cmp(&b.meta.name));
+        let inventory = cuteafd_loader::families::muse_spark::core::CoreInventory::default();
+        let global = cuteafd_loader::families::muse_spark::weight_layout::GlobalLayout::new(&cfg, &inventory)?;
+        for ranks in [1, 2] {
+            let layouts = (0..cfg.layers).map(|layer| LayerLayout::ranks(&cfg, layer, ranks, &inventory))
+                .collect::<Result<Vec<_>>>()?;
+            for rank in 0..ranks {
+                let device = Device { library: &library, id: rank as i32 };
+                let local = layouts.iter().map(|per_rank| &per_rank[rank]).collect::<Vec<_>>();
+                let arena = DeviceWeightArena::new(device,
+                    cuteafd_loader::families::muse_spark::weight_layout::coordinator_arena(rank, ranks, &global, &local)?, crate::shared::memory::TEST_ARENA)?;
+                let (embedding, weights) = if rank == 0 {
+                    let tensor = checkpoint.tensors.iter().find(|tensor|
+                        tensor.meta.name == "model.language_model.embed_tokens.weight").context("fixture embedding")?;
+                    let source = crate::shared::token_io::EmbedSource::new(&checkpoint.snapshot, &tensor.shard,
+                        &tensor.meta, cfg.hidden)?;
+                    let (embedding, weights) = device.run(|| crate::shared::token_io::TokenEmbedding::load_with(
+                        &library, source, crate::shared::memory::EmbedPlacement::Gpu,
+                        || load_rank(device, &cfg, &checkpoint, &layouts, rank, &arena),
+                        |name, bytes| allocate(device, &arena, name, bytes)))?;
+                    (Some(embedding), weights)
+                } else { (None, load_rank(device, &cfg, &checkpoint, &layouts, rank, &arena)?) };
+                let globals = GlobalWeights::load(device, &checkpoint, &global, rank, ranks, &arena)?;
+                assert!(globals.head.is_none());
+                assert_eq!(globals.head_bf16.is_some(), rank + 1 == ranks);
+                if let Some(head) = &globals.head_bf16 {
+                    let expected = crate::shared::checkpoint_read::read_tensor(&checkpoint, "lm_head.weight")?;
+                    let mut actual = vec![0; head.buffer.bytes];
+                    device.run(|| library.copy_d2h(&mut actual, head.buffer))?;
+                    assert_eq!(actual, expected.bytes);
+                    assert_eq!(head.weight_backing().context("BF16 head lost arena")?.buffer.bytes, arena.layout().bytes());
+                }
+                let backing_bytes = arena.layout().bytes();
+                drop(arena);
+                let device_ids = (0..ranks as i32).collect::<Vec<_>>();
+                let devices = cuteafd_loader::placement::planner::CoordinatorDevices::new(&device_ids)?;
+                let mut receipts = crate::shared::memory::receipts::Inventory::new(devices, "muse",
+                    cuteafd_loader::placement::planner::Lifetime::RESIDENT, cuteafd_core::memory_layout::Category::Weights,
+                    "Muse target weights");
+                for (layer, weights) in weights.iter().enumerate() {
+                    let expected = PackedLayer::pack(&cfg, layer, rank, ranks, &layouts[layer][rank], &BTreeMap::new(),
+                        |name| crate::shared::checkpoint_read::read_tensor(&checkpoint, name))?;
+                    weights.inventory(&mut receipts, &format!("layers.{layer}"))?;
+                    for (name, bytes) in &expected.operands {
+                        let owner = &weights.operands[name];
+                        assert_eq!(owner.weight_backing().context("Muse view lost backing")?.buffer.bytes, backing_bytes);
+                        let mut actual = vec![0; bytes.len()];
+                        device.run(|| library.copy_d2h(&mut actual, owner.buffer))?;
+                        assert_eq!(&actual, bytes, "TP{ranks} rank{rank} layer{layer} {name}");
+                    }
+                }
+                globals.inventory(&mut receipts)?;
+                let mut census = crate::shared::memory::receipts::Census::default();
+                census.owners(receipts.receipts);
+                if let Some(embedding) = &embedding {
+                    assert_eq!(embedding.verify_resident()?, global.embedding);
+                    census.owners(embedding.allocation_receipts(devices, "muse.embedding")?);
+                }
+                census.normalize(cuteafd_loader::placement::planner::PhaseOrder::TARGET_THEN_DRAFT)?;
+                assert_eq!(census.receipts.iter().filter(|receipt| receipt.allocation.view.is_none()).count(), 1);
+            }
+        }
+        assert_eq!(fixture.device_free_mismatch(&library)?.0, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn arena_k6_and_native_contents_match_original_loads() -> Result<()> {
+        use cuteafd_loader::{formats::{dense_trellis::TrellisSide, exl3_storage::Exl3Codebook,
+            trellis_core::{CoreProjection, CoreSplit}}, plan::{testing, checkpoint::CoreView}};
+        use std::io::{Seek, SeekFrom, Write};
+        let fixture = cuteafd_ffi::native_library_lifetime_fixture::Fixture::build_for_tests()?;
+        let library = fixture.load()?;
+        fixture.immediate_copies(&library)?;
+        fixture.strict_device_free(&library, true)?;
+        for device in 0..2 { fixture.configure_memory(&library, device, 128 << 20)?; }
+        let dir = tempfile::tempdir()?;
+        let q = format!("{PREFIX}0.self_attn.q_proj");
+        let o = format!("{PREFIX}0.self_attn.o_proj");
+        let head = cuteafd_loader::families::muse_spark::core::HEAD;
+        let bf16 = format!("{PREFIX}0.self_attn.k_proj");
+        let fp8 = format!("{PREFIX}0.self_attn.v_proj");
+        let mut tensors = Vec::new();
+        for stem in [&*q, &*o, head] { tensors.extend(testing::exl3(stem, 256, 256, 6)); }
+        tensors.push(testing::t(format!("{bf16}.weight"), "BF16", &[256, 256]));
+        tensors.extend(testing::fp8(&fp8, 256, 256, None));
+        testing::write_snapshot(dir.path(), &serde_json::json!({}), &tensors, None);
+        let checkpoint = cuteafd_loader::plan::Checkpoint::open(dir.path())?;
+        let mut file = std::fs::OpenOptions::new().write(true)
+            .open(dir.path().join("model-00001-of-00001.safetensors"))?;
+        for tensor in &checkpoint.tensors {
+            let bytes = if tensor.meta.name.ends_with(".mcg") { Exl3Codebook::Mcg.multiplier().to_le_bytes().to_vec() }
+                else if tensor.meta.dtype == DType::Bf16 {
+                    (0..tensor.meta.byte_length / 2).flat_map(|i| {
+                        let value = ((i % 23) as f32 - 11.0) / 16.0;
+                        ((value.to_bits() >> 16) as u16).to_le_bytes()
+                    }).collect()
+                } else { (0..tensor.meta.byte_length).map(|i| (i.wrapping_mul(17) % 251) as u8).collect() };
+            file.seek(SeekFrom::Start(tensor.meta.byte_offset))?;
+            file.write_all(&bytes)?;
+        }
+        drop(file);
+        for ranks in [1, 2] {
+            for rank in 0..ranks {
+                let device = Device { library: &library, id: rank as i32 };
+                for compact in [false, true] {
+                    let projection = |stem: &str, split, side, local_rank, local_ranks| {
+                        let projection = CoreProjection { stem: stem.into(), bits: 6, codebook: Exl3Codebook::Mcg,
+                            shape: [if stem == head { 193 } else { 256 }, 256], stored_outputs: 256,
+                            split, source_bytes: 0 };
+                        cuteafd_loader::formats::trellis_core::CoreWeightLayout::new(&projection, side, local_rank, local_ranks)
+                    };
+                    let cores = BTreeMap::from([
+                        ("attn.q", projection(&q, CoreSplit::Output, TrellisSide::Output, rank, ranks)?),
+                        ("attn.o", projection(&o, CoreSplit::Input, TrellisSide::Input, rank, ranks)?),
+                    ]);
+                    let native = BTreeMap::from([
+                        ("attn.k", cuteafd_loader::families::muse_spark::core::NativeLayout { stem: bf16.clone(),
+                            shape: [256 / ranks, 256], fp8: compact, rank, ranks, split: CoreSplit::Output }),
+                        ("attn.v", cuteafd_loader::families::muse_spark::core::NativeLayout { stem: fp8.clone(),
+                            shape: [256, 256 / ranks], fp8: true, rank, ranks, split: CoreSplit::Input }),
+                    ]);
+                    let layer = LayerLayout { operands: BTreeMap::new(), core: cores, native };
+                    let global = cuteafd_loader::families::muse_spark::weight_layout::GlobalLayout {
+                        embedding: 512, final_norm: 512, head: Some(projection(head, CoreSplit::Whole,
+                            TrellisSide::Output, 0, 1)?), head_bf16: 0 };
+                    let arena = DeviceWeightArena::new(device,
+                        cuteafd_loader::families::muse_spark::weight_layout::coordinator_arena(rank, ranks, &global, &[&layer])?, crate::shared::memory::TEST_ARENA)?;
+                    let dense = DenseLoad::mount(&library);
+                    for shared in layer.core.values().chain((rank + 1 == ranks).then_some(global.head.as_ref().unwrap())) {
+                        let layout = CoreWeightLayout::from_shared(shared.clone());
+                        let expected = layout.read(|name| crate::shared::checkpoint_read::read_tensor(&checkpoint, name))?;
+                        let actual = layout.load_recorded_with(device, &checkpoint, &dense, std::ptr::null_mut(),
+                            |name, bytes| allocate(device, &arena, name, bytes))?;
+                        for (owner, bytes) in [(&actual.payload, &expected.shard.payload),
+                            (&actual.suh, &expected.shard.suh), (&actual.svh, &expected.shard.svh)] {
+                            let mut landed = vec![0; bytes.len()];
+                            device.run(|| library.copy_d2h(&mut landed, owner.buffer))?;
+                            assert_eq!(&landed, bytes, "TP{ranks} rank{rank} {}", shared.stem);
+                        }
+                    }
+                    for layout in layer.native.values() {
+                        let actual = allocate_native(device, &arena, layout)?;
+                        let expected = device.own(|| Ok(NativeAttentionWeights { layout: layout.clone(),
+                            values: DeviceAllocation::new(&library, actual.values.buffer.bytes, crate::shared::memory::TEST)?,
+                            scales: actual.scales.as_ref().map(|s| DeviceAllocation::new(&library, s.buffer.bytes, crate::shared::memory::TEST)).transpose()? }))?;
+                        let selected = checkpoint.projection(&layout.stem)?;
+                        let mode = if compact && layout.stem == bf16 { CoreView::Fp8Compact } else { CoreView::Original };
+                        for owner in [&actual, &expected] {
+                            device.run(|| {
+                                for record in attention_records(dir.path(), &selected, mode, layout,
+                                    crate::shared::fp8_linear::Fp8Scales::Amax, owner.values.buffer,
+                                    owner.scales.as_ref().map(|s| s.buffer))? {
+                                    match record {
+                                        AttentionRecord::Operand(operand) => dense.operand(operand)?,
+                                        AttentionRecord::Step(step) => dense.step(step, std::ptr::null_mut())?,
+                                    }
+                                }
+                                Ok(())
+                            })?;
+                        }
+                        for (actual, expected) in std::iter::once((&actual.values, &expected.values))
+                            .chain(actual.scales.iter().zip(expected.scales.iter())) {
+                            let mut a = vec![0; actual.buffer.bytes];
+                            let mut b = vec![0; expected.buffer.bytes];
+                            device.run(|| { library.copy_d2h(&mut a, actual.buffer)?; library.copy_d2h(&mut b, expected.buffer) })?;
+                            assert_eq!(a, b, "native TP{ranks} rank{rank} {} compact={compact}", layout.stem);
+                        }
+                    }
+                    assert_eq!(fixture.device_free_mismatch(&library)?.0, 0, "native owner drops");
+                    drop(arena);
+                    assert_eq!(fixture.device_free_mismatch(&library)?.0, 0, "last arena root drop");
+                    drop(dense);
+                    assert_eq!(fixture.device_free_mismatch(&library)?, (0, -1, -1),
+                        "dense mount scratch drop TP{ranks} rank{rank} compact={compact}");
+                }
+            }
+        }
+        assert_eq!(fixture.device_free_mismatch(&library)?.0, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn shared_native_tp2_owners_destroy_values_and_scales_on_their_device() -> Result<()> {
+        use cuteafd_ffi::native_library_lifetime_fixture::Fixture;
+        use cuteafd_loader::formats::{native_attention::NativeLayout, trellis_core::CoreSplit};
+        let fixture = Fixture::build_for_tests()?;
+        let library = fixture.load()?;
+        fixture.strict_device_free(&library, true)?;
+        for fp8 in [false, true] {
+            let owners = (0..2).map(|rank| {
+                let device = Device { library: &library, id: rank };
+                let layout = NativeLayout { stem: format!("o.{rank}"), shape: [128, 128], fp8,
+                    rank: rank as usize, ranks: 2, split: CoreSplit::Input };
+                let mut tensors = vec![(format!("{}.values", layout.stem), 128 * 128 * if fp8 { 1 } else { 2 })];
+                if fp8 { tensors.push((format!("{}.scales", layout.stem), 4)); }
+                let arena = DeviceWeightArena::new(device,
+                    cuteafd_loader::serving_capacity::WeightArenaLayout::new(format!("muse-test/{rank}"), tensors)?, crate::shared::memory::TEST_ARENA)?;
+                allocate_native(device, &arena, &layout)
+            }).collect::<Result<Vec<_>>>()?;
+            for owner in owners {
+                let rank = owner.device.id;
+                assert_eq!(owner.values.buffer.device_id, rank);
+                assert_eq!(owner.scales.as_ref().map(|scales| scales.buffer.device_id), fp8.then_some(rank));
+                library.cuda_set_device(1 - rank)?;
+                drop(owner);
+                assert_eq!(library.cuda_get_device()?, 1 - rank);
+            }
+        }
+        assert_eq!(fixture.device_free_mismatch(&library)?, (0, -1, -1));
+        Ok(())
+    }
+
+    #[test]
+    fn native_attention_records_match_mode_residency_and_admitted_load() -> Result<()> {
+        use cuteafd_loader::{families::muse_spark::core::{CoreSplit, NativeLayout},
+            plan::{checkpoint::{CoreView, CheckpointView}, testing, Checkpoint}};
+        use crate::shared::native_attention::{attention_records, AttentionRecord};
+        let dir = tempfile::tempdir()?;
+        let stem = format!("{PREFIX}0.self_attn.o_proj");
+        let mut config = testing::muse_spark_config();
+        config["quantization_config"] = serde_json::json!({"quant_method":"exl3"});
+        testing::write_mc_snapshot(dir.path(), &config,
+            &[testing::t(format!("{stem}.weight"), "BF16", &[8192, 8192])],
+            &BTreeMap::from([(format!("{stem}.weight"), vec![8192, 8192])]));
+        for mode in [CoreView::Original, CoreView::Fp8Compact] {
+            let view = CheckpointView::select(dir.path(), mode)?;
+            let checkpoint = Checkpoint::open_view(&view)?;
+            let selected = checkpoint.projection(&stem)?;
+            for ranks in [1, 2] {
+                for rank in 0..ranks {
+                    let k = 8192 / ranks;
+                    let fp8 = mode == CoreView::Fp8Compact;
+                    let layout = NativeLayout { stem: stem.clone(), shape: [8192, k], fp8,
+                        split: CoreSplit::Input, rank, ranks };
+                    let values = CuteafdDeviceBuffer { ptr: 0x1000_0000usize as *mut _,
+                        bytes: 8192 * k * if fp8 { 1 } else { 2 }, device_id: rank as i32, flags: 0 };
+                    let scales = fp8.then_some(CuteafdDeviceBuffer { ptr: 0x8000_0000usize as *mut _,
+                        bytes: 64 * (k / 128) * 4, ..values });
+                    let receipt = cuteafd_loader::families::muse_spark::weight_layout::native_mount_load([&layout])?;
+                    let records = attention_records(dir.path(), &selected, mode, &layout,
+                        crate::shared::fp8_linear::Fp8Scales::Amax, values, scales)?;
+                    // Conversion windows are whole 128-row scale blocks, bounded above
+                    // by STEP_BYTES; smaller shared transform windows are also valid.
+                    assert!(!records.is_empty());
+                    if !fp8 { assert_eq!(records.len(), 1); }
+                    let mut converted_rows = 0;
+                    for record in records {
+                        match record {
+                            AttentionRecord::Operand(operand) => {
+                                assert!(!fp8);
+                                receipt.validate(operand.mount_load()?)?;
+                                assert!(operand.lands.iter().all(|(rect, _)| rect.name == format!("{stem}.weight")));
+                            }
+                            AttentionRecord::Step(step) => {
+                                assert!(fp8);
+                                let rows = step.rects.iter().map(|rect| rect.rows.len()).sum::<usize>();
+                                assert_eq!(rows % 128, 0);
+                                assert!(rows * k * 2 <= cuteafd_loader::shared::dense_read::STEP_BYTES);
+                                converted_rows += rows;
+                                receipt.validate(step.mount_load()?)?;
+                                assert!(step.rects.iter().all(|rect| rect.name == format!("{stem}.weight")));
+                                assert!(step.jobs.iter().all(|job| matches!(job, Job::Quant {
+                                    layout: crate::shared::fp8_load_quant::Layout::Block, .. })));
+                            }
+                        }
+                    }
+                    if fp8 { assert_eq!(converted_rows, 8192); }
+                }
+            }
+        }
         Ok(())
     }
 

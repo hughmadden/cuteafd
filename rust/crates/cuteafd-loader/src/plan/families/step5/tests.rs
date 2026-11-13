@@ -84,7 +84,7 @@ fn native_mtp_contract_accepts_only_validated_predictor_headers() -> anyhow::Res
         let cp = Checkpoint::coordinator(path, false, true)?;
         let model = Model::open(&cp)?;
         let groups = format::group_by_stem(&cp.tensors);
-        let scale = format::TensorScale { encoding: format::ScaleEncoding::F32 };
+        let scale = format::TensorScale { encoding: format::ScaleEncoding::F32, direction: format::ScaleDirection::Multiply };
         let mut count = 0;
         for (stem, members) in &groups {
             let Some(role) = STEP5.classify(model.spec(), stem) else { continue; };
@@ -144,17 +144,18 @@ fn full_context_mtp_forecast_charges_private_predictors_before_allocation() -> a
     let arch = ArchContext::coordinator(cuteafd_core::GpuArch::Sm120, capacity, None);
     for kv_format in [crate::families::qwen4::Qwen4KvCache::Bf16,
         crate::families::qwen4::Qwen4KvCache::Fp8] {
-        let inputs = RuntimeInputs { spark_reply_format: cuteafd_core::SparkReplyFormat::Bf16,
+        let inputs = RuntimeInputs { graph_layout: None, decode_graphs: false, bf16_target_head: crate::placement::planner::serving::BlasHead::TensorLt,
+            host: Default::default(), resident_weight_limit: None, spark_reply_format: cuteafd_core::SparkReplyFormat::Bf16,
             kv_format,
             inventory: Inventory { gpus: vec![GpuBudget { capacity_bytes: capacity,
                 baseline: Baseline::Planned { context_bytes: arch.context_bytes, loaded_bytes: 0 },
-                headroom_bytes: 1 << 30 }; 2], spark_ranks: 6, peer_access: true },
-            rows: 256, waves: 1, unit: 0, full_prefill_logits: false, sequences: 16, context: 1_048_576,
+                reserve_bytes: 1 << 30 }; 2], spark_ranks: 6, peer_access: true },
+            rows: 256, waves: 1, unit: 0, full_prefill_logits: false, sequences: 16, context: 1_048_576, serving_context: crate::placement::planner::Context::pinned(1_048_576),
             requested_pool: Some(1_048_576),
             marks: MarkRule { lanes: 16, entries: 20, budget_bytes: 2 << 30, host: true },
             pending_code: (0..2).map(|rank| inventory::loaded_code_allowance(
                 "step5", "step5:fp8", true, rank, &arch, Some(&programs)).bytes).collect(),
-            peer_diagnostics: false, startup: vec![], onboard: None,
+            peer_diagnostics: false, onboard: None,
         };
         for depth in [0, 1, 3].into_iter().filter(|&depth| depth != 3
             || kv_format == crate::families::qwen4::Qwen4KvCache::Bf16) {
@@ -164,16 +165,51 @@ fn full_context_mtp_forecast_charges_private_predictors_before_allocation() -> a
             assert_eq!(admitted.marks, 2);
             assert_eq!(admitted.cache.ranks[0].mtp_stage_hidden.len(), depth);
             assert!(admitted.cache.ranks[1].mtp_stage_hidden.is_empty());
-            let weights = coordinator::RankWeightLayout::for_mtp(&cp, depth)?.resident_bytes;
+            let planes = native::mtp_metadata_planes(inputs.unit_rows())?;
+            let uploads = admitted.solved.facts.allocations.iter()
+                .filter(|owner| owner.id == "step5.host.mtp.uploads")
+                .map(|owner| owner.bytes).sum::<u64>();
+            let per_stage = planes[..4].iter().sum::<usize>() + planes[2] + 8;
+            assert_eq!(uploads, (depth * (per_stage + 8)) as u64);
+            let contract = coordinator::CoordinatorContract::from_checkpoint(&cp)?;
+            let scratch = native::mtp_native_scratch_from_contract(&cp, &contract, depth, inputs.unit_rows())?;
             for rank in 0..2 {
                 let target = native::rank_admission(&cp, &admitted.ownership, rank, inputs.unit_rows(), inputs.rows, inputs.logit_rows())?;
                 let item = |group| admitted.fixed.iter().find(|item| item.gpu == rank as u8 && item.group == group)
                     .expect("native charge").bytes;
-                assert_eq!(item("Step-5 native target and head"), target.immutable + if rank == 0 { weights } else { 0 });
+                assert_eq!(item("Step-5 private native scratch"), target.immutable);
+                assert_eq!(item("Step-5 MTP native scratch"), if rank == 0 { scratch } else { 0 });
+                assert!(!admitted.fixed.iter().any(|item| item.group == "Step-5 GPU embedding"
+                    || item.group == "Step-5 native target and head"));
                 let workspace = if rank == 0 {
-                    target.workspace.max(native::mtp_forecast_workspace(inputs.unit_rows(), depth, kv_format)?)
+                    native::with_arena_phase(target.workspace, target.projection_bytes,
+                        native::mtp_forecast_workspace(inputs.unit_rows(), depth, kv_format)?)?
                 } else { target.workspace };
                 assert_eq!(item("Step-5 native workspace"), workspace);
+                let mut arenas = target.weight_arenas.clone();
+                if rank == usize::from(admitted.ownership.execution().spec().head_gpu) && depth > 0 {
+                    let predictor = coordinator::RankWeightLayout::mtp_from_contract(&cp, &contract, depth)?;
+                    arenas.push((predictor.mtp_arena(rank as i32)?, ResidentWeights(predictor.resident_bytes), cuteafd_core::memory_layout::MemoryKind::DrafterWeights));
+                }
+                for (arena, logical, kind) in arenas {
+                    let roots = admitted.solved.facts.allocations.iter().filter(|owner| owner.id == arena.id())
+                        .collect::<Vec<_>>();
+                    assert_eq!(roots.len(), 1, "one backing per arena");
+                    assert_eq!(roots[0].bytes, arena.bytes() as u64);
+                    assert_eq!(roots[0].category, kind.category());
+                    let tail = admitted.solved.facts.allocation_granularity.iter()
+                        .find(|owner| owner.id == format!("{}.tail", arena.id())).expect("arena tail");
+                    assert_eq!(tail.requests(), [arena.bytes() as u64]);
+                    assert_eq!(tail.bytes()?, (arena.bytes() as u64).div_ceil(2 << 20) * (2 << 20)
+                        - arena.bytes() as u64);
+                    assert_eq!(admitted.solved.facts.resident_weights.iter()
+                        .find(|owner| owner.id == arena.id()).expect("arena logical weights").weights, logical);
+                    eprintln!("Step-5 arena charge {}", serde_json::json!({
+                        "kv": format!("{kv_format:?}"), "depth": depth, "rank": rank, "id": arena.id(),
+                        "old": arena.bytes(), "old_rounding": "no", "backing": arena.bytes(),
+                        "tail": tail.bytes()?, "new": arena.bytes() as u64 + tail.bytes()?,
+                        "logical_weights": logical.0 }));
+                }
                 assert_eq!(item("Step-5 exact retained marks"), admitted.reservations[rank].marks as u64);
                 assert_eq!(item("Step-5 active sequence state"), admitted.reservations[rank].active as u64);
             }
@@ -183,7 +219,7 @@ fn full_context_mtp_forecast_charges_private_predictors_before_allocation() -> a
                 layout: Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)),
                     rtx_bytes: vec![capacity; 2], pool_tokens: inputs.requested_pool, step5_kv: kv_format,
                     context_tokens: inputs.context, concurrency: inputs.sequences as u64,
-                    prefill_rows: inputs.unit_rows() as u64, prefill_lanes: inputs.waves as u64, headroom_bytes: 1 << 30,
+                    prefill_rows: inputs.unit_rows() as u64, prefill_lanes: inputs.waves as u64,
                     native_mtp_layers: depth, workspace_manifest: Some(manifest_path.clone()),
                     mimo_prefix_entries: inputs.marks.entries as u64,
                     mimo_prefix_mark_bytes: inputs.marks.budget_bytes,
@@ -191,6 +227,10 @@ fn full_context_mtp_forecast_charges_private_predictors_before_allocation() -> a
                 }), ..Default::default()
             })?;
             assert!(planned.wip_launchable(), "depth {depth}: {:?}", planned.hints);
+            let host = planned.host_ledger.as_ref().expect("admitted Step-5 host owners");
+            assert_eq!(host.deferred_bytes, 64 * Config::parse(&cp)?.vocab as u64 * 4);
+            assert_eq!(host.items.iter().filter(|item| item.group == "Step-5 MTP host uploads")
+                .map(|item| item.bytes).sum::<u64>(), uploads);
             let memory = planned.memory_layout.as_ref().expect("depth-aware Step-5 layout");
             assert_eq!(memory.pool_tokens, admitted.placement.pool_tokens);
             for rank in 0..2 {
@@ -221,7 +261,7 @@ fn full_context_mtp_forecast_charges_private_predictors_before_allocation() -> a
             eprintln!("Step-5 full-context forecast {}", serde_json::json!({
                 "depth": depth, "context": admitted.cache.context, "pool": admitted.placement.pool_tokens,
                 "sequences": inputs.sequences, "rows": inputs.rows,
-                "marks": admitted.marks, "predictor_weights": weights,
+                "marks": admitted.marks, "predictor_weights": coordinator::RankWeightLayout::mtp_weight_charge(&cp, &contract, depth)?,
                 "owners": admitted.ownership.execution().modes().iter().map(|mode| format!("{mode:?}")).collect::<Vec<_>>(),
                 "ranks": by_category }));
         }
@@ -682,12 +722,21 @@ fn card_memory_conclusions_and_request_vs_pool_extent() {
     assert_eq!(r.memory_layout.as_ref().unwrap().pool_tokens, 262_144);
     assert!(r.memory_layout.as_ref().unwrap().devices.iter().all(|d| d.used_bytes() <= d.capacity_bytes));
     let r = report(dir.path(), 2, 96, 6, Some(262_144));
-    assert!(!r.wip_launchable());
-    assert!(r.hints.iter().any(|h| h.what.contains("compiled/max-context floor of 1048576")), "{:?}", r.hints);
+    assert!(r.wip_launchable(), "{:?}", r.hints);
+    assert_eq!(r.phase_ledger.as_ref().unwrap().served_context_tokens, 262_144);
+    assert_eq!(r.memory_layout.as_ref().unwrap().pool_tokens, 262_144);
+    let pinned = report_context(dir.path(), 2, 96, 6, Some(262_144), 1_048_576);
+    assert!(!pinned.wip_launchable());
+    assert!(pinned.hints.iter().any(|h| h.what.contains("explicit KV pool of 262144 tokens is below the compiled/max-context floor of 1048576 tokens")), "{:?}", pinned.hints);
     for (gpus, gib, ranks) in [(1,96,6), (1,32,6), (2,96,4), (2,96,0)] {
         let r = report(dir.path(), gpus, gib, ranks, None);
         assert!(!r.wip_launchable() && !r.native_serving_admitted);
-        assert!(r.hints.iter().any(|h| h.what.contains("unqualified") || h.what.contains("Spark") || h.what.contains("routed experts")), "{:?}", r.hints);
+        if ranks == 0 {
+            assert!(r.hints.iter().any(|h| h.what.contains("no local expert package for step5")), "{:?}", r.hints);
+            assert!(r.hints.iter().any(|h| h.what.contains("memory budget 'rtx0'")), "{:?}", r.hints);
+        } else {
+            assert!(r.hints.iter().any(|h| h.what.contains("unqualified") || h.what.contains("Spark") || h.what.contains("routed experts")), "{:?}", r.hints);
+        }
     }
     let r = report(dir.path(), 2, 96, 6, Some(32_768));
     assert!(!r.wip_launchable());
@@ -695,7 +744,7 @@ fn card_memory_conclusions_and_request_vs_pool_extent() {
     let r = report(dir.path(), 2, 96, 6, None);
     let memory = r.memory_layout.unwrap();
     assert!(memory.pool_tokens >= 262_144);
-    assert!(memory.notes.iter().any(|n| n.contains("zero graphs")));
+    assert!(memory.notes.iter().any(|n| n.contains("decode graphs true")));
     assert!(memory.notes.iter().any(|n| n.contains("compiled extent 1048576")));
 
 }
@@ -725,7 +774,7 @@ fn nvfp4_min_card_admits_native_w4a4_and_bf16_root_stays_reference_only() {
         if let Some(tokens) = pool {
             assert_eq!(memory.pool_tokens, tokens);
         } else {
-            let target = crate::placement::PoolPolicy::resolve(&[96 << 30], context, None, 64, false).target;
+            let target = crate::placement::PoolPolicy::resolve(&[96 << 30], context, None, 64).target;
             assert!((context..=target).contains(&memory.pool_tokens));
             // More free capacity must grow the same default-format pool to its cap.
             let roomy = report_context(dir.path(), 1, 160, 4, None, context);
@@ -753,7 +802,13 @@ fn nvfp4_min_card_admits_native_w4a4_and_bf16_root_stays_reference_only() {
     for (gpus, gib, ranks) in [(2, 96, 4), (1, 32, 4), (1, 96, 6), (1, 96, 0)] {
         let result = report(dir.path(), gpus, gib, ranks, None);
         assert!(!result.wip_launchable() && !result.native_serving_admitted);
-        assert!(result.hints.iter().any(|h| h.what.contains("unqualified") || h.what.contains("Spark")), "{:?}", result.hints);
+        if ranks == 0 {
+            assert!(result.hints.iter().any(|h| h.what.contains(
+                "no local expert package for step5: missing RTX expert export step5:bf16")),
+                "{:?}", result.hints);
+        } else {
+            assert!(result.hints.iter().any(|h| h.what.contains("unqualified") || h.what.contains("Spark")), "{:?}", result.hints);
+        }
     }
     let dir = snapshot("bf16");
     let r = report(dir.path(),2,96,6,None);
@@ -947,6 +1002,39 @@ fn routed_catalog_preserves_native_formats_activation_and_target_bounds() {
         }
         catalog.select_draft(crate::plan::spec::DraftOwnership::None).unwrap();
     }
+}
+
+#[test]
+fn mixed_native_onboarding_prices_actual_formats_and_excludes_other_packages() -> anyhow::Result<()> {
+    use crate::formats::fp8_experts::{ExpertFormat, Fp8Projection, Slicing};
+    let check = |path: &std::path::Path| -> anyhow::Result<()> {
+        let catalog = crate::read_expert_catalog(path)?;
+        let tensors = catalog.fp8().unwrap();
+        for tp2 in [false, true] {
+            let costs = crate::placement::rtx_onboard::expert_costs(&catalog, tp2)?;
+            for layer in 3..91 {
+                let view = tensors.for_coordinator().for_layer(layer)?;
+                let expected = |tp, rank| -> anyhow::Result<u64> {
+                    Fp8Projection::ALL.iter().try_fold(0u64, |sum, &p| {
+                        let (w, _) = view.slice_bytes_with(p, tp, rank, Slicing::Blocks(128))?;
+                        Ok(sum + (w * view.shape().experts).max(256) as u64
+                            + view.scale_region_bytes_with(p, tp, rank, Slicing::Blocks(128))?.max(256) as u64)
+                    })
+                };
+                let cost = costs[layer - 3];
+                assert_eq!(cost.whole.resident, expected(1, 0)?, "layer {layer}");
+                assert_eq!(cost.whole_supported, layer < 88, "layer {layer}");
+                assert_eq!(cost.tp2, tp2 && layer < 88, "layer {layer}");
+                if tp2 { for rank in 0..2 { assert_eq!(cost.half[rank].resident, expected(2, rank)?); } }
+                if layer >= 88 { assert_eq!(view.format(), ExpertFormat::Bf16); }
+            }
+            assert!(costs[85].whole.resident > costs[0].whole.resident);
+        }
+        Ok(())
+    };
+    check(snapshot("fp8").path())?;
+    if let Some(path) = std::env::var_os("CUTEAFD_STEP5_HEADER_SNAPSHOT") { check(std::path::Path::new(&path))?; }
+    Ok(())
 }
 
 #[test]
@@ -1236,19 +1324,70 @@ fn shared_ffn_region_keeps_replicated_replies_apart() {
 }
 
 
+fn assert_native_prefill_refusal(kind: &str, gpus: usize, ranks: usize) {
+    let dir = snapshot(kind);
+    let result = report(dir.path(), gpus, 96, ranks, None);
+    assert!(!result.fits && !result.placement_supported && !result.wip_launchable());
+    if ranks == 0 {
+        // #1383 admits local candidates; native checkpoints still need a BF16 tail export.
+        assert!(result.hints.iter().any(|hint| hint.what.contains(
+            "no local expert package for step5: missing RTX expert export step5:bf16")),
+            "{kind} ranks={ranks}: {:?}", result.hints);
+    } else {
+        assert!(result.hints.iter().any(|hint| hint.what.contains("Spark") || hint.what.contains("1..8")),
+            "{kind} ranks={ranks}: {:?}", result.hints);
+    }
+    assert!(result.memory_layout.unwrap().devices.is_empty());
+}
+
 #[test]
 fn native_prefill_refuses_every_unqualified_spark_count() {
     for (kind, gpus) in [("nvfp4", 1), ("fp8", 2)] {
-        let dir = snapshot(kind);
-        // Boundaries plus a transport-valid count that lacks this native executor.
         for ranks in [0, 1, 3, 8] {
-            let result = report(dir.path(), gpus, 96, ranks, None);
-            assert!(!result.fits && !result.placement_supported && !result.wip_launchable());
-            assert!(result.hints.iter().any(|hint| hint.what.contains("Spark") || hint.what.contains("1..8")),
-                "{kind} ranks={ranks}: {:?}", result.hints);
-            assert!(result.memory_layout.unwrap().devices.is_empty());
+            assert_native_prefill_refusal(kind, gpus, ranks);
         }
     }
+}
+
+// Individual cases keep the diagnostic regressions in the default CPU tier.
+#[test]
+fn native_prefill_refuses_nvfp4_local_without_bf16_tail_export() {
+    assert_native_prefill_refusal("nvfp4", 1, 0);
+}
+
+#[test]
+fn native_prefill_refuses_fp8_local_without_bf16_tail_export() {
+    assert_native_prefill_refusal("fp8", 2, 0);
+}
+
+#[test]
+fn native_prefill_refuses_nvfp4_spark_count_one() {
+    assert_native_prefill_refusal("nvfp4", 1, 1);
+}
+
+#[test]
+fn native_prefill_refuses_fp8_spark_count_one() {
+    assert_native_prefill_refusal("fp8", 2, 1);
+}
+
+#[test]
+fn native_prefill_refuses_nvfp4_spark_count_three() {
+    assert_native_prefill_refusal("nvfp4", 1, 3);
+}
+
+#[test]
+fn native_prefill_refuses_fp8_spark_count_three() {
+    assert_native_prefill_refusal("fp8", 2, 3);
+}
+
+#[test]
+fn native_prefill_refuses_nvfp4_spark_count_eight() {
+    assert_native_prefill_refusal("nvfp4", 1, 8);
+}
+
+#[test]
+fn native_prefill_refuses_fp8_spark_count_eight() {
+    assert_native_prefill_refusal("fp8", 2, 8);
 }
 
 #[test]
@@ -1385,11 +1524,11 @@ fn exl3_plan_reports_every_component_ready_and_k46_spark_recipe() {
 }
 
 #[test]
-fn exl3_contract_refuses_widths_the_recipe_does_not_declare() {
+fn exl3_contract_refuses_nonshipping_core_widths() {
     use crate::plan::checkpoint::CheckpointTensor;
     let fixture = exl3_snapshot();
     let mut cp = Checkpoint::inventory(fixture.path()).unwrap();
-    // A K5 core module disagrees with core_bits=6.
+    // A header-native K5 core is not in the shipping K6 target inventory.
     let stem = "model.layers.5.self_attn.q_proj";
     let shard = cp.weight_map[&format!("{stem}.trellis")].clone();
     let mut headers = crate::read_safetensors_metadata(&fixture.path().join(&shard)).unwrap();
@@ -1400,7 +1539,7 @@ fn exl3_contract_refuses_widths_the_recipe_does_not_declare() {
         .map(|meta| CheckpointTensor { shard: shard.clone(), meta }));
     cp.tensors.sort_by(|a, b| a.meta.name.cmp(&b.meta.name));
     let error = format!("{:#}", Model::open(&cp).err().unwrap());
-    assert!(error.contains("core requires K6, found K5"), "{error}");
+    assert!(error.contains("unsupported dense core width K5"), "{error}");
     // A routed layer declared K6 but stored K4 fails against the declaration.
     let mut config: Value = serde_json::from_slice(&std::fs::read(fixture.path().join("config.json")).unwrap()).unwrap();
     config["quantization_config"]["expert_bits_by_layer"]["87"] = serde_json::json!(6.0);
@@ -1414,6 +1553,8 @@ fn exl3_rank_layouts_own_native_core_with_head_split_sides() -> anyhow::Result<(
     use crate::formats::dense_trellis::TrellisSide;
     let fixture = exl3_snapshot();
     let cp = Checkpoint::open(fixture.path())?;
+    let contract = coordinator::CoordinatorContract::from_checkpoint(&cp)?;
+    assert_eq!(contract.retained_sync_h2d_bytes()?, 128896 * 4096 * 6 / 8);
     let whole = coordinator::RankWeightLayout::from_checkpoint(&cp, 0, 1)?;
     // 92 target layers x 7 + lm_head; no BF16 operand duplicates a native one.
     assert_eq!(whole.core.len(), 645);
@@ -1489,6 +1630,22 @@ fn exl3_two_rtx_onboards_tp2_halves_and_sparks_keep_the_rest() {
     assert_eq!((fixed.tp2.as_ref().unwrap().first, fixed.tp2.as_ref().unwrap().layers), (3, 2));
     assert!(solved.pool_tokens >= 2 << 20, "pool target first: {}", solved.pool_tokens);
     eprintln!("Step-5 EXL3 2 RTX + 6 Sparks: onboard {onboarded} layers TP2, pool {}", solved.pool_tokens);
+}
+
+#[test]
+fn exl3_zero_spark_refuses_partial_ownership_in_the_joint_planner() {
+    let fixture = exl3_snapshot();
+    let manifest = native_manifest(fixture.path());
+    let report = plan::plan(fixture.path(), &PlanOptions {
+        placement: ExpertPlacement::from_spark_ranks(0), draft_ownership: Some(spec::DraftOwnership::None),
+        layout: Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)),
+            rtx_bytes: vec![96 << 30; 2], workspace_manifest: Some(manifest),
+            onboard: Some(crate::placement::OnboardSetting::Layers(0)), ..Default::default() }),
+        ..Default::default()
+    }).unwrap();
+    assert!(!report.executable() && !report.wip_launchable());
+    assert!(report.solver_placement.is_none());
+    assert!(report.hints.iter().any(|hint| hint.what.contains("native placement refused")), "{:?}", report.hints);
 }
 
 /// NVFP4 Step is deprecated: auto onboards nothing (with the named reason),
@@ -1624,8 +1781,8 @@ fn swa_ring_of_one_unit_reads_every_window_exactly_and_restores_byte_identically
     }
 }
 
-/// The target SWA ring is one unit, whatever the prefill reserve; predictor
-/// rings, the hidden history and staging follow the step rows.
+/// Every SWA ring is one unit, whatever the prefill reserve; only staging and
+/// the target hidden history (published for a whole step) follow the step rows.
 #[test]
 fn target_ring_is_one_unit_and_the_reserve_only_sizes_step_storage() {
     use crate::serving_capacity::step5::{swa_ring, Step5CacheLayout};
@@ -1636,7 +1793,18 @@ fn target_ring_is_one_unit_and_the_reserve_only_sizes_step_storage() {
     let reserve = Step5CacheLayout::new(&cfg, 1, 1 << 20, 3, 2752, 3 * 2752, fp8).unwrap();
     assert_eq!(one.ring, swa_ring(512, 2752).unwrap());
     assert_eq!(reserve.ring, one.ring);
-    assert_eq!((reserve.step_rows, reserve.mtp_ring.step), (3 * 2752, 3 * 2752));
+    assert_eq!(reserve.step_rows, 3 * 2752);
+    // A predictor catch-up chunks at one unit, so its K/V ring reads one unit
+    // per call like the target: the wider reserve sizes it not at all.
+    assert_eq!(reserve.mtp_ring, one.mtp_ring);
+    assert_eq!(reserve.mtp_ring, swa_ring(512, 2752).unwrap());
+    assert!(reserve.mtp_ring.proposal(0, 2752).is_some());
+    assert!(reserve.mtp_ring.proposal(0, 2753).is_none());
+    // The hidden history is published for a whole step and read back by later
+    // steps, so it keeps the step (span) rows.
+    assert_eq!(one.mtp_history, Some(swa_ring(516, 2752).unwrap()));
+    assert_eq!(reserve.mtp_history, Some(swa_ring(516, 3 * 2752).unwrap()));
+    assert!(reserve.mtp_history.unwrap().proposal(0, 3 * 2752).is_some());
     assert!(reserve.mtp_hidden_rows > one.mtp_hidden_rows);
     let target = |layout: &Step5CacheLayout| layout.ranks[0].sliding.iter().filter(|r| !r.mtp)
         .map(|r| r.key.bytes + r.value.bytes).sum::<u64>();
@@ -1666,13 +1834,24 @@ fn tp2_onboarded_layers_skip_replication_and_validate_their_exchange() {
     assert_eq!(owners.routed_source(3).unwrap(), Some(0));
     assert_eq!(owners.routed_source(51).unwrap(), Some(1));
     assert_eq!(owners.routed_source(4).unwrap(), None);
-    // One unit, three lanes: three F32 partial planes plus routes and wire each.
-    let per_lane = 3 * 2752 * 4096 * 4 + (2752usize * 32).next_multiple_of(16) + 2752 * 32 + 2752 * (4096 + 128);
-    use super::admission::{tp2_exchange_bytes, Tp2Exchange};
-    assert_eq!(tp2_exchange_bytes(2752, 3, Tp2Exchange::Exl3).unwrap(), 3 * per_lane as u64);
-    // FP8: BF16 partials and BF16 input rows.
-    let fp8 = 3 * 2752 * 4096 * 2 + (2752usize * 32).next_multiple_of(16) + 2752 * 32 + 2752 * 4096 * 2;
-    assert_eq!(tp2_exchange_bytes(2752, 3, Tp2Exchange::Fp8).unwrap(), 3 * fp8 as u64);
+    use super::admission::{tp2_exchange_bytes, tp2_exchange_requests, Tp2Exchange};
+    for (exchange, partial_bytes, input_bytes, total) in [
+        (Tp2Exchange::Exl3, 4, 4096 + 128, 512_004_608),
+        (Tp2Exchange::Fp8, 2, 4096 * 2, 407_384_576),
+    ] {
+        let (rows, lanes) = (2752usize, 3);
+        let routes = 2 * (rows * 8 * 4).next_multiple_of(16);
+        let scratch = routes + rows * input_bytes;
+        // Three lane-wide partials, producer scratch, two retained peer slots
+        // per lane, and separate 256-byte control and abort requests.
+        let mut requests = vec![(lanes * rows * 4096 * partial_bytes) as u64; 3];
+        requests.push((lanes * scratch) as u64);
+        requests.extend(vec![scratch as u64; 2 * lanes]);
+        requests.extend([256, 256]);
+        assert_eq!(tp2_exchange_requests(rows, lanes, exchange).unwrap(), requests);
+        assert_eq!(requests.iter().sum::<u64>(), total);
+        assert_eq!(tp2_exchange_bytes(rows, lanes, exchange).unwrap(), total);
+    }
     assert!(tp2_exchange_bytes(0, 1, Tp2Exchange::Exl3).is_err() && tp2_exchange_bytes(64, 5, Tp2Exchange::Exl3).is_err());
 }
 
@@ -1721,4 +1900,108 @@ fn fp8_tp5_uses_width_recipe_but_still_requires_memory() {
     assert!(small.hints.iter().any(|hint| hint.what.contains("budget") || hint.what.contains("memory")), "{:?}", small.hints);
     assert!(matches!(crate::plan::experts::spark_recipe("step5:nvfp4",1536,5),
         Err(crate::plan::experts::SparkRecipeRefusal::Deprecated { .. })));
+}
+
+fn native_outputs_snapshot() -> tempfile::TempDir {
+    let dir = exl3_snapshot();
+    let root = dir.path();
+    let mut index: Value = serde_json::from_slice(&std::fs::read(root.join("model.safetensors.index.json")).unwrap()).unwrap();
+    let mut quant: Value = serde_json::from_slice(&std::fs::read(root.join("quantize_config.json")).unwrap()).unwrap();
+    let mut native = Vec::new();
+    for layer in 0..95 {
+        let stem = format!("model.layers.{layer}.self_attn.o_proj");
+        for suffix in ["trellis", "suh", "svh", "mcg"] {
+            index["weight_map"].as_object_mut().unwrap().remove(&format!("{stem}.{suffix}"));
+        }
+        quant["tensor_storage"].as_object_mut().unwrap().remove(&stem);
+        let name = format!("{stem}.weight");
+        index["weight_map"][&name] = Value::from("native-outputs.safetensors");
+        native.push(testing::t(&name, "BF16", &[4096, 12288]));
+    }
+    testing::write_safetensors(&root.join("native-outputs.safetensors"), &native);
+    std::fs::write(root.join("model.safetensors.index.json"), serde_json::to_vec(&index).unwrap()).unwrap();
+    std::fs::write(root.join("quantize_config.json"), serde_json::to_vec(&quant).unwrap()).unwrap();
+    dir
+}
+
+#[test]
+fn fp8_compact_step_outputs_and_mtp_have_exact_final_storage() -> anyhow::Result<()> {
+    use crate::plan::checkpoint::{CoreView, CheckpointView};
+    for rows in [1, 64, 4096] {
+        for heads in [32, 64] {
+            assert_eq!(native::swa_planes(rows, heads)?[native::SWA_OUTPUT_SCRATCH], native::OUTPUT_SCRATCH_BYTES);
+        }
+        assert_eq!(native::csa_planes(rows)?[native::CSA_OUTPUT_SCRATCH], native::OUTPUT_SCRATCH_BYTES);
+    }
+    let fixture = native_outputs_snapshot();
+    let original = Checkpoint::open(fixture.path())?;
+    let expected = exl3::expected(&Config::parse(&original)?);
+    let mut tensors = original.tensors.iter().filter(|tensor| !expected.keys().any(|name|
+        tensor.meta.name.starts_with(&format!("{}.", name.strip_suffix(".weight").unwrap()))))
+        .map(|tensor| (tensor.meta.name.clone(),
+            match tensor.meta.dtype { DType::Bf16 => "BF16", DType::F16 => "F16", DType::F32 => "F32",
+                DType::I16 => "I16", DType::I32 => "I32", DType::U8 => "U8", DType::F8E4M3 => "F8_E4M3",
+                _ => panic!("fixture dtype") }, tensor.meta.shape.clone())).collect::<Vec<_>>();
+    tensors.extend(expected.iter().map(|(name, shape)| (name.clone(), "BF16", shape.clone())));
+    let shapes = original.tensors.iter().filter(|tensor| tensor.meta.name.ends_with(".self_attn.o_proj.weight"))
+        .map(|tensor| (tensor.meta.name.clone(), tensor.meta.shape.clone())).collect();
+    testing::write_mc_snapshot(fixture.path(), &original.config, &tensors, &shapes);
+    let fp8 = Checkpoint::open_view(&CheckpointView::select(fixture.path(), CoreView::Fp8Compact)?)?;
+    let bf16 = Checkpoint::open_view(&CheckpointView::select(fixture.path(), CoreView::Original)?)?;
+    let cfg = Config::parse(&fp8)?;
+    let contract = coordinator::CoordinatorContract::from_checkpoint(&fp8)?;
+    let selection = native::NativeSelection::resolve(&contract, &cfg, 2, 3, 2048, None)?;
+    assert_eq!(selection.requirements.len(), 95);
+    assert_eq!(selection.resolved.programs, ["native_attention_n4096_k12288_m4096", "native_attention_n4096_k6144_m4096_f32"]);
+    assert_eq!(selection.resolved.fp8_scratch_bytes, 256);
+    for ranks in [1,2] {
+        for rank in 0..ranks {
+            let a = coordinator::RankWeightLayout::from_checkpoint(&fp8, rank, ranks)?;
+            let b = coordinator::RankWeightLayout::from_checkpoint(&bf16, rank, ranks)?;
+            assert_eq!(a.core, b.core);
+            assert_eq!(a.operands.len(), b.operands.len());
+            for (a,b) in a.operands.iter().zip(&b.operands) {
+                assert_eq!(a.name, b.name);
+                if a.name.ends_with(".self_attn.o_proj.weight") {
+                    assert_eq!(a.dtype, DType::F8E4M3);
+                    let layout = a.native_layout(rank,ranks)?;
+                    assert_eq!(a.allocation_bytes, layout.bytes()?);
+                    assert_eq!(a.allocation_bytes, b.allocation_bytes / 2 + (a.shape[0]/128*a.shape[1]/128*4) as u64);
+                } else {
+                    assert_eq!(a.dtype, b.dtype);
+                    assert_eq!(a.allocation_bytes, b.allocation_bytes);
+                }
+            }
+        }
+    }
+    let mtp = coordinator::RankWeightLayout::mtp_from_contract(&fp8, &contract, 3)?;
+    selection.validate_layout(&mtp, 2048)?;
+    assert_eq!(mtp.operands.iter().filter(|w| w.dtype == DType::F8E4M3).count(), 3);
+    // Final storage admission validates the dedicated output scratch ABI.
+    for rows in [1, 64, 65, 2048, 4096] {
+        use crate::placement::inventory::ProgramsManifest;
+        use cuteafd_ffi::draft_projection::ProjectionOutput;
+        let stage = if rows <= 64 { 64 } else { 4096 };
+        let entry = |k: usize, output: ProjectionOutput, scratch: u64| {
+            let suffix = if output == ProjectionOutput::F32 { "_f32" } else { "" };
+            serde_json::json!({"name":format!("native_attention_n4096_k{k}_m{stage}{suffix}"),
+                "capacity_rows":stage,"pointers":[{"name":"x"},{"name":"weight"},{"name":"scales"},{"name":"out"},{"name":"scratch"}],
+                "scalars":[{"type":"int32"}],"scratch_bytes_at_capacity":{"scratch":scratch},
+                "geometry":{"input_features":k,"output_features":4096,"output_dtype":output.torch_dtype(),
+                    "max_rows":stage,"decode_rows":64,"scale_block":128,"storage":"row_major_e4m3",
+                    "reduction":"canonical_fp8_gemv64_w8a16"}})
+        };
+        let manifest = |scratch| ProgramsManifest::from_manifest(&serde_json::json!({"programs":[
+            entry(12288, ProjectionOutput::Bf16, scratch), entry(6144, ProjectionOutput::F32, scratch)]}));
+        let exact = native::NativeSelection::resolve(&contract, &cfg, 2, 3, rows, Some(&manifest(256)?))?;
+        exact.validate_layout(&mtp, rows)?;
+        let oversized = native::NativeSelection::resolve(&contract, &cfg, 2, 3, rows, Some(&manifest(1 << 30)?))?;
+        assert!(oversized.validate_layout(&mtp, rows).unwrap_err().is::<native::NativeOwnerMismatch>());
+        let mut stale = entry(6144, ProjectionOutput::F32, 256);
+        stale["geometry"]["output_dtype"] = serde_json::json!("torch.bfloat16");
+        let bad = ProgramsManifest::from_manifest(&serde_json::json!({"programs":[
+            entry(12288, ProjectionOutput::Bf16, 256), stale]}))?;
+        assert!(native::NativeSelection::resolve(&contract, &cfg, 2, 3, rows, Some(&bad)).is_err());
+    }
+    Ok(())
 }

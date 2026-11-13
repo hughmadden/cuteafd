@@ -74,6 +74,63 @@ impl Drop for ReservedPassGuard<'_, '_, '_, '_, '_> {
     }
 }
 impl<'w, 'a> DistributedTargetPass<'w, 'a> {
+    pub(crate) fn visit_graph_banks(&mut self, f: &mut dyn FnMut(i32, &'static str, bool, &mut dyn crate::shared::decode_graph::CacheAttached) -> Result<()>) -> Result<()> {
+        for lane in &mut self.resources.lanes { lane.get_mut().visit_graph_banks(f)?; }
+        for index in self.resources.indices.iter_mut().flatten() { index.get_mut().visit_graph_banks(f)?; }
+        self.resources.execution.visit_graph_banks(f)?;
+        self.resources.engram.visit_graph_banks(f)?;
+        Ok(())
+    }
+    pub(crate) fn capture_startup_prefill(&mut self,
+        bank: &crate::families::deepseek_v41::v41_backbone_cache::BackboneCache<'a>, local: &[bool; 40]) -> Result<()> {
+        ensure!(self.state == State::Idle, "startup prefill capture requires idle target pass");
+        self.select_window(crate::shared::memory::row_window::RowWindow::NONE)?;
+        let resources = &mut self.resources;
+        // Nonwindowed single/continuation/replay paths use these exact sizes.
+        // Offset streamed-encoder units and odd tails remain eager (#1638).
+        let mut rows = resources.lanes[0].startup_prefill_rows();
+        for lane in resources.lanes.iter().skip(1) {
+            let measured = lane.startup_prefill_rows();
+            rows.retain(|rows| measured.contains(rows));
+        }
+        bank.capture_startup_producers(&mut resources.execution.producers.windows,
+            &mut resources.execution.producers.sources, &rows)?;
+        for index in resources.indices.iter_mut().flatten() {
+            let device = index.device;
+            device.run(|| index.get_mut().capture_startup(&rows, |layer, row|
+                resources.execution.startup_source(bank, layer, row)))?;
+        }
+        for lane in &mut resources.lanes {
+            let device = lane.device;
+            device.run(|| lane.get_mut().capture_startup_prefill(local))?;
+        }
+        resources.engram.capture_startup(&rows)?;
+        Ok(())
+    }
+    pub(crate) fn capture_startup(&mut self,
+        bank: &crate::families::deepseek_v41::v41_backbone_cache::BackboneCache<'a>, local: &[bool; 40]) -> Result<()> {
+        ensure!(self.state == State::Idle, "startup graph capture requires idle target pass");
+        let rows: Vec<_> = cuteafd_loader::serving_capacity::v41_graphs::v41_joint_prewarm_rows(crate::families::deepseek_v41::graph_policy::ranks(),
+            cuteafd_core::V41_VERIFY_ROWS);
+        let resources = &mut self.resources;
+        bank.capture_startup_producers(&mut resources.execution.producers.windows,
+            &mut resources.execution.producers.sources, &rows)?;
+        for gpu in 0..2 {
+            let index = resources.indices[gpu].as_mut().context("startup index lane absent")?;
+            let device = index.device;
+            device.run(|| index.get_mut().capture_startup(&rows, |layer, row|
+                resources.execution.startup_source(bank, layer, row)))?;
+            let selections = index.startup_selections();
+            let sinks = resources.execution.startup_sinks();
+            let lane = &mut resources.lanes[gpu];
+            let device = lane.device;
+            // Admitted CUDA planes have native allocation alignment; live views
+            // are validated again before every replay.
+            device.run(|| lane.get_mut().capture_startup(sinks, &selections, true, local))?;
+        }
+        resources.engram.capture_startup(&rows)?;
+        Ok(())
+    }
     pub fn bind_execution_plan(&mut self, placement: &cuteafd_loader::placement::Placement) -> Result<()> {
         use cuteafd_loader::placement::{HopKind, HopPoint, LayerExecutionPlan};
         let plan = LayerExecutionPlan::new(placement,
@@ -165,13 +222,13 @@ impl<'w, 'a> DistributedTargetPass<'w, 'a> {
         })?;
         #[cfg(test)]
         let trace_buffers = [
-            lanes[0].device.own(|| crate::shared::memory::DeviceAllocation::new(device.library, 40 * 16 * 40976))?,
-            lanes[1].device.own(|| crate::shared::memory::DeviceAllocation::new(device.library, 40 * 16 * 40976))?,
+            lanes[0].device.own(|| crate::shared::memory::DeviceAllocation::new(device.library, 40 * 16 * 40976, crate::shared::memory::TEST))?,
+            lanes[1].device.own(|| crate::shared::memory::DeviceAllocation::new(device.library, 40 * 16 * 40976, crate::shared::memory::TEST))?,
         ];
         #[cfg(test)]
         let trace_queries = [
-            lanes[0].device.own(|| crate::shared::memory::DeviceAllocation::new(device.library, 60 * 16 * 131072))?,
-            lanes[1].device.own(|| crate::shared::memory::DeviceAllocation::new(device.library, 60 * 16 * 131072))?,
+            lanes[0].device.own(|| crate::shared::memory::DeviceAllocation::new(device.library, 60 * 16 * 131072, crate::shared::memory::TEST))?,
+            lanes[1].device.own(|| crate::shared::memory::DeviceAllocation::new(device.library, 60 * 16 * 131072, crate::shared::memory::TEST))?,
         ];
         let chain = crate::shared::memory::chain::enabled()
             .then(|| crate::shared::memory::chain::StageChain::on_devices(lanes[0].device.library, &[0, 1]))
@@ -272,18 +329,6 @@ impl<'w, 'a> DistributedTargetPass<'w, 'a> {
         }
         Ok(())
     }
-    /// Retain decode-row graph shapes on both owning devices (sticky).
-    pub fn retain_small_graph_shapes(&mut self) -> Result<()> {
-        ensure!(self.state == State::Idle, "cannot change graph retention during a target pass");
-        for lane in &mut self.resources.lanes {
-            let device = lane.device;
-            device.run(|| { lane.retain_small_graph_shapes(); Ok(()) })?;
-        }
-        for index in self.resources.indices.iter_mut().flatten() {
-            index.get_mut().enable_small_graph_shapes();
-        }
-        Ok(())
-    }
     pub fn set_route_capture(&mut self, enabled: bool) -> Result<()> {
         if enabled {
             return self.set_capture(crate::families::deepseek_v41::v41_backbone_lane::Capture { routes: true, timing: true });
@@ -306,11 +351,6 @@ impl<'w, 'a> DistributedTargetPass<'w, 'a> {
         }
         self.resources.capture_routes = capture.routes;
         if enabled {
-            // Match the single-GPU pass: adaptive row changes must retain the
-            // index projection and selection graphs on both owning devices.
-            for index in self.resources.indices.iter_mut().flatten() {
-                index.get_mut().enable_small_graph_shapes();
-            }
             for rows in &mut self.resources.route_capture { rows.clear(); }
         }
         Ok(())
@@ -361,6 +401,9 @@ impl<'w, 'a> DistributedTargetPass<'w, 'a> {
             device.run(|| lane.get_mut().install_attention_plan(plan))?;
         }
         Ok(())
+    }
+    pub(crate) fn install_expert_usage(&mut self, usage: Option<std::rc::Rc<cuteafd_ffi::expert_usage::ExpertUsage<'a>>>) {
+        for lane in &mut self.resources.lanes { lane.get_mut().install_expert_usage(usage.clone()); }
     }
     pub fn set_attention_decode(&mut self, decode: bool) {
         for lane in &mut self.resources.lanes { lane.get_mut().set_attention_decode(decode); }
@@ -413,8 +456,14 @@ impl<'w, 'a> DistributedTargetPass<'w, 'a> {
     ) -> Result<()> {
         // Verification passes run with device-ordered stages. Peer-projection
         // modes (TP2 attention/query/output, all opt-in) keep host drains.
+        let library = self.resources.embedding.device.library;
         let verification = std::mem::replace(&mut self.resources.verification, false);
         self.set_attention_decode(verification);
+        let cycle = if !verification { crate::shared::decode_graph::device::Cycle::Prefill }
+            else if batch.cache()?.positions().len() == batch.cache()?.request_ids().len() {
+                crate::shared::decode_graph::device::Cycle::Decode
+            } else { crate::shared::decode_graph::device::Cycle::Verify };
+        super::super::graph_policy::cycle(cycle, |f| self.visit_graph_banks(f))?;
         // `--l2-prefetch` only while the other lane is idle (consumed per pass).
         let solo = std::mem::replace(&mut self.l2_solo, true);
         for lane in &mut self.resources.lanes { lane.get_mut().set_l2_prefetch(solo); }
@@ -425,7 +474,10 @@ impl<'w, 'a> DistributedTargetPass<'w, 'a> {
             // A failed Spark wire released its waits over garbage planes.
             let result = result.and_then(|()| crate::shared::spark_waves::healthy());
             // Remote layers left their captured routes in the routers' rings.
-            return self.settle_route_rings(result);
+            let result = self.settle_route_rings(result);
+            return result.and(unsafe { // SAFETY: V4.1 graph owners borrow persistent engine storage only.
+                crate::shared::decode_graph::device::observe_completed(library,
+                |f| self.visit_graph_banks(f)) });
         };
         let timed = tracing::enabled!(target: "cuteafd::timing", tracing::Level::DEBUG).then(Instant::now);
         let paced = handle.paced();
@@ -447,7 +499,9 @@ impl<'w, 'a> DistributedTargetPass<'w, 'a> {
             tracing::debug!(target: "cuteafd::timing", route_ring_us=t.elapsed().as_micros() as u64,
                 "distributed route ring drain");
         }
-        result
+        result.and(unsafe { // SAFETY: V4.1 graph owners borrow persistent engine storage only.
+            crate::shared::decode_graph::device::observe_completed(library,
+            |f| self.visit_graph_banks(f)) })
     }
     /// After a pass: a successful one's ring captures into the history; a
     /// failed one's dropped, so no router is left with an undrained ring (its
@@ -1310,17 +1364,16 @@ mod tests {
         // As serve: the workers' selection/admission handshake (layers 20.. on
         // the Sparks, two prefill units) before any link. Endpoints admit the
         // decode owners' verify width (64 rows); the fixture's 16-row links fit.
-        crate::families::deepseek_v41::v41_native_serve::admission::spark_admission(std::path::Path::new(&snapshot),
-            &catalog, 20, peers.len(), unit_rows.max(cuteafd_core::V41_VERIFY_ROWS as u32), 2,
-            // The workers run TP4 x EP1 (golden-run --spark-tp 4 --spark-ep 1), as serve's admission names it.
-            Some(cuteafd_transport::expert::SparkTopology::NATIVE_TP4_EP1))?.start(&peers)?.wait()?;
-        let roce = SparkExperts::new_world(cuteafd_transport::expert::SparkWorld::owned(cuteafd_transport::expert::SparkTopology::NATIVE_TP4_EP1)?, &peers, 16, crate::families::deepseek_v41::v41_native_serve::transport_config(crate::families::deepseek_v41::v41_native_serve::protocol_v2_timing()), 0)?;
+        crate::families::deepseek_v41::v41_native_serve::admission::spark_admission(&cuteafd_loader::plan::checkpoint::CheckpointView::select(
+            std::path::Path::new(&snapshot), cuteafd_loader::plan::checkpoint::CoreView::Original)?,
+            &catalog, 20, peers.len(), unit_rows.max(cuteafd_core::V41_VERIFY_ROWS as u32), 2)?.start(&peers)?.wait()?;
+        let roce = SparkExperts::new_world(cuteafd_transport::expert::SparkWorld::canonical(peers.len())?, &peers, 16, crate::families::deepseek_v41::v41_native_serve::transport_config(crate::families::deepseek_v41::v41_native_serve::protocol_v2_timing()), 0)?;
         let mut transport =
             devices[1].own(|| NativeTp4Wave::new(&lib, roce, NativeTp4Wave::device_bytes(16)?))?;
         transport.install_tp2(tp2_ffn::Wave::new(routed.clone(), shared.clone(), 20, 16, [None, None])?)?;
         // As serve: each link's exchange starts at the first remote layer.
         let nvfp4 = catalog.nvfp4().is_some();
-        devices[1].run(|| transport.get_mut().bootstrap(20, nvfp4))?;
+        devices[1].run(|| transport.get_mut().bootstrap(nvfp4))?;
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()?;
@@ -1507,23 +1560,23 @@ mod tests {
             NativeTp4Wave::new(
                 &lib,
                 // As serve: the second decode lane's own endpoint (lane 1).
-                SparkExperts::new_world(cuteafd_transport::expert::SparkWorld::owned(cuteafd_transport::expert::SparkTopology::NATIVE_TP4_EP1)?, &peers, 16, crate::families::deepseek_v41::v41_native_serve::transport_config(crate::families::deepseek_v41::v41_native_serve::protocol_v2_timing()), 1)?,
+                SparkExperts::new_world(cuteafd_transport::expert::SparkWorld::canonical(peers.len())?, &peers, 16, crate::families::deepseek_v41::v41_native_serve::transport_config(crate::families::deepseek_v41::v41_native_serve::protocol_v2_timing()), 1)?,
                 NativeTp4Wave::device_bytes(16)?,
             )
         })?;
         other_transport.install_tp2(tp2_ffn::Wave::new(routed.clone(), shared.clone(), 20, 16, [None, None])?)?;
-        devices[1].run(|| other_transport.get_mut().bootstrap(20, nvfp4))?;
+        devices[1].run(|| other_transport.get_mut().bootstrap(nvfp4))?;
         // The prefill slots: two passes on shared storage; slot 0's FFN owner
         // holds the one prefill link (execution lane 2), two return slots of
         // 16 rows; one TP2 FFN arena for both (reserve 32, unit 16).
         let ffn_storage = tp2_ffn::Storage::new(routed, shared, 20, reserve_rows, unit_rows, [None, None])?;
         let link = devices[1].own(|| crate::families::deepseek_v41::v41_experts::coordinator::V41Link::prefill(&lib,
-            SparkExperts::new_world(cuteafd_transport::expert::SparkWorld::owned(cuteafd_transport::expert::SparkTopology::NATIVE_TP4_EP1)?, &peers, unit_rows,
+            SparkExperts::new_world(cuteafd_transport::expert::SparkWorld::canonical(peers.len())?, &peers, unit_rows,
                 crate::families::deepseek_v41::v41_native_serve::transport_config(crate::families::deepseek_v41::v41_native_serve::protocol_v2_timing()), 2)?, 2, unit_rows))?;
         let mut slot_transports = [devices[1].own(|| NativeTp4Wave::with_link(&lib, link.into_inner()))?,
             devices[1].own(|| NativeTp4Wave::unlinked(&lib, unit_rows))?];
         for transport in &mut slot_transports { transport.install_tp2(tp2_ffn::Wave::on_storage(ffn_storage.clone()))?; }
-        devices[1].run(|| slot_transports[0].get_mut().bootstrap(20, nvfp4))?;
+        devices[1].run(|| slot_transports[0].get_mut().bootstrap(nvfp4))?;
         let [slot0_transport, slot1_transport] = slot_transports;
         let mut prefill_slots = crate::families::deepseek_v41::v41_native_serve::prefill_target::PrefillSlots {
             packed_suffix: pass.new_packed_storage(&lib, unit_rows as usize, 2)?,

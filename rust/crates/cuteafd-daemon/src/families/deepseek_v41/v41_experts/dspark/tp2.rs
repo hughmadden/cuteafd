@@ -11,6 +11,7 @@ mod push_tests;
 
 pub(super) use crate::shared::experts::rtx::draft::rank::Weights;
 use super::{DsparkRouter, DsparkSharedFfn, DsparkWeights};
+use crate::shared::memory::Tag;
 use crate::shared::memory::device::{Allocation, Device, Stream};
 use anyhow::{ensure, Result};
 use cuteafd_ffi::{CuteafdDeviceBuffer, NativeLibrary};
@@ -18,7 +19,6 @@ use std::{ffi::c_void, rc::Rc};
 
 /// One stage in one lane. The containing chain owns its external capture stream.
 pub(super) struct RoutedWave<'w, 'a> {
-    stream: Stream<'a>,
     pair: pair::Pair<'a>,
     inputs: [Allocation<'a>;3],
     shared: Allocation<'a>,
@@ -43,13 +43,12 @@ impl<'w,'a> RoutedWave<'w,'a> {
             pair.enable_push(v41_peer_push::lane_bytes(v41_peer_push::DECODE_ROWS,LAYOUT.route_bytes())?)?;
         }
         let routes=pair::padded(capacity as usize*12);
-        Ok(Self {stream:Stream::new(device)?,pair,
-            inputs:[Allocation::new(device,capacity as usize*10240)?,Allocation::new(device,routes)?,Allocation::new(device,routes)?],
-            shared:Allocation::new(device,capacity as usize*10240)?,owner,stage,capacity})
+        Ok(Self {pair,
+            inputs:[Allocation::new(device,capacity as usize*10240,Tag::drafter_workspace("v41/draft-tp2"))?,Allocation::new(device,routes,Tag::drafter_workspace("v41/draft-tp2"))?,Allocation::new(device,routes,Tag::drafter_workspace("v41/draft-tp2"))?],
+            shared:Allocation::new(device,capacity as usize*10240,Tag::drafter_workspace("v41/draft-tp2"))?,owner,stage,capacity})
     }
-    pub fn stream(&self)->*mut c_void {self.stream.raw}
     pub fn peer_stream(&self)->Rc<Stream<'a>> {self.pair.peer_stream()}
-    pub fn synchronize(&self)->Result<()> {let root=self.stream.drain();let peer=self.pair.drain_peer();root.and(peer)}
+    pub fn synchronize(&self)->Result<()> {let root=self.owner.standalone.drain();let peer=self.pair.drain_peer();root.and(peer)}
     pub fn inputs(&self)->[CuteafdDeviceBuffer;3] {self.inputs.each_ref().map(|a|a.buffer)}
     pub fn output(&self)->CuteafdDeviceBuffer {self.pair.output()}
     /// Caller retains/drains external stream and destroys captured graphs first.
@@ -104,9 +103,9 @@ mod tests {
             for rows in [1usize,7,16] {
                 for (ranks,topk) in [(1usize,3usize),(2,3),(4,6)] {
                     let count=rows*5120;let plane_count=count*topk;
-                    let planes=(0..ranks).map(|_|Allocation::new(device,plane_count*4)).collect::<Result<Vec<_>>>()?;
-                    let shared=Allocation::new(device,count*2)?;
-                    let output=Allocation::new(device,count*2)?;
+                    let planes=(0..ranks).map(|_|Allocation::new(device,plane_count*4, crate::shared::memory::TEST)).collect::<Result<Vec<_>>>()?;
+                    let shared=Allocation::new(device,count*2, crate::shared::memory::TEST)?;
+                    let output=Allocation::new(device,count*2, crate::shared::memory::TEST)?;
                     let pointers=std::array::from_fn(|rank|planes.get(rank).map_or(std::ptr::null(),|p|p.buffer.ptr.cast::<f32>()));
                     for with_shared in [false,true] {
                         let shared_ptr=if with_shared {shared.buffer.ptr.cast::<u16>()} else {std::ptr::null_mut()};
@@ -114,7 +113,7 @@ mod tests {
                             library.cuda_graph_begin_capture(stream.raw)?;
                             let queued=reducer.launch(pointers,shared_ptr,output.buffer.ptr.cast(),rows as u32,
                                 ranks as u32,topk as u32,stream.raw);
-                            let captured=library.cuda_graph_end_capture(stream.raw);
+                            let captured=library.cuda_graph_end_capture_for_test(stream.raw);
                             match (queued,captured) {
                                 (Ok(()),Ok(graph))=>Ok(graph),
                                 (Err(error),Ok(graph))=>{library.cuda_graph_exec_destroy(graph)?;Err(error)},

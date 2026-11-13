@@ -19,9 +19,9 @@ int main() {
   for (size_t i = 0; i < vocab; ++i) logits[vocab*5+i] = std::numeric_limits<float>::lowest();
   logits[vocab*6+255] = logits[vocab*6+256] = logits[vocab*6+65535] = 3.f;
   cuteafd_device_buffer_t input{}, indices{}, scores{};
-  ok(cuteafd_alloc_device_buffer(logits.size()*4, &input));
-  ok(cuteafd_alloc_device_buffer(rows*4, &indices));
-  ok(cuteafd_alloc_device_buffer(rows*4, &scores));
+  ok(cuteafd_alloc_device_buffer(logits.size()*4, &input, CUTEAFD_MEMORY_KIND_WORKSPACE, "selftest"));
+  ok(cuteafd_alloc_device_buffer(rows*4, &indices, CUTEAFD_MEMORY_KIND_WORKSPACE, "selftest"));
+  ok(cuteafd_alloc_device_buffer(rows*4, &scores, CUTEAFD_MEMORY_KIND_WORKSPACE, "selftest"));
   ok(cuteafd_copy_h2d(input, logits.data(), logits.size()*4));
   void* stream = nullptr; ok(cuteafd_cuda_stream_create(&stream));
   ok(cuteafd_cuda_logits_argmax_checked_f32_async(static_cast<const float*>(input.ptr),

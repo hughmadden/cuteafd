@@ -24,13 +24,14 @@ capacity, and a verified ``manifest.json``:
 Library ABI (``native/shared/include/cuteafd_fp8_moe.h``)::
 
     int32_t cuteafd_fp8moe_info(uint32_t* words, uint32_t count);
-        words: [0] bytes [version=5, storage, activation, projection]. Storage:
+        words: [0] bytes [version=6, storage, activation, projection]. Storage:
         1 FP8 block128, 2 MXFP4, 4 NVFP4 W4A4, 5 BF16 (no scales).
         Activation: 1 pre-SiLU clamp/BF16 intermediate, 2 post-SiLU clamp/FP32
         product. Projection: 1 BF16 gate/up and down. All bytes are mandatory.
         [1] hidden, [2] slice, [3] experts, [4] top-k,
         [5] intermediate, [6] tp, [7] input dtype (7 = FP8 K32 wire rows, 1 = BF16 rows),
-        [8] SwiGLU limit (FP32 bits, 0 = none), [9] capacities n, [10..] capacities
+        [8] SwiGLU limit (FP32 bits, 0 = none), [9] capacities n, [10..16) capacities
+        [16] alpha (FP32 bits), [17] beta (FP32 bits); neutral 1/0 for SiLU.
     int32_t cuteafd_fp8moe_scratch_bytes(uint32_t capacity, uint64_t* bytes);
     int32_t cuteafd_fp8moe_create(void** context);           // loads every program on the current device
     int32_t cuteafd_fp8moe_launch(void* context, uint32_t capacity, void* const* pointers,
@@ -72,9 +73,9 @@ os.environ.setdefault("B12X_COMPILE_MEMORY_CACHE", "0")
 
 SCHEMA = "cuteafd.fp8moe-package.v1"
 ROLE_LAYOUTS = {"coordinator": ("tp1", "tp2")}
-ABI_VERSION = 5
+ABI_VERSION = 6
 STORAGE = {"fp8": 1, "mxfp4": 2, "nvfp4a4": 4, "bf16": 5}
-ACTIVATION = {"silu_bf16_product": 1, "silu_post_clamp_fp32_product": 2}
+ACTIVATION = {"silu_bf16_product": 1, "silu_post_clamp_fp32_product": 2, "swigluoai": 3}
 PROJECTION = {"bf16": 1}
 ROLE_COMPUTE = {"spark": (12, 1), "coordinator": (12, 0)}
 # Spark ranks take the FP8 K32 wire rows of the expert protocol; coordinator
@@ -92,10 +93,15 @@ def input_kind(role: str, weights: str, requested: str | None = None) -> str:
 
 LIBRARY = "libcuteafd_fp8moe.so"
 POINTERS = 11
-INFO_WORDS = 16
+INFO_WORDS = 18
 # Large-row program forms, in cuteafd_fp8moe_set_options order.
 FORMS = ("auto", "w8a16", "w8a8")
 SEGMENT_MAX_ROWS = 4 * 4096
+
+
+def core_variants(role: str, weights: str, build_kind: str = "development") -> tuple[bool, ...]:
+    """Only release packages include optional compressed-reply producers."""
+    return (False, True) if build_kind == "release" and role == "spark" and weights != "nvfp4" else (False,)
 
 
 def digest(path: Path) -> str:
@@ -117,12 +123,30 @@ def capacity_scratch(programs: list[dict]) -> list[dict]:
 def bridge_source(programs: list[dict], info: list[int]) -> str:
     includes = "\n".join(f'#include "{p["stem"]}.h"' for p in programs)
     rows = ",\n".join(
-        f'  {{{p["capacity"]}u, {p["scratch"]}ull, {FORMS.index(p["form"])}u, {int(p.get("segmented", False))}u, {p.get("minimum_rows", 0)}u, {p.get("act_row_bytes", 0)}u, _mlir_cuteafd_{p["stem"]}_cuda_init, '
+        f'  {{{p["capacity"]}u, {p["scratch"]}ull, {FORMS.index(p["form"])}u, {int(p.get("segmented", False))}u, {p.get("minimum_rows", 0)}u, {p.get("act_row_bytes", 0)}u, {int(p.get("core_only", False))}u, _mlir_cuteafd_{p["stem"]}_cuda_init, '
         f'_mlir_cuteafd_{p["stem"]}_cuda_load_to_device, {p["entry"]}}}' for p in programs)
+    layout_rows = []
+    for p in programs:
+        if not p.get("core_only", False):
+            continue
+        previous = 0
+        for layout in p["reply_layouts"]:
+            end, route, metadata = layout["end_rows"], layout["route"], layout["metadata_bytes"]
+            if (not previous < end <= p["capacity"] or route not in (1, 2, 3)
+                    or metadata <= 0 or metadata % 1024 or layout["a4_split"] not in (0, 1)
+                    or (p.get("segmented", False) and route != 3)):
+                raise ValueError("invalid installed reply scratch layout")
+            layout_rows.append(f'  {{{p["capacity"]}u, {FORMS.index(p["form"])}u, {int(p.get("segmented", False))}u, '
+                f'{end}u, {route}u, {metadata}ull, '
+                f'{p["act_row_bytes"]}u, {layout["a4_split"]}u}}')
+            previous = end
+        if previous != p["capacity"]:
+            raise ValueError("installed reply scratch layouts do not cover capacity")
+    layout_table = ",\n".join(layout_rows) or "  {}"
     route_rows = []
     grouping_rows = []
     for p in programs:
-        if p.get("segmented", False):
+        if p.get("segmented", False) or p.get("core_only", False):
             continue
         previous = 0
         for segment in p["arithmetic_routes"]:
@@ -163,7 +187,7 @@ struct Program {{
   uint32_t capacity;
   uint64_t scratch;
   uint32_t form;  // 0 the default program, 1 its W8A16 form, 2 its W8A8 form
-  uint32_t segmented, minimum_rows, act_row_bytes;
+  uint32_t segmented, minimum_rows, act_row_bytes, core_only;
   ModuleFn initialize;
   ModuleFn load;
   LaunchFn launch;
@@ -181,6 +205,11 @@ struct ArithmeticRoute {{ uint32_t capacity, form, end_rows, route_id; }};
 const ArithmeticRoute kArithmeticRoutes[] = {{
 {route_table}
 }};
+struct ReplyLayout {{ uint32_t capacity, form, segmented, end_rows, route;
+  uint64_t metadata_bytes; uint32_t act_row_bytes, a4_split; }};
+const ReplyLayout kReplyLayouts[] = {{
+{layout_table}
+}};
 struct Context {{
   uint32_t form;
 }};
@@ -197,10 +226,11 @@ void unload_libraries() {{
 }};
 // The capacity's program in the requested form; the default program when the
 // capacity has no such form (the forms are the same program there).
-const Program* find(uint32_t capacity, uint32_t form, bool segmented = false) {{
+const Program* find(uint32_t capacity, uint32_t form, bool segmented = false, bool core_only = false) {{
   const Program* fallback = nullptr;
   for (uint32_t i = 0; i < kCount; ++i) {{
-    if (kPrograms[i].capacity != capacity || bool(kPrograms[i].segmented) != segmented) continue;
+    if (kPrograms[i].capacity != capacity || bool(kPrograms[i].segmented) != segmented
+        || bool(kPrograms[i].core_only) != core_only) continue;
     if (kPrograms[i].form == form) return &kPrograms[i];
     if (!kPrograms[i].form) fallback = &kPrograms[i];
   }}
@@ -286,6 +316,38 @@ extern "C" int32_t cuteafd_fp8moe_segment_scratch_bytes(uint32_t rows, uint64_t*
   return *bytes ? cudaSuccess : cudaErrorInvalidValue;
 }}
 
+// Offsets name the existing core scratch; no token output or new allocation.
+extern "C" int32_t cuteafd_fp8moe_reply_layout(uint32_t capacity, uint32_t form, uint32_t rows,
+                                               uint32_t segmented, uint64_t* words, uint32_t count) {{
+  if (form > 2u || segmented > 1u || !rows || rows > capacity || !words || count < 4u)
+    return cudaErrorInvalidValue;
+  const Program* program = find(capacity, form, bool(segmented), true);
+  if (!program) return cudaErrorInvalidValue;
+  auto align = [](uint64_t n) {{ return (n + 1023u) / 1024u * 1024u; }};
+  const uint64_t pairs = uint64_t(rows) * kInfo[4];
+  const uint64_t groups = pairs < kInfo[3] ? pairs : kInfo[3];
+  for (const auto& l : kReplyLayouts) {{
+    if (l.capacity != capacity || l.form != program->form || l.segmented != segmented || rows > l.end_rows) continue;
+    const uint64_t grouped = l.route == 1u ? pairs : 64u * ((pairs + 63u) / 64u + groups);
+    const uint64_t tiles = (pairs + 127u) / 128u + groups;
+    const uint64_t metadata = l.route == 1u ? 4u * (4u + 3u * kInfo[3] + 1u) : l.metadata_bytes;
+    const uint64_t pair_pos = align(metadata) + align(4u * (l.route == 3u ? pairs : grouped));
+    uint64_t y = pair_pos + align(4u * pairs);
+    if (l.route == 3u) {{
+      const uint64_t padded = tiles * 128u;
+      if (((kInfo[0] >> 8) & 0xffu) == 4u) {{
+        y += align(padded * kInfo[1] / 2u) + align(padded * kInfo[1] / 16u)
+            + 2u * align(l.a4_split ? pairs * kInfo[2] * 2u : 0u)
+            + align(padded * kInfo[2] / 2u) + align(padded * kInfo[2] / 16u);
+      }} else y += align(padded * l.act_row_bytes);
+    }}
+    words[0] = 1u; words[1] = pair_pos; words[2] = y;
+    words[3] = (l.route == 3u ? pairs : grouped) * kInfo[1] * 2u;
+    return cudaSuccess;
+  }}
+  return cudaErrorInvalidValue;
+}}
+
 extern "C" int32_t cuteafd_fp8moe_set_options(void* context, uint32_t options) {{
   auto* ctx = static_cast<Context*>(context);
   if (!ctx || options > 2u) return cudaErrorInvalidValue;
@@ -331,9 +393,9 @@ extern "C" int32_t cuteafd_fp8moe_create(void** context) {{
 }}
 
 static int32_t launch(void* context, uint32_t capacity, void* const* pointers, int32_t rows,
-                      void* stream, bool segmented) {{
+                      void* stream, bool segmented, bool core_only = false) {{
   if (!context) return cudaErrorInvalidValue;
-  const Program* program = find(capacity, static_cast<Context*>(context)->form, segmented);
+  const Program* program = find(capacity, static_cast<Context*>(context)->form, segmented, core_only);
   if (!program || !pointers || rows < 1 || uint32_t(rows) > capacity) return cudaErrorInvalidValue;
   void* values[{POINTERS}];
   void* arguments[{POINTERS} + 3];
@@ -354,6 +416,14 @@ static int32_t launch(void* context, uint32_t capacity, void* const* pointers, i
 extern "C" int32_t cuteafd_fp8moe_launch(void* context, uint32_t capacity, void* const* pointers,
                                          int32_t rows, void* stream) {{
   return launch(context, capacity, pointers, rows, stream, false);
+}}
+extern "C" int32_t cuteafd_fp8moe_launch_core(void* context, uint32_t capacity, void* const* pointers,
+                                              int32_t rows, void* stream) {{
+  return launch(context, capacity, pointers, rows, stream, false, true);
+}}
+extern "C" int32_t cuteafd_fp8moe_launch_segments_core(void* context, void* const* pointers,
+                                                       int32_t rows, void* stream) {{
+  return launch(context, {SEGMENT_MAX_ROWS}u, pointers, rows, stream, true, true);
 }}
 extern "C" int32_t cuteafd_fp8moe_launch_segments(void* context, void* const* pointers,
                                                   int32_t rows, void* stream) {{
@@ -427,6 +497,21 @@ def layout_geometry(base, layout: str):
     return tp, g
 
 
+def activation_params(activation, weights, alpha, beta, limit) -> tuple[float, float]:
+    import math
+
+    if not math.isfinite(limit) or limit < 0:
+        raise ValueError("SwiGLU limit must be finite and nonnegative")
+    if activation == "swigluoai":
+        if (weights != "nvfp4" or alpha is None or beta is None
+                or not math.isfinite(alpha) or alpha <= 0 or not math.isfinite(beta) or limit <= 0):
+            raise ValueError("SwiGLU-OAI requires native NVFP4, positive finite alpha/limit and finite beta")
+        return float(alpha), float(beta)
+    if alpha not in (None, 1.0) or beta not in (None, 0.0):
+        raise ValueError("SiLU requires neutral alpha=1 and beta=0")
+    return 1.0, 0.0
+
+
 def info_words(g, capacities: list[int], wire: bool) -> list[int]:
     limit = struct.unpack("<I", struct.pack("<f", float(g.swiglu_limit)))[0]
     import math
@@ -441,12 +526,15 @@ def info_words(g, capacities: list[int], wire: bool) -> list[int]:
         raise ValueError("NVFP4/BF16 packages require BF16 input")
     if not capacities or any(c <= 0 or c > 0x7fffffff for c in capacities) or capacities != sorted(set(capacities)):
         raise ValueError("capacities must be positive, strictly increasing int32 values")
+    alpha, beta = activation_params(g.activation, g.weights, getattr(g, "swiglu_alpha", None),
+                                    getattr(g, "swiglu_beta", None), g.swiglu_limit)
     contract = ABI_VERSION | STORAGE[g.kind] << 8 | ACTIVATION[g.activation] << 16 | PROJECTION[g.projection] << 24
     words = [contract, g.hidden, g.slice, g.experts, g.top_k, g.intermediate, g.tp, 7 if wire else 1, limit,
              len(capacities), *capacities]
-    if len(words) > INFO_WORDS:
-        raise ValueError(f"at most {INFO_WORDS - 10} capacities per package")
-    return words + [0] * (INFO_WORDS - len(words))
+    if len(words) > 16:
+        raise ValueError("at most 6 capacities per package")
+    params = [struct.unpack("<I", struct.pack("<f", value))[0] for value in (alpha, beta)]
+    return words + [0] * (16 - len(words)) + params
 
 
 def build(args: argparse.Namespace) -> None:
@@ -459,7 +547,7 @@ def build(args: argparse.Namespace) -> None:
     from b12x.integration.cuteafd import exportable_compilation, validate_exported_header
     from b12x.integration.cuteafd.fp8_moe import (
         GEOMETRIES, compile_fp8_moe_aot, fp8_moe_scratch_bytes, prefill_forms,
-        fp8_moe_segment_scratch_bytes, auto_large_rows,
+        fp8_moe_segment_scratch_bytes, auto_large_rows, fp8_moe_reply_layout, nvfp4_a4_fused,
     )
 
     props = torch.cuda.get_device_properties(0)
@@ -512,8 +600,11 @@ def build(args: argparse.Namespace) -> None:
             # TP is inspection metadata; kernels, routes and scratch use slice.
             # Preserve a distinct bridge (and its TP info word) per destination.
             compile_key = (g.slice, g.kind, wire, tuple(capacities), g.hidden, g.experts, g.top_k,
-                           g.activation, g.projection, g.swiglu_limit, ABI_VERSION,
-                           _pinned_sparkinfer.REVISION, props.major, props.minor, props.multi_processor_count)
+                           g.activation, g.projection, g.swiglu_limit,
+                           *activation_params(g.activation, g.weights, getattr(g, "swiglu_alpha", None),
+                                              getattr(g, "swiglu_beta", None), g.swiglu_limit), ABI_VERSION,
+                           _pinned_sparkinfer.REVISION, props.major, props.minor, props.multi_processor_count,
+                           os.environ.get("CUTEAFD_BUILD_KIND", "development"))
             identity = hashlib.sha256(json.dumps(compile_key).encode()).hexdigest()[:20]
             reused = compiled_widths.get(compile_key)
             raw = args.build_dir / args.geometry / f"width{g.slice}-{identity}"
@@ -528,12 +619,14 @@ def build(args: argparse.Namespace) -> None:
             exports = [(c, form, False) for c, form in forms]
             if args.role == "spark" and wire and g.weights in ("fp8", "mxfp4"):
                 exports += [(SEGMENT_MAX_ROWS, form, True) for form in FORMS]
-            for capacity, form, segmented in ([] if reused else exports):
+            exports = [(c, f, s, core) for c, f, s in exports
+                       for core in core_variants(args.role, g.weights, os.environ.get("CUTEAFD_BUILD_KIND", "development"))]
+            for capacity, form, segmented, core_only in ([] if reused else exports):
                 stem = (f"fp8moe_{args.geometry}_w{g.slice}_m{capacity}"
-                        f"{'' if form == 'auto' else '_' + form}{'_segments' if segmented else ''}")
+                        f"{'' if form == 'auto' else '_' + form}{'_segments' if segmented else ''}{'_core' if core_only else ''}")
                 with exportable_compilation():
                     program = compile_fp8_moe_aot(g, route="stream" if segmented else "auto",
-                                                  max_rows=capacity, wire=wire, prefill=form, row_addresses=segmented)
+                                                  max_rows=capacity, wire=wire, prefill=form, row_addresses=segmented, core_only=core_only)
                 program.export_to_c(str(raw), stem, "cuteafd_" + stem)
                 checked = validate_exported_header(program, raw / f"{stem}.h", "cuteafd_" + stem)
                 if checked["argument_count"] != POINTERS + 2:
@@ -541,12 +634,26 @@ def build(args: argparse.Namespace) -> None:
                 programs.append({"stem": stem, "capacity": capacity, "entry": checked["symbol"], "form": form,
                                  "scratch": (fp8_moe_segment_scratch_bytes(g, capacity, capacity, form) if segmented
                                              else fp8_moe_scratch_bytes(g, "auto", capacity, wire, form)),
-                                 "segmented": segmented,
+                                 "segmented": segmented, "core_only": core_only,
                                  "minimum_rows": auto_large_rows(wire, g.kind, form) + 1 if segmented else 0,
                                  "act_row_bytes": ((g.slice + g.slice // 32 + 15) // 16 * 16
                                                    if program.geometry["mxfp4_down_a8"] else 2 * g.slice),
                                  "weight_read_grouping": program.geometry["weight_read_grouping"],
                                  "arithmetic_routes": program.geometry["arithmetic_routes"]})
+                if core_only:
+                    reply_layouts = []
+                    ends = ([capacity] if segmented else
+                            [v["end_rows"] for v in program.geometry["arithmetic_routes"]])
+                    for end in ends:
+                        reply_layout = fp8_moe_reply_layout(g, route="stream" if segmented else "auto",
+                            rows=end, max_rows=capacity, wire=wire, prefill=form, row_addresses=segmented)
+                        # pair_row is the first region following the metadata reservation.
+                        pair_rows = (end * g.top_k if reply_layout["route"] in ("decode", "stream") else
+                                     64 * ((end * g.top_k + 63) // 64 + min(g.experts, end * g.top_k)))
+                        metadata = reply_layout["pair_pos_offset"] - (4 * pair_rows + 1023) // 1024 * 1024
+                        reply_layouts.append(dict(end_rows=end, route={"decode": 1, "prefill": 2, "stream": 3}[reply_layout["route"]],
+                            metadata_bytes=metadata, a4_split=int(not nvfp4_a4_fused())))
+                    programs[-1]["reply_layouts"] = reply_layouts
                 print(f"exported {stem} (scratch {programs[-1]['scratch']} B)", flush=True)
             if reused:
                 programs, object_root = reused
@@ -564,14 +671,17 @@ def build(args: argparse.Namespace) -> None:
                 "tp": tp, "hidden": g.hidden, "slice": g.slice, "experts": g.experts, "top_k": g.top_k,
                 "intermediate": g.intermediate, "swiglu_limit": g.swiglu_limit, "input": "wire" if wire else "bf16",
                 "weights": g.weights, "activation": g.activation, "projection": g.projection, "abi_version": ABI_VERSION,
+                **dict(zip(("swiglu_alpha", "swiglu_beta"), activation_params(g.activation, g.weights,
+                    getattr(g, "swiglu_alpha", None), getattr(g, "swiglu_beta", None), g.swiglu_limit))),
                 "arithmetic_routes": [{"capacity": p["capacity"], "form": p["form"],
-                                        "segments": p["arithmetic_routes"]} for p in programs],
+                                        "segments": p["arithmetic_routes"]} for p in programs if not p.get("core_only", False)],
                 "weight_read_grouping": [{"capacity": p["capacity"], "form": p["form"],
-                                          **p["weight_read_grouping"]} for p in programs if not p["segmented"]],
+                                          **p["weight_read_grouping"]} for p in programs if not p["segmented"] and not p.get("core_only", False)],
                 "segments": [{k: p[k] for k in ("capacity", "form", "minimum_rows", "act_row_bytes")}
-                             for p in programs if p["segmented"]],
+                             for p in programs if p["segmented"] and not p.get("core_only", False)],
+                "reply_producers": [p["stem"] for p in programs if p.get("core_only", False)],
                 "capacities": capacity_scratch(programs),
-                "prefill_forms": {form: [p["capacity"] for p in programs if p["form"] == form and not p["segmented"]]
+                "prefill_forms": {form: [p["capacity"] for p in programs if p["form"] == form and not p["segmented"] and not p.get("core_only", False)]
                                   for form in FORMS[1:]}}
         manifest["files"] = {str(p.relative_to(stage)): {"bytes": p.stat().st_size, "sha256": digest(p)}
                              for p in sorted(stage.rglob("*")) if p.is_file()}
@@ -605,6 +715,10 @@ def verify(package: Path, *, revision: str | None = None, role: str | None = Non
         info = layouts[name]
         if info.get("abi_version") != ABI_VERSION or info.get("activation") not in ACTIVATION or info.get("projection") not in PROJECTION:
             raise ValueError(f"{package}/{name}: missing or unknown expert activation/projection ABI")
+        if not all(key in info for key in ("swiglu_alpha", "swiglu_beta", "swiglu_limit")):
+            raise ValueError(f"{package}/{name}: missing explicit activation parameters")
+        activation_params(info["activation"], info.get("weights"), info["swiglu_alpha"],
+                          info["swiglu_beta"], info["swiglu_limit"])
         if info.get("weights") == "mxfp4" and info["activation"] != "silu_bf16_product":
             raise ValueError(f"{package}/{name}: MXFP4 supports only the pre-SiLU activation contract")
         if info.get("weights") in ("nvfp4", "bf16") and info.get("input") != "bf16":
@@ -633,7 +747,7 @@ def main() -> None:
     create.add_argument("--role", choices=sorted(ROLE_COMPUTE), required=True)
     create.add_argument("--geometry", choices=("mimo", "mimop", "mimof", "glm", "glmf", "qwen4", "glm_nvfp4", "glmf_nvfp4",
                                                "qwen4_nvfp4", "glm_nvfp4a4", "glmf_nvfp4a4", "qwen4_nvfp4a4",
-                                               "glmfdense_nvfp4", "glmfdense_nvfp4a4", "step5", "step5_bf16", "step5_nvfp4"),
+                                               "glmfdense_nvfp4", "glmfdense_nvfp4a4", "step5", "step5_bf16", "step5_nvfp4", "minimax_nvfp4a4"),
                         required=True)
     create.add_argument("--layouts", help="comma list (default: tp4,tp2,tp6 where they split for spark, "
                         "tp1 for coordinator)")

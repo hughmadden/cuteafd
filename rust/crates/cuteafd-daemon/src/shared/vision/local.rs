@@ -141,7 +141,7 @@ mod tests {
             }
         });
         let service = EncoderService {
-            queue: Some(queue), owner: Some(owner), ledger: Default::default(),
+            queue: Some(queue), owner: Some(super::super::push::OwnerThread::mock(owner)), ledger: Default::default(),
             audio_ledger: Some(Default::default()), audio_geometry: Some(geometry),
             healthy: Arc::new(std::sync::atomic::AtomicBool::new(true)),
         };
@@ -210,7 +210,7 @@ mod tests {
                 let _ = work.reply.send(Ok(job.output));
             }
         });
-        let service = EncoderService { queue: Some(queue), owner: Some(owner), ledger: Default::default(), audio_ledger: None, audio_geometry: None, healthy: Arc::new(std::sync::atomic::AtomicBool::new(true)) };
+        let service = EncoderService { queue: Some(queue), owner: Some(super::super::push::OwnerThread::mock(owner)), ledger: Default::default(), audio_ledger: None, audio_geometry: None, healthy: Arc::new(std::sync::atomic::AtomicBool::new(true)) };
         let config = ProcessorConfig::for_family(cuteafd_loader::media::ImageFamily::Mimo);
         let mut encoder = LocalEncoder::new(service, &config, 2, 256);
         for n in 0..2 {
@@ -244,7 +244,7 @@ mod tests {
                 let _ = work.reply.send(Ok(job.output));
             }
         });
-        let service = EncoderService { queue: Some(queue), owner: Some(owner), ledger: Default::default(), audio_ledger: None, audio_geometry: None, healthy: Arc::new(std::sync::atomic::AtomicBool::new(true)) };
+        let service = EncoderService { queue: Some(queue), owner: Some(super::super::push::OwnerThread::mock(owner)), ledger: Default::default(), audio_ledger: None, audio_geometry: None, healthy: Arc::new(std::sync::atomic::AtomicBool::new(true)) };
         let config = ProcessorConfig::for_family(cuteafd_loader::media::ImageFamily::Mimo);
         let mut encoder = LocalEncoder::new(service, &config, 2, 256);
         let mut ids = (0..64u8).map(|i| encoder.submit(media::EncodeJob::image(ImageKey([i; 32]), [1, 2, 2], vec![i; 3072].into(), 1, 2)).unwrap()).collect::<Vec<_>>();

@@ -52,6 +52,12 @@ impl Activation {
 
 #[derive(Debug, Clone)]
 pub enum Variable {
+    /// A small family-declared list of correlated attention assignments.
+    /// Avoid independent binary decisions for contiguous boundaries.
+    AttentionProfiles {
+        layers: Vec<usize>,
+        values: Vec<Vec<LayerMode>>,
+    },
     Attention {
         layer: usize,
         values: Vec<LayerMode>,
@@ -59,6 +65,14 @@ pub enum Variable {
     Prefill(Vec<PrefillShape>),
     Lanes(Vec<u64>),
     Embedding(Vec<EmbeddingHome>),
+    /// Ordered coordinator homes for one drafter; lower index is preferred.
+    DraftHome(Vec<u8>),
+    /// Ordered coordinator homes for the single vocabulary head.
+    HeadHome(Vec<u8>),
+    /// Ordered coordinator homes for the single Spark intake owner.
+    IntakeHome(Vec<u8>),
+    /// Ordered optional bundled-encoder candidates; lower index is preferred.
+    Encoder(Vec<usize>),
     /// Fallback rank set for this routed group, after the selected ordered
     /// onboarding prefixes have claimed their local layers. No per-layer
     /// optional local home is introduced.
@@ -78,10 +92,13 @@ pub enum Variable {
 impl Variable {
     pub(super) fn len(&self) -> usize {
         match self {
+            Self::AttentionProfiles { values, .. } => values.len(),
             Self::Attention { values, .. } => values.len(),
             Self::Prefill(values) => values.len(),
             Self::Lanes(values) => values.len(),
             Self::Embedding(values) => values.len(),
+            Self::DraftHome(values) | Self::HeadHome(values) | Self::IntakeHome(values) => values.len(),
+            Self::Encoder(values) => values.len(),
             Self::ExpertHome { rank_sets, .. } => rank_sets.len(),
             Self::Onboard { counts, .. } => counts.len(),
         }
@@ -112,6 +129,75 @@ pub struct BytePiece {
     pub last: u64,
     pub bytes_at_first: u64,
     pub bytes_per_page: u64,
+    /// Round the whole affine request independently, not its per-page slope.
+    /// Requests at or below `SMALL` share driver blocks and are not rounded.
+    pub granularity: u64,
+    /// Equal, independently rounded backings the affine request is split into
+    /// (for example one KV page allocation per attention layer). Each backing
+    /// round-up applies on its own; `1` charges the affine request once.
+    pub backings: u64,
+}
+impl BytePiece {
+    pub(super) fn raw_at(&self, pages: u64) -> Result<u64, Refusal> {
+        self.bytes_per_page.checked_mul(pages - self.first)
+            .and_then(|n| self.bytes_at_first.checked_add(n))
+            .ok_or(Refusal::Overflow("component curve"))
+    }
+    /// One backing's requested bytes, or `None` when the split is not exact.
+    fn request(&self, raw: u64) -> Option<u64> {
+        if self.backings == 0 || raw % self.backings != 0 { None } else { Some(raw / self.backings) }
+    }
+    /// Whether every page count of this affine interval splits into whole
+    /// equal backings, which is what the exact O(1) inverse relies on.
+    pub(super) fn splits_exactly(&self) -> bool {
+        self.backings != 0 && self.bytes_at_first % self.backings == 0
+            && self.bytes_per_page % self.backings == 0
+    }
+    pub(super) fn at(&self, pages: u64) -> Result<u64, Refusal> {
+        if self.granularity == 0 {
+            return Err(Refusal::InvalidFact("zero curve granularity".into()));
+        }
+        let raw = self.raw_at(pages)?;
+        let request = self.request(raw)
+            .ok_or_else(|| Refusal::InvalidFact("curve backings do not divide the request".into()))?;
+        if self.granularity == super::granularity::SM120_ALLOCATION_GRANULARITY_BYTES {
+            return super::granularity::sm120_request_backing(request)?
+                .checked_mul(self.backings)
+                .ok_or(Refusal::Overflow("rounded component curve"));
+        }
+        request.div_ceil(self.granularity).checked_mul(self.granularity)
+            .and_then(|n| n.checked_mul(self.backings))
+            .ok_or(Refusal::Overflow("rounded component curve"))
+    }
+    /// Each backing rounds on its own: `backings * ceil(raw / backings / G) * G
+    /// <= available` iff `raw <= (available / (G * backings)) * G * backings`.
+    /// A backing at or below the shared threshold costs its own bytes instead.
+    pub(super) fn last_affordable(&self, available: u64) -> Result<Option<u64>, Refusal> {
+        if self.granularity == 0 || self.backings == 0 {
+            return Err(Refusal::InvalidFact("zero curve granularity".into()));
+        }
+        let unit = self.granularity.checked_mul(self.backings)
+            .ok_or(Refusal::Overflow("curve affordable backings"))?;
+        let rounded = (available / unit).checked_mul(unit)
+            .ok_or(Refusal::Overflow("curve affordable backings"))?;
+        // A backing request at or below the shared small threshold costs its own
+        // bytes, so a sub-threshold pool fits its exact extent.
+        let ceiling = if self.granularity == super::granularity::SM120_ALLOCATION_GRANULARITY_BYTES {
+            let shared = self.backings
+                .checked_mul(super::granularity::SM120_SHARED_REQUEST_BYTES)
+                .ok_or(Refusal::Overflow("curve affordable backings"))?;
+            let exact = (available.min(shared) / self.backings)
+                .checked_mul(self.backings)
+                .ok_or(Refusal::Overflow("curve affordable backings"))?;
+            rounded.max(exact)
+        } else {
+            rounded
+        };
+        Ok(if ceiling < self.bytes_at_first { None }
+            else if self.bytes_per_page == 0 { Some(self.last) }
+            else { Some(self.last.min(self.first.saturating_add(
+                (ceiling - self.bytes_at_first) / self.bytes_per_page))) })
+    }
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ByteCurve(pub Vec<BytePiece>);
@@ -120,20 +206,38 @@ impl ByteCurve {
         Self::linear(bytes, 0, maximum)
     }
     pub fn linear(bytes_at_first: u64, bytes_per_page: u64, maximum: u64) -> Self {
+        Self::linear_rounded(bytes_at_first, bytes_per_page, maximum, 1)
+    }
+    /// One physical driver request per page-scaled owner, rounded up to the
+    /// driver's allocation granularity. The rounded extent is the charge, so an
+    /// owner that is exactly one `cudaMalloc` never needs a separate tail.
+    pub fn linear_rounded(bytes_at_first: u64, bytes_per_page: u64, maximum: u64,
+        granularity: u64) -> Self {
         Self(vec![BytePiece {
             first: 1,
             last: maximum,
             bytes_at_first,
             bytes_per_page,
+            granularity,
+            backings: 1,
+        }])
+    }
+    /// An affine pool the runtime allocates as `backings` equal pages, each
+    /// rounded up to `granularity` on its own (one KV page allocation per
+    /// attention layer). The split must be exact at every page count.
+    pub fn paged(bytes_at_first: u64, bytes_per_page: u64, granularity: u64, backings: u64,
+        maximum: u64) -> Self {
+        Self(vec![BytePiece {
+            first: 1,
+            last: maximum,
+            bytes_at_first,
+            bytes_per_page,
+            granularity,
+            backings,
         }])
     }
     pub fn at(&self, pages: u64) -> Result<u64, Refusal> {
-        let piece = self.piece(pages)?;
-        piece
-            .bytes_per_page
-            .checked_mul(pages - piece.first)
-            .and_then(|n| piece.bytes_at_first.checked_add(n))
-            .ok_or(Refusal::Overflow("component curve"))
+        self.piece(pages)?.at(pages)
     }
     pub(super) fn piece(&self, pages: u64) -> Result<&BytePiece, Refusal> {
         self.0
@@ -149,7 +253,12 @@ impl ByteCurve {
                     "component curve has a gap, overlap or invalid interval".into(),
                 ));
             }
-            self.at(piece.last)?;
+            if !piece.splits_exactly() {
+                return Err(Refusal::InvalidFact(
+                    "component curve backings do not split every page exactly".into(),
+                ));
+            }
+            piece.at(piece.last)?;
             next = piece
                 .last
                 .checked_add(1)
@@ -179,8 +288,11 @@ pub enum ComponentKind {
     Sequential(Sequential),
     Reservation(Reservation),
     Allowance(Allowance),
+    /// `bytes` is the physical backing extent, not its driver residency.
+    DriverPageTables { model: DriverPageTableModel, location: Location, lifetime: Lifetime, backing: String },
     /// Weight residency can outlive or precede the future allocation ledger.
     ResidentWeight(ResidentWeight),
+    AllocationGranularity(AllocationGranularity),
 }
 #[derive(Debug, Clone)]
 pub struct Component {
@@ -252,7 +364,9 @@ impl Component {
                 .map(|a| (a.location, a.lifetime, false)),
             ComponentKind::Reservation(r) => Some((r.location, r.lifetime, false)),
             ComponentKind::Allowance(a) => Some((a.location, a.lifetime, true)),
+            ComponentKind::DriverPageTables { location, lifetime, .. } => Some((*location, *lifetime, true)),
             ComponentKind::ResidentWeight(_) => None,
+            ComponentKind::AllocationGranularity(owner) => Some((owner.location, owner.lifetime, true)),
         }
     }
 }
@@ -261,12 +375,17 @@ impl Component {
 pub struct Contract {
     pub phase_order: PhaseOrder,
     /// Family-resolved once, before components price the selected reply storage.
-    pub spark_reply_format: Option<SparkReplyFormat>,
+    pub spark_reply_formats: Option<SparkReplyFormats>,
     pub resident_weight_limit: Option<ResidentWeights>,
     pub page_rows: u64,
+    /// Legal pool sizes are multiples of this many physical pages.
+    pub pool_page_multiple: u64,
     pub maximum_pages: u64,
     pub gpus: usize,
     pub variables: Vec<Variable>,
+    /// Permit this option only when the alternatives cannot meet the pool floor.
+    /// This preference precedes pool maximization within the same search.
+    pub floor_fallback: Option<Choice>,
     pub requires: Vec<Requires>,
     pub components: Vec<Component>,
 }
@@ -307,18 +426,32 @@ impl Contract {
             bytes: ByteCurve::fixed(a.bytes, maximum_pages),
             kind: ComponentKind::Allowance(a),
         }));
+        components.extend(facts.driver_page_tables.into_iter().map(|mapping| Component {
+            activation: Activation::always(),
+            bytes: ByteCurve::fixed(mapping.mapped_bytes, maximum_pages),
+            kind: ComponentKind::DriverPageTables {
+                model: mapping.model, location: mapping.location, lifetime: mapping.lifetime, backing: mapping.backing,
+            },
+        }));
+        components.extend(facts.allocation_granularity.into_iter().map(|owner| Component {
+            activation: Activation::always(),
+            bytes: ByteCurve::fixed(owner.bytes().unwrap_or(0), maximum_pages),
+            kind: ComponentKind::AllocationGranularity(owner),
+        }));
         components.extend(facts.resident_weights.into_iter().map(|owner| {
             let bytes = ByteCurve::fixed(owner.weights.0, maximum_pages);
             Component::resident_weight(owner, bytes)
         }));
         Self {
             phase_order: facts.phase_order,
-            spark_reply_format: None,
+            spark_reply_formats: None,
             resident_weight_limit: None,
             page_rows,
+            pool_page_multiple: 1,
             maximum_pages,
             gpus,
             variables: vec![],
+            floor_fallback: None,
             requires: vec![],
             components,
         }
@@ -334,9 +467,40 @@ impl Contract {
             .ok_or_else(|| Refusal::InvalidFact(format!("unknown component {id}")))?;
         component.byte_extent(curve)
     }
+    /// Portable CUDA host backings map into every coordinator context. Aliases
+    /// do not register storage again; Spark arena page tables have their own row.
+    pub fn add_driver_page_tables(&mut self) {
+        self.components.retain(|component| !matches!(component.kind,
+            ComponentKind::DriverPageTables { model: DriverPageTableModel::Sm120Portable, .. }));
+        let mut mappings = Vec::new();
+        for component in &self.components {
+            let owner = match &component.kind {
+                ComponentKind::Allocation { template, .. }
+                    if template.location == Location::PINNED && template.view.is_none() =>
+                    Some((template.id.clone(), template.lifetime)),
+                ComponentKind::Sequential(group) if group.members.first()
+                    .is_some_and(|member| member.location == Location::PINNED) =>
+                    Some((group.id.clone(), group.members[0].lifetime)),
+                _ => None,
+            };
+            if let Some((backing, lifetime)) = owner {
+                for gpu in 0..self.gpus {
+                    mappings.push(Component {
+                        activation: component.activation.clone(),
+                        bytes: component.bytes.clone(),
+                        kind: ComponentKind::DriverPageTables {
+                            model: DriverPageTableModel::Sm120Portable,
+                            location: Location::coordinator(gpu as u8), lifetime, backing: backing.clone(),
+                        },
+                    });
+                }
+            }
+        }
+        self.components.extend(mappings);
+    }
     pub fn facts(&self, selected: &[usize], pages: u64) -> Result<Facts, Refusal> {
         self.decisions(selected)?;
-        let mut result = Facts { resident_weights: vec![],
+        let mut result = Facts { allocation_granularity: vec![], driver_page_tables: vec![], resident_weights: vec![],
             phase_order: self.phase_order,
             allocations: vec![],
             deferred: vec![],
@@ -348,7 +512,7 @@ impl Contract {
                 continue;
             }
             let bytes = component.bytes.at(pages)?;
-            if bytes == 0 && !matches!(component.kind, ComponentKind::ResidentWeight(_)) {
+            if bytes == 0 && !matches!(component.kind, ComponentKind::ResidentWeight(_) | ComponentKind::AllocationGranularity(_)) {
                 continue;
             }
             match &component.kind {
@@ -391,6 +555,17 @@ impl Contract {
                     allowance.bytes = bytes;
                     result.allowances.push(allowance);
                 }
+                ComponentKind::DriverPageTables { model, location, lifetime, backing } => {
+                    result.driver_page_tables.push(DriverPageTable {
+                        model: *model, location: *location, lifetime: *lifetime, backing: backing.clone(), mapped_bytes: bytes,
+                    });
+                }
+                ComponentKind::AllocationGranularity(owner) => {
+                    if bytes != owner.bytes()? {
+                        return Err(Refusal::InvalidFact("cudaMalloc granularity curve differs from physical inventory".into()));
+                    }
+                    result.allocation_granularity.push(owner.clone());
+                }
                 ComponentKind::ResidentWeight(template) => {
                     let mut owner = template.clone();
                     owner.weights = ResidentWeights(bytes);
@@ -416,8 +591,17 @@ impl Contract {
         let mut expert_homes = BTreeMap::new();
         let mut remote_homes = BTreeMap::new();
         let mut embedding = None;
+        let mut draft_home = None;
+        let mut head_home = None;
+        let mut intake_home = None;
+        let mut encoder = None;
         for (variable, &option) in self.variables.iter().zip(selected) {
             match variable {
+                Variable::AttentionProfiles { layers, values } => {
+                    for (&layer, &mode) in layers.iter().zip(&values[option]) {
+                        attention.insert(layer, mode);
+                    }
+                }
                 Variable::Attention { layer, values } => {
                     attention.insert(*layer, values[option]);
                 }
@@ -430,6 +614,26 @@ impl Contract {
                 Variable::Embedding(values) => {
                     if embedding.replace(values[option]).is_some() {
                         return Err(Refusal::InvalidFact("duplicate embedding domain".into()));
+                    }
+                }
+                Variable::DraftHome(values) => {
+                    if draft_home.replace(values[option]).is_some() {
+                        return Err(Refusal::InvalidFact("duplicate draft home domain".into()));
+                    }
+                }
+                Variable::HeadHome(values) => {
+                    if head_home.replace(values[option]).is_some() {
+                        return Err(Refusal::InvalidFact("duplicate head home domain".into()));
+                    }
+                }
+                Variable::IntakeHome(values) => {
+                    if intake_home.replace(values[option]).is_some() {
+                        return Err(Refusal::InvalidFact("duplicate intake home domain".into()));
+                    }
+                }
+                Variable::Encoder(values) => {
+                    if encoder.replace(values[option]).is_some() {
+                        return Err(Refusal::InvalidFact("duplicate encoder domain".into()));
                     }
                 }
                 Variable::ExpertHome { layers, rank_sets } => {
@@ -468,11 +672,15 @@ impl Contract {
             expert_homes.entry(layer).or_insert(home);
         }
         Ok(Decisions {
-            spark_reply_format: self.spark_reply_format,
+            spark_reply_formats: self.spark_reply_formats,
             attention: attention.into_values().collect(),
             onboard_layers,
             expert_homes,
             embedding,
+            draft_home,
+            head_home,
+            intake_home,
+            encoder,
             prefill: prefill
                 .ok_or_else(|| Refusal::InvalidFact("missing prefill domain".into()))?,
             lanes: lanes.ok_or_else(|| Refusal::InvalidFact("missing lane domain".into()))?,
@@ -492,6 +700,11 @@ impl Contract {
                 Variable::Embedding(values) => {
                     if values.iter().any(|home| !covered(home.location())) {
                         return Err(Refusal::InvalidFact("embedding home has no physical budget".into()));
+                    }
+                }
+                Variable::DraftHome(values) | Variable::HeadHome(values) | Variable::IntakeHome(values) => {
+                    if values.iter().any(|&gpu| !covered(Location::coordinator(gpu))) {
+                        return Err(Refusal::InvalidFact("owner home has no physical budget".into()));
                     }
                 }
                 Variable::ExpertHome { rank_sets, .. } => {
@@ -514,6 +727,8 @@ impl Contract {
     }
     pub(super) fn validate(&self) -> Result<(), Refusal> {
         if self.page_rows == 0
+            || self.pool_page_multiple == 0
+            || self.page_rows.checked_mul(self.pool_page_multiple).is_none()
             || self.maximum_pages == 0
             || self.maximum_pages == u64::MAX
             || self.gpus == 0
@@ -525,11 +740,26 @@ impl Contract {
         let mut attention = BTreeSet::new();
         let mut remote_layers = BTreeSet::new();
         let (mut prefill, mut lanes, mut embedding) = (0, 0, 0);
+        let mut encoder = false;
+        let mut draft_home = false;
+        let mut head_home = false;
+        let mut intake_home = false;
         for variable in &self.variables {
             if variable.len() == 0 {
                 return Err(Refusal::Unsupported);
             }
             match variable {
+                Variable::AttentionProfiles { layers, values } => {
+                    if layers.is_empty() || layers.iter().any(|&layer| !attention.insert(layer))
+                        || values.iter().enumerate().any(|(index, modes)| {
+                            modes.len() != layers.len() || values[..index].contains(modes)
+                                || modes.iter().any(|mode| matches!(mode,
+                                    LayerMode::Whole { gpu, .. } if usize::from(*gpu) >= self.gpus))
+                        })
+                    {
+                        return Err(Refusal::InvalidFact("invalid attention profile domain".into()));
+                    }
+                }
                 Variable::Attention { layer, values } => {
                     if !attention.insert(*layer)
                         || values.iter().any(|v| {
@@ -560,6 +790,25 @@ impl Contract {
                     }) {
                         return Err(Refusal::InvalidFact("invalid embedding domain".into()));
                     }
+                }
+                Variable::DraftHome(values) | Variable::HeadHome(values) | Variable::IntakeHome(values) => {
+                    let seen = match variable {
+                        Variable::DraftHome(_) => &mut draft_home,
+                        Variable::HeadHome(_) => &mut head_home,
+                        Variable::IntakeHome(_) => &mut intake_home,
+                        _ => unreachable!(),
+                    };
+                    if *seen || values.iter().enumerate().any(|(index, &gpu)|
+                        usize::from(gpu) >= self.gpus || values[..index].contains(&gpu)) {
+                        return Err(Refusal::InvalidFact("invalid owner home domain".into()));
+                    }
+                    *seen = true;
+                }
+                Variable::Encoder(values) => {
+                    if encoder || values.iter().copied().ne(0..values.len()) {
+                        return Err(Refusal::InvalidFact("invalid encoder domain".into()));
+                    }
+                    encoder = true;
                 }
                 Variable::ExpertHome { layers, rank_sets } => {
                     if layers.is_empty()
@@ -632,8 +881,13 @@ impl Contract {
                     return Err(Refusal::InvalidFact(format!("invalid resident weight {}", owner.id)));
                 }
             }
+            if let ComponentKind::AllocationGranularity(owner) = &component.kind {
+                if component.bytes != ByteCurve::fixed(owner.bytes()?, self.maximum_pages) {
+                    return Err(Refusal::InvalidFact("variable cudaMalloc granularity inventory".into()));
+                }
+            }
             if let ComponentKind::Reservation(reservation) = &component.kind {
-                let facts = Facts { resident_weights: vec![], phase_order: self.phase_order, allocations: vec![], deferred: vec![],
+                let facts = Facts { allocation_granularity: vec![], driver_page_tables: vec![], resident_weights: vec![], phase_order: self.phase_order, allocations: vec![], deferred: vec![],
                     sequential: vec![], reservations: vec![reservation.clone()], allowances: vec![] };
                 validate_owners(&facts)?;
             }

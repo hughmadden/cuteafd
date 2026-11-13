@@ -23,8 +23,28 @@ pub enum KimiAttention {
     Mla,
 }
 
+/// Native K3.1 indexer. Layers share the MLA schedule but never share top-k ids.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KimiDsaConfig {
+    pub heads: usize,
+    pub head_dim: usize,
+    pub topk: usize,
+}
+
+impl KimiDsaConfig {
+    pub fn geometry(self) -> crate::shared::sparse_indexer::IndexerGeometry {
+        use crate::shared::sparse_indexer::*;
+        IndexerGeometry { query_heads: self.heads, key_heads: 1, head_dim: self.head_dim,
+            rope: None, query_norm: Norm::None, key_norm: Norm::LayerNorm,
+            activation: Activation::Relu, head_reduction: HeadReduction::WeightedSum { learned: true },
+            selection_heads: 1, granularity: Granularity::Token, topk: self.topk,
+            initial_blocks: 0, local_blocks: 0, forced_windows: ForcedWindows::WithinTopK, index_values: false }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct KimiK3Config {
+    pub dsa: Option<KimiDsaConfig>,
     pub vocab_size: usize,
     pub hidden: usize,
     pub layers: usize,
@@ -103,6 +123,23 @@ impl KimiK3Config {
             .map(|(layer, kind)| kind.with_context(|| format!("layer {} (1-based) has no attention kind", layer + 1)))
             .collect::<Result<Vec<_>>>()?;
 
+        let k31 = root["model_type"] == "kimi_k31"
+            || root["architectures"].as_array().is_some_and(|names|
+                names.iter().any(|name| name == "KimiK31ForConditionalGeneration"));
+        let dsa = if k31 || v.get("dsa_config").is_some() {
+            let index = &v["dsa_config"];
+            ensure!(index.is_object(), "Kimi K3.1 requires dsa_config");
+            ensure!(index["dsa_layers"] == linear["full_attn_layers"],
+                "Kimi K3.1 dsa_layers must equal the 1-based full_attn_layers schedule");
+            ensure!(index["index_rope_dim"].as_u64() == Some(0)
+                && index["index_k_norm_type"] == "layernorm"
+                && index["index_topk_freq"].as_u64() == Some(1)
+                && index["index_skip_topk_offset"].as_u64() == Some(1),
+                "unsupported Kimi K3.1 DSA semantics: NoPE, layernorm, fresh top-k per layer (freq=1, offset=1) required");
+            Some(KimiDsaConfig { heads: int(index, "index_num_heads")?,
+                head_dim: int(index, "index_head_dim")?, topk: int(index, "index_topk")? })
+        } else { None };
+
         let first_k = v["first_k_dense_replace"].as_u64().unwrap_or(0) as usize;
         let freq = v["moe_layer_freq"].as_u64().unwrap_or(1) as usize;
         ensure!(freq >= 1, "moe_layer_freq must be positive");
@@ -130,6 +167,7 @@ impl KimiK3Config {
             _ => Vec::new(),
         };
         let cfg = Self {
+            dsa,
             vocab_size: int(v, "vocab_size")?,
             hidden: int(v, "hidden_size")?,
             layers,
@@ -161,6 +199,7 @@ impl KimiK3Config {
                 || root["tie_word_embeddings"].as_bool().unwrap_or(false),
             eos,
         };
+        ensure!(cfg.rms_norm_eps > 0.0, "Kimi normalization epsilon must be positive");
         ensure!(cfg.situ_beta > 0.0 && cfg.situ_linear_beta > 0.0, "Situ beta values must be positive");
         ensure!(cfg.kda_heads * cfg.kda_head_dim > 0 && cfg.latent < cfg.hidden,
             "Kimi K3 latent width {} must be narrower than hidden {}", cfg.latent, cfg.hidden);
@@ -185,6 +224,10 @@ impl KimiK3Config {
         for (key, actual, wanted) in expected {
             ensure!(actual == wanted, "unsupported Kimi K3 {key}: {actual}, the release geometry is {wanted}");
         }
+        if let Some(dsa) = self.dsa {
+            ensure!((dsa.heads, dsa.head_dim, dsa.topk) == (32, 128, 2048),
+                "unsupported Kimi K3.1 indexer geometry: {dsa:?}");
+        }
         ensure!(self.dense.iter().enumerate().all(|(l, d)| *d == (l == 0)), "Kimi K3 release has exactly layer 0 dense");
         ensure!(self.kda_gate_lower_bound == -5.0, "unsupported KDA gate lower bound {}", self.kda_gate_lower_bound);
         ensure!(self.routed_scale == 1.0, "unsupported routed_scaling_factor {}", self.routed_scale);
@@ -195,6 +238,25 @@ impl KimiK3Config {
 
     pub fn kda_layers(&self) -> usize { self.attention.iter().filter(|a| **a == KimiAttention::Kda).count() }
     pub fn mla_layers(&self) -> usize { self.attention.iter().filter(|a| **a == KimiAttention::Mla).count() }
+
+    /// K3's external drafter has not been qualified against K3.1 hidden states.
+    pub fn validate_speculation(&self, enabled: bool) -> Result<()> {
+        ensure!(!enabled || self.dsa.is_none(),
+            "Kimi K3.1 DFlash2 hidden-state compatibility is unqualified; use speculation off (#1777)");
+        Ok(())
+    }
+
+    /// Serving and planning remain closed until the sparse golden is qualified.
+    pub fn validate_attention_runtime(&self) -> Result<()> {
+        self.validate_attention_role(false)
+    }
+
+    /// Explicit golden entry point; never selected from checkpoint metadata.
+    pub fn validate_attention_role(&self, golden: bool) -> Result<()> {
+        ensure!(golden || self.dsa.is_none(),
+            "Kimi K3.1 Gated DSA serving is unqualified; use the explicit golden diagnostic (#1777)");
+        Ok(())
+    }
 
     /// Layers that open a new attention-residual block (their input becomes a
     /// stored candidate). Layer 0's block is the embedding.
@@ -231,6 +293,44 @@ pub(crate) mod tests {
     use serde_json::json;
 
     pub(crate) fn release_config() -> Value { crate::plan::testing::kimi_k3_config() }
+
+    pub(crate) fn k31_config() -> Value {
+        let mut config = release_config();
+        config["model_type"] = json!("kimi_k31");
+        config["architectures"] = json!(["KimiK31ForConditionalGeneration"]);
+        config["text_config"]["dsa_config"] = json!({
+            "dsa_layers": config["text_config"]["linear_attn_config"]["full_attn_layers"],
+            "index_num_heads": 32, "index_head_dim": 128, "index_topk": 2048,
+            "index_rope_dim": 0, "index_k_norm_type": "layernorm", "index_topk_freq": 1,
+            "index_skip_topk_offset": 1 });
+        config
+    }
+
+    #[test]
+    fn k31_schedule_indexer_and_fail_closed_execution() -> Result<()> {
+        let cfg = KimiK3Config::from_hf(&k31_config())?;
+        cfg.release_geometry()?;
+        assert_eq!(cfg.family_id(), "kimi_k3");
+        assert_eq!((cfg.kda_layers(), cfg.mla_layers()), (69,24));
+        let index = cfg.dsa.unwrap().geometry();
+        index.validate()?;
+        assert_eq!(index.key_heads, 1);
+        assert_eq!(index.key_cache_bytes(64, 2)?, 16384);
+        assert_eq!(index.selection_bytes(16)?, 16 * 2048 * 4);
+        assert!(cfg.validate_attention_runtime().unwrap_err().to_string().contains("Gated DSA"));
+        cfg.validate_attention_role(true)?;
+        assert!(cfg.validate_attention_role(false).is_err());
+        cfg.validate_speculation(false)?;
+        assert!(cfg.validate_speculation(true).is_err());
+        KimiK3Config::from_hf(&release_config())?.validate_attention_runtime()?;
+        for (key,value) in [("index_rope_dim",json!(64)),("index_k_norm_type",json!("rmsnorm")),
+            ("index_topk_freq",json!(2)),("index_skip_topk_offset",json!(0)),("dsa_layers",json!([4]))] {
+            let mut config = k31_config();
+            config["text_config"]["dsa_config"][key] = value;
+            assert!(KimiK3Config::from_hf(&config).is_err(), "{key}");
+        }
+        Ok(())
+    }
 
     #[test]
     fn release_config_parses_with_one_based_schedule() {

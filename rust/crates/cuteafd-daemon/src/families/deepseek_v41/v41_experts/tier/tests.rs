@@ -26,9 +26,13 @@ fn tier_halves_record_the_planned_ids_at_the_planned_bytes() -> Result<()> {
     let half = catalog.routed_experts().intermediate / 2;
     for rank in 0..2usize {
         let mut resident = 0u64;
+        let mut regions = Vec::new();
         for (layer, ids) in tier.resident.iter().enumerate().filter(|(_, ids)| !ids.is_empty()) {
             let (stride, planes) = fake_planes(rank as i32, (layer + 1) << 40, ids.len(), half)?;
             resident += planes.iter().map(|plane| plane.bytes as u64).sum::<u64>();
+            regions.extend(planes.iter().enumerate().map(|(plane, buffer)|
+                (crate::shared::experts::weight_layout::name(ExpertLayer::BackboneTp2 { layer, rank }, plane),
+                    buffer.bytes)));
             for (slot, &id) in ids.iter().enumerate() {
                 let slices = slot_slices(stride, planes, slot);
                 let selection = V41ExpertSelection::BackboneTp2 { layer, expert: usize::from(id), rank };
@@ -47,10 +51,69 @@ fn tier_halves_record_the_planned_ids_at_the_planned_bytes() -> Result<()> {
                 }
             }
         }
+        let arena = crate::shared::experts::weight_layout::layout(rank as i32, "native-tier", regions)?;
+        ensure!(arena.bytes() as u64 == resident && arena.padding_bytes() == 0,
+            "aggregate tier backing differs from the compact planes");
+        ensure!(arena.views().len() == 4 * tier.resident.iter().filter(|ids| !ids.is_empty()).count()
+            && arena.views().values().all(|view| view.offset() % 256 == 0),
+            "aggregate tier views do not cover every selected layer with aligned planes");
         ensure!(resident == tier.resident_bytes[rank],
             "GPU {rank}: recorded {resident} B, the planner charges {}", tier.resident_bytes[rank]);
         eprintln!("GPU {rank}: {} resident halves, {resident} B (planner {})", tier.experts, tier.resident_bytes[rank]);
     }
+    Ok(())
+}
+
+/// The native size ABI is enough to charge both ranks: this CPU DSO has no
+/// CUDA device API at all, so even entering device zero would fail.
+#[test]
+fn tier_charge_uses_native_sizes_without_any_device_switch() -> Result<()> {
+    let target = std::env::current_exe()?.parent().context("test executable has no parent")?.to_path_buf();
+    let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
+    ensure!(std::process::Command::new("python3")
+        .arg(repo.join("scripts/build/assert-build-filesystem.py")).arg(&target).status()?.success(),
+        "tier size fixture must build on the build filesystem");
+    let fixture = tempfile::tempdir_in(target)?;
+    let source = fixture.path().join("tier-sizes.c");
+    let module = fixture.path().join("libtier_sizes.so");
+    std::fs::write(&source, r#"
+#include <stdint.h>
+typedef struct {
+    uint32_t abi, role, experts, hidden, logical, stored, topk, capacity;
+    uint64_t scratch;
+    int32_t max_rows, rows_padded, tasks, tiles, clusters;
+    uint32_t input_dtype;
+} Info;
+int cuteafd_rdma_rc_endpoint_try_poll(void) { return 1; }
+int cuteafd_v41_tp2_expert_info(int32_t capacity, Info *info) {
+    *info = (Info){2, 3, 384, 5120, 1152, 1152, 6, capacity, 1, 0, 0, 0, 0, 0, 1};
+    return 0;
+}
+int cuteafd_expert_packed_sizes(uint32_t intermediate, uint64_t *bytes) {
+    (void)intermediate;
+    for (int i = 0; i < 4; ++i) bytes[i] = 0;
+    return 0;
+}
+int cuteafd_pack_expert_async(void) { return 1; }
+"#)?;
+    ensure!(std::process::Command::new(repo.join("scripts/build/build-slot.sh"))
+        .args(["cc", "-shared", "-fPIC", "-O0"]).arg(&source).arg("-o").arg(&module).status()?.success(),
+        "building the CPU tier-size ABI fixture failed");
+    // SAFETY: this test-built CPU DSO implements only metadata ABIs and
+    // outlives the library; it never loads CUDA or dereferences device memory.
+    let library = unsafe { cuteafd_ffi::NativeLibrary::load(&module)? };
+    assert!(library.cuda_set_device(0).is_err());
+    assert!(library.cuda_set_device(1).is_err());
+    let (_dir, catalog) = expert_fixture()?;
+    let tier = planned_tier(catalog.snapshot(), 2)?;
+    let charged = resident_bytes(&library, &catalog, &tier.resident)?;
+    for rank in 0..2 {
+        assert_eq!(charged[rank] as u64, tier.resident_bytes[rank]);
+        eprintln!("device-free rank {rank}: {} B (planner {})", charged[rank], tier.resident_bytes[rank]);
+    }
+    assert_eq!(resident_bytes(&library, &catalog, &vec![Vec::new(); 40])?, [0; 2]);
+    // Subset validation is still on the shared loading recipe.
+    assert!(resident_bytes(&library, &catalog, &[vec![1, 1]]).is_err());
     Ok(())
 }
 
@@ -214,11 +277,11 @@ fn tier_half_equals_the_whole_layer_half_with_other_routes_dropped() -> Result<(
     layers[layer] = resident.clone();
     let residency = TierResidency::new(384, layers)?;
     let shape = cuteafd_ffi::TierSlotShape { layers: residency.layers(), experts: residency.experts() };
-    let tables = Allocation::new(device, shape.bytes())?;
+    let tables = Allocation::new(device, shape.bytes(), crate::shared::memory::TEST)?;
     lib.copy_h2d(tables.buffer, &residency.slot_tables().iter().flat_map(|slot| slot.to_ne_bytes()).collect::<Vec<_>>())?;
     let ids_bytes = capacity * 6 * 4;
     let [wire, ids, masked, slots, routing] = [capacity * 5280, ids_bytes, ids_bytes, ids_bytes, ids_bytes]
-        .map(|bytes| Allocation::new(device, bytes));
+        .map(|bytes| Allocation::new(device, bytes, crate::shared::memory::TEST));
     let (wire, ids, masked, slots, routing) = (wire?, ids?, masked?, slots?, routing?);
     let stream = Stream::new(device)?;
     let host = |buffer: cuteafd_ffi::CuteafdDeviceBuffer, bytes: usize| -> Result<Vec<u8>> {
@@ -309,12 +372,10 @@ fn tier_lane_allocations_are_the_planned_lane_bytes() -> Result<()> {
     Ok(())
 }
 
-fn tiered_planner(residency: &Arc<TierResidency>)
-    -> Result<std::sync::Mutex<super::super::coordinator::ReplicatedGroupPlanner>> {
-    let mut planner = super::super::coordinator::ReplicatedGroupPlanner::new(
-        cuteafd_transport::expert::SparkTopology::NATIVE_TP4_EP1)?;
-    planner.set_tier(residency.clone())?;
-    Ok(std::sync::Mutex::new(planner))
+fn resident_sets(residency: &Arc<TierResidency>)
+    -> Result<Vec<cuteafd_core::CoordinatorExpertResidency>> {
+    residency.resident().iter().map(|ids|
+        cuteafd_core::CoordinatorExpertResidency::from_experts(ids).map_err(Into::into)).collect()
 }
 
 /// The startup check accepts views that agree and names each kind of
@@ -350,22 +411,20 @@ fn startup_check_names_every_disagreement() -> Result<()> {
     Ok(())
 }
 
-/// The host view through the planner the link uses: a tiered planner marks
-/// exactly the resident experts of every layer; an untiered one marks none,
+/// The host view through the immutable sets the link uses: tier sets mark
+/// exactly the resident experts of every layer; an empty slice marks none,
 /// which the check refuses wherever the GPUs hold experts.
 #[test]
 fn planner_marking_is_the_hosts_view_of_the_tier() -> Result<()> {
     use super::super::coordinator::coordinator_routes;
     let residency = Arc::new(spread_residency()?);
-    let planner = tiered_planner(&residency)?;
+    let planner = resident_sets(&residency)?;
     let probe = probe_ids(384);
     for layer in 0..40usize {
         let host = coordinator_routes(&planner, layer as u32, &probe)?;
         check_views(&residency, layer, 0, &probe, &host, &tier_slots_host(&residency, layer, &probe))?;
     }
-    let untiered = std::sync::Mutex::new(super::super::coordinator::ReplicatedGroupPlanner::new(
-        cuteafd_transport::expert::SparkTopology::NATIVE_TP4_EP1)?);
-    let host = coordinator_routes(&untiered, 0, &probe)?;
+    let host = coordinator_routes(&[], 0, &probe)?;
     assert!(host.iter().all(|&marked| !marked));
     assert!(check_views(&residency, 0, 0, &probe, &host, &tier_slots_host(&residency, 0, &probe)).is_err());
     Ok(())
@@ -378,8 +437,8 @@ fn tier_slots_host(residency: &TierResidency, layer: usize, ids: &[u32]) -> Vec<
 
 /// The startup check on one GPU as the serving path runs it: the set's
 /// tables uploaded, every layer probed through the slot kernel against the
-/// tiered planner's marking; then one corrupted device entry and a planner
-/// built for another set are each refused, naming the layer.
+/// immutable resident sets' marking; then one corrupted device entry and
+/// another resident set are each refused, naming the layer.
 #[test]
 #[ignore = "requires CUTEAFD_NATIVE_LIB (with cuteafd_v41_tier_slots) and one CUDA GPU"]
 fn startup_check_on_a_gpu_refuses_a_corrupted_table() -> Result<()> {
@@ -391,9 +450,9 @@ fn startup_check_on_a_gpu_refuses_a_corrupted_table() -> Result<()> {
     let kernel = lib.v41_tier_slots()?;
     let residency = Arc::new(spread_residency()?);
     let shape = cuteafd_ffi::TierSlotShape { layers: residency.layers(), experts: residency.experts() };
-    let tables = Allocation::new(device, shape.bytes())?;
+    let tables = Allocation::new(device, shape.bytes(), crate::shared::memory::TEST)?;
     lib.copy_h2d(tables.buffer, &residency.slot_tables().iter().flat_map(|slot| slot.to_ne_bytes()).collect::<Vec<_>>())?;
-    let planner = tiered_planner(&residency)?;
+    let planner = resident_sets(&residency)?;
     let probe = probe_ids(384);
     let started = std::time::Instant::now();
     for layer in 0..40usize {
@@ -415,7 +474,7 @@ fn startup_check_on_a_gpu_refuses_a_corrupted_table() -> Result<()> {
     // A planner built for another set disagrees with these tables.
     lib.copy_h2d(entry, &2i32.to_ne_bytes())?;
     let other = Arc::new(TierResidency::new(384, (0..40).map(|_| vec![1u16, 2, 3]).collect())?);
-    let host = coordinator_routes(&tiered_planner(&other)?, 0, &probe)?;
+    let host = coordinator_routes(&resident_sets(&other)?, 0, &probe)?;
     assert!(check_views(&residency, 0, 0, &probe, &host, &probe_slots(device, &kernel, tables.buffer, shape, 0, &probe)?)
         .is_err());
     Ok(())
@@ -467,7 +526,7 @@ fn tier_start_up_on_one_gpu_loads_the_planned_halves_and_checks_both_views() -> 
     let lane = TierLane::new(halves.residency.clone(), [device, device], 64)?;
     ensure!(TierLane::table_bytes(&residency, 64) as u64
         == cuteafd_loader::placement::families::deepseek_v41::tier_lane_bytes(40, 384, 64));
-    let planner = tiered_planner(&residency)?;
+    let planner = resident_sets(&residency)?;
     let probe = probe_ids(384);
     let started = std::time::Instant::now();
     for layer in 0..40usize {
@@ -513,13 +572,13 @@ fn tier_plane_joins_the_spark_reduce_in_plane_order() -> Result<()> {
             let planes: Vec<Vec<u16>> = (0..=ranks).map(|_| (0..count).map(|_| bf16(value())).collect()).collect();
             let shared: Vec<u16> = (0..count).map(|_| bf16(value())).collect();
             let upload = |data: &[u16]| -> Result<Allocation<'_>> {
-                let allocation = Allocation::new(device, count * 2)?;
+                let allocation = Allocation::new(device, count * 2, crate::shared::memory::TEST)?;
                 lib.copy_h2d(allocation.buffer, &data.iter().flat_map(|v| v.to_ne_bytes()).collect::<Vec<_>>())?;
                 Ok(allocation)
             };
             let buffers = planes.iter().map(|plane| upload(plane)).collect::<Result<Vec<_>>>()?;
             let shared_buffer = upload(&shared)?;
-            let output = Allocation::new(device, count * 2)?;
+            let output = Allocation::new(device, count * 2, crate::shared::memory::TEST)?;
             // Ranks first, the tier's plane last: what `reduce_with` passes.
             let mut pointers = [std::ptr::null::<u16>(); 8];
             for (pointer, buffer) in pointers.iter_mut().zip(&buffers) { *pointer = buffer.buffer.ptr.cast_const().cast(); }

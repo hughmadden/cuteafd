@@ -60,9 +60,9 @@ fn compare(exl3: bool) -> Result<()> {
         .into_iter()
         .map(|device| {
             let buffers = [
-                Allocation::new(device, wire.len())?,
-                Allocation::new(device, ids.len())?,
-                Allocation::new(device, weights.len())?,
+                Allocation::new(device, wire.len(), crate::shared::memory::TEST)?,
+                Allocation::new(device, ids.len(), crate::shared::memory::TEST)?,
+                Allocation::new(device, weights.len(), crate::shared::memory::TEST)?,
             ];
             device.run(|| {
                 for (b, data) in buffers.iter().zip([&wire, &ids, &weights]) {
@@ -124,7 +124,7 @@ fn compare(exl3: bool) -> Result<()> {
             .map(|x| f32::from_ne_bytes(x.try_into().unwrap()))
             .collect())
     };
-    let tp1_sums = Allocation::new(devices[0], capacity * h * 4)?;
+    let tp1_sums = Allocation::new(devices[0], capacity * h * 4, crate::shared::memory::TEST)?;
     let mut failures = Vec::new();
     for rows in if exl3 {
         vec![1, 16, 80]

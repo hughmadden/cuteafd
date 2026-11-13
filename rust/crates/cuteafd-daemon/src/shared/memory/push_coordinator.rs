@@ -100,8 +100,9 @@ impl CoordinatorExpertPlan {
     pub fn native_selected(catalog: &OfficialV41Catalog,
         selections: &[crate::shared::experts::layer::ExpertLayer], gpu: usize, admitted: usize) -> Result<Self> {
         use crate::shared::experts::layer::ExpertLayer;
-        ensure!(!selections.is_empty() && catalog.exl3().is_none() && catalog.fp8().is_none()
-            && catalog.nvfp4().is_none(), "coordinator native push takes MXFP4 selections");
+        ensure!(!selections.is_empty() && catalog.exl3().is_none() && catalog.fp8().is_none(),
+            "coordinator native push takes MXFP4 or NVFP4 selections");
+        let nvfp4 = catalog.nvfp4().is_some();
         let mut seen = Vec::new();
         let native = selections.iter().map(|&selection| {
             ensure!(!seen.contains(&selection), "duplicate coordinator native selection");
@@ -115,13 +116,16 @@ impl CoordinatorExpertPlan {
                 }
                 _ => anyhow::bail!("unsupported coordinator native selection {selection:?}"),
             };
-            let staging = catalog.expert_staging(selection.expert(0))?;
-            let width = staging.intermediate_size();
+            let width = if nvfp4 { catalog.nvfp4_expert_staging(selection.expert(0))?.intermediate_size() }
+                else { catalog.expert_staging(selection.expert(0))?.intermediate_size() };
             cuteafd_loader::push_load::native::NativePlanes::with_scale_codes(catalog.routed_experts().hidden,
-                width, width.div_ceil(128) * 128, experts, false, catalog.mxfp4_scale_codes())
+                width, width.div_ceil(128) * 128, experts, nvfp4, !nvfp4 && catalog.mxfp4_scale_codes())
         }).collect::<Result<Vec<_>>>()?;
         let layout = ArenaLayout::new(native.iter().map(|p| p.bytes), admitted)?;
         let validation = ValidationLayout::exl3(&[], layout.bytes() as u64, usize::MAX)?;
+        let scalar_bytes = native.iter().try_fold(0usize, |bytes, planes|
+            bytes.checked_add(planes.scalar_bytes()).context("coordinator native scalar overflow"))?;
+        let layout = layout.with_validation(scalar_bytes, scalar_bytes)?;
         let mut generated = Vec::new();
         let mut scale_layers = Vec::new();
         for (region, (&selection, planes)) in selections.iter().zip(&native).enumerate() {
@@ -146,8 +150,25 @@ impl CoordinatorExpertPlan {
             retained = retained.checked_add(host).context("EXLR8 retained host overflow")?;
             scratch = scratch.max(residency.descriptor_host_bytes()?);
         }
+        let native = self.native.iter().try_fold(0usize, |bytes, planes|
+            bytes.checked_add(planes.scalar_bytes()).context("coordinator native scalar overflow"))?;
+        let vectors = self.native.iter().filter(|p| p.nvfp4)
+            .map(|p| p.experts.checked_mul(128).context("coordinator native vector scratch overflow"))
+            .collect::<Result<Vec<_>>>()?.into_iter().max().unwrap_or(0);
         retained.checked_add(scratch.max(self.fp8.as_ref().map_or(0, |p| p.host_scratch)))
+            .and_then(|bytes| bytes.checked_add(native)).and_then(|bytes| bytes.checked_add(vectors))
             .context("coordinator host admission overflow")
+    }
+
+    /// Source and index metadata carried into the published EXLR8 owners.
+    pub fn retained_host_bytes(&self) -> Result<usize> {
+        self.exlr8.iter().try_fold(0usize, |bytes, residency|
+            bytes.checked_add(residency.host_bytes()).context("EXLR8 retained host overflow"))
+    }
+
+    pub fn transient_host_bytes(&self) -> Result<usize> {
+        self.host_bytes()?.checked_sub(self.retained_host_bytes()?)
+            .context("coordinator retained host exceeds total")
     }
 
     /// Expert-owned host storage, independent of the family DenseArena and ring.
@@ -201,14 +222,19 @@ impl CoordinatorExpertPlan {
             return Ok(());
         }
         if !self.native.is_empty() {
+            let mut scalar_offset = self.layout.bytes() as u64;
             for (index, (planes, &selection)) in self.native.iter().zip(&self.native_layers).enumerate() {
                 let range = self.layout.region(index)?;
                 let destination = Destination { rank, offset: base + range.start as u64, bytes: range.len() as u64 };
+                let scalars = planes.nvfp4.then_some(Destination { rank, offset: base + scalar_offset,
+                    bytes: planes.scalar_bytes() as u64 });
+                scalar_offset += planes.scalar_bytes() as u64;
                 for expert in 0..planes.experts {
                     let world = if matches!(selection, crate::shared::experts::layer::ExpertLayer::BackboneFull { .. }) { 1 } else { 2 };
                     let checkpoint_rank = if world == 1 { 0 } else { self.gpu };
-                    let names = catalog.expert_staging(selection.expert(expert))?.tensor_names().to_vec();
-                    builder.v41_resident(catalog, &names, planes, expert, world, checkpoint_rank as u32, destination, None)?;
+                    let names = if planes.nvfp4 { catalog.nvfp4_expert_staging(selection.expert(expert))?.tensor_names().to_vec() }
+                        else { catalog.expert_staging(selection.expert(expert))?.tensor_names().to_vec() };
+                    builder.v41_resident(catalog, &names, planes, expert, world, checkpoint_rank as u32, destination, scalars)?;
                 }
             }
             self.scales.append(builder, rank, base + self.scales.base(&self.layout))?;

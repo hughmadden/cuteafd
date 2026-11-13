@@ -5,23 +5,25 @@
 
 --jobs is the total worker budget: split evenly between Cargo and pytest when
 both run, otherwise given entirely to the requested suite. Default excludes
-15 measured full-plan/cache tests; --full restores them and is required for
-dev merges and releases. This includes the installed-example deployment-to-
+measured full-plan/cache and live V4 tests and is the merge gate; --full
+restores them for release cuts. This includes the installed-example deployment-to-
 release_prefill_shape sweep: HF_HOME (or ~/.cache/huggingface) is the default
-inventory; CUTEAFD_DEPLOYMENT_TEST_HF_HOME overrides it. Missing checkpoints skip.
-The sweep discovers PROGRAMS.json in /opt/cuteafd/share, ~/.local/share/cuteafd,
-or the live V4 fixture's ~/.cache/cuteafd/builds/v3-p4/c1/artifacts (in that order).
-CUTEAFD_DEPLOYMENT_TEST_PROGRAMS overrides discovery, retaining adjacent capacity
-manifests. Configs requiring an absent PROGRAMS file skip with an explicit counted
-reason; planner failures with present inputs still fail.
-Receipts name every exclusion. --slow separately
-adds the explicit ignored CPU soaks and is also required at release cuts. Install cargo-nextest
+inventory; CUTEAFD_DEPLOYMENT_TEST_HF_HOME overrides it. Missing required inputs
+fail, including pinned checkpoint revisions and the published placement-inputs
+share/PROGRAMS.json with sibling lib/fp8 and adjacent expert metadata. CUTEAFD_DEPLOYMENT_TEST_PROGRAMS
+overrides manifest discovery; the gate only reads exports, never builds them.
+Receipts name every exclusion; compiled test inventories reject dead exclusion
+IDs. --slow separately adds the explicit ignored CPU soaks and is also required at release cuts. Install cargo-nextest
 without root into the persistent architecture Cargo home (see AGENTS.md).
 The gate finds it on PATH or there automatically; cargo test remains the fallback.
 When cargo or rustc is not on PATH (a systemd user unit), the gate prepends the
 existing standard Cargo bin directories ($CARGO_HOME/bin, ~/.cargo/bin, the
 persistent architecture Cargo home, Homebrew's bin, and the toolchain rustup
 resolves when /opt/rustup exists) for itself and every child before refusing.
+Systemd user units inherit the user manager's groups, so Docker-socket tests
+such as test_cleanup_foreign_root_refused reach /var/run/docker.sock when the
+user is in the docker group. Don't pass -p SupplementaryGroups=docker: a user
+manager can't set supplementary groups and the unit fails with 216/GROUP.
 
 With none of --cargo, --scripts, --benches the first two run. --benches runs
 the release host-cost bounds (BENCHES: the draft policy's select median at the
@@ -32,14 +34,16 @@ recording each bench's medians. Everything lives under
 pytest's basetemp. Submodules are initialized at their pinned commits first.
 Compiling (cargo test --no-run) holds a build slot (scripts/build/build-slot.sh,
 slot 0 is build.lock); running the tests holds none. Each suite has its own
-timeout. The python is the checkout's .venv, else the main checkout's.
+timeout. The python is the checkout's .venv, else ~/.cache/cuteafd/gate-venv,
+else the main checkout's .venv, verified against scripts/dev/gate-requirements.txt.
 
 The verdict comes from the parsed test summaries, never from an exit code
 alone: a suite passes only when its summaries report more than zero tests and
 no failures. Failing test ids are listed per suite. --base REV runs the same
 gate on a detached worktree of REV and reports only the ids that are new in
-this checkout. --skip-live-planners skips the slow live-inventory V4 planner
-tests (real checkpoints + manifests) and records that choice.
+this checkout. --skip-live-planners explicitly excludes both live V4 and installed
+checkpoint planners and records that choice. Missing or stale compiler inputs
+fail the requested full gate; provenance must match the fork and export sources.
 
 Writes NAME/cpu-gate.json and NAME/cpu-gate.md; exit 0 only when every
 requested suite passed (or, with --base, introduced no new failing ids).
@@ -70,28 +74,45 @@ import time
 
 REPO = Path(__file__).resolve().parents[2]
 BUILDS = Path.home() / '.cache/cuteafd/builds'
+GATE_REQUIREMENTS = REPO / 'scripts/dev/gate-requirements.txt'
 # Real-checkpoint V4 placement tests: minutes each, need sparknest snapshots.
 LIVE_PLANNERS = ('families::deepseek_v4::placement_tests::planner_equals_runtime_deepseek_v4',
-                 'families::deepseek_v4::placement_tests::planner_equals_runtime_deepseek_v4_missing_tp2_package')
+                 'families::deepseek_v4::placement_tests::planner_equals_runtime_deepseek_v4_missing_tp2_package',
+                 'families::deepseek_v4::placement_tests::planner_equals_runtime_deepseek_v4_measured',
+                 'serving_capacity::v4_placement::tp2_tests::real_tp2_costs_match_catalog_reference')
 INSTALLED_PLANNERS = (
     'installed_glm_exlr8_min_max_plans_pass_launcher_worker_budget',
     'installed_example_deployments_publish_executable_prefill_shapes',
-    'installed_release_v4_matrix_recipe_ids_parse_from_checkpoint_headers',
+    'installed_release_matrix_recipe_ids_parse_from_checkpoint_headers',
 )
-# Actual >60s IDs from the 081a00072 full gate, plus installed-checkpoint planners.
+MERGE_INSTALLED_PLANNERS = ('installed_v41_sim5090_head_pools_preserve_1m',
+                            'installed_mimo_min_onboarding_is_eligible')
+INSTALLED_INPUT_TESTS = (
+    *MERGE_INSTALLED_PLANNERS,
+    *LIVE_PLANNERS,
+    *INSTALLED_PLANNERS,
+    'shared::experts::rtx::local_physical_tests::installed_glm_local_physical_equals_serving',
+)
+PLACEMENT_INPUT_ERROR = re.compile(
+    r'stale V4 placement inputs:[^\n]*?regenerate inputs'
+    r'|missing live V4 inputs at [^\n]+'
+    r'|required (?:installed )?PROGRAMS(?:\.json)? missing: [^\n]+'
+    r'|missing placement (?:provenance|input) [^\n]+'
+    r'|stale placement inputs: [^\n]+'
+)
+# Hermetic matrices still >=10s on raptor (2026-11-07), plus external inputs.
 FULL_TESTS = (
+    *LIVE_PLANNERS,
     'families::kimi_k3::admission::tests::installed_max_planner_and_runtime_remaining_kv_match_per_gpu',
-    'plan::families::step5::tests::adaptive_prefill_selection_preserves_overrides_and_never_retries_on_capacity',
     'families::step5::admission::tests::public_nvfp4_min_card_planner_equals_measured_daemon_before_allocation',
+    # Nonhermetic: recursively reads published sets under ~/.cache/cuteafd/fidelity.
     'fidelity_dataset::tests::cached_published_qualifications_and_manifests_load',
     'families::kimi_k3::admission::tests::planner_equals_runtime_context_extent_at_256k_512k_and_1m',
     'families::step5::admission::tests::public_max_card_planner_equals_measured_daemon_before_allocation',
     'plan::families::step5::tests::native_prefill_refuses_every_unqualified_spark_count',
-    'plan::families::step5::tests::full_context_mtp_forecast_charges_private_predictors_before_allocation',
     'plan::layout::draft_prefix_tests::kimi_host_snapshots_use_serve_context_and_selected_draft_record',
     'plan::families::step5::tests::nvfp4_min_card_admits_native_w4a4_and_bf16_root_stays_reference_only',
     'families::kimi_k3::serve::tests::shared_prefill_policy_matches_planner_and_runtime_admission',
-    'plan::families::kimi::tests::planner_resolves_every_spark_count_before_recipe_refusal',
     'plan::families::kimi::tests::direct_layout_uses_shared_host_mark_rule_and_preserves_overrides',
     'plan::tests::v41_32gib_counts_share_pool_and_local_layer_admission',
     *INSTALLED_PLANNERS,
@@ -146,12 +167,62 @@ def checked(cmd, **kwargs):
     return result.stdout
 
 
+def gate_venv_for(env=None):
+    """Shared host gate venv (~/.cache/cuteafd/gate-venv); preferred over a main
+    checkout's .venv so worktrees on maxq never fall back to the quant venv."""
+    home = Path((os.environ if env is None else env).get('HOME') or Path.home())
+    return home / '.cache/cuteafd/gate-venv'
+
+
+def parse_requirements(path=GATE_REQUIREMENTS):
+    expected = {}
+    for raw in path.read_text().splitlines():
+        line = raw.split('#', 1)[0].strip()
+        if not line:
+            continue
+        name, sep, version = line.partition('==')
+        if not sep or not name.strip() or not version.strip():
+            raise SystemExit(f'cpu-gate: invalid requirement in {path}: {raw!r}')
+        expected[re.sub(r'[-_.]+', '-', name.strip()).lower()] = version.strip()
+    return expected
+
+
+def installed_packages(python):
+    probe = ('import importlib.metadata as m, json, re; '
+             'print(json.dumps({re.sub(r"[-_.]+", "-", d.metadata["Name"]).lower(): d.version '
+             'for d in m.distributions() if d.metadata.get("Name")}))')
+    result = subprocess.run([str(python), '-c', probe], text=True, capture_output=True, timeout=30)
+    if result.returncode:
+        raise SystemExit(f'cpu-gate: failed to inspect venv {python}: {(result.stderr or result.stdout).strip()[-400:]}')
+    return json.loads(result.stdout)
+
+
+def check_venv(python, requirements=GATE_REQUIREMENTS):
+    expected = parse_requirements(requirements)
+    actual = installed_packages(python)
+    missing = [f'{name}=={ver}' for name, ver in sorted(expected.items()) if name not in actual]
+    wrong = [f'{name}=={actual[name]} (expected {ver})' for name, ver in sorted(expected.items())
+             if name in actual and actual[name] != ver]
+    extra = [f'{name}=={ver}' for name, ver in sorted(actual.items()) if name not in expected]
+    problems = ([f"missing: {', '.join(missing[:8])}" + (f' (+{len(missing) - 8} more)' if len(missing) > 8 else '')] if missing else []) + \
+               ([f"version mismatch: {', '.join(wrong[:8])}" + (f' (+{len(wrong) - 8} more)' if len(wrong) > 8 else '')] if wrong else []) + \
+               ([f"unexpected packages: {', '.join(extra[:8])}" + (f' (+{len(extra) - 8} more)' if len(extra) > 8 else '')] if extra else [])
+    if problems:
+        venv = Path(python).parent.parent
+        raise SystemExit(f'cpu-gate: venv {python} does not match {requirements} ({"; ".join(problems)}); '
+                         f'sync with: uv pip sync --python {venv}/bin/python {requirements}')
+    return python
+
+
 def python_for(source):
-    for candidate in (source / '.venv/bin/python', REPO / '.venv/bin/python',
-                      Path(checked(['git', '-C', str(source), 'rev-parse', '--path-format=absolute', '--git-common-dir']).strip()).parent / '.venv/bin/python'):
+    common = Path(checked(['git', '-C', str(source), 'rev-parse', '--path-format=absolute', '--git-common-dir']).strip()).parent
+    candidates = [*([] if source.resolve() == common.resolve() else [source / '.venv/bin/python']),
+                  gate_venv_for() / 'bin/python', REPO / '.venv/bin/python', common / '.venv/bin/python']
+    for candidate in candidates:
         if candidate.is_file():
-            return candidate
-    raise SystemExit('cpu-gate: no .venv here or in the main checkout (uv venv --python 3.12 .venv; see AGENTS.md)')
+            return check_venv(candidate)
+    raise SystemExit(f'cpu-gate: no .venv here, in ~/.cache/cuteafd/gate-venv, or in the main checkout '
+                     f'(uv venv --python 3.12 .venv && uv pip sync --python .venv/bin/python {GATE_REQUIREMENTS}; see AGENTS.md)')
 
 
 def update_submodules(source, local=None):
@@ -423,61 +494,6 @@ def cargo_build_succeeded(path):
     return finished == [True] and not errors
 
 
-def _config_kv(path):
-    return dict(line.split('=', 1) for line in path.read_text().splitlines() if '=' in line)
-
-
-def _snapshot_installed(hf_home, model_id, revision=None):
-    if hf_home is None or not hf_home.is_dir():
-        return False
-    snapshots = hf_home / 'hub' / f"models--{model_id.replace('/', '--')}" / 'snapshots'
-    if not snapshots.is_dir():
-        return False
-    return (snapshots / revision).is_dir() if revision else any(snapshots.iterdir())
-
-
-def _programs_installed(env):
-    override = env.get('CUTEAFD_DEPLOYMENT_TEST_PROGRAMS')
-    if override is not None:
-        return bool(override) and Path(override).exists()
-    home = Path(env.get('HOME') or Path.home())
-    return any(path.exists() for path in (
-        Path('/opt/cuteafd/share/PROGRAMS.json'),
-        home / '.local/share/cuteafd/PROGRAMS.json',
-        home / '.cache/cuteafd/builds/v3-p4/c1/artifacts/PROGRAMS.json',
-    ))
-
-
-def installed_planner_skips(source, env):
-    """Installed-checkpoint tests in budget_cli.rs whose required HF_HOME, PROGRAMS.json
-    or checkpoint snapshots are absent."""
-    root = source if (source / 'examples/configs').is_dir() else REPO
-    raw_hf = env.get('CUTEAFD_DEPLOYMENT_TEST_HF_HOME')
-    hf_home = Path(raw_hf) if raw_hf else None
-    has_programs = _programs_installed(env)
-    skipped = []
-    exlr8_configs = [_config_kv(root / f'examples/configs/glm53-exlr8-{name}.config') for name in ('min', 'max')]
-    if not has_programs or not all(_snapshot_installed(hf_home, cfg['MODEL_ID'], cfg.get('MODEL_REVISION'))
-                                   for cfg in exlr8_configs):
-        skipped.append('installed_glm_exlr8_min_max_plans_pass_launcher_worker_budget')
-    example_configs = [_config_kv(path) for path in sorted((root / 'examples/configs').glob('*.config'))]
-    if not has_programs or not example_configs or not all(
-            _snapshot_installed(hf_home, cfg['MODEL_ID'], cfg.get('MODEL_REVISION')) for cfg in example_configs):
-        skipped.append('installed_example_deployments_publish_executable_prefill_shapes')
-    matrix = json.loads((root / 'scripts/bench/release-smoke-v4.json').read_text()).get('entries', [])
-    matrix_configs = []
-    for entry in matrix:
-        cfg = _config_kv(root / entry['config'])
-        for key, value in (entry.get('set') or {}).items():
-            if isinstance(value, str):
-                cfg[key] = value
-        matrix_configs.append(cfg)
-    if not matrix_configs or not all(
-            _snapshot_installed(hf_home, cfg['MODEL_ID'], cfg.get('MODEL_REVISION')) for cfg in matrix_configs):
-        skipped.append('installed_release_v4_matrix_recipe_ids_parse_from_checkpoint_headers')
-    return skipped
-
-
 def scrub_compiler_cache_env(env):
     """Remove inherited compiler-launcher and cache variables so Cargo and script suites
     never share read-only kache outputs or inherit ambient launcher overrides."""
@@ -490,32 +506,57 @@ def scrub_compiler_cache_env(env):
     return cleaned, scrubbed
 
 
+def validate_full_test_ids(source, root, args, env):
+    """Check exclusions against compiled libtest IDs, independently of the runner."""
+    path = root / 'logs/cargo-test-inventory.log'
+    code, seconds = run_logged(['nice', '-n', '19', 'cargo', 'test', '--workspace', '--locked',
+                                '--lib', '--bins', '--tests', '--', '--list', '--format', 'terse'], path, env, source / 'rust', args.cargo_timeout)
+    names = {line.removesuffix(': test') for line in path.read_text(errors='replace').splitlines()
+             if line.endswith(': test')}
+    missing = sorted(set(FULL_TESTS) - names)
+    result = dict(inventory_exit=code, inventory_s=round(seconds), inventory_log=str(path),
+                  missing_full_tests=missing)
+    if code:
+        result['error'] = f'test inventory failed (exit {code})'
+    elif not names:
+        result['error'] = 'test inventory is empty'
+    elif missing:
+        result['error'] = 'FULL_TESTS ids match zero tests: ' + ', '.join(missing)
+    return result
+
+
 def cargo(source, root, args, env):
     target = root / 'target-cpu-gate'
     checked([sys.executable, str(source / 'scripts/build/assert-build-filesystem.py'), str(target)])
     env, scrubbed_env = scrub_compiler_cache_env(env)
     env = {**env, 'CARGO_TARGET_DIR': str(target), 'CARGO_BUILD_JOBS': str(getattr(args, 'cargo_jobs', 16)),
            'RUST_TEST_THREADS': str(getattr(args, 'cargo_jobs', 16))}
+    env.setdefault('CUTEAFD_DEPLOYMENT_TEST_PROGRAMS',
+                   str(Path(env.get('HOME', str(Path.home()))) / '.cache/cuteafd/builds/placement-inputs/current/share/PROGRAMS.json'))
     log('cargo: compiling tests (build slot held while compiling)')
     build_log = root / 'logs/cargo-build.log'
     code, build_s = run_logged(['nice', '-n', '19', str(source / 'scripts/build/build-slot.sh'), 'cargo', 'test', '--workspace', '--locked',
                                 '--no-run', '--message-format=json-render-diagnostics'], build_log, env, source / 'rust', args.cargo_build_timeout)
     complete = cargo_build_succeeded(build_log)
     result = dict(suite='cargo', build_exit=code, build_complete=complete, build_s=round(build_s), build_log=str(build_log),
-                  scrubbed_env=scrubbed_env)
+                  scrubbed_env=scrubbed_env, deployment_test_programs=env['CUTEAFD_DEPLOYMENT_TEST_PROGRAMS'])
     if code or not complete:
         tail = [line for line in build_log.read_text(errors='replace').splitlines() if line.startswith('error')][:5]
         return {**result, 'status': 'failed', 'error': 'compile failed: ' + ('; '.join(tail) or
                 f'exit {code}; missing or unsuccessful build-finished event')}
+    result.update(validate_full_test_ids(source, root, args, env))
+    if 'error' in result:
+        return {**result, 'status': 'failed'}
     full = getattr(args, 'full', False)
-    if full:
+    if full and not args.skip_live_planners:
+        # Installed launcher checks import the same pytest helpers as the script suite.
+        env['CUTEAFD_TEST_PYTHON'] = str(python_for(source))
+    if not args.skip_live_planners:
         env.setdefault('CUTEAFD_DEPLOYMENT_TEST_HF_HOME',
                        env.get('HF_HOME') or str(Path(env.get('HOME', str(Path.home()))) / '.cache/huggingface'))
     skipped_full = [] if full else list(FULL_TESTS)
-    skipped_live = list(LIVE_PLANNERS) if args.skip_live_planners else []
-    if full:
-        skipped_live.extend(list(INSTALLED_PLANNERS) if args.skip_live_planners else installed_planner_skips(source, env))
-    skipped = skipped_full + skipped_live
+    skipped_live = list((*LIVE_PLANNERS, *INSTALLED_PLANNERS, *MERGE_INSTALLED_PLANNERS)) if args.skip_live_planners else []
+    skipped = list(dict.fromkeys(skipped_full + skipped_live))
     skips = [flag for name in skipped for flag in ('--skip', name)]
     test_args = ['nice', '-n', '19', 'cargo', 'test', '--workspace', '--locked', '--no-fail-fast', '--', *skips]
     if skips:
@@ -589,6 +630,10 @@ def cargo(source, root, args, env):
         result.update(status='failed', error=f'{failed} failed' + ('' if failed or ids else f' (exit {code}, no failing ids parsed)'))
     else:
         result['status'] = 'pass'
+    if result['status'] == 'failed' and set(ids).intersection(INSTALLED_INPUT_TESTS):
+        reasons = sorted(set(PLACEMENT_INPUT_ERROR.findall(text)))
+        if reasons:
+            result['error'] += '; ' + '; '.join(reasons)
     return result
 
 
@@ -685,6 +730,8 @@ def scripts(source, root, args, env):
 
 
 def gate(source, root, args, owned=False, local=None):
+    if args.scripts or (args.cargo and getattr(args, 'full', False) and not getattr(args, 'skip_live_planners', False)):
+        python_for(source)
     prepare(source, root, owned, **({'local': local} if local is not None else {}))
     # Record the gated commit before running: a checkout that moves during the
     # gate would otherwise be credited with tests that ran against older source.
@@ -721,15 +768,15 @@ def render(record):
     for suite in record['suites']:
         note = suite.get('error', '')
         if suite.get('skipped_live_planners'):
-            note = (note + '; ' if note else '') + 'live V4 planner tests skipped (--skip-live-planners)'
+            note = (note + '; ' if note else '') + 'live planner tests skipped (--skip-live-planners)'
         if suite.get('skipped_full_tests'):
-            note = (note + '; ' if note else '') + f"default tier: {len(suite['skipped_full_tests'])} full tests excluded; not a merge/release gate"
+            note = (note + '; ' if note else '') + f"default tier: {len(suite['skipped_full_tests'])} full tests excluded; merge gate (use --full for releases)"
         elif suite.get('full'):
             note = (note + '; ' if note else '') + 'full tier'
         for test, values in suite.get('medians', {}).items():
             note = (note + '; ' if note else '') + f"{test} medians " + ', '.join(f'{k} {v:.0f} us' for k, v in values.items())
         lines.append(f"| {suite['suite']} | {suite['status']} | {suite.get('passed', '')} | {suite.get('failed', '')} | "
-                     f"{suite.get('build_s', 0) + suite.get('test_s', 0)} | {note} |")
+                     f"{suite.get('build_s', 0) + suite.get('inventory_s', 0) + suite.get('test_s', 0)} | {note} |")
     for suite in record['suites']:
         if suite.get('failing'):
             lines += ['', f"## Failing {suite['suite']} ids", *[f'- {i}' for i in suite['failing']]]
@@ -746,13 +793,13 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('--jobs', type=int, default=os.environ.get('CUTEAFD_TEST_JOBS', max(1, (os.cpu_count() or 2) // 2)),
                         help='total CPU worker budget (default: CUTEAFD_TEST_JOBS or half logical CPUs)')
-    parser.add_argument('--full', action='store_true', help='include measured full-plan/cache tests (required for dev merges and releases)')
+    parser.add_argument('--full', action='store_true', help='include full-plan/cache and installed-checkpoint tests (required for releases)')
     parser.add_argument('--slow', action='store_true', help='also run explicit ignored CPU soaks (required at release cuts; never enables GPU tests)')
     parser.add_argument('--task', required=True, help='build directory name under ~/.cache/cuteafd/builds')
     parser.add_argument('--cargo', action='store_true')
     parser.add_argument('--scripts', action='store_true')
     parser.add_argument('--benches', action='store_true', help='release host-cost bounds (BENCHES), recorded as their own suite')
-    parser.add_argument('--skip-live-planners', action='store_true', help='skip the live-inventory V4 planner tests (recorded)')
+    parser.add_argument('--skip-live-planners', action='store_true', help='skip live V4 and installed-checkpoint planners (explicitly recorded)')
     parser.add_argument('--base', metavar='REV', help='also gate REV in a detached worktree; fail only on new failing ids')
     parser.add_argument('--source', type=Path, default=REPO, help='checkout to gate (default: this one)')
     parser.add_argument('--keep', action='store_true', help='keep tmp/ and the Cargo targets after the run (default: delete)')

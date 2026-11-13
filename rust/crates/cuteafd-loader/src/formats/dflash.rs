@@ -40,12 +40,49 @@ pub struct MlaDflashConfig {
     pub markov_rank: usize,
 }
 
-/// Named immutable allocation recipe. Admission and device storage consume the
-/// same byte counts; embedding, mask row and vocabulary weights belong to target.
+/// Named allocation recipe. Admission and device storage consume the same byte
+/// counts; embedding, mask row and vocabulary weights belong to target. `kind`
+/// is what the buffer holds, stated where the recipe names it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MlaDraftBuffer {
     pub name: String,
     pub bytes: usize,
+    pub kind: cuteafd_core::memory_layout::MemoryKind,
+}
+
+impl MlaDraftBuffer {
+    /// The kind of every recipe name this module emits; `None` for a name no
+    /// rule covers, so a new buffer cannot inherit a kind by default. Only the
+    /// paged per-layer cache is retained request state; per-batch page tables,
+    /// slots, positions, lengths and the context exchange are rebuilt every
+    /// launch; RoPE inverse frequencies and Markov norms are written once at
+    /// load; only the Context peer landings are Transport (producer scratch that is
+    /// later copied to a peer stays the drafter's workspace).
+    pub fn kind_of(name: &str) -> Option<cuteafd_core::memory_layout::MemoryKind> {
+        use cuteafd_core::memory_layout::MemoryKind::*;
+        if let Some(rest) = name.strip_prefix("layer.") {
+            let (index, field) = rest.split_once('.')?;
+            index.parse::<usize>().ok()?;
+            return match field { "cache" => Some(DrafterKv), "page_table" => Some(DrafterWorkspace), _ => None };
+        }
+        Some(match name {
+            "inverse_frequencies" | "markov_norms" => DrafterWeights,
+            // Peer landings the lead's partial reply is pushed into.
+            "received_partial" | "received_lse" => Transport,
+            "taps" | "fused" | "fused_norm" | "context_positions" | "context_slots" | "query" | "attention"
+            | "lse" | "native_scratch" | "lengths" | "query_offsets" | "native_slots" | "native_positions"
+            | "head_workspace" | "h" | "n" | "delta" | "gate_up" | "act" | "logits" | "markov_workspace"
+            | "anchors" | "ids" | "tokens" | "positions" | "candidates" | "conv" | "dynamic" | "features"
+            | "fp8_scratch" | "projected" | "q_residual" | "topk_workspace" | "unary" | "page_table"
+            | "intervals" | "partial" | "scratch" | "producer_cache" | "producer_slots" | "sink" => DrafterWorkspace,
+            _ => return None,
+        })
+    }
+
+    fn named(name: String, bytes: usize) -> Result<Self> {
+        let kind = Self::kind_of(&name).ok_or_else(|| unsupported("MLA draft buffer has no memory kind rule"))?;
+        Ok(Self { name, bytes, kind })
+    }
 }
 
 /// Placement-independent owner facts. Device ordinals are bound by the caller;
@@ -61,6 +98,7 @@ pub struct MlaDraftOwner {
     pub id: String,
     pub domain: MlaDraftDomain,
     pub bytes: usize,
+    pub resident_weights: crate::placement::ResidentWeights,
     pub alignment: usize,
     pub dtype: MlaDraftDtype,
     pub shape: Vec<usize>,
@@ -164,6 +202,25 @@ pub struct MlaDraftRuntimeLayout {
     buffers: Vec<MlaDraftBuffer>,
     owners: Vec<MlaDraftOwner>,
     weight_destinations: Vec<MlaDraftWeight>,
+    weight_arena_requests: Vec<(String, usize)>,
+    context_split: bool,
+}
+
+/// Actual device inventory for the draft Context path. The lead keeps all
+/// weights, producer and output work; the peer owns only latent KV and partial
+/// attention. `buffers` includes every cache, staging and exchange operand.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MlaDraftContextLayout {
+    pub buffers: [Vec<MlaDraftBuffer>; 2],
+}
+
+impl MlaDraftContextLayout {
+    pub fn demands(&self) -> Vec<crate::placement::Demand> {
+        use cuteafd_core::memory_layout::{Basis, Category};
+        self.buffers.iter().enumerate().flat_map(|(rank, buffers)| buffers.iter().map(move |buffer|
+            crate::placement::Demand::new(rank as u8, Category::Drafter,
+                format!("MLA DFlash Context {}", buffer.name), buffer.bytes as u64, Basis::Formula))).collect()
+    }
 }
 
 /// Only DFlash2 uses the native top-16 selector; RNN-Markov has no selector owner.
@@ -191,10 +248,31 @@ impl MlaDraftRuntimeLayout {
     pub fn buffers(&self) -> &[MlaDraftBuffer] { &self.buffers }
     pub fn owners(&self) -> &[MlaDraftOwner] { &self.owners }
     pub fn weight_destinations(&self) -> &[MlaDraftWeight] { &self.weight_destinations }
+    pub fn is_immutable_buffer(&self, name: &str) -> bool {
+        self.weight_destinations.iter().any(|weight| weight.owner == name)
+            || (self.kind == cuteafd_core::coordinator_programs::MlaDraftKind::Ml4Dspark
+                && name == "markov_norms")
+    }
+    /// The exact immutable subset handed to the serving weight allocator.
+    pub fn immutable_arena_requests(&self) -> Vec<(String, usize)> {
+        self.common_device_buffers().into_iter().filter(|buffer| self.is_immutable_buffer(&buffer.name))
+            .map(|buffer| (buffer.name, buffer.bytes)).collect()
+    }
+    /// All immutable destinations, including DFlash2's separately loaded MLA weights.
+    pub fn weight_arena_requests(&self) -> Vec<(String, usize)> {
+        if self.kind == cuteafd_core::coordinator_programs::MlaDraftKind::Dflash2 {
+            self.weight_arena_requests.clone()
+        } else {
+            self.immutable_arena_requests()
+        }
+    }
     pub fn device_buffers(&self) -> Vec<MlaDraftBuffer> {
         if self.owners.is_empty() { return self.buffers.clone(); }
         self.owners.iter().filter(|o| o.domain == MlaDraftDomain::Device)
-            .map(|o| MlaDraftBuffer { name: o.id.clone(), bytes: o.bytes }).collect()
+            .map(|o| MlaDraftBuffer { name: o.id.clone(), bytes: o.bytes,
+                kind: if o.resident_weights.0 > 0 { cuteafd_core::memory_layout::MemoryKind::DrafterWeights }
+                    else { MlaDraftBuffer::kind_of(&o.id).expect("every runtime owner was built through MlaDraftBuffer::named") } })
+            .collect()
     }
     pub fn allocate_device_with<T, E>(&self, mut allocate: impl FnMut(&MlaDraftBuffer) -> std::result::Result<T, E>)
         -> std::result::Result<Vec<T>, E> {
@@ -266,6 +344,62 @@ impl MlaDraftRuntimeLayout {
     }
     pub fn sm_count(&self) -> usize { self.sm_count }
     pub fn fp8_mode(&self) -> u8 { self.fp8_mode }
+    pub fn context_split(&self) -> bool { self.context_split }
+
+    pub fn with_context_split(mut self, enabled: bool) -> Result<Self> {
+        if enabled && (self.kind != cuteafd_core::coordinator_programs::MlaDraftKind::Dflash2
+            || self.target_hidden != 7168 || !self.owners.is_empty()) {
+            return Err(unsupported("Context draft requires Kimi h64 DFlash2"));
+        }
+        self.context_split = enabled;
+        Ok(self)
+    }
+
+    pub fn context_layout(&self) -> Result<MlaDraftContextLayout> {
+        if !self.context_split { return Err(unsupported("Context draft was not selected")); }
+        let mut buffers: [Vec<MlaDraftBuffer>; 2] = std::array::from_fn(|_| Vec::new());
+        let page_bytes = self.paged_cache.page_rows.checked_mul(self.paged_cache.record_bytes)
+            .ok_or_else(|| unsupported("Context draft page extent overflow"))?;
+        for rank in 0..2 {
+            let mut add = |name: String, bytes: usize| -> Result<()> {
+                buffers[rank].push(MlaDraftBuffer::named(name, bytes.max(256))?);
+                Ok(())
+            };
+            for (layer, &bytes) in self.paged_cache.layer_bytes.iter().enumerate() {
+                if bytes % page_bytes != 0 { return Err(unsupported("Context draft cache is not page aligned")); }
+                let pages = bytes / page_bytes;
+                let owned = pages / 2 + usize::from(rank == 0 && pages % 2 != 0);
+                add(format!("layer.{layer}.cache"), owned.checked_mul(page_bytes)
+                    .ok_or_else(|| unsupported("Context draft local cache overflow"))?)?;
+            }
+            let width = self.cache.layers.iter().map(|layer| layer.table_width).max().unwrap_or(0);
+            // Pool IDs have arbitrary parity. A table can contain only one
+            // owner's pages, so its capacity is not half the logical width.
+            add("page_table".into(), 64usize.checked_mul(width).and_then(|n| n.checked_mul(4))
+                .ok_or_else(|| unsupported("Context draft compact table overflow"))?)?;
+            add("intervals".into(), 64 * 2 * 4)?;
+            add("query_offsets".into(), 65 * 4)?;
+            add("partial".into(), 64 * 64 * 512 * 2)?;
+            add("lse".into(), 64 * 64 * 4)?;
+            add("scratch".into(), 67_371_008)?;
+            if rank == 0 { add("query".into(), 64 * 64 * 576 * 2)?; }
+            else {
+                add("producer_cache".into(), page_bytes)?;
+                add("producer_slots".into(), 64 * 8)?;
+                add("received_partial".into(), 64 * 64 * 512 * 2)?;
+                add("received_lse".into(), 64 * 64 * 4)?;
+                add("sink".into(), 64 * 4)?;
+            }
+        }
+        Ok(MlaDraftContextLayout { buffers })
+    }
+
+    /// The head's common executor no longer owns full cache buffers. The
+    /// separate Context recipe owns both physical halves before allocation.
+    pub fn common_device_buffers(&self) -> Vec<MlaDraftBuffer> {
+        self.device_buffers().into_iter().filter(|buffer|
+            !self.context_split || !(buffer.name.starts_with("layer.") && buffer.name.ends_with(".cache"))).collect()
+    }
 
     /// Rebind only the aggregate full-context pool; every native shape and bounded
     /// ring remains identical to the checked checkpoint-derived layout.
@@ -319,15 +453,25 @@ impl MlaDraftRuntimeLayout {
     /// SM-local scratch, bounded rings and the shared full-layer pool stay on the target's
     /// home. Packing is a separate startup peak, never a second resident copy.
     pub fn demands(&self, gpu: u8) -> Result<(crate::placement::draft::DrafterDemand, crate::placement::Demand)> {
-        use crate::placement::{draft::DrafterDemand, Demand};
+        use crate::placement::{draft::DrafterDemand, Demand, ResidentWeights};
         use cuteafd_core::memory_layout::{Basis, Category};
+        if self.context_split && gpu != 1 { return Err(unsupported("Context draft requires head rank one")); }
         let mut owned = if self.owners.is_empty() {
-            vec![Demand::new(gpu, Category::Drafter, "MLA DFlash owned weights",
-                self.weights.resident_bytes().map_err(|_| unsupported("MLA draft weights overflow"))?, Basis::Formula)]
-        } else { Vec::new() };
-        owned.extend(self.device_buffers().iter().map(|b| Demand::new(gpu, Category::Drafter,
-            format!("MLA DFlash {}", b.name), b.bytes as u64, Basis::Formula)));
-        let peak = self.resident_bytes()?.checked_add(self.weights.max_load_staging)
+            let weights = self.weights.resident_bytes().map_err(|_| unsupported("MLA draft weights overflow"))?;
+            let mut owned = vec![Demand::new(gpu, Category::Drafter, "MLA DFlash owned weights",
+                weights, Basis::Formula).with_resident_weights(ResidentWeights(weights))];
+            owned.extend(self.common_device_buffers().iter().map(|b| Demand::new(gpu, Category::Drafter,
+                format!("MLA DFlash {}", b.name), b.bytes as u64, Basis::Formula)));
+            owned
+        } else {
+            self.owners.iter().filter(|owner| owner.domain == MlaDraftDomain::Device).map(|owner|
+                Demand::new(gpu, Category::Drafter, format!("MLA DFlash {}", owner.id),
+                    owner.bytes as u64, Basis::Formula).with_resident_weights(owner.resident_weights)).collect()
+        };
+        if self.context_split { owned.extend(self.context_layout()?.demands()); }
+        let resident = owned.iter().try_fold(0u64, |sum, d| sum.checked_add(d.bytes))
+            .ok_or_else(|| unsupported("MLA draft physical resident total overflow"))?;
+        let peak = resident.checked_add(self.weights.max_load_staging)
             .ok_or_else(|| unsupported("MLA draft startup peak overflow"))?;
         Ok((DrafterDemand::itemized(owned, gpu), Demand::new(gpu, Category::Drafter,
             "MLA DFlash load peak including transient packing", peak, Basis::Formula)))
@@ -420,6 +564,91 @@ pub struct MlaDraftCacheBatch {
     pub page_table_width: usize,
     pub lengths: Vec<i32>,
     pub query_offsets: Vec<i32>,
+}
+
+/// Metadata for one physical owner's h64 Context partial. Every query is its
+/// own request; interval endpoints already include the global noncausal mask.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MlaDraftContextBatch {
+    pub slots: Vec<i64>,
+    pub page_table: Vec<i32>,
+    pub page_table_width: usize,
+    pub intervals: Vec<i32>,
+    pub query_offsets: Vec<i32>,
+}
+
+impl MlaDraftCacheBatch {
+    /// Physical IDs, not logical page positions, determine ownership. Pool COW
+    /// may change parity and a wrapped window table may repeat a physical page.
+    pub fn context_shards(&self, window: Option<usize>, cache_pages: usize)
+        -> Result<[MlaDraftContextBatch; 2]> {
+        let rows = self.positions.len();
+        let requests = self.lengths.len();
+        if !(1..=64).contains(&rows) || self.slots.len() != rows || requests == 0
+            || self.page_table_width == 0 || cache_pages == 0 || cache_pages > i32::MAX as usize
+            || self.page_table.len() != requests.checked_mul(self.page_table_width)
+                .ok_or_else(|| unsupported("draft Context table overflow"))?
+            || self.query_offsets.len() != requests + 1 || self.query_offsets[0] != 0
+            || self.query_offsets[requests] != rows as i32 || window == Some(0) {
+            return Err(unsupported("draft Context batch geometry"));
+        }
+        let mut tables: [Vec<Vec<i32>>; 2] = std::array::from_fn(|_| Vec::with_capacity(rows));
+        let mut intervals: [Vec<i32>; 2] = std::array::from_fn(|_| Vec::with_capacity(rows * 2));
+        for request in 0..requests {
+            let start = usize::try_from(self.query_offsets[request])
+                .map_err(|_| unsupported("draft Context negative query offset"))?;
+            let stop = usize::try_from(self.query_offsets[request + 1])
+                .map_err(|_| unsupported("draft Context negative query offset"))?;
+            let end = usize::try_from(self.lengths[request])
+                .map_err(|_| unsupported("draft Context negative length"))?;
+            if start >= stop || stop > rows || end < stop - start || end.div_ceil(64) > self.page_table_width {
+                return Err(unsupported("draft Context query span or length"));
+            }
+            let block = stop - start;
+            let anchor = end - block;
+            let pages = &self.page_table[request * self.page_table_width..request * self.page_table_width + end.div_ceil(64)];
+            if pages.iter().any(|&p| p < 0 || p as usize >= cache_pages)
+                || self.positions[start] < 0
+                || self.positions[start..stop].iter().enumerate().any(|(offset, &position)|
+                    self.positions[start].checked_add(offset as i64) != Some(position)) {
+                return Err(unsupported("draft Context page ID or absolute positions"));
+            }
+            let owned: [Vec<i32>; 2] = std::array::from_fn(|rank| pages.iter()
+                .copied().filter(|p| *p as usize % 2 == rank).map(|p| p / 2).collect());
+            // Map endpoints through table order, retaining sub-page bounds. Do
+            // not count padding or infer ownership from the logical row number.
+            let count = |endpoint: usize, rank: usize| -> usize {
+                pages.iter().enumerate().filter(|(_, p)| **p as usize % 2 == rank)
+                    .map(|(index, _)| endpoint.saturating_sub(index * 64).min(64)).sum()
+            };
+            for offset in 0..block {
+                let begin = window.map_or(0, |width| (anchor + offset + 1).saturating_sub(width).min(anchor));
+                for rank in 0..2 {
+                    intervals[rank].extend([count(begin, rank) as i32, count(end, rank) as i32]);
+                    tables[rank].push(owned[rank].clone());
+                }
+            }
+        }
+        let mut result = Vec::with_capacity(2);
+        for rank in 0..2 {
+            let width = tables[rank].iter().map(Vec::len).max().unwrap_or(0).max(1);
+            let mut page_table = Vec::with_capacity(rows * width);
+            for table in &tables[rank] {
+                page_table.extend(table);
+                page_table.resize(page_table.len() + width - table.len(), 0);
+            }
+            let slots = self.slots.iter().map(|&slot| {
+                if slot < -1 || slot >= 0 && slot as u64 >= cache_pages as u64 * 64 {
+                    return Err(unsupported("draft Context producer slot outside cache"));
+                }
+                Ok(if slot < 0 || slot as usize / 64 % 2 != rank { -1 }
+                    else { (slot / 128) * 64 + slot % 64 })
+            }).collect::<Result<Vec<_>>>()?;
+            result.push(MlaDraftContextBatch { slots, page_table, page_table_width: width,
+                intervals: std::mem::take(&mut intervals[rank]), query_offsets: (0..=rows as i32).collect() });
+        }
+        result.try_into().map_err(|_| unsupported("draft Context physical rank count"))
+    }
 }
 
 /// A cold continuation binds one immutable storage origin to one slot. Rebind
@@ -925,7 +1154,7 @@ impl MlaDflashConfig {
         let mut add = |name: String, dimensions: &[usize]| -> Result<()> {
             let bytes = dimensions.iter().try_fold(1usize, |n, &d| n.checked_mul(d))
                 .ok_or_else(|| unsupported("MLA draft arena multiplication overflow"))?.max(256);
-            buffers.push(MlaDraftBuffer { name, bytes });
+            buffers.push(MlaDraftBuffer::named(name, bytes)?);
             Ok(())
         };
         for (index, layer) in cache.layers.iter().enumerate() {
@@ -976,9 +1205,12 @@ impl MlaDflashConfig {
             add("fp8_scratch".into(), &[usize::try_from(bytes).map_err(|_| invalid())?])?;
             Some(GlmDraftFp8ScratchLayout { rows: scratch_rows, shapes })
         } else { None };
+        let weight_arena_requests = crate::families::glm5::draft_physical::mla_arena_requests(self, mode)
+            .map_err(|error| unsupported(&error.to_string()))?;
         let layout = MlaDraftRuntimeLayout { kind: self.kind, cache_format, target_hidden: h, target_vocab: self.vocab,
             target_taps: self.taps.clone(), capacity, weights, cache, paged_cache, program,
-            fp8_scratch, sm_count, fp8_mode, buffers, owners: Vec::new(), weight_destinations: Vec::new() };
+            fp8_scratch, sm_count, fp8_mode, buffers, owners: Vec::new(), weight_destinations: Vec::new(),
+            weight_arena_requests, context_split: false };
         layout.resident_bytes()?;
         Ok(layout)
     }
@@ -1015,9 +1247,10 @@ impl MlaDflashConfig {
             let bytes = dimensions.iter().try_fold(width, |n, &d| n.checked_mul(d))
                 .ok_or_else(|| unsupported("mtp_dspark arena multiplication overflow"))?.max(256);
             owners.push(MlaDraftOwner { id: name.clone(), domain: MlaDraftDomain::Device, bytes,
+                resident_weights: crate::placement::ResidentWeights::default(),
                 alignment: 256, dtype, shape: dimensions.to_vec(), lifetime: MlaDraftLifetime::Runtime,
                 shared_key: None, staging_for: None, on_use: false });
-            buffers.push(MlaDraftBuffer { name, bytes });
+            buffers.push(MlaDraftBuffer::named(name, bytes)?);
             Ok(())
         };
         use MlaDraftDtype::{Bytes, Bf16, F32, I32, U32, I64};
@@ -1039,7 +1272,11 @@ impl MlaDflashConfig {
             ("h", vec![rows, h], Bf16), ("n", vec![rows, h], Bf16), ("delta", vec![rows, h], Bf16),
             ("gate_up", vec![rows, 2 * inter], Bf16), ("act", vec![rows, inter], Bf16),
             ("logits", vec![rows, self.vocab], F32), ("markov_norms", vec![self.vocab], F32),
-            ("markov_workspace", vec![seq * 296 * 8 + rows * 4 + seq * self.markov_rank * 4], Bytes),
+            // cuteafd_ml4_dspark_markov_workspace: partial values+indices (296
+            // blocks x 8 B), base argmax top, state+embedding (2 x rank BF16) and
+            // the joint projection (3 x rank F32).
+            ("markov_workspace", vec![seq * 296 * 8 + rows * 4 + seq * self.markov_rank * 4
+                + seq * 3 * self.markov_rank * 4], Bytes),
             ("anchors", vec![seq], U32), ("ids", vec![rows], U32),
             ("tokens", vec![seq * self.drafts()], U32), ("positions", vec![rows], I64),
         ] { add(name.into(), &dims, dtype)?; }
@@ -1048,6 +1285,7 @@ impl MlaDflashConfig {
             let bytes = weight.shape.iter().try_fold(2usize, |n, &d| n.checked_mul(d))
                 .ok_or_else(|| unsupported("mtp_dspark weight destination overflow"))?.max(256);
             owners.push(MlaDraftOwner { id: weight.owner.clone(), domain: MlaDraftDomain::Device, bytes,
+                resident_weights: crate::placement::ResidentWeights(bytes as u64),
                 alignment: 256, dtype: Bf16, shape: weight.shape.clone(), lifetime: MlaDraftLifetime::Runtime,
                 shared_key: None, staging_for: None, on_use: false });
         }
@@ -1058,17 +1296,20 @@ impl MlaDflashConfig {
         let staging: Vec<_> = owners.iter().filter(|o| metadata.contains(&o.id.as_str())
             || o.id.ends_with(".page_table") || matches!(o.id.as_str(), "h" | "taps"))
             .map(|o| MlaDraftOwner { id: format!("host.ordered.{}", o.id), domain: MlaDraftDomain::HostPinned,
+                resident_weights: crate::placement::ResidentWeights::default(),
                 bytes: o.bytes, alignment: 1, dtype: Bytes, shape: vec![o.bytes], lifetime: MlaDraftLifetime::Library,
                 shared_key: Some(format!("ordered-h2d/{}", o.id)), staging_for: Some(o.id.clone()),
                 on_use: matches!(o.id.as_str(), "h" | "taps") }).collect();
         owners.extend(staging);
         owners.push(MlaDraftOwner { id: "host.landing".into(), domain: MlaDraftDomain::HostPinned,
+            resident_weights: crate::placement::ResidentWeights::default(),
             bytes: seq * self.drafts() * 4, alignment: 1, dtype: U32, shape: vec![seq, self.drafts()],
             lifetime: MlaDraftLifetime::Runtime, shared_key: None, staging_for: None, on_use: false });
         let largest_upload = owners.iter().filter(|o| o.domain == MlaDraftDomain::Device
             && (o.id.starts_with("weight.") || o.id == "inverse_frequencies"))
             .map(|o| o.bytes).max().unwrap_or(0);
         owners.push(MlaDraftOwner { id: "host.sync_h2d".into(), domain: MlaDraftDomain::HostPinned,
+            resident_weights: crate::placement::ResidentWeights::default(),
             bytes: largest_upload, alignment: 1, dtype: Bytes, shape: vec![largest_upload],
             lifetime: MlaDraftLifetime::Library, shared_key: Some("library/sync-h2d".into()),
             staging_for: None, on_use: false });
@@ -1082,7 +1323,8 @@ impl MlaDflashConfig {
             .ok_or_else(|| unsupported("mtp_dspark generated weight overflow"))?;
         let layout = MlaDraftRuntimeLayout { kind: self.kind, cache_format, target_hidden: h, target_vocab: self.vocab,
             target_taps: self.taps.clone(), capacity, weights, cache, paged_cache, program,
-            fp8_scratch: None, sm_count, fp8_mode: 0, buffers, owners, weight_destinations };
+            fp8_scratch: None, sm_count, fp8_mode: 0, buffers, owners, weight_destinations,
+            weight_arena_requests: Vec::new(), context_split: false };
         layout.resident_bytes()?;
         Ok(layout)
     }
@@ -1224,6 +1466,75 @@ mod tests {
         }
     }
 
+    #[test]
+    fn context_shards_preserve_global_masks_with_arbitrary_physical_pages() {
+        // The final page repeats a physical ring page; ownership is deliberately
+        // unrelated to logical table parity, as after pool COW and reuse.
+        let pages = [9, 2, 6, 3, 9];
+        for end in [256, 257, 263, 264] {
+            let rows = 8;
+            let batch = MlaDraftCacheBatch { first_sequence: 0,
+                positions: (10001..10001 + rows as i64).collect(),
+                slots: vec![9 * 64 + 7, 2 * 64 + 8, 6 * 64 + 9, 3 * 64 + 10, -1, 0, 63, 64],
+                page_table: pages.to_vec(), page_table_width: pages.len(),
+                lengths: vec![end], query_offsets: vec![0, rows as i32] };
+            for window in [None, Some(1), Some(65), Some(128), Some(4096)] {
+                let shards = batch.context_shards(window, 10).unwrap();
+                for row in 0..rows {
+                    let anchor = end as usize - rows;
+                    let begin = window.map_or(0, |width| (anchor + row + 1).saturating_sub(width).min(anchor));
+                    let mut recovered = Vec::new();
+                    for rank in 0..2 {
+                        let shard = &shards[rank];
+                        let local = &shard.page_table[row * shard.page_table_width..(row + 1) * shard.page_table_width];
+                        let lo = shard.intervals[row * 2] as usize;
+                        let hi = shard.intervals[row * 2 + 1] as usize;
+                        let stream = (0..end as usize).filter(|index| pages[index / 64] as usize % 2 == rank)
+                            .collect::<Vec<_>>();
+                        recovered.extend_from_slice(&stream[lo..hi]);
+                        for (compact, &logical) in stream.iter().enumerate() {
+                            assert_eq!(local[compact / 64] * 2 + rank as i32, pages[logical / 64]);
+                            assert_eq!(compact % 64, logical % 64);
+                        }
+                        let slot = batch.slots[row];
+                        let mapped = shard.slots[row];
+                        if slot < 0 || slot / 64 % 2 != rank as i64 { assert_eq!(mapped, -1); }
+                        else { assert_eq!((mapped / 64 * 2 + rank as i64) * 64 + mapped % 64, slot); }
+                        assert_eq!(shard.query_offsets, (0..=rows as i32).collect::<Vec<_>>());
+                    }
+                    recovered.sort_unstable();
+                    assert_eq!(recovered, (begin..end as usize).collect::<Vec<_>>());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn context_shards_keep_empty_owners_and_sequence_boundaries() {
+        let batch = MlaDraftCacheBatch { first_sequence: 2, positions: vec![9, 10, 800, 801],
+            slots: vec![129, 130, 257, 258], page_table: vec![2, 4], page_table_width: 1,
+            lengths: vec![4, 2], query_offsets: vec![0, 2, 4] };
+        let [even, odd] = batch.context_shards(None, 5).unwrap();
+        assert_eq!(even.page_table, [1, 1, 2, 2]);
+        assert_eq!(even.intervals, [0, 4, 0, 4, 0, 2, 0, 2]);
+        assert_eq!(odd.intervals, [0; 8]);
+        assert_eq!(odd.page_table_width, 1);
+        assert_eq!(odd.page_table, [0; 4]);
+        assert_eq!(odd.slots, [-1; 4]);
+        let mut broken = batch.clone(); broken.query_offsets[1] = -1;
+        assert!(broken.context_shards(None, 5).is_err());
+        let mut broken = batch.clone(); broken.lengths[0] = 1;
+        assert!(broken.context_shards(None, 5).is_err());
+        let mut broken = batch.clone(); broken.page_table[0] = 5;
+        assert!(broken.context_shards(None, 5).is_err());
+        let mut broken = batch.clone(); broken.slots[0] = 320;
+        assert!(broken.context_shards(None, 5).is_err());
+        let mut broken = batch.clone(); broken.positions[1] = 12;
+        assert!(broken.context_shards(None, 5).is_err());
+        assert!(batch.context_shards(Some(0), 5).is_err());
+        assert!(batch.context_shards(None, 0).is_err());
+    }
+
     fn config() -> serde_json::Value {
         json!({"architectures":["DFlash2DraftModel"], "hidden_size":7168,
             "intermediate_size":14336, "num_hidden_layers":5, "num_attention_heads":64,
@@ -1241,6 +1552,125 @@ mod tests {
             "dflash_config":{"attention_mode":"mla", "block_size":8,
                 "conv_kernel_size":2, "conv_group_size":16, "selector_rank":256,
                 "selector_top_k":16, "target_layer_ids":[19,37,66,78,90], "mask_token_id":163592}})
+    }
+
+    /// Every buffer each real layout emits is classified by rule: only the
+    /// retained paged cache is KV, per-batch tables and context-update planes
+    /// are scratch, the RoPE table is a constant and only peer landings are Transport.
+    #[test]
+    fn every_draft_buffer_kind_is_stated_by_its_recipe() {
+        use crate::families::glm5::draft_representation::{GlmDraftCapacity, GlmDraftRepresentation::*};
+        use cuteafd_core::memory_layout::MemoryKind::*;
+        let cfg = MlaDflashConfig::from_json(&config()).unwrap();
+        let ml4 = MlaDflashConfig { mla: MlaGeometry { hidden: 6144, heads: 64, q_rank: 0,
+            kv_rank: 512, nope: 64, rope: 64, value: 128 }, intermediate: 24576, eps: 1e-5,
+            block: 3, group: 0, selector_rank: 512, selector_top_k: 0, taps: vec![1,18,36,54,71],
+            vocab: 204800, mask_token: 0, max_context: 1 << 20, windows: vec![Some(2048); 3],
+            rotary: DsparkRotaryPlan { inv_freq: vec![1.;32], attention_factor: 1., softmax_factor: 1. },
+            kind: cuteafd_core::coordinator_programs::MlaDraftKind::Ml4Dspark, markov_rank: 512 };
+        let capacity = GlmDraftCapacity::new(8, 8, 8).unwrap();
+        let layouts = [
+            cfg.runtime_layout(Bf16Only, capacity, 8192, 4096, 188, 0, MlaCacheFormat::Bf16).unwrap(),
+            cfg.runtime_layout(Fp8Only, capacity, 8192, 4096, 188, 0, MlaCacheFormat::Fp8).unwrap(),
+            ml4.runtime_layout(Bf16Only, GlmDraftCapacity::new(5, 1, 3).unwrap(), 1 << 20, 1 << 21, 188, 0, MlaCacheFormat::Fp8).unwrap(),
+        ];
+        for layout in &layouts {
+            let mut buffers = layout.device_buffers();
+            if let Ok(split) = layout.clone().with_context_split(true) {
+                buffers.extend(split.context_layout().unwrap().buffers.into_iter().flatten());
+            }
+            for buffer in &buffers {
+                let expected = if layout.weight_destinations().iter().any(|w| w.owner == buffer.name) { Some(DrafterWeights) }
+                    else { MlaDraftBuffer::kind_of(&buffer.name) };
+                assert_eq!(Some(buffer.kind), expected, "{}", buffer.name);
+            }
+            let kind = |name: &str| buffers.iter().find(|b| b.name == name).map(|b| b.kind);
+            assert_eq!(kind("layer.0.cache"), Some(DrafterKv));
+            assert_eq!(kind("layer.0.page_table"), Some(DrafterWorkspace));
+            assert_eq!(kind("inverse_frequencies"), Some(DrafterWeights));
+            for name in ["context_slots", "context_positions", "taps", "fused", "fused_norm", "lengths"] {
+                assert_eq!(kind(name), Some(DrafterWorkspace), "{name}");
+            }
+        }
+        let split = layouts[0].clone().with_context_split(true).unwrap().context_layout().unwrap();
+        let rank1 = |name: &str| split.buffers[1].iter().find(|b| b.name == name).unwrap().kind;
+        assert_eq!((rank1("received_partial"), rank1("received_lse")), (Transport, Transport));
+        assert_eq!((rank1("producer_cache"), rank1("scratch"), rank1("sink")), (DrafterWorkspace, DrafterWorkspace, DrafterWorkspace));
+        assert_eq!(MlaDraftBuffer::kind_of("unruled"), None);
+        assert_eq!(MlaDraftBuffer::kind_of("layer.x.cache"), None);
+    }
+
+    #[test]
+    fn context_draft_recipe_charges_physical_cache_and_exchange_owners() {
+        use crate::families::glm5::draft_representation::{GlmDraftCapacity, GlmDraftRepresentation};
+        let cfg = MlaDflashConfig::from_json(&config()).unwrap();
+        for format in [MlaCacheFormat::Bf16, MlaCacheFormat::Fp8] {
+            let base = cfg.runtime_layout(GlmDraftRepresentation::Fp8Only,
+                GlmDraftCapacity::new(16, 8, 8).unwrap(), 8192, 4096, 188, 0, format).unwrap();
+            assert!(!base.context_split());
+            let layout = base.clone().with_context_split(true).unwrap();
+            let context = layout.context_layout().unwrap();
+            let bytes = |rank: usize, name: &str| context.buffers[rank].iter()
+                .find(|buffer| buffer.name == name).unwrap().bytes;
+            assert_eq!(bytes(1, "producer_cache"), 64 * format.record_bytes());
+            assert_eq!(bytes(0, "query"), 64 * 64 * 576 * 2);
+            assert!(!context.buffers[0].iter().any(|b| b.name == "producer_cache"));
+            assert!(!layout.common_device_buffers().iter().any(|b| b.name.ends_with(".cache")));
+            for (index, &original) in layout.paged_cache().layer_bytes.iter().enumerate() {
+                assert_eq!(bytes(0, &format!("layer.{index}.cache"))
+                    + bytes(1, &format!("layer.{index}.cache")), original);
+            }
+            let (demand, peak) = layout.demands(1).unwrap();
+            let common: u64 = layout.common_device_buffers().iter().map(|b| b.bytes as u64).sum();
+            let extra: u64 = context.buffers.iter().flatten().map(|b| b.bytes as u64).sum();
+            assert_eq!(demand.owned.iter().map(|d| d.bytes).sum::<u64>(), common + extra + layout.weights().resident_bytes().unwrap());
+            assert_eq!(peak.bytes, common + extra + layout.weights().resident_bytes().unwrap() + layout.weights().max_load_staging);
+            assert!(layout.demands(0).is_err());
+            for page_rows in [64, 128] {
+                let facts = crate::placement::families::kimi::draft_facts(&layout, page_rows, 16, 1).unwrap();
+                assert!(facts.context_split);
+                let (gpu, arena) = facts.arena.as_ref().unwrap();
+                assert_eq!(*gpu, 1);
+                assert_eq!(arena.id(), "kimi/draft/1");
+                assert_eq!(arena.payload_bytes() as u64, layout.weights().resident_bytes().unwrap());
+                assert_eq!(arena.views().iter().map(|(name, view)| (name.clone(), view.bytes()))
+                    .collect::<std::collections::BTreeMap<_, _>>(),
+                    layout.weight_arena_requests().into_iter().collect());
+                assert!(facts.owners.iter().all(|owner| owner.group != "MLA DFlash owned weights"
+                    && owner.weights_at_first == 0 && owner.weights_per_page == 0));
+                use crate::placement::planner::{ComponentKind, Lifetime, Location, weight_arena_components};
+                let components = weight_arena_components(arena, Location::coordinator(*gpu), Lifetime::RESIDENT, 16, cuteafd_core::memory_layout::MemoryKind::DrafterWeights).unwrap();
+                let ComponentKind::Allocation { template: root, .. } = &components[0].kind else { panic!("arena root") };
+                let ComponentKind::AllocationGranularity(tail) = &components[2].kind else { panic!("arena tail") };
+                assert_eq!(root.bytes, arena.bytes() as u64);
+                assert!(root.view.is_none());
+                assert_eq!(tail.backings.len(), 1);
+                assert_eq!(tail.backings[0].backing, root.id);
+                assert_eq!(tail.requests(), [root.bytes]);
+                assert_eq!(root.bytes + tail.bytes().unwrap(), root.bytes.div_ceil(2 << 20) * (2 << 20));
+                for pages in (2..=16).step_by(2) {
+                    let physical = layout.with_pool_tokens(pages * page_rows as usize).unwrap().demands(1).unwrap().0;
+                    let retired = physical.owned.iter().filter(|owner| owner.group == "MLA DFlash owned weights")
+                        .collect::<Vec<_>>();
+                    assert_eq!(retired.len(), 1);
+                    assert_eq!(retired[0].bytes, arena.payload_bytes() as u64);
+                    let mutable = physical.owned.iter().filter(|owner| owner.group != "MLA DFlash owned weights")
+                        .collect::<Vec<_>>();
+                    assert_eq!(facts.owners.len(), mutable.len());
+                    for (owner, actual) in facts.owners.iter().zip(mutable) {
+                        assert_eq!(owner.gpu, actual.gpu);
+                        assert_eq!(owner.group, actual.group);
+                        assert_eq!(owner.category, actual.category);
+                        assert_eq!(owner.bytes_at_first + owner.bytes_per_page * (pages - 1) as u64, actual.bytes);
+                    }
+                    let admitted = facts.owners.iter().map(|owner|
+                        owner.bytes_at_first + owner.bytes_per_page * (pages - 1) as u64).sum::<u64>()
+                        + root.bytes + tail.bytes().unwrap();
+                    assert_eq!(admitted, physical.owned.iter().map(|owner| owner.bytes).sum::<u64>()
+                        - retired[0].bytes + root.bytes + tail.bytes().unwrap());
+                }
+            }
+        }
     }
 
     #[test]
@@ -1308,9 +1738,21 @@ mod tests {
                 1 << 20, 1 << 21, 188, 0, MlaCacheFormat::Fp8)?;
             let allocated: BTreeMap<_, _> = layout.allocate_device_with(|b| Ok::<_, anyhow::Error>((b.name.clone(), b.bytes)))?
                 .into_iter().collect();
-            let demanded: BTreeMap<_, _> = layout.demands(device)?.0.movable(2)?.conditional[0].demands.iter()
+            let movable = layout.demands(device)?.0.movable(2)?;
+            let demands = &movable.conditional[0].demands;
+            let demanded: BTreeMap<_, _> = demands.iter()
                 .map(|d| (d.group.strip_prefix("MLA DFlash ").unwrap().to_string(), d.bytes as usize)).collect();
             assert_eq!(allocated, demanded, "{label}: every owner, not just totals");
+            let weights = layout.weight_destinations().iter().map(|weight|
+                (weight.shape.iter().product::<usize>() * 2).max(256) as u64).sum::<u64>();
+            assert_eq!(demands.iter().map(|d| d.resident_weights.0).sum::<u64>(), weights);
+            assert_eq!(weights, layout.weights().resident_bytes()?);
+            for owner in layout.owners() {
+                let expected = if layout.weight_destinations().iter().any(|weight| weight.owner == owner.id) {
+                    owner.bytes as u64
+                } else { 0 };
+                assert_eq!(owner.resident_weights.0, expected, "{label}: {}", owner.id);
+            }
             let shipped: Vec<serde_json::Value> = serde_json::from_str(include_str!("../families/mistral_large4/official-tensors.json"))?;
             let mut headers = BTreeMap::new();
             for tensor in shipped {

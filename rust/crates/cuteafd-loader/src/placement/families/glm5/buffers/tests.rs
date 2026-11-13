@@ -1,6 +1,14 @@
 use super::*;
 use crate::placement::planner::{self, Budget, Contract, Facts, Variable};
 
+/// The searched extent: an independent cudaMalloc request rounds to its own
+/// driver block; sub-block requests stay exact and share blocks.
+fn searched(exact: u64) -> u64 {
+    if planner::independent_request(exact) {
+        exact + planner::allocation_granularity_forecast(&[exact]).unwrap()
+    } else { exact }
+}
+
 pub(super) fn cfg() -> GlmDsaConfig {
     GlmDsaConfig::from_hf(&crate::plan::testing::glm5_config()).unwrap()
 }
@@ -30,7 +38,7 @@ pub(super) fn target(device: u8) -> TargetBuffers {
         )),
         full_prefill_logits: false,
         payload_row_bytes: 0,
-        core_rows: false,
+        core_rows: false, attention_partial_bytes: 2, down_partial_bytes: 2,
     }
 }
 
@@ -39,7 +47,7 @@ fn facts(target: &TargetBuffers, pages: u64) -> Facts {
         target.page_tokens,
         target.maximum_pages,
         2,
-        Facts { resident_weights: vec![],
+        Facts { allocation_granularity: vec![], driver_page_tables: vec![], resident_weights: vec![],
             phase_order: crate::placement::planner::PhaseOrder::DRAFT_THEN_TARGET,
             allocations: vec![],
             deferred: vec![],
@@ -109,15 +117,15 @@ fn prefix_backings_charge_tail_and_window_marks_but_no_target_or_draft_aliases()
                 let spec = PrefixBuffers { device, draft_windows: windows, mark_slots: slots };
                 let owners = spec.allocations(life).unwrap();
                 assert_eq!(owners.len(), 1 + usize::from(windows.is_some() && slots > 0));
-                assert_eq!(owners[0].id, format!("glm.prefix.gpu.{device}.tail-scratch"));
+                assert_eq!(owners[0].id, "glm.prefix.scratch");
                 assert_eq!(owners[0].bytes, 256);
                 if let Some(windows) = windows.filter(|_| slots > 0) {
                     assert_eq!(owners[1].bytes, if windows == 0 {256} else {((windows + 16) * slots).max(256)});
-                    assert_eq!(owners[1].id, format!("glm.prefix.gpu.{device}.draft-marks"));
+                    assert_eq!(owners[1].id, "glm.prefix.draft_marks");
                 }
                 assert!(owners.iter().all(|a| a.view.is_none() && a.lifetime == life
                     && a.location == Location::coordinator(device) && a.category == Category::Prefix));
-                let mut contract = Contract::fixed(64, 16, 2, Facts { resident_weights: vec![],
+                let mut contract = Contract::fixed(64, 16, 2, Facts { allocation_granularity: vec![], driver_page_tables: vec![], resident_weights: vec![],
                     phase_order: planner::PhaseOrder::DRAFT_THEN_TARGET, allocations: vec![],
                     deferred: vec![], sequential: vec![], reservations: vec![], allowances: vec![] });
                 contract.variables = vec![Variable::Prefill(vec![PrefillShape {rows: 64, waves: 1}]), Variable::Lanes(vec![1])];
@@ -151,9 +159,9 @@ fn named_target_buffers_match_independent_pool_geometry_and_aliases() {
                     .find(|a| a.id == format!("{prefix}.{name}"))
                     .unwrap()
             };
-            assert_eq!(get("kv.0").bytes, (pages + 1) * 41984);
+            assert_eq!(get("kv.0").bytes, searched((pages + 1) * 41984));
             assert_eq!(get("kv.1").bytes, 256);
-            assert_eq!(get("index.0").bytes, (pages + 1) * 8448);
+            assert_eq!(get("index.0").bytes, searched((pages + 1) * 8448));
             assert!(!facts
                 .allocations
                 .iter()
@@ -185,11 +193,17 @@ fn named_target_buffers_match_independent_pool_geometry_and_aliases() {
                     .any(|a| a.id == format!("{prefix}.decode.upload.0.ids")));
             }
             // Views do not charge a second physical arena or shared logits allocation.
+            // Serving prefill lanes are allocated by the first live prefill (Growth),
+            // so they are absent from the Ready charge.
             let phase = planner::evaluate(&facts, &budgets()).unwrap();
             let physical: u64 = facts
                 .allocations
                 .iter()
-                .filter(|a| a.view.is_none() && a.location == Location::coordinator(device))
+                .filter(|a| {
+                    a.view.is_none()
+                        && a.location == Location::coordinator(device)
+                        && a.lifetime.contains(Phase::Ready, facts.phase_order)
+                })
                 .map(|a| a.bytes)
                 .sum();
             assert_eq!(
@@ -200,6 +214,43 @@ fn named_target_buffers_match_independent_pool_geometry_and_aliases() {
                     .owned,
                 physical
             );
+        }
+    }
+}
+
+#[test]
+fn ml4_target_caches_preserve_nope_and_shared_latent_geometry() {
+    let cfg = GlmDsaConfig::from_hf(&crate::plan::testing::mistral_large4_config()).unwrap();
+    assert!((0..cfg.layers).any(|layer| !cfg.owns_kv(layer)));
+    assert!((0..cfg.layers).any(|layer| !cfg.rope(layer) && cfg.owns_kv(layer)));
+    for partitioned in [false, true] {
+        let mut target = target(0);
+        target.partitioned = partitioned;
+        target.page_tokens = if partitioned { 128 } else { 64 };
+        target.owned_layers = (0..cfg.layers).map(|layer| layer % 3 != 2).collect();
+        let components = target.components(&cfg).unwrap();
+        for pages in [1, 17, 128] {
+            let mut contract = Contract::fixed(target.page_tokens, target.maximum_pages, 2,
+                Facts { allocation_granularity: vec![], driver_page_tables: vec![], phase_order: planner::PhaseOrder::DRAFT_THEN_TARGET,
+                    allocations: vec![], deferred: vec![], sequential: vec![],
+                    reservations: vec![], allowances: vec![], resident_weights: vec![] });
+            contract.variables = vec![
+                Variable::Prefill(vec![target.prefill.as_ref().unwrap().0]),
+                Variable::Lanes(vec![1]),
+            ];
+            contract.components = components.clone();
+            let facts = contract.facts(&[0, 0], pages).unwrap();
+            for (layer, &owned) in target.owned_layers.iter().enumerate() {
+                let get = |suffix: &str| facts.allocations.iter().find(|owner|
+                    owner.id == format!("glm.target.gpu.0.{suffix}.{layer}"));
+                let bytes = if owned && cfg.owns_kv(layer) {
+                    searched((pages + 1) * 64 * if cfg.rope(layer) { 656 } else { 528 })
+                } else { 256 };
+                assert_eq!(get("kv").unwrap().bytes, bytes, "layer {layer}");
+                assert_eq!(get("index").map(|owner| owner.bytes),
+                    (owned && cfg.indexers[layer] == GlmIndexer::Full)
+                        .then_some(searched((pages + 1) * 8448)));
+            }
         }
     }
 }

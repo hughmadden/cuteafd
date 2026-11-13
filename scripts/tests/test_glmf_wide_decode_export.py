@@ -8,6 +8,7 @@ import dataclasses
 import importlib.util
 import json
 import re
+import subprocess
 import sys
 import types
 from pathlib import Path
@@ -16,7 +17,8 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[2]
 EXPORTER = ROOT / "python" / "tools" / "aot" / "export_b12x_dsv4_aot.py"
-GEOMETRY = types.SimpleNamespace(moe_inter=2048, dense_inter=12288, index_kpool=4, kda_width=8192, hidden=4096)
+GEOMETRY = types.SimpleNamespace(moe_inter=2048, dense_inter=12288, index_kpool=4, kda_width=8192, hidden=4096,
+                                 q_lora_rank=1536, kv_lora_rank=512, heads=64, qk_nope_dim=256, v_head_dim=256)
 WIDE_STEMS = {
     "index_producer_m128", "index_producer_c_m128", "index_topk_decode_m128", "mhc_post_pre_m128", "kda_m128",
     "kda_w8_m128", "kda_s16_m128", "kda_w8_s16_m128", "mla_producer_m128", "o_m128", "sparse_mla_decode_m128", "ffn_i2048_m128",
@@ -40,11 +42,27 @@ def exporter(monkeypatch):
         monkeypatch.setenv(name, "1")
     monkeypatch.setitem(sys.modules, "_pinned_sparkinfer", types.SimpleNamespace(REVISION="test"))
     package = types.ModuleType("b12x.integration.cuteafd")
-    for name in ("glmf", "glmf_split", "glm_ffn", "glm_attention", "glm_indexer", "dsv4_mhc", "glm_sparse_mla", "context_split", "qwen4", "qwen4_gdn", "qwen4_attention", "qwen_dense", "qwen_dense_fp8", "kimi_mla", "kimi_residual", "pointwise", "mimo_attention", "mimo_ffn", "native_dense"):
+    for name in ("glmf", "glmf_split", "glm_ffn", "glm_attention", "glm_indexer", "dsv4_mhc", "glm_sparse_mla", "context_split", "qwen4", "qwen4_gdn", "qwen4_attention", "qwen_dense", "qwen_dense_fp8", "kimi_mla", "kimi_dsa", "kimi_residual", "pointwise", "mimo_attention", "mimo_ffn", "native_dense"):
         module = _Compilers(f"b12x.integration.cuteafd.{name}")
         setattr(package, name, module)
         monkeypatch.setitem(sys.modules, module.__name__, module)
-    package.kimi_mla.KimiMlaGeometry = lambda **kw: types.SimpleNamespace(**kw)
+    class KimiGeometry(types.SimpleNamespace):
+        @property
+        def record_bytes(self):
+            return 656 if self.kv_cache == "fp8" else 1152
+    package.kimi_dsa.KimiDsaGeometry = lambda: types.SimpleNamespace(index_heads=32, index_head_dim=128,
+        index_topk=2048, index_norm_eps=1e-5, hidden=7168, q_lora_rank=1536, page_rows=64)
+    package.kimi_mla.KimiMlaGeometry = lambda **kw: KimiGeometry(**kw)
+    package.kimi_mla.kimi_context_heads_per_tile = lambda *, rows: 8 if rows < 4 else 16
+    @dataclasses.dataclass(frozen=True)
+    class PartialProgram:
+        call: tuple
+        geometry: dict
+    for fn in ("compile_kimi_index_topk_aot", "compile_kimi_context_index_topk_aot"):
+        setattr(package.kimi_dsa, fn, lambda *args, _fn=fn, **kw: PartialProgram(
+            ("kimi_dsa", _fn, args, kw), {}))
+    package.kimi_mla.compile_kimi_mla_partial_aot = lambda *args, **kw: PartialProgram(
+        ("kimi_mla", "compile_kimi_mla_partial_aot", args, kw), dict(kw))
     package.glmf.mhc_geometry = lambda g: ("mhc geometry", g)
     package.dsv4_mhc.mhc_post_pre_route = lambda rows: "decode" if rows < 96 else "block_m"
     # The real planner's shape at 32 heads: more splits for fewer rows (188 SMs: s32/s11/s4).
@@ -56,7 +74,27 @@ def exporter(monkeypatch):
     spec = importlib.util.spec_from_file_location("export_b12x_dsv4_aot_under_test", EXPORTER)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
+    monkeypatch.setattr(module, "compile_glmf_head_block_fp8",
+        lambda g: ("glmf", "compile_glmf_head_block_fp8", (g,), {}))
     return module
+
+
+def test_block_fp8_head_keeps_exact_w8a16_wide_route():
+    tree = ast.parse(EXPORTER.read_text())
+    compiler = next(node for node in tree.body if isinstance(node, ast.FunctionDef)
+                    and node.name == "compile_glmf_head_block_fp8")
+    source = ast.get_source_segment(EXPORTER.read_text(), compiler)
+    assert 'TmaFp8Gemm(vocab, g.hidden, scales="block", out_dtype=cutlass.Float32)' in source
+    assert 'if rows <= Int32(16):' in source
+    assert 'self.gemv(x, w_fp8, scale, logits, rows, stream)' in source
+    assert 'self.gemm(x, w_fp8, scale, logits, rows, stream)' in source
+    assert 'max_rows=4096' in source
+    assert 'launch.gemm.key()' in source
+    assert 'BlockFp8Projection' not in source
+    runtime = (ROOT / "rust/crates/cuteafd-daemon/src/families/glm5_flash/head.rs").read_text()
+    single = runtime.split('        if block {', 1)[1].split('        for (first, n)', 1)[0]
+    assert 'Scalar::I32(rows as i32)' in single
+    assert 'return Ok(());' in single
 
 
 def test_ml4_context_fc_exports_the_canonical_bf16_projection(exporter, monkeypatch):
@@ -83,12 +121,12 @@ def test_ml4_context_fc_exports_the_canonical_bf16_projection(exporter, monkeypa
 @pytest.mark.parametrize("intermediates", [(12288, 2048), (6144, 1024)])
 @pytest.mark.parametrize("decode_rows,prefill_rows", [(64, 4096), (128, 4096), (64, 64)])
 def test_flash_native_stage_catalog_preserves_projection_boundaries(exporter, intermediates, decode_rows, prefill_rows):
-    geometry = types.SimpleNamespace(dense_inter=intermediates[0], moe_inter=intermediates[1])
+    geometry = types.SimpleNamespace(**{**vars(GEOMETRY), "dense_inter": intermediates[0], "moe_inter": intermediates[1]})
     programs = exporter.glmf_stage_programs(geometry, decode_rows, prefill_rows)
     calls = {stem: (op, params, thunk()) for stem, op, params, thunk in programs}
     decode_caps = {decode_rows} | ({64} if decode_rows == 128 else set())
     caps = decode_caps | {prefill_rows}
-    assert len(calls) == len(programs) == 11 * len(caps)
+    assert len(calls) == len(programs)
     existing = []
     for rows in sorted(caps):
         existing.extend([f"kda_core_m{rows}", *[f"{stage}_m{rows}" for stage in ("rank_norm", "absorb", "values")],
@@ -96,7 +134,19 @@ def test_flash_native_stage_catalog_preserves_projection_boundaries(exporter, in
     for rows in sorted(caps):
         existing.extend([f"kda_projected_m{rows}", f"absorb_fp8_m{rows}", f"values_fp8_m{rows}"])
     existing.extend(f"index_projected_c_m{rows}" for rows in sorted(caps))
-    assert list(calls) == existing + [f"index_projected_keys_m{rows}" for rows in sorted(caps)]
+    existing += [f"index_projected_keys_m{rows}" for rows in sorted(caps)]
+    shapes = sorted({(1536, 16384), (16384, 4096), (4096, 8192), (8192, 4096),
+                     (4096, 1536), (4096, 512),
+                     *[(k, n) for inter in intermediates for k, n in ((4096, inter), (inter, 4096))]})
+    assert len(calls) == (11 + len(shapes)) * len(caps)
+    added = [f"fp8_linear_k{k}_n{n}_m{rows}" for rows in sorted(caps) for k, n in shapes]
+    assert list(calls) == existing + added
+    for rows in caps:
+        for k, n in shapes:
+            op, params, call = calls[f"fp8_linear_k{k}_n{n}_m{rows}"]
+            assert op == "attention_projection"
+            assert params == dict(input_features=k, output_features=n, max_rows=rows, decode=rows in decode_caps)
+            assert call == ("glmf_split", "compile_glmf_fp8_linear_aot", (), params)
     for rows in caps:
         op, params, (module, compiler, args, kwargs) = calls[f"kda_core_m{rows}"]
         assert (op, module, compiler) == ("kda_core", "glmf_split", "compile_glmf_kda_core_aot")
@@ -188,7 +238,7 @@ def test_flash_wide_native_stages_preserve_narrow_catalog(exporter):
     wide = exporter.glmf_stage_programs(GEOMETRY, 128, 4096)
     describe = lambda programs: {name: (op, params, thunk()) for name, op, params, thunk in programs}
     narrow, wide = describe(narrow), describe(wide)
-    assert len(narrow) == 22 and len(wide) == 33
+    assert len(narrow) == 42 and len(wide) == 63
     assert {name: wide[name] for name in narrow} == narrow
     assert all(name.endswith("_m128") for name in wide.keys() - narrow.keys())
     assert "g, max(args.decode_rows, args.glmf_wide_decode_rows), args.prefill_rows)" in EXPORTER.read_text()
@@ -431,20 +481,40 @@ def test_the_head_split_takes_no_wide_program(exporter):
     assert stems and not any("m128" in stem for stem in stems)
 
 
-def test_builds_export_the_wide_programs_unless_switched_off():
-    """CMake's CUTEAFD_GLMF_WIDE_DECODE_ROWS (default 128) reaches the exporter and its stamp; WIP
-    builds pass CUTEAFD_WIP_GLMF_WIDE_DECODE_ROWS through (0 leaves the wide programs out)."""
-    cmake = (ROOT / "native" / "CMakeLists.txt").read_text()
-    assert re.search(r'set\(CUTEAFD_GLMF_WIDE_DECODE_ROWS "128" CACHE STRING', cmake)
-    programs = (ROOT / "native" / "cmake" / "shared" / "dsv4_programs.cmake").read_text()
-    assert '--glmf-wide-decode-rows "${CUTEAFD_GLMF_WIDE_DECODE_ROWS}"' in programs
-    # The stamp holds the export arguments, so changing the switch exports again.
-    assert 'file(GENERATE OUTPUT "${stamp}" CONTENT "${CUTEAFD_DSV4_EXPORT_ARGS}\\n")' in programs
-    wip = (ROOT / "scripts" / "build" / "build-wip-artifacts.sh").read_text()
-    assert '-DCUTEAFD_GLMF_WIDE_DECODE_ROWS="${CUTEAFD_WIP_GLMF_WIDE_DECODE_ROWS:-128}"' in wip
-    assert '"CUTEAFD_WIP_GLMF_WIDE_DECODE_ROWS=${CUTEAFD_WIP_GLMF_WIDE_DECODE_ROWS:-128}"' in (ROOT / "wip.sh").read_text()
-    exporter = EXPORTER.read_text()
-    assert 'parser.add_argument("--glmf-wide-decode-rows", type=int, default=128,' in exporter
+def test_build_stamp_tracks_build_kind_and_wide_decode_rows(tmp_path):
+    """Configure the real module without CUDA; both inputs invalidate its stamp."""
+    source = tmp_path / "source"
+    source.mkdir()
+    module = ROOT / "native/cmake/shared/dsv4_programs.cmake"
+    (source / "CMakeLists.txt").write_text(f"""cmake_minimum_required(VERSION 3.24)
+project(stamp_contract NONE)
+set(CUTEAFD_CUDA_ARCHITECTURES 120)
+set(CUTEAFD_ENABLE_GLMF_AOT ON)
+set(CUTEAFD_CONTEXT_SPLIT_AOT OFF)
+set(CUTEAFD_DSV4_DECODE_ROWS 64)
+set(CUTEAFD_DSV4_PREFILL_ROWS 4096)
+set(CUTEAFD_DSV4_MAX_CONTEXT 1048576)
+add_custom_target(cuteafd_verify_sparkinfer_source)
+include("{module}")
+""")
+    build = tmp_path / "build"
+    stamps = {}
+    for kind in ("development", "release"):
+        for rows in (128, 0):
+            result = subprocess.run(
+                ["cmake", "-S", str(source), "-B", str(build),
+                 f"-DCUTEAFD_BUILD_KIND={kind}", f"-DCUTEAFD_GLMF_WIDE_DECODE_ROWS={rows}"],
+                capture_output=True, text=True, timeout=30,
+            )
+            assert result.returncode == 0, result.stdout + result.stderr
+            stamp = (build / "dsv4_programs.stamp").read_text()
+            identity, arguments = stamp.strip().split("|", 1)
+            assert identity == kind
+            argv = arguments.split(";")
+            assert argv[argv.index("--glmf-wide-decode-rows") + 1] == str(rows)
+            assert argv[argv.index("--geometry") + 1].startswith("glmf,glmf2,")
+            stamps[kind, rows] = stamp
+    assert len(set(stamps.values())) == 4
 
 
 @pytest.mark.parametrize("family,heads,index_topk,pool,record_bytes", [
@@ -485,6 +555,35 @@ def test_context_split_opt_in_geometry(exporter, family, heads, index_topk, pool
     assert ("index_expand_owned" in calls) == (family == "glmf")
     if family == "glmf":
         assert calls["index_expand_owned"][1][:2] == ("glmf", "compile_glmf_index_expand_owned_aot")
+
+
+@pytest.mark.parametrize("name", ["flash", "pro", "glm", "glmf", "kimik3"])
+def test_context_only_dispatches_native_geometry_without_other_programs(exporter, name):
+    tree = ast.parse(EXPORTER.read_text())
+    main = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "main")
+    validation = next(node for node in main.body if isinstance(node, ast.If)
+                      and any(isinstance(child, ast.Constant) and isinstance(child.value, str)
+                              and child.value.startswith("--context-split-only takes") for child in ast.walk(node)))
+    dispatch = next(node for node in ast.walk(main) if isinstance(node, ast.If)
+                    and ast.unparse(node.test) == "args.context_split_only"
+                    and any(isinstance(child, ast.Name) and child.id == "family_work" for child in ast.walk(node)))
+    geometry = types.SimpleNamespace(heads=64, index_topk=2048, record_bytes=656,
+                                     page_rows=64, kv_page_bytes=656*64, index_kpool=4, o_groups=8)
+    def unexpected(*args):
+        pytest.fail("context-only mode must not enumerate ordinary KDA/MLA programs")
+    scope = {"args": types.SimpleNamespace(context_split_only=True, decode_rows=64, prefill_rows=4096),
+             "name": name, "geometries": [name], "g": geometry, "extent": 1048576,
+             "make": unexpected, "kimi_context_programs": exporter.kimi_context_programs,
+             "context_split_programs": exporter.context_split_programs}
+    exec(compile(ast.Module(body=[validation, dispatch], type_ignores=[]), str(EXPORTER), "exec"), scope)
+    expected = (exporter.kimi_context_programs(64, 1048576) if name == "kimik3" else
+                exporter.context_split_programs(geometry, 64, 1048576))
+    assert [item[:3] for item in scope["family_work"]] == [item[:3] for item in expected]
+    if name == "kimik3":
+        assert len(scope["family_work"]) == 11
+    scope["geometries"] = ["qwen4"]
+    with pytest.raises(SystemExit, match="--context-split-only takes"):
+        exec(compile(ast.Module(body=[validation], type_ignores=[]), str(EXPORTER), "exec"), scope)
 
 
 def test_context_split_programs_append_after_every_other_program_when_switched_on():
@@ -532,11 +631,13 @@ def test_kimi_kda_exports_share_glmf_program_and_native_tp2_abi(exporter, decode
         if op == "kda":
             assert kwargs["output_kind"] == "norm"
             assert kwargs["decode"] == (kwargs["max_rows"] == decode_rows)
+            # The wide route is a prefill route; decode programs keep their shape.
+            assert kwargs["bf16_wide"] == (kwargs["max_rows"] != decode_rows)
     # KDA reuses the identical shared-FFN down projection, without a second export.
     output = [p for p in programs if p[0] == "ffn_down_i6144"]
     assert len(output) == 1
     _, op, params, thunk = output[0]
-    assert op == "bf16_projection" and params == {"width": 6144, "outputs": 7168}
+    assert op == "bf16_projection" and params == {"width": 6144, "outputs": 7168, "wide": True}
     assert thunk() == ("pointwise", "compile_bf16_projection_aot", (), params)
 
 
@@ -545,7 +646,7 @@ def test_kimi_nope_mla_exports_both_head_layouts_and_all_modes(exporter, decode_
     programs = exporter.kimi_kda_programs(GEOMETRY, decode_rows, prefill_rows, 1048576)
     calls = {stem: (op, params, thunk()) for stem, op, params, thunk in programs
              if op in ("mla_producer", "mla_output", "dense_mla")}
-    assert len([p for p in programs if p[1].startswith("mla_draft_")]) == 7
+    assert len([p for p in programs if p[1].startswith("mla_draft_")]) == 11
     assert len(calls) == 2 * (3 * len({decode_rows, prefill_rows}) + 6)
     for heads in (48, 96):
         suffix = "" if heads == 48 else "_h96"
@@ -569,10 +670,96 @@ def test_kimi_nope_mla_exports_both_head_layouts_and_all_modes(exporter, decode_
                 assert params == {"mode": mode, "max_rows": rows, "heads": heads, "kv_cache": cache}
 
 
+@pytest.mark.parametrize("decode_rows,prefill_rows", [(64, 4096), (128, 2048)])
+def test_kimi_k31_exports_native_dsa_without_changing_k3_or_enabling_a_drafter(exporter, decode_rows, prefill_rows):
+    programs = exporter.kimi_k31_programs(GEOMETRY, decode_rows, prefill_rows, 1048576)
+    catalog = {stem: (op, params, build) for stem, op, params, build in programs}
+    assert len(catalog) == len(programs)
+    assert not any("draft" in stem or "dense_mla" in stem for stem in catalog)
+    assert {"kda_commit", "lse_combine2", "dsa_candidate_merge"} <= catalog.keys()
+    for suffix, row_bytes in [("", 1152), ("_fp8", 656)]:
+        module, function, args, kwargs = catalog[f"paged_staging_gather{suffix}"][2]()
+        assert (module, function, args) == ("context_split", "compile_paged_staging_gather_aot", ())
+        assert kwargs == {"row_bytes": row_bytes, "page_rows": 64}
+    for rows, mode in [(decode_rows, "decode"), (prefill_rows, "prefill")]:
+        module, function, args, kwargs = catalog[f"index_producer_m{rows}"][2]()
+        assert (module, function, kwargs) == ("kimi_dsa", "compile_kimi_index_producer_aot", {"max_rows": rows})
+        assert args[0].index_norm_eps == 1e-5
+        for stem, function in [("index_topk", "compile_kimi_index_topk_aot"),
+                               ("scored_index_topk", "compile_kimi_context_index_topk_aot")]:
+            selected = catalog[f"{stem}_{mode}_m{rows}"][2]()
+            module, actual, args, kwargs = selected.call
+            assert (module, actual) == ("kimi_dsa", function)
+            assert kwargs == {"max_rows": rows, "max_pages": 16384, "mode": mode}
+            assert selected.geometry == kwargs
+        for heads in (48, 96):
+            suffix = "" if heads == 48 else "_h96"
+            for cache in ("bf16", "fp8"):
+                cache_suffix = "" if cache == "bf16" else "_fp8"
+                for stem in (f"mla_producer{suffix}{cache_suffix}_m{rows}",
+                             f"sparse_mla{suffix}{cache_suffix}_m{rows}"):
+                    module, function, args, kwargs = catalog[stem][2]()
+                    assert args[0].norm_eps == 1e-5
+                    assert (args[0].heads, args[0].kv_cache, kwargs["max_rows"]) == (heads, cache, rows)
+                if heads == 96:
+                    for begin in (0, 48):
+                        module, function, args, kwargs = catalog[f"sparse_mla_partial{cache_suffix}_h{begin}_m{rows}"][2]()
+                        assert (module, function) == ("kimi_dsa", "compile_kimi_sparse_mla_partial_aot")
+                        assert args[0].norm_eps == 1e-5
+                        assert kwargs == {"max_rows": rows, "head_begin": begin}
+    for stem, op, params, build in exporter.kimi_kda_programs(GEOMETRY, decode_rows, prefill_rows, 1048576):
+        if op == "mla_producer":
+            assert "norm_eps" not in vars(build()[2][0])
+
+
+def test_kimi_k31_shared_programs_keep_one_existing_runtime_namespace(exporter):
+    shared = exporter.kimi_shared_programs()
+    k3 = exporter.kimi_kda_programs(GEOMETRY, 64, 4096, 1048576)
+    k31 = exporter.kimi_k31_programs(GEOMETRY, 64, 4096, 1048576)
+    shared_names = {stem for stem, *_ in shared}
+    assert shared_names <= {stem for stem, *_ in k3}
+    assert shared_names.isdisjoint(stem for stem, *_ in k31)
+    assert {"rmsnorm_h7168", "latent_down", "router_scores", "expert_input_quant"} <= shared_names
+    source = EXPORTER.read_text()
+    assert '"kimik31" in geometries and not args.context_split_only and "kimik3" not in geometries' in source
+    assert 'work += [("kimik3", *item) for item in kimi_shared_programs()]' in source
+
+
+def test_kimi_context_exports_native_partial_ranges_and_shared_primitives(exporter, monkeypatch):
+    package = sys.modules["b12x.integration.cuteafd"]
+    # Deliberately change the fork rule: exporter/runtime metadata must not copy its threshold.
+    monkeypatch.setattr(package.kimi_mla, "kimi_context_heads_per_tile",
+                        lambda *, rows: 8 if rows in (1, 5, 11) else 16)
+    programs = exporter.kimi_context_programs(64, 1048576)
+    assert len(programs) == 11
+    for stem, op, params, thunk in programs:
+        result = thunk()
+        module, fn, args, kw = result.call if op == "mla_partial" else result
+        if op == "mla_partial":
+            assert result.geometry["context_heads_per_tile"] == [
+                8 if rows in (1, 5, 11) else 16 for rows in range(1, 65)]
+            assert result.geometry["heads_per_tile"] == params["heads_per_tile"]
+            assert f'_t{params["heads_per_tile"]}_' in stem
+            assert params["heads_per_tile"] in (8, 16)
+            assert module == "kimi_mla" and fn == "compile_kimi_mla_partial_aot"
+            assert kw == {k: v for k, v in params.items() if k != "kv_cache"}
+            assert args[0].kv_cache == params["kv_cache"]
+            assert params["head_begin"] in (0, 48) and params["head_count"] == 48
+            assert params["num_splits"] == 16
+            assert params["device_splits"] is True
+        else:
+            assert module == "context_split"
+            assert fn == f"compile_{op}_aot"
+            assert kw == params
+    catalog = {stem for stem, *_ in exporter.kimi_kda_programs(GEOMETRY, 64, 4096, 1048576)}
+    assert {stem for stem, *_ in programs} <= catalog
+
+
 @pytest.mark.parametrize("namespace", ["kimik3"])
 def test_shared_mla_drafter_requested_names_exist_in_family_catalog(exporter, namespace):
     ffi = (ROOT / "rust/crates/cuteafd-ffi/src/shared/mla_draft.rs").read_text()
-    load = ffi.split("pub fn load(", 1)[1].split("pub fn scratch_bytes", 1)[0]
+    implementation = ffi.split("impl<'a> MlaDraft<'a> {", 1)[1]
+    load = implementation.split("pub fn load(", 1)[1].split("pub fn load_ml4(", 1)[0]
     requested = re.findall(r'programs\.program\(&format!\("([^"]+)"', load)
     assert len(requested) == 3
     catalog = {f"{namespace}_{stem}" for stem, *_ in
@@ -588,7 +775,8 @@ def test_shared_mla_drafter_requested_names_exist_in_family_catalog(exporter, na
     shared = (daemon / "shared/speculation/dflash.rs").read_text()
     assert f'MlaDraft::load(programs, "{namespace}", MlaDraftWindow::Full, options.cache_format)' in startup
     assert f'MlaDraft::load(programs, "{namespace}", MlaDraftWindow::Sliding4096, options.cache_format)' in startup
-    assert f'DflashDrafter::load_mla(device.library, programs, "{namespace}",' in admission
+    assert re.search(r'DflashDrafter::load_mla_with\(device\.library, programs,\s*'
+                     rf'target_projection, "{namespace}",', admission)
     assert "MlaDraft::load(programs, program_namespace," in shared
 
 
@@ -629,6 +817,8 @@ def test_kimi_w8_exports_every_residual_transition_and_situ_width(exporter):
                         if "gate_up" in stem else {"width": width, "outputs": 7168})
             if stem.endswith("_comp"):
                 expected["compensated"] = True
+            elif (expected["outputs"], expected["width"]) in ((6144, 7168), (7168, 3072), (7168, 6144)):
+                expected["wide"] = True
             assert params == expected
             continue
         assert module == "kimi_residual"
@@ -640,6 +830,9 @@ def test_kimi_w8_exports_every_residual_transition_and_situ_width(exporter):
             assert params["hidden"] == 7168
             assert params["has_mix"] == (params["candidates"] != 1)
             assert params["append"] == stem.endswith("_append")
+    # Only the owned Kimi BF16 shapes have a measured wide-route floor.
+    assert {stem for stem, (_, params, _) in calls.items() if params.get("wide")} == {
+        "ffn_gate_up_i3072", "ffn_down_i3072", "ffn_down_i6144"}
     for width in (3072, 6144, 16896, 33792):
         assert f"ffn_gate_up_i{width}" in calls
         assert f"ffn_gate_up_i{width}_comp" in calls
@@ -663,7 +856,7 @@ def test_kimi_routes_reuse_shared_kernels_at_hidden_and_latent_widths(exporter):
         assert len(args) == 1 and vars(args[0]) == geometry
     # KDA output already uses this canonical BF16 projection; no duplicate export.
     op, params, thunk = calls["ffn_down_i6144"]
-    assert op == "bf16_projection" and params == {"width": 6144, "outputs": 7168}
+    assert op == "bf16_projection" and params == {"width": 6144, "outputs": 7168, "wide": True}
     assert thunk() == ("pointwise", "compile_bf16_projection_aot", (), params)
 
 
@@ -772,7 +965,7 @@ def test_glm_official_catalog_stays_fused(exporter):
     geometry = types.SimpleNamespace(moe_inter=2048, dense_inter=12288)
     entries = exporter.glm_programs(geometry, 64, 4096, 1048576)
     names = {name for name, _, _, _ in entries}
-    assert len(names) == len(entries) == 27
+    assert len(names) == len(entries) == 29
     for rows in (64, 4096):
         for stem in ("producer", "index_producer", "o"):
             assert f"{stem}_m{rows}" in names
@@ -788,7 +981,7 @@ def test_kimi_latent_exports_native_norm_and_canonical_projections(exporter):
         assert calls[f"rmsnorm_h{hidden}"] == ("rmsnorm", {"hidden": hidden},
             ("kimi_residual", "compile_kimi_rmsnorm_aot", (), {"hidden": hidden}))
     for direction, width, outputs in (("down", 7168, 3584), ("up", 3584, 7168)):
-        params = dict(width=width, outputs=outputs)
+        params = dict(width=width, outputs=outputs, wide=True)
         assert calls[f"latent_{direction}"] == ("bf16_projection", params,
             ("pointwise", "compile_bf16_projection_aot", (), params))
 
@@ -902,7 +1095,7 @@ def _rust_methods(source, names):
 
 
 @pytest.mark.parametrize("family,methods,launches,inventory_names", [
-    ("mimo_v2", {"norm_full", "attention_part", "dense_ffn", "moe_front_on"},
+    ("mimo_v2", {"norm_full", "attention_part", "dense_ffn", "moe_front_on", "moe_front_on_accounted"},
      {"mimo_norm", "mimo_{k}_producer{kv}_{cap}", "mimo_{k}_attention{}_{mode}_{cap}",
       "mimo_o_w8_{cap}", "mimo_o_{cap}", "mimo_ffn_{cap}", "mimo_router_scores", "mimo_expert_input_quant"},
      {"mimo_norm", "mimo_{k}_producer{kv}_m4096", "mimo_{k}_attention{kv}_prefill_m4096",
@@ -1035,3 +1228,25 @@ def test_projected_operand_data_contract_matches_exporter_declarations():
                       ("projected_index_keys", "compile_glmf_projected_index_keys_aot")):
         actual[key] = declared(declaration(trees["glmf_split.py"], ast.FunctionDef, name))
     assert actual == contracts
+
+
+def test_glmf_tp2_drafter_exports_every_rank_local_projection(exporter):
+    shapes = exporter.draft_bf16_shapes()
+    expected = {(20480, 4096), (4096, 3072), (4096, 1024),
+                (2048, 4096), (4096, 12288), (6144, 4096)}
+    assert {shape for shape, families in shapes.items() if "dflash2-glmf-tp2" in families} == expected
+    assert "dflash-convolution" in shapes[4096, 1024]
+    assert "dflash-selector" in shapes[4096, 256]
+
+
+@pytest.mark.parametrize("family,heads,kv,intermediate", [
+    ("dflash2-muse-radix", 64, 8, 28672),
+    ("dflash2-muse-nvidia", 128, 16, 24576),
+])
+def test_muse_tp2_drafter_exports_every_rank_local_projection(exporter, family, heads, kv, intermediate):
+    shapes = exporter.draft_bf16_shapes()
+    expected = {(40960, 8192), (8192, (heads // 2 + kv) * (128 if heads == 64 else 64)),
+                (8192, kv * (128 if heads == 64 else 64)),
+                (heads // 2 * (128 if heads == 64 else 64), 8192),
+                (8192, intermediate), (intermediate // 2, 8192)}
+    assert {shape for shape, families in shapes.items() if family + "-tp2" in families} == expected

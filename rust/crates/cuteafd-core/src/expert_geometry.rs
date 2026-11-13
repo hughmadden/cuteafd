@@ -172,7 +172,6 @@ pub struct SparkProcessSample {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct SparkRuntimeDetail {
     /// Checkpoint-derived, layer-sequential load-only owners, absent for backends
     /// without a qualified load plan. Never added to the serving workspace.
@@ -183,6 +182,9 @@ pub struct SparkRuntimeDetail {
     /// state and must not become an offline context/modules calibration.
     pub runtime_sample_method: String,
     pub context_modules_qualified: bool,
+    /// Optional raw CUDA sample and provenance beside the GB10 admission sample.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_reconciliation: Option<serde_json::Value>,
 }
 
 /// Measurements made by the Spark owner, not coordinator-architecture estimates.
@@ -305,6 +307,8 @@ impl ExpertGeometry {
     /// Mistral Large 4 (mistral_large4): routed layers 1..72, softmax top-4,
     /// SiLU unclamped, one shared expert on the coordinator.
     pub const MISTRAL_LARGE4: Self = Self { hidden: 6144, experts: 128, topk: 4, intermediate: 6144, layers: 72 };
+    /// MiniMax M3.1 Flash: native NVFP4 routed layers 3..60, SwiGLU-OAI.
+    pub const MINIMAX_M3: Self = Self { hidden: 6144, experts: 128, topk: 4, intermediate: 3072, layers: 60 };
 
     /// Step-5 routed target layers 3..91 (layer 91 is dense).
     pub const STEP5: Self = Self { hidden: 4096, experts: 352, topk: 8, intermediate: 1536, layers: 91 };
@@ -327,6 +331,20 @@ impl ExpertGeometry {
         let request = prefix.checked_add(rows.checked_mul(if bf16 { hidden * 2 } else { hidden + hidden / 32 })?)?;
         let response = rows.checked_mul(4 + hidden * 2)?.checked_add(96)?;
         Some((request, response))
+    }
+
+    /// Native frames include indexed BF16 replies and the largest partial plane.
+    /// Keep the transport's ordinary 64 MiB frame floor.
+    pub fn native_frame_budget(&self, capacity: u32) -> Option<usize> {
+        let endpoint = SparkEndpoint { capacity, ingress: SparkIngress::Bf16,
+            ring_depth: None, partial_reply_bytes: None };
+        let (request, response) = endpoint.wire_bytes(*self)?;
+        let debug_delta = PARTIAL_RESPONSE_HEADER_BYTES - 96;
+        let partial = match self.partial_reply_bound(capacity) {
+            Some(bytes) => bytes.checked_add(PARTIAL_RESPONSE_HEADER_BYTES)?,
+            None => 0,
+        };
+        Some(request.max(response).checked_add(debug_delta)?.max(partial).max(64 << 20))
     }
 
     /// Persistent request/response mapped rings, shared by admission and planning.
@@ -370,6 +388,7 @@ impl ExpertGeometry {
             (Self::KIMI_K3, "kimik3"),
             (Self::MUSE_SPARK, "muse"),
             (Self::MISTRAL_LARGE4, "ml4"),
+            (Self::MINIMAX_M3, "minimax"),
         ]
         .into_iter()
         .find_map(|(shape, family)| self.same_shape(&shape).then_some(family))
@@ -392,7 +411,7 @@ impl ExpertGeometry {
     /// 10; Step-5 clamps post-SiLU at 7 (see `activation`). GLM 5.x, MiMo,
     /// Qwen 3.8 Flash Next Kimi K3, Muse Spark and Mistral Large 4 are unclamped (`None`).
     pub fn swiglu_limit(&self) -> Option<f32> {
-        if self.same_shape(&Self::STEP5) { return Some(7.0); }
+        if self.same_shape(&Self::STEP5) || self.same_shape(&Self::MINIMAX_M3) { return Some(7.0); }
         (!self.same_shape(&Self::GLM5) && !self.same_shape(&Self::MIMO_V2_FLASH)
             && !self.same_shape(&Self::MIMO_V26_PRO) && !self.same_shape(&Self::QWEN4)
             && !self.same_shape(&Self::KIMI_K3) && !self.same_shape(&Self::MUSE_SPARK) && !self.same_shape(&Self::MISTRAL_LARGE4)).then_some(10.0)
@@ -400,7 +419,9 @@ impl ExpertGeometry {
 
     /// Expert arithmetic; existing families retain their legacy rounding exactly.
     pub fn activation(&self) -> crate::FfnActivation {
-        if self.same_shape(&Self::KIMI_K3) {
+        if self.same_shape(&Self::MINIMAX_M3) {
+            crate::FfnActivation::SwigluOai { alpha: 1.702, beta: 1.0, limit: 7.0 }
+        } else if self.same_shape(&Self::KIMI_K3) {
             crate::FfnActivation::Situ { beta: 4.0, linear_beta: Some(25.0) }
         } else if self.same_shape(&Self::STEP5) {
             crate::FfnActivation::SiluPostClampFp32Product { limit: 7.0 }
@@ -479,6 +500,22 @@ pub fn expert_geometry() -> ExpertGeometry {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn runtime_detail_accepts_old_missing_and_future_optional_fields() {
+        use super::SparkRuntimeDetail;
+        let mut older = serde_json::to_value(SparkRuntimeDetail::default()).unwrap();
+        older.as_object_mut().unwrap().remove("memory_reconciliation");
+        assert!(serde_json::from_value::<SparkRuntimeDetail>(older.clone()).unwrap().memory_reconciliation.is_none());
+        older["memory_reconciliation"] = serde_json::json!({"cuda_used_bytes": 10});
+        older["future_worker_detail"] = serde_json::json!({"version": 2});
+        assert!(serde_json::from_value::<SparkRuntimeDetail>(older.clone()).unwrap().memory_reconciliation.is_some());
+        // The supported release-pair schema tolerates a newer coordinator's
+        // optional detail when this same tolerant schema is the worker reader.
+        let decoded: SparkRuntimeDetail = serde_json::from_value(older).unwrap();
+        let roundtrip: SparkRuntimeDetail = serde_json::from_value(serde_json::to_value(decoded).unwrap()).unwrap();
+        assert_eq!(roundtrip.memory_reconciliation.unwrap()["cuda_used_bytes"], 10);
+    }
+
     #[test]
     fn execution_workspace_charges_scratch_once_and_retains_every_route_stage() {
         use super::*;
@@ -634,6 +671,18 @@ mod tests {
             assert_eq!(*before, *after as usize, "GLM Flash selection changed at {rows}");
             assert_ne!(*after, 16);
         }
+    }
+
+    #[test]
+    fn minimax_native_geometry_keeps_oai_activation() {
+        let g = ExpertGeometry::MINIMAX_M3;
+        assert_eq!(g.family(), Some("minimax"));
+        assert_eq!(g.row_bytes(), 12288);
+        assert_eq!(g.slice(6), Some(512));
+        assert_eq!(g.swiglu_limit(), Some(7.0));
+        assert_eq!(g.activation(), crate::FfnActivation::SwigluOai { alpha: 1.702, beta: 1.0, limit: 7.0 });
+        assert!(!g.same_shape(&ExpertGeometry::MISTRAL_LARGE4));
+        assert_eq!(ExpertGeometry { layers: 61, ..g }.family(), Some("minimax"));
     }
 
     #[test]

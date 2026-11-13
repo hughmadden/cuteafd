@@ -20,6 +20,8 @@ use std::{
 /// rank's single admitted arena; coordinator ranks may map it differently.
 pub(crate) trait PushDestination {
     type Delivered;
+    /// Flags published only after the rank's whole-group commit acknowledgment.
+    fn host_ready(&self) -> Vec<std::sync::Arc<std::sync::atomic::AtomicBool>> { Vec::new() }
     fn belongs_to(&self, device: Device<'_>) -> bool;
     fn logical_bytes(&self) -> usize;
     fn device_bytes(&self) -> usize;
@@ -74,7 +76,7 @@ impl RankEvents for PushRank {
     }
 }
 
-const COPY_STREAMS: usize = 4;
+use cuteafd_loader::push_load::COPY_STREAMS;
 
 struct Copies<'a> {
     device: Device<'a>,
@@ -257,9 +259,10 @@ pub(crate) fn consume<'a, A: PushDestination>(
                 let stream = copies.streams[stream_index];
                 // SAFETY: checked live arena/ring views, retained through the slot's
                 // event or the teardown drain; the copies stream is non-default.
-                device.run(|| unsafe {
+                let bytes = lens.iter().sum();
+                super::load_timing::push(bytes, || super::load_timing::upload(bytes, || device.run(|| unsafe {
                     device.library.copy_host_buffers_h2d_batch_async(&dsts, &srcs, &lens, stream)
-                })?;
+                })))?;
                 // SAFETY: event and stream belong to device and remain retained by Copies.
                 device.run(|| unsafe { device.library.cuda_event_record(event, stream) })?;
                 copies.pending.insert(index, fragments);

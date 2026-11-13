@@ -17,6 +17,34 @@ static TAIL_REQUESTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU6
 static TAIL_PROPOSED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static TAIL_REACHED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static TAIL_ACCEPTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static DRAFT_FALLBACKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// One lane round's draft seeds: (request identity, anchor, committed end,
+/// remaining output budget).
+type DraftSeed = (u64, u32, u64, usize);
+
+/// Reset a lane's draft state before a new proposal attempt. A proposal that
+/// fails in its guards must not leave the previous round's width, drafted
+/// request count or confidence trace behind for `select_lengths`/`observe`.
+pub(crate) fn reset_lane_draft(lane: &mut LaneRound, confidence_trace: &mut std::collections::BTreeMap<u64, Vec<f32>>,
+    neural_lengths: &mut std::collections::BTreeMap<u64, usize>, inputs: &[DraftSeed]) {
+    lane.width = 0;
+    lane.drafted_requests = 0;
+    for &(id, _, _, _) in inputs {
+        confidence_trace.remove(&id);
+        neural_lengths.remove(&id);
+    }
+}
+
+/// The anchor-only inputs a failed proposal verifies.
+pub(crate) fn anchor_inputs(seeds: &[DraftSeed]) -> Vec<Vec<u32>> {
+    seeds.iter().map(|seed| vec![seed.1]).collect()
+}
+
+/// Whether a pending proposal still holds request `id` (and so blocks release).
+pub(crate) fn pending_draft_blocks(pending: &[Option<(Vec<DraftSeed>, Instant)>], id: u64) -> bool {
+    pending.iter().flatten().any(|(seeds, _)| seeds.iter().any(|seed| seed.0 == id))
+}
 
 pub(crate) fn policy_snapshot() -> serde_json::Value {
     use std::sync::atomic::Ordering::Relaxed;
@@ -25,6 +53,7 @@ pub(crate) fn policy_snapshot() -> serde_json::Value {
         "requests": TAIL_REQUESTS.load(Relaxed), "proposed": TAIL_PROPOSED.load(Relaxed),
         "reached": TAIL_REACHED.load(Relaxed), "accepted": TAIL_ACCEPTED.load(Relaxed),
     });
+    snapshot["draft_fallbacks"] = serde_json::json!(DRAFT_FALLBACKS.load(Relaxed));
     snapshot
 }
 
@@ -34,8 +63,18 @@ fn tail_outcome(rows: usize, accepted: usize, neural: usize) -> (usize, usize, u
     let accepted = accepted.saturating_sub(neural + 1).min(proposed);
     (proposed, reached, accepted)
 }
-pub(crate) use chain::DraftChain;
+pub(crate) use chain::{DraftChain, ProposeChain};
 mod distributed;
+
+/// The process-wide terminal signal for the expert wire. A draft that runs on
+/// a terminal engine is not a reusable target-only fallback: the lane must
+/// fail the round instead of verifying anchors forever.
+pub(crate) fn require_peer_live() -> Result<()> {
+    if let Some(reason) = cuteafd_transport::health::failure_reason() {
+        anyhow::bail!("draft peer wire unavailable until restart: {reason}");
+    }
+    Ok(())
+}
 
 /// Execution workspaces share a request-indexed bank of persistent draft state.
 pub(crate) struct DraftRuntime<'w, 'a, C = DsparkChain<'w, 'a>> {
@@ -52,14 +91,14 @@ pub(crate) struct DraftRuntime<'w, 'a, C = DsparkChain<'w, 'a>> {
     // Downloaded whenever the length policy is bound, or for diagnostics.
     confidence_trace: std::collections::BTreeMap<u64, Vec<f32>>,
     neural_lengths: std::collections::BTreeMap<u64, usize>,
-    /// Verify every available draft instead of selecting lengths.
-    fixed: bool,
+    /// Shared fixed-length override, absent for adaptive selection.
+    length: crate::shared::draft::length::DraftLength,
     /// Online bandwidth-balance length policy, bound to the installed placement.
     policy: Option<cuteafd_core::DraftPolicy>,
     published: Option<Instant>,
     /// Per lane: the round's draft width, the last selection's regime and
     /// prediction, and the route storage its observation reuses.
-    lanes: [LaneRound; 2],
+    lanes: Vec<LaneRound>,
 }
 struct DraftRequest {
     leases: [WindowLease; 3],
@@ -67,6 +106,14 @@ struct DraftRequest {
     slot: usize,
 }
 impl<'w, 'a> DraftRuntime<'w, 'a> {
+    pub(crate) fn capture_startup(&mut self) -> Result<()> {
+        ensure!(self.requests.is_empty() && self.pending.iter().all(Option::is_none),
+            "draft startup requires no admitted requests");
+        let windows = self.windows.each_ref();
+        for chain in &mut self.chains { chain.capture_startup(windows)?; }
+        self.graph_completed()
+    }
+
     pub fn with_requests(
         lib: &'a NativeLibrary, weights: &'w DsparkWeights<'a>,
         table: &'w NativeRtxTensors<'a>, head: &'w VocabularyHead<'a>,
@@ -100,10 +147,10 @@ impl<'w, 'a> DraftRuntime<'w, 'a> {
             draft_width: weights.draft_width(),
             confidence_trace: Default::default(),
             neural_lengths: Default::default(),
-            fixed: false,
+            length: Default::default(),
             policy: None,
             published: None,
-            lanes: std::array::from_fn(|_| LaneRound::new(policy::LAYERS, policy::TOPK)),
+            lanes: (0..lane_count).map(|_| LaneRound::new(policy::LAYERS, policy::TOPK)).collect(),
         })
     }
 }
@@ -135,22 +182,15 @@ impl<'w, 'a, C: DraftChain<'a>> DraftRuntime<'w, 'a, C> {
     pub(super) fn prefill_tap_capacity(&self) -> usize { self.mains[0].capacity() }
     pub fn max_verify_rows(&self) -> usize { self.draft_width + crate::shared::draft::copy::COPY_EXTENSION + 1 }
     pub fn attention_drafts(&self) -> usize { self.draft_limit.min(self.draft_width) }
-    pub fn set_draft_limit(&mut self, limit: u8) -> Result<()> {
-        ensure!((1..=self.draft_width as u8).contains(&limit), "draft limit exceeds generated width");
-        self.draft_limit = limit as usize;
+    pub fn set_length(&mut self, length: crate::shared::draft::length::DraftLength) -> Result<()> {
+        self.draft_limit = length.draft_length.unwrap_or(5).min(self.draft_width);
+        self.length = length;
         Ok(())
-    }
-    /// Verify every available draft; the policy still records statistics.
-    pub fn set_fixed(&mut self, fixed: bool) {
-        self.fixed = fixed;
-        if let Some(policy) = &mut self.policy {
-            *policy = policy.restarted(fixed);
-        }
     }
     /// Bind the length policy to the installed expert placement before serving.
     pub fn configure_policy(&mut self, transport: &NativeTp4Wave<'_>, nvfp4: bool) -> Result<()> {
         let geometry = policy::placement(transport, nvfp4, self.draft_width)?;
-        tracing::info!(fixed=self.fixed, draft_limit=self.draft_limit, local_layers=policy::local_layers(&geometry),
+        tracing::info!(fixed=self.length.draft_length.is_some(), draft_limit=self.draft_limit, local_layers=policy::local_layers(&geometry),
             remote_expert_bytes=policy::remote_expert_bytes(&geometry),
             "dSpark bandwidth-balance length policy bound");
         self.bind_policy(geometry)
@@ -161,8 +201,7 @@ impl<'w, 'a, C: DraftChain<'a>> DraftRuntime<'w, 'a, C> {
         ensure!(geometry.widths.last() == Some(&self.draft_width), "policy widths differ from the loaded draft width");
         geometry.max_positions = self.draft_width + crate::shared::draft::copy::COPY_EXTENSION;
         let seed = cuteafd_core::PolicySeed::weak(self.draft_width);
-        let mut policy = cuteafd_core::DraftPolicy::new(geometry, seed, self.fixed)?;
-        crate::shared::draft::apply_length_rule(&mut policy);
+        let policy = self.length.policy(geometry, seed, self.draft_width)?;
         policy::publish(&policy, self.draft_limit);
         self.policy = Some(policy);
         Ok(())
@@ -171,15 +210,15 @@ impl<'w, 'a, C: DraftChain<'a>> DraftRuntime<'w, 'a, C> {
     pub fn has_policy(&self) -> bool { self.policy.is_some() }
     /// What a verification round records: see [`round_capture`].
     pub fn capture(&self) -> Capture {
-        round_capture(self.policy.as_ref(), super::console::live().is_some())
+        round_capture(self.policy.as_ref(), super::console::live().is_some(),
+            crate::shared::draft::binding::replay_trace().is_some(), crate::shared::draft::timing_profile())
     }
     fn wants_confidence(&self) -> bool {
         self.policy.is_some() || tracing::enabled!(target: "cuteafd::draft_policy", tracing::Level::DEBUG)
     }
     /// Choose each request's draft length for one lane round. `requests` are
     /// (identity, available drafts) in lane order; `shared` means the other lane
-    /// has active requests. `None` verifies every available draft (fixed mode
-    /// or a fit still warming up).
+    /// has active requests. `None` verifies every available draft while a fit warms up.
     pub fn select_lengths(&mut self, lane: usize, requests: &[(u64, usize)], shared: bool)
         -> Result<Option<Vec<usize>>> {
         let round = self.lanes.get_mut(lane).context("invalid draft policy lane")?;
@@ -199,6 +238,8 @@ impl<'w, 'a, C: DraftChain<'a>> DraftRuntime<'w, 'a, C> {
             .map(|(&(id, _), confidence)| cuteafd_core::DraftCandidate { id, confidence }).collect();
         let started = Instant::now();
         let drafted_requests = round.drafted_requests;
+        if let Some(lengths) = crate::shared::draft::resource::fixed_selection(policy, &candidates,
+            cuteafd_core::V41_VERIFY_ROWS) { return Ok(Some(lengths)); }
         let selection = policy.select_drafted_within(shared, &candidates, width, cuteafd_core::V41_VERIFY_ROWS, drafted_requests)?;
         Ok(match selection {
             Some(selection) => {
@@ -262,7 +303,10 @@ impl<'w, 'a, C: DraftChain<'a>> DraftRuntime<'w, 'a, C> {
             }
             None => maximum,
         };
-        self.chains[chain].set_width(width)?;
+        if let Err(error) = self.chains[chain].set_width(width) {
+            self.chains[chain].note_failure(&error);
+            return Err(error);
+        }
         self.lanes[lane].width = width;
         self.lanes[lane].drafted_requests = requests.iter().filter(|r| r.1 > 0).count();
         Ok(width)
@@ -270,7 +314,7 @@ impl<'w, 'a, C: DraftChain<'a>> DraftRuntime<'w, 'a, C> {
     pub fn release(&mut self, id: u64) -> Result<()> {
         let _device = self.chains[0].execution_device().map(|device| device.enter()).transpose()?;
         ensure!(!self.pending_prefix_ids.contains(&Some(id)), "cannot release a request with pending snapshot copies");
-        ensure!(!self.pending.iter().flatten().any(|(seeds, _)| seeds.iter().any(|seed| seed.0 == id)),
+        ensure!(!pending_draft_blocks(&self.pending, id),
             "cannot release a request with a pending draft");
         ensure!(!self.pending_commit_ids.iter().any(|ids| ids.contains(&id)),
             "cannot release a request with a pending commit");
@@ -476,7 +520,7 @@ impl<'w, 'a, C: DraftChain<'a>> DraftRuntime<'w, 'a, C> {
     pub fn finish_queued_commit(&mut self, lane: usize, pass: &mut impl crate::families::deepseek_v41::v41_target_pass::TargetCache<'a>,
         requests: &mut Requests<'a>, batch: &mut RequestBatch, accepted: &[u32]) -> Result<()> {
         let _device = self.chains[0].execution_device().map(|device| device.enter()).transpose()?;
-        self.mains[lane].publish_commit(&mut self.windows)?;
+        self.mains[lane].publish_commit(self.windows.as_mut_slice())?;
         pass.commit(requests, batch, accepted)?;
         self.pending_commit_ids[lane].clear();
         Ok(())
@@ -490,7 +534,7 @@ impl<'w, 'a, C: DraftChain<'a>> DraftRuntime<'w, 'a, C> {
         let ids = if self.pending_commit_ids[lane].is_empty() {
             batch.cache().map(|cache| cache.request_ids().to_vec()).unwrap_or_default()
         } else { self.pending_commit_ids[lane].clone() };
-        let mut result = self.mains[lane].abort_commit(&mut self.windows);
+        let mut result = self.mains[lane].abort_commit(self.windows.as_mut_slice());
         self.pending_commit_ids[lane].clear();
         requests.revoke_batch(batch);
         for id in ids { if let Err(error) = self.release(id) { result = Err(error); } }
@@ -498,7 +542,7 @@ impl<'w, 'a, C: DraftChain<'a>> DraftRuntime<'w, 'a, C> {
     }
 
     pub fn calibrated_confidence(&self, requests: usize, id: u64, extent: usize) -> Result<Option<Vec<f64>>> {
-        let Some(policy) = self.policy.as_ref().filter(|_| !self.fixed) else { return Ok(None); };
+        let Some(policy) = self.policy.as_ref().filter(|policy| !policy.fixed()) else { return Ok(None); };
         let logits = self.confidence_trace.get(&id).context("missing neural draft confidence")?;
         ensure!(extent <= logits.len(), "neural confidence extent mismatch");
         let prior: Vec<_> = logits[..extent].iter().map(|&x| sigmoid(x)).collect();
@@ -520,20 +564,50 @@ impl<'w, 'a, C: DraftChain<'a>> DraftRuntime<'w, 'a, C> {
 
     /// Each lane owns its draft scratch and stream; both can replay concurrently.
     /// Short RefCell borrows never survive a scheduler yield.
+    pub(crate) fn visit_graph_banks(&mut self, f: &mut dyn FnMut(i32, &'static str, bool, &mut dyn crate::shared::decode_graph::CacheAttached) -> Result<()>) -> Result<()> {
+        for main in &mut self.mains { main.visit_graph_banks(f)?; }
+        for chain in &mut self.chains { chain.visit_graph_banks(f)?; }
+        Ok(())
+    }
+    fn graph_cycle(&mut self) -> Result<()> {
+        crate::families::deepseek_v41::graph_policy::cycle(
+            crate::shared::decode_graph::device::Cycle::Verify, |f| self.visit_graph_banks(f))
+    }
+    fn graph_completed(&mut self) -> Result<()> {
+        let library = self.windows[0].device().library;
+        unsafe { // SAFETY: V4.1 graph owners borrow persistent engine storage only.
+            crate::shared::decode_graph::device::observe_completed(library, |f| self.visit_graph_banks(f)) }
+    }
     pub fn poll_propose(&mut self, lane: usize,
         inputs: &[(u64, u32, u64, usize)],
     ) -> Result<Option<(Vec<Vec<u32>>, u64)>> {
-        let _device = self.chains[0].execution_device().map(|device| device.enter()).transpose()?;
         ensure!(lane < self.chains.len(), "invalid draft lane");
-        if let Some((seeds, started)) = &self.pending[lane] {
-            let started = *started;
-            ensure!(seeds == inputs, "pending draft request inputs changed");
+        let _device = self.chains[lane].execution_device().map(|device| device.enter()).transpose()?;
+        if let Some((seeds, started)) = self.pending[lane].take() {
+            if seeds != inputs {
+                // W64-1: the pending proposal no longer matches this round's
+                // inputs. Cancel it and drop the marker so `release()` can free
+                // the requests; the caller then verifies anchors only.
+                self.chains[lane].cancel_replay();
+                if let Some(round) = self.lanes.get_mut(lane) {
+                    // Clear the cancelled proposal's ids, not the new round's:
+                    // the new round resets its own state when it starts.
+                    reset_lane_draft(round, &mut self.confidence_trace, &mut self.neural_lengths, &seeds);
+                }
+                anyhow::bail!("pending draft request inputs changed");
+            }
             let completed = match self.chains[lane].poll_replay() {
-                Ok(None) => return Ok(None),
+                Ok(None) => { self.pending[lane] = Some((seeds, started)); return Ok(None); },
                 Ok(Some(value)) => value,
-                Err(error) => { self.pending[lane] = None; return Err(error); },
+                Err(error) => {
+                    self.chains[lane].note_failure(&error);
+                    if let Some(round) = self.lanes.get_mut(lane) {
+                        reset_lane_draft(round, &mut self.confidence_trace, &mut self.neural_lengths, inputs);
+                    }
+                    return Err(error);
+                },
             };
-            self.pending[lane] = None;
+            self.graph_completed()?;
             let (packed, values) = completed;
             let active: Vec<_> = inputs.iter().enumerate()
                 .filter(|(_, (_, _, end, remaining))| *end >= 2 && *remaining > 1).collect();
@@ -553,21 +627,21 @@ impl<'w, 'a, C: DraftChain<'a>> DraftRuntime<'w, 'a, C> {
         }
         let started = Instant::now();
         ensure!(self.pending[lane].is_none(), "shared draft proposal still pending");
+        // W64-1: reset before the guards so a proposal that fails them cannot
+        // leave the previous round's width/counts/confidence behind.
+        if let Some(round) = self.lanes.get_mut(lane) {
+            reset_lane_draft(round, &mut self.confidence_trace, &mut self.neural_lengths, inputs);
+        }
         ensure!(!inputs.is_empty() && inputs.len() <= cuteafd_core::V41_MAX_LANE_MEMBERS, "invalid draft batch size");
         let mut seen = std::collections::BTreeSet::new();
         for &(id, anchor, _, remaining) in inputs {
             ensure!(seen.insert(id) && self.requests.contains_key(&id), "invalid draft request identity");
             ensure!(anchor < 129280 && remaining > 0, "invalid draft request input");
         }
-        for &(id, _, _, _) in inputs {
-            self.confidence_trace.remove(&id);
-        self.neural_lengths.remove(&id);
-        }
         let active: Vec<_> = inputs.iter().enumerate()
             .filter(|(_, (_, _, end, remaining))| *end >= 2 && *remaining > 1).collect();
         let outputs: Vec<_> = inputs.iter().map(|(_, anchor, _, _)| vec![*anchor]).collect();
         if active.is_empty() {
-            self.lanes[lane].width = 0; self.lanes[lane].drafted_requests = 0;
             return Ok(Some((outputs, started.elapsed().as_micros() as u64)));
         }
         let widths: Vec<_> = inputs.iter().map(|&(id, _, end, remaining)|
@@ -577,16 +651,27 @@ impl<'w, 'a, C: DraftChain<'a>> DraftRuntime<'w, 'a, C> {
         let tokens: Vec<_> = active.iter().map(|(_, (_, anchor, _, _))| *anchor as i32).collect();
         let bindings: [Vec<_>; 3] = std::array::from_fn(|stage| active.iter()
             .map(|(_, (id, _, end, _))| (self.requests[id].leases[stage], *end)).collect());
-        self.chains[lane].stage_tokens(&tokens)?;
+        if let Err(error) = self.chains[lane].stage_tokens(&tokens) {
+            self.chains[lane].note_failure(&error);
+            return Err(error);
+        }
         let mut rngs: Vec<_> = self.requests.iter_mut().filter_map(|(id, request)|
             active.iter().position(|(_, (active_id, _, _, _))| active_id == id)
                 .map(|index| (index, &mut request.rng))).collect();
         rngs.sort_by_key(|(index, _)| *index);
-        self.chains[lane].stage_sampling(&mut rngs.into_iter().map(|(_, rng)| rng).collect::<Vec<_>>(),
-            &vec![0.0; count])?;
+        if let Err(error) = self.chains[lane].stage_sampling(&mut rngs.into_iter().map(|(_, rng)| rng).collect::<Vec<_>>(),
+            &vec![0.0; count]) {
+            self.chains[lane].note_failure(&error);
+            return Err(error);
+        }
+        self.graph_cycle()?;
         let windows = self.windows.each_ref();
         let bindings = bindings.each_ref().map(|rows| rows.as_slice());
-        unsafe { self.chains[lane].begin_replay(windows, bindings)?; }
+        // SAFETY: admitted leases and windows stay owned by the runtime through completion/cancellation.
+        if let Err(error) = unsafe { self.chains[lane].begin_replay(windows, bindings) } {
+            self.chains[lane].note_failure(&error);
+            return Err(error);
+        }
         self.pending[lane] = Some((inputs.to_vec(), started));
         Ok(None)
     }
@@ -597,52 +682,91 @@ impl<'w, 'a, C: DraftChain<'a>> DraftRuntime<'w, 'a, C> {
 }
 
 impl<'w, 'a, C: DraftChain<'a>> DraftRuntime<'w, 'a, C> {
-    pub fn windows(&self) -> &[DsparkWindow<'a>; 3] {
+    pub fn windows(&self) -> &[DsparkWindow<'a>] {
         &self.windows
     }
+    /// Liveness gate for the anchor-only fallback: a terminal draft propagates
+    /// its error instead of silently degrading every round to anchors.
+    pub fn require_live(&self, lane: usize) -> Result<()> {
+        self.chains.get(lane).context("invalid draft lane")?.require_live()
+    }
+    /// A failed draft proposal: verify each member's anchor alone, but only
+    /// while the draft is still live. A terminal draft propagates its error so
+    /// the round fails instead of degrading to anchors forever. The lane's
+    /// draft state is reset so the anchor-only round is observed as undrafted.
+    pub fn anchor_fallback(&mut self, lane: usize, seeds: &[DraftSeed], error: &anyhow::Error)
+        -> Result<Vec<Vec<u32>>> {
+        self.require_live(lane)?;
+        if let Some(round) = self.lanes.get_mut(lane) {
+            reset_lane_draft(round, &mut self.confidence_trace, &mut self.neural_lengths, seeds);
+        }
+        let total = DRAFT_FALLBACKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        tracing::warn!(lane, requests = seeds.len(), total, error = %format!("{error:#}"),
+            "dSpark draft proposal failed; this lane round verifies anchors only");
+        Ok(anchor_inputs(seeds))
+    }
+
 }
-impl<'w, 'a> DraftRuntime<'w, 'a> {
+impl<'w, 'a, C: ProposeChain<'a>> DraftRuntime<'w, 'a, C> {
     /// Inputs are (request identity, anchor, committed end, remaining output budget).
     /// Returned rows retain input order; short histories/budgets use the anchor only.
-    /// Chain 0's queued draft, waited for in place: the uploads, replay and
+    /// The lane's queued draft, waited for in place: the uploads, replay and
     /// downloads go out without a host round trip, and the host waits once.
+    ///
+    /// The lane's own chain drafts and latches: `propose` and `require_live` must
+    /// agree on which chain a lane owns, or a terminal failure on one chain is
+    /// never seen by the lane that drafts on it.
     pub fn propose(&mut self, lane: usize,
         inputs: &[(u64, u32, u64, usize)],
     ) -> Result<Vec<Vec<u32>>> {
-        ensure!(lane < self.lanes.len(), "invalid draft lane");
+        ensure!(lane < self.lanes.len() && lane < self.chains.len(), "invalid draft lane");
         ensure!(self.pending.iter().all(Option::is_none), "shared draft proposal still pending");
+        // W64-1: reset before the guards so a proposal that fails them cannot
+        // leave the previous round's width/counts/confidence behind.
+        reset_lane_draft(&mut self.lanes[lane], &mut self.confidence_trace, &mut self.neural_lengths, inputs);
         ensure!(!inputs.is_empty() && inputs.len() <= cuteafd_core::V41_MAX_LANE_MEMBERS, "invalid draft batch size");
         let mut seen = std::collections::BTreeSet::new();
         for &(id, anchor, _, remaining) in inputs {
             ensure!(seen.insert(id) && self.requests.contains_key(&id), "invalid draft request identity");
             ensure!(anchor < 129280 && remaining > 0, "invalid draft request input");
         }
-        for &(id, _, _, _) in inputs {
-            self.confidence_trace.remove(&id);
-        self.neural_lengths.remove(&id);
-        }
         let active: Vec<_> = inputs.iter().enumerate()
             .filter(|(_, (_, _, end, remaining))| *end >= 2 && *remaining > 1).collect();
         let mut outputs: Vec<_> = inputs.iter().map(|(_, anchor, _, _)| vec![*anchor]).collect();
-        if active.is_empty() { self.lanes[lane].width = 0; self.lanes[lane].drafted_requests = 0; return Ok(outputs); }
+        if active.is_empty() { return Ok(outputs); }
         let widths: Vec<_> = inputs.iter().map(|&(id, _, end, remaining)|
             (id, if end >= 2 { remaining.saturating_sub(1) } else { 0 })).collect();
-        let width = self.apply_width(lane, 0, &widths)?;
+        let width = self.apply_width(lane, lane, &widths)?;
         let count = active.len();
         let tokens: Vec<_> = active.iter().map(|(_, (_, anchor, _, _))| *anchor as i32).collect();
         let bindings: [Vec<_>; 3] = std::array::from_fn(|stage| active.iter()
             .map(|(_, (id, _, end, _))| (self.requests[id].leases[stage], *end)).collect());
-        self.chains[0].stage_tokens(&tokens)?;
+        if let Err(error) = self.chains[lane].stage_tokens(&tokens) {
+            self.chains[lane].note_failure(&error);
+            return Err(error);
+        }
         let mut rngs: Vec<_> = self.requests.iter_mut().filter_map(|(id, request)|
             active.iter().position(|(_, (active_id, _, _, _))| active_id == id)
                 .map(|index| (index, &mut request.rng))).collect();
         rngs.sort_by_key(|(index, _)| *index);
-        self.chains[0].stage_sampling(&mut rngs.into_iter().map(|(_, rng)| rng).collect::<Vec<_>>(),
-            &vec![0.0; count])?;
+        if let Err(error) = self.chains[lane].stage_sampling(
+            &mut rngs.into_iter().map(|(_, rng)| rng).collect::<Vec<_>>(), &vec![0.0; count]) {
+            self.chains[lane].note_failure(&error);
+            return Err(error);
+        }
+        self.graph_cycle()?;
         let windows = self.windows.each_ref();
         let bindings = bindings.each_ref().map(|rows| rows.as_slice());
-        unsafe { self.chains[0].begin_replay(windows, bindings)?; }
-        let (packed, values) = self.chains[0].wait_replay()?;
+        // SAFETY: admitted windows, bindings and staged inputs live until the queued replay drains.
+        if let Err(error) = unsafe { self.chains[lane].begin_replay(windows, bindings) } {
+            self.chains[lane].note_failure(&error);
+            return Err(error);
+        }
+        let (packed, values) = match self.chains[lane].wait_replay() {
+            Ok(output) => output,
+            Err(error) => { self.chains[lane].note_failure(&error); return Err(error); }
+        };
+        self.graph_completed()?;
         ensure!(packed.len() == (width + 1) * count && values.len() == width * count,
             "draft output extent differs");
         if self.wants_confidence() {
@@ -661,44 +785,58 @@ impl<'w, 'a> DraftRuntime<'w, 'a> {
 
 }
 
-/// A policy-bound verification round captures route ids only for resource
-/// pricing or the replay trace, whatever the draft mode; simple and fixed modes
-/// skip them. Per-layer CUDA-event times and the FFN stage split come with the
-/// routes and also whenever a console viewer is connected (its layer profile
-/// and expert-stage panels), so a default launch keeps them while watched and
-/// skips them while nobody is.
-pub(crate) fn round_capture(policy: Option<&cuteafd_core::DraftPolicy>, console_live: bool) -> Capture {
-    let Some(policy) = policy else { return Capture::default() };
-    let routes = crate::shared::draft::binding::needs_routes(policy);
-    Capture { routes, timing: routes || console_live }
+/// Observers use host round timestamps. Replay routes are read after the pass;
+/// only resource pricing or an explicit timing profile requests layer events.
+pub(crate) fn round_capture(policy: Option<&cuteafd_core::DraftPolicy>, _console_live: bool,
+    replay: bool, profiling: bool) -> Capture {
+    let Some(policy) = policy else { return Capture { routes: false, timing: profiling } };
+    Capture { routes: policy.needs_routes() || replay, timing: policy.needs_routes() || profiling }
 }
 
 #[cfg(test)]
 mod restored_prefix_tests {
     use super::*;
 
-    /// Simple and fixed rounds never capture route ids; a connected console
-    /// still gets per-layer times and the FFN stage split in every mode, and an
-    /// unwatched simple or fixed round records neither. The priced policy
-    /// captures both, watched or not.
     #[test]
-    fn console_keeps_layer_times_in_every_draft_mode() {
+    fn observation_and_replay_do_not_enable_layer_timing() {
         use cuteafd_core::{DraftMode, DraftPolicy, PolicySeed};
-        assert_eq!(round_capture(None, true), Capture::default());
         let geometry = super::policy::remote_geometry(7);
         for (mode, fixed, priced) in [(DraftMode::Simple, false, false), (DraftMode::SimpleRc, false, false),
             (DraftMode::SimpleDerived, false, false), (DraftMode::Shared, true, false), (DraftMode::Shared, false, true)] {
             let mut policy = DraftPolicy::new(geometry.clone(), PolicySeed::weak(7), fixed).unwrap();
             policy.set_draft_mode(mode);
-            // The replay trace (SPECULATION_TRACE) forces routes; this test runs without it.
-            let traced = crate::shared::draft::binding::needs_routes(&policy) && !priced;
-            assert!(!traced, "{mode:?} fixed={fixed}: unexpected route need");
-            let watched = round_capture(Some(&policy), true);
-            let unwatched = round_capture(Some(&policy), false);
-            assert_eq!(watched, Capture { routes: priced, timing: true }, "{mode:?} fixed={fixed} watched");
-            assert_eq!(unwatched, Capture { routes: priced, timing: priced }, "{mode:?} fixed={fixed} unwatched");
+            for watched in [false, true] {
+                for replay in [false, true] {
+                    for profiling in [false, true] {
+                        assert_eq!(round_capture(Some(&policy), watched, replay, profiling),
+                            Capture { routes: priced || replay, timing: priced || profiling },
+                            "{mode:?} fixed={fixed} watched={watched} replay={replay} profiling={profiling}");
+                    }
+                }
+            }
         }
+        assert_eq!(round_capture(None, true, false, false), Capture::default());
+        assert_eq!(round_capture(None, true, false, true), Capture { routes: false, timing: true });
     }
+    #[tokio::test]
+    async fn console_subscriber_keeps_capture_timing_off_unless_profiled() {
+        use tower::ServiceExt;
+        let hub = cuteafd_api::openai::ConsoleHub::new(false);
+        let (queue, _receive) = tokio::sync::mpsc::channel(1);
+        let router = cuteafd_api::openai::router_with_console(queue,
+            cuteafd_api::openai::NativeLimits::default(),
+            std::sync::Arc::new(std::sync::Mutex::new(serde_json::Value::Null)),
+            std::time::Duration::from_secs(1), hub.clone());
+        let response = router.oneshot(axum::http::Request::builder()
+            .uri("/v1/console/events").body(axum::body::Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        assert_eq!(hub.viewers(), 1, "a real console subscriber must be counted");
+        assert!(!round_capture(None, hub.viewers() > 0, false, false).timing);
+        assert!(round_capture(None, hub.viewers() > 0, false, true).timing);
+        drop(response);
+        assert_eq!(hub.viewers(), 0);
+    }
+
     #[test]
     fn long_tail_stats_count_only_judged_positions() {
         assert_eq!(tail_outcome(38, 1, 5), (32, 0, 0));

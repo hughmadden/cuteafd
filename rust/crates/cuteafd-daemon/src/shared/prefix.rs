@@ -97,6 +97,7 @@ impl PrefixArgs {
         if self.prefix_cache_entries == cuteafd_core::concurrency::AUTO_ENTRIES {
             self.prefix_cache_entries = cuteafd_core::concurrency::prefix_entries(concurrency as u64) as usize;
         }
+        cuteafd_bench::context::set_resolved("prefix-cache-entries", &self.prefix_cache_entries.to_string());
     }
 
     pub fn with_scoring(&self, rows: usize, lane_rows: usize, vocab: usize) -> Result<Self> {
@@ -154,8 +155,7 @@ impl PrefixArgs {
         if self.prefix_cache_entries == 0 || !self.host_cache_bytes.enabled() {
             return Ok(None);
         }
-        let chunk = (256u64 << 20).max(layout.page_bytes as u64)
-            .max(layout.mark_bytes as u64).max(layout.draft_bytes as u64);
+        let chunk = Self::host_chunk_bytes(layout);
         let bytes = match self.host_cache_bytes {
             HostBudget::Bytes(bytes) => bytes,
             HostBudget::Auto => {
@@ -168,17 +168,7 @@ impl PrefixArgs {
                 bytes
             }
         };
-        anyhow::ensure!(bytes > 0,
-            "host prefix quota resolves to zero; provide a positive quota or disable it explicitly for device retention");
-        let config = cuteafd_hostcache::config::Config {
-            bytes,
-            eviction_headroom: budget::eviction_headroom(layout, self.host_cache_evict_tokens)?,
-            chunk_bytes: chunk.min(bytes),
-            min_tokens: self.host_cache_min_tokens,
-            max_tokens: u32::try_from(max_context)?,
-            ..Default::default()
-        };
-        config.validate()?;
+        let config = self.host_config_for(layout, max_context, bytes)?;
         let geometry = cuteafd_core::prefix::HostCacheGeometry { unit_rows: layout.page_rows as u64,
             page_bytes: layout.page_bytes as u64, mark_bytes: layout.mark_bytes as u64,
             draft_bytes: layout.draft_bytes as u64 };
@@ -191,6 +181,30 @@ impl PrefixArgs {
                 "host prefix quota holds fewer 50K conversations than concurrency plus four");
         }
         Ok(Some(config))
+    }
+
+    /// The host tier's configuration for a quota of `bytes` another admission already resolved
+    /// (V4.1 sizes it jointly with its other host owners): these flags' limits and the
+    /// layout's chunk and eviction geometry. Validated, not admitted.
+    pub fn host_config_for(&self, layout: FamilyLayout, max_context: usize, bytes: u64)
+        -> Result<cuteafd_hostcache::config::Config> {
+        anyhow::ensure!(bytes > 0,
+            "host prefix quota resolves to zero; provide a positive quota or disable it explicitly for device retention");
+        let config = cuteafd_hostcache::config::Config {
+            bytes,
+            eviction_headroom: budget::eviction_headroom(layout, self.host_cache_evict_tokens)?,
+            chunk_bytes: Self::host_chunk_bytes(layout).min(bytes),
+            min_tokens: self.host_cache_min_tokens,
+            max_tokens: u32::try_from(max_context)?,
+            ..Default::default()
+        };
+        config.validate()?;
+        Ok(config)
+    }
+
+    /// The host tier's pinned allocation granularity for `layout`.
+    pub fn host_chunk_bytes(layout: FamilyLayout) -> u64 {
+        (256u64 << 20).max(layout.page_bytes as u64).max(layout.mark_bytes as u64).max(layout.draft_bytes as u64)
     }
 
     /// Single-device copy engine for the resolved retained-prefix budget.
@@ -315,6 +329,8 @@ mod tests {
             let mut placement = ExpertPlacement::Local;
             match adapter.id() {
                 "mimo_v2" => {
+                    // An explicit pool below the selected context is a typed refusal.
+                    options.context_tokens = 32768;
                     let mut config = testing::mimo_flash_config();
                     config["vision_config"] = json!({"depth":28,"hidden_size":1280,"intermediate_size":4608,
                         "num_heads":32,"num_key_value_heads":8,"out_hidden_size":4096,"patch_size":16,
@@ -326,7 +342,7 @@ mod tests {
                     std::fs::write(&package, serde_json::to_vec(&json!({"layouts":{"tp1":{
                         "input":"bf16", "tp":1, "hidden":4096, "experts":256,
                         "top_k":8, "intermediate":2048, "slice":2048, "weights":"fp8",
-                        "capacities":[{"capacity":4096,"scratch_bytes":671_354_880}]
+                        "abi_version":6,"projection":"bf16","activation":"silu_bf16_product","swiglu_limit":0.0,"swiglu_alpha":1.0,"swiglu_beta":0.0,"capacities":[{"capacity":4096,"scratch_bytes":671_354_880}]
                     }}}))?)?;
                     options.mimo_expert_manifest = Some(package);
                 }
@@ -348,10 +364,17 @@ mod tests {
                         "num_heads":16,"out_hidden_size":4096,"patch_size":14,"temporal_patch_size":2,
                         "spatial_merge_size":2,"projection_intermediate_size":10240,"in_channels":3,
                         "attention_bias":true,"hidden_act":"silu","rms_norm_eps":1e-5,"swiglu_limit":10.0});
-                    let tensors = testing::glm5_flash_vision_tensors();
+                    let mut tensors = testing::glm5_flash_tensors(&config);
+                    tensors.extend(testing::glm5_flash_vision_tensors());
                     testing::write_snapshot(dir.path(), &config, &tensors, Some(4));
+                    options.workspace_manifest = Some(testing::write_glm5_flash_workspaces(dir.path()));
+                    options.drafter_bytes = 256 << 20;
+                    options.context_tokens = 32768;
                 }
                 "muse_spark" => {
+                    // This fixture pins a 32K diagnostic pool; the shared
+                    // contract correctly refuses a larger compiled context.
+                    options.context_tokens = 32768;
                     testing::write_muse_vision_snapshot(dir.path(), &(0..62).collect::<Vec<_>>());
                     let path = testing::write_muse_exl3_capacities(&dir.path().join("image"));
                     let programs = crate::families::muse_spark::programs::required(2)?.into_iter()
@@ -381,8 +404,29 @@ mod tests {
                         assert_eq!(cuteafd_engine::media::EmbeddingCache::new(bytes).capacity(), bytes);
                         bytes as u64
                     };
-                    let planned = report.host_ledger.as_ref().context("host media ledger")?.items.iter()
-                        .filter(|item| item.group == "media/embedding-cache").map(|item| item.bytes).sum::<u64>();
+                    let planned = if adapter.id() == "glm5_flash" {
+                        use cuteafd_loader::placement::planner::{Location, Phase};
+                        let ledger = report.phase_ledger.as_ref().context("joint physical ledger")?;
+                        let host = ledger.budgets.iter().find(|budget| budget.locations.contains(&Location::HOST))
+                            .context("physical host budget")?;
+                        let owned = |phase| ledger.phases.iter().find(|row|
+                            row.budget == host.id && row.phase == phase).unwrap().owned;
+                        let zero = input.plan(&PlanOptions { placement, vision, audio: MediaMode::Off,
+                            layout: Some(LayoutOptions { media_cache_bytes: Some(0), ..options.clone() }),
+                            ..Default::default() })?;
+                        let zero_ledger = zero.phase_ledger.as_ref().context("zero-cache physical ledger")?;
+                        let zero_owned = |phase| zero_ledger.phases.iter().find(|row|
+                            row.budget == host.id && row.phase == phase).unwrap().owned;
+                        assert_eq!(owned(Phase::PostTargetKv), zero_owned(Phase::PostTargetKv),
+                            "media cache must not exist before Warmup");
+                        for phase in [Phase::Warmup, Phase::Ready, Phase::Growth] {
+                            assert_eq!(owned(phase) - zero_owned(phase), runtime);
+                        }
+                        owned(Phase::Ready) - zero_owned(Phase::Ready)
+                    } else {
+                        report.host_ledger.as_ref().context("host media ledger")?.items.iter()
+                            .filter(|item| item.group == "media/embedding-cache").map(|item| item.bytes).sum::<u64>()
+                    };
                     assert_eq!(planned, runtime, "{}: vision={vision:?}, quota={quota:?}", adapter.id());
                 }
             }

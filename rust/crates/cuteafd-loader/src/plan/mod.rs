@@ -10,6 +10,7 @@ pub mod families;
 pub mod family;
 pub mod files;
 pub mod format;
+pub mod inputs;
 pub mod launch;
 pub mod layout;
 pub mod names;
@@ -60,7 +61,7 @@ pub fn resolve_audio(mode: MediaMode, snapshot: &Path) -> Result<MediaMode, Plan
     resolve_audio_config(mode, snapshot, &config)
 }
 
-pub(crate) fn resolve_audio_config(mode: MediaMode, snapshot: &Path, config: &serde_json::Value)
+pub fn resolve_audio_config(mode: MediaMode, snapshot: &Path, config: &serde_json::Value)
     -> Result<MediaMode, PlanError> {
     if mode == MediaMode::Off { return Ok(mode); }
     let kind = crate::media::AudioTowerKind::from_config(config)
@@ -192,6 +193,67 @@ pub struct RoleReadiness {
     pub unavailable: Vec<Rejection>,
 }
 
+/// The admitted phase totals, separate from Ready-resident layout items.
+#[derive(Debug, Clone, Serialize)]
+pub struct SolvedPhaseLedger {
+    pub served_context_tokens: u64,
+    pub budgets: Vec<crate::placement::planner::Budget>,
+    pub phases: Vec<crate::placement::planner::PhaseBudget>,
+}
+
+impl From<&crate::placement::planner::ResolvedPlan> for SolvedPhaseLedger {
+    fn from(plan: &crate::placement::planner::ResolvedPlan) -> Self {
+        Self { served_context_tokens: plan.served_context(), budgets: plan.budgets.clone(), phases: plan.phases.clone() }
+    }
+}
+
+impl SolvedPhaseLedger {
+    fn render(&self, out: &mut String) {
+        use crate::placement::planner::{Baseline, Device, Domain};
+        use std::fmt::Write;
+        let _ = writeln!(out, "served context: {} tokens", self.served_context_tokens);
+        for budget in &self.budgets {
+            let Some(peak) = self.phases.iter().filter(|row| row.budget == budget.id)
+                .reduce(|peak, row| if u128::from(row.owned) + u128::from(row.opaque)
+                    > u128::from(peak.owned) + u128::from(peak.opaque) { row } else { peak })
+            else { continue };
+            let locations = budget.locations.iter().map(|location| {
+                let device = match location.device {
+                    Device::Coordinator(rank) => format!("coordinator GPU {rank}"),
+                    Device::Spark(rank) => format!("Spark rank {rank}"),
+                    Device::Host => "host RAM".into(),
+                };
+                let domain = match location.domain {
+                    Domain::Device => "device", Domain::Host => "ordinary",
+                    Domain::Pinned => "pinned", Domain::Managed => "managed",
+                };
+                format!("{device} {domain}")
+            }).collect::<Vec<_>>().join(" + ");
+            let total = u128::from(peak.owned) + u128::from(peak.opaque);
+            let _ = writeln!(out,
+                "memory peak {} [{locations}]: {}; {total} bytes (owned {}, opaque {}); available {} bytes",
+                budget.id, peak.phase, peak.owned, peak.opaque, peak.available);
+            let (occupied, source, attribution) = match &budget.baseline {
+                Baseline::Forecast { occupied, source, assumed } =>
+                    (*occupied, source, if *assumed { "estimated" } else { "calibrated" }),
+                Baseline::Sampled { free, source, .. } =>
+                    (budget.physical_bytes - free, source, "sampled"),
+            };
+            let _ = writeln!(out,
+                "memory limit {}: physical {} bytes; logical {} bytes; baseline {occupied} bytes ({attribution}: {source}); headroom {} bytes",
+                budget.id, budget.physical_bytes, budget.logical_bytes, budget.headroom);
+        }
+    }
+}
+
+/// Observed admission work, separate from deterministic placement output.
+#[derive(Debug, Clone, Serialize)]
+pub struct AdmissionTiming {
+    /// Prepare plus solve/execution work, excluding checkpoint inventory.
+    pub solve_us: u64,
+    pub admissions: u32,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct PlanReport {
     pub mapped_placement: crate::formats::mapped_preload::MappedPlacement,
@@ -199,6 +261,11 @@ pub struct PlanReport {
     pub host_budget_bytes: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub host_ledger: Option<cuteafd_core::memory_layout::HostLayout>,
+    /// Already solved startup and resident totals; never a second admission.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub phase_ledger: Option<SolvedPhaseLedger>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub admission_timing: Option<AdmissionTiming>,
     pub attention_placement: crate::placement::AttentionPlacement,
     /// The routed-expert weight budget per Spark rank this plan used
     /// (explicit, or the family's default).
@@ -299,15 +366,55 @@ pub struct PlanReport {
     /// Native EXLR8 trellis prefill activations the layout charged (EXLR8 native plans only).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub exlr8_prefill_activations: Option<exlr8::PrefillActivations>,
+    /// GLM Flash KDA replay-record storage (`own` or `shared`) resolved by the planner.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub replay_records: Option<&'static str>,
+    /// Qwen's automatic native MTP choice, charged by the same plan.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub speculator: Option<&'static str>,
     /// Per-device memory layout, when requested.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub memory_layout: Option<cuteafd_core::memory_layout::MemoryLayout>,
+    /// One line per device from the memory policy (`placement::reserve::layout_lines`):
+    /// the cap, weights, workspaces, named reserve components and KV target/min/max.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub memory_policy_lines: Vec<String>,
     /// Offline solver result; runtime admission still samples live resources.
     #[serde(skip)]
     pub solver_placement: Option<crate::placement::Placement>,
+    /// Resolved GLM Flash drafter placement, including automatic comparisons.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tp2_dflash: Option<bool>,
 }
 
 impl PlanReport {
+    pub fn spark_expert_layers(&self) -> Vec<u32> {
+        if let Some(placement) = &self.solver_placement {
+            placement.layers.iter().enumerate().filter_map(|(layer, home)|
+                (home.experts == crate::placement::ExpertHome::Spark).then_some(layer as u32)).collect()
+        } else if self.placement == ExpertPlacement::Local || self.spark_ranks == 0
+            || self.spec.as_ref().is_some_and(|spec| spec.moe.is_none()) {
+            // A dense model has no experts to place, even beside media-only Spark ranks.
+            Vec::new()
+        } else {
+            // Failed or shape-only reports have no solved ownership to narrow.
+            let first = self.launch.as_ref().map_or(0, |launch| launch.first_expert_layer);
+            let end = self.launch.as_ref().and_then(|launch| launch.last_expert_layer.map(|l| l + 1))
+                .or_else(|| self.spec.as_ref().map(|spec| spec.layers.len())).unwrap_or(first);
+            (first..end).map(|layer| layer as u32).collect()
+        }
+    }
+
+    pub fn spark_expert_world(&self) -> usize {
+        if self.spark_expert_layers().is_empty() { 0 } else { self.spark_ranks }
+    }
+
+    pub(crate) fn refuse_placement(&mut self, what: String, how: impl Into<String>) {
+        self.fits = false;
+        self.placement_supported = false;
+        self.hints.push(Hint { what, how: how.into() });
+    }
+
     pub fn executable(&self) -> bool { self.launchable(false) }
 
     pub fn wip_launchable(&self) -> bool { self.launchable(true) }
@@ -338,6 +445,8 @@ pub struct PlanOptions {
     pub mapped_scale_host_budget_bytes: Option<u64>,
     /// Resolved target-checkpoint draft ownership; absent keeps family defaults.
     pub draft_ownership: Option<spec::DraftOwnership>,
+    /// Resolve qualified Qwen MTP from each candidate's admitted expert world.
+    pub qwen_auto_mtp: bool,
     pub attention_placement: Option<crate::placement::AttentionPlacement>,
     pub vision: MediaMode,
     pub audio: MediaMode,
@@ -348,6 +457,9 @@ pub struct PlanOptions {
     /// Weight bytes the coordinator GPU may hold (its own tensors, plus every
     /// routed expert in the local-only placement).
     pub coordinator_budget_bytes: u64,
+    /// Per-GPU storage ceiling for admission without a complete memory layout;
+    /// independent of the resident-weight cap above.
+    pub coordinator_gpu_budget_bytes: u64,
     /// Also lay out every device's memory (`plan --layout`).
     pub layout: Option<layout::LayoutOptions>,
 }
@@ -359,12 +471,14 @@ impl Default for PlanOptions {
             mapped_scale_preload_bytes: crate::formats::mapped_preload::DEFAULT_CAP_BYTES,
             mapped_scale_host_budget_bytes: None,
             draft_ownership: None,
+            qwen_auto_mtp: false,
             attention_placement: None,
             vision: MediaMode::Auto,
             audio: MediaMode::Auto,
             placement: ExpertPlacement::Sparks { ranks: 6 },
             spark_budget_bytes: None,
             coordinator_budget_bytes: 80 << 30,
+            coordinator_gpu_budget_bytes: crate::placement::inventory::PRO_TOTAL_BYTES,
             layout: None,
         }
     }
@@ -395,7 +509,11 @@ impl PlanOptions {
                 });
             }
         }
-        for (option, bytes) in [("Spark budget", self.spark_budget_bytes.unwrap_or(DEFAULT_SPARK_BUDGET_BYTES)), ("coordinator budget", self.coordinator_budget_bytes)] {
+        for (option, bytes) in [
+            ("Spark budget", self.spark_budget_bytes.unwrap_or(DEFAULT_SPARK_BUDGET_BYTES)),
+            ("coordinator weight budget", self.coordinator_budget_bytes),
+            ("coordinator GPU budget", self.coordinator_gpu_budget_bytes),
+        ] {
             if bytes == 0 {
                 return Err(PlanError::InvalidOption { option, reason: "must be positive".into() });
             }
@@ -443,8 +561,8 @@ fn precision_optimizations(family: &str, options: &PlanOptions) -> Vec<String> {
     let mut active = Vec::new();
     match family {
         "glm5" => {
-            if std::env::var("CUTEAFD_GLM_BF16").as_deref() != Ok("native") {
-                active.push("attention, indexer and shared experts: load-time FP8 block weights (existing default; CUTEAFD_GLM_BF16=native disables)".into());
+            if !crate::families::glm5::native_bf16() {
+                active.push("attention, indexer and dense/shared experts: explicit load-time FP8 block weights (CUTEAFD_GLM_BF16=fp8)".into());
             }
             if !options.layout.as_ref().is_some_and(|layout| layout.glm5_drafter_disabled || layout.glm5_draft_bf16) {
                 active.push("external drafter: FP8 weights (existing launcher default)".into());
@@ -452,14 +570,26 @@ fn precision_optimizations(family: &str, options: &PlanOptions) -> Vec<String> {
         }
         "glm5_flash" => {
             let repr = options.layout.as_ref().map(|layout| layout.glmf_representation).unwrap_or_default();
-            active.push("MLA and shared experts: FP8 block weights; W8A8 prefill (existing launcher default)".into());
-            if repr.kda_fp8 { active.push("KDA projections: row-K128 FP8 weights (existing launcher default)".into()); }
-            if repr.fp8_head { active.push("head: row-K128 FP8 weights (existing launcher default)".into()); }
+
+            if repr.kda_fp8 { active.push("KDA projections: explicit row-K128 FP8 weights".into()); }
+            match repr.head {
+                crate::families::glm5_flash::resident::GlmfHeadFormat::Auto =>
+                    active.push("head: auto (checkpoint BF16; native head unchanged)".into()),
+                crate::families::glm5_flash::resident::GlmfHeadFormat::Fp8 =>
+                    active.push("head: row-K128 FP8 weights".into()),
+                crate::families::glm5_flash::resident::GlmfHeadFormat::Packed =>
+                    active.push("head: exact 12-bit copy of the BF16 weights (target logits exact; drafter reads its coarse plane)".into()),
+                crate::families::glm5_flash::resident::GlmfHeadFormat::Bf16 => {}
+            }
             if !options.layout.as_ref().is_some_and(|layout| layout.glmf_drafter_disabled) {
                 active.push("external drafter: FP8 weights and W8A8 draft linear (existing launcher default)".into());
             }
         }
-        "qwen4" => active.push("target/MTP shared head: FP8 weights (existing launcher default; attention projections remain checkpoint precision)".into()),
+        "qwen4" => {
+            if options.layout.as_ref().is_some_and(|layout| layout.qwen_representation.fp8_head) {
+                active.push("target/MTP shared head: explicit FP8 weights".into());
+            }
+        }
         _ => {}
     }
     active
@@ -534,11 +664,27 @@ pub struct PlanInput {
 #[derive(Default)]
 struct ManifestCache {
     values: Mutex<BTreeMap<std::path::PathBuf, Result<Arc<serde_json::Value>, String>>>,
+    programs: Mutex<BTreeMap<std::path::PathBuf, Result<Arc<crate::placement::inventory::ProgramsManifest>, String>>>,
+    #[cfg(test)]
+    program_parses: Mutex<BTreeMap<std::path::PathBuf, usize>>,
     #[cfg(test)]
     parses: Mutex<BTreeMap<std::path::PathBuf, usize>>,
 }
 
 impl ManifestCache {
+    fn programs(&self, path: &Path) -> anyhow::Result<Arc<crate::placement::inventory::ProgramsManifest>> {
+        let mut programs = self.programs.lock().expect("plan typed manifest cache poisoned");
+        match programs.entry(path.to_path_buf()).or_insert_with(|| {
+            #[cfg(test)]
+            { *self.program_parses.lock().unwrap().entry(path.to_path_buf()).or_default() += 1; }
+            self.read(path).and_then(|value| crate::placement::inventory::ProgramsManifest::from_manifest(&value))
+                .map(Arc::new).map_err(|error| format!("{}: {error:#}", path.display()))
+        }) {
+            Ok(value) => Ok(Arc::clone(value)),
+            Err(error) => Err(anyhow::anyhow!("{error}")),
+        }
+    }
+
     fn read(&self, path: &Path) -> anyhow::Result<Arc<serde_json::Value>> {
         use anyhow::Context;
         let mut values = self.values.lock().expect("plan manifest cache poisoned");
@@ -580,8 +726,12 @@ struct ComponentCensus {
 
 impl PlanInput {
     pub fn open(snapshot: &Path) -> anyhow::Result<Self> {
+        Self::open_view(&checkpoint::CheckpointView::select(snapshot, checkpoint::CoreView::Original)?)
+    }
+
+    pub fn open_view(view: &checkpoint::CheckpointView) -> anyhow::Result<Self> {
         let start = Instant::now();
-        let (checkpoint, validation) = Checkpoint::open_with_header_validation(snapshot)?;
+        let (checkpoint, validation) = Checkpoint::open_view_with_header_validation(view)?;
         Ok(Self { checkpoint, header_validation: Some(validation), catalog: OnceLock::new(), manifests: ManifestCache::default(),
             open_time: start.elapsed(), open_reported: AtomicBool::new(false), phases: PhaseCounters::default(),
             native_spark_headers: OnceLock::new(), module_numerics: OnceLock::new(),
@@ -600,6 +750,12 @@ impl PlanInput {
         self.manifests.read(path)
     }
 
+    /// Native projection metadata is parsed once per immutable artifact path,
+    /// including failures, alongside the raw manifest cache used by other exports.
+    pub fn programs_manifest(&self, path: &Path) -> anyhow::Result<Arc<crate::placement::inventory::ProgramsManifest>> {
+        self.manifests.programs(path)
+    }
+
     pub fn checkpoint(&self) -> &Checkpoint {
         &self.checkpoint
     }
@@ -613,7 +769,10 @@ impl PlanInput {
             if let Some(validation) = &self.header_validation {
                 crate::families::deepseek_v41::v41_catalog::expert_catalog_from_checkpoint(&self.checkpoint, validation)
             } else {
-                crate::read_expert_catalog(&self.checkpoint.snapshot)
+                match &self.checkpoint.view {
+                    Some(view) => crate::read_expert_catalog_view(view),
+                    None => crate::read_expert_catalog(&self.checkpoint.snapshot),
+                }
             }
         }) {
             Ok(catalog) => Ok(catalog),
@@ -726,10 +885,8 @@ fn family_layout(model: &dyn FamilyModel, input: &PlanInput, report: &mut PlanRe
     let family = report.family.as_deref().unwrap_or("unknown");
     let concurrency = options.resolved_concurrency(family);
     if let Err(error) = cuteafd_core::concurrency::validate(family, concurrency) {
-        report.fits = false;
-        report.placement_supported = false;
         let reason = error.to_string();
-        report.hints.push(Hint { what: reason.clone(), how: "Use a supported boot-time concurrency or add the named program capacity.".into() });
+        report.refuse_placement(reason.clone(), "Use a supported boot-time concurrency or add the named program capacity.");
         return Ok(cuteafd_core::memory_layout::MemoryLayout { devices: vec![], pool_tokens: 0, waste: vec![], notes: vec![reason] });
     }
     if options.mimo_prefix_entries == u64::MAX {
@@ -749,22 +906,22 @@ fn family_layout(model: &dyn FamilyModel, input: &PlanInput, report: &mut PlanRe
         return Ok(cuteafd_core::memory_layout::MemoryLayout { devices: vec![], pool_tokens: 0, waste: vec![], notes: vec![what] });
     }
     match model.placement(input, report, options, requested) {
-        Some(Ok(memory)) => {
+        Some(Ok(mut memory)) => {
+            for device in &mut memory.devices {
+                cuteafd_core::memory_layout::charge_spark_runtime(device)
+                    .ok_or_else(|| anyhow::anyhow!("Spark arena reserve overflow"))?;
+            }
             report.native_serving_admitted = model.native_serving_admission();
             Ok(memory)
         },
         Some(Err(error)) => {
-            report.fits = false;
-            report.placement_supported = false;
-            report.hints.push(Hint { what: format!("native placement refused: {error:#}"),
-                how: "Supply the native exports and a shape supported by the family's executor.".into() });
+            report.refuse_placement(format!("native placement refused: {error:#}"),
+                "Supply the native exports and a shape supported by the family's executor.");
             Ok(cuteafd_core::memory_layout::MemoryLayout { devices: vec![], pool_tokens: 0,
                 waste: vec![], notes: vec![format!("native placement refused: {error:#}")] })
         }
         None => {
             let family = report.family.as_deref().unwrap_or("unknown");
-            report.fits = false;
-            report.placement_supported = false;
             let drafter = matches!(family, "dflash2" | "dspark");
             let what = if drafter { format!("{family}: a drafter checkpoint has no memory layout of its own") }
                 else { format!("{family}: no placement adapter in this build") };
@@ -775,14 +932,47 @@ fn family_layout(model: &dyn FamilyModel, input: &PlanInput, report: &mut PlanRe
                 format!("Implement FamilyModel::placement for {family} (plan/families/), solving the same \
                     PlacementRequest its runtime admits, before claiming a memory layout.")
             };
-            report.hints.push(Hint { what: what.clone(), how });
+            report.refuse_placement(what.clone(), how);
             Ok(cuteafd_core::memory_layout::MemoryLayout { devices: vec![], pool_tokens: 0, waste: vec![], notes: vec![what] })
         }
     }
 }
 
+/// Match the qualified local paths: one native stage, EXL3 or ModelOpt's
+/// four-bit weight groups (including its FP8 MTP package).
+pub fn qualified_qwen_mtp(config: &serde_json::Value) -> bool {
+    let text = config.get("text_config").unwrap_or(config);
+    let quant = &config["quantization_config"];
+    let method = quant.get("quant_method").or_else(|| quant.get("method")).and_then(serde_json::Value::as_str);
+    text["mtp_num_hidden_layers"] == 1 && (method == Some("exl3")
+        || method == Some("modelopt") && quant["config_groups"].as_object()
+            .is_some_and(|groups| groups.values().any(|group| group["weights"]["num_bits"] == 4)))
+}
+
 fn plan_of(input: &PlanInput, options: &PlanOptions) -> Result<PlanReport, PlanError> {
-    let mut report = plan_unrestricted(input, options)?;
+    let mut resolved = options.clone();
+    let auto = options.qwen_auto_mtp;
+    let choice = |world| {
+        if world == 0 && options.layout.as_ref().is_none_or(|layout| layout.native_mtp_layers > 0)
+            && qualified_qwen_mtp(&input.checkpoint().config) { "mtp" } else { "off" }
+    };
+    let mut selected = choice(options.placement.spark_ranks());
+    if auto { resolved.draft_ownership = Some(spec::DraftOwnership::selected("qwen4", selected)); }
+    let mut report = plan_unrestricted(input, &resolved)?;
+    if auto {
+        let admitted = choice(report.spark_expert_world());
+        if admitted != selected {
+            // Rebuild every owner, workspace and cache charge, not just the JSON flag.
+            selected = admitted;
+            resolved.draft_ownership = Some(spec::DraftOwnership::selected("qwen4", selected));
+            report = plan_unrestricted(input, &resolved)?;
+            if choice(report.spark_expert_world()) != selected {
+                report.refuse_placement("Qwen auto MTP changes the admitted expert world".into(),
+                    "Select SPECULATOR=mtp or off explicitly for this placement.");
+            }
+        }
+        report.speculator = Some(selected);
+    }
     let _timer = PhaseTimer::new(&input.phases.admission, &[&input.phases.catalog, &input.phases.layout]);
     match spark_range::admit(input, options, &report) {
         Ok(()) => {},
@@ -803,6 +993,8 @@ pub(crate) fn empty_report(input: &PlanInput, options: &PlanOptions) -> anyhow::
         mapped_placement: Default::default(),
         host_budget_bytes: 0,
         host_ledger: None,
+        phase_ledger: None,
+        admission_timing: None,
         attention_placement: options.attention_placement.unwrap_or_default(),
         spark_budget_bytes: options.spark_budget(),
         requested_attention: options.attention_placement,
@@ -855,8 +1047,12 @@ pub(crate) fn empty_report(input: &PlanInput, options: &PlanOptions) -> anyhow::
         expert_storage: None,
         hints: Vec::new(),
         exlr8_prefill_activations: None,
+        replay_records: None,
+        speculator: None,
         memory_layout: None,
+        memory_policy_lines: Vec::new(),
         solver_placement: None,
+        tp2_dflash: None,
     })
 }
 
@@ -958,7 +1154,8 @@ fn plan_unrestricted(input: &PlanInput, options: &PlanOptions) -> Result<PlanRep
                       algorithm or spelling.".into(),
             });
             report.config_error = Some(error.to_string());
-            None
+            report.fits = false;
+            return Ok(report);
         }
     };
     report.quantization = modelopt.as_ref().map(|m| m.summary());
@@ -987,8 +1184,12 @@ fn plan_unrestricted(input: &PlanInput, options: &PlanOptions) -> Result<PlanRep
     report.numerics_deviations = numerics_deviations(family.id(), &report.module_numerics);
     if let Some(executor) = crate::placement::families::executor(family.id()) {
         let gpus = options.layout.as_ref().map_or(1, |layout| layout.rtx_bytes.len());
+        let all_onboarded = options.layout.as_ref().is_some_and(|layout|
+            input.family_model().ok().is_some_and(|model| model.spec().moe_layers() > 0
+                && layout.resolve_onboard(model.spec().moe_layers())
+                    == Some(crate::placement::Onboard::Layers(model.spec().moe_layers()))));
         let peer = options.layout.as_ref().is_some_and(|layout| layout.head_split)
-            && (family.id() != "qwen4" || options.placement == ExpertPlacement::Local);
+            && (family.id() != "qwen4" || options.placement == ExpertPlacement::Local || all_onboarded);
         match executor.check_attention(options.attention_placement, gpus, peer) {
             Ok(mode) => report.attention_placement = mode,
             Err(error) => {
@@ -1020,13 +1221,14 @@ fn plan_unrestricted(input: &PlanInput, options: &PlanOptions) -> Result<PlanRep
                     (cuteafd-loader/src/families/{}/config.rs); extend it and the engine together.",
                     family.id(), family.id()),
             });
+            report.fits = false;
             report.config_error.get_or_insert_with(|| error.0.clone());
             return Ok(report);
         }
     };
     report.vision = model.vision_mode(options.vision);
     // An unset Spark budget is the family's own (Kimi K3 admits more than the
-    // shared default); an explicit --spark-budget-gib always wins.
+    // shared default); an explicit --spark-memory-cap always wins.
     let mut resolved = options.clone();
     if let Some(layout) = &mut resolved.layout { layout.decode_lanes = report.decode_lanes; }
     resolved.apply_spark_budget();
@@ -1158,25 +1360,9 @@ fn plan_unrestricted(input: &PlanInput, options: &PlanOptions) -> Result<PlanRep
         let mut memory = family_layout(model, input, &mut report, &mut layout_options, options.placement)?;
         report.prefill_unit_rows = layout_options.prefill_unit_rows;
         report.prefill_waves = Some(layout_options.prefill_waves);
-        if family.id() == "deepseek_v41" && !memory.devices.is_empty() {
-            let shape = (|| -> anyhow::Result<crate::EngramStagingShape> {
-                use anyhow::Context;
-                Ok(crate::EngramStagingShape::new(
-                    usize::try_from(layout_options.prefill_unit_rows.context("V4.1 prefill unit missing")?)?,
-                    usize::try_from(layout_options.prefill_waves)?)?)
-            })()?;
-            report.mapped_placement = crate::formats::mapped_preload::MappedPlacement::resolve(
-                mapped_names, scales, scale_bytes, options.mapped_scale_preload_bytes,
-                shape.preload_budget(host_budget, layout::engram_row_bytes(input.checkpoint())?)).admit_tables(table_bytes);
-            report.bytes_by_owner.remove("host-preloaded");
-            if report.mapped_placement.preloaded_bytes > 0 {
-                report.bytes_by_owner.insert("host-preloaded".into(), report.mapped_placement.preloaded_bytes);
-            }
-            layout::mapped_table_note(&report, &mut memory.notes);
-        }
         if let Some(placement) = &report.solver_placement {
             report.onboard_layers = Some(placement.onboard_layers);
-            report.max_pool_tokens_no_onboard = Some(placement.max_pool_tokens_no_onboard);
+            report.max_pool_tokens_no_onboard = placement.max_pool_tokens_no_onboard;
         }
         if layout_options.host_embedding {
             for note in memory.notes.iter().filter(|n| n.starts_with("host embedding ineligible:")) {
@@ -1197,8 +1383,19 @@ fn plan_unrestricted(input: &PlanInput, options: &PlanOptions) -> Result<PlanRep
             }
         }
         let refused = !report.placement_supported && memory.devices.is_empty();
+        if !memory.devices.is_empty() {
+            // The serving context: explicit, else the checkpoint's maximum.
+            let context = if layout_options.context_tokens > 0 { layout_options.context_tokens } else {
+                report.cache_requirements.as_ref().and_then(|cache| cache.checkpoint_max_context_tokens).unwrap_or(0) };
+            let physical = layout_options.rtx_bytes.iter().map(|&bytes| crate::placement::CoordinatorCard::planned(
+                bytes, layout_options.physical_sms).physical_bytes).min().unwrap_or(u64::MAX);
+            report.memory_policy_lines = crate::placement::reserve::layout_lines(&memory,
+                report.family.as_deref().unwrap_or(""), context, &layout_options.rtx_bytes, physical);
+        }
         report.memory_layout = Some(memory);
-        if !refused { layout::charge_host(&mut report, &layout_options, input, false)?; }
+        if !refused && !model.contract_admission() {
+            layout::charge_host(&mut report, &layout_options, input, false)?;
+        }
     }
     if !report.unclassified.is_empty() {
         report.hints.push(Hint {
@@ -1219,14 +1416,29 @@ fn plan_unrestricted(input: &PlanInput, options: &PlanOptions) -> Result<PlanRep
     }
     if options.layout.is_none() {
         // A tensor-only inventory does not request an external speculation checkpoint.
-        let mut inventory = layout::LayoutOptions { rtx_bytes: vec![options.coordinator_budget_bytes], spark_bytes: options.spark_budget(),
+        let mut inventory = layout::LayoutOptions { rtx_bytes: vec![options.coordinator_gpu_budget_bytes], spark_bytes: options.spark_budget(),
             spark_allocation_budget_bytes: Some(options.spark_budget()), glm5_drafter_disabled: true,
             glmf_drafter_disabled: true, native_mtp_layers: if ownership.uses_checkpoint() { 3 } else { 0 },
-            weight_budget_bytes: options.coordinator_budget_bytes, ..Default::default() };
+            weight_budget_bytes: options.coordinator_budget_bytes, inventory: true, ..Default::default() };
         let _ = family_layout(model, input, &mut report, &mut inventory, options.placement)?;
         report.prefill_unit_rows = inventory.prefill_unit_rows;
         report.prefill_waves = Some(inventory.prefill_waves);
     }
+    finalize_media_report(&mut report, checkpoint, family, spec)?;
+    if family.runtime() == RuntimeStatus::Planned && !report.native_serving_admitted {
+        report.fits = false;
+        report.placement_supported = false;
+        report.hints.push(Hint {
+            what: "planned family has no executable serving admission in this build".into(),
+            how: "The component bytes are a checkpoint inventory, not a serving-fit result; implement and gate the runtime first.".into(),
+        });
+    }
+    Ok(report)
+}
+
+/// Publish media ownership and the shared encoder handshake for every storage format.
+fn finalize_media_report(report: &mut PlanReport, checkpoint: &Checkpoint,
+    family: &dyn Family, spec: &ModelSpec) -> Result<(), PlanError> {
     if let Some(encoder) = &report.encoder {
         let owner = match &encoder.kind {
             encoder::EncoderKind::Rtx { gpu } => Some(format!("rtx{gpu} vision")),
@@ -1294,25 +1506,18 @@ fn plan_unrestricted(input: &PlanInput, options: &PlanOptions) -> Result<PlanRep
         }
     }
     report.encoder_plan_hash = format!("{:x}", hash.finalize());
-    if family.runtime() == RuntimeStatus::Planned && !report.native_serving_admitted {
-        report.fits = false;
-        report.placement_supported = false;
-        report.hints.push(Hint {
-            what: "planned family has no executable serving admission in this build".into(),
-            how: "The component bytes are a checkpoint inventory, not a serving-fit result; implement and gate the runtime first.".into(),
-        });
-    }
-    Ok(report)
+    Ok(())
 }
 
-/// Places the routed experts (Spark slices or the coordinator) and checks
-/// memory: the widest Spark rank against the Spark budget, the coordinator's
-/// own tensors (plus every expert, local-only) against its budget.
+/// Inventory display and routed-package compatibility. Native family owners
+/// enforce coordinator resident-weight admission independently of source bytes.
 fn place(report: &mut PlanReport, options: &PlanOptions, spec: &ModelSpec, model: &dyn FamilyModel,
     routed_operands: &BTreeMap<String, QuantOperand>) {
     if spec.moe.is_none() {
-        report.placement = ExpertPlacement::Local;
-        report.spark_ranks = 0;
+        if !matches!(report.vision, MediaMode::Spark(_)) && !matches!(report.audio, MediaMode::Spark(_)) {
+            report.placement = ExpertPlacement::Local;
+            report.spark_ranks = 0;
+        }
         report.min_spark_ranks = Some(0);
     }
     let bytes_of = |owner: Owner| -> u64 {
@@ -1345,7 +1550,6 @@ fn place(report: &mut PlanReport, options: &PlanOptions, spec: &ModelSpec, model
     });
     let intermediate = spec.moe.as_ref().map(|moe| moe.intermediate);
     let gib = |bytes: f64| bytes / GIB;
-    let coordinator = options.coordinator_budget_bytes as f64;
     if routed > 0 {
         let share = |ranks: usize| -> Option<f64> {
             let contract = contract.as_ref()?;
@@ -1381,6 +1585,14 @@ fn place(report: &mut PlanReport, options: &PlanOptions, spec: &ModelSpec, model
             (_, None) => {} // the routed-expert component already reports its missing kernel
             (ExpertPlacement::Sparks { ranks }, Some(contract)) => {
                 report.spark_rank_share = share(ranks).unwrap_or(0.0);
+                let all_onboarded = options.layout.as_ref()
+                    .and_then(|layout| layout.resolve_onboard(spec.moe_layers()))
+                    == Some(crate::placement::Onboard::Layers(spec.moe_layers()));
+                // Joint admission, not the available host count, chooses expert ownership.
+                if options.layout.is_some() && (model.admits_expert_packages() || all_onboarded) {
+                    report.experts = Some(contract.clone());
+                    return;
+                }
                 if let Some(worlds) = experts::frozen_refusal(&contract.package, ranks) {
                     // Frozen formats admit only the worlds they shipped on, for every family.
                     report.placement_supported = false;
@@ -1430,34 +1642,9 @@ fn place(report: &mut PlanReport, options: &PlanOptions, spec: &ModelSpec, model
                         how: format!("{advice}."),
                     });
                 }
-                // GLM Flash's selected solver ledger checks the full resident layout,
-                // including TP2 halves; source bytes on one GPU are not its admission.
-                Ok(_) if spec.family == "glm5_flash" && options.layout.is_some() => {}
-                Ok(_) => {
-                    let need = (rtx + routed) as f64;
-                    if need > coordinator {
-                        report.fits = false;
-                        report.hints.push(Hint {
-                            what: format!("local-only placement needs {:.1} GiB on the coordinator GPU ({:.1} GiB \
-                                routed experts + {:.1} GiB other weights), {:.1} GiB over the {:.0} GiB budget",
-                                gib(need), gib(routed as f64), gib(rtx as f64), gib(need - coordinator), gib(coordinator)),
-                            how: format!("{advice}."),
-                        });
-                    }
-                }
+                Ok(_) => {}
             },
         }
-    }
-    // The weight budget is per coordinator GPU; a head-split layout spreads
-    // the backbone over each GPU it names.
-    let gpus = options.layout.as_ref().filter(|l| l.head_split).map_or(1, |l| l.rtx_bytes.len().max(1));
-    if options.placement != ExpertPlacement::Local && rtx as f64 > coordinator * gpus as f64 {
-        report.fits = false;
-        report.hints.push(Hint {
-            what: format!("coordinator weights need {:.1} GiB, over the {:.0} GiB coordinator budget{}",
-                gib(rtx as f64), gib(coordinator * gpus as f64), if gpus > 1 { format!(" ({gpus} GPUs)") } else { String::new() }),
-            how: "Split the backbone over two coordinator GPUs or move components to Sparks.".into(),
-        });
     }
     report.experts = contract;
 }
@@ -1489,16 +1676,26 @@ pub fn plan_spark_count(snapshot: &Path, options: &PlanOptions, available: usize
 /// checkpoint and catalog `input` already read.
 fn plan_spark_count_of(input: &PlanInput, options: &PlanOptions, available: usize,
     explicit: Option<usize>) -> Result<PlanReport, PlanError> {
+    plan_spark_count_with(input, options, available, explicit, |candidate| input.plan(candidate))
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn plan_spark_count_with(input: &PlanInput, options: &PlanOptions, available: usize,
+    explicit: Option<usize>,
+    mut plan_one: impl FnMut(&PlanOptions) -> Result<PlanReport, PlanError>) -> Result<PlanReport, PlanError> {
     if available > 8 {
         return Err(PlanError::InvalidOption { option: "available Sparks", reason: "inventory exceeds transport limit 8".into() });
     }
     let count = explicit.unwrap_or(available);
-    let candidate = |ranks| -> Result<PlanReport, PlanError> {
+    let mut candidate = |ranks| -> Result<PlanReport, PlanError> {
         let mut candidate = PlanOptions {
             placement: ExpertPlacement::from_spark_ranks(ranks), ..options.clone()
         };
-        let mut report = input.plan(&candidate)?;
-        if ranks == 0 || candidate.layout.is_none() {
+        let mut report = plan_one(&candidate)?;
+        // Shared Recipe families admit one fixed prefill shape. Preserve their
+        // typed refusal instead of retrying smaller reserves in a second solve.
+        if ranks == 0 || candidate.layout.is_none()
+            || input.family_model().is_ok_and(|model| model.contract_admission()) {
             return Ok(report);
         }
         // The prefill reserve is sized first (TJ 2026-10-27): the largest
@@ -1533,7 +1730,7 @@ fn plan_spark_count_of(input: &PlanInput, options: &PlanOptions, available: usiz
         let mut at = |reserve: u64| -> Result<PlanReport, PlanError> {
             let mut report = if reserve == RESERVE_ROWS { report.clone() } else {
                 candidate.layout.as_mut().unwrap().prefill_reserve_rows = Some(reserve);
-                input.plan(&candidate)?
+                plan_one(&candidate)?
             };
             report.prefill_reserve_rows = Some(reserve);
             Ok(report)
@@ -1631,10 +1828,14 @@ pub fn render(report: &PlanReport) -> String {
             let _ = writeln!(out, "host item  {}: {} bytes ({:?})", item.group, item.bytes, item.basis);
         }
     }
-    if let (Some(layers), Some(maximum)) = (report.onboard_layers, report.max_pool_tokens_no_onboard) {
+    if let Some(ledger) = &report.phase_ledger { ledger.render(&mut out); }
+    if let Some(layers) = report.onboard_layers {
         let pool = report.memory_layout.as_ref().map_or(0, |memory| memory.pool_tokens);
-        let _ = writeln!(out, "pool       {pool} tokens admitted with {layers} RTX expert layers; max_pool_tokens_no_onboard {maximum}");
+        let maximum = report.max_pool_tokens_no_onboard
+            .map(|maximum| format!("; max_pool_tokens_no_onboard {maximum}")).unwrap_or_default();
+        let _ = writeln!(out, "pool       {pool} tokens admitted with {layers} RTX expert layers{maximum}");
     }
+    for line in &report.memory_policy_lines { let _ = writeln!(out, "memory     {line}"); }
     if let Some(warning) = &report.spark_count_warning { let _ = writeln!(out, "warning: {warning}"); }
     if report.disabled_media_bytes > 0 { out.push_str(&format!("media disabled: {} bytes saved\n", report.disabled_media_bytes)); }
     if let Some(cap) = report.max_image_tokens {
@@ -1709,6 +1910,8 @@ pub fn render(report: &PlanReport) -> String {
                     }
                     AttentionKind::MlaDsa { indexer } => format!("mla-dsa{}", if *indexer { "+idx" } else { "(shared idx)" }),
                     AttentionKind::Gqa { heads, kv_heads, head_dim } => format!("gqa {heads}/{kv_heads}x{head_dim}"),
+                    AttentionKind::BlockSparseGqa { heads, kv_heads, head_dim, block, topk_blocks, .. } =>
+                        format!("block-sparse-gqa {heads}/{kv_heads}x{head_dim} top{topk_blocks}x{block}"),
                     AttentionKind::SlidingGqa { window, sinks, .. } => {
                         format!("swa-gqa w{window}{}", if *sinks { "+sink" } else { "" })
                     }

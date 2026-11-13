@@ -12,7 +12,7 @@
 //! hold), runs its half of the resident experts on the unchanged TP2 expert
 //! kernel, and the halves meet on the Spark reduce's GPU, whose result joins
 //! that reduce as one more plane. The Spark request leaves the same experts to the
-//! coordinator (`ReplicatedGroupPlanner::set_tier`), so every route runs
+//! coordinator (the immutable coordinator resident sets), so every route runs
 //! exactly once.
 use super::{ExpertLayer, ExpertWeights};
 use crate::shared::experts::rtx::pair::{OwnerPolicy, OwnerWeights};
@@ -113,17 +113,30 @@ pub(crate) fn load_halves<'a>(devices: [Device<'a>; 2], catalog: &OfficialV41Cat
     ensure!(devices[0].id != devices[1].id && std::ptr::eq(devices[0].library, devices[1].library),
         "tier halves need two GPUs of one library");
     ensure!(resident.len() <= catalog.routed_experts().layers, "tier names more layers than the backbone has");
+    let ids = resident.iter().map(|ids| ids.iter().map(|&id| usize::from(id)).collect::<Vec<_>>())
+        .collect::<Vec<_>>();
+    if ids.iter().all(Vec::is_empty) {
+        return Ok([devices[0].own(|| Ok(Vec::new()))?, devices[1].own(|| Ok(Vec::new()))?]);
+    }
+    let mut layouts = Vec::with_capacity(2);
+    for rank in 0..2 {
+        let (layout, staging) = ExpertWeights::resident_arena_layout(devices[rank], catalog,
+            ids.iter().enumerate().filter(|(_, ids)| !ids.is_empty())
+                .map(|(layer, ids)| (ExpertLayer::BackboneTp2 { layer, rank }, ids.as_slice())))?;
+        crate::shared::experts::weight_layout::admit(&layout, staging, 0, budgets[rank])?;
+        layouts.push(layout);
+    }
+    let arenas = layouts.into_iter().enumerate().map(|(rank, layout)|
+        crate::shared::memory::weight_arena::DeviceWeightArena::new(devices[rank], layout,
+            cuteafd_core::memory_layout::ArenaTag::experts("experts/native-tier")))
+        .collect::<Result<Vec<_>>>()?;
     let mut halves = [devices[0].own(|| Ok(Vec::new()))?, devices[1].own(|| Ok(Vec::new()))?];
-    let mut remaining = budgets;
-    for (layer, ids) in resident.iter().enumerate().filter(|(_, ids)| !ids.is_empty()) {
-        let ids = ids.iter().map(|&id| usize::from(id)).collect::<Vec<_>>();
+    for (layer, ids) in ids.iter().enumerate().filter(|(_, ids)| !ids.is_empty()) {
         for rank in 0..2 {
             devices[rank].run(|| {
-                let half = ExpertWeights::load_resident(devices[rank].library, catalog,
-                    ExpertLayer::BackboneTp2 { layer, rank }, &ids, remaining[rank])
+                let half = ExpertWeights::load_resident_into(devices[rank].library, catalog,
+                    ExpertLayer::BackboneTp2 { layer, rank }, ids, budgets[rank], &arenas[rank])
                     .with_context(|| format!("tier layer {layer} half {rank}"))?;
-                remaining[rank] = remaining[rank].checked_sub(half.budget().resident_bytes)
-                    .context("tier halves exceed their GPU budget")?;
                 halves[rank].push((layer, half));
                 Ok(())
             })?;
@@ -132,19 +145,19 @@ pub(crate) fn load_halves<'a>(devices: [Device<'a>; 2], catalog: &OfficialV41Cat
     Ok(halves)
 }
 
-/// Each GPU's resident bytes for `resident`'s halves (what `load_halves`
-/// allocates and a push delivers), without loading anything.
+/// Each rank's physical aggregate arena bytes, including alignment, without
+/// loading or switching devices. Native sizes come from the current device;
+/// the TP2 rank selects the half, not a CUDA ordinal to enter.
 pub(crate) fn resident_bytes(library: &cuteafd_ffi::NativeLibrary, catalog: &OfficialV41Catalog,
     resident: &[Vec<u16>]) -> Result<[usize; 2]> {
-    let mut bytes = [0usize; 2];
-    for (layer, ids) in resident.iter().enumerate().filter(|(_, ids)| !ids.is_empty()) {
-        for (rank, total) in bytes.iter_mut().enumerate() {
-            let selection = ExpertLayer::BackboneTp2 { layer, rank };
-            let whole = ExpertWeights::plan(library, catalog, selection)?;
-            let experts = catalog.routed_experts().experts;
-            ensure!(whole.resident_bytes % experts == 0, "tier layer {layer} does not divide by expert");
-            *total = total.checked_add(whole.resident_bytes / experts * ids.len()).context("tier bytes overflow")?;
-        }
+    let ids = resident.iter().map(|ids| ids.iter().map(|&id| usize::from(id)).collect::<Vec<_>>())
+        .collect::<Vec<_>>();
+    if ids.iter().all(Vec::is_empty) { return Ok([0; 2]); }
+    let mut bytes = [0; 2];
+    for (rank, total) in bytes.iter_mut().enumerate() {
+        *total = ExpertWeights::resident_arena_layout_current(library, rank as i32, catalog,
+            ids.iter().enumerate().filter(|(_, ids)| !ids.is_empty())
+                .map(|(layer, ids)| (ExpertLayer::BackboneTp2 { layer, rank }, ids.as_slice())))?.0.bytes();
     }
     Ok(bytes)
 }
@@ -215,12 +228,12 @@ impl<'a> TierLane<'a> {
         let [table_bytes, slot_bytes] = Self::allocation_sizes(shape, capacity);
         let table: Vec<u8> = residency.slot_tables().iter().flat_map(|slot| slot.to_ne_bytes()).collect();
         let tables = devices.map(|device| -> Result<Allocation<'a>> {
-            let allocation = Allocation::new(device, table_bytes)?;
+            let allocation = Allocation::new(device, table_bytes, cuteafd_core::memory_layout::Tag::workspace("v41/tier/tables"))?;
             device.run(|| device.library.copy_h2d(allocation.buffer, &table))?;
             Ok(allocation)
         });
         let [left, right] = tables;
-        let slots = devices.map(|device| Allocation::new(device, slot_bytes));
+        let slots = devices.map(|device| Allocation::new(device, slot_bytes, cuteafd_core::memory_layout::Tag::workspace("v41/tier/routes")));
         let [first, second] = slots;
         Ok(Self { residency, tables: [left?, right?], slots: [first?, second?],
             kernel: devices[0].library.v41_tier_slots()?, shape, capacity })
@@ -271,8 +284,8 @@ pub(crate) fn probe_ids(experts: usize) -> Vec<u32> {
 /// `slot_of` tables) and `kernel`, synchronously on a stream of its own.
 pub(crate) fn probe_slots<'a>(device: Device<'a>, kernel: &TierSlotKernel<'_>, tables: CuteafdDeviceBuffer,
     shape: TierSlotShape, layer: usize, probe: &[u32]) -> Result<Vec<i32>> {
-    let ids = Allocation::new(device, probe.len() * 4)?;
-    let slots = Allocation::new(device, probe.len() * 4)?;
+    let ids = Allocation::new(device, probe.len() * 4, cuteafd_core::memory_layout::Tag::workspace("v41/tier/probe"))?;
+    let slots = Allocation::new(device, probe.len() * 4, cuteafd_core::memory_layout::Tag::workspace("v41/tier/probe"))?;
     let stream = Stream::new(device)?;
     device.run(|| device.library.copy_h2d(ids.buffer, &probe.iter().flat_map(|id| id.to_ne_bytes()).collect::<Vec<_>>()))?;
     // SAFETY: every buffer is this function's or the caller's live tables;

@@ -40,7 +40,9 @@ class PlacementHandoffTest(unittest.TestCase):
             setup=r'''
 set -euo pipefail
 source scripts/lib/release-common.sh
+source scripts/lib/family-keys.sh
 release_die() { echo "$*" >&2; exit 1; }
+get() { printf '%s' "${2:-}"; }
 RELEASE_RTX_GPUS="$1"
 repo_root="$PWD"
 coordinator=coordinator
@@ -59,7 +61,9 @@ HTTP_QUEUE_WAIT_MS=25000
 RTX_EXPERT_LAYERS=auto
 HOST_CACHE_BYTES=auto
 KV_POOL_SIZE=
-MEMORY_RESERVATION=
+memory_policy_args=()
+v41_weight_budget_gib=95.5
+spark_memory_args=()
 SPECULATOR=dspark
 EMBEDDING=gpu
 VISION=off
@@ -67,19 +71,15 @@ AUDIO=off
 RELEASE_MODEL_REVISION=0123456789012345678901234567890123456789
 lanes=(10.55.0.1 10.55.0.2 10.55.0.3 10.55.0.4)
 # Mirror the run.sh scope the extracted block relies on: release_load_config
-# defaults DSPARK_DRAFT_POLICY, and run.sh's argument parsing always defines
-# dspark_draft_limit (empty unless --dspark-draft-limit was passed). Omitting
+# defaults DRAFT_LENGTH, and run.sh's argument parsing always defines
+# draft_length (empty unless --draft-length was passed). Omitting
 # either makes the block die on `set -u` before any stub is invoked.
-DSPARK_DRAFT_POLICY=adaptive
-dspark_draft_limit=
+draft_length=
 TP2_ATTENTION=off
 TP2_QUERY_PROJECTION=off
 TP2_OUTPUT_PROJECTION=off
 TP2_DSPARK_EXPERTS=
 release_resolve_tp2_dspark_experts deepseek_v41 "$RELEASE_RTX_GPUS"
-topology_explicit=0
-spark_ep=1
-spark_admission=not-applicable
 spark_exl3_identity=
 gpu_request=device=uuid0,uuid1
 gpu_uuid_csv=uuid0,uuid1
@@ -89,7 +89,6 @@ site_hub=0
 namespace_root=/mnt/sparknest
 COORDINATOR_DOCKER_INFERENCE=coordinator-image
 SPARK_EXPERT_DOCKER_INFERENCE=spark-image
-SPARK_DEVICE_BUDGET_BYTES=1000000
 spark_prefix=worker
 hosts=(a b c d)
 EXPERT_PORT=19441
@@ -113,15 +112,18 @@ resolved_decode_lanes=2
             if encoder is not None:
                 setup+='\nVISION=auto\ncount_plan="$ENCODER_PLAN"\n'
             setup+=f'\nRTX_EXPERT_LAYERS={local_layers}\nSPARK_COUNT={spark_count}\nhosts=("${{hosts[@]:0:SPARK_COUNT}}")\n'
-            # Legacy geometry: release_spark_tp defaults to SPARK_COUNT and
-            # release_spark_ep to 1 when no explicit topology is configured.
             setup+=f'spark_tp={spark_count}\n'
             if spark_count == 2:
-                setup+='MEMORY_RESERVATION=32GiB\nKV_POOL_SIZE=2GiB\npeers=10.55.0.1:19441,10.55.0.2:19441\n'
+                setup+='memory_policy_args=(--gpu-memory-cap 32GiB)\nKV_POOL_SIZE=2GiB\npeers=10.55.0.1:19441,10.55.0.2:19441\n'
             setup+=''.join(f'\nTP2_{option}=on\n' for option in options)
             if dspark_experts is not None:
                 setup+=f'\nTP2_DSPARK_EXPERTS={dspark_experts}\n'
             count_plan = {**(encoder or {}), "spark_admission": "coordinator_authoritative"}
+            count_plan["memory_layout"] = dict(devices=[dict(kind="spark", index=i, worker_budget_bytes=107374182400) for i in range(spark_count)])
+            count_plan.update(spark_expert_world=spark_count,
+                spark_roles=[dict(rank=i, experts=True, encoder=(encoder or {}).get("encoder") if i == (encoder or {}).get("encoder", {}).get("kind", {}).get("rank") else None) for i in range(spark_count)])
+            setup += f"\nspark_expert_world={spark_count}\nspark_worker_ranks=({' '.join(map(str, range(spark_count)))})\n"
+            setup += "spark_vision_ranks=(" + (str(encoder["encoder"]["kind"]["rank"]) if encoder else "") + ")\n"
             setup += "\ncount_plan=" + __import__("shlex").quote(json.dumps(count_plan)) + "\n"
             result=subprocess.run(['bash','-c',setup+block,'test',str(gpus)],env=env,cwd=ROOT,capture_output=True,text=True,timeout=10)
             events=[json.loads(line) for line in (root/'events').read_text().splitlines()]
@@ -155,10 +157,10 @@ resolved_decode_lanes=2
                               if tool == 'ssh' and '-s' in args]
                     self.assertEqual(len(starts), 4)
                     tails = [self.worker_tail(args) for _, args in starts]
-                    self.assertTrue(all(len(tail) == 15 for tail in tails), tails)
-                    self.assertTrue(all(tail[7:11] == ['4', '0', '4', '1'] for tail in tails))
+                    self.assertTrue(all(len(tail) == 17 for tail in tails), tails)
+                    self.assertTrue(all(tail[7] == '4' for tail in tails))
                     ready = [i for i, (tool, args) in enumerate(events)
-                             if tool == 'ssh' and any('native worker bootstrap ready' in arg for arg in args)]
+                             if tool == 'ssh' and any('worker bootstrap ready' in arg for arg in args)]
                     self.assertFalse(any('/dev/tcp' in arg for tool, args in events
                                          if tool == 'ssh' for arg in args))
                     coordinator = next(i for i, (tool, args) in enumerate(events)
@@ -184,9 +186,9 @@ resolved_decode_lanes=2
         self.assertEqual(coordinator[coordinator.index('--encoder-plan-hash')+1],'ab'*32)
         tails=[self.worker_tail(args) for tool,args in events if tool=='ssh' and '-s' in args]
         self.assertEqual(len(tails),4)
-        self.assertTrue(all(tail[15:]==['2','19541','ab'*32,
-            '0123456789012345678901234567890123456789'] for tail in tails))
-        self.assertIn('if [[ "$rank" == "${16:--1}" ]]', (ROOT/'scripts/launch/run-family.sh').read_text())
+        self.assertTrue(all(tail[12:]==[tail[2] if tail[2] == '2' else '-1','19541','ab'*32,
+            '0123456789012345678901234567890123456789','1'] for tail in tails))
+        self.assertIn('if [[ "$rank" == "${13:--1}" ]]', (ROOT/'scripts/launch/run-family.sh').read_text())
 
     def test_compact_starts_exactly_two_workers_and_passes_ceiling(self):
         result,events=self.run_startup(1,dict(version=1,rtx_gpus=1,nonce="fresh",rtx_expert_layers=0,spark_first_layer=0),spark_count=2)
@@ -195,11 +197,9 @@ resolved_decode_lanes=2
         self.assertEqual(len(starts),2)
         tails=[self.worker_tail(args) for args in starts]
         self.assertTrue(all(tail[7]=='2' for tail in tails))
-        # Legacy geometry tail: explicit flag off, TP=SPARK_COUNT, EP=1.
-        self.assertTrue(all(tail[8:11]==['0','2','1'] for tail in tails))
         coordinator=next(args for tool,args in events if tool=='docker' and args[0]=='run')
         self.assertEqual(coordinator[coordinator.index('--peers')+1], '10.55.0.1:19441,10.55.0.2:19441')
-        self.assertEqual(coordinator[coordinator.index('--memory-reservation')+1], '32GiB')
+        self.assertEqual(coordinator[coordinator.index('--gpu-memory-cap')+1], '32GiB')
         self.assertEqual(coordinator[coordinator.index('--kv-pool-size')+1], '2GiB')
 
     def test_zero_spark_launch_has_no_remote_workers(self):

@@ -172,10 +172,10 @@ mod tests {
         let kernels = library.route_census()?;
         let shape = RouteCensusShape { layers: 40, experts: 384, topk: 6 };
         let capacity = 4096usize;
-        let mut ids_buffer = library.alloc_device_buffer(capacity * shape.topk * 4)?;
-        let mut live_buffer = library.alloc_device_buffer(capacity)?;
-        let mut counts = library.alloc_device_buffer(shape.bytes())?;
-        let mut phase = library.alloc_device_buffer(1)?;
+        let mut ids_buffer = library.alloc_device_buffer(capacity * shape.topk * 4, crate::memory_ledger::Tag::workspace("test/route-census"))?;
+        let mut live_buffer = library.alloc_device_buffer(capacity, crate::memory_ledger::Tag::workspace("test/route-census"))?;
+        let mut counts = library.alloc_device_buffer(shape.bytes(), crate::memory_ledger::Tag::workspace("test/route-census"))?;
+        let mut phase = library.alloc_device_buffer(1, crate::memory_ledger::Tag::workspace("test/route-census"))?;
         let stream = library.cuda_stream_create()?;
         let read = |counts: CuteafdDeviceBuffer| -> Result<Vec<u64>> {
             let mut bytes = vec![0u8; shape.bytes()];

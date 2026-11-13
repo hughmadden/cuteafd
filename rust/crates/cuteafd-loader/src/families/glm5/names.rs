@@ -110,6 +110,26 @@ impl GlmDsaConfig {
         })
     }
 
+    /// Plain resident operand names shared by the native reader and weight census.
+    pub fn plain_owners(&self, layer: usize) -> Vec<(&'static str, String)> {
+        use Operand::*;
+        let mut names = Vec::new();
+        for (key, op) in [("input_norm", InputNorm), ("post_norm", PostAttentionNorm),
+            ("q_a_norm", QANorm), ("kv_a_norm", KvANorm), ("gate.bias", RouterBias),
+            ("query_scale_s", QueryScaleS), ("query_scale_b", QueryScaleB),
+            ("index_scale_s", IndexQueryScaleS), ("index_scale_b", IndexQueryScaleB)] {
+            if let Some(name) = self.weight(layer, op) { names.push((key, name)); }
+        }
+        for (weight, bias, op) in [("k_norm_w", "k_norm_b", IndexKNorm),
+            ("index_q_norm_w", "index_q_norm_b", IndexQNorm)] {
+            if let Some(stem) = self.stem(layer, op) {
+                names.push((weight, format!("{stem}.weight")));
+                names.push((bias, format!("{stem}.bias")));
+            }
+        }
+        names
+    }
+
     pub fn embedding(&self) -> &'static str {
         if self.variant.is_glm() { "model.embed_tokens.weight" } else { "tok_embeddings.weight" }
     }

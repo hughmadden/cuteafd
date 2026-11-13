@@ -3,6 +3,7 @@ pub(crate) mod distributed;
 pub(crate) mod distributed_target;
 use crate::families::deepseek_v41::v41_attention_binding::QueryBinding;
 use crate::families::deepseek_v41::v41_block::BlockOutput;
+use crate::shared::memory::Tag;
 use crate::shared::memory::{DeviceAllocation, HostAllocation, LoadStream};
 use crate::families::deepseek_v41::v41_tensors::{NativeRtxTensors, VocabularyHead};
 use anyhow::{Context, Result, ensure};
@@ -38,16 +39,29 @@ pub(crate) struct TargetHeadWeights<'a> {
     norm: NativeRtxTensors<'a>,
 }
 impl<'a> TargetHeadWeights<'a> {
+    pub(crate) fn inventory(&self, inventory: &mut crate::shared::memory::receipts::Inventory<'_>) -> Result<()> {
+        self.norm.inventory(inventory)
+    }
     pub fn device_bytes(catalog: &OfficialV41Catalog) -> Result<usize> {
         let bytes = NativeRtxTensors::plan(catalog, &["norm.weight".into()])?;
         ensure!(bytes == 10240, "unexpected target norm geometry");
         Ok(bytes)
     }
+    #[cfg(test)]
     pub fn load(
         library: &'a NativeLibrary,
         catalog: &OfficialV41Catalog,
         budget: usize,
         staging: usize,
+    ) -> Result<Self> {
+        Self::load_in(library, catalog, budget, staging, None)
+    }
+    pub fn load_in(
+        library: &'a NativeLibrary,
+        catalog: &OfficialV41Catalog,
+        budget: usize,
+        staging: usize,
+        arena: Option<&crate::shared::memory::weight_arena::DeviceWeightArena<'a>>,
     ) -> Result<Self> {
         ensure!(
             Self::device_bytes(catalog)? <= budget,
@@ -55,12 +69,8 @@ impl<'a> TargetHeadWeights<'a> {
         );
         Ok(Self {
             library,
-            norm: NativeRtxTensors::load(
-                library,
-                catalog,
-                &["norm.weight".into()],
-                budget,
-                staging,
+            norm: NativeRtxTensors::load_in(
+                library, catalog, &["norm.weight".into()], budget, staging, arena,
             )?,
         })
     }
@@ -75,11 +85,16 @@ impl<'a> TargetHeadWeights<'a> {
             "target head wave exceeds budget"
         );
         let workspace =
-            DeviceAllocation::new(self.library, V41VocabularyProjection::WORKSPACE_BYTES)?;
-        let projection = unsafe { self.library.v41_vocabulary_head(workspace.buffer)? };
+            DeviceAllocation::new(self.library, V41VocabularyProjection::WORKSPACE_BYTES, Tag::workspace("v41/blas/target-head"))?;
+        let native = crate::families::deepseek_v41::v41_tensors::fp8_scratch(self.library, head.copy(), capacity,
+            crate::families::deepseek_v41::v41_tensors::Fp8Head::All)?;
+        let projection = if native.is_some() { None } else {
+            Some(unsafe { self.library.v41_vocabulary_head(workspace.buffer,
+                crate::shared::target_head::TargetHead::configured().native_mode())? })
+        };
         let buffers = STRIDES
             .into_iter()
-            .map(|n| DeviceAllocation::new(self.library, n * capacity))
+            .map(|n| DeviceAllocation::new(self.library, n * capacity, Tag::workspace("v41/target-head")))
             .collect::<Result<Vec<_>>>()?;
         ensure!(
             head.device_id() == buffers[0].buffer.device_id
@@ -98,14 +113,13 @@ impl<'a> TargetHeadWeights<'a> {
             weights: self,
             head,
             capacity,
-            graphs: crate::shared::decode_graph::RowGraphs::new(self.library, "target_head", capacity),
-            fp8_scratch: crate::families::deepseek_v41::v41_tensors::fp8_scratch(self.library, head.copy(), capacity,
-                crate::families::deepseek_v41::v41_tensors::Fp8Head::All)?,
+            graphs: crate::shared::decode_graph::RowGraphs::new(self.library, "target_head", capacity, "deepseek_v41"),
+            fp8_scratch: native,
             ready: None,
             origin: None,
             selected: Vec::new(),
             tokens: Vec::new(),
-            greedy_staging: HostAllocation::new(self.library, capacity * 8)?,
+            greedy_staging: HostAllocation::new(self.library, capacity * 8, Tag::staging("v41/target-head"))?,
             greedy_ready: false,
             sampling: TargetSamplingWave::new(self.library, capacity, SAMPLING_VOCAB)?,
             download: crate::shared::memory::RowDownload::new(self.library, capacity * STRIDES[4])?,
@@ -130,7 +144,7 @@ impl TargetLogits<'_> {
 pub(crate) struct TargetHeadWave<'w, 'a> {
     download: crate::shared::memory::RowDownload<'a>,
     stream: LoadStream<'a>,
-    projection: V41VocabularyProjection<'a>,
+    projection: Option<V41VocabularyProjection<'a>>,
     _workspace: DeviceAllocation<'a>,
     hc: V41Hc<'a>,
     buffers: Vec<DeviceAllocation<'a>>,
@@ -150,7 +164,7 @@ pub(crate) struct TargetHeadWave<'w, 'a> {
     greedy_ready: bool,
     sampling: TargetSamplingWave<'a>,
 }
-impl TargetHeadWave<'_, '_> {
+impl<'a> TargetHeadWave<'a, '_> {
     /// Target verification rows are bounded by the shared V4.1 verifier budget.
     pub fn device_bytes(capacity: usize) -> Result<usize> {
         ensure!(
@@ -198,7 +212,7 @@ impl TargetHeadWave<'_, '_> {
                 1e-20,
                 self.stream.raw,
             )?;
-            crate::families::deepseek_v41::v41_tensors::project_target_vocabulary(self.stream.library, &self.projection,
+            crate::families::deepseek_v41::v41_tensors::project_target_vocabulary(self.stream.library, self.projection.as_ref(),
                 self.head.weight(), self.head.copy().zip(self.fp8_scratch.as_ref()), self.b(3), self.b(4), rows,
                 self.stream.raw)?;
             Ok(())
@@ -224,33 +238,47 @@ impl TargetHeadWave<'_, '_> {
         }
         unsafe { self.capture_ready(rows) }
     }
+    pub(crate) fn capture_startup(&mut self, rows: &[usize]) -> Result<()> {
+        self.synchronize()?;
+        for &row in rows {
+            if self.graph(row).is_none() {
+                // SAFETY: recording owns all buffers and never executes its inputs.
+                unsafe { self.capture_ready(row)?; }
+                crate::shared::decode_graph::device::observe_device(self.stream.library, self.b(0).device_id)?;
+            }
+        }
+        Ok(())
+    }
     unsafe fn capture_ready(&mut self, rows: usize) -> Result<()> {
         self.invalidate();
         ensure!((1..=self.capacity).contains(&rows) && self.graph(rows).is_none(),
             "target head graph for {rows} rows already captured or out of range");
+        let Some(mut ticket) = self.graphs.cache_ticket(&rows,
+            super::graph_policy::pinned_shape(self.b(0).device_id, rows as u32), None) else { return Ok(()) };
         unsafe {
-            self.stream
+            ticket.capture_result(self.stream
                 .library
-                .cuda_graph_begin_capture(self.stream.raw)?;
+                .cuda_graph_begin_capture(self.stream.raw))?;
         }
         let launched = unsafe { self.enqueue(rows) };
-        let captured = unsafe { self.stream.library.cuda_graph_end_capture(self.stream.raw) };
+        let captured = unsafe { ticket.capture_result(self.stream.library.cuda_graph_end_capture_topology(self.stream.raw)) };
         match (launched, captured) {
-            (Ok(()), Ok(graph)) => {
+            (Ok(()), Ok((graph, nodes, width, spans, _))) => {
                 // SAFETY: warmup drained and the wave owns every captured pointer.
-                if let Err(error) = unsafe { self.graphs.insert(rows, graph) } {
+                if let Err(error) = unsafe { self.graphs.cache_insert(rows, graph, ticket, nodes as u64, width, spans) } {
                     // SAFETY: failed insertion did not take ownership of graph.
                     unsafe { self.stream.library.cuda_graph_exec_destroy(graph)?; }
                     return Err(error);
                 }
                 Ok(())
             }
-            (Err(e), Ok(graph)) => {
+            (Err(e), Ok((graph, ..))) => {
                 unsafe {
                     self.stream.library.cuda_graph_exec_destroy(graph)?;
                 }
                 Err(e)
             }
+            (Ok(()), Err(error)) if cuteafd_ffi::is_small_graph(&error) => Ok(()),
             (Err(e), Err(_)) | (Ok(()), Err(e)) => Err(e),
         }
     }
@@ -258,7 +286,7 @@ impl TargetHeadWave<'_, '_> {
     /// Same inputs as execute; live row count must match the captured graph.
     pub unsafe fn replay(&mut self, rows: usize) -> Result<TargetLogits<'_>> {
         self.validate(rows)?;
-        let graph = self.graph(rows).context("target head graph missing")?;
+        let graph = self.graphs.cached_launch(rows).context("target head graph missing")?;
         let launched = unsafe {
             self.stream
                 .library
@@ -363,7 +391,9 @@ impl TargetHeadWave<'_, '_> {
         unsafe { self.copy_block(block, selected)?; }
         self.synchronize()?;
         if super::graph_policy::captures_shape(selected.len() as u32) {
-            unsafe { self.capture_block_head(selected.len())?; self.replay(selected.len())?; }
+            if self.graph(selected.len()).is_none() {
+                unsafe { self.capture_block_head(selected.len())?; }
+            } else { unsafe { self.replay(selected.len())?; } }
         } else { unsafe { self.execute(selected.len())?; } }
         self.publish_block(block, selected);
         self.output()
@@ -375,12 +405,13 @@ impl TargetHeadWave<'_, '_> {
         unsafe { self.copy_block(block, selected)?; }
         // Warmup and replay consume input copies on this same stream.
         let captured = super::graph_policy::captures_shape(selected.len() as u32);
-        if captured && self.graph(selected.len()).is_none() {
+        let warmed = captured && self.graph(selected.len()).is_none();
+        if warmed {
             unsafe { self.prepare_head_cooperative(selected.len()).await?; }
         }
         self.invalidate();
-        let launched = if captured {
-            let graph = self.graph(selected.len()).context("target head graph missing")?;
+        let launched = if warmed { Ok(()) }
+        else if let Some(graph) = self.graphs.cached_launch(selected.len()).filter(|_| captured) {
             unsafe { self.stream.library.cuda_graph_launch(graph, self.stream.raw) }
         } else { unsafe { self.enqueue(selected.len()) } };
         let drained = self.stream.wait().await;
@@ -394,19 +425,20 @@ impl TargetHeadWave<'_, '_> {
         unsafe { self.copy_block(block, selected)?; }
         let rows = selected.len();
         let captured = super::graph_policy::captures_shape(rows as u32);
-        if captured && self.graph(rows).is_none() {
+        let warmed = captured && self.graph(rows).is_none();
+        if warmed {
             if cooperative { unsafe { self.prepare_head_cooperative(rows).await?; } }
             else { self.synchronize()?; unsafe { self.capture_block_head(rows)?; } }
         }
         self.invalidate();
-        let graph = if captured { Some(self.graph(rows).context("target head graph missing")?) } else { None };
+        let graph = if captured && !warmed { self.graphs.cached_launch(rows) } else { None };
         let logits = Self::slice(self.b(4), 0, rows * STRIDES[4])?;
         let indices = Self::slice(self.b(5), 0, rows * 4)?;
         let scores = Self::slice(self.b(6), 0, rows * 4)?;
         let launched = (|| -> Result<()> { unsafe {
             let lib = self.stream.library;
             if let Some(graph) = graph { lib.cuda_graph_launch(graph, self.stream.raw)?; }
-            else { self.enqueue(rows)?; }
+            else if !warmed { self.enqueue(rows)?; }
             lib.cuda_logits_argmax_checked_f32_async(logits, indices, scores, rows, 129280, self.stream.raw)?;
             let host = self.greedy_staging.bytes_mut();
             lib.copy_d2h_async(&mut host[..rows*4], indices, self.stream.raw)?;
@@ -451,12 +483,13 @@ impl TargetHeadWave<'_, '_> {
         unsafe { self.copy_block(block, selected)?; }
         let rows = selected.len();
         let captured = super::graph_policy::captures_shape(rows as u32);
-        if captured && self.graph(rows).is_none() {
+        let warmed = captured && self.graph(rows).is_none();
+        if warmed {
             if cooperative { unsafe { self.prepare_head_cooperative(rows).await?; } }
             else { self.synchronize()?; unsafe { self.capture_block_head(rows)?; } }
         }
         self.invalidate();
-        let graph = if captured { Some(self.graph(rows).context("target head graph missing")?) } else { None };
+        let graph = if captured && !warmed { self.graphs.cached_launch(rows) } else { None };
         let logits = Self::slice(self.b(4), 0, rows * STRIDES[4])?;
         let staged = self
             .sampling
@@ -464,7 +497,7 @@ impl TargetHeadWave<'_, '_> {
         let launched: Result<()> = staged.and_then(|()| {
             (|| -> Result<()> { unsafe {
                 if let Some(graph) = graph { self.stream.library.cuda_graph_launch(graph, self.stream.raw)?; }
-                else { self.enqueue(rows)?; }
+                else if !warmed { self.enqueue(rows)?; }
                 self.sampling.launch(logits, rows, ordered_rows, self.stream.raw)?;
                 Ok(())
             } })()
@@ -523,8 +556,14 @@ impl TargetHeadWave<'_, '_> {
         // The head remains exclusively borrowed through transfer completion.
         unsafe { self.download.rows(logits, STRIDES[4], rows).await }
     }
+    pub(crate) fn library(&self) -> &'a NativeLibrary { self.stream.library }
     fn graph(&self, rows: usize) -> Option<*mut c_void> {
         self.graphs.get(rows)
+    }
+    pub(crate) fn visit_graph_banks(&mut self,
+        f: &mut dyn FnMut(i32, &'static str, bool, &mut dyn crate::shared::decode_graph::CacheAttached) -> Result<()>,
+    ) -> Result<()> {
+        f(self.b(0).device_id, "target_head", false, &mut self.graphs)
     }
     pub fn clear_graph(&mut self) -> Result<()> {
         self.invalidate();
@@ -1089,7 +1128,7 @@ mod sampler_wiring_tests {
             use super::recording_sampler as rec;
             let library: &'static NativeLibrary = Box::leak(Box::new(wiring_library()?));
             let mut wave = TargetSamplingWave::allocate(library, rec::stages(), rows, SAMPLING_VOCAB).unwrap();
-            let logits_buffer = library.alloc_device_buffer(rows * vocab * 4).unwrap();
+            let logits_buffer = library.alloc_device_buffer(rows * vocab * 4, crate::shared::memory::TEST).unwrap();
             let values = logits(rows, vocab);
             library.copy_h2d(logits_buffer, &logit_bytes(&values)).unwrap();
             wave.upload(&plan.rows, Some(arena), cuteafd_ffi::cuteafd_sampler_mask_words(vocab),
@@ -1581,7 +1620,7 @@ mod sampler_device_tests {
             .map(|mask| vec![mask.clone()]).collect();
         build_sampling_masks(&row_masks, &mut arena)?;
 
-        let logits_buffer = library.alloc_device_buffer(rows * VOCAB * 4)?;
+        let logits_buffer = library.alloc_device_buffer(rows * VOCAB * 4, crate::shared::memory::TEST)?;
         library.copy_h2d(logits_buffer, &bytes(&values))?;
         let stream = library.cuda_stream_create()?;
         // One wave for both launches: its buffers must not be freed under the
@@ -1735,7 +1774,7 @@ mod sampler_device_tests {
             let plan = build_target_sampling_plan(&members, &inputs)?;
             let mut arena = vec![0u32; rows * words];
             build_sampling_masks(&vec![vec![None]; rows], &mut arena)?;
-            let logits_buffer = library.alloc_device_buffer(rows * VOCAB * 4)?;
+            let logits_buffer = library.alloc_device_buffer(rows * VOCAB * 4, crate::shared::memory::TEST)?;
             library.copy_h2d(logits_buffer, &bytes(&values))?;
             let mut host_rows = vec![0u8; rows * VOCAB * 4];
             let stream = library.cuda_stream_create()?;
@@ -1824,7 +1863,7 @@ mod sampler_device_tests {
             let inputs: Vec<Vec<u32>> = vec![vec![0]; rows];
             let plan = build_target_sampling_plan(&members, &inputs)?;
             assert!(!plan.routes_need_ordered_tail());
-            let logits_buffer = library.alloc_device_buffer(rows * VOCAB * 4)?;
+            let logits_buffer = library.alloc_device_buffer(rows * VOCAB * 4, crate::shared::memory::TEST)?;
             library.copy_h2d(logits_buffer, &bytes(&values))?;
             let stream = library.cuda_stream_create()?;
             let mut wave = TargetSamplingWave::new(&library, rows, SAMPLING_VOCAB)?;
@@ -1868,10 +1907,10 @@ mod sampler_device_tests {
         // the kernel stage only.
         let rows = 48usize;
         let values = smooth_narrow(rows);
-        let logits_buffer = library.alloc_device_buffer(rows * VOCAB * 4)?;
+        let logits_buffer = library.alloc_device_buffer(rows * VOCAB * 4, crate::shared::memory::TEST)?;
         library.copy_h2d(logits_buffer, &bytes(&values))?;
-        let indices = library.alloc_device_buffer(rows * 4)?;
-        let scores = library.alloc_device_buffer(rows * 4)?;
+        let indices = library.alloc_device_buffer(rows * 4, crate::shared::memory::TEST)?;
+        let scores = library.alloc_device_buffer(rows * 4, crate::shared::memory::TEST)?;
         let stream = library.cuda_stream_create()?;
         let mut greedy_us = Vec::new();
         for iteration in 0..60 {
@@ -1909,7 +1948,7 @@ mod sampler_device_tests {
             let inputs: Vec<Vec<u32>> = vec![vec![0]; rows];
             let plan = build_target_sampling_plan(&members, &inputs)?;
             assert!(plan.route.iter().all(|route| *route == crate::families::deepseek_v41::v41_native_serve::scheduler::SamplingRoute::DeviceGreedy));
-            let logits_buffer = library.alloc_device_buffer(rows * VOCAB * 4)?;
+            let logits_buffer = library.alloc_device_buffer(rows * VOCAB * 4, crate::shared::memory::TEST)?;
             library.copy_h2d(logits_buffer, &bytes(&values))?;
             let stream = library.cuda_stream_create()?;
             let mut wave = TargetSamplingWave::new(&library, rows, SAMPLING_VOCAB)?;
@@ -1961,7 +2000,7 @@ mod sampler_device_tests {
         {
             let rows = 8usize;
             let values = smooth_narrow(rows);
-            let buffer = library.alloc_device_buffer(rows * VOCAB * 4)?;
+            let buffer = library.alloc_device_buffer(rows * VOCAB * 4, crate::shared::memory::TEST)?;
             library.copy_h2d(buffer, &bytes(&values))?;
             let mut host = vec![0u8; VOCAB * 4];
             let mut one_row = buffer;
@@ -2159,7 +2198,7 @@ mod sampler_device_tests {
         let plan = build_target_sampling_plan(&members, &inputs)?;
         let mut arena = vec![0u32; rows * words];
         build_sampling_masks(&[vec![Some(mask.clone())], vec![None]], &mut arena)?;
-        let logits_buffer = library.alloc_device_buffer(rows * VOCAB * 4)?;
+        let logits_buffer = library.alloc_device_buffer(rows * VOCAB * 4, crate::shared::memory::TEST)?;
         library.copy_h2d(logits_buffer, &bytes(&values))?;
         let stream = library.cuda_stream_create()?;
         let result = (|| -> Result<Vec<u32>> {
@@ -2226,7 +2265,7 @@ mod sampler_device_tests {
         fn new(library: &'a NativeLibrary, rows: usize, values: &[f32],
             plan: &crate::families::deepseek_v41::v41_native_serve::scheduler::SamplingPlan, arena: Option<&[u32]>,
         ) -> Result<Self> {
-            let logits = library.alloc_device_buffer(rows * VOCAB * 4)?;
+            let logits = library.alloc_device_buffer(rows * VOCAB * 4, crate::shared::memory::TEST)?;
             library.copy_h2d(logits, &bytes(values))?;
             let stream = library.cuda_stream_create()?;
             let mut wave = TargetSamplingWave::new(library, rows, SAMPLING_VOCAB)?;

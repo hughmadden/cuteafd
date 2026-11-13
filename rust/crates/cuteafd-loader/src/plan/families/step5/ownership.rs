@@ -1,6 +1,8 @@
 //! Pre-allocation binding of the shared layer plan to native Step-5 owners.
 use super::Config;
-use crate::placement::{FfnMode, LayerExecutionPlan, LayerMode, RoutedReplication};
+use crate::placement::{AttentionPlacement, ExpertHome, FfnMode, HopSpec, LayerAssignment,
+    LayerExecutionPlan, LayerMode, Placement, PoolLimits, RoutedReplication, plan_hops,
+    residual_homes};
 use anyhow::{ensure, Result};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -56,6 +58,23 @@ impl ExecutionOwnership {
         let owners = Self { ranks, execution, full: cfg.full.clone(), moe: cfg.moe.clone(), onboarded: vec![] };
         owners.execution.validate_routed_replications(&owners.routed_replications()?)?;
         Ok(owners)
+    }
+
+    /// Binds a fixed layer ownership before any solve. The family's facts
+    /// choose the modes; the executor still validates every one of them.
+    pub fn for_modes(cfg: &Config, ranks: usize, modes: &[LayerMode], spec: HopSpec) -> Result<Self> {
+        ensure!(modes.len() == cfg.layers, "Step-5 CSA owner extent");
+        let placement = Placement {
+            expert_tier: None,
+            pool_tokens: 0, pool_limits: PoolLimits(vec![]),
+            attention_placement: AttentionPlacement::Heads, attention_by_kind: vec![],
+            peer_row_bytes: 0, onboard_layers: 0, max_pool_tokens_no_onboard: None,
+            layers: modes.iter().enumerate().map(|(layer, &mode)| LayerAssignment { mode,
+                experts: if cfg.moe[layer] { ExpertHome::Spark } else { ExpertHome::Dense } }).collect(),
+            movables: vec![], expert_ranges: vec![], residual: residual_homes(modes, &spec)?,
+            hops: plan_hops(modes, &spec)?, tp2: None, items: vec![],
+        };
+        Self::new(cfg, ranks, LayerExecutionPlan::new(&placement, spec)?)
     }
 
     /// Routed replies use the entry GPU intake and existing peer publication.
@@ -151,7 +170,7 @@ pub(crate) fn plan(modes: &[LayerMode], entry: u8, head: u8) -> LayerExecutionPl
         } else { TerminalHome::Replicated } };
     let placement = Placement { expert_tier: None, pool_tokens: 0, pool_limits: PoolLimits(vec![]),
         attention_placement: AttentionPlacement::Layers, attention_by_kind: vec![],
-        peer_row_bytes: 0, onboard_layers: 0, max_pool_tokens_no_onboard: 0,
+        peer_row_bytes: 0, onboard_layers: 0, max_pool_tokens_no_onboard: None,
         layers: modes.iter().map(|&mode| LayerAssignment { mode, experts: ExpertHome::Spark }).collect(),
         movables: vec![], expert_ranges: vec![], residual: residual_homes(modes, &spec).unwrap(),
         hops: plan_hops(modes, &spec).unwrap(), tp2: None, items: vec![] };

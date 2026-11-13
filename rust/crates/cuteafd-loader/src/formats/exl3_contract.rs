@@ -235,6 +235,7 @@ pub(crate) fn check_gptqmodel_manifest(
     if let Some(kept) = manifest.get("kept_tensors") {
         ensure!(kept.is_object(), "EXL3 kept_tensors must map tensor names to native dtypes/shapes");
     }
+
     check_native_quantization_config(manifest)?;
     ensure!(compact.get("native_quantization_config") == manifest.get("native_quantization_config"),
         "compact/full EXL3 metadata disagree at native_quantization_config");
@@ -243,15 +244,16 @@ pub(crate) fn check_gptqmodel_manifest(
     ensure!(compact.get("quant_method") == Some(&Value::from("exl3")), "config must declare EXL3 quantization");
     for (key, value) in compact {
         if key == "per_module_metadata" {
-            ensure!(value == "quantize_config.json:tensor_storage",
-                "EXL3 per_module_metadata must name quantize_config.json:tensor_storage, not {value}");
+            ensure!(matches!(value.as_str(), Some("quantize_config.json:tensor_storage" | "quantize_config.k6.json:tensor_storage" | "quantize_config.k8.json:tensor_storage")),
+                "EXL3 per_module_metadata must name the selected quantization tensor_storage, not {value}");
             continue;
         }
         ensure!(manifest.get(key) == Some(value), "compact/full EXL3 metadata disagree at {key}");
     }
     if let Some(pointer) = manifest.get("per_module_metadata") {
-        ensure!(pointer == "quantize_config.json:tensor_storage",
-            "EXL3 per_module_metadata must name quantize_config.json:tensor_storage, not {pointer}");
+        ensure!(matches!(pointer.as_str(), Some("quantize_config.json:tensor_storage" | "quantize_config.k6.json:tensor_storage" | "quantize_config.k8.json:tensor_storage"))
+            && compact.get("per_module_metadata").is_none_or(|value| value == pointer),
+            "EXL3 per_module_metadata must name the selected quantization tensor_storage, not {pointer}");
     }
     Ok(())
 }
@@ -299,6 +301,7 @@ mod tests {
             "tensor_storage":true}).as_object().unwrap().clone());
         (compact, manifest)
     }
+
 
     #[test]
     fn published_muse_fused_source_provenance_matches_emitted_expert_headers() {

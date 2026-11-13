@@ -130,7 +130,7 @@ impl BundledAudioSpec {
     }
     pub fn required_bytes(&self, library: &Path) -> Result<u64> {
         match self { Self::Mimo(spec) => Ok(NativeAudio::required(library, spec.native())?.total_bytes()?),
-            Self::Pcm(spec) => spec.required_bytes() }
+            Self::Pcm(spec) => spec.required_bytes(library) }
     }
     pub fn geometry(&self) -> cuteafd_core::media::AudioTokenGeometry {
         match self { Self::Mimo(_) => cuteafd_core::media::AudioTokenGeometry::MimoRvq,
@@ -167,7 +167,7 @@ impl AudioOwnerConfig {
     }
     pub fn required_bytes(&self, library: &Path) -> Result<u64> {
         match self { Self::Mimo { spec, .. } => Ok(NativeAudio::required(library, spec.native())?.total_bytes()?),
-            Self::Pcm { spec, .. } => spec.required_bytes() }
+            Self::Pcm { spec, .. } => spec.required_bytes(library) }
     }
 }
 pub struct AudioEncodeJob {
@@ -196,6 +196,21 @@ pub(super) enum AudioRuntime {
     Pcm(super::pcm_audio::PcmTower),
 }
 impl AudioRuntime {
+    pub(super) fn prepare(config: AudioOwnerConfig, library: &Path, device: i32) -> Result<Self> {
+        match config {
+            AudioOwnerConfig::Pcm { spec, admitted_bytes } => Ok(Self::Pcm(spec.prepare(library, device, admitted_bytes)?)),
+            AudioOwnerConfig::Mimo { spec, admitted_bytes } => {
+                let native = NativeAudio::prepare(library, spec.native(), device, admitted_bytes, cuteafd_ffi::memory_ledger::MediaTags::new("media/mimo-audio"))?;
+                Ok(Self::Mimo { native, spec: *spec.native() })
+            }
+        }
+    }
+    pub(super) fn weight_arena(&self) -> Result<Option<usize>> {
+        match self { Self::Pcm(tower) => Ok(Some(tower.weight_arena()?)), Self::Mimo { native, .. } => Ok(Some(native.weight_arena()?)) }
+    }
+    pub(super) fn commit_weights(&mut self) -> Result<()> {
+        match self { Self::Pcm(tower) => tower.commit_weights(), Self::Mimo { native, .. } => Ok(native.commit_weights()?) }
+    }
     pub(super) fn load(config: AudioOwnerConfig, library: &Path, device: i32) -> Result<Self> {
         let (tower, admitted_bytes) = match config {
             AudioOwnerConfig::Pcm { spec, admitted_bytes } => return Ok(Self::Pcm(spec.load(library, device, admitted_bytes)?)),
@@ -209,7 +224,7 @@ impl AudioRuntime {
             )));
         }
         let weights = tower.plan.load_weights(admitted_bytes)?;
-        let native = NativeAudio::load_embedded(library, &spec, device, admitted_bytes, &weights)?;
+        let native = NativeAudio::load_embedded(library, &spec, device, admitted_bytes, &weights, cuteafd_ffi::memory_ledger::MediaTags::new("media/mimo-audio"))?;
         Ok(Self::Mimo { native, spec })
     }
     pub(super) fn ledger(&self) -> Result<AudioLedger> {

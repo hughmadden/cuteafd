@@ -16,7 +16,7 @@ add_custom_command(
     ${CUTEAFD_V41_DSPARK_TP2_EXPERT_OBJECTS} ${CUTEAFD_V41_DSPARK_TP2_EXPERT_HEADERS}
   COMMAND ${CUTEAFD_SPARKINFER_VERIFY_COMMAND}
   COMMAND "${CMAKE_COMMAND}" -E env ${CUTEAFD_SPARKINFER_PYTHON_ENV}
-    "${Python3_EXECUTABLE}"
+    ${CUTEAFD_EXPORT_LAUNCHER} "${Python3_EXECUTABLE}"
     "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/aot/export_b12x_slices_aot.py"
     --output-dir "${CUTEAFD_V41_DSPARK_TP2_EXPERT_DIR}" --role dspark_tp2
     --rows "${CUTEAFD_V41_DRAFT_ROWS_ARG}" --width 192 --standard-names

@@ -13,25 +13,79 @@ use thiserror::Error;
 
 mod deepseek;
 pub mod step5;
+pub mod step5_graphs;
 mod spark_intake;
 pub mod prefill_waves;
-pub use spark_intake::{prefill_return_bytes, prefill_return_bytes_with_format, spark_intake_bytes, PrefillShape};
+mod fp8moe_workspace;
+pub use fp8moe_workspace::fp8moe_tp2_workspace;
+mod weight_storage;
+pub use weight_storage::{PackedWeightRegions, WeightArenaLayout, WeightArenaView};
+
+/// Stable physical owner ID for one independently retired expert selection.
+/// Both admission planners and runtime loaders pass the same ordered final views.
+pub fn expert_weight_arena_id(format: &str, device: i32,
+    regions: &[(String, usize)]) -> anyhow::Result<String> {
+    use sha2::{Digest, Sha256};
+    anyhow::ensure!(!format.is_empty() && device >= 0, "invalid expert arena identity");
+    let selection = format!("{:x}", Sha256::digest(serde_json::to_vec(regions)?));
+    Ok(format!("experts.{format}.gpu.{device}.{selection}"))
+}
+
+#[cfg(test)]
+mod expert_weight_arena_id_tests {
+    use super::*;
+
+    #[test]
+    fn planner_runtime_ids_match_tp1_tp2_and_independent_draft() -> anyhow::Result<()> {
+        for device in 0..2 {
+            for shard in ["BackboneFull", "BackboneTp2"] {
+                let target = vec![(format!("{shard}.layer.3.0"), 4097),
+                    (format!("{shard}.layer.7.0"), 8193)];
+                let draft = vec![("Dspark.stage.0.0".into(), 2049)];
+                let planner = expert_weight_arena_id("exl3", device, &target)?;
+                let runtime = WeightArenaLayout::new(
+                    expert_weight_arena_id("exl3", device, &target)?, target.clone())?;
+                assert_eq!(planner, runtime.id());
+                assert_ne!(planner, expert_weight_arena_id("exl3", device, &draft)?);
+                assert_ne!(planner, expert_weight_arena_id("exl3", 1 - device, &target)?);
+                let combined = target.into_iter().chain(draft).collect::<Vec<_>>();
+                assert_ne!(planner, expert_weight_arena_id("exl3", device, &combined)?);
+            }
+        }
+        Ok(())
+    }
+}
+
+mod peer_storage;
+pub use peer_storage::PeerStorageLayout;
+pub use spark_intake::{prefill_return_bytes, prefill_return_bytes_with_format,
+    prefill_return_requests_with_format, spark_intake_bytes, spark_intake_requests, PrefillShape};
 mod exl3_workspace;
 pub(crate) use exl3_workspace::exl3_workspace_bytes_from_refs;
-pub use exl3_workspace::{exl3_workspace_bytes, Exl3Epilogue, Exl3WorkspaceBinding, Exl3WorkspaceLayout, Exl3WorkspaceOwner};
+pub use exl3_workspace::{exl3_rtx_output_bytes, exl3_workspace_bytes, Exl3Epilogue, Exl3WorkspaceBinding, Exl3WorkspaceLayout, Exl3WorkspaceOwner};
 pub mod glm_graphs;
+pub mod v41_graphs;
+pub mod v41_workspace;
+pub mod mimo_graphs;
+pub mod muse_graphs;
+pub mod glm_graph_nodes;
 pub mod glmf_graphs;
+pub mod kimi_prewarm;
 mod glmf_workspace;
 pub use glmf_workspace::{glmf_expert_rows, glmf_lane_bytes, glmf_manifest_scratch, glmf_selector_bytes,
-    glmf_step_scratch, glmf_core_step_scratch, GlmfCoreScratch,
+    glmf_step_scratch, glmf_core_step_scratch, glmf_step_request_pairs, GlmfCoreScratch,
     glmf_step_workspaces, glmf_table_pages, glmf_temporary_bytes, GlmfKdaState, GlmfLaneBytes, GlmfMissingProgram,
     GlmfScratch, GlmfScratchOptions, GlmfStepShape, GlmfStepWorkspaces, GlmfTemporaryBytes, GLMF_DECODE_ROWS,
     GLMF_HEAD_WORKSPACE, GLMF_SPARSE_TOPK, GLMF_WIDE_DECODE_ROWS};
 pub mod qwen_graphs;
+pub mod qwen35_graphs;
+pub mod v4_graphs;
 mod v4_placement;
 pub use v4_placement::{deepseek_v4_expert_cost, deepseek_v4_native_workspace, deepseek_v4_tp2_expert_cost, deepseek_v4_tp2_native_workspace, deepseek_v4_tp2_workspace, V4ExpertCost};
+mod v4_kv;
+pub use v4_kv::V4KvLayout;
 mod v4_workspace;
-pub use v4_workspace::{V4_PACKED_MEMBERS, V4_PACKED_TABLE_EXTRA_ROWS, deepseek_v4_tap_rows, compiled_c128_width, deepseek_v4_expert_exchange_bytes, deepseek_v4_headroom_bytes, deepseek_v4_peer_exchange_bytes, deepseek_v4_tp2_payload_bytes, deepseek_v4_workspace_geometry, deepseek_v4_workspace_scratch, V4WorkspaceRank, V4WorkspaceScratch};
+pub use v4_workspace::{V4_PACKED_MEMBERS, V4_PACKED_TABLE_EXTRA_ROWS, deepseek_v4_tap_rows, compiled_c128_width, deepseek_v4_expert_exchange_bytes, deepseek_v4_peer_exchange_bytes, deepseek_v4_tp2_payload_bytes, deepseek_v4_workspace_geometry, deepseek_v4_workspace_scratch, deepseek_v4_lane_page_tables, V4LanePageTable, V4WorkspaceRank, V4WorkspaceScratch};
 pub use deepseek::{deepseek_v41_cache_bytes, deepseek_v41_cache_geometry, deepseek_v41_pool_groups,
     deepseek_v4_cache_geometry, deepseek_v4_layer_unit_bytes};
 
@@ -100,8 +154,14 @@ pub struct CacheOptions {
     pub qwen_kv: Qwen4KvCache,
     pub step5_kv: Qwen4KvCache,
     pub mla_kv: cuteafd_core::MlaCacheFormat,
-    /// DeepSeek V4's window ring holds one prefill chunk plus its window.
+    /// One staged prefill unit (one wave's rows): the largest step a shared
+    /// prefill kernel reads at once. Rings sized by the whole multi-wave span
+    /// are oversized ([`cuteafd_core::prefix::swa_ring`]).
     pub prefill_rows: u64,
+    /// The whole admitted prefill span (`waves * prefill_rows`), for state a
+    /// step publishes for later steps to read (Step-5's target hidden history).
+    /// Zero means "no wider than one unit".
+    pub prefill_span_rows: u64,
     /// GLM 5.3 Flash's DSA index cache.
     pub glmf_index: GlmfIndexCache,
     /// Bytes of one GLM Flash KDA recurrent-state element: 4 (FP32) or 2 (`--kda-state bf16`).
@@ -123,6 +183,7 @@ impl Default for CacheOptions {
             step5_kv: Qwen4KvCache::Bf16,
             mla_kv: Default::default(),
             prefill_rows: 4096,
+            prefill_span_rows: 0,
             glmf_index: GlmfIndexCache::Keys,
             kda_state_bytes: 4,
             glmf_decode_rows: GLMF_DECODE_ROWS,
@@ -208,23 +269,25 @@ pub enum CacheGeometryError {
         family: &'static str,
         what: &'static str,
     },
+    #[error("graph reserve: {0}")]
+    GraphReserve(#[source] crate::placement::graph_reserve::Error),
 }
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum PoolContextError {
     #[error("explicit context {context} > admitted pool supports {pool}; set POOL_TOKENS/MAX_CONTEXT_TOKENS to change")]
     Explicit { context: usize, pool: usize },
-    #[error("admitted pool {pool} cannot hold one request plus its safety margin")]
+    #[error("admitted pool {pool} cannot hold one request")]
     TooSmall { pool: usize },
 }
 
 /// Resolve the serving extent before sizing pool-dependent startup inventories.
-pub fn pool_context(context: usize, automatic: bool, pool: usize, unit: usize) -> Result<usize, PoolContextError> {
-    if context <= pool { return Ok(context); }
-    if !automatic { return Err(PoolContextError::Explicit { context, pool }); }
-    let supported = pool.saturating_sub(unit.max(64));
-    if supported == 0 { return Err(PoolContextError::TooSmall { pool }); }
-    Ok(supported)
+pub fn pool_context(context: crate::placement::planner::Context, pool: usize) -> Result<usize, PoolContextError> {
+    if pool == 0 { return Err(PoolContextError::TooSmall { pool }); }
+    if context.required() > pool as u64 {
+        return Err(PoolContextError::Explicit { context: context.required() as usize, pool });
+    }
+    Ok(context.served(pool as u64) as usize)
 }
 
 /// Shared scalar/WMMA draft-attention arena. WMMA capacity partitions are
@@ -366,16 +429,6 @@ pub fn glm_decode_table_widths(context: usize, pool_pages: usize) -> Vec<usize> 
     widths
 }
 
-/// Per GPU: a 170 KB/segment calibration plus 10% and 64 MiB bounds the
-/// measured 131K/1M captures on SM120. Keep the qualified 3 GiB floor.
-/// The lead has one head segment in addition to the target's layer segments.
-pub fn glm_decode_graph_allowance(context: usize, layers: usize) -> Result<u64, CacheGeometryError> {
-    let shapes: usize = glm_decode_table_widths(context, context.div_ceil(GLM_PAGE_ROWS)).iter()
-        .map(|&width| glm_decode_row_buckets(width).len()).sum();
-    let bytes = product("GLM decode graphs", &[shapes as u64, layers as u64 + 1, 187_000])?;
-    Ok(sum("GLM decode graph margin", &[bytes, 64 << 20])?.max(3 << 30))
-}
-
 /// GLM keeps the complete latent/index pools on every head-split GPU.
 pub fn glm_cache_geometry(
     cfg: &GlmDsaConfig,
@@ -499,6 +552,40 @@ pub fn glm_flash_rank_cache_geometry_rows(
 /// Storage for a candidate attention placement, not an executor capability.
 /// KDA always partitions heads. Context owns alternate 256-token units, while
 /// layers owns alternate MLA layers; compact tails/replay follow those owners.
+/// One KDA layer's recurrent state per sequence on one rank: `channels` (its share of
+/// the heads x head dim) x head dim x `state_bytes`. The caches allocate it separately
+/// from the short-conv state (`glmf/kda-state`, `glmf/kda-conv`).
+fn gmf_kda_recurrent(cfg: &GlmNextConfig, channels: u64, state_bytes: u64) -> Result<u64, CacheGeometryError> {
+    product("KDA recurrent state", &[channels, cfg.kda_head_dim as u64, state_bytes])
+}
+
+/// One KDA layer's BF16 short-conv state per sequence on one rank: three taps of
+/// `3 x channels` BF16 values.
+fn gmf_kda_conv(channels: u64) -> Result<u64, CacheGeometryError> {
+    product("KDA short-conv state", &[3, 3, channels, 2])
+}
+
+/// One KDA layer's recurrent and short-conv state per sequence on one rank, which the
+/// caches allocate as two independent device requests.
+pub fn glm_flash_kda_state_pieces(cfg: &GlmNextConfig, ranks: usize, state_bytes: u64)
+    -> Result<(u64, u64), CacheGeometryError> {
+    let channels = product("KDA channels", &[(cfg.kda_heads / ranks) as u64, cfg.kda_head_dim as u64])?;
+    Ok((gmf_kda_recurrent(cfg, channels, state_bytes)?, gmf_kda_conv(channels)?))
+}
+
+/// One unit's pool storage in one resident MLA layer, split by the physical
+/// allocation that owns it: the 256 latent records (528 B each), the full index
+/// cache's 256 key | gate rows (512 B each, absent when the cache is compact) and
+/// the 64-entry pool-key page (132 B each). The engine allocates one request per
+/// piece and MLA layer, so each piece carries its own driver granularity.
+pub fn glm_flash_mla_unit_pieces(index: GlmfIndexCache,
+    attention: crate::placement::AttentionPlacement) -> [(&'static str, u64); 3] {
+    let half = if attention == crate::placement::AttentionPlacement::Context { 2 } else { 1 };
+    [("records", 256 * 528 / half),
+        ("pool-keys", 64 * 132 / half),
+        ("index-keys", if index == GlmfIndexCache::Keys { 256 * 512 / half } else { 0 })]
+}
+
 pub fn glm_flash_placed_cache_geometry_rows(
     cfg: &GlmNextConfig,
     layers: usize,
@@ -550,13 +637,7 @@ pub fn glm_flash_placed_cache_geometry_rows(
     )?;
     let state = sum(
         "KDA state",
-        &[
-            product(
-                "KDA recurrent state",
-                &[channels, cfg.kda_head_dim as u64, state_bytes],
-            )?,
-            product("KDA short-conv state", &[3, 3, channels, 2])?,
-        ],
+        &[gmf_kda_recurrent(cfg, channels, state_bytes)?, gmf_kda_conv(channels)?],
     )?;
     let replay = sum(
         "KDA replay",
@@ -576,13 +657,10 @@ pub fn glm_flash_placed_cache_geometry_rows(
             what: "compact index cache under a head split",
         });
     }
-    // Per unit and MLA layer: 256 latent records, the per-token index keys unless compact,
-    // and one pool-key page (64 pools).
-    let per_layer_unit = if compact {
-        sum("GLM Flash MLA unit", &[256 * 528, 64 * 132])?
-    } else {
-        sum("GLM Flash MLA unit", &[256 * (528 + 512), 64 * 132])?
-    };
+    // Per unit and MLA layer: the latent records, the pool-key page and, unless compact,
+    // the per-token index keys; see [`glm_flash_mla_unit_pieces`].
+    let per_layer_unit: u64 = glm_flash_mla_unit_pieces(index, attention).iter()
+        .map(|&(_, bytes)| bytes).sum();
     let kda_state = product("GLM Flash active KDA", &[kda, state])?;
     let ranks = (0..ranks).map(|rank| {
         let resident_mla = if attention == AttentionPlacement::Layers {
@@ -591,8 +669,7 @@ pub fn glm_flash_placed_cache_geometry_rows(
         let tails = if compact { product("GLM Flash index tails", &[resident_mla, GLMF_INDEX_TAIL_BYTES])? } else { 0 };
         let index_replay = if compact { product("GLM Flash index replay", &[resident_mla, decode_rows, 512])? } else { 0 };
         Ok(RankCacheGeometry {
-            persistent_unit_bytes: product("GLM Flash MLA pools", &[resident_mla, per_layer_unit])?
-                / if attention == AttentionPlacement::Context { 2 } else { 1 },
+            persistent_unit_bytes: product("GLM Flash MLA pools", &[resident_mla, per_layer_unit])?,
             pool_metadata_unit_bytes: 4,
             active_state_per_sequence_bytes: sum("GLM Flash active state", &[kda_state, tails])?,
             retained_mark_bytes: sum("GLM Flash mark", &[kda_state, tails])?,
@@ -772,6 +849,11 @@ pub fn qwen_cache_geometry(
     })
 }
 
+/// Rows in one MiMo sliding-window ring (the target layers' SWA rings, every
+/// MTP stage's ring and its hidden-history ring), matching
+/// `MimoEngine::RING_ROWS`.
+pub const MIMO_RING_ROWS: u64 = 256;
+
 pub fn mimo_cache_geometry(
     cfg: &MimoV2Config,
     layers: usize,
@@ -810,7 +892,7 @@ pub fn mimo_cache_geometry(
             "MiMo full KV pages",
             &[64, full, share.record_bytes(MimoAttention::Full, kv) as u64],
         )?,
-        active_state_per_sequence_bytes: product("MiMo SWA rings", &[swa, 256, swa_record])?,
+        active_state_per_sequence_bytes: product("MiMo SWA rings", &[swa, MIMO_RING_ROWS, swa_record])?,
         retained_mark_bytes: product("MiMo SWA marks", &[swa, cfg.window as u64, swa_record])?,
         context_table_bytes_per_token: 0,
         speculative_replay_bytes: 0,
@@ -831,11 +913,11 @@ pub fn mimo_cache_geometry(
             "MiMo MTP stage rings",
             &[
                 mtp_stages as u64,
-                256,
+                MIMO_RING_ROWS,
                 cfg.record_bytes(MimoAttention::Sliding, kv) as u64,
             ],
         )?;
-        let hidden_ring = product("MiMo MTP hidden ring", &[256, cfg.hidden as u64, 2])?;
+        let hidden_ring = product("MiMo MTP hidden ring", &[MIMO_RING_ROWS, cfg.hidden as u64, 2])?;
         costs[0].active_state_per_sequence_bytes = sum(
             "MiMo MTP active state",
             &[
@@ -905,19 +987,6 @@ mod tests {
         assert!(glm_decode_row_bucket(0, 16384).is_err());
         assert!(glm_decode_row_bucket(65, 16384).is_err());
         assert_eq!(glm_decode_table_widths(1_048_576, 3000), vec![16, 32, 64, 128, 256, 512, 1024, 2048, 3000]);
-    }
-
-    #[test]
-    fn glm_graph_allowance_bounds_measured_captures_and_scales() {
-        let old = glm_decode_graph_allowance(131_072, 78).unwrap();
-        let new = glm_decode_graph_allowance(1_048_576, 78).unwrap();
-        assert_eq!(old, 3 << 30);
-        assert_eq!(new, 3 << 30);
-        assert!(old >= 2_575_302_656);
-        // Conservative physical bound at 213 shapes (79 lead segments each).
-        assert!(new >= 213 * 79 * 170_000 + (64 << 20));
-        assert!(glm_decode_graph_allowance(1_048_576, 100).unwrap() > new);
-        assert!(glm_decode_graph_allowance(0, 78).unwrap() >= 3 << 30);
     }
 
     #[test]
@@ -1412,4 +1481,39 @@ mod tests {
         assert_eq!(absent.checkpoint_max_context_tokens, None);
         assert_eq!(absent.requested_kv_floor_tokens, Some(2 << 20));
     }
+}
+
+/// Coordinator host Spark transport bytes: registered rings, egress request
+/// slots and the host-mode intake upper bound. `v4_decode` adds V4's separate
+/// decode request slot instead of multiplying egress by endpoints.
+#[allow(clippy::too_many_arguments)]
+pub fn spark_host_transport(geometry: cuteafd_core::ExpertGeometry, endpoints: usize, ranks: usize,
+    native: bool, bf16: bool, compact_bf16: bool, unit_rows: u64, intake_rows: u64, waves: u64,
+    v4_decode: Option<u64>) -> anyhow::Result<[u64; 3]> {
+    use anyhow::Context;
+    use cuteafd_core::{SparkEndpoint, SparkIngress, SparkRings};
+    let ingress = if native { SparkIngress::Fp8K32 } else if bf16 { SparkIngress::Bf16 } else { SparkIngress::Fp8K32 };
+    let endpoint = SparkEndpoint { ring_depth: None, capacity: u32::try_from(unit_rows)?, ingress, partial_reply_bytes: None };
+    let (request, response) = endpoint.wire_bytes(geometry).context("host wire size overflow")?;
+    let rings = SparkRings { max_frame_bytes: (64 << 20).max(request).max(response),
+        depth: 8, slot_bytes: 8 << 20, alignment: 4096 };
+    let bytes = (endpoint.ring_bytes(geometry, rings).context("host ring geometry overflow")? as u64)
+        .checked_mul(endpoints as u64).and_then(|n| n.checked_mul(ranks as u64))
+        .context("coordinator host rings overflow")?;
+    let egress_request = geometry.compact_wire_bytes(u32::try_from(unit_rows)?, compact_bf16)
+        .context("host egress geometry overflow")?.0 as u64;
+    let egress = match v4_decode {
+        Some(decode) => {
+            let decode_request = geometry.compact_wire_bytes(u32::try_from(decode)?, false)
+                .context("V4 decode egress geometry overflow")?.0 as u64;
+            egress_request.checked_mul(waves).and_then(|bytes| bytes.checked_add(decode_request))
+                .context("V4 registered egress overflow")?
+        }
+        None => egress_request.checked_mul(waves).and_then(|n| n.checked_mul(endpoints as u64))
+            .context("coordinator registered egress overflow")?,
+    };
+    let intake = intake_rows.checked_mul(geometry.hidden as u64).and_then(|n| n.checked_mul(if native { 4 } else { 2 }))
+        .and_then(|n| n.checked_mul(ranks as u64)).and_then(|n| n.checked_mul(endpoints as u64))
+        .context("coordinator intake overflow")?;
+    Ok([bytes, egress, intake])
 }

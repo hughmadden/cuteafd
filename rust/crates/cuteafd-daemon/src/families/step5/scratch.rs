@@ -1,5 +1,5 @@
 //! Stable per-rank scratch views; each layer retires before the next reuses them.
-use crate::shared::memory::device::{Allocation, Device, Stream};
+use crate::shared::memory::{device::{Allocation, Device, Stream}, Tag};
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::CuteafdDeviceBuffer;
 use std::rc::Rc;
@@ -15,16 +15,32 @@ pub(super) struct Plane<'a> {
     pub buffer: CuteafdDeviceBuffer,
     _owner: Rc<Allocation<'a>>,
 }
+impl Plane<'_> {
+    pub(super) fn inventory(&self, inventory: &mut crate::shared::memory::receipts::Inventory<'_>, name: &str) -> Result<()> {
+        let first = inventory.receipts.len();
+        inventory.backed_device(name, self.buffer, self._owner.buffer)?;
+        for receipt in &mut inventory.receipts[first..] {
+            receipt.allocation.category = cuteafd_core::memory_layout::Category::Workspace;
+            receipt.allocation.group = "step5 attention workspace".into();
+        }
+        Ok(())
+    }
+}
 impl BufferOwner for Plane<'_> {
     fn buffer(&self) -> CuteafdDeviceBuffer { self.buffer }
 }
 
+/// One Workspace backing: target and MTP per-step scratch reuse it in stream
+/// order, after live outputs have been copied to retained cache/history storage.
 #[derive(Clone)]
-pub(super) struct Arena<'a>(Rc<Allocation<'a>>);
+pub(super) struct Arena<'a>(Rc<Allocation<'a>>, Rc<crate::shared::memory::StandaloneStream<'a>>);
 impl<'a> Arena<'a> {
-    pub fn new(device: Device<'a>, bytes: usize) -> Result<Self> {
-        let _scope = cuteafd_ffi::memory_ledger::scope("step5_scratch_workspace");
-        Ok(Self(Rc::new(Allocation::new(device, bytes)?)))
+    pub fn new(device: Device<'a>, bytes: usize, tag: Tag) -> Result<Self> {
+        Ok(Self(Rc::new(Allocation::new(device, bytes, tag)?), Rc::new(crate::shared::memory::StandaloneStream::new(device))))
+    }
+
+    pub(super) fn standalone(&self) -> Rc<crate::shared::memory::StandaloneStream<'a>> {
+        self.1.clone()
     }
 
     pub fn poison_after(&self, keep: usize) -> Result<()> {
@@ -62,9 +78,16 @@ pub(super) struct CompactKv<'a> {
 }
 impl<'a> CompactKv<'a> {
     pub(super) fn new(device: Device<'a>, programs: &'a cuteafd_ffi::programs::Programs<'a>,
-        rows: usize, heads: &[usize], sizes: [usize; 2], arena: Option<(&Arena<'a>, usize)>) -> Result<Self> {
+        rows: usize, heads: &[usize], sizes: [usize; 2], arena: Option<(&Arena<'a>, usize)>,
+        tag: Tag) -> Result<Self> {
+        Self::with_planes(device, programs, rows, heads, planes(device, &sizes, arena, tag)?)
+    }
+
+    pub(super) fn with_planes(device: Device<'a>, programs: &'a cuteafd_ffi::programs::Programs<'a>,
+        rows: usize, heads: &[usize], planes: Vec<Plane<'a>>) -> Result<Self> {
         use cuteafd_loader::families::qwen4::Qwen4KvCache;
-        ensure!(rows > 0 && !heads.is_empty(), "Step-5 compact producer capacity");
+        ensure!(rows > 0 && !heads.is_empty() && planes.len() == 2, "Step-5 compact producer capacity");
+        let sizes = planes.iter().map(|plane| plane.buffer.bytes).collect::<Vec<_>>();
         let writers = heads.iter().copied().map(|heads| {
             ensure!(matches!(heads, 32 | 64), "Step-5 compact producer heads");
             let groups = heads / 16;
@@ -80,7 +103,7 @@ impl<'a> CompactKv<'a> {
                 "{name}: compact producer ABI/geometry/capacity");
             Ok((heads, device.run(|| programs.program(name, &["x", "out"]))?))
         }).collect::<Result<Vec<_>>>()?;
-        Ok(Self { planes: planes(device, &sizes, arena)?, writers, device, rows })
+        Ok(Self { planes, writers, device, rows })
     }
 
     pub(super) fn enqueue(&self, stream: &Stream<'a>, sources: [CuteafdDeviceBuffer; 2],
@@ -124,6 +147,85 @@ fn view_layout(capacity: usize, sizes: &[usize], offset: usize) -> Result<Vec<(u
 mod tests {
     use super::*;
     use cuteafd_loader::plan::families::step5::native;
+
+    #[test]
+    fn arena_components_share_one_lazy_standalone_stream() -> Result<()> {
+        let (_directory, fixture) = crate::shared::memory::cpu_stream_fixture()?;
+        let library = fixture.load()?;
+        let device = Device { library: &library, id: 0 };
+        let arena = Arena::new(device, 256, crate::shared::memory::TEST)?;
+        let first = standalone(device, Some((&arena, 0)));
+        let second = standalone(device, Some((&arena, 128)));
+        assert!(Rc::ptr_eq(&first, &second));
+        first.drain()?;
+        assert!(!fixture.events()?.contains('V'));
+        assert_eq!(first.get()?.raw, second.get()?.raw);
+        assert_eq!(fixture.events()?.matches('V').count(), 1);
+        let lane = standalone(device, None);
+        assert_ne!(lane.get()?.raw, first.get()?.raw);
+        assert_eq!(fixture.events()?.matches('V').count(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn full_head_arena_keeps_projection_backing_outside_phase_maximum() -> Result<()> {
+        use cuteafd_loader::formats::trellis_core::ProjectionScratchLayout;
+        let (unit, span) = (2752, 3 * 2752);
+        let mut projection = ProjectionScratchLayout::new(13824, 4096, unit)?;
+        for (k, n) in [(4096, 13824), (4096, 768), (12288, 4096), (4096, 12288)] {
+            projection.merge(&ProjectionScratchLayout::new(k, n, unit)?)?;
+        }
+        let projection = projection.packed_bytes()? as u64;
+        assert_eq!(projection, 257_851_656);
+        let layer = native::layer_workspace(unit, span, true, 64)?;
+        let head_planes = native::head_planes(span)?;
+        let head = native::plane_bytes(&head_planes)?;
+        let old_total = (layer + projection).max(head);
+        let old_arena = old_total - projection;
+        assert_eq!(head - old_arena, projection);
+        assert!(view_layout(old_arena as usize, &head_planes, 0).is_err());
+        let total = native::with_arena_phase(layer + projection, projection, head)?;
+        let arena = usize::try_from(total - projection)?;
+        assert_eq!(total, head + projection);
+        view_layout(arena, &head_planes, 0)?;
+        for depth in [0, 1, 3] {
+            let predictor = native::mtp_forecast_workspace(unit, depth,
+                cuteafd_loader::families::qwen4::Qwen4KvCache::Fp8)?;
+            let admitted = native::with_arena_phase(total, projection, predictor)?;
+            assert_eq!(admitted - projection, (arena as u64).max(predictor));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn output_scratch_is_disjoint_and_inventoried_once_per_backing() -> Result<()> {
+        for rows in [1, 64, 65, 4096] {
+            for sizes in [native::swa_planes(rows, 32)?.to_vec(),
+                native::swa_planes(rows, 64)?.to_vec(), native::csa_planes(rows)?.to_vec()] {
+                let views = view_layout(native::plane_bytes(&sizes)? as usize, &sizes, 0)?;
+                let &(offset, bytes) = views.last().unwrap();
+                assert_eq!(bytes, native::OUTPUT_SCRATCH_BYTES);
+                assert!(views[..views.len()-1].iter().all(|&(start, size)| start + size <= offset));
+            }
+        }
+        let (_directory, fixture) = crate::shared::memory::cpu_stream_fixture()?;
+        let library = fixture.load()?;
+        let device = Device { library: &library, id: 0 };
+        let arena = Arena::new(device, 512, crate::shared::memory::Tag::workspace("step5/test-output-scratch"))?;
+        let plane = arena.planes(device, &[256], 256)?.remove(0);
+        use cuteafd_loader::placement::planner::{CoordinatorDevices, Lifetime};
+        use cuteafd_core::memory_layout::Category;
+        let ids = [0];
+        let mut inventory = crate::shared::memory::receipts::Inventory::new(
+            CoordinatorDevices::new(&ids)?, "step5", Lifetime::RESIDENT, Category::Weights, "test");
+        plane.inventory(&mut inventory, "lane0.output-scratch")?;
+        plane.inventory(&mut inventory, "lane1.output-scratch")?;
+        assert_eq!(inventory.receipts.iter().filter(|r| r.allocation.view.is_none()).count(), 1);
+        assert_eq!(inventory.receipts.iter().filter(|r| r.allocation.view.is_some()).count(), 2);
+        assert!(inventory.receipts.iter().all(|r| r.allocation.category == Category::Workspace));
+        assert!(inventory.receipts.iter().filter_map(|r| r.allocation.view.as_ref()).all(|v| v.offset == 256));
+        Ok(())
+    }
 
     #[test]
     fn predictor_arena_spans_preserve_live_inputs_output_and_selected_tokens() -> Result<()> {
@@ -243,9 +345,9 @@ mod tests {
 /// FFN planes at the shared region offsets (`native::dense_layout`/`routed_layout`)
 /// when arena-backed, so every FFN kind keeps its live planes at common offsets.
 pub(super) fn region_planes<'a>(device: Device<'a>, spans: &[(usize, usize)],
-    arena: Option<(&Arena<'a>, usize)>) -> Result<Vec<Plane<'a>>> {
+    arena: Option<(&Arena<'a>, usize)>, tag: Tag) -> Result<Vec<Plane<'a>>> {
     let Some((arena, base)) = arena else {
-        return planes(device, &spans.iter().map(|&(_, bytes)| bytes).collect::<Vec<_>>(), None);
+        return planes(device, &spans.iter().map(|&(_, bytes)| bytes).collect::<Vec<_>>(), None, tag);
     };
     ensure!(device.id == arena.0.device.id && std::ptr::eq(device.library, arena.0.device.library),
         "Step-5 scratch device mismatch");
@@ -259,10 +361,18 @@ pub(super) fn region_planes<'a>(device: Device<'a>, spans: &[(usize, usize)],
 }
 
 pub(super) fn planes<'a>(device: Device<'a>, sizes: &[usize],
-    arena: Option<(&Arena<'a>, usize)>) -> Result<Vec<Plane<'a>>> {
+    arena: Option<(&Arena<'a>, usize)>, tag: Tag) -> Result<Vec<Plane<'a>>> {
     if let Some((arena, offset)) = arena { return arena.planes(device, sizes, offset); }
     sizes.iter().map(|&bytes| {
-        let owner = Rc::new(Allocation::new(device, bytes)?);
+        let owner = Rc::new(Allocation::new(device, bytes, tag)?);
         Ok(Plane { buffer: owner.buffer, _owner: owner })
     }).collect()
+}
+
+/// Arena users share one standalone stream; a separately loaded owner/lane has
+/// its own lazy context. No CUDA stream is created while serving owners load.
+pub(super) fn standalone<'a>(device: Device<'a>, arena: Option<(&Arena<'a>, usize)>)
+    -> Rc<crate::shared::memory::StandaloneStream<'a>> {
+    arena.map_or_else(|| Rc::new(crate::shared::memory::StandaloneStream::new(device)),
+        |(arena, _)| arena.standalone())
 }

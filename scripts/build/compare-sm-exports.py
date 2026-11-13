@@ -23,6 +23,7 @@ import os
 from pathlib import Path
 import re
 import runpy
+import shutil
 import struct
 import subprocess
 import sys
@@ -54,6 +55,48 @@ def resolve_source_root(path: Path | str | None = None, env=os.environ) -> Path:
 
 
 ROOT = resolve_source_root()
+PROGRAM_RECORDER = None
+PROGRAM_PLANS = None  # this worker's comparison-plans.json, by object name
+
+
+def recorded_construction(function, *args, **kwargs):
+    if PROGRAM_RECORDER is not None:
+        return PROGRAM_RECORDER.construct(function, *args, **kwargs)
+    return function(*args, **kwargs)
+
+
+class ProgramRecords:
+    """The exporter's view of this worker's IR records, for programs it reuses whole.
+
+    export_b12x_dsv4_aot.py stores a program's record with its cached object and
+    hands it back here on a hit, so the publication keeps one record per object.
+    """
+
+    def record(self, output, label):
+        if PROGRAM_RECORDER is None:
+            return None
+        path = (Path(output) / (label + ".o")).relative_to(PROGRAM_RECORDER.output).as_posix()
+        record = PROGRAM_RECORDER.exports.get(path)
+        return json.loads(json.dumps(record)) if record is not None else None
+
+    def restore_plan(self, label, geometry, abi):
+        # The plan export_to_c would have captured (worker's export_with_plan).
+        if PROGRAM_PLANS is not None:
+            PROGRAM_PLANS[label] = {"geometry": dict(geometry), "abi": abi}
+
+    def restore(self, output, label, record):
+        if PROGRAM_RECORDER is None:
+            return
+        path = (Path(output) / (label + ".o")).relative_to(PROGRAM_RECORDER.output).as_posix()
+        # The reads it recorded, hashed as they are now (the export cache matched them).
+        record = dict(record, source_reads_sha256={
+            name: sha((ROOT / name).read_bytes()) for name in record.get("source_reads_sha256", {})
+            if (ROOT / name).is_file()})
+        PROGRAM_RECORDER.exports[path] = record
+
+    @property
+    def active(self):
+        return PROGRAM_RECORDER is not None
 GEOMETRIES = ("flash", "pro", "flash2", "pro2", "glm", "glm2", "glmf", "glmf2",
               "mimo", "mimo2", "mimop", "mimop2", "mimof", "mimof2", "qwen4", "qwen35", "qwen38", "step5", "step52")
 CAPACITIES = "1,16,80,256,1024,4096"
@@ -134,6 +177,14 @@ def jobs(scope):
     result.append(("draft-bf16", "export_b12x_dsv4_aot.py",
                    ["--geometry", "qwen38", "--only", ",".join(
                        f"k{k}_n{n}" for k, n in sorted(drafter.draft_bf16_shapes()))]))
+    native_bf16 = drafter.native_attention_bf16_shapes()
+    native_names = [f"k{k}_n{n}" for k, n in sorted(native_bf16)]
+    native_names += [f"k{k}_n{n}_f32" for n, k in sorted(drafter.native_attention_bf16_f32_shapes())]
+    result.append(("native-attention-bf16", "export_b12x_dsv4_aot.py",
+                   ["--geometry", "muse", "--only", ",".join(native_names)]))
+    result.append(("native-attention-fp8", "export_b12x_dsv4_aot.py",
+                   ["--geometry", "native_attention", "--only", ",".join(
+                       item[0] for item in drafter.native_attention_programs())]))
     # Small-row top-k deliberately exercises the fused persistent route, which
     # the production m64 table does not select.
     for geometry in ("flash", "pro", "glm", "glmf"):
@@ -167,11 +218,17 @@ def jobs(scope):
                        ["--geometry", "kimik3", "--only", ",".join(names)]))
     result.append(("ml4-draft-context-fc", "export_b12x_dsv4_aot.py",
                    ["--geometry", "ml4", "--only", "draft_context_fc"]))
+    result.append(("ml4-index", "export_b12x_dsv4_aot.py",
+                   ["--geometry", "ml4", "--only", ",".join(
+                       f"index_post{suffix}_m{rows}" for rows in (64, 4096) for suffix in ("", "_nope"))]))
     result.append(("mla-draft-h64", "export_b12x_dsv4_aot.py",
                    ["--geometry", "kimik3", "--only", ",".join([
                        "mla_draft_producer_m64", "mla_draft_producer_fp8_m64", "mla_draft_output_m64",
                        "mla_draft_attention_full_m64", "mla_draft_attention_w4096_m64",
-                       "mla_draft_attention_full_fp8_m64", "mla_draft_attention_w4096_fp8_m64"])]))
+                       "mla_draft_attention_full_fp8_m64", "mla_draft_attention_w4096_fp8_m64",
+                       "mla_draft_partial_full_m64", "mla_draft_partial_w4096_m64",
+                       "mla_draft_partial_full_fp8_m64", "mla_draft_partial_w4096_fp8_m64",
+                       "mla_draft_lse_combine2"])]))
     result.append(("kimi-residual", "export_b12x_dsv4_aot.py",
                    ["--geometry", "kimik3", "--only", ",".join([
                        "attn_res_c1_keep_append", "attn_res_c2_add_append",
@@ -264,9 +321,10 @@ def jobs(scope):
                    ["--geometry", "mimop", "--capacities", CAPACITIES,
                     "--layouts", "tp6", "--exact-slices"]))
     geometry_worlds = load_file("spark_packages", ROOT / "python/tools/lib/spark_packages.py").geometry_worlds
-    for geometry in ("mimo", "mimof", "mimop", "glm", "glmf", "qwen4", "step5", "step5_bf16"):
+    for geometry in (geometry for geometry in ROUTED_GEOMETRIES if not geometry.startswith("glmfdense")):
         layouts = ",".join(f"tp{world}" for world in geometry_worlds(geometry))
-        for input_format in (("bf16",) if geometry == "step5_bf16" else ("wire", "bf16")):
+        bf16_only = geometry.endswith(("_bf16", "_nvfp4", "_nvfp4a4"))
+        for input_format in (("bf16",) if bf16_only else ("wire", "bf16")):
             result.append((f"routed-{geometry}-spark-{input_format}", "package_fp8_moe_aot.py",
                            ["--geometry", geometry, "--capacities", CAPACITIES,
                             "--layouts", layouts, "--exact-slices", "--role", "spark",
@@ -295,6 +353,11 @@ def jobs(scope):
     result.extend((f"context-split-{geometry}", "export_b12x_dsv4_aot.py",
                    ["--geometry", geometry, "--context-split-only"])
                   for geometry in ("flash", "pro", "glm", "glmf"))
+    kimi_context = [f"mla_partial{cache}_h{begin}_t{tile}_m64"
+                    for cache in ("", "_fp8") for begin in (0, 48) for tile in (8, 16)]
+    kimi_context += ["paged_staging_gather", "paged_staging_gather_fp8", "lse_combine2"]
+    result.append(("context-split-kimik3", "export_b12x_dsv4_aot.py",
+                   ["--geometry", "kimik3", "--context-split", "on", "--only", ",".join(kimi_context)]))
     result.extend((f"exl3-routes-{geometry}", "export_b12x_exl3_routes_aot.py",
                    ["--geometry", geometry, "--capacities", exl3_capacity_args[geometry]])
                   for geometry in EXL3_GEOMETRIES)
@@ -421,7 +484,26 @@ def routed_package_layouts(package, geometry, base, role):
     return layouts
 
 
-def export_routed(extra, output):
+def routed_core_variants(package, role, weights):
+    """Read the compared checkout's production policy, including old baselines."""
+    path = Path(package.__file__)
+    tree = ast.parse(path.read_text())
+    policy = next((node for node in tree.body if isinstance(node, ast.FunctionDef)
+                   and node.name == "core_variants"), None)
+    if policy is None:
+        return (False,)
+    namespace = {}
+    exec(compile(ast.Module(body=[policy], type_ignores=[]), str(path), "exec"), namespace)
+    select = namespace["core_variants"]
+    variants = (select(role, weights, os.environ.get("CUTEAFD_BUILD_KIND", "development"))
+                if len(policy.args.args) > 2 else
+                select(role, weights) if len(policy.args.args) > 1 else select(role))
+    if not variants or any(type(value) is not bool for value in variants) or len(set(variants)) != len(variants):
+        raise ValueError(f"{path}: invalid production core-variant policy")
+    return variants
+
+
+def export_routed(extra, output, selected_objects=None):
     """Use the package's exact compiler/form policy without linking its DSOs."""
     from b12x.integration.cuteafd import exportable_compilation, validate_exported_header
     from b12x.integration.cuteafd.fp8_moe import (
@@ -452,29 +534,52 @@ def export_routed(extra, output):
     if segmented:
         from b12x.integration.cuteafd.fp8_moe import fp8_moe_segment_scratch_bytes
     records = []
+    layout_metadata = {}
     for layout in dict.fromkeys(layouts):
-        _, g = package.layout_geometry(base, layout)
+        tp, g = package.layout_geometry(base, layout)
+        layout_metadata[layout] = {
+            "tp": tp, **{key: getattr(g, key) for key in
+                ("hidden", "slice", "experts", "top_k", "intermediate", "weights")},
+            "input": "wire" if wire else "bf16",
+            "abi_version": package.ABI_VERSION, "activation": g.activation,
+            "projection": g.projection, "swiglu_limit": g.swiglu_limit,
+            **dict(zip(("swiglu_alpha", "swiglu_beta"), package.activation_params(
+                g.activation, g.weights, getattr(g, "swiglu_alpha", None),
+                getattr(g, "swiglu_beta", None), g.swiglu_limit))),
+        }
         forms = [(rows, "auto", indirect) for rows in capacities]
         forms += [(rows, form, indirect) for rows in capacities for form in prefill_forms(g, rows, wire)]
         if segmented and not indirect:
             forms += [(package.SEGMENT_MAX_ROWS, form, True) for form in package.FORMS]
-        for rows, form, row_addresses in forms:
+        forms = [(rows, form, addresses, core) for rows, form, addresses in forms
+                 for core in routed_core_variants(package, role, g.weights)]
+        for rows, form, row_addresses, core_only in forms:
             stem = f"fp8moe_{geometry}_{layout.replace('-', '_')}_m{rows}" + ("" if form == "auto" else "_" + form)
             if row_addresses and not indirect:
                 stem += "_segments"
-            with exportable_compilation():
-                program = compile_fp8_moe_aot(g, route="stream" if row_addresses else "auto",
-                    max_rows=package.SEGMENT_MAX_ROWS if row_addresses else rows, wire=wire, prefill=form,
-                    **({"row_addresses": True} if row_addresses else {}))
+            if core_only:
+                stem += "_core"
+            if selected_objects is not None and stem not in selected_objects:
+                continue
+            def construct():
+                with exportable_compilation():
+                    program = compile_fp8_moe_aot(g, route="stream" if row_addresses else "auto",
+                        max_rows=package.SEGMENT_MAX_ROWS if row_addresses else rows, wire=wire, prefill=form,
+                        **({"row_addresses": True} if row_addresses else {}),
+                        **({"core_only": True} if core_only else {}))
+                scratch = (fp8_moe_segment_scratch_bytes(g, rows, package.SEGMENT_MAX_ROWS, form)
+                           if row_addresses else fp8_moe_scratch_bytes(g, "auto", rows, wire, form))
+                return program, scratch
+            program, scratch = recorded_construction(construct)
             program.export_to_c(str(output), stem, "cuteafd_" + stem)
             checked = validate_exported_header(program, output / f"{stem}.h", "cuteafd_" + stem)
             if checked["argument_count"] != package.POINTERS + 2:
                 raise ValueError(f"{stem}: unexpected routed expert ABI")
             records.append({"name": stem, "layout": layout, "capacity": rows, "form": form, "abi": checked,
-                            "scratch_bytes": (fp8_moe_segment_scratch_bytes(g, rows, package.SEGMENT_MAX_ROWS, form)
-                                              if row_addresses else fp8_moe_scratch_bytes(g, "auto", rows, wire, form))})
+                            **({"core_only": True} if core_only else {}),
+                            "scratch_bytes": scratch})
             print(f"exported {stem}", flush=True)
-    (output / "routed.json").write_text(json.dumps({"programs": records}, indent=2) + "\n")
+    (output / "routed.json").write_text(json.dumps({"programs": records, "layouts": layout_metadata}, indent=2) + "\n")
 
 
 @contextmanager
@@ -584,10 +689,10 @@ def _export_exl3(extra, output):
             default_options = dict(options)
             if (schedule := package.default_decode_schedule(geometry, role, profile, rows, list(bits))) is not None:
                 default_options["decode_schedule"] = schedule
-            export(output / profile / f"m{rows}", width, experts, rows, bits, "auto", topk, dtype, **default_options)
+            recorded_construction(export, output / profile / f"m{rows}", width, experts, rows, bits, "auto", topk, dtype, **default_options)
             if not compact:
                 for schedule, schedule_options in package.decode_schedule_variants(geometry, role, profile, rows):
-                    export(output / profile / f"m{rows}-{schedule}", width, experts, rows, bits, "auto", topk,
+                    recorded_construction(export, output / profile / f"m{rows}-{schedule}", width, experts, rows, bits, "auto", topk,
                            dtype, **{**options, **schedule_options})
 
 
@@ -612,6 +717,7 @@ def export_exl3_routes(extra, output):
 
 
 def worker(payload):
+    global PROGRAM_RECORDER, PROGRAM_PLANS
     output = Path(payload["output"])
     os.environ["TRITON_CACHE_DIR"] = str(output.parent / f".triton-cache-{payload['sms']}")
     os.environ["CUDA_VISIBLE_DEVICES"] = ""
@@ -620,6 +726,8 @@ def worker(payload):
     candidates = payload.get("candidates", "1")
     os.environ["CUTEAFD_EXPORT_NARROW_AOT"] = candidates
     os.environ["CUTEAFD_EXPORT_HC_LAGGED"] = payload.get("hc_lagged", candidates)
+    # As native/CMakeLists.txt: Triton line info embeds the checkout path (#1485).
+    os.environ["TRITON_DISABLE_LINE_INFO"] = "1"
     sys.path[:0] = [str(ROOT / "python/tools/lib"), str(ROOT / "python/tools/aot")]
     import _pinned_sparkinfer
     from b12x._lib.compile_pool import _initialize_worker
@@ -638,7 +746,7 @@ def worker(payload):
     import importlib.metadata
     toolchain = {name: importlib.metadata.version(name) for name in ("torch", "triton", "nvidia-cutlass-dsl")}
     from b12x.integration.cuteafd import AotProgram
-    plans = {}
+    plans = PROGRAM_PLANS = {}
     original_export = AotProgram.export_to_c
 
     def export_with_plan(program, file_path, file_name, function_prefix):
@@ -646,10 +754,24 @@ def worker(payload):
         return original_export(program, file_path, file_name, function_prefix)
 
     AotProgram.export_to_c = export_with_plan
+    recorder = None
+    if payload.get("program_records"):
+        # The ordinary cache fingerprints the package, not frontend semantics.
+        # Warm that bookkeeping before observing actual recipe dependencies.
+        from b12x._lib.compiler import b12x_package_fingerprint
+        b12x_package_fingerprint()
+        records_module = load_file("placement_kernel_records", ROOT / "scripts/build/kernel-records.py")
+        backend_cache = None
+        if payload.get("backend_cache"):
+            identity = records_module.compiler_identity(ROOT, payload, capability)
+            backend_cache = records_module.BackendCache(payload["backend_cache"], identity)
+        recorder = records_module.Recorder(ROOT, output, backend_cache).install()
+        PROGRAM_RECORDER = recorder
+        # runpy exporters receive a worker-local hook, not a serving dependency.
     start = time.monotonic()
     path = ROOT / "python/tools/aot" / payload["exporter"]
     if payload["exporter"] == "package_fp8_moe_aot.py":
-        export_routed(payload["args"], output)
+        export_routed(payload["args"], output, payload.get("selected_objects"))
     elif payload["exporter"] == "package_exl3_aot.py":
         export_exl3(payload["args"], output)
     elif payload["exporter"] == "export_b12x_exl3_routes_aot.py":
@@ -669,7 +791,10 @@ def worker(payload):
             finally:
                 compile_pool._initialize_worker = _initialize_worker
         else:
-            runpy.run_path(str(path), run_name="__main__")
+            runpy.run_path(str(path), run_name="__main__", init_globals={
+                "_record_construction": recorded_construction,
+                "_program_records": ProgramRecords(),
+                "_selected_object_labels": payload.get("selected_objects")})
     if torch.cuda.get_device_properties(0).multi_processor_count != payload["sms"]:
         raise RuntimeError("exporter changed the synthetic SM count")
     if torch.cuda.is_initialized():
@@ -679,12 +804,20 @@ def worker(payload):
                "sparkinfer_revision": _pinned_sparkinfer.REVISION,
                "source_tree_sha256": _pinned_sparkinfer.LOCK_DATA["source_tree_sha256"],
                "exporter": payload["exporter"], "args": payload["args"], "toolchain": toolchain,
+               "build_kind": os.environ.get("CUTEAFD_BUILD_KIND", "development"),
                "environment": {key: os.environ[key] for key in ("CUTEAFD_EXPORT_NARROW_AOT", "CUTEAFD_EXPORT_HC_LAGGED")},
                "exporter_sha256": sha(path.read_bytes()), "comparison_script_sha256": sha(Path(__file__).read_bytes()),
                "export_sources_sha256": {str(source.relative_to(ROOT)): sha(source.read_bytes())
                    for source in sorted((ROOT / "python/tools/aot").glob("*.py"))},
                "max_shared_memory_per_block": 101376, "max_shared_memory_per_multiprocessor": 102400,
                "seconds": time.monotonic() - start}
+    if recorder is not None:
+        inspector = load_file("placement_cuda_images", ROOT / "scripts/qualify/deepseek_v41/inspect-cute-object.py")
+        program_records = recorder.finish(inspector, summary, plans)
+        summary["source_reads_sha256"] = recorder.reads()
+        summary["stage0_inputs"] = records_module.stage0_inputs(ROOT, payload, capability)
+        if recorder.backend_cache is not None:
+            summary["backend_reuse"] = {"hits": recorder.backend_cache.hits, "misses": recorder.backend_cache.misses}
     (Path(payload["output"]) / "comparison-context.json").write_text(json.dumps(summary, indent=2) + "\n")
 
 
@@ -947,6 +1080,92 @@ def parse_sms(value):
     return sms
 
 
+def v4_placement_sources():
+    # Keep this set identical to plan::testing::v4_placement_source_hashes.
+    paths = {ROOT / "scripts/build/compare-sm-exports.py", ROOT / "scripts/build/kernel-records.py",
+             ROOT / "scripts/build/export-placement-inputs.py"}
+    for directory in ("python/tools/aot", "python/tools/lib"):
+        paths.update((ROOT / directory).rglob("*.py"))
+    paths.update((ROOT / "scripts/build").glob("*.json"))
+    return {str(path.relative_to(ROOT)): sha(path.read_bytes()) for path in sorted(paths)}
+
+
+def v4_placement_inputs(destination, staging, timeout, workers, previous=None, backend_cache=None, verify_skips=False):
+    """Publish compiler-produced planner metadata, never inferred scratch sizes."""
+    filesystem = load_file("cuteafd_build_filesystem", ROOT / "scripts/build/assert-build-filesystem.py")
+    for path in (destination, staging):
+        filesystem.check_path(str(path))
+        if path.exists() and any(path.iterdir()):
+            raise ValueError(f"output is not empty: {path}")
+        path.mkdir(parents=True, exist_ok=True)
+    engine = subprocess.check_output(["git", "-C", str(ROOT), "rev-parse", "HEAD"], text=True).strip()
+    lock = json.loads((ROOT / "third_party/sparkinfer.lock.json").read_text())
+    sources = v4_placement_sources()
+    exports = [(str(context), "export_b12x_dsv4_aot.py",
+                ["--geometry", "flash,pro,flash2,pro2", "--max-context", str(context),
+                 "--decode-rows", "64", "--prefill-rows", "4096", "--context-split", "on"])
+               for context in (131072, 1048576)]
+    exports.append(("exl3", "package_exl3_aot.py",
+                    ["--geometry", "dsv4p", "--capacities", EXL3_CAPACITIES,
+                     "--bits", "2,3", "--role", "coordinator"]))
+
+    publisher = load_file("v4_publication_records", ROOT / "scripts/build/export-placement-inputs.py")
+    if backend_cache:
+        filesystem.check_path(str(backend_cache))
+    verify_skips = verify_skips or os.environ.get("CUTEAFD_BUILD_KIND") == "release"
+
+    def compile_one(job):
+        return publisher.compile_job(job, staging, previous, lock, timeout, backend_cache, verify_skips)
+
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        summaries = list(pool.map(compile_one, exports))
+    if sources != v4_placement_sources() or lock != json.loads((ROOT / "third_party/sparkinfer.lock.json").read_text()):
+        raise ValueError("V4 export sources changed during compilation")
+    for summary in summaries:
+        if (summary.get("sparkinfer_revision") != lock["revision"]
+                or summary.get("source_tree_sha256") != lock["source_tree_sha256"]
+                or summary.get("cuda_initialized") is not False):
+            raise ValueError("V4 worker provenance differs from captured source lock or initialized CUDA")
+    publisher = load_file("v4_publication_records", ROOT / "scripts/build/export-placement-inputs.py")
+    records = publisher.publication_records(staging, [(name, exporter, extra) for name, exporter, extra in exports])
+    for context in (131072, 1048576):
+        for model in ("flash", "pro"):
+            for rtx in (1, 2):
+                target = destination / f"{model}-{rtx}-{context}"
+                target.mkdir()
+                programs = json.loads((staging / str(context) / "dsv4_programs.json").read_text())
+                if records:
+                    programs["kernel_records"] = {name: record for name, record in records.items()
+                                                  if name.startswith(str(context) + "/")}
+                (target / "PROGRAMS.json").write_text(json.dumps(programs, indent=2) + "\n")
+                if model == "pro":
+                    package = target / "exl3/exl3-dsv4p-k23"
+                    for source in (staging / "exl3").rglob("v41_exl3.json"):
+                        copied = package / source.relative_to(staging / "exl3")
+                        copied.parent.mkdir(parents=True, exist_ok=True)
+                        shutil.copy2(source, copied)
+    for name, _, _ in exports:
+        for source in (staging / name).rglob("*.json"):
+            target = destination / ".workers" / name / source.relative_to(staging / name)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, target)
+    files = {str(path.relative_to(destination)): sha(path.read_bytes())
+             for path in sorted(destination.rglob("*.json"))}
+    provenance = dict(schema=1, engine_commit=engine, sparkinfer_revision=lock["revision"],
+                      source_tree_sha256=lock["source_tree_sha256"], engine_sources_sha256=sources,
+                      exports=summaries, files=files, program_records=records)
+    (destination / "INPUTS.json").write_text(json.dumps(provenance, indent=2) + "\n")
+    sm_report = publisher.kernel_records.change_report({}, records)
+    if sm_report["sm170_mismatches"]:
+        publisher.kernel_records.write_report(destination, sm_report)
+        raise ValueError(f"SM 170 / 188 OBJECT MISMATCH: {sm_report['sm170_mismatches']}")
+    if previous:
+        records_module = load_file("v4_change_records", ROOT / "scripts/build/kernel-records.py")
+        old = json.loads((previous / "INPUTS.json").read_text())["program_records"]
+        records_module.write_report(destination, records_module.change_report(old, records))
+    print(f"Published V4 placement inputs: {destination}", flush=True)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--arch", choices=tuple(ARCHES), default="sm120",
@@ -968,6 +1187,11 @@ def main():
     parser.add_argument("--require-identical", action="store_true")
     parser.add_argument("--timeout", type=int, default=7200, help="seconds per export context")
     parser.add_argument("--workers", type=int, default=1, help="independent CPU export groups in parallel")
+    parser.add_argument("--v4-placement-inputs", type=Path,
+                        help="CPU-only Flash/Pro 1/2-RTX x 128K/1M planner metadata; --output-dir is staging")
+    parser.add_argument("--previous", type=Path, help="prior V4 publication for incremental job replay")
+    parser.add_argument("--backend-cache", type=Path, help="content-addressed lowered-MLIR cache")
+    parser.add_argument("--verify-skips", action="store_true", help="run skipped frontends and reject IR drift")
     parser.add_argument("--_worker", help=argparse.SUPPRESS)
     args = parser.parse_args()
     if args._worker:
@@ -980,6 +1204,16 @@ def main():
         variation = read_variation(variation_path) if variation_path else None
     except (OSError, ValueError) as exc:
         parser.error(str(exc))
+
+    if args.v4_placement_inputs:
+        if args.workers < 1 or args.timeout < 1:
+            parser.error("--workers and --timeout must be positive")
+        v4_placement_inputs(args.v4_placement_inputs.expanduser().resolve(),
+                            args.output_dir.expanduser().resolve(), args.timeout, args.workers,
+                            args.previous.expanduser().resolve() if args.previous else None,
+                            args.backend_cache.expanduser().resolve() if args.backend_cache else None,
+                            args.verify_skips)
+        return 0
     if args.expected_removals and not args.baseline_source:
         parser.error("--expected-removals requires --baseline-source")
     try:

@@ -47,7 +47,7 @@ impl DsparkMainContext<'_, '_> {
         ensure!(self.pending_writes.is_some(), "main-context commit not pending");
         self.synchronize()
     }
-    pub fn publish_commit(&mut self, windows: &mut [DsparkWindow<'_>; 3]) -> Result<()> {
+    pub fn publish_commit(&mut self, windows: &mut [DsparkWindow<'_>]) -> Result<()> {
         ensure!(self.poll_commit()?, "main-context commit has not completed");
         self.timing.publish_completed()?;
         let writes = self.pending_writes.as_ref().unwrap();
@@ -58,7 +58,7 @@ impl DsparkMainContext<'_, '_> {
         }
         Ok(())
     }
-    pub fn abort_commit(&mut self, windows: &mut [DsparkWindow<'_>; 3]) -> Result<()> {
+    pub fn abort_commit(&mut self, windows: &mut [DsparkWindow<'_>]) -> Result<()> {
         let drained = self.synchronize();
         let mut result = Ok(());
         if let Some(writes) = self.pending_writes.take() {

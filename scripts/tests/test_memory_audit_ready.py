@@ -14,7 +14,8 @@ MIB = 1 << 20
 
 def report(used, tracked, scopes):
     value = {"stage": "coordinator", "devices": [{"device": 0, "tracked": tracked, "peak": tracked, "scopes": scopes,
-                                                  "used": used, "total": 96 << 30, "untracked": used - tracked}],
+                                                  "used": used, "total": 96 << 30, "untracked": used - tracked,
+                                                  "by_kind": {"kinds": scopes, "untagged": 0}}],
              "pinned": {"tracked": 0, "peak": 0, "scopes": {}}, "weights": [], "dual_formats": [], "host": {}}
     return "2026-10-10T00:00:00Z INFO cuteafd::memory: memory ledger report=" + json.dumps(value) + "\n"
 
@@ -190,7 +191,7 @@ def test_strict_ready_rejects_invalid_tolerance(tmp_path, tolerance):
     assert run(log, plan, strict=True, tolerance=tolerance) == 2
 
 
-def test_pool_following_v4_page_tables_use_the_planners_kv_records_scope(tmp_path):
+def test_pool_following_v4_page_tables_are_views_of_the_planned_kv_arena(tmp_path):
     engine = (Path(__file__).parents[2] / "rust/crates/cuteafd-daemon/src/families/deepseek_v4/engine.rs").read_text()
     def enclosed(source, opening, closing):
         start = source.index(opening)
@@ -203,15 +204,17 @@ def test_pool_following_v4_page_tables_use_the_planners_kv_records_scope(tmp_pat
         raise AssertionError("unclosed source block")
 
     signature = enclosed(engine.split("fn step_buffers", 1)[1], "(", ")")
-    assert re.findall(r"(\w+)\s*:\s*usize", signature) == ["rows", "page_lists", "members"]
+    assert re.findall(r"(\w+)\s*:\s*usize", signature) == ["rank", "lane", "rows", "page_lists", "members"]
     body = enclosed(engine.split("fn step_buffers", 1)[1], "{", "}")
     allocation = enclosed(body.split("c4_page_table:", 1)[1], "{", "}")
-    assert 'scope("kv/records")' in allocation
-    assert allocation.index('scope("kv/records")') < allocation.index("ints(")
-    assert re.search(r"ints\s*\(\s*page_lists\s*\*\s*\(\s*self\.shape\.units\s*\+\s*if\s+members\s*>\s*1\s*\{\s*3\s*\}\s*else\s*\{\s*0\s*\}\s*\)\s*\)", allocation)
+    assert 'const KV: Tag = Tag::kv("v4/kv")' in engine
+    assert '"tables.decode"' in allocation and 'format!("tables.prefill{lane}")' in allocation
+    assert 'arena.view(&name)?' in allocation
+    assert 'self.alloc(' not in allocation
+    assert 'rank == 0 { &self.kv_arena } else { &self.peer()?.kv_arena }' in allocation
     call = enclosed(engine.split("self.step_buffers", 1)[1], "(", ")")
     branches = re.findall(r"if\s+shared_page_list\s*\{\s*([\w:]+)\s*\}\s*else\s*\{\s*(\w+)\s*\}", call)
-    assert re.match(r"\s*t\s*,", call)
+    assert re.match(r"\s*rank\s*,\s*index\s*,\s*shared_page_list\s*,\s*t\s*,", call)
     assert len(branches) == 2
     assert [value.rsplit("::", 1)[-1] for value, _ in branches] == ["V4_PACKED_MEMBERS"] * 2
     assert [fallback for _, fallback in branches] == ["t", "1"]
@@ -219,7 +222,7 @@ def test_pool_following_v4_page_tables_use_the_planners_kv_records_scope(tmp_pat
     table_bytes = waves * members * (units + 3) * 4 + decode_rows * units * 4
     log = tmp_path / "coordinator.log"
     log.write_text(report(1000 * MIB + table_bytes, 900 * MIB + table_bytes,
-                          {"weights": 900 * MIB, "kv/records": table_bytes}))
+                          {"weights": 900 * MIB, "kv": table_bytes}))
     categories = memory_audit.summarize(next(memory_audit.reports(str(log))))["devices"][0]["categories"]
     assert categories["kv"] == table_bytes
     assert categories.get("workspace", 0) == 0
@@ -228,16 +231,27 @@ def test_pool_following_v4_page_tables_use_the_planners_kv_records_scope(tmp_pat
 def test_v4_admits_tables_and_frozen_prefix_quota_before_first_reservation():
     root = Path(__file__).parents[2] / "rust/crates/cuteafd-daemon/src/families/deepseek_v4"
     startup = (root / "mod.rs").read_text().split("pub(crate) fn with_engine", 1)[1]
-    assert startup.index("engine.attach_peer(") < startup.index("admission::host_memory(")
-    assert startup.index("admission::host_memory(") < startup.index("engine.attach_context(")
-    assert startup.index("admission::host_memory(") < startup.index("engine.prepare_workspaces()")
+    # One contract admission prices every device and host owner (pinned tables,
+    # the frozen prefix quota, logits, link storage) before the first upload.
+    admit = startup.index("admission::admit(&facts)")
+    assert startup.count("admission::admit(") == 1
+    assert startup.index("host_memory: cuteafd_loader::formats::mapped_preload::host_memory()?") < admit
+    assert admit < startup.index("push::load_alone(")
+    assert admit < startup.index("engine::Engine::new(")
+    assert admit < startup.index("engine.attach_peer(")
+    # The retained config is built from the admitted quota, never re-admitted live.
+    config = startup.index("admission::host_config(prefix,")
+    assert config < startup.index("engine.attach_context(")
+    assert config < startup.index("engine.prepare_workspaces()")
+    assert "host_prefix)?" in startup[config:config + 200]
+    assert "admit_host_memory(" not in startup
     assert "body(&engine, &mut transports, &runtime, host_config)" in startup
-    admission = (root / "admission.rs").read_text().split("pub(crate) fn host_memory(", 1)[1]
-    admission = admission.split("pub(crate) fn request(", 1)[0]
-    assert admission.count("resolve_host_config(") == 1
-    assert admission.count("admit_host_memory(") == 1
-    assert "config.as_ref().map_or(0, |c| c.bytes)" in admission
-    assert "&tables, logits" in admission
+    admission = (root / "admission.rs").read_text()
+    assert "admit_host_memory(" not in admission
+    assert "PinnedTables" not in admission
+    host_config = admission.split("pub(crate) fn host_config(", 1)[1].split("\npub(crate) fn ", 1)[0]
+    assert host_config.count("resolve_host_config(") == 1
+    assert "HostBudget::Bytes(admitted.quota_bytes)" in host_config
     serve = (root / "serve.rs").read_text()
     cache = serve.split("fn prefix_cache", 1)[1].split("/// Gives a finished", 1)[0]
     assert "host_config.map(|config|" in cache
@@ -247,12 +261,12 @@ def test_v4_admits_tables_and_frozen_prefix_quota_before_first_reservation():
     assert "prefix_cache(engine, prefix, host_config)?" in serve
 
 
-def test_glmf_kda_only_pool_backing_uses_the_planners_prefix_scope():
+def test_glmf_kda_only_pool_backing_has_a_prefix_kind():
     source = (Path(__file__).parents[2] / "rust/crates/cuteafd-daemon/src/families/glm5_flash/engine.rs").read_text()
     allocation = source.split("let pool_mark_backing = if pool_mark_unit_bytes > 0 {", 1)[1].split("} else { None };", 1)[0]
-    assert 'scope("prefix/KDA-only pool marks")' in allocation.split("Some(zeroed(", 1)[0]
+    assert 'Tag::prefix("glmf/prefix-pool-marks")' in allocation
     assert 'pool_pages.checked_mul(pool_mark_unit_bytes)' in allocation
-    assert memory_audit.category("prefix/KDA-only pool marks") == "prefix"
+    assert memory_audit.kind_categories({"kinds": {"prefix": 1}}) == {"prefix": 1}
 
 
 def test_tp2_expert_loaders_scope_both_parent_and_parallel_rank_allocations():
@@ -265,7 +279,7 @@ def test_tp2_expert_loaders_scope_both_parent_and_parallel_rank_allocations():
         assert 'scope_owned(&label)' in parent.split("synchronized_load::load_pair", 1)[0]
         parallel = parent.split("synchronized_load::load_pair", 1)[1]
         assert 'scope_owned(&label)' in parallel.split("Ok(vec![", 1)[0]
-    assert memory_audit.category("experts/TP2 expert layer halves 0..36") == "experts"
+    assert memory_audit.kind_categories({"kinds": {"experts": 1}}) == {"experts": 1}
 
 
 def test_fp8_tp2_pair_scopes_its_bf16_output_with_the_expert_arena():
@@ -274,15 +288,71 @@ def test_fp8_tp2_pair_scopes_its_bf16_output_with_the_expert_arena():
     pair = source.split("pub(crate) fn load_pair(", 1)[1].split("fn log_pair_load", 1)[0]
     scope = 'scope("experts/TP2 FP8 expert layer halves")'
     assert scope in pair.split("Fp8Experts::load_pair", 1)[0]
-    assert pair.index(scope) < pair.index("Allocation::new(devices[rank], plans[rank].output_bytes)")
-    assert memory_audit.category("experts/TP2 FP8 expert layer halves") == "experts"
+    assert pair.index(scope) < pair.index("Allocation::new(devices[rank], plans[rank].output_bytes,")
+    assert memory_audit.kind_categories({"kinds": {"experts": 1}}) == {"experts": 1}
 
 
 def test_raw_cuda_audit_labels_gb10_reclaimable_cache(capsys):
     scope = "raw cudaMemGetInfo; GB10 under-reports reclaimable page cache; host MemAvailable is allocatable headroom"
     report = {"stage": "ready", "devices": [{"device": 0, "tracked": 0, "peak": 0,
-        "cuda_memory_scope": scope, "scopes": {}}], "host": {"MemAvailable": 45 * 2**30}}
+        "cuda_memory_scope": scope, "scopes": {}, "by_kind": {"kinds": {}, "untagged": 0}}], "host": {"MemAvailable": 45 * 2**30}}
     memory_audit.render("spark.log", memory_audit.summarize(report))
     output = capsys.readouterr().out
     assert scope in output
     assert "MemAvailable 45.00" in output
+
+
+def test_typed_reports_use_kinds_not_scope_names():
+    # A misleading scope name must not decide the category once allocations carry kinds.
+    device = {"device": 0, "tracked": 700, "peak": 700, "used": 800, "total": 1000, "untracked": 100,
+              "scopes": {"weights/misleading": 700},
+              "by_kind": {"kinds": {"kv": 400, "drafter_workspace": 200}, "untagged": 50},
+              "managed_by_kind": {"kinds": {"staging": 50}, "untagged": 0}}
+    summary = memory_audit.summarize({"stage": "ready", "devices": [device], "weights": []})
+    cats = summary["devices"][0]["categories"]
+    assert cats == {"kv": 400, "drafter": 200, "untagged": 50, "staging": 50, "runtime": 100}
+
+
+def test_kimi_reconciliation_uses_shared_ready_first_request_and_stats_paths():
+    root = Path(__file__).parents[2] / "rust/crates/cuteafd-daemon/src"
+    startup = (root / "families/kimi_k3/startup.rs").read_text()
+    assert '"memory_reconciliation_provenance"' in startup
+    for field in ["source_commit", "native_sha256", "programs_sha256", "devices"]:
+        assert f'"{field}"' in startup
+    assert '"devices": inventory.gpus' in startup
+    assert "hash(options.manifest)?" in startup
+    for name in ["serve.rs", "golden.rs"]:
+        assert "manifest: &args.manifest" in (root / "families/kimi_k3" / name).read_text()
+    assert 'memory_report::log("ready")' in (root / "families/kimi_k3/serve.rs").read_text()
+    assert 'if stage == "ready" { reconcile::capture(&stage); }' in (root / "shared/memory_report.rs").read_text()
+    scheduler = (root / "shared/qwen/scheduler.rs").read_text()
+    hook = '''    if requests > 0 {
+        static FIRST: std::sync::Once = std::sync::Once::new();
+        crate::shared::probe::first_request(&FIRST, requests, || crate::shared::memory_report::reconcile::capture("first_request"));
+    }'''
+    assert hook in scheduler
+    assert scheduler.count('reconcile::capture("first_request")') == 1
+    assert 'memory_reconciliation' in (root / "shared/probe.rs").read_text()
+
+
+def test_kind_category_mirrors_every_memory_kind():
+    source = (Path(__file__).parents[2] / "rust/crates/cuteafd-core/src/memory_layout.rs").read_text()
+    labels = re.findall(r'Self::\w+ => "(\w+)",', source.split("pub const fn label(self)", 1)[1].split("}", 1)[0])
+    assert sorted(labels) == sorted(memory_audit.KIND_CATEGORY)
+
+
+def test_kimi_startup_capture_window_excludes_eager_first_touch():
+    root = Path(__file__).parents[2] / "rust/crates/cuteafd-daemon/src/families/kimi_k3"
+    engine = (root / "engine.rs").read_text().split("pub(crate) fn warm_graphs(", 1)[1]
+    assert engine.index("restore_startup_kda()?") < engine.index("let before_capture =")
+    assert engine.index("let before_capture =") < engine.index("observe_device(")
+    assert engine.index("let mut controllers =") < engine.index("device_cache(")
+    assert engine.index("controllers.push(") < engine.index("local.warm_graphs(")
+    assert engine.index("local.warm_graphs(") < engine.index("drop(controllers)")
+    assert engine.index("set_reserve_policy(") < engine.index("local.warm_graphs(")
+    assert engine.index("observe_device(") < engine.index("local.warm_graphs(")
+    assert engine.index("self.graph_settle()?") < engine.index("Ok(GraphWarmup")
+    startup = (root / "startup.rs").read_text()
+    assert "let bytes = warmup.before_capture[rank]" in startup
+    assert "cuda_physical_memory_info()?" in (root / "engine.rs").read_text()
+    assert "first_touch_bytes" in startup and "capture_delta_bytes" in startup

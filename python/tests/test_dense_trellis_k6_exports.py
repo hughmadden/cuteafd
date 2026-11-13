@@ -28,7 +28,7 @@ def test_local_shapes_and_sides(monkeypatch):
         (7168, 6144, 1), (6144, 7168, 2), (7168, 3072, 1), (3072, 7168, 2),
         (7168, 3584, 1), (3584, 7168, 1), (7168, 1536, 1), (7168, 640, 1),
         (1536, 18432, 1), (1536, 9216, 1), (7168, 12288, 1),
-        (12288, 7168, 1), (7168, 163840, 1),
+        (12288, 7168, 1), (7168, 163840, 1), (6144, 7168, 1),
     }
     assert all(k % 128 == n % 128 == 0 for _, k, n, _ in shapes)
     assert not any(n == 576 or k == 1792 or n == 1792 for _, k, n, _ in shapes)
@@ -44,7 +44,7 @@ def test_only_shared_native_compiler_and_both_codebooks(monkeypatch):
     transforms.compile_trellis_output_aot = lambda **params: params
     monkeypatch.setitem(sys.modules, transforms.__name__, transforms)
     programs = module["programs"]()
-    assert len(programs) == 46
+    assert len(programs) == 48
     assert len({name for name, *_ in programs}) == len(programs)
     grouped = [item for item in programs if item[2].get("groups")]
     assert {name for name, *_ in grouped} == {
@@ -107,6 +107,28 @@ def test_only_shared_native_compiler_and_both_codebooks(monkeypatch):
     assert "b12x.integration.cuteafd.trellis_linear" in imports
 
 
+def test_k8_screen_is_opt_in_and_names_do_not_collide(monkeypatch):
+    module = load_exporter(monkeypatch)
+    fake = ModuleType("b12x.integration.cuteafd.trellis_linear")
+    fake.compile_trellis_linear_aot = lambda **params: params
+    monkeypatch.setitem(sys.modules, fake.__name__, fake)
+    transforms = ModuleType("b12x.integration.cuteafd.trellis_transform")
+    transforms.compile_trellis_input_aot = lambda **params: params
+    transforms.compile_trellis_output_aot = lambda **params: params
+    monkeypatch.setitem(sys.modules, transforms.__name__, transforms)
+    shipping = module["programs"](families=tuple(module["FAMILY_SHAPES"]))
+    assert {params["bits"] for _, op, params, _ in shipping if op == "trellis_linear"} == {4, 6}
+    shapes = module["KIMI_SHAPES"] + module["kimi_k8_screen_shapes"]()
+    screen = module["programs_for_shapes"](shapes)
+    assert len({name for name, *_ in screen}) == len(screen)
+    for name, op, params, compile_program in screen:
+        assert compile_program() == params
+        if op == "trellis_linear" and params["bits"] == 8:
+            assert "_k8" in name
+    assert sum(op == "trellis_linear" and params.get("groups") == 4 and params["bits"] == 8
+               for _, op, params, _ in screen) == 2
+
+
 def test_comparison_group_is_opt_in():
     groups = runpy.run_path(str(ROOT / "scripts/build/compare-sm-exports.py"))["jobs"]("all")
     group = next(row for row in groups if row[0] == "kimi-k6-dense")
@@ -115,7 +137,7 @@ def test_comparison_group_is_opt_in():
 
 def test_native_only_policy_has_no_dequant_scratch(monkeypatch):
     policies = load_exporter(monkeypatch)["row_policies"]()
-    assert len(policies) == 26
+    assert len(policies) == 28
     for policy in policies:
         assert not any("chunk" in key or "dequant" in key or "scratch" in key for key in policy)
         assert "wide_input" not in policy

@@ -2,6 +2,7 @@
 #[cfg(test)]
 #[path = "push_fp8/tests.rs"]
 mod tests;
+use crate::shared::memory::Tag;
 use super::{modules::Fp8Group, NativeExpertServiceConfig};
 use crate::shared::{
     experts::fp8::Fp8Layer,
@@ -24,6 +25,7 @@ use cuteafd_loader::{
 };
 use cuteafd_transport::worker_selection::push::{self, Offer};
 use std::{net::TcpStream, os::fd::AsRawFd, rc::Rc};
+use cuteafd_core::memory_layout::ArenaTag;
 
 pub(super) fn load<'a>(
     library: &'a NativeLibrary,
@@ -51,7 +53,7 @@ pub(super) fn load<'a>(
         );
         // Execution scratch is allocated only after the weight transaction completes.
         let available = library.cuda_allocatable_memory_info()?.0;
-        let headroom = super::spark_runtime_headroom()?;
+        let headroom = super::spark_runtime_headroom(config, cuteafd_core::expert_geometry(), plan.layout.bytes())?;
         let peak = super::push::admit_peak(
             plan.layout.bytes(),
             plan.host_scratch,
@@ -102,8 +104,8 @@ fn receive<'a>(
     let joined = (|| -> Result<_> {
         let started = std::time::Instant::now();
         let expected = ExpectedCoverage::from_plan(checked, u32::try_from(rank_id)?)?;
-        let arena = LoadingArena::new(device, plan.layout.clone(), expected)?;
-        let ring = RegisteredRing::new(library, DEFAULT_SLOTS, DEFAULT_SLOT_BYTES)?;
+        let arena = LoadingArena::new(device, plan.layout.clone(), expected, ArenaTag::experts("experts/spark-fp8"))?;
+        let ring = RegisteredRing::new(library, DEFAULT_SLOTS, DEFAULT_SLOT_BYTES, Tag::staging("experts/spark-push-ring"))?;
         let allocated = started.elapsed();
         let rank = client.join(JoinArgs {
             group,

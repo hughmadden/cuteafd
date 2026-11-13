@@ -1,7 +1,8 @@
 //! Predictor input and independent cache coordinates; no scheduler frontier advances here.
+use crate::shared::memory::weight_arena::DeviceWeightArena;
 use super::{weights::load_operand, scratch::{Arena, CompactKv, Plane}};
 use cuteafd_loader::plan::families::step5::native;
-use crate::shared::memory::device::{Allocation, Device, Event, Stream};
+use crate::shared::memory::{device::{Allocation, Device, Event, Stream}, Tag};
 use anyhow::{ensure, Context, Result};
 use cuteafd_core::DType;
 use cuteafd_loader::families::qwen4::Qwen4KvCache;
@@ -9,6 +10,7 @@ use cuteafd_ffi::{programs::{Program, ProgramSpec, Programs, Scalar}, CuteafdDev
 use cuteafd_loader::plan::{checkpoint::Checkpoint,
     families::step5::{Config, coordinator::{RankWeightLayout, WeightOperand}}};
 use std::rc::Rc;
+use cuteafd_core::memory_layout::ArenaTag;
 
 const H: usize = 4096;
 const NORM_POINTERS: &[&str] = &["x", "weight", "bias", "cos", "sin", "positions", "out"];
@@ -71,7 +73,7 @@ impl InputPlan {
             programs.spec("step5_mtp_eh")?, rows)?;
         let native_bytes = match &native {
             Some(name) => (layout.core[name].bytes as u64).checked_add(
-                cuteafd_loader::formats::trellis_core::ProjectionScratchLayout::new(2 * H, H, rows)?.bytes()? as u64)
+                cuteafd_loader::formats::trellis_core::ProjectionScratchLayout::new(2 * H, H, rows)?.packed_bytes()? as u64)
                 .context("Step-5 native eh overflow")?,
             None => 0,
         };
@@ -100,9 +102,15 @@ pub(super) struct InputOwner<'a> {
     rows: usize,
 }
 impl<'a> InputOwner<'a> {
+    fn inventory(&self, inventory: &mut crate::shared::memory::receipts::Inventory<'_>, prefix: &str) -> Result<()> {
+        let weights = &self.immutable;
+        let native = weights.native.iter().map(|(linear, _)| linear).collect::<Vec<_>>();
+        super::native::inventory_owner(inventory, prefix, weights.weights.iter().map(Some), &native)
+    }
+
     pub(super) fn load(device: Device<'a>, programs: &'a Programs<'a>,
         checkpoint: &'a Checkpoint, plan: InputPlan, stream: Rc<Stream<'a>>,
-        available: u64, reservations: &[u64], arena: &Arena<'a>) -> Result<Self> {
+        available: u64, reservations: &[u64], arena: &Arena<'a>, weight_arena: &DeviceWeightArena<'a>) -> Result<Self> {
         let bytes = reservations.iter().try_fold(plan.bytes, |n, v| n.checked_add(*v))
             .context("Step-5 predictor input reservation overflow")?;
         ensure!(bytes <= available && stream.device.id == device.id
@@ -112,15 +120,15 @@ impl<'a> InputOwner<'a> {
             let norm = programs.program("step5_final_norm", NORM_POINTERS)?;
             let eh = programs.program("step5_mtp_eh", EH_POINTERS)?;
             let weights = plan.weights.iter()
-                .map(|w| load_operand(device, checkpoint, &plan.layout, w))
+                .map(|w| load_operand(device, checkpoint, &plan.layout, w, Some(weight_arena)))
                 .collect::<Result<Vec<_>>>()?;
             let native = plan.native.as_ref().map(|name| -> Result<_> {
                 let mut layer = super::native::NativeLayer::load(device, programs, checkpoint, &plan.layout,
-                    plan.rows, |n| n == name)?;
+                    plan.rows, |n| n == name, Some(weight_arena))?;
                 let layout = layer.scratch_layout(plan.rows)?.context("native eh scratch")?;
                 let linear = Rc::try_unwrap(layer.linears.remove(name).context("native eh")?)
                     .map_err(|_| anyhow::anyhow!("native eh aliased"))?;
-                Ok((linear, super::native::NativeScratch::allocate(device, &layout)?))
+                Ok((linear, super::native::NativeScratch::allocate(device, &layout, crate::shared::memory::Tag::drafter_workspace("step5/mtp-projection"))?))
             }).transpose()?;
             Ok(Rc::new(InputWeights { norm, eh, weights, epsilon: plan.epsilon, native }))
         })?;
@@ -214,8 +222,9 @@ impl Coordinates {
     }
 }
 
-/// Predictor weights and cache identity are private; sequential scratch aliases
-/// the target and all predictors on the admitted main stream.
+/// Predictor weights and cache identity are private. Per-step scratch, including
+/// compact K/V producers, reuses the target's Workspace sequential-scratch arena
+/// on the admitted main stream, after retained outputs have been copied out.
 pub(super) struct StageOwner<'a> {
     stream: Rc<Stream<'a>>,
     input: InputOwner<'a>,
@@ -231,11 +240,18 @@ pub(super) struct StageOwner<'a> {
     cache_owner: std::cell::Cell<Option<usize>>,
 }
 impl<'a> StageOwner<'a> {
+    fn inventory(&self, inventory: &mut crate::shared::memory::receipts::Inventory<'_>, prefix: &str) -> Result<()> {
+        self.input.inventory(inventory, &format!("{prefix}.input"))?;
+        self.attention.inventory(inventory, &format!("{prefix}.layer"))?;
+        self.head.inventory(inventory, &format!("{prefix}.head"))
+    }
+
     pub(super) fn load(device: Device<'a>, programs: &'a Programs<'a>,
         checkpoint: &'a Checkpoint, stage: usize, rows: usize,
         rope: Rc<super::rope::TargetTables<'a>>, available: u64, reservations: &[u64],
         arena: &Arena<'a>, stream: Rc<Stream<'a>>, kv_format: Qwen4KvCache,
-        contract: &cuteafd_loader::plan::families::step5::coordinator::CoordinatorContract) -> Result<Self> {
+        contract: &cuteafd_loader::plan::families::step5::coordinator::CoordinatorContract,
+        weight_arena: &DeviceWeightArena<'a>) -> Result<Self> {
         let capacities = native::mtp_rows(rows)?;
         let rows = capacities.layer;
         let input = InputPlan::prepare(programs, checkpoint, stage, rows, contract)?;
@@ -246,16 +262,16 @@ impl<'a> StageOwner<'a> {
             .context("Step-5 predictor owner admission overflow")?;
         ensure!(total <= available && stream.device.id == device.id,
             "Step-5 predictor owner and reservations exceed admission");
-        let input = InputOwner::load(device, programs, checkpoint, input, stream.clone(), available, &[], arena)?;
+        let input = InputOwner::load(device, programs, checkpoint, input, stream.clone(), available, &[], arena, weight_arena)?;
         let attention = super::swa::SwaLayer::for_mtp_stage(device, programs, checkpoint,
-            stage, rows, rope, available, &[], arena, kv_format, contract)?;
+            stage, rows, rope, available, &[], arena, kv_format, contract, weight_arena)?;
         let head = super::head::TargetHeadOwner::load_in(device, programs, checkpoint,
-            head, available, &[], Some((arena, 0)))?;
+            head, available, &[], Some((arena, 0)), Some(weight_arena))?;
         let sizes = native::mtp_metadata_planes(rows)?;
         // Shared device scratch aliases between stages; pinned upload sources
         // remain private and are reusable after their own H2D completion event.
         let uploads = sizes[..4].iter().copied().chain([sizes[2], 8])
-            .map(|bytes| crate::shared::memory::HostAllocation::new(device.library, bytes))
+            .map(|bytes| crate::shared::memory::HostAllocation::new(device.library, bytes, Tag::staging("step5/mtp-uploads")))
             .collect::<Result<Vec<_>>>()?;
         let upload_done = (0..uploads.len()).map(|_| Ok((Event::new(device)?, false)))
             .collect::<Result<Vec<_>>>()?;
@@ -265,9 +281,12 @@ impl<'a> StageOwner<'a> {
         metadata.extend(arena.planes(device, &sizes[4..],
             usize::try_from(native::mtp_scratch_core(rows, kv_format)?)? + stage * 256)?);
         let compact = if kv_format == Qwen4KvCache::Fp8 {
+            // The stage planes are views of the rank's sequential scratch arena, so
+            // the tag must describe that backing, not the predictor.
             Some(CompactKv::new(device, programs, rows, &[64],
                 native::mtp_compact_planes(rows, kv_format)?,
-                Some((arena, usize::try_from(native::mtp_compact_offset(rows)?)?)))?)
+                Some((arena, usize::try_from(native::mtp_compact_offset(rows)?)?)),
+                Tag::workspace("step5/sequential-scratch"))?)
         } else { None };
         Ok(Self { stream, input, attention, head, metadata, uploads, upload_done, compact, kv_format, stage, rows,
             cache_owner: std::cell::Cell::new(None) })
@@ -386,8 +405,7 @@ impl<'a> StageOwner<'a> {
         let source = cache.request_component(span, sequence)?;
         let element = if self.stage == 0 { 2 } else { 4 };
         let target = self.input.planes[5].buffer;
-        let ring = cuteafd_core::prefix::AppendRing { window: cache.layout().mtp_hidden_rows
-            - cache.layout().step_rows, step: cache.layout().step_rows, rows: cache.layout().mtp_hidden_rows };
+        let ring = cache.layout().mtp_history.context("Step-5 MTP hidden history ring")?;
         self.stream.device.run(|| {
             for run in ring.runs(base, rows as u64).context("Step-5 predictor source history extent")? {
                 let input = slice(source, run.slot as usize * H * element, run.rows as usize * H * element)?;
@@ -529,12 +547,10 @@ impl<'e, 'a> StageStep<'e, 'a> {
                 requests: owner.metadata[2].buffer, rows, base: self.coordinates.base as usize,
                 extent: (self.coordinates.end + owner.stage as u64 + 1) as usize, heads: 64, kv_format: owner.kv_format },
             start: 0, key: self.components[0], value: self.components[1], summaries: None,
-            table: owner.metadata[3].buffer, table_width: self.coordinates.table.len(),
+            table: owner.metadata[3].buffer, table_width: self.coordinates.table.len(), table_batch: 1,
             pages: self.cache.layout().mtp_ring.rows as usize / 64,
         })?;
-        let history_ring = cuteafd_core::prefix::AppendRing {
-            window: self.cache.layout().mtp_hidden_rows - self.cache.layout().step_rows,
-            step: self.cache.layout().step_rows, rows: self.cache.layout().mtp_hidden_rows };
+        let history_ring = self.cache.layout().mtp_history.context("Step-5 MTP hidden history ring")?;
         for run in history_ring.proposal(self.coordinates.base, rows as u64)
             .context("Step-5 predictor own history ring")? {
             let source = slice(owner.attention.output(), run.offset as usize * H * 4, run.rows as usize * H * 4)?;
@@ -625,6 +641,14 @@ pub(super) struct Runtime<'a> {
     rank: usize,
 }
 impl<'a> Runtime<'a> {
+    /// Every predictor stage's retained weights; all are views of one MTP arena.
+    pub(super) fn inventory(&self, inventory: &mut crate::shared::memory::receipts::Inventory<'_>) -> Result<()> {
+        for (stage, owner) in self.stages.borrow().iter().enumerate() {
+            owner.inventory(inventory, &format!("gpu.{}.mtp.{stage}", self.rank))?;
+        }
+        Ok(())
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(super) fn load(contract: &cuteafd_loader::plan::families::step5::coordinator::CoordinatorContract,
         rope: Rc<super::rope::TargetTables<'a>>, arena: &Arena<'a>, stream: Rc<Stream<'a>>,
@@ -633,19 +657,27 @@ impl<'a> Runtime<'a> {
         available: u64, reservations: &[u64]) -> Result<Self> {
         ensure!((1..=3).contains(&depth) && rows > depth,
             "Step-5 predictor runtime depth/row capacity");
-        let immutable = RankWeightLayout::mtp_from_contract(checkpoint, contract, depth)?.resident_bytes;
+        // One independently retired predictor arena, plus its single backing tail.
+        let packed = RankWeightLayout::mtp_from_contract(checkpoint, contract, depth)?
+            .mtp_arena(cache.stream.device.id)?;
+        let immutable = RankWeightLayout::mtp_weight_charge(checkpoint, contract, depth)?;
+        let bytes = packed.bytes() as u64;
+        let tail = cuteafd_loader::placement::planner::allocation_granularity_forecast(&[bytes])?;
+        ensure!(immutable == bytes.checked_add(tail).context("Step-5 predictor backing overflow")?,
+            "Step-5 predictor arena differs from its admitted charge");
         let total = reservations.iter().try_fold(immutable, |n, bytes| n.checked_add(*bytes))
             .context("Step-5 predictor runtime reservation overflow")?;
         ensure!(total <= available && cache.layout().ranks[cache.rank()].mtp_lengths.len() == depth,
             "Step-5 predictor runtime exceeds admitted owners/cache");
+        let weight_arena = DeviceWeightArena::new(cache.stream.device, packed, ArenaTag::drafter_weights("step5/mtp"))?;
         let mut stages = Vec::with_capacity(depth);
         for stage in 0..depth {
             let owner = StageOwner::load(cache.stream.device, programs, checkpoint, stage,
-                rows, rope.clone(), available, &[], arena, stream.clone(), cache.layout().kv_format, contract)?;
+                rows, rope.clone(), available, &[], arena, stream.clone(), cache.layout().kv_format, contract, &weight_arena)?;
             owner.bind_cache(cache)?;
             stages.push(owner);
         }
-        let selected = crate::shared::memory::HostAllocation::new(cache.stream.device.library, depth * 8)?;
+        let selected = crate::shared::memory::HostAllocation::new(cache.stream.device.library, depth * 8, Tag::staging("step5/mtp-selected"))?;
         Ok(Self { stages: std::cell::RefCell::new(stages),
             tokens: std::cell::RefCell::new(vec![Vec::new(); cache.sequences() as usize]),
             selected: std::cell::RefCell::new(selected), rank: cache.rank() })
@@ -859,7 +891,7 @@ mod tests {
         let mut cache = CacheRank::new(device, layout.clone(), 0, 1, 2, 1, usize::MAX)?;
         let contract = CoordinatorContract::from_checkpoint(&checkpoint)?;
         let rope = Rc::new(TargetTables::load(device, &programs, &contract, "step5_", u64::MAX, &[])?);
-        let arena = Arena::new(device, usize::try_from(native::mtp_forecast_workspace(64, 3, kv_format)?)?)?;
+        let arena = Arena::new(device, usize::try_from(native::mtp_forecast_workspace(64, 3, kv_format)?)?, crate::shared::memory::TEST)?;
         let stream = Rc::new(Stream::new(device)?);
         let (runtime, records) = crate::shared::experts::rtx::dense::recording(||
             Runtime::load(&contract, rope.clone(), &arena, stream.clone(), &programs, &checkpoint,
@@ -1006,11 +1038,15 @@ mod tests {
                 let probes = case["probes"].as_array().context("MTP probes")?.iter()
                     .map(|p| p.as_u64().context("MTP probe").map(|p| p as usize)).collect::<Result<Vec<_>>>()?;
                 let expected_logits = load("logits.bin", probes.len() * 128896 * 4)?;
-                let embedding = Allocation::new(device, 64 * H * 2)?;
-                let hidden = Allocation::new(device, 64 * H * 4)?;
-                let arena = Arena::new(device, usize::try_from(native::mtp_forecast_workspace(64, 3, kv_format)?)?)?;
+                let embedding = Allocation::new(device, 64 * H * 2, crate::shared::memory::TEST)?;
+                let hidden = Allocation::new(device, 64 * H * 4, crate::shared::memory::TEST)?;
+                let arena = Arena::new(device, usize::try_from(native::mtp_forecast_workspace(64, 3, kv_format)?)?, crate::shared::memory::TEST)?;
+                let weight_arena = DeviceWeightArena::new(device,
+                    RankWeightLayout::mtp_stage_from_contract(&checkpoint, &contract, stage)?
+                        .arena_layout(format!("step5/mtp/gpu{}", device.id), |_| true)?, crate::shared::memory::TEST_ARENA)?;
                 let mut owner = StageOwner::load(device, &programs, &checkpoint, stage, 64,
-                    rope.clone(), u64::MAX, &[], &arena, Rc::new(Stream::new(device)?), kv_format, &contract)?;
+                    rope.clone(), u64::MAX, &[], &arena, Rc::new(Stream::new(device)?), kv_format, &contract,
+                    &weight_arena)?;
                 owner.bind_cache(&cache)?;
                 let mut boundaries: Vec<(&str, usize, Vec<u8>)> = [
                     ("enorm", H), ("hnorm", H), ("concat", 2 * H), ("eh", H),

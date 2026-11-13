@@ -1,49 +1,9 @@
 //! V4.1 CED ownership stays fixed; pool and local experts use shared admission.
 use super::super::*;
+pub mod admission;
 pub mod owners;
 pub mod resident;
-
-/// Existing lazy-capture envelope, separate from qualified ready residency.
-/// Small cards previously hid this same growth allowance in the CUDA sample.
-pub fn graph_reserve(total: u64, ranks: usize) -> u64 {
-    if total <= 32 << 30 { 2048 << 20 } else if ranks == 1 { 3264 << 20 } else { 1472 << 20 }
-}
-
-pub fn runtime_reserve(total: u64, ranks: usize, automatic: bool) -> u64 {
-    if total <= 32 << 30 { 0 } else if automatic { 3 << 30 }
-    else if ranks == 1 { 2 << 30 } else { 800 << 20 }
-}
-
-/// Future owners beside the pool; none of these bytes is live at ready.
-pub fn growth_demands(total: u64, ranks: usize, automatic: bool, gpu: u8) -> Vec<Demand> {
-    let mut demands = vec![GraphSet::budget(&[graph_reserve(total, ranks)]).demand(0).on(gpu)];
-    let runtime = runtime_reserve(total, ranks, automatic);
-    if runtime > 0 {
-        demands.push(Demand::new(gpu, cuteafd_core::memory_layout::Category::Reserved,
-            "runtime growth", runtime, cuteafd_core::memory_layout::Basis::Calibrated)
-            .with_lifetime(ItemLifetime::PostReadyReserve));
-    }
-    if total <= 32 << 30 {
-        demands.push(Demand::new(gpu, cuteafd_core::memory_layout::Category::Reserved,
-            "memory sample margin", 32 << 20, cuteafd_core::memory_layout::Basis::Calibrated)
-            .with_lifetime(ItemLifetime::PostReadyReserve));
-    }
-    demands
-}
-
-/// V4.1 requires its full admitted context; other Spark families may clamp it.
-pub fn validate_pool_floor(pool: &PoolPolicy, placement: &Placement) -> Result<(), PlacementError> {
-    if placement.pool_tokens < pool.floor {
-        return Err(PlacementError::BelowFloor {
-            pool: placement.pool_tokens,
-            floor: pool.floor,
-            layers: placement.onboard_layers,
-            short: pool.floor - placement.pool_tokens,
-            limits: placement.pool_limits.clone(),
-        });
-    }
-    Ok(())
-}
+pub mod weight_layout;
 
 /// Exact expert allocation extents, supplied either by linked native info or
 /// the corresponding published AOT manifest. No device-specific estimate.
@@ -347,7 +307,7 @@ fn expert_workspace(
                 whole: Bytes2::default(),
                 half: [Bytes2::default(); 2],
                 tp2: !local,
-                spark_ok: true,
+                whole_supported: true, spark_ok: true,
             };
             if local {
                 cost.whole = expert_cost(catalog, layer, 1, 0, stored)?;
@@ -411,52 +371,6 @@ pub fn shared_workspace(manifest: &serde_json::Value, rows: u64, sms: u32) -> an
         .context("shared FFN workspace overflow")
 }
 
-/// Install exact cache ownership, including source tables bounded by the
-/// compiled 4096-row extent and private active/retained COW tail groups.
-/// Snapshot arenas are separate fixed owners; replicas hold KV, never keys.
-pub fn cache_demands(request: &mut PlacementRequest, config: &serde_json::Value,
-    slots: u64, retained_turns: u64, replicated: bool) -> anyhow::Result<u64> {
-    use anyhow::{ensure, Context};
-    use cuteafd_core::memory_layout::{Basis, Category};
-    let ranks = request.inventory.gpus.len();
-    let geometry = crate::serving_capacity::deepseek_v41_cache_geometry(config, ranks)?;
-    ensure!((1..=cuteafd_core::V41_MAX_REQUESTS as u64).contains(&slots) && retained_turns <= 128 && (!replicated || ranks == 2),
-        "invalid V4.1 cache admission shape");
-    let tails = slots + 2 * retained_turns;
-    let mut units = geometry.ranks.iter().map(|r| r.persistent_unit_bytes).collect::<Vec<_>>();
-    if replicated {
-        units[0] += 2 * 256 * 288;
-        units[1] += 3 * 256 * 288;
-    }
-    // At one group each source table is still linear. Subtract its entries
-    // from the canonical allocator total to isolate fixed windows and carry.
-    let first = crate::serving_capacity::deepseek_v41_cache_bytes(config, ranks, slots, 1, replicated)?;
-    let mut tables = Vec::new();
-    let sources = if ranks == 1 { vec![(3, 1)] } else { vec![(3, 0), (0, 1)] };
-    for (gpu, &(c2, c1)) in sources.iter().enumerate() {
-        let replica = if replicated { if gpu == 0 { (0, 1) } else { (3, 0) } } else { (0, 0) };
-        for (count, ratio) in [(c2 + replica.0, 1u64), (c1 + replica.1, 2)] {
-            if count == 0 { continue; }
-            tables.push(BoundedDemand {
-                gpu: gpu as u8, category: Category::Kv, group: "source page tables".into(),
-                bytes_per_unit: count * slots * ratio * 4,
-                offset_units: tails, cap_units: 4096 / ratio, basis: Basis::Formula,
-            });
-        }
-        let entries = tables.iter().filter(|d| usize::from(d.gpu) == gpu)
-            .map(|d| d.bytes_per_unit).sum::<u64>();
-        let fixed = first[gpu].checked_sub(units[gpu]).and_then(|n| n.checked_sub(entries))
-            .context("V4.1 fixed cache extent underflow")?;
-        request.fixed.push(Demand::new(gpu as u8, Category::Kv, "window state, table headers and compressor carry", fixed, Basis::Formula));
-        request.fixed.push(Demand::new(gpu as u8, Category::Kv, "active and retained COW tails",
-            units[gpu].checked_mul(tails).context("V4.1 tail extent overflow")?, Basis::Formula));
-    }
-    request.pool_overhead = units;
-    request.pool_bounded = tables;
-    request.pool.ceiling = request.pool.ceiling.min((131_072 - tails) * 512);
-    Ok(tails)
-}
-
 /// Growth beyond the calibrated 48-row serving lanes. Keep verifier storage
 /// independent of prefill rows and neural width; both target lanes retain it.
 pub fn verify_workspace_growth(gpus: usize, rank: usize) -> u64 {
@@ -493,56 +407,6 @@ pub fn execution_hops(ranks: usize) -> HopSpec {
     }
 }
 
-/// All weights, lanes, graphs and prefix state are charged in the inventory's
-/// baseline. Pool units include private tails supplied by the caller as fixed.
-pub fn request(
-    inventory: Inventory,
-    pool: PoolPolicy,
-    unit_bytes: Vec<u64>,
-    experts: Vec<ExpertCost>,
-    workspace: u64,
-    onboard: Onboard,
-) -> PlacementRequest {
-    let gpus = inventory.gpus.len();
-    assert!(experts.len() <= 40, "V4.1 has exactly 40 backbone layers");
-    PlacementRequest { expert_tier: None,
-        inventory,
-        attention_placement: Some(if gpus == 2 { AttentionPlacement::Layers } else { AttentionPlacement::Heads }),
-        context_buffers: ContextBuffers::default(),
-        layers_first_gpu: 0,
-        pool,
-        pool_bounded: Vec::new(),
-        pool_overhead: unit_bytes,
-        fixed: vec![],
-        startup: Vec::new(),
-        movables: vec![],
-        layers: (0..40)
-            .map(|layer| LayerDemand {
-                kind: AttentionClass::Csa,
-                weights: ModeBytes::default(),
-                kv_unit: ModeBytes::default().into(),
-                fixed_bytes: ModeBytes::default(),
-                extra: vec![],
-                context_indexer: false,
-                colocate: None,
-                experts: experts.get(layer).cloned(),
-                modes: vec![LayerMode::Whole {
-                    gpu: u8::from(gpus == 2 && layer >= 20),
-                    ffn: FfnMode::Owner,
-                }],
-            })
-            .collect(),
-        expert_workspace: workspace,
-        tp2_workspace: [workspace; 2],
-        onboard,
-        minimum_expert_layers: 0,
-        expert_gpus: gpus,
-        policy: LayerPolicy::default(),
-        hops: execution_hops(gpus),
-        executor: super::DEEPSEEK_V41,
-    }
-}
-
 /// `--gpu-expert-tier` and `--gpu-expert-tier-profile` as `cuteafd plan
 /// --layout` and serving both read them: the one source of the tier V4.1
 /// asks the solver for, so a plan admits the resident set serving loads.
@@ -552,6 +416,9 @@ pub struct TierChoice {
     pub profile: Option<std::path::PathBuf>,
     /// What the slots are ranked by (serving: the default model).
     pub model: TierStepModel,
+    /// The selected coordinator build exports `expert_reply_reduce_tier`.
+    /// Both plan and serving derive this from the same program manifest.
+    pub expert_reply_reduce_tier: bool,
 }
 
 /// The activations a tier's order comes from, and the profile they were
@@ -564,6 +431,11 @@ pub struct TierInputs {
 }
 
 impl TierChoice {
+    pub fn expert_reply_reduce_tier_available(manifest: &serde_json::Value) -> bool {
+        manifest["programs"].as_array().is_some_and(|programs| programs.iter()
+            .any(|program| program["name"].as_str() == Some("expert_reply_reduce_tier")))
+    }
+
     /// The tier's expected activations over `routed` routed layers of
     /// `experts` experts (`topk` per row): the profile at the step model's
     /// verify width, else uniform popularity; `None` when the tier is off.
@@ -584,29 +456,14 @@ impl TierChoice {
         }
     }
 
-    /// Asks `request` (V4.1's, built by [`request`]) for the tier: every
-    /// routed slot ranked by how much its residency cuts the predicted step
-    /// time, behind the whole layers `pinned` (`--rtx-expert-layers`) pins,
-    /// in place of whole-layer onboarding (no TP2 or TP1 layer prefix, none
-    /// mandatory). The Sparks keep every expert, so it needs Spark ranks.
-    pub fn apply(&self, request: &mut PlacementRequest, inputs: &TierInputs, pinned: Option<Onboard>,
-        experts: usize) -> anyhow::Result<()> {
-        use anyhow::ensure;
-        let routed = request.layers.iter().enumerate().filter(|(_, layer)| layer.experts.is_some())
-            .map(|(index, _)| index).collect::<Vec<_>>();
+    /// Rank the slots once for phase-aware admission. Explicit whole layers
+    /// lead the order and are included in the tier's count, never a second arena.
+    pub fn request(&self, inputs: &TierInputs, routed: &[usize], experts: usize,
+        pinned: usize) -> anyhow::Result<ExpertTierRequest> {
+        anyhow::ensure!(pinned <= routed.len(), "--rtx-expert-layers {pinned} exceeds the {} routed layers", routed.len());
         let size = self.setting.size(routed.len()).ok_or_else(|| anyhow::anyhow!("the GPU expert tier is off"))?;
-        ensure!(request.inventory.spark_ranks > 0,
-            "the GPU expert tier runs non-resident experts on the Sparks: plan it with Spark ranks");
-        let pinned = match pinned {
-            None | Some(Onboard::Auto) => 0,
-            Some(Onboard::Layers(layers)) => layers,
-        };
-        ensure!(pinned <= routed.len(), "--rtx-expert-layers {pinned} exceeds the {} routed layers", routed.len());
-        let order = super::super::expert_tier::optimized_order(&routed, &inputs.activation, &self.model, pinned);
-        request.expert_tier = Some(ExpertTierRequest::new(size, experts, order, inputs.source));
-        request.onboard = Onboard::Layers(0);
-        request.minimum_expert_layers = 0;
-        Ok(())
+        let order = super::super::expert_tier::optimized_order(routed, &inputs.activation, &self.model, pinned);
+        Ok(ExpertTierRequest::new(size, experts, order, inputs.source))
     }
 }
 
@@ -618,100 +475,7 @@ pub fn tier_lane_bytes(layers: u64, experts: u64, rows: u64) -> u64 {
     layers * experts * 4 + rows * 6 * 4
 }
 
-/// Each GPU's weights outside the routed experts, as `--coordinator-weight-
-/// budget-gib` counts them: the weight, embedding and table owners in
-/// `fixed` (and an external drafter's weights), plus the dSpark drafter's
-/// resident bytes beside the head on the last GPU and, with its TP2 experts,
-/// the other half on GPU0.
-pub fn fixed_weight_bytes(fixed: &[Demand], draft: Option<&DraftInventory>, gpus: usize) -> anyhow::Result<Vec<u64>> {
-    use anyhow::Context;
-    (0..gpus).map(|gpu| {
-        let mut bytes = fixed.iter().filter(|d| usize::from(d.gpu) == gpu
-            && (matches!(d.category, Category::Weights | Category::Embedding | Category::Tables)
-                || d.group == "external drafter weights"))
-            .try_fold(0u64, |sum, d| sum.checked_add(d.bytes).context("V4.1 weight budget overflow"))?;
-        if gpu == gpus - 1 {
-            bytes = bytes.checked_add(draft.map_or(0, |d| d.resident)).context("V4.1 draft weight budget overflow")?;
-        }
-        if gpu == 0 && gpus == 2 {
-            // --tp2-dspark-experts: GPU0 holds the other half of dSpark's experts.
-            bytes = bytes.checked_add(draft.map_or(0, |d| d.peer_half)).context("V4.1 draft weight budget overflow")?;
-        }
-        Ok(bytes)
-    }).collect()
-}
-
-/// Each GPU's retained weights in `placed`: its `fixed` weights
-/// ([`fixed_weight_bytes`]) plus the GPU expert tier's and the onboarded
-/// routed layers' resident experts.
-pub fn retained_weight_bytes(request: &PlacementRequest, placed: &Placement, fixed: &[u64])
-    -> anyhow::Result<Vec<u64>> {
-    use anyhow::Context;
-    fixed.iter().enumerate().map(|(gpu, &fixed)| {
-        let mut bytes = fixed;
-        if let Some(tier) = &placed.expert_tier {
-            bytes = bytes.checked_add(tier.resident_bytes.get(gpu).copied().unwrap_or(0))
-                .context("V4.1 GPU expert tier weight budget overflow")?;
-        }
-        for (layer, assigned) in request.layers.iter().zip(&placed.layers) {
-            if let Some(cost) = layer.experts {
-                let resident = match assigned.experts {
-                    ExpertHome::RtxTp2 => cost.half[gpu].resident,
-                    ExpertHome::RtxWhole { gpu: owner } if usize::from(owner) == gpu => cost.whole.resident,
-                    _ => 0,
-                };
-                bytes = bytes.checked_add(resident).context("V4.1 expert weight budget overflow")?;
-            }
-        }
-        Ok(bytes)
-    }).collect()
-}
-
-/// Solves `request` within `limit` retained weight bytes per GPU
-/// (`--coordinator-weight-budget-gib`), as `cuteafd plan` and serving both
-/// admit: an over-budget solution sheds GPU expert tier experts (whole
-/// experts, by the excess), else optional whole layers, and solves again
-/// (an automatic pool kept as first admitted). `fixed` is each GPU's weights
-/// outside the routed experts ([`fixed_weight_bytes`]).
-pub fn solve_with_weight_limit(request: &PlacementRequest, fixed: &[u64], limit: u64) -> anyhow::Result<Placement> {
-    use anyhow::{ensure, Context};
-    let mut placement = solve(request)?;
-    loop {
-        let retained = retained_weight_bytes(request, &placement, fixed)?;
-        if retained.iter().all(|&bytes| bytes <= limit) { return Ok(placement); }
-        if let Some(tier) = placement.expert_tier.as_ref().filter(|tier| tier.experts > 0) {
-            // Shrink the tier by the excess, in whole experts (the largest
-            // per-expert part bounds how many must go).
-            let excess = retained.iter().map(|&bytes| bytes.saturating_sub(limit)).max().unwrap_or(0);
-            let largest = request.layers.iter().filter_map(|layer| layer.experts)
-                .flat_map(|cost| [cost.half[0].resident, cost.half[1].resident, cost.whole.resident])
-                .max().unwrap_or(0) / request.expert_tier.as_ref().map_or(1, |t| t.experts_per_layer.max(1)) as u64;
-            let drop = usize::try_from(excess.div_ceil(largest.max(1)))?.max(1);
-            let mut trial = request.clone();
-            let mut shrunk = trial.expert_tier.take().context("GPU expert tier request")?;
-            let keep = tier.experts.saturating_sub(drop);
-            ensure!(keep >= shrunk.pinned,
-                "V4.1 coordinator weight budget exceeded; pinned whole layers need more than {limit} bytes");
-            if shrunk.size == ExpertTierSize::Auto { trial.pool.pin_selected(placement.pool_tokens); }
-            shrunk.size = ExpertTierSize::Experts(keep);
-            trial.expert_tier = Some(shrunk);
-            placement = solve(&trial)?;
-            continue;
-        }
-        ensure!(request.inventory.spark_ranks > 0 && request.onboard.layers(40).is_none()
-            && placement.onboard_layers > request.minimum_expert_layers,
-            "V4.1 coordinator weight budget exceeded; mandatory owners require more than {limit} bytes");
-        let mut trial = request.clone();
-        trial.onboard = Onboard::Layers(placement.onboard_layers - 1);
-        // Keep pool-first's admitted pool while reducing only the optional prefix.
-        if matches!(request.onboard, Onboard::Auto) {
-            trial.pool.pin_selected(placement.pool_tokens);
-        }
-        placement = solve(&trial)?;
-    }
-}
-
-/// What the V4.1 dSpark drafter retains, measured from its own plan before/// What the V4.1 dSpark drafter retains, measured from its own plan before
+/// What the V4.1 dSpark drafter retains, measured from its own plan before
 /// any payload is read. Runtime owners come from `owners::NativePrograms::dspark`
 /// (request lanes, main context, windows) on the default native BF16 path;
 /// EXL3 arenas and TP2 expert halves are sized from their packages.
@@ -724,7 +488,7 @@ pub struct DraftInventory {
     pub runtime: Vec<Demand>,
     /// Prefix draft marks (`DRAFT_MARK_BYTES` per retained mark slot).
     pub marks: u64,
-    /// `--tp2-dspark-experts`: GPU0's expert halves plus its wave workspace.
+    /// `--tp2-dspark-experts`: GPU0's checkpoint expert halves; runtime is separate.
     pub peer_half: u64,
     /// Largest transient load staging on the home and on the peer half; the
     /// caller folds it into the full dSpark load-phase peak.
@@ -736,6 +500,11 @@ pub struct DraftInventory {
     /// max(experts + their staging, all retained weights). Runtime owners
     /// (lanes, windows, main contexts) are not part of loading.
     pub loader_peak: [u64; 2],
+    /// The independently retired dense arena on the home GPU
+    /// (`weight_layout::draft_layout`). Its extent is part of `resident`;
+    /// admission charges it as one arena plus its tail and the remainder of
+    /// `resident` as routed experts.
+    pub dense: Option<crate::serving_capacity::WeightArenaLayout>,
 }
 
 impl DraftInventory {
@@ -756,217 +525,345 @@ impl DraftInventory {
     }
 }
 
-/// The dSpark drafter as one itemized shared drafter Movable at the head GPU
-/// (GPU1 on two RTX): it reads the decoder's taps and the GPU1 vocabulary
-/// shard every step, so it has no bridge. The TP2 expert half is a cross-GPU
-/// demand of that home. Load staging is not retained and is not a startup
-/// phase by itself: `request.startup` holds full sequential phase peaks, so the
-/// caller composes the dSpark load phase from `staging` plus the owners that
-/// coexist with it.
-pub fn drafter(inventory: &DraftInventory, ranks: usize) -> Result<Movable, PlacementError> {
-    if !(1..=2).contains(&ranks) || (ranks == 1 && inventory.peer_half > 0)
-        || inventory.runtime.iter().any(|d| usize::from(d.gpu) >= ranks) {
-        return Err(PlacementError::Inventory("V4.1 dSpark draft inventory"));
-    }
-    let home = (ranks - 1) as u8;
-    let mut owned = vec![Demand::new(home, Category::Drafter, "dSpark weights", inventory.resident, Basis::Exact)];
-    if inventory.marks > 0 {
-        owned.push(Demand::new(home, Category::Prefix, "dSpark marks", inventory.marks, Basis::Formula));
-    }
-    // Runtime owners name their rank (the terminal's vocabulary half lives on
-    // GPU0); only the home's are re-homed with the movable.
-    let (local, peer): (Vec<_>, Vec<_>) = inventory.runtime.iter().cloned().partition(|d| d.gpu == home);
-    owned.extend(local);
-    let mut drafter = draft::DrafterDemand::itemized(owned, home);
-    let mut cross = peer;
-    if inventory.peer_half > 0 {
-        cross.push(Demand::new(0, Category::Drafter, "dSpark TP2 expert half", inventory.peer_half, Basis::Exact));
-    }
-    if !cross.is_empty() {
-        drafter.per_home = vec![MovableDemands { placement_gpu: home, demands: cross }];
-    }
-    drafter.movable(ranks)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::placement::planner::{Lifetime, Location, Operation, Phase, PrefillShape, Refusal};
+    use admission::{production_request, AdmittedV41, ProductionInput};
+
+    fn config() -> serde_json::Value {
+        serde_json::from_str(include_str!("../../families/deepseek_v41/official-v41-config.json")).unwrap()
+    }
+
+    /// Synthetic routed-layer costs; `arena` owns the exact expected peak.
+    fn cost(ranks: usize) -> ExpertCost {
+        ExpertCost {
+            whole: Bytes2 { resident: 200 << 20, staging: 32 << 20 },
+            half: [Bytes2 { resident: 100 << 20, staging: 16 << 20 }; 2],
+            tp2: ranks == 2,
+            whole_supported: true,
+            spark_ok: true,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn admit(config: &serde_json::Value, ranks: usize, owners: Vec<admission::Owner>,
+        draft: Option<DraftInventory>, experts: Vec<ExpertCost>, onboard: Onboard,
+        pool: Option<u64>, context: u64, concurrency: u64, turns: u64, replicated: bool,
+        free: u64,
+    ) -> Result<AdmittedV41, Refusal> {
+        let total = 96 << 30;
+        let budgets = admission::live_budgets(&vec![(total, total, free); ranks], &vec![64 << 30; 4])?;
+        let input = ProductionInput {
+            coordinator_arch: cuteafd_core::GpuArch::Sm120,
+            blas: Vec::new(),
+            expert_usage: false,
+            config, gpus: ranks, context, maximum_pool_tokens: pool.unwrap_or(2 << 20),
+            prefill: PrefillShape { rows: 128, waves: 1 }, concurrency, retained_turns: turns,
+            replicated, spark_ranks: 4, onboard_minimum: 0, onboard_counts: None,
+            experts, workspace: 0, owners, weight_arenas: Vec::new(), startup: Vec::new(), allowances: Vec::new(),
+            draft, encoders: Vec::new(), media_cache_bytes: 0,
+            resident_weight_limit: u64::MAX, spark_reply_formats: Default::default(),
+            operation: Operation::Serving, budgets,
+        };
+        let request = production_request(context, pool, onboard, PrefillShape { rows: 128, waves: 1 },
+            Operation::Serving, u64::MAX, Default::default());
+        input.prepare()?.admit(request)
+    }
 
     #[test]
-    fn growth_owners_are_post_ready_reserves_on_every_card_and_policy() {
-        for total in [32 << 30, 96 << 30] {
-            for ranks in [1, 2] {
-                for automatic in [false, true] {
-                    for gpu in 0..ranks {
-                        let demands = growth_demands(total, ranks, automatic, gpu as u8);
-                        assert!(demands.iter().all(|d| d.gpu == gpu as u8
-                            && d.lifetime == ItemLifetime::PostReadyReserve
-                            && d.item().lifetime == ItemLifetime::PostReadyReserve));
-                        assert_eq!(demands.iter().map(|d| d.bytes).sum::<u64>(),
-                            graph_reserve(total, ranks) + runtime_reserve(total, ranks, automatic)
-                                + if total <= 32 << 30 { 32 << 20 } else { 0 });
+    fn expert_usage_is_admitted_once_per_canonical_ced_router() -> anyhow::Result<()> {
+        use crate::placement::planner::{ComponentKind, Recipe};
+        let config = config();
+        for ranks in [1, 2] {
+            for enabled in [false, true] {
+                let prepared = ProductionInput {
+            coordinator_arch: cuteafd_core::GpuArch::Sm120,
+                    blas: Vec::new(),
+                    expert_usage: enabled, config: &config, gpus: ranks, context: 512,
+                    maximum_pool_tokens: 4096, prefill: PrefillShape { rows: 128, waves: 1 },
+                    concurrency: 1, retained_turns: 0, replicated: false, spark_ranks: 4,
+                    onboard_minimum: 0, onboard_counts: None, experts: vec![cost(ranks); 40],
+                    workspace: 0, owners: Vec::new(), weight_arenas: Vec::new(), startup: Vec::new(), allowances: Vec::new(),
+                    draft: None, encoders: Vec::new(), media_cache_bytes: 0,
+                    resident_weight_limit: u64::MAX, spark_reply_formats: Default::default(),
+                    operation: Operation::Serving,
+                    budgets: admission::production_budgets(&vec![(96 << 30, 96 << 30); ranks],
+                        0, Some((128 << 30, 128 << 30)), 0, &vec![64 << 30; 4])?,
+                }.prepare()?;
+                let request = production_request(512, Some(4096), Onboard::Layers(0),
+                    PrefillShape { rows: 128, waves: 1 }, Operation::Serving, u64::MAX, Default::default());
+                let contract = prepared.recipe.prepare(&request)?;
+                let mut found = std::collections::BTreeSet::new();
+                for component in &contract.components {
+                    let ComponentKind::Allocation { template, .. } = &component.kind else { continue; };
+                    if !template.id.starts_with("expert-usage.") { continue; }
+                    assert!(found.insert(template.id.clone()));
+                    assert_eq!(component.bytes.at(1)?, component.bytes.at(contract.maximum_pages)?);
+                    if template.id == "expert-usage.history" {
+                        assert_eq!(template.location, Location::HOST);
+                        assert_eq!(template.bytes, prepared.recipe.expert_usage.as_ref().unwrap()
+                            .host_bytes(ranks).unwrap() as u64);
+                    } else {
+                        assert_eq!(template.bytes, 40 * 384 * 2 * 8);
+                        let gpu = template.id.split('.').nth(1).unwrap().trim_start_matches("gpu").parse::<u8>()?;
+                        assert!(usize::from(gpu) < ranks);
+                        assert_eq!(template.location, if template.id.ends_with("pinned") {
+                            Location::PINNED
+                        } else { Location::coordinator(gpu) });
                     }
                 }
+                assert_eq!(found.len(), if enabled { ranks * 3 + 1 } else { 0 });
+                let admitted = prepared.admit(request)?;
+                assert_eq!(admitted.expert_usage.is_some(), enabled);
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn expert_usage_geometry_comes_from_checkpoint_and_refuses_invalid_headers() {
+        let mut config = config();
+        let geometry = admission::expert_usage_geometry(&config).unwrap();
+        assert_eq!((geometry.layers, geometry.experts, geometry.topk), (40, 384, 6));
+        assert_eq!(geometry.routed_layers, (0..40).collect::<Vec<_>>());
+        assert_eq!(admission::expert_usage_geometry(&config["text_config"]).unwrap(), geometry);
+        for (key, value) in [("n_routed_experts", 0), ("num_experts_per_tok", 385), ("num_hidden_layers", 39)] {
+            let old = config["text_config"][key].take();
+            config["text_config"][key] = serde_json::json!(value);
+            assert!(admission::expert_usage_geometry(&config).is_err(), "{key}");
+            config["text_config"][key] = old;
+        }
+    }
+
+    #[test]
+    fn all_onboarded_experts_allow_a_budgeted_spark_tower() {
+        use crate::plan::encoder::{EncoderKind, EncoderPlacement};
+        let config = config();
+        let input = ProductionInput {
+            coordinator_arch: cuteafd_core::GpuArch::Sm120,
+            blas: Vec::new(),
+            expert_usage: false, config: &config, gpus: 2, context: 32768, maximum_pool_tokens: 32768,
+            prefill: PrefillShape { rows: 128, waves: 1 }, concurrency: 1, retained_turns: 0,
+            replicated: false, spark_ranks: 1, onboard_minimum: 0, onboard_counts: None,
+            experts: vec![cost(2); 40], workspace: 0, owners: vec![], weight_arenas: Vec::new(), startup: vec![], allowances: vec![],
+            draft: None, encoders: vec![EncoderPlacement { kind: EncoderKind::Spark { rank: 0 },
+                weights: 123456, scratch: 654321, replicas: vec![], reason: "tower only".into(), shortfall: 0 }],
+            media_cache_bytes: 0, resident_weight_limit: u64::MAX, spark_reply_formats: Default::default(),
+            operation: Operation::Serving,
+            budgets: admission::live_budgets(&[(96 << 30, 96 << 30, 96 << 30); 2], &[64 << 30]).unwrap(),
+        };
+        let request = production_request(32768, Some(32768), Onboard::Layers(40),
+            PrefillShape { rows: 128, waves: 1 }, Operation::Serving, u64::MAX, Default::default());
+        let mut prepared = input.prepare().unwrap();
+        prepared.recipe.vision_arena = Some(crate::serving_capacity::WeightArenaLayout::new(
+            "v41/vision", [("tower".into(), 123456)]).unwrap());
+        let admitted = prepared.admit(request).unwrap();
+        assert!(admitted.spark.spark_layers.is_empty());
+        let owners = admitted.solved.facts.allocations.iter().filter(|owner| owner.id.starts_with("v41.encoder.")).collect::<Vec<_>>();
+        assert_eq!(owners.iter().map(|owner| owner.bytes).sum::<u64>(), 123456 + 654321);
+        assert!(owners.iter().all(|owner| owner.location.device == crate::placement::planner::Device::Spark(0)));
+    }
+
+    #[test]
+    fn vision_arenas_preserve_choices_payload_and_physical_device_binding() -> anyhow::Result<()> {
+        use crate::plan::encoder::{EncoderKind, EncoderPlacement};
+        use crate::placement::planner::{Activation, ComponentKind, CoordinatorDevices, Device,
+            Domain, Recipe, allocation_granularity_forecast};
+        let config = config();
+        // Deliberately include alignment padding so Managed B cannot masquerade as P.
+        let arena = crate::serving_capacity::WeightArenaLayout::new("v41/vision",
+            [("first".into(), (1 << 20) + 1), ("second".into(), 2)])?;
+        let payload = arena.payload_bytes() as u64;
+        let extent = arena.bytes() as u64;
+        assert!(extent > payload);
+        for physical in [&[1][..], &[1, 0][..]] {
+            let devices = CoordinatorDevices::new(physical)?;
+            let ranks = physical.len();
+            let mut kinds = vec![EncoderKind::Rtx { gpu: 0 }, EncoderKind::Spark { rank: 0 }, EncoderKind::Off];
+            if ranks == 2 { kinds.insert(1, EncoderKind::Rtx { gpu: 1 }); }
+            for first in 0..kinds.len() {
+                let mut ordered = kinds.clone();
+                ordered.rotate_left(first);
+                let encoders = ordered.iter().cloned().map(|kind| EncoderPlacement {
+                    replicas: if matches!(kind, EncoderKind::Spark { .. }) { vec![1] } else { vec![] },
+                    kind, weights: payload, scratch: 333, reason: "arena proof".into(), shortfall: 0,
+                }).collect();
+                let mut prepared = ProductionInput {
+            coordinator_arch: cuteafd_core::GpuArch::Sm120,
+                    blas: Vec::new(),
+                    expert_usage: false, config: &config, gpus: ranks, context: 512, maximum_pool_tokens: 512,
+                    prefill: PrefillShape { rows: 128, waves: 1 }, concurrency: 1, retained_turns: 0,
+                    replicated: false, spark_ranks: 4, onboard_minimum: 0, onboard_counts: None,
+                    experts: vec![cost(ranks); 40], workspace: 0, owners: vec![], weight_arenas: vec![],
+                    startup: vec![], allowances: vec![], draft: None, encoders, media_cache_bytes: 0,
+                    resident_weight_limit: u64::MAX, spark_reply_formats: Default::default(),
+                    operation: Operation::Serving,
+                    budgets: admission::live_budgets(&vec![(96 << 30, 96 << 30, 96 << 30); ranks],
+                        &[64 << 30; 4])?,
+                }.prepare()?;
+                prepared.recipe.vision_arena = Some(arena.clone());
+                let request = production_request(512, Some(512), Onboard::Layers(0),
+                    PrefillShape { rows: 128, waves: 1 }, Operation::Serving, u64::MAX, Default::default());
+                let contract = prepared.recipe.prepare(&request)?;
+                for component in &contract.components {
+                    let id = match &component.kind {
+                        ComponentKind::Allocation { template, .. } => &template.id,
+                        ComponentKind::ResidentWeight(claim) => &claim.id,
+                        ComponentKind::AllocationGranularity(tail) => &tail.id,
+                        _ => continue,
+                    };
+                    if let Some(suffix) = id.strip_prefix("v41.encoder.") {
+                        let option: usize = suffix.split('.').next().unwrap().parse()?;
+                        let clause = &component.activation.clauses[0];
+                        assert_eq!(clause.len(), 1);
+                        assert_eq!(component.activation, Activation::choice(clause[0].variable, option));
+                    }
+                }
+                let admitted = prepared.admit(request)?;
+                assert_eq!(admitted.solved.decisions.encoder, Some(0));
+                let handles = admitted.solved.facts.allocations.iter().filter(|owner|
+                    owner.group.starts_with("cuBLAS handles:")
+                        && owner.lifetime.contains(Phase::Ready, admitted.solved.facts.phase_order))
+                    .collect::<Vec<_>>();
+                // Spark media is covered by its existing measured overhead (#1568).
+                assert_eq!(handles.len(), usize::from(matches!(ordered[0], EncoderKind::Rtx { .. })));
+                assert!(handles.iter().all(|owner| matches!(owner.location.device, Device::Coordinator(_))));
+                let mapped = devices.remap_plan_weight_arenas(&admitted.solved)?;
+                let roots = mapped.facts.allocations.iter().filter(|owner|
+                    owner.id.starts_with("v41.encoder.") && owner.id.ends_with(".weights")).collect::<Vec<_>>();
+                let expected_copies = match ordered[0] {
+                    EncoderKind::Off => 0, EncoderKind::Spark { .. } => 2, _ => 1,
+                };
+                assert_eq!(roots.len(), expected_copies);
+                for (copy, root) in roots.iter().enumerate() {
+                    assert_eq!(root.id, format!("v41.encoder.0.{copy}.weights"));
+                    assert_eq!((root.bytes, root.group.as_str()), (extent, "weight arena"));
+                    assert_eq!(root.lifetime, Lifetime::RESIDENT);
+                    assert!(root.view.is_none());
+                    let claim = mapped.facts.resident_weights.iter().find(|claim| claim.id == root.id).unwrap();
+                    assert_eq!(claim.weights.0, payload);
+                    let tails = mapped.facts.allocation_granularity.iter().filter(|tail|
+                        tail.backings.iter().any(|backing| backing.backing == root.id)).collect::<Vec<_>>();
+                    match root.location.device {
+                        Device::Coordinator(rank) => {
+                            assert_eq!(devices.location(physical[usize::from(rank)])?, root.location);
+                            assert_eq!(tails.len(), 1);
+                            assert_eq!(tails[0].id, format!("{}.tail", root.id));
+                            assert_eq!(tails[0].requests(), [extent]);
+                            assert_eq!(tails[0].bytes()?, allocation_granularity_forecast(&[extent])?);
+                        }
+                        Device::Spark(rank) => {
+                            assert_eq!(usize::from(rank), copy);
+                            assert_eq!(root.location.domain, Domain::Managed);
+                            assert!(tails.is_empty());
+                        }
+                        _ => panic!("unexpected tower location"),
+                    }
+                    let scratch = mapped.facts.allocations.iter().find(|owner|
+                        owner.id == format!("v41.encoder.0.{copy}.scratch")).unwrap();
+                    assert_eq!((scratch.location, scratch.bytes), (root.location, 333));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn graph_reserve_is_one_post_ready_owner_per_card_of_any_size() {
+        // Card size does not change a layout/rank's measured graph budget.
+        // Every device has one canonical owner, never a second envelope.
+        for ranks in [1, 2] {
+            for gpu in 0..ranks {
+                let owner = admission::graph_allowance(ranks, gpu).unwrap();
+                assert_eq!(owner.location, Location::coordinator(gpu as u8));
+                assert_eq!(owner.lifetime, Lifetime { first: Phase::Ready, last: Phase::Growth });
+                assert_eq!(owner.source, format!("graph reserve: v41.graphs.{gpu}"));
+                let (base, tail) = crate::placement::graph_reserve::v41_default(ranks, gpu);
+                assert_eq!(owner.bytes, crate::placement::graph_reserve::resolve(None, gpu, false, base, tail).unwrap().bytes);
+                assert_eq!(owner.basis, Basis::Calibrated);
             }
         }
     }
 
     #[test]
-    fn ced_ownership_and_tp2_loading_peak_are_preserved() {
-        let inventory = Inventory {
-            gpus: vec![
-                GpuBudget {
-                    capacity_bytes: 8 << 30,
-                    headroom_bytes: 0,
-                    baseline: Baseline::Measured {
-                        free_bytes: 8 << 30
-                    }
-                };
-                2
-            ],
-            spark_ranks: 4,
-            peer_access: true,
-        };
-        let pool = PoolPolicy::resolve(&[8 << 30; 2], 512, Some(512), 512, false);
-        let cost = ExpertCost {
-            whole: Bytes2 {
-                resident: 200 << 20,
-                staging: 32 << 20,
-            },
-            half: [Bytes2 {
-                resident: 100 << 20,
-                staging: 16 << 20,
-            }; 2],
-            tp2: true,
-            spark_ok: true,
-        };
-        let placement = solve(&request(
-            inventory,
-            pool,
-            vec![1024; 2],
-            vec![cost; 40],
-            64 << 20,
-            Onboard::Layers(3),
-        ))
-        .unwrap();
+    fn ced_ownership_and_tp2_loading_peak_are_preserved() -> anyhow::Result<()> {
+        let config = config();
+        let costs = vec![cost(2); 40];
+        let admitted = admit(&config, 2, Vec::new(), None, costs.clone(), Onboard::Layers(3),
+            Some(512), 512, 1, 0, false, 96 << 30)?;
+        let placement = &admitted.placement;
         assert_eq!(placement.attention_placement, AttentionPlacement::Layers);
         assert_eq!(placement.onboard_layers, 3);
         for (layer, assignment) in placement.layers.iter().enumerate() {
-            assert_eq!(
-                assignment.mode,
-                LayerMode::Whole {
-                    gpu: u8::from(layer >= 20),
-                    ffn: FfnMode::Owner
-                }
-            );
-            assert_eq!(
-                assignment.experts,
-                if layer < 3 {
-                    ExpertHome::RtxTp2
-                } else {
-                    ExpertHome::Spark
-                }
-            );
+            assert_eq!(assignment.mode, LayerMode::Whole { gpu: u8::from(layer >= 20), ffn: FfnMode::Owner });
+            assert_eq!(assignment.experts, if layer < 3 { ExpertHome::RtxTp2 } else { ExpertHome::Spark });
         }
-        assert_eq!(placement.tp2.unwrap().peak_bytes, [380 << 20; 2]);
-        let plan = LayerExecutionPlan::new(&placement, execution_hops(2)).unwrap();
+        let (peak, _) = admission::arena(3, 2, &costs, 0)?;
+        assert_eq!(placement.tp2.expect("TP2 range").peak_bytes, peak);
+        let plan = LayerExecutionPlan::new(placement, execution_hops(2))?;
         assert_eq!(plan.hops(), &[Hop { at: HopPoint::BeforeLayer(20), from: 0, to: 1,
             kind: HopKind::Boundary, storage: HopStorage::DirectInput, row_bytes: 40976 }]);
         assert_eq!(hop_buffer_bytes(plan.hops(), &plan.spec(), 2), Some(vec![0, 0]));
         assert_eq!(plan.homes()[40], ResidualHome::Owned(1));
         assert!(!placement.items.iter().flatten().any(|item| item.group == "residual hops"));
-        assert!(placement.summary().contains("BeforeLayer(20) rtx0->rtx1 40976 B/row"));
-        assert!(placement.summary().contains("no extra receive storage"));
-        let json = serde_json::to_value(&placement).unwrap();
-        assert_eq!(json["hops"][0]["storage"], "direct_input");
-        assert_eq!(json["hops"][0]["row_bytes"], 40976);
         let mut wrong_storage = placement.clone();
         wrong_storage.hops[0].storage = HopStorage::ReceiveSlots;
         assert_eq!(LayerExecutionPlan::new(&wrong_storage, execution_hops(2)), Err(LayerPlanError::Hops));
+        Ok(())
     }
 
     #[test]
-    fn ced_demands_cover_every_layer_with_partial_or_no_expert_inventory() {
-        let cost = ExpertCost {
-            whole: Bytes2 {
-                resident: 1024,
-                staging: 256,
-            },
-            half: [Bytes2 {
-                resident: 512,
-                staging: 128,
-            }; 2],
-            tp2: true,
-            spark_ok: true,
-        };
-        for gpus in [1, 2] {
-            for prefix in [0, 1, 3, 19, 20, 21, 40] {
-                let request = request(
-                    Inventory {
-                        gpus: vec![
-                            GpuBudget {
-                                capacity_bytes: 8 << 30,
-                                headroom_bytes: 0,
-                                baseline: Baseline::Measured {
-                                    free_bytes: 8 << 30
-                                },
-                            };
-                            gpus
-                        ],
-                        spark_ranks: 4,
-                        peer_access: gpus == 2,
-                    },
-                    PoolPolicy::resolve(&vec![8 << 30; gpus], 512, Some(512), 512, false),
-                    vec![1024; gpus],
-                    vec![cost; prefix],
-                    64,
-                    Onboard::Layers(0),
-                );
-                assert_eq!(request.layers.len(), 40);
-                for (layer, demand) in request.layers.iter().enumerate() {
-                    assert_eq!(demand.experts.is_some(), layer < prefix);
-                    assert_eq!(
-                        demand.modes,
-                        vec![LayerMode::Whole {
-                            gpu: u8::from(gpus == 2 && layer >= 20),
-                            ffn: FfnMode::Owner,
-                        }]
-                    );
-                }
-                let placement = solve(&request).unwrap();
-                assert_eq!(placement.layers.len(), 40);
-                assert_eq!(placement.residual.len(), 41);
-            }
-        }
-    }
-    fn config() -> serde_json::Value {
-        serde_json::from_str(include_str!("../../families/deepseek_v41/official-v41-config.json")).unwrap()
-    }
-
-    #[test]
-    fn exact_cache_demands_match_allocator_across_table_caps_and_replicas() {
+    fn exact_cache_owners_match_allocator_across_table_caps_and_replicas() -> anyhow::Result<()> {
         use cuteafd_core::memory_layout::Category;
+        let config = config();
         for (ranks, replicated) in [(1, false), (2, false), (2, true)] {
             for (slots, turns) in [(1, 0), (16, 20), (17, 20), (32, 20), (64, 80), (3, 128), (64, 128)] {
                 let tails = slots + 2 * turns;
                 for physical in [tails + slots, 2047, 2048, 2049, 4095, 4096, 4097, 131072] {
                     let logical = physical - tails;
-                    let mut req = request(Inventory { gpus: vec![GpuBudget { capacity_bytes: 1 << 40,
-                        headroom_bytes: 0, baseline: Baseline::Measured { free_bytes: 1 << 40 } }; ranks],
-                        spark_ranks: 4, peer_access: ranks == 2 },
-                        PoolPolicy { compiled_context: logical * 512, requested: Some(logical * 512), target: logical * 512,
-                            floor: logical * 512, ceiling: u64::MAX, unit_rows: 512 },
-                        vec![0; ranks], vec![], 0, Onboard::Layers(0));
-                    assert_eq!(cache_demands(&mut req, &config(), slots, turns, replicated).unwrap(), tails);
-                    let placement = solve(&req).unwrap();
-                    let exact = crate::serving_capacity::deepseek_v41_cache_bytes(&config(), ranks, slots, physical, replicated).unwrap();
+                    let admitted = admit(&config, ranks, Vec::new(), None, vec![cost(ranks); 40],
+                        Onboard::Layers(0), Some(logical * 512), logical * 512, slots, turns, replicated, 96 << 30)?;
+                    let exact = crate::serving_capacity::deepseek_v41_cache_bytes(
+                        &config, ranks, slots, physical, replicated)?;
                     for gpu in 0..ranks {
-                        assert_eq!(placement.items[gpu].iter().filter(|i| i.category == Category::Kv)
-                            .map(|i| i.bytes).sum::<u64>(), exact[gpu], "ranks={ranks} replicas={replicated} slots={slots} groups={physical} gpu={gpu}");
+                        assert_eq!(admitted.placement.items[gpu].iter()
+                            .filter(|i| i.category == Category::Kv).map(|i| i.bytes).sum::<u64>(),
+                            exact[gpu], "ranks={ranks} replicas={replicated} slots={slots} groups={physical} gpu={gpu}");
                     }
                 }
             }
         }
+        Ok(())
+    }
+
+    /// V4.1 never clamps below its compiled context: an automatic pool that
+    /// cannot hold the context is a typed shortfall, not a smaller plan.
+    #[test]
+    fn an_automatic_pool_below_the_context_is_refused_not_clamped() -> anyhow::Result<()> {
+        let config = config();
+        // Include 100MiB release padding so the remaining 64MiB still tests
+        // the context shortfall, rather than exhausting the reserve itself.
+        let padding = cuteafd_core::memory_policy::MemoryPolicy::current().release_padding();
+        let cards = vec![(96u64 << 30, 96u64 << 30, (64 << 20) + padding); 2];
+        let budgets = admission::live_budgets(&cards, &vec![1 << 30; 4])?;
+        let input = ProductionInput {
+            coordinator_arch: cuteafd_core::GpuArch::Sm120,
+            blas: Vec::new(),
+            expert_usage: false,
+            config: &config, gpus: 2, context: 262_144, maximum_pool_tokens: 2 << 20,
+            prefill: PrefillShape { rows: 128, waves: 1 }, concurrency: 1, retained_turns: 0,
+            replicated: false, spark_ranks: 4, onboard_minimum: 0, onboard_counts: None,
+            experts: vec![cost(2); 40], workspace: 0, owners: Vec::new(), weight_arenas: Vec::new(), startup: Vec::new(),
+            allowances: Vec::new(), draft: None, encoders: Vec::new(), media_cache_bytes: 0,
+            resident_weight_limit: u64::MAX, spark_reply_formats: Default::default(),
+            operation: Operation::Serving, budgets,
+        };
+        let request = production_request(262_144, None, Onboard::Layers(0),
+            PrefillShape { rows: 128, waves: 1 }, Operation::Serving, u64::MAX, Default::default());
+        assert!(matches!(input.prepare()?.admit(request),
+            Err(Refusal::FullContextShortfall { context: 262_144, .. })));
+        Ok(())
     }
 
     #[test]
@@ -1021,80 +918,21 @@ mod tests {
     }
 
     #[test]
-    fn equivalent_baselines_produce_identical_deepseek_v41_placement() {
-        // Bounded synthetic allocations and exact published-workspace payloads:
-        // no HF_HOME, checkpoint shards, live GPU, or exponential layer sweep.
+    fn the_drafter_charges_both_gpus_before_the_pool() -> anyhow::Result<()> {
         let config = config();
-        for ranks in [1,2] {
-            for onboard in [Onboard::Auto,Onboard::Layers(3)] {
-                let loaded = (20u64 << 30) + 12345;
-                let capacity = 96u64 << 30;
-                let expert = ExpertCost { whole: Bytes2 { resident:1<<30,staging:3<<20 },
-                    half:[Bytes2 {resident:512<<20,staging:2<<20};2],tp2:ranks==2,spark_ok:true };
-                let build = |baseline| {
-                    let mut req = request(Inventory { gpus:vec![GpuBudget {capacity_bytes:capacity,
-                        headroom_bytes:2<<30,baseline};ranks], spark_ranks:4,peer_access:ranks==2 },
-                        PoolPolicy::resolve(&vec![capacity;ranks],1<<20,None,512,false),
-                        vec![0;ranks],vec![expert;40], 1234567,onboard);
-                    req.pool.ceiling=req.pool.target;
-                    cache_demands(&mut req,&config,16,20,false).unwrap();
-                    req
-                };
-                let planner = solve(&build(Baseline::Planned {context_bytes:12345,loaded_bytes:loaded-12345})).unwrap();
-                let runtime = solve(&build(Baseline::Measured {free_bytes:capacity-loaded})).unwrap();
-                assert_eq!(planner,runtime);
-                assert_eq!(planner.pool_tokens,2<<20);
-                assert_eq!(planner.layers.len(),40);
-            }
-        }
-    }
-
-
-    #[test]
-    fn dspark_drafter_is_one_movable_at_the_head_with_its_peer_half() {
-        let runtime = vec![Demand::new(0, Category::Drafter, "dSpark request lanes", 7 << 20, Basis::Formula),
-            Demand::new(1, Category::Drafter, "dSpark request lanes", 900 << 20, Basis::Formula),
-            Demand::new(1, Category::Drafter, "dSpark main context", 300 << 20, Basis::Formula),
-            Demand::new(1, Category::Drafter, "dSpark windows", 9 << 20, Basis::Formula)];
-        for peer_half in [0, 3 << 30] {
-            let inventory = DraftInventory { resident: if peer_half > 0 { 4 << 30 } else { 7 << 30 }, runtime: runtime.clone(),
-                marks: 64 << 20, peer_half, staging: [512 << 20, if peer_half > 0 { 256 << 20 } else { 0 }], loading_experts: [6 << 30, peer_half], loader_peak: [0; 2] };
-            let movable = drafter(&inventory, 2).unwrap();
-            assert_eq!((movable.id, movable.allowed.clone(), movable.parts.len()), (MovableId::Drafter, vec![1], 0));
-            assert_eq!(movable.conditional.len(), 1);
-            let home = &movable.conditional[0];
-            assert_eq!(home.placement_gpu, 1);
-            let on = |gpu| home.demands.iter().filter(|d| d.gpu == gpu).map(|d| d.bytes).sum::<u64>();
-            assert_eq!(on(1), inventory.resident + (64 << 20) + (900 << 20) + (300 << 20) + (9 << 20));
-            assert_eq!(on(0), (7 << 20) + peer_half);
-        }
-        let one = DraftInventory { resident: 7 << 30, runtime: runtime.iter().filter(|d| d.gpu == 1)
-            .cloned().map(|d| d.on(0)).collect(), marks: 0, peer_half: 0, staging: [1, 0], loading_experts: [0; 2], loader_peak: [0; 2] };
-        let movable = drafter(&one, 1).unwrap();
-        assert_eq!(movable.allowed, [0]);
-        assert!(movable.conditional[0].demands.iter().all(|d| d.gpu == 0));
-        assert!(drafter(&DraftInventory { peer_half: 1, ..one.clone() }, 1).is_err());
-        assert!(drafter(&DraftInventory { runtime: runtime.clone(), ..one }, 1).is_err());
-    }
-
-    #[test]
-    fn dspark_drafter_placement_charges_both_gpus_before_the_pool() {
-        let inventory = Inventory { gpus: vec![GpuBudget { capacity_bytes: 96 << 30, headroom_bytes: 0,
-            baseline: Baseline::Measured { free_bytes: 80 << 30 } }; 2], spark_ranks: 4, peer_access: true };
-        let pool = PoolPolicy::resolve(&[96 << 30; 2], 512, None, 512, false);
-        let cost = ExpertCost { whole: Bytes2 { resident: 200 << 20, staging: 32 << 20 },
-            half: [Bytes2 { resident: 100 << 20, staging: 16 << 20 }; 2], tp2: true, spark_ok: true };
-        let base = request(inventory, pool, vec![1 << 20; 2], vec![cost; 40], 64 << 20, Onboard::Layers(4));
-        let movable = drafter(&DraftInventory { resident: 6 << 30,
+        let inventory = DraftInventory { resident: 6 << 30,
             runtime: vec![Demand::new(1, Category::Drafter, "dSpark request lanes", 1 << 30, Basis::Formula)],
-            marks: 0, peer_half: 2 << 30, staging: [1 << 30, 1 << 29], loading_experts: [4 << 30, 2 << 30], loader_peak: [0; 2] }, 2).unwrap();
-        let mut with = base.clone();
-        with.movables = vec![movable];
-        let (a, b) = (solve(&base).unwrap(), solve(&with).unwrap());
-        assert_eq!(draft::home(&b), Some(1));
-        let units = |p: &Placement| p.pool_tokens / 512;
-        assert!(units(&b) < units(&a), "the drafter's bytes come out of the pool, not after it");
-        crate::placement::draft::assert_same_as_fixed(&with);
+            marks: 0, peer_half: 2 << 30, staging: [1 << 30, 1 << 29],
+            loading_experts: [4 << 30, 2 << 30], loader_peak: [0; 2], dense: None };
+        let free = 8 << 30;
+        let base = admit(&config, 2, Vec::new(), None, vec![cost(2); 40], Onboard::Layers(4),
+            None, 512, 1, 0, false, free)?;
+        let with = admit(&config, 2, Vec::new(), Some(inventory), vec![cost(2); 40],
+            Onboard::Layers(4), None, 512, 1, 0, false, free)?;
+        assert_eq!(crate::placement::draft::home(&with.placement), Some(1));
+        assert!(with.placement.pool_tokens < base.placement.pool_tokens,
+            "the drafter's bytes come out of the pool, not after it");
+        Ok(())
     }
 
     #[test]
@@ -1107,5 +945,31 @@ mod tests {
         assert_eq!(phase(&d), [(1, 9 << 30), (0, (2 << 30) + (1 << 29))]);
         d.peer_half = 0;
         assert_eq!(d.load_phase(1).unwrap()[0].gpu, 0);
+    }
+}
+
+impl TierInputs {
+    /// Notes from the same immutable profile and model used for admission.
+    pub fn notes(&self, tier: &ExpertTierPlacement, model: &TierStepModel) -> Vec<String> {
+        let routed = tier.resident.iter().map(|ids| ids.as_slice()).collect::<Vec<_>>();
+        let mut notes = vec![format!("GPU expert tier resident experts per routed layer: {:?}",
+            routed.iter().map(|ids| ids.len()).collect::<Vec<_>>())];
+        let ms = |ns: f64| ns / 1e6;
+        let all_spark = model.step_ns(&self.activation, &[]);
+        let tiered = model.step_ns(&self.activation, &routed);
+        let experts = self.activation.layers.first().map_or(1, Vec::len).max(1);
+        let per_whole_layer = (all_spark - model.whole_step_ns(&self.activation)) / self.activation.layers.len().max(1) as f64;
+        let whole = per_whole_layer * tier.experts as f64 / experts as f64;
+        notes.push(format!("GPU expert tier predicted expert time per verify step: {:.2} -> {:.2} ms ({:.2} ms saved) \
+            at a {:.1}% byte hit rate; the same bytes as whole layers save {:.2} ms (step model: GPU {:.2} us per \
+            expert + {:.0} us, Spark {:.2} us per expert + {:.0} us, {} active experts per layer)",
+            ms(all_spark), ms(tiered), ms(all_spark - tiered), 100.0 * self.activation.hit_rate(&routed), ms(whole),
+            model.gpu_expert_ns as f64 / 1e3, model.gpu_fixed_ns as f64 / 1e3, model.spark_expert_ns as f64 / 1e3,
+            model.spark_fixed_ns as f64 / 1e3, model.active_experts));
+        if let Some(profile) = &self.profile {
+            notes.push(format!("GPU expert tier profile: route hit rate {:.1}% (one-row steps)",
+                100.0 * profile.route_share(&routed)));
+        }
+        notes
     }
 }

@@ -66,9 +66,19 @@ impl Drop for RoutedLane<'_> {
 }
 
 impl<'a> RoutedLane<'a> {
+    pub(super) fn skipped_golden(library: &'a Arc<cuteafd_ffi::NativeLibrary>,
+        local: &LocalLane<'a>, waves: usize, unit: usize) -> Result<Self> {
+        ensure!(std::ptr::eq(library.as_ref(), local.stream().device.library) && waves > 0 && unit > 0,
+            "Kimi skipped-routed lane binding differs");
+        Ok(Self { stream: local.stream().clone(), link: None, library_owner: Arc::clone(library),
+            terminal: false, capacity: unit, waves, unit, sequence: std::cell::Cell::new(0),
+            outstanding: std::collections::VecDeque::new() })
+    }
+
     pub(super) fn connect(library_owner: &'a Arc<cuteafd_ffi::NativeLibrary>,
         local: &LocalLane<'a>, placement: &Placement, world: SparkWorld,
-        peers: Vec<SocketAddr>, config: TcpTransportConfig, waves: usize, unit: usize) -> Result<Self> {
+        peers: Vec<SocketAddr>, config: TcpTransportConfig, waves: usize, unit: usize,
+        admitted: cuteafd_loader::placement::PreparedSparkLink) -> Result<Self> {
         ensure!(std::ptr::eq(library_owner.as_ref(), local.stream().device.library),
             "Kimi Spark library owner differs from admitted device");
         ensure!(cuteafd_core::expert_geometry() == ExpertGeometry::KIMI_K3,
@@ -77,7 +87,7 @@ impl<'a> RoutedLane<'a> {
         ensure!((1..=8).contains(&ranks), "Kimi routed exchange requires 1..8 real Spark ranks");
         let owner = placement.items.len().checked_sub(1).context("Kimi Spark intake has no physical owner")?;
         let charge = admitted_demand_on(waves, unit, local.lane_index(), ranks, owner,
-            cuteafd_core::SparkReplyFormat::resolve(cuteafd_core::spark_reply::requested(), false))?;
+            cuteafd_core::SparkReplyFormat::resolve(cuteafd_core::spark_reply::requested().prefill, false))?;
         let charges = placement.items[owner].iter().filter(|item| item.group == charge.group).collect::<Vec<_>>();
         ensure!(charges.len() == 1 && charges[0].category == charge.category
             && charges[0].basis == charge.basis && charges[0].bytes == charge.bytes,
@@ -88,15 +98,14 @@ impl<'a> RoutedLane<'a> {
         let mut link = stream.device.run(|| {
             library.v41_compact_reducer()?.require_plane_reduction(ranks as u32)?;
             // `waves` return slots of `unit` rows per rank.
-            let mut link = SparkLink::new_waves(library, world, &peers, u32::try_from(unit)?, config, LATENT * 2,
-                waves, u32::try_from(unit)?)?;
+            let mut link = SparkLink::prepared(library, world, &peers, config, admitted)?;
             link.enable_terminal_ownership(Arc::clone(library_owner))?;
             Ok(link)
         })?;
         ensure!(link.world_size() == ranks, "Kimi Spark transport world differs from admission");
-        if let Some(layer) = placement.layers.iter().position(|assignment|
+        if placement.layers.iter().any(|assignment|
             assignment.experts == cuteafd_loader::placement::ExpertHome::Spark) {
-            stream.device.run(|| link.bootstrap(&bootstrap_request(layer, unit)?))?;
+            stream.device.run(|| link.bootstrap(&bootstrap_shape(unit)?))?;
             ensure!(link.installed_grouping()?.len() == ranks,
                 "Kimi bootstrap requires installed grouping from all admitted ranks");
         }
@@ -207,11 +216,12 @@ impl<'a> RoutedLane<'a> {
 
 /// Control bootstrap sizes rings for the widest real request; these rows
 /// are never dispatched to the expert kernels.
-fn bootstrap_request(layer: usize, rows: usize) -> Result<ExpertProtocolV2Request> {
-    ensure!((1..93).contains(&layer) && (1..=4096).contains(&rows), "Kimi bootstrap geometry");
-    let layout = RouteStaging::new(rows, TOPK, KimiExpertInput::ROW_BYTES)?;
-    let staged = vec![0; layout.bytes];
-    request(layer, rows, 1, ExpertV2SourceKind::Prefill, &layout, &staged)
+fn bootstrap_shape(rows: usize) -> Result<cuteafd_transport::SparkSessionShape> {
+    ensure!((1..=4096).contains(&rows), "Kimi bootstrap geometry");
+    let mut shape = cuteafd_transport::SparkSessionShape::new(rows as u32, LATENT as u32, TOPK as u32,
+        ExpertV2Dtype::Fp8E4m3Ue8m0K32)?;
+    shape.flags |= cuteafd_transport::expert::EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16;
+    Ok(shape)
 }
 
 fn request(layer: usize, rows: usize, sequence: u64, kind: ExpertV2SourceKind,
@@ -267,17 +277,20 @@ mod tests {
     #[test]
     fn widest_bootstrap_matches_real_request_storage_without_consuming_a_wave() -> Result<()> {
         for rows in [1, 64, 4096] {
-            let request = bootstrap_request(6, rows)?;
-            assert_eq!(request.header.layer_id, 6);
-            assert_eq!(request.header.row_count as usize, rows);
-            assert_eq!(request.rows.len(), rows);
-            assert_eq!(request.routes.len(), rows * TOPK);
-            assert_eq!(request.hidden_payload.len(), rows * KimiExpertInput::ROW_BYTES);
-            assert!(request.routes.iter().all(|route| route.expert_id == 0 && route.gate_weight == 0.));
+            let shape = bootstrap_shape(rows)?;
+            assert_eq!(shape.row_count as usize, rows);
+            assert_eq!(shape.route_count as usize, rows * TOPK);
+            assert_eq!(shape.hidden_payload_bytes as usize, rows * KimiExpertInput::ROW_BYTES);
+            let layout = RouteStaging::new(rows, TOPK, KimiExpertInput::ROW_BYTES)?;
+            for kind in [ExpertV2SourceKind::Decode, ExpertV2SourceKind::Prefill] {
+                let real = request(92, rows, 1, kind, &layout, &vec![0; layout.bytes])?;
+                let real = cuteafd_transport::SparkSessionShape::from_request(&real)?;
+                assert_eq!(shape.request_wire_bytes, real.request_wire_bytes);
+                assert!(shape.response_wire_bytes >= real.response_wire_bytes);
+            }
         }
-        assert!(bootstrap_request(0, 4096).is_err());
-        assert!(bootstrap_request(1, 0).is_err());
-        assert!(bootstrap_request(1, 4097).is_err());
+        assert!(bootstrap_shape(0).is_err());
+        assert!(bootstrap_shape(4097).is_err());
         Ok(())
     }
 

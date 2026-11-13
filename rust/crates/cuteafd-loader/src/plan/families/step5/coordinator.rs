@@ -6,7 +6,7 @@ use crate::plan::{
     checkpoint::{Checkpoint, CheckpointTensor},
     spec::Component,
 };
-use anyhow::{ensure, Result};
+use anyhow::{ensure, Context, Result};
 use cuteafd_core::dense_attention::{
     GqaGeometry, NormWeight, RotaryArithmetic, RouterBiasOrder, SigmoidRouter, SlidingWindow,
 };
@@ -14,6 +14,8 @@ use cuteafd_core::DType;
 
 #[derive(Debug, Clone)]
 pub struct CoordinatorContract {
+    pub core_view: crate::plan::checkpoint::CoreView,
+    pub fp8_tensors: Vec<String>,
     pub weights: NativeDenseLayout,
     /// Header-native EXL3 dense projections (empty for FP8/NVFP4 releases).
     pub core: super::exl3::CoreInventory,
@@ -22,7 +24,7 @@ pub struct CoordinatorContract {
     pub rope_tables: crate::plan::rope::Tables,
     pub router: SigmoidRouter,
     pub layers: Vec<LayerContract>,
-    mtp_declarations: Vec<(String, Vec<usize>, DType)>,
+    pub(super) mtp_declarations: Vec<(String, Vec<usize>, DType)>,
 }
 
 /// Official target norms all receive config.rms_norm_eps, including the
@@ -93,6 +95,45 @@ impl LayerContract {
 }
 
 impl CoordinatorContract {
+    /// FP8-compact load-only staging; final device values/scales are charged by rank layouts.
+    pub fn attention_mount_load(&self, ranks: usize) -> Result<crate::shared::dense_read::MountLoad> {
+        if self.core_view != crate::plan::checkpoint::CoreView::Fp8Compact {
+            return Ok(Default::default());
+        }
+        crate::shared::dense_read::MountLoad::from_headers(self.weights.tensors.iter()
+            .filter(|tensor| self.fp8_tensors.contains(&tensor.meta.name))
+            .map(|tensor| &tensor.meta), ranks)
+    }
+
+    /// `copy_h2d` retains its largest pinned source until the library drops.
+    /// Whole source extents conservatively cover TP shards; embedding uses the
+    /// separate dense loader, not this reusable synchronous upload owner.
+    pub fn retained_sync_h2d_bytes(&self) -> Result<u64> {
+        let mut maximum = self.weights.tensors.iter()
+            .filter(|tensor| tensor.meta.name != "model.embed_tokens.weight")
+            .map(|tensor| tensor.meta.byte_length).max().unwrap_or(0);
+        for (_, shape, dtype) in &self.mtp_declarations {
+            let element = match dtype {
+                DType::Bf16 => 2u64, DType::F32 => 4, DType::F8E4M3 => 1,
+                _ => anyhow::bail!("unsupported Step-5 retained upload dtype {dtype:?}"),
+            };
+            let bytes = shape.iter().try_fold(element, |bytes, &dim| bytes.checked_mul(dim as u64))
+                .ok_or_else(|| anyhow::anyhow!("Step-5 retained upload extent overflow"))?;
+            maximum = maximum.max(bytes);
+        }
+        for projection in self.core.projections.values() {
+            let n = projection.stored_outputs as u64;
+            let k = projection.shape[1] as u64;
+            let payload = n.checked_mul(k).and_then(|bytes| bytes.checked_mul(projection.bits as u64))
+                .ok_or_else(|| anyhow::anyhow!("Step-5 retained core upload overflow"))? / 8;
+            maximum = maximum.max(payload).max(n * 2).max(k * 2);
+        }
+        for recipe in &self.rope_tables.recipes {
+            maximum = maximum.max(recipe.allocation_bytes(self.rope_tables.extent)? / 2);
+        }
+        Ok(maximum.max(256))
+    }
+
     /// Requires every selected native target header. Routed experts, vision
     /// and independently owned MTP stages are not charged as target weights.
     /// Full tensors are conservatively replicated; no unimplemented TP packing
@@ -100,6 +141,16 @@ impl CoordinatorContract {
     pub fn from_checkpoint(checkpoint: &Checkpoint) -> Result<Self> {
         let _construction = tracing::debug_span!("step5_coordinator_contract_construction").entered();
         let model = Model::open(checkpoint)?;
+        Self::from_model(checkpoint, &model)
+    }
+
+    /// Reuse the planner's validated model instead of rebuilding its tensor contract.
+    pub(super) fn from_model(checkpoint: &Checkpoint, model: &Model) -> Result<Self> {
+        checkpoint.validate_fp8_roles("Step-5", |name| {
+            let attention = name.contains(".self_attn.");
+            (if attention { "attention projection" } else { "core projection" },
+                name.ends_with(".self_attn.o_proj.weight"))
+        })?;
         let cfg: &Config = &model.cfg;
         let declarations = model
             .tensors
@@ -123,6 +174,8 @@ impl CoordinatorContract {
             !is_exl3_member(name) && tensor.role.component == Component::Speculator)
             .map(|(name, tensor)| (name.clone(), tensor.shape.clone(), tensor.dtype.clone())).collect();
         Ok(Self {
+            core_view: checkpoint.core_view(),
+            fp8_tensors: checkpoint.view.as_ref().map_or_else(Vec::new, |view| view.fp8_tensors().to_vec()),
             weights,
             mtp_declarations,
             core: model.core.clone(),
@@ -159,6 +212,21 @@ pub struct WeightOperand {
     pub allocation_bytes: u64,
 }
 
+impl WeightOperand {
+    pub fn native_layout(&self, rank: usize, ranks: usize) -> Result<crate::formats::native_attention::NativeLayout> {
+        use crate::formats::trellis_core::CoreSplit;
+        ensure!(self.shape.len() == 2, "Step-5 native output matrix");
+        let split = match self.slice { WeightSlice::Replicated => CoreSplit::Whole,
+            WeightSlice::Rows => CoreSplit::Output, WeightSlice::Cols => CoreSplit::Input };
+        Ok(crate::formats::native_attention::NativeLayout {
+            stem: self.name.strip_suffix(".weight").ok_or_else(|| anyhow::anyhow!("native weight name"))?.into(),
+            shape: [self.shape[0], self.shape[1]], fp8: self.dtype == DType::F8E4M3,
+            rank: if split == CoreSplit::Whole { 0 } else { rank },
+            ranks: if split == CoreSplit::Whole { 1 } else { ranks }, split,
+        })
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct RankWeightLayout {
     pub rank: usize,
@@ -174,7 +242,65 @@ fn is_exl3_member(name: &str) -> bool {
     matches!(crate::plan::format::split_stem(name).1, "trellis" | "suh" | "svh" | "mcg")
 }
 
+/// Program and allocation prefix of the target's rotary tables.
+pub const ROPE_PREFIX: &str = "step5_";
+
 impl RankWeightLayout {
+    /// Final rank-local owners only; composite FP8 values/scales remain one view.
+    pub fn arena_tensors(&self, select: impl Fn(&str) -> bool) -> Result<Vec<(String, usize)>> {
+        let mut tensors = self.operands.iter().filter(|operand| select(&operand.name))
+            .map(|operand| Ok((if operand.name == "model.embed_tokens.weight" {
+                "embedding.table".to_owned()
+            } else { operand.name.clone() }, usize::try_from(operand.allocation_bytes)?)))
+            .collect::<Result<Vec<_>>>()?;
+        for (name, core) in &self.core {
+            if select(name) { tensors.extend(core.arena_tensors(&core.stem)?); }
+        }
+        Ok(tensors)
+    }
+
+    pub fn arena_layout(&self, id: impl Into<String>, select: impl Fn(&str) -> bool)
+        -> Result<crate::serving_capacity::WeightArenaLayout> {
+        crate::serving_capacity::WeightArenaLayout::new(id, self.arena_tensors(select)?)
+    }
+
+    /// The one target arena a coordinator rank allocates, planned and served
+    /// alike: the selected operands and trellis cores of the first `count`
+    /// layers (globals only for the whole model), the generated rotary planes,
+    /// and the embedding table on the entry rank.
+    pub fn target_arena(&self, rope: Option<&crate::plan::rope::Tables>, device: i32, count: usize,
+        embedding: bool) -> Result<crate::serving_capacity::WeightArenaLayout> {
+        let mut tensors = self.arena_tensors(|name| {
+            if name == "model.embed_tokens.weight" { return embedding; }
+            if let Some(rest) = name.strip_prefix("model.layers.") {
+                return rest.split_once('.').and_then(|(layer, _)| layer.parse::<usize>().ok())
+                    .is_some_and(|layer| layer < count);
+            }
+            count == 92
+        })?;
+        if let Some(rope) = rope {
+            for (index, recipe) in rope.recipes.iter().enumerate() {
+                let plane = usize::try_from(recipe.allocation_bytes(rope.extent)? / 2)?;
+                for part in ["cos", "sin"] { tensors.push((format!("{ROPE_PREFIX}rotary.{index}.{part}"), plane)); }
+            }
+        }
+        crate::serving_capacity::WeightArenaLayout::new(format!("step5/target/gpu{device}"), tensors)
+    }
+
+    /// The predictor's own arena: every stage's owners, nothing of the target.
+    pub fn mtp_arena(&self, device: i32) -> Result<crate::serving_capacity::WeightArenaLayout> {
+        self.arena_layout(format!("step5/mtp/gpu{device}"), |_| true)
+    }
+
+    /// The predictor's single physical backing and its separately derived SM120 tail.
+    pub fn mtp_weight_charge(checkpoint: &Checkpoint, contract: &CoordinatorContract, depth: usize) -> Result<u64> {
+        let layout = Self::mtp_from_contract(checkpoint, contract, depth)?;
+        if layout.operands.is_empty() && layout.core.is_empty() { return Ok(0); }
+        let bytes = layout.mtp_arena(0)?.bytes() as u64;
+        bytes.checked_add(crate::placement::planner::allocation_granularity_forecast(&[bytes])?)
+            .context("Step-5 predictor arena charge overflow")
+    }
+
     pub fn from_checkpoint(checkpoint: &Checkpoint, rank: usize, ranks: usize) -> Result<Self> {
         Self::build(checkpoint, rank, ranks, None)
     }
@@ -208,6 +334,7 @@ impl RankWeightLayout {
         let mut layout = Self::from_native(&weights, 0, 1, None)?;
         for operand in &mut layout.operands { operand.slice = WeightSlice::Replicated; }
         layout.attach_core(&cfg, &contract.core, None, |layer| layer >= cfg.layers && layer < cfg.layers + depth)?;
+        layout.select_core_view(&contract.fp8_tensors)?;
         Ok(layout)
     }
 
@@ -248,7 +375,25 @@ impl RankWeightLayout {
         if let Some(ownership) = ownership { ownership.validate_config(cfg)?; }
         let mut layout = Self::from_native(&contract.weights, rank, ranks, ownership)?;
         layout.attach_core(cfg, &contract.core, ownership, |layer| layer < cfg.layers)?;
+        layout.select_core_view(&contract.fp8_tensors)?;
         Ok(layout)
+    }
+
+    /// Replace exactly the metadata-selected native matrices, never the EXL3 core.
+    fn select_core_view(&mut self, tensors: &[String]) -> Result<()> {
+        if tensors.is_empty() { return Ok(()); }
+        for operand in &mut self.operands {
+            if !tensors.contains(&operand.name) { continue; }
+            ensure!(operand.dtype == DType::Bf16 && operand.shape.len() == 2
+                && operand.shape.iter().all(|dim| dim % 128 == 0), "Step-5 FP8 output geometry");
+            operand.dtype = DType::F8E4M3;
+            operand.allocation_bytes = operand.native_layout(self.rank, self.ranks)?.bytes()?;
+        }
+        self.resident_bytes = self.operands.iter().map(|w| w.allocation_bytes)
+            .chain(self.core.values().map(|w| w.bytes as u64))
+            .try_fold(0u64, |sum, bytes| sum.checked_add(bytes))
+            .context("Step-5 selected attention weight size overflow")?;
+        Ok(())
     }
 
     /// Native trellis owners follow the same ownership as their BF16 operands:
@@ -816,5 +961,103 @@ mod tests {
             cp.config["text_config"]["rms_norm_eps"] = bad;
             assert!(CoordinatorContract::from_checkpoint(&cp).is_err());
         }
+    }
+
+    /// Before: one cudaMalloc per final owner (operand, or trellis member);
+    /// after: one arena. SM120 rounds requests over 1 MiB up to 2 MiB.
+    fn census(layout: &RankWeightLayout, arena: &crate::serving_capacity::WeightArenaLayout) -> String {
+        let tensors = layout.arena_tensors(|_| true).unwrap();
+        let bytes = tensors.iter().map(|(_, n)| *n as u64).sum::<u64>();
+        let large = tensors.iter().filter(|(_, n)| *n > 1 << 20).map(|(_, n)| *n as u64).collect::<Vec<_>>();
+        let rounding = large.iter().map(|n| n.div_ceil(2 << 20) * (2 << 20) - n).sum::<u64>();
+        let last = arena.views().values().map(|v| v.offset() + v.bytes()).max().unwrap();
+        format!("before {} allocations / {bytes} B, {} > 1 MiB / {} B, SM120 rounding {rounding} B; \
+            after arena {} B, padding {} B, tail {} B", tensors.len(), large.len(), large.iter().sum::<u64>(),
+            arena.bytes(), arena.padding_bytes(), arena.bytes() - last)
+    }
+
+    /// Views are exactly the final owners: unique, 256-aligned, disjoint, and
+    /// summing to the admitted resident bytes; composites stay one view.
+    fn assert_arena(layout: &RankWeightLayout) -> crate::serving_capacity::WeightArenaLayout {
+        let arena = layout.arena_layout("step5/test", |_| true).unwrap();
+        assert_eq!(arena.payload_bytes() as u64, layout.resident_bytes);
+        assert_eq!(arena.views().len(), layout.operands.len() + 3 * layout.core.len());
+        let mut views = arena.views().iter().collect::<Vec<_>>();
+        views.sort_by_key(|(_, v)| v.offset());
+        let mut end = 0;
+        for (name, view) in &views {
+            assert_eq!(view.offset() % 256, 0, "{name}");
+            assert!(view.offset() >= end && view.offset() - end < 256, "{name}");
+            assert!(!name.contains("staging") && !name.contains("marker"), "{name}");
+            end = view.offset() + view.bytes();
+        }
+        assert_eq!(end, arena.bytes());
+        for operand in &layout.operands {
+            let key = if operand.name == "model.embed_tokens.weight" { "embedding.table" } else { &operand.name };
+            assert_eq!(arena.view(key).unwrap().bytes() as u64, operand.allocation_bytes, "{key}");
+        }
+        for core in layout.core.values() {
+            let parts = ["trellis", "suh", "svh"].map(|p| arena.view(&format!("{}.{p}", core.stem)).unwrap().bytes());
+            assert_eq!(parts.iter().sum::<usize>(), core.bytes, "{}", core.stem);
+        }
+        arena
+    }
+
+    #[test]
+    fn rank_arenas_hold_exactly_the_final_fp8_owners() {
+        let dir = snapshot("fp8");
+        let cp = Checkpoint::open(dir.path()).unwrap();
+        let one = RankWeightLayout::from_checkpoint(&cp, 0, 1).unwrap();
+        let arena = assert_arena(&one);
+        assert!(arena.views().keys().all(|name| !name.ends_with("weight_scale_inv")));
+        eprintln!("Step-5 FP8 TP1 rank 0: {}", census(&one, &arena));
+        // FP8-compact attention: each converted O keeps values and scales as one
+        // composite view, sized by its packed native layout.
+        let mut compact = one.clone();
+        compact.select_core_view(&one.operands.iter().filter(|op| op.name.ends_with(".self_attn.o_proj.weight")).map(|op| op.name.clone()).collect::<Vec<_>>()).unwrap();
+        let arena = assert_arena(&compact);
+        let converted = compact.operands.iter().filter(|o| o.dtype == DType::F8E4M3).collect::<Vec<_>>();
+        assert!(!converted.is_empty() && converted.iter().all(|o| o.name.ends_with(".self_attn.o_proj.weight")));
+        for operand in converted {
+            assert_eq!(arena.view(&operand.name).unwrap().bytes() as u64,
+                operand.native_layout(0, 1).unwrap().bytes().unwrap(), "{}", operand.name);
+        }
+        eprintln!("Step-5 FP8-compact TP1 rank 0: {}", census(&compact, &arena));
+        let ranks = [0, 1].map(|rank| RankWeightLayout::from_checkpoint(&cp, rank, 2).unwrap());
+        for (rank, layout) in ranks.iter().enumerate() {
+            let arena = assert_arena(layout);
+            eprintln!("Step-5 FP8 TP2 rank {rank}: {}", census(layout, &arena));
+        }
+        // TP2 holds rank-local slices: q rows halve, replicated FFNs keep whole extents.
+        let q = |l: &RankWeightLayout| l.operands.iter().find(|o| o.name == "model.layers.3.self_attn.q_proj.weight")
+            .unwrap().allocation_bytes;
+        assert_eq!(q(&ranks[0]) * 2, q(&one));
+        assert_eq!(q(&ranks[0]), q(&ranks[1]));
+    }
+
+    #[test]
+    fn rank_and_predictor_arenas_hold_exactly_the_final_exl3_owners() {
+        let dir = crate::plan::families::step5::tests::exl3_snapshot();
+        let cp = Checkpoint::coordinator(dir.path(), false, true).unwrap();
+        let one = RankWeightLayout::from_checkpoint(&cp, 0, 1).unwrap();
+        assert!(!one.core.is_empty());
+        let arena = assert_arena(&one);
+        eprintln!("Step-5 EXL3 TP1 rank 0: {}", census(&one, &arena));
+        for rank in 0..2 {
+            let layout = RankWeightLayout::from_checkpoint(&cp, rank, 2).unwrap();
+            let arena = assert_arena(&layout);
+            eprintln!("Step-5 EXL3 TP2 rank {rank}: {}", census(&layout, &arena));
+            // A K-split o_proj owner keeps only this rank's input columns.
+            let o = &layout.core["model.layers.3.self_attn.o_proj.weight"];
+            assert_eq!((o.rank, o.ranks), (rank, 2));
+        }
+        // The predictor arena is its own scope: no target layer or global appears in it.
+        let mtp = RankWeightLayout::for_mtp(&cp, 3).unwrap();
+        let predictor = assert_arena(&mtp);
+        let cfg = crate::plan::families::step5::Config::parse(&cp).unwrap();
+        assert!(predictor.views().keys().all(|name| name.strip_prefix("model.layers.")
+            .and_then(|rest| rest.split('.').next()).and_then(|l| l.parse::<usize>().ok())
+            .is_some_and(|layer| layer >= cfg.layers)), "predictor arena holds a target owner");
+        eprintln!("Step-5 EXL3 MTP depth 3: {}", census(&mtp, &predictor));
     }
 }

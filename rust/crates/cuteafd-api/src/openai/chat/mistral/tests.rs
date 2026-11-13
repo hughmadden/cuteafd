@@ -21,6 +21,17 @@ fn own_template_matches_transformers_and_mistral_common_goldens() {
 }
 
 #[test]
+fn reasoning_only_retained_turn_obeys_official_v15_nonempty_constraint() {
+    let mut body = json!({"messages": [{"role": "user", "content": "Reply OK"},
+        {"role": "assistant", "content": ""}, {"role": "user", "content": "Next"}]});
+    // mistral_common 1.13.1 InstructTokenizerV15 rejects the same empty turn.
+    assert!(encoding().render(&body, &options(&body)).unwrap_err().contains("Assistant message must have"));
+    body["messages"][1]["reasoning_content"] = json!("Let me check");
+    assert_eq!(encoding().render(&body, &options(&body)).unwrap(),
+        "<s>[MODEL_SETTINGS]{\"reasoning_effort\": \"high\"}[/MODEL_SETTINGS][INST]Reply OK[/INST][THINK]Let me check[/THINK]</s>[INST]Next[/INST]");
+}
+
+#[test]
 fn served_snapshot_is_recognized_and_matches_the_fixture_when_present() {
     let snapshot = std::path::Path::new("/mnt/sparknest/hf-home/hub/models--mistralai--Mistral-Large-4-1T-A52B/snapshots/f12dabdc0c1e99e7f7924461a6f308859b05af4d");
     if !snapshot.exists() { return; }
@@ -90,6 +101,7 @@ fn run(text: &str, tools: bool, split: usize) -> (String, String, Vec<(String, S
             OutputChunk::Raw { content: text } => content.push_str(&text),
             OutputChunk::ToolCall { tool_name, arguments } => calls.push((tool_name, arguments)),
             OutputChunk::ToolArgumentsDelta { content: text } => calls.last_mut().unwrap().1.push_str(&text),
+            OutputChunk::ToolCallBegin => {}
             other => panic!("unexpected {other:?}"),
         }
     }
@@ -155,5 +167,102 @@ fn text_after_a_parsed_call_is_dropped() {
     for split in splits(text) {
         let (_, content, calls, count) = run(text, true, split);
         assert_eq!((content.as_str(), calls.len(), count), ("", 1, 1), "{split}");
+    }
+}
+
+// ------------------------------------------------------- streamed args
+
+mod streamed_args {
+    use super::*;
+
+    /// The assembled arguments of a parse: the `ToolCall` opener's bytes plus
+    /// every `ToolArgumentsDelta`, exactly as a client concatenates them.
+    fn assembled(chunks: &[OutputChunk]) -> String {
+        let mut text = String::new();
+        for chunk in chunks {
+            match chunk {
+                OutputChunk::ToolCall { arguments, .. } => text.push_str(arguments),
+                OutputChunk::ToolArgumentsDelta { content } => text.push_str(content),
+                _ => {}
+            }
+        }
+        text
+    }
+
+    fn parse_streaming(text: &str, streaming: bool) -> (Vec<OutputChunk>, usize) {
+        let mut parser = MistralOutputParser::with_stream_args(MistralParserOptions {
+            tools: Some(vec![weather()]), stop_sequences: Vec::new() }, streaming);
+        let mut chunks = Vec::new();
+        for character in text.chars() {
+            chunks.extend(parser.push(&character.to_string()));
+        }
+        chunks.extend(parser.finish());
+        (chunks, parser.tool_calls())
+    }
+
+    /// Every two-way split, including one inside the closing brace, must stream
+    /// the same bytes the hold path assembles.
+    fn assert_streamed_matches_hold(shape: &str, text: &str) {
+        let (hold, hold_calls) = parse_streaming(text, false);
+        let (streamed, streamed_calls) = parse_streaming(text, true);
+        assert_eq!((hold_calls, streamed_calls), (1, 1), "{shape}");
+        assert_eq!(assembled(&streamed), assembled(&hold), "{shape}: streamed == held, byte for byte");
+        for split in text.char_indices().map(|(index, _)| index).chain([text.len()]) {
+            let mut parser = MistralOutputParser::with_stream_args(MistralParserOptions {
+                tools: Some(vec![weather()]), stop_sequences: Vec::new() }, true);
+            let mut chunks = parser.push(&text[..split]);
+            chunks.extend(parser.push(&text[split..]));
+            chunks.extend(parser.finish());
+            assert_eq!(assembled(&chunks), assembled(&hold), "{shape}: split at {split}");
+        }
+        // A buffering constructor would pass every check above; prove a delta
+        // actually arrives before the call closes.
+        let close = text.rfind('}').expect("the object closes");
+        let mut parser = MistralOutputParser::with_stream_args(MistralParserOptions {
+            tools: Some(vec![weather()]), stop_sequences: Vec::new() }, true);
+        let mut saw_delta_before_close = false;
+        for (index, character) in text.char_indices() {
+            let chunks = parser.push(&character.to_string());
+            if index < close
+                && chunks.iter().any(|chunk| matches!(chunk, OutputChunk::ToolArgumentsDelta { .. }))
+            {
+                saw_delta_before_close = true;
+            }
+        }
+        parser.finish();
+        assert!(saw_delta_before_close, "{shape}: a delta must arrive before the call closes");
+    }
+
+    #[test]
+    fn arguments_stream_byte_for_byte() {
+        assert_streamed_matches_hold("one call", "[TOOL_CALLS]get_weather[ARGS]{\"city\": \"Taipei\"}");
+    }
+
+    /// The whitespace between `[ARGS]` and `{` is not part of the arguments in
+    /// hold mode, so it must not be streamed either.
+    #[test]
+    fn whitespace_before_the_object_is_not_streamed() {
+        let text = "[TOOL_CALLS]get_weather[ARGS]   {\"city\": \"Oslo\"}";
+        assert_streamed_matches_hold("leading whitespace", text);
+        let (streamed, _) = parse_streaming(text, true);
+        assert_eq!(assembled(&streamed), "{\"city\": \"Oslo\"}");
+    }
+
+    #[test]
+    fn a_chunk_boundary_inside_the_closing_brace_does_not_leak() {
+        assert_streamed_matches_hold("split close", "[TOOL_CALLS]get_weather[ARGS]{\"city\": \"台北\"}");
+    }
+
+    /// A call cut off before its object closes is content in hold mode; the
+    /// streamed call is counted and left incomplete.
+    #[test]
+    fn a_truncated_call_fails_the_streamed_call() {
+        let text = "[TOOL_CALLS]get_weather[ARGS]{\"city\": \"Oslo\"";
+        let (hold, hold_calls) = parse_streaming(text, false);
+        assert_eq!(hold_calls, 0);
+        assert!(hold.iter().any(|chunk| matches!(chunk, OutputChunk::Raw { .. })));
+        let (streamed, streamed_calls) = parse_streaming(text, true);
+        assert_eq!(streamed_calls, 1);
+        assert!(serde_json::from_str::<Value>(&assembled(&streamed)).is_err());
     }
 }

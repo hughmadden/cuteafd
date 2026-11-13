@@ -1,5 +1,452 @@
 use super::*;
+use cuteafd_core::SparkReplyFormat;
 use crate::placement::FfnMode;
+
+#[test]
+fn rounded_affine_closed_form_equals_enumeration_at_physical_boundaries() {
+    for granularity in [1, 8, SM120_ALLOCATION_GRANULARITY_BYTES] {
+        for first in [1, 4] {
+            for bytes_at_first in [0, 1, granularity, granularity + 1] {
+                for bytes_per_page in [0, 1, granularity / 2, granularity + 7] {
+                    let piece = BytePiece { first, last: first + 31, bytes_at_first,
+                        bytes_per_page, granularity, backings: 1, };
+                    let mut budgets = BTreeSet::from([0, 1, u64::MAX]);
+                    for pages in first..=piece.last {
+                        let bytes = piece.at(pages).unwrap();
+                        budgets.extend([bytes.saturating_sub(1), bytes, bytes + 1]);
+                    }
+                    for available in budgets {
+                        let expected = (first..=piece.last)
+                            .filter(|&pages| piece.at(pages).unwrap() <= available).max();
+                        assert_eq!(piece.last_affordable(available).unwrap(), expected,
+                            "{piece:?}, available={available}");
+                    }
+                }
+            }
+        }
+    }
+    assert!(ByteCurve(vec![BytePiece { first: 1, last: 1, bytes_at_first: 1,
+        bytes_per_page: 0, granularity: 0, backings: 1, }]).validate(1).is_err());
+    assert!(ByteCurve(vec![BytePiece { first: 1, last: 1, bytes_at_first: u64::MAX,
+        bytes_per_page: 0, granularity: 2, backings: 1, }]).validate(1).is_err());
+}
+
+#[test]
+fn paged_backings_round_each_backing_independently() {
+    for backings in [1, 3, 9] {
+        for (bytes_at_first, bytes_per_page) in [(0, 0), (backings, 0), (5 * backings, 3 * backings)] {
+            let piece = BytePiece { first: 1, last: 24, bytes_at_first,
+                bytes_per_page, granularity: 16, backings, };
+            assert!(piece.splits_exactly(), "{piece:?}");
+            for pages in 1..=piece.last {
+                let raw = bytes_at_first + bytes_per_page * (pages - 1);
+                assert_eq!(piece.at(pages).unwrap(),
+                    backings * (raw / backings).div_ceil(16) * 16, "{piece:?} pages={pages}");
+            }
+            let mut budgets = BTreeSet::from([0, u64::MAX]);
+            for pages in 1..=piece.last {
+                let bytes = piece.at(pages).unwrap();
+                budgets.extend([bytes.saturating_sub(1), bytes, bytes + 1]);
+            }
+            for available in budgets {
+                let expected = (1..=piece.last)
+                    .filter(|&pages| piece.at(pages).unwrap() <= available).max();
+                assert_eq!(piece.last_affordable(available).unwrap(), expected,
+                    "{piece:?}, available={available}");
+            }
+        }
+    }
+    // The exact inverse and the solver both require a whole split at every
+    // page count; an inexact one is refused instead of mispriced.
+    let inexact = ByteCurve::paged(3, 5, 16, 3, 8);
+    assert!(inexact.validate(8).is_err());
+    let split = ByteCurve::paged(30, 60, 16, 3, 8);
+    split.validate(8).unwrap();
+    // Page 3 asks 30 + 60 * 2 = 150 bytes: three 50-byte backings, each
+    // rounded up to its own 64-byte block.
+    assert_eq!(split.at(3).unwrap(), 3 * 64);
+}
+
+#[test]
+fn requests_at_or_below_one_mib_share_blocks_instead_of_rounding() {
+    let granularity = SM120_ALLOCATION_GRANULARITY_BYTES;
+    for (bytes_at_first, expected) in [(1 << 20, 1 << 20), ((1 << 20) + 1, granularity),
+        (granularity, granularity), (granularity + 1, 2 * granularity)] {
+        let curve = ByteCurve::linear_rounded(bytes_at_first, 0, 4, granularity);
+        assert_eq!(curve.at(1).unwrap(), expected, "bytes_at_first={bytes_at_first}");
+    }
+    // A page-scaled owner crosses the shared-block threshold as its pool grows.
+    let curve = ByteCurve::linear_rounded(1 << 19, 1 << 19, 8, granularity);
+    assert_eq!(curve.at(2).unwrap(), 1 << 20);
+    assert_eq!(curve.at(3).unwrap(), granularity);
+}
+
+#[test]
+fn rounded_affine_search_matches_exact_independent_backings_and_mixed_slopes() {
+    let maximum = 32;
+    let rounded = |bytes_at_first, bytes_per_page| ByteCurve(vec![BytePiece {
+        first: 1, last: maximum, bytes_at_first, bytes_per_page, granularity: 8, backings: 1,
+    }]);
+    for (other, multiple) in [(None, 1), (Some(ByteCurve::linear(2, 2, maximum)), 1),
+        (Some(rounded(1, 3)), 1), (Some(rounded(1, 3)), 3)] {
+        let mut contract = Linear { maximum: maximum * 64, ..Linear::new() }.prepare(&request()).unwrap();
+        let curve = rounded(3, 5);
+        contract.set_byte_extent("kv", curve.clone()).unwrap();
+        contract.pool_page_multiple = multiple;
+        contract.components.push(Component::allocation(allocation("fixed", 23),
+            ByteCurve::fixed(23, maximum), false, maximum));
+        if let Some(bytes) = &other {
+            let mut component = Component::allocation(allocation("other", 1), bytes.clone(), false, maximum);
+            component.byte_extent(bytes.clone()).unwrap();
+            contract.components.push(component);
+        }
+        for available in 1..=400 {
+            let budgets = vec![budget(available)];
+            let compiled = search::Compiled::new(&contract, &budgets).unwrap();
+            let expected = (1..=maximum).filter(|pages| pages % multiple == 0)
+                .filter(|&pages| curve.at(pages).unwrap() + 23
+                    + other.as_ref().map_or(0, |curve| curve.at(pages).unwrap()) <= available).max();
+            assert_eq!(compiled.limit(&budgets, &[0, 0, 0], 1, maximum).unwrap(), expected);
+            let solved = solve(request(), budgets.clone(), &Prepared(contract.clone()));
+            match expected {
+                Some(pages) => {
+                    let plan = solved.unwrap();
+                    assert_eq!(plan.pool_tokens, pages * 64);
+                    assert_eq!(compiled.phases(&budgets, &[0, 0, 0], pages).unwrap(),
+                        evaluate(&plan.facts, &budgets).unwrap());
+                }
+                None => assert!(solved.is_err()),
+            }
+        }
+    }
+    // A pool allocated as equal, independently rounded backings keeps the same
+    // closed-form limit: each backing's round-up, enumerated page by page.
+    for (backings, bytes_at_first, bytes_per_page) in [(3u64, 24u64, 48u64), (9, 90, 180)] {
+        let curve = ByteCurve::paged(bytes_at_first, bytes_per_page, 8, backings, maximum);
+        let mut contract = Linear { maximum: maximum * 64, ..Linear::new() }.prepare(&request()).unwrap();
+        contract.set_byte_extent("kv", curve.clone()).unwrap();
+        contract.components.push(Component::allocation(allocation("fixed", 23),
+            ByteCurve::fixed(23, maximum), false, maximum));
+        for available in 1..=800 {
+            let budgets = vec![budget(available)];
+            let compiled = search::Compiled::new(&contract, &budgets).unwrap();
+            let expected = (1..=maximum)
+                .filter(|&pages| curve.at(pages).unwrap() + 23 <= available).max();
+            assert_eq!(compiled.limit(&budgets, &[0, 0, 0], 1, maximum).unwrap(), expected,
+                "backings={backings}, available={available}");
+        }
+    }
+}
+
+fn granular_owner(id: &str, backing: &str, requests: Vec<u64>, lifetime: Lifetime) -> AllocationGranularity {
+    AllocationGranularity { id: id.into(), location: Location::coordinator(0), lifetime,
+        backings: vec![GranularityBacking { backing: backing.into(), requests }], evidence: GranularityEvidence::Forecast }
+}
+
+#[test]
+fn allocation_granularity_preserves_activation_lifetimes_serde_search_and_fixed_replay() {
+    let maximum = 8;
+    let mut contract = Linear { maximum: maximum * 64, ..Linear::new() }.prepare(&request()).unwrap();
+    let lifetime = Lifetime { first: Phase::Ready, last: Phase::Growth };
+    let owner = granular_owner("weights", "payload", vec![3 << 20, 24 << 10], lifetime);
+    let payload = owner.requests().iter().sum();
+    let option = contract.variables.len();
+    contract.variables.push(Variable::Encoder(vec![0, 1]));
+    let mut allocation = Component::allocation(Allocation::buffer("payload", owner.location,
+        payload, lifetime, Category::Weights, "weights"), ByteCurve::fixed(payload, maximum), false, maximum);
+    allocation.activation = Activation::choice(option, 0);
+    contract.components.push(allocation);
+    let mut component = allocation_granularity_component(owner.clone(), maximum).unwrap();
+    component.activation = Activation::choice(option, 0);
+    contract.components.push(component);
+    // An exact multiple still retains its typed inventory when the slack is zero.
+    let zero = granular_owner("zero", "aligned", vec![2 << 20], Lifetime::RESIDENT);
+    contract.components.push(Component::allocation(Allocation::buffer("aligned", zero.location,
+        2 << 20, zero.lifetime, Category::Weights, "aligned"), ByteCurve::fixed(2 << 20, maximum), false, maximum));
+    contract.components.push(allocation_granularity_component(zero, maximum).unwrap());
+    let budgets = vec![budget(16 << 20)];
+    let compiled = search::Compiled::new(&contract, &budgets).unwrap();
+    for selected in [&[0, 0, 0, 0][..], &[0, 0, 0, 1][..]] {
+        for pages in 1..=maximum {
+            let owners = contract.facts(selected, pages).unwrap();
+            let phases = evaluate(&owners, &budgets).unwrap();
+            assert_eq!(compiled.phases(&budgets, selected, pages).unwrap(), phases);
+            assert_eq!(owners.allocation_granularity.len(), if selected[option] == 0 { 2 } else { 1 });
+            for row in phases {
+                assert_eq!(row.opaque, if selected[option] == 0 && lifetime.contains(row.phase, owners.phase_order) {
+                    owner.bytes().unwrap()
+                } else { 0 });
+            }
+            let encoded = serde_json::to_vec(&owners).unwrap();
+            let restored: Facts = serde_json::from_slice(&encoded).unwrap();
+            let mut replay = Contract::fixed(64, 1, 1, restored);
+            replay.variables = vec![Variable::Prefill(vec![PrefillShape { rows: 64, waves: 1 }]), Variable::Lanes(vec![1])];
+            assert_eq!(replay.facts(&[0, 0], 1).unwrap(), owners);
+        }
+    }
+    cuteafd_core::memory_policy::MemoryPolicy { gpu_reserve: Some(0), ..Default::default() }.scoped(|| {
+        let mut overridden = contract.clone();
+        let mut budgets = budgets.clone();
+        search::apply_reserve_override(&mut overridden, &mut budgets);
+        assert_eq!(overridden.components.iter().filter(|c| matches!(c.kind, ComponentKind::AllocationGranularity(_))).count(), 2);
+    });
+}
+
+#[test]
+fn allocation_granularity_refuses_duplicate_alias_stale_and_wrong_domain_backings() {
+    let owner = granular_owner("weights", "payload", vec![3 << 20], Lifetime::TARGET);
+    let mut owners = facts(vec![Allocation::buffer("payload", owner.location, 3 << 20,
+        owner.lifetime, Category::Weights, "weights")]);
+    owners.allocation_granularity.push(owner);
+    let budgets = vec![budget(16 << 20)];
+    evaluate(&owners, &budgets).unwrap();
+    let mut invalid = Vec::new();
+    let mut duplicate = owners.clone();
+    duplicate.allocation_granularity.push(duplicate.allocation_granularity[0].clone());
+    invalid.push(duplicate);
+    let mut duplicate_backing = owners.clone();
+    let mut other = duplicate_backing.allocation_granularity[0].clone();
+    other.id = "other".into();
+    duplicate_backing.allocation_granularity.push(other);
+    invalid.push(duplicate_backing);
+    let mut alias = owners.clone();
+    let mut view = alias.allocations[0].clone();
+    view.id = "alias".into();
+    view.view = Some(View { backing: "payload".into(), offset: 0 });
+    alias.allocations.push(view);
+    alias.allocation_granularity[0].backings[0].backing = "alias".into();
+    invalid.push(alias);
+    let mut stale = owners.clone();
+    stale.allocation_granularity[0].backings[0].requests[0] += 1;
+    invalid.push(stale);
+    let mut missing = owners.clone();
+    missing.allocation_granularity[0].backings[0].backing = "missing".into();
+    invalid.push(missing);
+    let mut wrong_domain = owners.clone();
+    wrong_domain.allocation_granularity[0].location = Location { device: Device::Spark(0), domain: Domain::Managed };
+    invalid.push(wrong_domain);
+    let mut wrong_lifetime = owners.clone();
+    wrong_lifetime.allocation_granularity[0].lifetime = Lifetime::RESIDENT;
+    invalid.push(wrong_lifetime);
+    let mut overflow = owners.clone();
+    overflow.allocation_granularity[0].backings[0].requests = vec![u64::MAX];
+    invalid.push(overflow);
+    for owners in invalid {
+        assert!(evaluate(&owners, &budgets).is_err());
+        let mut replay = Contract::fixed(64, 1, 1, owners);
+        replay.variables = vec![Variable::Prefill(vec![PrefillShape { rows: 64, waves: 1 }]), Variable::Lanes(vec![1])];
+        assert!(solve(request(), budgets.clone(), &Prepared(replay)).is_err());
+    }
+}
+
+#[test]
+fn driver_page_tables_preserve_backings_aliases_activation_and_lifetimes() {
+    let maximum = 32;
+    let mut contract = Linear { maximum: maximum * 64, ..Linear::new() }.prepare(&request()).unwrap();
+    contract.gpus = 2;
+    let ready = Lifetime { first: Phase::Ready, last: Phase::Growth };
+    let mut backing = Allocation::buffer("prefix.0", Location::PINNED, 1, ready, Category::Prefix, "host prefix");
+    let mut component = Component::allocation(backing.clone(), ByteCurve::linear(1, 513, maximum), true, maximum);
+    component.byte_extent(ByteCurve::linear(1, 513, maximum)).unwrap();
+    let option = contract.variables.len();
+    contract.variables.push(Variable::Encoder(vec![0, 1]));
+    component.activation = Activation::choice(option, 0);
+    contract.components.push(component);
+    backing.id = "prefix.alias".into();
+    backing.view = Some(View { backing: "prefix.0".into(), offset: 0 });
+    let mut alias = Component::allocation(backing, ByteCurve::fixed(1, maximum), true, maximum);
+    alias.activation = Activation::choice(option, 0);
+    contract.components.push(alias);
+    let load = Lifetime { first: Phase::Load, last: Phase::Load };
+    let group = Sequential { id: "readers".into(), members: vec![
+        Allocation::buffer("read.a", Location::PINNED, 1024, load, Category::Staging, "reader"),
+        Allocation::buffer("read.b", Location::PINNED, 4096, load, Category::Staging, "reader"),
+    ] };
+    contract.components.push(Component { activation: Activation::always(), bytes: ByteCurve::fixed(group.peak(), maximum),
+        kind: ComponentKind::Sequential(group) });
+    contract.add_driver_page_tables();
+    contract.add_driver_page_tables();
+    assert_eq!(contract.components.iter().filter(|c| matches!(c.kind, ComponentKind::DriverPageTables { .. })).count(), 4);
+    let mut gpu1 = budget(1 << 30);
+    gpu1.id = "gpu1".into();
+    gpu1.locations = vec![Location::coordinator(1)];
+    let mut host = budget(1 << 30);
+    host.id = "host".into();
+    host.locations = vec![Location::HOST, Location::PINNED];
+    let budgets = vec![budget(1 << 30), gpu1, host];
+    let compiled = search::Compiled::new(&contract, &budgets).unwrap();
+    for selected in [&[0, 0, 0, 0][..], &[0, 0, 0, 1][..]] {
+        for pages in 1..=maximum {
+            let owners = contract.facts(selected, pages).unwrap();
+            assert_eq!(compiled.phases(&budgets, selected, pages).unwrap(), evaluate(&owners, &budgets).unwrap());
+            let json = serde_json::to_vec(&owners).unwrap();
+            let restored: Facts = serde_json::from_slice(&json).unwrap();
+            let mut replay = Contract::fixed(64, 1, 2, restored);
+            replay.add_driver_page_tables();
+            replay.add_driver_page_tables();
+            // Contract decisions need explicit physical execution geometry.
+            replay.variables = vec![Variable::Prefill(vec![PrefillShape { rows: 64, waves: 1 }]), Variable::Lanes(vec![1])];
+            let replayed = replay.facts(&[0, 0], 1).unwrap();
+            assert_eq!(replayed, owners);
+            assert_eq!(evaluate(&replayed, &budgets).unwrap(), evaluate(&owners, &budgets).unwrap());
+            let mut stale = owners.clone();
+            stale.driver_page_tables[0].mapped_bytes += 1;
+            assert!(matches!(evaluate(&stale, &budgets), Err(Refusal::InvalidFact(_))));
+            let mut duplicate = owners.clone();
+            duplicate.driver_page_tables.push(duplicate.driver_page_tables[0].clone());
+            assert!(matches!(evaluate(&duplicate, &budgets), Err(Refusal::InvalidFact(_))));
+            for gpu in 0..2 {
+                let rows: Vec<_> = owners.driver_page_tables.iter().filter(|a| a.location == Location::coordinator(gpu)).collect();
+                assert_eq!(rows.len(), if selected[option] == 0 { 2 } else { 1 });
+                let reader = rows.iter().find(|a| a.backing == "readers").unwrap();
+                assert_eq!((reader.bytes(), reader.lifetime), (8, load));
+                if selected[option] == 0 {
+                    let prefix = rows.iter().find(|a| a.backing == "prefix.0").unwrap();
+                    assert_eq!((prefix.bytes(), prefix.lifetime), (driver_page_table_bytes(1 + (pages - 1) * 513), ready));
+                }
+            }
+        }
+    }
+    for (bytes, expected) in [(0, 0), (1, 1), (512, 1), (513, 2), (32 << 30, 64 << 20)] {
+        assert_eq!(driver_page_table_bytes(bytes), expected);
+    }
+    assert_eq!(driver_page_table_bytes(u64::MAX), u64::MAX / 512 + 1);
+    cuteafd_core::memory_policy::MemoryPolicy { gpu_reserve: Some(0), ..Default::default() }.scoped(|| {
+        let mut overridden = contract.clone();
+        let mut overridden_budgets = budgets.clone();
+        search::apply_reserve_override(&mut overridden, &mut overridden_budgets);
+        assert_eq!(overridden.components.iter().filter(|component|
+            matches!(component.kind, ComponentKind::DriverPageTables { .. })).count(), 4);
+    });
+}
+
+#[test]
+fn driver_page_table_staircase_limits_pool_without_rounding_slope() {
+    let maximum = 32;
+    let mut contract = Linear { maximum: maximum * 64, ..Linear::new() }.prepare(&request()).unwrap();
+    let pinned = Allocation::buffer("mapped", Location::PINNED, 1, Lifetime::TARGET, Category::Workspace, "mapped");
+    let mut component = Component::allocation(pinned, ByteCurve::linear(1, 513, maximum), false, maximum);
+    component.byte_extent(ByteCurve::linear(1, 513, maximum)).unwrap();
+    contract.components.push(component);
+    assert!(!contract.components.iter().any(|component|
+        matches!(component.kind, ComponentKind::DriverPageTables { .. })));
+    let mut host = budget(1 << 30);
+    host.id = "host".into();
+    host.locations = vec![Location::PINNED];
+    for bytes in [1039, 1040, 1041] {
+        let expected = (1..=maximum).filter(|pages| pages * 64 + driver_page_table_bytes(1 + (pages - 1) * 513) <= bytes).max().unwrap();
+        let plan = solve(request(), vec![budget(bytes), host.clone()], &Prepared(contract.clone())).unwrap();
+        assert_eq!(plan.pool_tokens, expected * 64);
+        assert!(plan.facts.driver_page_tables.iter().any(|a| a.backing == "mapped"));
+    }
+}
+
+#[test]
+fn driver_models_preserve_physical_backings_opaque_costs_and_fixed_replay() {
+    let maximum = 8;
+    let spark = Location { device: Device::Spark(0), domain: Domain::Managed };
+    let mut contract = Linear { maximum: maximum * 64, ..Linear::new() }.prepare(&request()).unwrap();
+    let option = contract.variables.len();
+    contract.variables.push(Variable::Encoder(vec![0, 1]));
+    let curve = ByteCurve::linear(1, 4097, maximum);
+    let arena = Allocation::buffer("arena", spark, 1, Lifetime::RESIDENT, Category::Experts, "experts");
+    let mut owner = Component::allocation(arena.clone(), curve.clone(), false, maximum);
+    owner.byte_extent(curve.clone()).unwrap();
+    owner.activation = Activation::choice(option, 0);
+    contract.components.push(owner);
+    let mut alias = arena;
+    alias.id = "arena.alias".into();
+    alias.view = Some(View { backing: "arena".into(), offset: 0 });
+    let mut alias = Component::allocation(alias, ByteCurve::fixed(1, maximum), false, maximum);
+    alias.activation = Activation::choice(option, 0);
+    contract.components.push(alias);
+    contract.components.push(Component {
+        activation: Activation::choice(option, 0), bytes: curve,
+        kind: ComponentKind::DriverPageTables { model: DriverPageTableModel::Sm121Arena,
+            location: spark, lifetime: Lifetime::RESIDENT, backing: "arena".into() },
+    });
+    contract.components.push(Component::allocation(
+        Allocation::buffer("portable", Location::PINNED, 513, Lifetime::TARGET, Category::Prefix, "prefix"),
+        ByteCurve::fixed(513, maximum), false, maximum));
+    contract.add_driver_page_tables();
+    contract.add_driver_page_tables();
+    let mut host = budget(1 << 30);
+    host.id = "host".into();
+    host.locations = vec![Location::PINNED];
+    let mut worker = budget(1 << 30);
+    worker.id = "spark".into();
+    worker.locations = vec![spark];
+    let budgets = vec![budget(1 << 30), host, worker];
+    let compiled = search::Compiled::new(&contract, &budgets).unwrap();
+    for selected in [&[0, 0, 0, 0][..], &[0, 0, 0, 1][..]] {
+        for pages in 1..=maximum {
+            let owners = contract.facts(selected, pages).unwrap();
+            let phases = evaluate(&owners, &budgets).unwrap();
+            assert_eq!(compiled.phases(&budgets, selected, pages).unwrap(), phases);
+            let json = serde_json::to_vec(&owners).unwrap();
+            let restored: Facts = serde_json::from_slice(&json).unwrap();
+            let mut replay = Contract::fixed(64, 1, 1, restored);
+            replay.add_driver_page_tables();
+            replay.add_driver_page_tables();
+            replay.variables = vec![Variable::Prefill(vec![PrefillShape { rows: 64, waves: 1 }]), Variable::Lanes(vec![1])];
+            assert_eq!(replay.facts(&[0, 0], 1).unwrap(), owners);
+            for phase in phases.iter().filter(|row| row.budget == "spark") {
+                let bytes = if selected[option] == 0 { 1 + (pages - 1) * 4097 } else { 0 };
+                assert_eq!((phase.owned, phase.opaque), (bytes, DriverPageTableModel::Sm121Arena.bytes(bytes)));
+            }
+            for row in &owners.driver_page_tables {
+                let mut wrong_model = owners.clone();
+                wrong_model.driver_page_tables.iter_mut().find(|item| item.backing == row.backing).unwrap().model =
+                    match row.model {
+                        DriverPageTableModel::Sm120Portable => DriverPageTableModel::Sm121Arena,
+                        DriverPageTableModel::Sm121Arena => DriverPageTableModel::Sm120Portable,
+                    };
+                assert!(matches!(evaluate(&wrong_model, &budgets), Err(Refusal::InvalidFact(_))));
+            }
+            if selected[option] == 0 {
+                let mut alias = owners.clone();
+                alias.driver_page_tables.iter_mut().find(|row| row.backing == "arena").unwrap().backing = "arena.alias".into();
+                assert!(matches!(evaluate(&alias, &budgets), Err(Refusal::InvalidFact(_))));
+                let mut stale = owners.clone();
+                stale.driver_page_tables.iter_mut().find(|row| row.backing == "arena").unwrap().mapped_bytes += 1;
+                assert!(matches!(evaluate(&stale, &budgets), Err(Refusal::InvalidFact(_))));
+                let mut wrong_owner = owners.clone();
+                wrong_owner.allocations.iter_mut().find(|owner| owner.id == "arena").unwrap().category = Category::Workspace;
+                assert!(matches!(evaluate(&wrong_owner, &budgets), Err(Refusal::InvalidFact(_))));
+            }
+        }
+    }
+}
+
+#[test]
+fn spark_driver_staircase_matches_exact_search_and_affine_pricing() {
+    let maximum = 8;
+    let spark = Location { device: Device::Spark(0), domain: Domain::Managed };
+    for slope in [4096, 4097] {
+        let mut contract = Linear { maximum: maximum * 64, ..Linear::new() }.prepare(&request()).unwrap();
+        let curve = ByteCurve::linear(1, slope, maximum);
+        let mut owner = Component::allocation(
+            Allocation::buffer("arena", spark, 1, Lifetime::RESIDENT, Category::Experts, "experts"),
+            curve.clone(), false, maximum);
+        owner.byte_extent(curve.clone()).unwrap();
+        contract.components.push(owner);
+        contract.components.push(Component { activation: Activation::always(), bytes: curve,
+            kind: ComponentKind::DriverPageTables { model: DriverPageTableModel::Sm121Arena,
+                location: spark, lifetime: Lifetime::RESIDENT, backing: "arena".into() } });
+        for bytes in [4144, 4145, 8241, 8242, 8243, 12400] {
+            let expected = (1..=maximum).filter(|pages| {
+                let arena = 1 + (pages - 1) * slope;
+                arena + DriverPageTableModel::Sm121Arena.bytes(arena) <= bytes
+            }).max().unwrap();
+            let mut worker = budget(bytes);
+            worker.id = "spark".into();
+            worker.locations = vec![spark];
+            let plan = solve(request(), vec![budget(1 << 30), worker], &Prepared(contract.clone())).unwrap();
+            assert_eq!(plan.pool_tokens, expected * 64, "slope={slope}, budget={bytes}");
+            assert_eq!(plan.facts.driver_page_tables.len(), 1);
+        }
+    }
+}
 
 #[test]
 fn coordinator_devices_preserve_logical_rank_for_reversed_and_sparse_ordinals() {
@@ -17,6 +464,339 @@ fn coordinator_devices_preserve_logical_rank_for_reversed_and_sparse_ordinals() 
         assert!(CoordinatorDevices::new(physical).is_err());
     }
     assert_eq!(CoordinatorDevices::new(&[1]).unwrap().location(1).unwrap(), Location::coordinator(0));
+}
+
+#[test]
+fn startup_graph_capture_replaces_opaque_estimate_without_reselection() {
+    use crate::placement::inventory::{CapturedGraphRank, GraphRank, GraphSet, Lifetime as GraphLifetime};
+    let rank = GraphRank::estimated(2, 10);
+    let owner = serving::startup_graph_component("test.0", Location::coordinator(0), rank, 1).unwrap();
+    let ComponentKind::Allowance(owner) = owner.kind else { panic!("graph is not an opaque allowance") };
+    let mut physical = facts(vec![allocation("kv", 100)]);
+    physical.allowances.push(owner);
+    let budgets = vec![budget(1000)];
+    let mut plan = ResolvedPlan { pool_page_rows: 64, encoder_diagnostics: vec![], request: request(), decisions: decisions(1),
+        pool_tokens: 64, phases: evaluate(&physical, &budgets).unwrap(), facts: physical, budgets };
+    let original = plan.clone();
+    let graphs = GraphSet { ranks: vec![rank], shapes: 1, lifetime: GraphLifetime::Startup };
+    let declared: Vec<String> = vec!["exact keys".into()];
+    let capture = CapturedGraphRank { declared_graphs: declared[0].clone(), executables: 2, bytes: 200 };
+    let measured = serving::reconcile_startup_graphs(&mut plan, "test", &graphs, &declared, &[capture.clone()]).unwrap();
+    assert_eq!(measured.ranks[0].bytes, 200);
+    assert_eq!(measured.ranks[0].basis, Basis::Calibrated);
+    assert_eq!(plan.request, original.request);
+    assert_eq!(plan.decisions, original.decisions);
+    assert_eq!(plan.pool_tokens, original.pool_tokens);
+    assert_eq!(plan.budgets, original.budgets);
+    assert_eq!(plan.facts.allocations, original.facts.allocations);
+    assert_eq!(plan.facts.allowances[0].bytes, 200);
+    assert!(!plan.facts.allowances[0].assumed);
+    for phase in plan.phases.iter().filter(|phase| matches!(phase.phase, Phase::Warmup | Phase::Ready | Phase::Growth)) {
+        assert_eq!((phase.owned, phase.opaque), (100, 200));
+    }
+    let good = plan.clone();
+    // A capture above every budget is served, not refused: the graphs are
+    // already resident, so the measured row is installed and reported (#1605).
+    let over = CapturedGraphRank { bytes: 1000, ..capture.clone() };
+    let mut above = good.clone();
+    assert_eq!(serving::reconcile_startup_graphs(&mut above, "test", &graphs, &declared, &[over]).unwrap().ranks[0].bytes, 1000);
+    assert_eq!(above.facts.allowances[0].bytes, 1000);
+    assert!(!above.facts.allowances[0].assumed);
+    for phase in above.phases.iter().filter(|phase| matches!(phase.phase, Phase::Warmup | Phase::Ready | Phase::Growth)) {
+        assert_eq!((phase.owned, phase.opaque, phase.available), (100, 1000, 1000));
+    }
+    assert_eq!(above.request, good.request);
+    assert_eq!(above.decisions, good.decisions);
+    // An ill-formed capture still refuses and leaves the receipt intact.
+    for bad in [CapturedGraphRank { declared_graphs: "wrong keys".into(), ..capture.clone() },
+        CapturedGraphRank { executables: 3, ..capture.clone() }] {
+        assert!(serving::reconcile_startup_graphs(&mut plan, "test", &graphs, &declared, &[bad]).is_err());
+        assert_eq!(plan, good);
+    }
+    let mut over = good.clone();
+    serving::reconcile_startup_graphs(&mut over, "test", &graphs, &declared,
+        &[CapturedGraphRank { bytes: 1000, ..capture.clone() }]).unwrap();
+    assert_eq!(over.facts.allowances[0].bytes, 1000);
+    assert!(over.phases.iter().any(|p| p.owned + p.opaque > p.available));
+    assert_eq!(over.remaining(&over.budgets[0].id, Phase::Ready), Some(0));
+    let mut duplicate = good.clone();
+    duplicate.facts.allowances.push(duplicate.facts.allowances[0].clone());
+    let unchanged = duplicate.clone();
+    assert!(serving::reconcile_startup_graphs(&mut duplicate, "test", &graphs, &declared, &[capture.clone()]).is_err());
+    assert_eq!(duplicate, unchanged);
+    let mut missing = good.clone();
+    missing.facts.allowances.clear();
+    assert!(serving::reconcile_startup_graphs(&mut missing, "test", &graphs, &declared, &[capture]).is_err());
+    assert!(serving::startup_graph_component("", Location::coordinator(0), rank, 1).is_err());
+    assert!(serving::startup_graph_component("test", Location::coordinator(0), rank, 0).is_err());
+    assert!(serving::startup_graph_component("test", Location::coordinator(0), GraphRank { margin: 1, ..rank }, 1).is_err());
+}
+
+#[test]
+fn shared_draft_arena_reconciliation_maps_roots_views_and_derived_references() -> anyhow::Result<()> {
+    for prefix in ["qwen3_5/dspark/gpu", "glm/draft/", "glm5_flash/draft/", "kimi/draft/"] {
+        for physical in [&[1][..], &[0, 1], &[1, 0]] {
+            let devices = CoordinatorDevices::new(physical)?;
+            let mut contract = Linear::new().prepare(&request())?;
+            contract.components.clear();
+            let mut runtime = Vec::new();
+            for (rank, &ordinal) in physical.iter().enumerate() {
+                let id = format!("{prefix}{rank}");
+                let location = Location::coordinator(rank as u8);
+                let components = weight_arena_extent_components(&id, 3 << 20, location,
+                    Lifetime::RESIDENT, contract.maximum_pages, MemoryKind::DrafterWeights)?;
+                let ComponentKind::Allocation { template, .. } = &components[0].kind else { unreachable!() };
+                assert_eq!(template.category, MemoryKind::DrafterWeights.category());
+                let address = 0x1000000 + rank as u64 * 0x1000000;
+                runtime.push(Receipt { allocation: Allocation { id: format!("{prefix}{ordinal}"), ..template.clone() }, address });
+                let mut alias = Allocation::buffer(format!("draft.{rank}.tensor"), location, 257,
+                    Lifetime::RESIDENT, Category::Drafter, "draft owners");
+                alias.view = Some(View { backing: id.clone(), offset: 256 });
+                contract.components.extend(components);
+                contract.components.push(Component::allocation(alias.clone(),
+                    ByteCurve::fixed(alias.bytes, contract.maximum_pages), false, contract.maximum_pages));
+                alias.view.as_mut().unwrap().backing = format!("{prefix}{ordinal}");
+                runtime.push(Receipt { allocation: alias, address: address + 256 });
+            }
+            let mut budgets = vec![budget(16 << 20)];
+            if physical.len() == 2 { let mut peer = budget(16 << 20);
+                peer.id = "peer".into(); peer.locations = vec![Location::coordinator(1)]; budgets.push(peer); }
+            let facts = contract.facts(&vec![0; contract.variables.len()], 1)?;
+            let plan = ResolvedPlan { pool_page_rows: 64, encoder_diagnostics: vec![], request: request(), decisions: decisions(0),
+                pool_tokens: 64, phases: evaluate(&facts, &budgets)?, budgets, facts };
+            let original = plan.clone();
+            let mapped = devices.remap_plan_weight_arenas(&plan)?;
+            assert_eq!(plan, original);
+            assert_eq!(mapped.phases, original.phases);
+            for (rank, &ordinal) in physical.iter().enumerate() {
+                let id = format!("{prefix}{ordinal}");
+                assert!(mapped.facts.resident_weights.iter().any(|owner| owner.id == id
+                    && owner.location == Location::coordinator(rank as u8)));
+                assert!(mapped.facts.allocation_granularity.iter().any(|owner|
+                    owner.backings.iter().any(|backing| backing.backing == id && backing.requests == [3 << 20])));
+            }
+            devices.reconcile(&plan, Phase::Ready, &runtime)?;
+            let mut missing = plan.facts.allocations.clone();
+            missing.remove(0);
+            assert!(devices.remap_weight_arenas(&missing).is_err());
+            let mut wrong = plan.facts.allocations.clone();
+            wrong[0].id.push('9');
+            assert!(devices.remap_weight_arenas(&wrong).is_err());
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn drafter_kv_root_does_not_remap_as_an_immutable_arena() -> anyhow::Result<()> {
+    assert_eq!(MemoryKind::DrafterWeights.category(), MemoryKind::DrafterKv.category());
+    assert_ne!(MemoryKind::DrafterWeights.behaviour(), MemoryKind::DrafterKv.behaviour());
+    let devices = CoordinatorDevices::new(&[1])?;
+    for kind in [MemoryKind::DrafterKv, MemoryKind::DrafterWorkspace] {
+        let root = Allocation::buffer("glm/draft/0", Location::coordinator(0), 1024,
+            Lifetime::RESIDENT, kind.category(), "drafter state");
+        assert_eq!(devices.remap_weight_arenas(&[root.clone()])?, [root]);
+    }
+    Ok(())
+}
+
+#[test]
+fn arena_tail_report_inherits_category_without_reforecasting_grouped_requests() -> anyhow::Result<()> {
+    let mut p = plan(vec![]);
+    p.facts.allocations.push(Allocation::buffer("draft", Location::coordinator(0), (3 << 20) + 1,
+        Lifetime::RESIDENT, MemoryKind::DrafterWeights.category(), "weight arena"));
+    p.facts.allocation_granularity.push(granular_owner("draft.tail", "draft", vec![(3 << 20) + 1], Lifetime::RESIDENT));
+    let mut grouped = granular_owner("legacy.tail", "a", vec![1 << 20], Lifetime::RESIDENT);
+    grouped.backings.push(GranularityBacking { backing: "b".into(), requests: vec![1 << 20] });
+    for id in ["a", "b"] {
+        p.facts.allocations.push(Allocation::buffer(id, Location::coordinator(0), 1 << 20,
+            Lifetime::RESIDENT, Category::Workspace, "legacy"));
+    }
+    assert_eq!(grouped.bytes()?, 0);
+    p.facts.allocation_granularity.push(grouped);
+    let items = p.items(Location::coordinator(0))?;
+    let tails = items.iter().filter(|item| item.group == ALLOCATION_GRANULARITY_GROUP).collect::<Vec<_>>();
+    assert_eq!(tails.len(), 2);
+    assert_eq!(tails[0].category, MemoryKind::DrafterWeights.category());
+    assert_eq!(tails[0].bytes, (1 << 20) - 1);
+    assert_eq!(tails[1].bytes, 0, "do not round the two small backings independently");
+    Ok(())
+}
+
+#[test]
+fn shared_arena_reconciliation_maps_physical_ids_without_changing_the_plan() -> anyhow::Result<()> {
+    use crate::serving_capacity::{expert_weight_arena_id, WeightArenaLayout};
+    for physical in [&[1][..], &[0, 1], &[1, 0]] {
+        let devices = CoordinatorDevices::new(physical)?;
+        let mut planned = Vec::new();
+        let mut runtime = Vec::new();
+        for (rank, &ordinal) in physical.iter().enumerate() {
+            let location = Location::coordinator(rank as u8);
+            for (selection, label) in [(vec![("layer.3".into(), 257), ("layer.7".into(), 17)], "target"),
+                (vec![("draft.0".into(), 19)], "draft")] {
+                let layout = WeightArenaLayout::new(expert_weight_arena_id("exl3", rank as i32, &selection)?, selection.clone())?;
+                let physical_id = expert_weight_arena_id("exl3", ordinal, &selection)?;
+                let root = Allocation::buffer(layout.id(), location, layout.bytes() as u64,
+                    Lifetime::TARGET, Category::Experts, "weight arena");
+                let address = 0x10000 + rank as u64 * 0x10000 + if label == "draft" { 0x8000 } else { 0 };
+                planned.push(root.clone());
+                runtime.push(Receipt { allocation: Allocation { id: physical_id.clone(), ..root }, address });
+                for (name, view) in layout.views() {
+                    let mut alias = Allocation::buffer(format!("{label}.rank.{rank}.{name}"), location, view.bytes() as u64,
+                        Lifetime::TARGET, Category::Experts, "resident expert owners");
+                    alias.view = Some(View { backing: layout.id().into(), offset: view.offset() as u64 });
+                    planned.push(alias.clone());
+                    alias.view.as_mut().unwrap().backing = physical_id.clone();
+                    runtime.push(Receipt { allocation: alias, address: address + view.offset() as u64 });
+                }
+            }
+        }
+        let mut budgets = vec![budget(4096)];
+        if physical.len() == 2 {
+            let mut peer = budget(4096);
+            peer.id = "peer".into();
+            peer.locations = vec![Location::coordinator(1)];
+            budgets.push(peer);
+        }
+        let mut facts = facts(planned.clone());
+        facts.resident_weights = facts.allocations.iter().filter(|a| a.view.is_none())
+            .map(|a| ResidentWeight::from_allocation(a, ResidentWeights(a.bytes))).collect();
+        let plan = ResolvedPlan { pool_page_rows: 64, encoder_diagnostics: vec![], request: request(), decisions: decisions(0),
+            pool_tokens: 64, phases: evaluate(&facts, &budgets)?, budgets, facts };
+        let original = plan.clone();
+        let mapped = devices.remap_plan_weight_arenas(&plan)?;
+        assert_eq!(plan, original, "identity translation mutates the admitted plan");
+        assert_eq!(mapped.decisions, plan.decisions);
+        assert_eq!(mapped.phases, plan.phases);
+        assert_eq!(mapped.budgets, plan.budgets);
+        assert_eq!(mapped.facts.allocations, runtime.iter().map(|r| r.allocation.clone()).collect::<Vec<_>>());
+        for resident in &mapped.facts.resident_weights {
+            assert!(mapped.facts.allocations.iter().any(|a| a.id == resident.id && a.location == resident.location));
+        }
+        assert_eq!(devices.remap_weight_arenas(&planned)?, mapped.facts.allocations);
+        devices.reconcile(&plan, Phase::Ready, &runtime)?;
+        let history = runtime.iter().cloned().map(|receipt| Observation {
+            created: receipt.allocation.lifetime.first, freed: None, receipt }).collect::<Vec<_>>();
+        devices.reconcile_history(&plan, Phase::Ready, &history)?;
+        let events = runtime.iter().filter(|r| r.allocation.view.is_none()).cloned()
+            .map(|receipt| OwnerEvent::Allocated { phase: receipt.allocation.lifetime.first, receipt }).collect::<Vec<_>>();
+        let views = history.iter().filter(|o| o.receipt.allocation.view.is_some()).cloned().collect::<Vec<_>>();
+        devices.reconcile_events(&plan, Phase::Ready, &events, &views)?;
+        devices.reconcile_startup(&plan, Phase::Ready, &events, &views, &[])?;
+        assert!(devices.reconcile(&plan, Phase::Ready, &runtime[1..]).is_err());
+        let mut wrong = runtime.clone();
+        wrong[0].allocation.bytes += 1;
+        assert!(devices.reconcile(&plan, Phase::Ready, &wrong).is_err());
+        wrong = runtime.clone();
+        wrong[1].allocation.view.as_mut().unwrap().offset += 1;
+        assert!(devices.reconcile(&plan, Phase::Ready, &wrong).is_err());
+        if physical != [0, 1] { assert!(reconcile(&plan, Phase::Ready, &runtime).is_err()); }
+        let mut invalid = planned.clone();
+        invalid[0].id = "experts.exl3.gpu.0.bad-sha".into();
+        assert!(devices.remap_weight_arenas(&invalid).is_err());
+        assert!(devices.remap_weight_arenas(&planned[1..]).is_err(), "partial rootless inventory accepted");
+    }
+    let mut ordinary = allocation("core/logical/0", 64);
+    ordinary.category = Category::Weights;
+    ordinary.group = "weight arena".into();
+    assert_eq!(CoordinatorDevices::new(&[1])?.remap_weight_arenas(&[ordinary.clone()])?, [ordinary]);
+    Ok(())
+}
+
+#[test]
+fn shared_arena_remap_preserves_derived_backings_and_all_owner_scopes() -> anyhow::Result<()> {
+    use crate::serving_capacity::expert_weight_arena_id;
+    for physical in [&[1][..], &[0, 1], &[1, 0]] {
+        for order in [PhaseOrder::TARGET_THEN_DRAFT, PhaseOrder::DRAFT_THEN_TARGET] {
+            let devices = CoordinatorDevices::new(physical)?;
+            let mut planned = facts(vec![]);
+            let mut expected = facts(vec![]);
+            for inventory in [&mut planned, &mut expected] {
+                inventory.phase_order = order;
+                inventory.allocations.push(Allocation::buffer("mapped.prefix", Location::PINNED,
+                    513, Lifetime::RESIDENT, Category::Prefix, "host prefix"));
+            }
+            let draft = Lifetime { first: Phase::DraftLoad, last: Phase::Growth };
+            let load = Lifetime { first: Phase::Load, last: Phase::Load };
+            for (rank, &ordinal) in physical.iter().enumerate() {
+                let location = Location::coordinator(rank as u8);
+                // Build physical expectations independently, including derived references.
+                for (inventory, ordinal) in [(&mut planned, rank as i32), (&mut expected, ordinal)] {
+                    let mut resident_backings = Vec::new();
+                    let mut sequential = Vec::new();
+                    for (scope, label, bytes, lifetime) in [
+                        (0, "target", (3 << 20) + 257, Lifetime::RESIDENT),
+                        (1, "deferred", (2 << 20) + 17, Lifetime::RESIDENT),
+                        (1, "draft", (3 << 20) + 33, draft),
+                        (2, "load.a", 513, load),
+                        (2, "load.b", 1025, load),
+                    ] {
+                        let selection = vec![(label.into(), bytes as usize)];
+                        let id = expert_weight_arena_id("exl3", ordinal, &selection)?;
+                        let root = Allocation::buffer(&id, location, bytes, lifetime,
+                            Category::Experts, "weight arena");
+                        if scope == 2 {
+                            sequential.push(root);
+                            continue;
+                        }
+                        inventory.resident_weights.push(ResidentWeight::from_allocation(&root, ResidentWeights(bytes)));
+                        let mut alias = Allocation::buffer(format!("{label}.rank.{rank}.view"), location,
+                            17, lifetime, Category::Experts, "resident expert owners");
+                        alias.view = Some(View { backing: id.clone(), offset: 256 });
+                        let allocations = if scope == 0 { &mut inventory.allocations } else { &mut inventory.deferred };
+                        allocations.extend([root, alias]);
+                        let backing = GranularityBacking { backing: id, requests: vec![bytes] };
+                        if label == "draft" {
+                            inventory.allocation_granularity.push(AllocationGranularity {
+                                id: format!("draft.rank.{rank}.tail"), location, lifetime,
+                                backings: vec![backing], evidence: GranularityEvidence::Forecast,
+                            });
+                        } else {
+                            resident_backings.push(backing);
+                        }
+                    }
+                    inventory.allocation_granularity.push(AllocationGranularity {
+                        id: format!("resident.rank.{rank}.tails"), location, lifetime: Lifetime::RESIDENT,
+                        backings: resident_backings, evidence: GranularityEvidence::Forecast,
+                    });
+                    inventory.sequential.push(Sequential { id: format!("load.rank.{rank}"), members: sequential });
+                    // SM120 maps pinned storage, not device weight arenas.
+                    inventory.driver_page_tables.push(DriverPageTable { model: DriverPageTableModel::Sm120Portable,
+                        location, lifetime: Lifetime::RESIDENT, backing: "mapped.prefix".into(), mapped_bytes: 513 });
+                }
+            }
+            let mut budgets = (0..physical.len()).map(|rank| {
+                let mut row = budget(64 << 20);
+                row.id = format!("gpu{rank}");
+                row.locations = vec![Location::coordinator(rank as u8)];
+                row
+            }).collect::<Vec<_>>();
+            let mut host = budget(4096);
+            host.id = "host".into();
+            host.locations = vec![Location::PINNED];
+            budgets.push(host);
+            let plan = ResolvedPlan { pool_page_rows: 64, encoder_diagnostics: vec![], request: request(), decisions: decisions(0),
+                pool_tokens: 64, phases: evaluate(&planned, &budgets)?, budgets, facts: planned };
+            let original = plan.clone();
+            let mut expected_plan = plan.clone();
+            expected_plan.facts = expected;
+            assert_eq!(evaluate(&expected_plan.facts, &expected_plan.budgets)?, plan.phases);
+            let mapped = devices.remap_plan_weight_arenas(&plan)?;
+            assert_eq!(mapped, expected_plan);
+            assert_eq!(plan, original, "translation mutates the admitted plan");
+            assert_eq!(mapped.facts.driver_page_tables, plan.facts.driver_page_tables);
+            for (before, after) in plan.facts.allocation_granularity.iter().zip(&mapped.facts.allocation_granularity) {
+                assert_eq!(before.bytes()?, after.bytes()?);
+                assert_eq!(before.requests(), after.requests());
+            }
+            let mut invalid = plan.clone();
+            invalid.facts.allocation_granularity[0].backings[0].backing = "missing".into();
+            let unchanged = invalid.clone();
+            assert!(devices.remap_plan_weight_arenas(&invalid).is_err());
+            assert_eq!(invalid, unchanged);
+        }
+    }
+    Ok(())
 }
 
 fn budget(bytes: u64) -> Budget {
@@ -44,7 +824,7 @@ fn allocation(id: &str, bytes: u64) -> Allocation {
     )
 }
 fn facts(allocations: Vec<Allocation>) -> Facts {
-    Facts { resident_weights: vec![],
+    Facts { allocation_granularity: vec![], driver_page_tables: vec![], resident_weights: vec![],
         phase_order: crate::placement::planner::PhaseOrder::TARGET_THEN_DRAFT,
         allocations,
         deferred: vec![],
@@ -54,17 +834,18 @@ fn facts(allocations: Vec<Allocation>) -> Facts {
 }
 fn request() -> Request {
     Request {
-        context: 64,
+        context: (64).into(),
         pool: Pin::Auto,
         onboard: Pin::Auto,
         prefill: Pin::Auto,
-        spark_reply_format: None,
+        spark_reply_formats: Default::default(),
         operation: Operation::Serving, resident_weight_limit: None,
     }
 }
 fn decisions(onboard: u64) -> Decisions {
     Decisions {
-        spark_reply_format: None,
+        encoder: None,
+        spark_reply_formats: None,
         attention: vec![LayerMode::Whole {
             gpu: 0,
             ffn: FfnMode::Owner,
@@ -73,6 +854,9 @@ fn decisions(onboard: u64) -> Decisions {
         expert_homes: (0..onboard as usize).map(|layer|
             (layer, ExpertDestination::Coordinator { gpus: vec![0] })).collect(),
         embedding: None,
+        draft_home: None,
+        head_home: None,
+        intake_home: None,
         prefill: PrefillShape {
             rows: 4096,
             waves: 1,
@@ -142,6 +926,8 @@ fn plan(allocations: Vec<Allocation>) -> ResolvedPlan {
     let facts = facts(allocations);
     let phases = evaluate(&facts, &budgets).unwrap();
     ResolvedPlan {
+        pool_page_rows: 64,
+        encoder_diagnostics: vec![],
         request: request(),
         decisions: decisions(0),
         pool_tokens: 64,
@@ -150,6 +936,89 @@ fn plan(allocations: Vec<Allocation>) -> ResolvedPlan {
         phases,
     }
 }
+#[test]
+fn ready_items_include_opaque_attribution_but_not_startup_peaks_or_views() {
+    let owner = allocation("owner", 100);
+    let mut view = allocation("view", 16);
+    view.view = Some(View { backing: owner.id.clone(), offset: 0 });
+    let mut startup = allocation("startup", 500);
+    startup.lifetime = Lifetime { first: Phase::Load, last: Phase::Load };
+    let mut p = plan(vec![owner, view, startup]);
+    p.facts.allowances = vec![
+        Allowance { location: Location::coordinator(0), bytes: 37,
+            lifetime: Lifetime::RESIDENT, source: "measured context".into(), assumed: false },
+        Allowance { location: Location::coordinator(0), bytes: 19,
+            lifetime: Lifetime::TARGET, source: "estimated runtime".into(), assumed: true },
+        Allowance { location: Location::coordinator(0), bytes: 11,
+            lifetime: Lifetime { first: Phase::Load, last: Phase::Warmup },
+            source: "load only".into(), assumed: true },
+        Allowance { location: Location::coordinator(0), bytes: 13,
+            lifetime: Lifetime { first: Phase::Growth, last: Phase::Growth },
+            source: "growth only".into(), assumed: false },
+        Allowance { location: Location::coordinator(0), bytes: 0,
+            lifetime: Lifetime::RESIDENT, source: "empty".into(), assumed: true },
+    ];
+    p.phases = evaluate(&p.facts, &p.budgets).unwrap();
+    let items = p.items(Location::coordinator(0)).unwrap();
+    assert_eq!(items.len(), 3);
+    assert_eq!(items.iter().map(|item| item.bytes).sum::<u64>(), 156);
+    assert!(items.iter().all(|item|
+        item.lifetime == cuteafd_core::memory_layout::ItemLifetime::ReadyResident));
+    for (name, bytes, basis) in [("measured context", 37, Basis::Calibrated),
+        ("estimated runtime", 19, Basis::Estimated)]
+    {
+        let item = items.iter().find(|item| item.group == name).unwrap();
+        assert_eq!((item.bytes, item.category, item.basis), (bytes, Category::Runtime, basis));
+    }
+    assert_eq!(items.iter().filter(|item| item.basis == Basis::Exact)
+        .map(|item| item.bytes).sum::<u64>(), 100);
+    let ready = p.phases.iter().find(|row| row.phase == Phase::Ready).unwrap();
+    assert_eq!(ready.owned + ready.opaque, 156);
+    let load = p.phases.iter().find(|row| row.phase == Phase::Load).unwrap();
+    assert_eq!(load.owned + load.opaque, 548);
+}
+
+#[test]
+fn growth_items_include_lazy_workspace_staging_allowances_and_derived_owners_once() {
+    let location = Location::coordinator(0);
+    let growth = Lifetime { first: Phase::Growth, last: Phase::Growth };
+    let mut workspace = allocation("prefill", 100);
+    workspace.category = Category::Workspace;
+    workspace.lifetime = growth;
+    let mut staging = allocation("staging", 200);
+    staging.category = Category::Staging;
+    staging.lifetime = growth;
+    let mut alias = allocation("alias", 50);
+    alias.lifetime = growth;
+    alias.view = Some(View { backing: workspace.id.clone(), offset: 0 });
+    let mut startup = allocation("startup", 300);
+    startup.lifetime = Lifetime { first: Phase::Load, last: Phase::Warmup };
+    let mut p = plan(vec![workspace, staging, alias, startup]);
+    p.facts.allowances.push(Allowance { location, bytes: 17, lifetime: growth,
+        source: "lazy modules".into(), assumed: false });
+    p.facts.driver_page_tables.push(DriverPageTable { model: DriverPageTableModel::Sm120Portable,
+        location, lifetime: growth, backing: "staging".into(), mapped_bytes: 200 });
+    let tail = granular_owner("prefill-tail", "prefill", vec![100], growth);
+    let expected = 300 + 17 + tail.bytes().unwrap() + driver_page_table_bytes(200);
+    p.facts.allocation_granularity.push(tail);
+    assert!(p.items(location).unwrap().is_empty());
+    let items = p.items_at(location, Phase::Growth).unwrap();
+    assert_eq!(items.iter().map(|item| item.bytes).sum::<u64>(), expected);
+    assert_eq!(items.iter().filter(|item| item.category == Category::Workspace)
+        .map(|item| item.bytes).sum::<u64>(), 100);
+    assert_eq!(items.iter().filter(|item| item.category == Category::Staging)
+        .map(|item| item.bytes).sum::<u64>(), 200);
+}
+
+#[test]
+fn capacity_refusal_names_binding_budget_phase_and_exact_bytes() {
+    let refusal = Refusal::Capacity { budget: "coordinator GPU 0".into(),
+        phase: Phase::Warmup, required: 1025, available: 1024, owners: vec![] };
+    let text = refusal.to_string();
+    assert!(text.contains("memory budget 'coordinator GPU 0' during decode warm-up"), "{text}");
+    assert!(text.contains("needs 1025 bytes, has 1024 bytes available"), "{text}");
+}
+
 fn receipts(plan: &ResolvedPlan) -> Vec<Receipt> {
     plan.facts
         .allocations
@@ -176,28 +1045,93 @@ impl Recipe for Prepared {
 }
 
 #[test]
-fn immutable_reply_format_flows_to_decisions_and_explicit_conflicts_refuse() {
-    for resolved in [None, Some(SparkReplyFormat::Bf16), Some(SparkReplyFormat::Fp8),
-        Some(SparkReplyFormat::Nvfp4)] {
+fn pool_page_multiple_aligns_automatic_pool_floor_extent_and_explicit_pins() {
+    let mut contract = Linear { maximum: 64 * 9, ..Linear::new() }.prepare(&request()).unwrap();
+    assert_eq!(contract.pool_page_multiple, 1);
+    assert_eq!(solve(request(), vec![budget(64 * 7)], &Prepared(contract.clone())).unwrap().pool_tokens, 64 * 7);
+    contract.pool_page_multiple = 2;
+    for (capacity, pages) in [(9, 8), (8, 8), (7, 6), (3, 2)] {
+        let result = solve(request(), vec![budget(64 * capacity)], &Prepared(contract.clone())).unwrap();
+        assert_eq!(result.pool_tokens, 64 * pages);
+        assert_eq!(result.facts.allocations.iter().find(|owner| owner.id == "kv").unwrap().bytes, 64 * pages);
+    }
+    let mut pinned = request();
+    pinned.pool = Pin::Exact(64 * 7);
+    assert!(matches!(solve(pinned, vec![budget(1024)], &Prepared(contract.clone())),
+        Err(Refusal::MisalignedPool { tokens: 448, page_rows: 128 })));
+    let mut floor = request();
+    floor.context = (64 * 3).into();
+    assert_eq!(solve(floor.clone(), vec![budget(64 * 5)], &Prepared(contract.clone())).unwrap().pool_tokens, 64 * 4);
+    assert!(matches!(solve(floor, vec![budget(64 * 3)], &Prepared(contract.clone())),
+        Err(Refusal::FullContextShortfall { tokens: 128, .. })));
+    for multiple in [0, u64::MAX] {
+        contract.pool_page_multiple = multiple;
+        assert!(matches!(solve(request(), vec![budget(1024)], &Prepared(contract.clone())), Err(Refusal::InvalidFact(_))));
+    }
+}
+
+#[test]
+fn strided_pool_search_matches_enumeration_across_nonmonotonic_breakpoints() {
+    let mut contract = Linear { maximum: 64 * 13, ..Linear::new() }.prepare(&request()).unwrap();
+    let curve = ByteCurve(vec![
+        BytePiece { granularity: 1, first: 1, last: 3, bytes_at_first: 10, bytes_per_page: 10, backings: 1, },
+        BytePiece { granularity: 1, first: 4, last: 6, bytes_at_first: 100, bytes_per_page: 0, backings: 1, },
+        BytePiece { granularity: 1, first: 7, last: 7, bytes_at_first: 1, bytes_per_page: 0, backings: 1, },
+        BytePiece { granularity: 1, first: 8, last: 11, bytes_at_first: 20, bytes_per_page: 10, backings: 1, },
+        BytePiece { granularity: 1, first: 12, last: 13, bytes_at_first: 80, bytes_per_page: 5, backings: 1, },
+    ]);
+    contract.set_byte_extent("kv", curve.clone()).unwrap();
+    for multiple in [1, 2, 3, 4] {
+        contract.pool_page_multiple = multiple;
+        for capacity in 1..=110 {
+            let expected = (1..=13).filter(|pages| pages % multiple == 0)
+                .filter(|&pages| curve.at(pages).unwrap() <= capacity).max();
+            let result = solve(request(), vec![budget(capacity)], &Prepared(contract.clone()));
+            if let Some(pages) = expected {
+                assert_eq!(result.unwrap().pool_tokens, pages * 64, "multiple {multiple}, capacity {capacity}");
+            } else {
+                assert!(result.is_err(), "multiple {multiple}, capacity {capacity}");
+            }
+        }
+    }
+}
+
+#[test]
+fn immutable_reply_formats_flow_to_decisions_and_each_explicit_phase_conflicts() {
+    use SparkReplyFormat::{Bf16, Fp8, Nvfp4};
+    let mut contracts = vec![None];
+    for prefill in [Bf16, Fp8, Nvfp4] {
+        for decode in [Bf16, Fp8, Nvfp4] {
+            contracts.push(Some(SparkReplyFormats { prefill: Some(prefill), decode: Some(decode) }));
+        }
+    }
+    for resolved in contracts {
         let mut contract = Linear::new().prepare(&request()).unwrap();
-        contract.spark_reply_format = resolved;
+        contract.spark_reply_formats = resolved;
         let selected = vec![0; contract.variables.len()];
-        assert_eq!(contract.decisions(&selected).unwrap().spark_reply_format, resolved);
+        assert_eq!(contract.decisions(&selected).unwrap().spark_reply_formats, resolved);
         let recipe = Prepared(contract);
-        for requested in [None, Some(SparkReplyFormat::Bf16), Some(SparkReplyFormat::Fp8),
-            Some(SparkReplyFormat::Nvfp4)] {
-            let req = Request { spark_reply_format: requested, ..request() };
-            match solve(req.clone(), vec![budget(1 << 40)], &recipe) {
-                Ok(plan) => {
-                    assert!(requested.is_none() || requested == resolved);
-                    assert_eq!(plan.request.spark_reply_format, requested);
-                    assert_eq!(plan.decisions.spark_reply_format, resolved);
-                    let encoded = serde_json::to_value(&plan).unwrap();
-                    let decoded: ResolvedPlan = serde_json::from_value(encoded).unwrap();
-                    assert_eq!(decoded, plan);
+        for prefill in [None, Some(Bf16), Some(Fp8), Some(Nvfp4)] {
+            for decode in [None, Some(Bf16), Some(Fp8), Some(Nvfp4)] {
+                let requested = SparkReplyFormats { prefill, decode };
+                let conflict = [(prefill, resolved.and_then(|formats| formats.prefill)),
+                    (decode, resolved.and_then(|formats| formats.decode))]
+                    .into_iter().any(|(requested, resolved)| requested.is_some() && requested != resolved);
+                let req = Request { spark_reply_formats: requested, ..request() };
+                match solve(req, vec![budget(1 << 40)], &recipe) {
+                    Ok(plan) => {
+                        assert!(!conflict, "{requested:?} vs {resolved:?}");
+                        assert_eq!(plan.request.spark_reply_formats, requested);
+                        assert_eq!(plan.decisions.spark_reply_formats, resolved);
+                        let encoded = serde_json::to_value(&plan).unwrap();
+                        assert_eq!(encoded["request"]["spark_reply_formats"]["prefill"], serde_json::to_value(prefill).unwrap());
+                        assert_eq!(encoded["request"]["spark_reply_formats"]["decode"], serde_json::to_value(decode).unwrap());
+                        let decoded: ResolvedPlan = serde_json::from_value(encoded).unwrap();
+                        assert_eq!(decoded, plan);
+                    }
+                    Err(Refusal::PinConflict) => assert!(conflict, "{requested:?} vs {resolved:?}"),
+                    other => panic!("unexpected reply-format admission: {other:?}"),
                 }
-                Err(Refusal::PinConflict) => assert!(requested.is_some() && requested != resolved),
-                other => panic!("unexpected reply-format admission: {other:?}"),
             }
         }
     }
@@ -238,23 +1172,23 @@ fn piecewise_cost_vectors_match_exact_owners_at_every_breakpoint_neighbor() {
     .prepare(&request())
     .unwrap();
     let curve = ByteCurve(vec![
-        BytePiece {
+        BytePiece { granularity: 1,
             first: 1,
             last: 4,
             bytes_at_first: 0,
-            bytes_per_page: 16,
+            bytes_per_page: 16, backings: 1,
         },
-        BytePiece {
+        BytePiece { granularity: 1,
             first: 5,
             last: 8,
             bytes_at_first: 96,
-            bytes_per_page: 0,
+            bytes_per_page: 0, backings: 1,
         },
-        BytePiece {
+        BytePiece { granularity: 1,
             first: 9,
             last: 20,
             bytes_at_first: 128,
-            bytes_per_page: 3,
+            bytes_per_page: 3, backings: 1,
         },
     ]);
     let mut bounded = Component::allocation(allocation("index", 16), curve.clone(), false, 20);
@@ -320,23 +1254,23 @@ fn analytic_pool_solves_discontinuous_nonmonotone_and_zero_slope_pieces() {
         .set_byte_extent(
             "kv",
             ByteCurve(vec![
-                BytePiece {
+                BytePiece { granularity: 1,
                     first: 1,
                     last: 3,
                     bytes_at_first: 100,
-                    bytes_per_page: 10,
+                    bytes_per_page: 10, backings: 1,
                 },
-                BytePiece {
+                BytePiece { granularity: 1,
                     first: 4,
                     last: 6,
                     bytes_at_first: 1000,
-                    bytes_per_page: 0,
+                    bytes_per_page: 0, backings: 1,
                 },
-                BytePiece {
+                BytePiece { granularity: 1,
                     first: 7,
                     last: 12,
                     bytes_at_first: 50,
-                    bytes_per_page: 10,
+                    bytes_per_page: 10, backings: 1,
                 },
             ]),
         )
@@ -608,8 +1542,89 @@ fn home_contract() -> (Contract, Vec<Budget>) {
 }
 
 #[test]
+fn single_copy_homes_are_selected_jointly_with_pool_and_per_gpu_headroom() {
+    for kind in 0..3 {
+        let domain = |values| match kind {
+            0 => Variable::DraftHome(values),
+            1 => Variable::HeadHome(values),
+            _ => Variable::IntakeHome(values),
+        };
+        let home = |decisions: &Decisions| match kind {
+            0 => decisions.draft_home,
+            1 => decisions.head_home,
+            _ => decisions.intake_home,
+        };
+        let mut contract = Linear::new().prepare(&request()).unwrap();
+        contract.gpus = 2;
+        let mut peer = allocation("peer.kv", 64);
+        peer.location = Location::coordinator(1);
+        let curve = ByteCurve::linear(64, 64, contract.maximum_pages);
+        let mut component = Component::allocation(peer, curve.clone(), false, contract.maximum_pages);
+        component.byte_extent(curve).unwrap();
+        contract.components.push(component);
+        let variable = contract.variables.len();
+        contract.variables.push(domain(vec![0, 1]));
+        for (option, gpu) in [0, 1].into_iter().enumerate() {
+            let mut owner = allocation("draft", 64);
+            owner.location = Location::coordinator(gpu);
+            let mut component = Component::allocation(owner, ByteCurve::fixed(64, contract.maximum_pages), false, contract.maximum_pages);
+            component.activation = Activation::choice(variable, option);
+            contract.components.push(component);
+        }
+        let budgets = two_gpus(100, 1000);
+        let selected = solve(request(), budgets.clone(), &Prepared(contract.clone())).unwrap();
+        assert_eq!(home(&selected.decisions), Some(1));
+        let equal = solve(request(), two_gpus(1000, 1000), &Prepared(contract.clone())).unwrap();
+        assert_eq!(home(&equal.decisions), Some(0));
+        for values in [vec![], vec![2], vec![0, 0]] {
+            let mut invalid = contract.clone();
+            invalid.variables[variable] = domain(values);
+            assert!(solve(request(), budgets.clone(), &Prepared(invalid)).is_err());
+        }
+        let mut duplicate = contract.clone();
+        duplicate.variables.push(domain(vec![0]));
+        assert!(matches!(solve(request(), budgets, &Prepared(duplicate)), Err(Refusal::InvalidFact(_))));
+        assert!(matches!(solve(request(), vec![budget(1000)], &Prepared(contract)), Err(Refusal::InvalidFact(_))));
+    }
+}
+
+#[test]
+fn single_copy_homes_balance_jointly_and_charge_cross_gpu_owners() {
+    let mut contract = Linear::new().prepare(&request()).unwrap();
+    contract.gpus = 2;
+    contract.components.clear();
+    let first = contract.variables.len();
+    contract.variables.extend([Variable::DraftHome(vec![0, 1]), Variable::HeadHome(vec![0, 1]),
+        Variable::IntakeHome(vec![0, 1])]);
+    for (index, bytes) in [60, 30, 20].into_iter().enumerate() {
+        for (option, gpu) in [0, 1].into_iter().enumerate() {
+            let mut owner = allocation(&format!("owner.{index}"), bytes);
+            owner.location = Location::coordinator(gpu);
+            let mut component = Component::allocation(owner, ByteCurve::fixed(bytes, contract.maximum_pages),
+                false, contract.maximum_pages);
+            component.activation = Activation::choice(first + index, option);
+            contract.components.push(component);
+        }
+    }
+    let selected = solve(request(), two_gpus(100, 100), &Prepared(contract.clone())).unwrap();
+    assert_eq!((selected.decisions.draft_home, selected.decisions.head_home, selected.decisions.intake_home),
+        (Some(0), Some(1), Some(1)));
+    // A costly remote bridge is a physical owner, not a post-solve adjustment.
+    let mut bridge = allocation("remote.head.bridge", 60);
+    bridge.location = Location::coordinator(1);
+    let mut component = Component::allocation(bridge, ByteCurve::fixed(60, contract.maximum_pages),
+        false, contract.maximum_pages);
+    component.activation = Activation::choice(first + 1, 1);
+    contract.components.push(component);
+    let selected = solve(request(), two_gpus(100, 100), &Prepared(contract)).unwrap();
+    assert_eq!((selected.decisions.draft_home, selected.decisions.head_home, selected.decisions.intake_home),
+        (Some(1), Some(0), Some(0)));
+}
+
+#[test]
 fn embedding_and_remote_rank_domains_share_pool_first_constraints_and_exact_profiles() {
-    let (contract, budgets) = home_contract();
+    let (mut contract, budgets) = home_contract();
+    contract.add_driver_page_tables();
     let recipe = Prepared(contract.clone());
     let req = Request { onboard: Pin::Exact(2), ..request() };
     let resolved = solve(req.clone(), budgets.clone(), &recipe).unwrap();
@@ -625,7 +1640,13 @@ fn embedding_and_remote_rank_domains_share_pool_first_constraints_and_exact_prof
     assert_eq!(resolved.decisions.onboard(), 2);
     assert_eq!(resolved.remaining("spark.2", Phase::Ready), Some(36));
     let automatic = solve(request(), budgets.clone(), &recipe).unwrap();
-    assert_eq!((automatic.pool_tokens, automatic.decisions.onboard()), (256, 3));
+    // Three onboard layers + KV exactly consumed 160 B before the portable
+    // host embedding's 1 B/context mapping cost; that choice now needs 161 B.
+    assert_eq!((automatic.pool_tokens, automatic.decisions.onboard()), (256, 2));
+    let mut mapped = contract.clone();
+    mapped.add_driver_page_tables();
+    assert!(matches!(evaluate(&mapped.facts(&[0, 0, 0, 1, 3, 1], 4).unwrap(), &budgets),
+        Err(Refusal::Capacity { required: 161, available: 160, .. })));
     // Fixing a home is an initial compatibility restriction. An exact pool
     // refuses rather than silently changing the home or dropping a pool page.
     let mut restricted = contract.clone();
@@ -636,7 +1657,9 @@ fn embedding_and_remote_rank_domains_share_pool_first_constraints_and_exact_prof
     assert_eq!((smaller.pool_tokens, smaller.decisions.onboard()), (128, 2));
     let mut restricted = contract.clone();
     restricted.requires.push(Requires { when: Choice { variable: 3, option: 1 }, any_of: vec![] });
-    assert!(matches!(solve(req, budgets.clone(), &Prepared(restricted)), Err(Refusal::Capacity { .. })));
+    assert!(matches!(solve(req, budgets.clone(), &Prepared(restricted)),
+        Err(Refusal::FullContextShortfall { tokens: 0, limiting, .. })
+            if matches!(*limiting, Refusal::Capacity { .. })));
     // Resolved local homes override remote fallback independent of variable order.
     let mut reversed = contract.clone();
     reversed.variables.swap(3, 4);
@@ -939,7 +1962,7 @@ fn step_exact_fifteen_inventory_replay_preserves_feasible_two_million_target() {
         }
     }
     let recipe = Prepared(contract);
-    let req = Request { context: 1 << 20, onboard: Pin::Exact(15), ..request() };
+    let req = Request { context: (1 << 20).into(), onboard: Pin::Exact(15), ..request() };
     let pinned = solve(req.clone(), budgets.clone(), &recipe).unwrap();
     let explicit = solve(Request { pool: Pin::Exact(TARGET), ..req.clone() },
         budgets.clone(), &recipe).unwrap();
@@ -997,7 +2020,7 @@ fn flash_spark_free_auto_all_inventory_replay_stops_at_target_and_retains_slack(
     assert!(matches!(evaluate(&contract.facts(&selected, LEGACY_POOL / 256 + 1).unwrap(), &budgets),
         Err(Refusal::Capacity { .. })));
     let recipe = Prepared(contract);
-    let req = Request { context: 1 << 20, ..request() };
+    let req = Request { context: (1 << 20).into(), ..request() };
     let automatic = solve(req.clone(), budgets.clone(), &recipe).unwrap();
     let pinned = solve(Request { onboard: Pin::Exact(42), ..req.clone() }, budgets.clone(), &recipe).unwrap();
     let explicit = solve(Request { pool: Pin::Exact(TARGET), ..req.clone() }, budgets.clone(), &recipe).unwrap();
@@ -1084,7 +2107,8 @@ fn capacity_shaving_keeps_resource_failure_distinct_from_pin_conflict() {
     }
     assert!(matches!(
         solve(request(), two_gpus(64, 64), &Prepared(contract.clone())),
-        Err(Refusal::Capacity { .. })
+        Err(Refusal::FullContextShortfall { tokens: 0, limiting, .. })
+            if matches!(*limiting, Refusal::Capacity { .. })
     ));
     assert_eq!(
         solve(
@@ -1148,17 +2172,17 @@ fn correlated_count_profiles_match_exhaustive_full_score_oracle() {
         ],
     });
     let curve = ByteCurve(vec![
-        BytePiece {
+        BytePiece { granularity: 1,
             first: 1,
             last: 3,
             bytes_at_first: 20,
-            bytes_per_page: 19,
+            bytes_per_page: 19, backings: 1,
         },
-        BytePiece {
+        BytePiece { granularity: 1,
             first: 4,
             last: 6,
             bytes_at_first: 12,
-            bytes_per_page: 13,
+            bytes_per_page: 13, backings: 1,
         },
     ]);
     for gpu in 0..2 {
@@ -1290,11 +2314,11 @@ fn malformed_curves_and_unrepresentable_recipes_are_typed_refusals() {
     contract
         .set_byte_extent(
             "kv",
-            ByteCurve(vec![BytePiece {
+            ByteCurve(vec![BytePiece { granularity: 1,
                 first: 2,
                 last: 4,
                 bytes_at_first: 1,
-                bytes_per_page: 1,
+                bytes_per_page: 1, backings: 1,
             }]),
         )
         .unwrap();
@@ -1369,7 +2393,7 @@ fn pool_pins_are_exact_and_context_is_never_clamped() {
     ));
     let automatic = solve(
         Request {
-            context: 129,
+            context: (129).into(),
             ..request()
         },
         vec![budget(192)],
@@ -1377,20 +2401,47 @@ fn pool_pins_are_exact_and_context_is_never_clamped() {
     )
     .unwrap();
     assert_eq!(
-        (automatic.request.context, automatic.pool_tokens),
+        (automatic.request.context.maximum, automatic.pool_tokens),
         (129, 192)
     );
-    assert!(matches!(
-        solve(
-            Request {
-                context: 193,
-                ..request()
-            },
-            vec![budget(192)],
-            &recipe
-        ),
-        Err(Refusal::Capacity { .. })
-    ));
+    for (available, context, tokens) in [(192, 193, 192), (192, 2 << 20, 192), (63, 64, 0)] {
+        let refusal = solve(Request { context: context.into(), ..request() }, vec![budget(available)], &recipe).unwrap_err();
+        let text = refusal.to_string();
+        assert!(text.contains(&format!("maximum feasible pool is {tokens} tokens")), "{text}");
+        assert!(text.contains("lower explicit context"), "{text}");
+        let Refusal::FullContextShortfall { context: actual, tokens: maximum, limiting } = refusal else {
+            panic!("expected a full-context refusal");
+        };
+        assert_eq!((actual, maximum), (context, tokens));
+        assert!(matches!(*limiting, Refusal::Capacity { phase: Phase::PostTargetKv, .. }));
+    }
+}
+
+#[test]
+fn full_context_refusal_prices_best_feasible_assignment_not_pruned_alternative() {
+    let mut contract = Linear::new().prepare(&request()).unwrap();
+    let variable = add_profile(&mut contract, vec![0], vec![0], vec![0, 1], &[0, 64]);
+    let mut remote = allocation("remote.experts", 1000);
+    remote.location = Location { device: Device::Spark(0), domain: Domain::Device };
+    let mut component = Component::allocation(remote, ByteCurve::fixed(1000, contract.maximum_pages),
+        false, contract.maximum_pages);
+    component.activation = Activation::choice(variable, 0);
+    contract.components.push(component);
+    let mut spark = budget(100);
+    spark.id = "spark0".into();
+    spark.locations = vec![Location { device: Device::Spark(0), domain: Domain::Device }];
+    let refusal = solve(Request { context: (256).into(), ..request() }, vec![budget(192), spark],
+        &Prepared(contract)).unwrap_err();
+    let Refusal::FullContextShortfall { tokens, limiting, .. } = refusal else {
+        panic!("expected full-context refusal");
+    };
+    assert_eq!(tokens, 128);
+    let Refusal::Capacity { budget, required, available, owners, .. } = *limiting else {
+        panic!("expected capacity witness");
+    };
+    assert_eq!((budget.as_str(), required, available), ("gpu", 256, 192));
+    assert!(!owners.is_empty(), "refusal must retain evaluated owner names");
+    assert!(!owners.iter().any(|owner| owner.contains("remote.experts")));
 }
 
 #[test]
@@ -1416,7 +2467,7 @@ fn automatic_target_uses_physical_card_not_logical_cap() {
     assert_eq!(
         solve(
             Request {
-                context,
+                context: context.into(),
                 ..request()
             },
             vec![budget(32 << 30)],
@@ -2284,9 +3335,9 @@ fn analytical_weight_cap_prices_every_finite_piece_and_exact_bound() {
     let mut contract = Linear { maximum: 64 * 12, ..Linear::new() }.prepare(&request()).unwrap();
     let mut owner = resource("piecewise.weight", 0, 100, 12);
     owner.bytes = ByteCurve(vec![
-        BytePiece { first: 1, last: 3, bytes_at_first: 100, bytes_per_page: 0 },
-        BytePiece { first: 4, last: 8, bytes_at_first: 10, bytes_per_page: 10 },
-        BytePiece { first: 9, last: 12, bytes_at_first: 100, bytes_per_page: 0 },
+        BytePiece { granularity: 1, first: 1, last: 3, bytes_at_first: 100, bytes_per_page: 0, backings: 1, },
+        BytePiece { granularity: 1, first: 4, last: 8, bytes_at_first: 10, bytes_per_page: 10, backings: 1, },
+        BytePiece { granularity: 1, first: 9, last: 12, bytes_at_first: 100, bytes_per_page: 0, backings: 1, },
     ]);
     contract.components.push(owner);
     let plan = solve(capped(35), vec![budget(1 << 30)], &Prepared(contract.clone())).unwrap();
@@ -2318,4 +3369,385 @@ fn analytical_weight_cap_rejects_alias_duplicate_unknown_home_and_overflow() {
     overflow.components.push(resource("loaded.a", 0, u64::MAX, overflow.maximum_pages));
     overflow.components.push(resource("loaded.b", 0, 1, overflow.maximum_pages));
     assert!(matches!(solve(request(), vec![budget(1 << 30)], &Prepared(overflow)), Err(Refusal::Overflow(_))));
+}
+
+#[test]
+fn floor_fallback_preserves_optional_owner_before_maximizing_pool() {
+    struct Optional;
+    impl Recipe for Optional {
+        fn prepare(&self, request: &Request) -> Result<Contract, Refusal> {
+            let mut base = Linear::new();
+            base.maximum = 256;
+            let mut contract = base.prepare(request)?;
+            let variable = contract.variables.len();
+            contract.variables.push(Variable::Encoder(vec![0, 1]));
+            contract.floor_fallback = Some(Choice { variable, option: 1 });
+            let mut tower = Component::allocation(allocation("tower", 64),
+                ByteCurve::fixed(64, 4), false, 4);
+            tower.activation = Activation::choice(variable, 0);
+            contract.components.push(tower);
+            Ok(contract)
+        }
+    }
+    let on = solve(request(), vec![budget(256)], &Optional).unwrap();
+    assert_eq!((on.pool_tokens, on.decisions.encoder), (192, Some(0)));
+    let off = solve(request(), vec![budget(64)], &Optional).unwrap();
+    assert_eq!((off.pool_tokens, off.decisions.encoder), (64, Some(1)));
+    let exact = solve(Request { pool: Pin::Exact(256), ..request() },
+        vec![budget(256)], &Optional).unwrap();
+    assert_eq!((exact.pool_tokens, exact.decisions.encoder), (256, Some(1)));
+    assert!(matches!(solve(request(), vec![budget(32)], &Optional),
+        Err(Refusal::FullContextShortfall { .. })));
+}
+
+#[test]
+fn encoder_priority_follows_pool_and_onboarding_before_slack() {
+    struct WithEncoder;
+    impl Recipe for WithEncoder {
+        fn prepare(&self, request: &Request) -> Result<Contract, Refusal> {
+            let mut base = Linear::new();
+            base.maximum = 128;
+            base.onboard = 1;
+            let mut contract = base.prepare(request)?;
+            let variable = contract.variables.len();
+            contract.variables.push(Variable::Encoder(vec![0, 1]));
+            let mut tower = Component::allocation(allocation("tower", 64),
+                ByteCurve::fixed(64, 2), false, 2);
+            tower.activation = Activation::choice(variable, 0);
+            contract.components.push(tower);
+            Ok(contract)
+        }
+    }
+    let roomy = solve(request(), vec![budget(256)], &WithEncoder).unwrap();
+    assert_eq!(roomy.pool_tokens, 128);
+    assert_eq!(roomy.decisions.onboard_layers, vec![vec![0]]);
+    assert_eq!(roomy.decisions.encoder, Some(0), "encoder wins over extra slack");
+    let tight = solve(request(), vec![budget(192)], &WithEncoder).unwrap();
+    assert_eq!(tight.pool_tokens, 128);
+    assert_eq!(tight.decisions.onboard_layers, vec![vec![0]]);
+    assert_eq!(tight.decisions.encoder, Some(1), "onboarding wins over optional encoder");
+    assert_eq!(tight.encoder_diagnostics[0].1, 64);
+    let tighter = solve(request(), vec![budget(128)], &WithEncoder).unwrap();
+    assert_eq!(tighter.pool_tokens, 128, "pool wins over optional encoder");
+    assert_eq!(tighter.decisions.encoder, Some(1));
+}
+
+#[test]
+fn many_singletons_preserve_branching_winner_and_typed_refusals() {
+    let request = Request { pool: Pin::Exact(128), ..request() };
+    let compact = Linear { maximum: 256, onboard: 2, fixed: 0 }.prepare(&request).unwrap();
+    let mut padded = compact.clone();
+    for layer in 1..64 {
+        padded.variables.push(Variable::Attention { layer,
+            values: vec![LayerMode::Whole { gpu: 0, ffn: FfnMode::Owner }] });
+    }
+    for capacity in [128, 192, 256] {
+        let expected = solve(request.clone(), vec![budget(capacity)], &Prepared(compact.clone())).unwrap();
+        let actual = solve(request.clone(), vec![budget(capacity)], &Prepared(padded.clone())).unwrap();
+        assert_eq!(actual.pool_tokens, 128);
+        assert_eq!(actual.decisions.onboard_layers, expected.decisions.onboard_layers);
+        assert_eq!(actual.decisions.onboard_layers[0].len(), ((capacity - 128) / 64) as usize);
+        assert_eq!(actual.decisions.attention.len(), 64);
+        assert_eq!(actual.facts, expected.facts);
+        assert_eq!(actual.phases, expected.phases);
+    }
+    let expected = solve(request.clone(), vec![budget(127)], &Prepared(compact)).unwrap_err();
+    let actual = solve(request.clone(), vec![budget(127)], &Prepared(padded)).unwrap_err();
+    assert_eq!(actual, expected);
+    assert!(matches!(actual, Refusal::Capacity { .. }));
+}
+
+#[test]
+fn infeasible_singletons_are_refused_without_an_option_probe() {
+    let request = Request { pool: Pin::Exact(64), ..request() };
+    let mut contract = Linear { maximum: 64, ..Linear::new() }.prepare(&request).unwrap();
+    for layer in 1..64 {
+        contract.variables.push(Variable::Attention { layer,
+            values: vec![LayerMode::Whole { gpu: 0, ffn: FfnMode::Owner }] });
+    }
+    let refusal = solve(request.clone(), vec![budget(63)], &Prepared(contract)).unwrap_err();
+    assert!(matches!(refusal, Refusal::Capacity { required: 64, available: 63, .. }));
+}
+
+/// A Linear contract (64 B per 64-token page) with built-in GPU reserve
+/// components: an opaque runtime allowance and a Runtime-category allocation.
+fn with_reserve_components(maximum_pages: u64) -> Contract {
+    let mut contract = Linear { maximum: 64 * maximum_pages, ..Linear::new() }.prepare(&request()).unwrap();
+    contract.components.push(Component { activation: Activation::always(),
+        bytes: ByteCurve::fixed(1000, maximum_pages), kind: ComponentKind::Allowance(Allowance {
+            location: Location::coordinator(0), bytes: 1000, lifetime: Lifetime::RESIDENT,
+            source: "estimated runtime growth".into(), assumed: true }) });
+    let graphs = Allocation::buffer("graphs", Location::coordinator(0), 500, Lifetime::RESIDENT,
+        Category::Runtime, "graphs");
+    contract.components.push(Component::allocation(graphs, ByteCurve::fixed(500, maximum_pages), false, maximum_pages));
+    contract
+}
+
+#[test]
+fn gpu_reserve_override_replaces_every_builtin_reserve_component() {
+    use cuteafd_core::memory_policy::MemoryPolicy;
+    let contract = with_reserve_components(1 << 15);
+    // Default: both components charged; 64 * 100 B of pool beside 1500 B.
+    let auto = solve(request(), vec![budget(1500 + 64 * 100)], &Prepared(contract.clone())).unwrap();
+    assert_eq!(auto.pool_tokens, 64 * 100);
+    assert!(auto.facts.allocations.iter().any(|owner| owner.id == "graphs"));
+    assert_eq!(auto.facts.allowances.len(), 1);
+    // GPU_RESERVE 200 B: components dropped, the budget keeps 200 B free.
+    let overridden = MemoryPolicy { gpu_reserve: Some(200), ..Default::default() }
+        .scoped(|| solve(request(), vec![budget(1500 + 64 * 100)], &Prepared(contract.clone()))).unwrap();
+    assert!(!overridden.facts.allocations.iter().any(|owner| owner.id == "graphs"));
+    assert!(overridden.facts.allowances.is_empty());
+    assert_eq!(overridden.budgets[0].headroom, 200);
+    assert_eq!(overridden.pool_tokens, 64 * ((1500 + 64 * 100 - 200) / 64));
+    // A Spark override leaves GPU components alone.
+    let spark = MemoryPolicy { spark_reserve: Some(200), ..Default::default() }
+        .scoped(|| solve(request(), vec![budget(1500 + 64 * 100)], &Prepared(contract.clone()))).unwrap();
+    assert_eq!((spark.pool_tokens, spark.budgets[0].headroom), (auto.pool_tokens, 0));
+}
+
+#[test]
+fn graph_node_owner_and_padding_survive_reserve_override_once() {
+    use crate::placement::graph_nodes::{GraphNodeCharge, GraphNodeCounts, charge};
+    use crate::serving_capacity::glm_graph_nodes::GLM_SM120_NODE_RATES;
+    use cuteafd_core::memory_policy::MemoryPolicy;
+    let nodes = GraphNodeCounts { nodes: 10, executables: 2 };
+    let charged: GraphNodeCharge = charge("glm5", "sm_120", &nodes, &GLM_SM120_NODE_RATES,
+        MemoryPolicy::default().graph_node_padding).unwrap();
+    let graph = serving::startup_graph_component("test.0", Location::coordinator(0), charged.rank(), 1).unwrap();
+    let mut contract = with_reserve_components(1);
+    contract.components.push(graph);
+    let mut budgets = vec![budget(1 << 30)];
+    MemoryPolicy { gpu_reserve: Some(0), ..Default::default() }.scoped(|| {
+        super::search::apply_reserve_override(&mut contract, &mut budgets);
+    });
+    let graphs: Vec<_> = contract.components.iter().filter_map(|component| match &component.kind {
+        ComponentKind::Allowance(owner) => Some(owner), _ => None }).collect();
+    assert_eq!(graphs.len(), 1);
+    assert_eq!(graphs[0].bytes, charged.packed_bytes);
+    assert!(graphs[0].source.contains("GRAPH_NODE_PADDING=5854 bytes"));
+}
+
+#[test]
+fn family_reserve_adds_to_the_measured_components() {
+    use cuteafd_core::memory_policy::MemoryPolicy;
+    let contract = with_reserve_components(1 << 15);
+    let solved = MemoryPolicy { family_reserve: Some(640), memory_padding: Some(0), ..Default::default() }.scoped(|| {
+        let mut budgets = vec![budget(1500 + 64 * 100)];
+        budgets[0].headroom = crate::placement::reserve::gpu("glm5");
+        solve(request(), budgets, &Prepared(contract.clone()))
+    }).unwrap();
+    // The components stay charged and the named reserve comes off on top.
+    assert!(solved.facts.allocations.iter().any(|owner| owner.id == "graphs"));
+    assert_eq!(solved.facts.allowances.len(), 1);
+    assert_eq!(solved.budgets[0].headroom, 640);
+    assert_eq!(solved.pool_tokens, 64 * 90);
+}
+
+#[test]
+fn kv_min_refuses_and_kv_max_grows_an_automatic_pool_past_the_target() {
+    use cuteafd_core::memory_policy::MemoryPolicy;
+    let contract = Linear { maximum: 64 * 1000, ..Linear::new() }.prepare(&request()).unwrap();
+    let solve_with = |policy: MemoryPolicy, bytes: u64| policy.scoped(||
+        solve(request(), vec![budget(bytes)], &Prepared(contract.clone())));
+    // Target 64 pages: the layout is sized for it; without a max the pool stops there.
+    let target = MemoryPolicy { kv_target: Some(64 * 64), kv_min: Some(64), ..Default::default() };
+    assert_eq!(solve_with(target, 64 * 500).unwrap().pool_tokens, 64 * 64);
+    // KV max 640 pages: the pool grows into what is left, up to the max.
+    let grow = MemoryPolicy { kv_max: Some(64 * 640), ..target };
+    assert_eq!(solve_with(grow, 64 * 500).unwrap().pool_tokens, 64 * 500);
+    assert_eq!(solve_with(grow, 64 * 900).unwrap().pool_tokens, 64 * 640);
+    // KV min above what fits is refused, never published.
+    let minimum = MemoryPolicy { kv_min: Some(64 * 64), ..target };
+    assert!(solve_with(minimum, 64 * 32).is_err());
+    assert_eq!(solve_with(minimum, 64 * 64).unwrap().pool_tokens, 64 * 64);
+}
+
+#[test]
+fn automatic_context_uses_shared_floor_and_exact_admitted_extent() {
+    let maximum = 1 << 20;
+    let recipe = Linear { maximum: 2 << 20, ..Linear::new() };
+    let automatic = Request { context: Context::automatic(maximum), ..request() };
+    for pool in [262_144, 760_768, maximum, 2 << 20] {
+        let mut available = budget(pool);
+        available.physical_bytes = 96 << 30;
+        let solved = solve(automatic.clone(), vec![available], &recipe).unwrap();
+        assert_eq!(solved.pool_tokens, pool);
+        assert_eq!(solved.served_context(), maximum.min(pool));
+        assert_eq!(solved.request.context.maximum, maximum);
+    }
+    assert!(solve(automatic.clone(), vec![budget(262_144 - 64)], &recipe).is_err());
+    let pinned = Request { context: Context::pinned(maximum), ..automatic.clone() };
+    assert!(solve(pinned, vec![budget(760_768)], &recipe).is_err());
+    let small_pool = Request { pool: Pin::Exact(64), ..automatic };
+    let solved = solve(small_pool, vec![budget(64)], &recipe).unwrap();
+    assert_eq!(solved.served_context(), 64);
+    let short = solve(Request { context: Context::automatic(128), ..request() },
+        vec![budget(128)], &recipe).unwrap();
+    assert_eq!(short.served_context(), 128);
+    assert!(solve(Request { context: Context::resolve(128, Some(256)), ..request() },
+        vec![budget(512)], &recipe).is_err());
+}
+
+#[test]
+fn pinned_context_keeps_the_operator_limit_with_a_larger_pool() {
+    let solved = solve(Request { context: Context::resolve(1 << 20, Some(131_072)), ..request() },
+        vec![budget(2 << 20)], &Linear::new()).unwrap();
+    assert_eq!(solved.served_context(), 131_072);
+    assert_eq!(solved.request.context.maximum, 1 << 20);
+}
+
+#[test]
+fn automatic_floor_is_bounded_by_an_explicit_target() {
+    cuteafd_core::memory_policy::MemoryPolicy { kv_target: Some(131_072), ..Default::default() }
+        .scoped(|| {
+            let solved = solve(Request { context: Context::automatic(1 << 20), ..request() },
+                vec![budget(2 << 20)], &Linear::new()).unwrap();
+            assert_eq!((solved.pool_tokens, solved.served_context()), (131_072, 131_072));
+        });
+}
+
+#[test]
+fn release_padding_charges_once_per_gpu_for_every_family() {
+    use cuteafd_core::memory_policy::{MemoryPolicy, DEFAULT_MEMORY_PADDING};
+    for family in ["deepseek_v41", "deepseek_v4", "glm5", "glm5_flash", "mimo_v2",
+        "qwen4", "qwen3_5", "kimi_k3", "muse_spark", "mistral_large4", "step5"] {
+        for gpus in [1, 2] {
+            let solve_with = |padding: Option<u64>| MemoryPolicy { memory_padding: padding,
+                kv_target: Some(DEFAULT_MEMORY_PADDING + 64 * 100), kv_min: Some(64), ..Default::default() }.scoped(|| {
+                let reserve = crate::placement::reserve::gpu(family);
+                let mut contract = with_reserve_components((DEFAULT_MEMORY_PADDING / 64) + 100);
+                contract.gpus = gpus as usize;
+                for gpu in 1..gpus {
+                    let mut extra = contract.components.clone();
+                    for component in &mut extra {
+                        match &mut component.kind {
+                            ComponentKind::Allocation { template: allocation, .. } => {
+                                allocation.id = format!("gpu{gpu}.{}", allocation.id);
+                                allocation.location = Location::coordinator(gpu);
+                            }
+                            ComponentKind::Allowance(allowance) => allowance.location = Location::coordinator(gpu),
+                            _ => unreachable!("linear fixture has only allocations and allowances"),
+                        }
+                    }
+                    contract.components.extend(extra);
+                }
+                let budgets = (0..gpus).map(|gpu| {
+                    let mut b = budget(crate::placement::reserve::family_constant(family)
+                        + DEFAULT_MEMORY_PADDING + 1500 + 64 * 100);
+                    b.id = format!("rtx{gpu}");
+                    b.locations = vec![Location::coordinator(gpu)];
+                    b.headroom = reserve;
+                    b
+                }).collect();
+                solve(request(), budgets, &Prepared(contract)).unwrap()
+            });
+            let unpadded = solve_with(Some(0));
+            let padded = solve_with(None);
+            assert_eq!(padded.pool_tokens, 64 * 100, "{family}/{gpus}");
+            assert_eq!(unpadded.pool_tokens - padded.pool_tokens, DEFAULT_MEMORY_PADDING, "64 B per 64-token page: {family}/{gpus}");
+            for (before, after) in unpadded.budgets.iter().zip(&padded.budgets) {
+                assert_eq!(after.headroom - before.headroom, DEFAULT_MEMORY_PADDING, "{family}/{gpus}");
+            }
+        }
+    }
+}
+
+#[test]
+fn zero_padding_is_identical_to_a_plan_with_no_padding_component() {
+    use cuteafd_core::memory_policy::MemoryPolicy;
+    let contract = with_reserve_components(1 << 15);
+    for family in ["glm5", "glm5_flash", "mimo_v2", "step5"] {
+        let mut bare = budget(crate::placement::reserve::family_constant(family) + 1500 + 64 * 100);
+        bare.headroom = crate::placement::reserve::family_constant(family);
+        // Reconstruct the pre-padding budget directly, without calling the
+        // padding helper or dropping any real reserve owner.
+        let expected = solve(request(), vec![bare.clone()], &Prepared(contract.clone())).unwrap();
+        let actual = MemoryPolicy { memory_padding: Some(0), ..Default::default() }.scoped(|| {
+            bare.headroom = crate::placement::reserve::gpu(family);
+            solve(request(), vec![bare], &Prepared(contract.clone())).unwrap()
+        });
+        assert_eq!(actual, expected, "{family}: all decisions, owners and phases must match");
+    }
+}
+
+#[test]
+fn graph_cache_reserve_survives_gpu_reserve_override() {
+    use cuteafd_core::memory_policy::MemoryPolicy;
+    let mut contract = with_reserve_components(1 << 15);
+    let source = crate::placement::graph_reserve::source("test.graphs.0");
+    contract.components.push(Component { activation: Activation::always(),
+        bytes: ByteCurve::fixed(500, 1 << 15),
+        kind: ComponentKind::Allowance(Allowance { location: Location::coordinator(0),
+            bytes: 500, lifetime: Lifetime::RESIDENT, source: source.clone(), assumed: false }) });
+    let overridden = MemoryPolicy { gpu_reserve: Some(0), ..Default::default() }
+        .scoped(|| solve(request(), vec![budget(1500 + 64 * 100)], &Prepared(contract))).unwrap();
+    assert_eq!(overridden.facts.allowances.len(), 1);
+    assert_eq!(overridden.facts.allowances[0].source, source);
+    assert_eq!(overridden.facts.allowances[0].bytes, 500);
+}
+
+#[test]
+fn sampled_family_occupancy_survives_zero_gpu_reserve() {
+    use cuteafd_core::memory_policy::MemoryPolicy;
+    for family in ["Qwen context and selected modules", "MiMo context and selected modules",
+        "CUDA context and loaded modules", "V4 context and selected modules",
+        "Dense Qwen context and selected modules"] {
+        let mut contract = with_reserve_components(1 << 15);
+        let source = crate::placement::sampled_baseline::source(family);
+        contract.components.push(Component { activation: Activation::always(),
+            bytes: ByteCurve::fixed(500, 1 << 15),
+            kind: ComponentKind::Allowance(Allowance { location: Location::coordinator(0),
+                bytes: 500, lifetime: Lifetime::RESIDENT, source: source.clone(), assumed: false }) });
+        let solved = MemoryPolicy { gpu_reserve: Some(0), ..Default::default() }.scoped(||
+            solve(request(), vec![budget(1500 + 64 * 100)], &Prepared(contract))).unwrap();
+        assert_eq!(solved.facts.allowances.len(), 1, "{family}");
+        assert_eq!(solved.facts.allowances[0].source, source);
+        assert_eq!(solved.facts.allowances[0].bytes, 500);
+        assert_eq!(solved.budgets[0].physical_bytes, 1500 + 64 * 100);
+        assert_eq!(solved.budgets[0].headroom, 0);
+    }
+}
+
+#[test]
+fn dashboard_reservations_include_deferred_host_prefix_and_match_assess() {
+    let mut p = plan(vec![]);
+    p.budgets[0].id = "host".into();
+    p.budgets[0].locations = vec![Location::HOST, Location::PINNED];
+    p.budgets[0].headroom = 17;
+    let prefix = Allocation::buffer("host.prefix", Location::PINNED, 1200,
+        Lifetime { first: Phase::Ready, last: Phase::Growth }, Category::Prefix,
+        "Kimi retained host-prefix quota");
+    let mut alias = prefix.clone();
+    alias.id = "host.prefix.alias".into();
+    alias.bytes = 100;
+    alias.view = Some(View { backing: prefix.id.clone(), offset: 0 });
+    p.facts.deferred = vec![prefix, alias];
+    p.facts.allocations.push(Allocation::buffer("host.scoring", Location::HOST, 200,
+        Lifetime::RESIDENT, Category::Workspace, "scoring"));
+    p.facts.reservations.push(Reservation { id: "load.pool".into(), location: Location::PINNED,
+        bytes: 300, lifetime: Lifetime { first: Phase::Load, last: Phase::Load },
+        source: "bounded load pool".into() });
+    let temporary = |id, bytes| Allocation::buffer(id, Location::PINNED, bytes,
+        Lifetime { first: Phase::Load, last: Phase::Load }, Category::Staging, "load scratch");
+    p.facts.sequential.push(Sequential { id: "load.serial".into(),
+        members: vec![temporary("load.a", 50), temporary("load.b", 90)] });
+    let assessed = assess(&p.facts, &p.budgets).unwrap();
+    for row in assessed.rows {
+        let items: Vec<_> = p.budgets[0].locations.iter().flat_map(|&location|
+            p.reservation_items_at(location, row.phase).unwrap()).collect();
+        assert_eq!(items.iter().map(|item| item.bytes).sum::<u64>(), row.owned + row.opaque,
+            "dashboard must match assessment at {:?}", row.phase);
+        if row.phase == Phase::Growth {
+            assert!(items.iter().any(|item| item.group == "deferred: Kimi retained host-prefix quota"
+                && item.bytes == 1200));
+            assert_eq!(items.iter().map(|item| item.bytes).sum::<u64>() + p.budgets[0].headroom, 1417);
+            assert!(!items.iter().any(|item| item.group.starts_with("sequential") || item.group.starts_with("reservation")));
+        }
+        if row.phase == Phase::Load {
+            assert!(items.iter().any(|item| item.group == "sequential peak: load.serial" && item.bytes == 90));
+            assert!(items.iter().any(|item| item.group == "reservation: load.pool" && item.bytes == 300));
+        }
+    }
+    // Existing readiness/admission projection semantics are intentionally unchanged.
+    assert!(p.items_at(Location::PINNED, Phase::Growth).unwrap().is_empty());
 }

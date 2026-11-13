@@ -94,6 +94,16 @@ impl DflashConfig {
         })
     }
 
+    /// Aggregate opaque rank-local ring records, with one shared valid floor.
+    /// FP8 records align per rank, so this is not always a whole-record split.
+    pub fn mark_bytes(&self, ranks: usize, kv: crate::families::qwen4::Qwen4KvCache) -> Result<u64> {
+        let local = self.for_tp(ranks)?;
+        let mark = super::draft_representation::mimo_draft_mark_bytes(
+            local.layers as u64, local.kv_heads as u64, local.head_dim as u64, kv)?;
+        (mark - 8).checked_mul(ranks as u64).and_then(|bytes| bytes.checked_add(8))
+            .context("DFlash aggregate mark overflow")
+    }
+
     pub fn drafts(&self) -> usize {
         self.block - 1
     }
@@ -111,6 +121,13 @@ impl DflashConfig {
             intermediate: self.intermediate as u64, layers: self.layers as u64, heads: self.heads as u64,
             kv_heads: self.kv_heads as u64, head_dim: self.head_dim as u64, taps: self.taps.len() as u64,
             vocab: self.vocab as u64, sinks: self.sinks }
+    }
+
+    /// A rank's GQA/FFN geometry; checkpoint validation always uses the full config.
+    pub fn for_tp(&self, ranks: usize) -> Result<Self> {
+        let local = self.weight_geometry().for_tp(ranks)?;
+        Ok(Self { heads: usize::try_from(local.heads)?, kv_heads: usize::try_from(local.kv_heads)?,
+            intermediate: usize::try_from(local.intermediate)?, ..self.clone() })
     }
 
     pub fn weight_layout(&self, mode: MimoDraftRepresentation) -> Result<MimoDraftWeightLayout> {

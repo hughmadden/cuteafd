@@ -52,7 +52,7 @@ def bind(path):
     lib = C.CDLL(path)
     sig = {
         "cuteafd_vocab_head_rows": ([P, P, P, C.c_int32, C.c_int32, C.c_int32, P], C.c_int32),
-        "cuteafd_vocabulary_head_create_vocab": ([P, C.c_uint64, C.c_int32, C.c_int32, C.c_int32, C.POINTER(P)],
+        "cuteafd_vocabulary_head_create_vocab": ([P, C.c_uint64, C.c_int32, C.c_int32, C.c_int32, C.c_int32, C.POINTER(P)],
                                                  C.c_int32),
         "cuteafd_vocabulary_head_launch_width": ([P, P, P, P, C.c_int32, P], C.c_int32),
         "cuteafd_vocabulary_head_launch_tensor_op": ([P, P, P, P, C.c_int32, P], C.c_int32),
@@ -284,7 +284,7 @@ def head_check(lib, args):
     workspace = torch.empty(4 << 20, device="cuda", dtype=torch.uint8)
     handle = P()
     assert lib.cuteafd_vocabulary_head_create_vocab(workspace.data_ptr(), workspace.numel(), width, rows_all, vocab,
-                                                    C.byref(handle)) == 0
+                                                    0, C.byref(handle)) == 0
     out = {name: torch.empty(rows_all, vocab, device="cuda") for name in ("pedantic", "tensor", "few")}
 
     def launch(name, rows, offset=0):
@@ -730,7 +730,7 @@ def mimo_forward_check(lib, args):
         head_workspace = torch.empty(4 << 20, device="cuda", dtype=torch.uint8)
         head_handle = P()
         assert lib.cuteafd_vocabulary_head_create_vocab(head_workspace.data_ptr(), head_workspace.numel(),
-            h, max_rows, cfg["vocab_size"], C.byref(head_handle)) == 0
+            h, max_rows, cfg["vocab_size"], 0, C.byref(head_handle)) == 0
         head_logits = torch.empty(max_rows, cfg["vocab_size"], device="cuda")
         head_unary = torch.empty(max_rows // block * (block - 1), 16, device="cuda")
         head_candidates = torch.empty_like(head_unary, dtype=torch.int32)

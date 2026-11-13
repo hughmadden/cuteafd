@@ -506,6 +506,7 @@ pub fn v41_spark_inventory(assignment: &SparkAssignment, execution: &SparkExecut
     }
     let all: Vec<_> = runtime.device.iter().chain(&runtime.pinned).chain(&runtime.host).collect();
     let mut retained = execution.retained.clone();
+    // The assignment includes inter-plane/layer padding in the physical request.
     retained.device.insert(0, Item::new(Category::Experts, "expert_weights", "checkpoint_native",
         assignment.resident_bytes, Basis::Exact));
     // Intake is already the input/routes/output owners above. EXL3 output is

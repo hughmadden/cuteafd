@@ -15,9 +15,10 @@ unsafe impl<T> Send for Loaded<T> {}
 /// and unwinds must drain queued work before releasing partial allocations.
 /// Neither executor state nor an already-published owner may cross this boundary.
 pub unsafe fn load_pair<T>(load: impl Fn(usize) -> Result<T> + Sync) -> Result<[T; 2]> {
+    let timing = crate::load_timing::capture();
     std::thread::scope(|scope| {
-        let left = scope.spawn(|| load(0).map(Loaded));
-        let right = scope.spawn(|| load(1).map(Loaded));
+        let left = scope.spawn(|| timing.enter(|| load(0).map(Loaded)));
+        let right = scope.spawn(|| timing.enter(|| load(1).map(Loaded)));
         // Join both even when one fails or panics; never release an owner while
         // its partner is still loading. Scope also joins on a parent unwind.
         let left = left.join().map_err(|_| anyhow!("rank0 weight loader panicked"));
@@ -48,11 +49,13 @@ pub unsafe fn load_pair_beside<T, U>(load: impl Fn(usize) -> Result<T> + Sync,
 pub unsafe fn load_pair_with<I, T, U>(inputs: [I; 2], load: impl Fn(usize, I) -> Result<T> + Sync,
     beside: impl FnOnce() -> U) -> (Result<[T; 2]>, U) {
     let [left_input, right_input] = inputs.map(Loaded);
+    let timing = crate::load_timing::capture();
     std::thread::scope(|scope| {
         let load = &load;
+        let timing = &timing;
         // Capture each whole wrapper (not its field) so only `Loaded` crosses threads.
-        let left = scope.spawn(move || { let input = left_input; load(0, input.0).map(Loaded) });
-        let right = scope.spawn(move || { let input = right_input; load(1, input.0).map(Loaded) });
+        let left = scope.spawn(move || timing.enter(|| { let input = left_input; load(0, input.0).map(Loaded) }));
+        let right = scope.spawn(move || timing.enter(|| { let input = right_input; load(1, input.0).map(Loaded) }));
         let value = beside();
         let left = left.join().map_err(|_| anyhow!("rank0 weight loader panicked"));
         let right = right.join().map_err(|_| anyhow!("rank1 weight loader panicked"));

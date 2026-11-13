@@ -416,6 +416,9 @@ impl FamilyModel for DeepSeekModel {
         &self.spec
     }
 
+    /// Both native DeepSeek contracts declare their own device and host owners.
+    fn contract_admission(&self) -> bool { matches!(self.id, "deepseek_v4" | "deepseek_v41") }
+
     /// V4.1's Engram pipeline preloads both layers' tables.
     fn mapped_table_preload(&self) -> bool {
         self.id == "deepseek_v41"
@@ -478,7 +481,11 @@ impl FamilyModel for DeepSeekModel {
     fn experts(&self, operand: &QuantOperand) -> Option<ExpertContract> {
         let geometry = self.geometry()?;
         let format = match operand.exl3_bits() {
-            Some(bits) => format!("exl3-k{bits}"),
+            // The decoder-tier package the runtime loads, not the checkpoint
+            // tier: Pro K2/K3 serve the shipped k23 pair (v41_catalog
+            // exl3_catalog_or_read(.., &[2, 3])), a uniform tier its adjacent pair.
+            Some(2 | 3) => "exl3-k23".into(),
+            Some(bits) => format!("exl3-k{bits}{}", if bits == 6 { 5 } else { bits + 1 }),
             None if operand.is_mxfp4(32) => "mxfp4".into(),
             None if operand.is_nvfp4() => "nvfp4".into(),
             None => return None,
@@ -489,7 +496,7 @@ impl FamilyModel for DeepSeekModel {
             block: 128,
             // Native packages remain bounded independently of transport capacity.
             spark_worlds: crate::plan::experts::spark_worlds(&format!("{geometry}:{format}"), self.spec().moe.as_ref()?.intermediate),
-            local: Err(format!("{serve} requires a checkpoint-qualified Spark expert recipe; local expert layers only supplement remote ranks")),
+            local: Ok(format!("{serve} native RTX whole-layer or TP2 expert package")),
         })
     }
 }

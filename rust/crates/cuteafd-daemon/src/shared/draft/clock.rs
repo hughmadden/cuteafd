@@ -29,6 +29,12 @@ pub(crate) struct LayerClock<'a> {
 }
 
 impl<'a> LayerClock<'a> {
+    /// CUDA event state is a separately measured startup owner, not a guessed buffer.
+    pub(crate) fn allocation_receipts(&self,
+        inventory: &mut crate::shared::memory::receipts::Inventory<'_>, name: &str) -> Result<()> {
+        inventory.host(&format!("{name}.events"), &self.events)?;
+        inventory.host(&format!("{name}.recorded"), &self.recorded)
+    }
     /// Timing events for `layers` layers on the current device.
     pub fn new(library: &'a NativeLibrary, layers: usize) -> Result<Self> {
         let mut events = Vec::with_capacity(layers + 1);

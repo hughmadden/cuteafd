@@ -54,7 +54,7 @@ async fn count_tokens(
     }
     .await;
     with_request_id(match result {
-        Ok(n) => Json(json!({"input_tokens": n})).into_response(),
+        Ok(n) => Json(json!({"input_tokens": n, "exact_token_count": gateway.backend.capabilities().exact_token_count})).into_response(),
         Err(error) => error.anthropic_response(),
     })
 }

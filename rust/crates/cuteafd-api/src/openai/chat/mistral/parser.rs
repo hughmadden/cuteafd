@@ -28,6 +28,7 @@ use serde_json::Value;
 
 use super::{ARGS, THINK_CLOSE, THINK_OPEN, TOOL_CALLS};
 use crate::openai::chat::glm5::{parser::GlmStop, TextParser};
+use crate::openai::chat::stream_args::{ArgStream, held_prefix, name_is_readable};
 
 /// Parser settings for one request.
 #[derive(Debug, Clone, Default)]
@@ -53,6 +54,44 @@ struct Call {
     text: String,
     /// Whitespace held before `[TOOL_CALLS]`, kept with a lost call's text.
     before: String,
+    /// The assembled arguments object (streaming only).
+    arguments: String,
+    /// Incremental brace/string scanner over the arguments object.
+    scan: JsonScan,
+}
+
+/// Tracks the brace depth and string state of a JSON object across chunks.
+#[derive(Debug, Default)]
+struct JsonScan {
+    depth: i32,
+    in_string: bool,
+    escape: bool,
+    started: bool,
+}
+
+impl JsonScan {
+    /// Scan `text`, returning the byte offset just past the closing brace of
+    /// the first complete object, or `None` while it is still open.
+    fn scan(&mut self, text: &str) -> Option<usize> {
+        for (index, byte) in text.bytes().enumerate() {
+            if self.in_string {
+                if self.escape { self.escape = false; }
+                else if byte == b'\\' { self.escape = true; }
+                else if byte == b'"' { self.in_string = false; }
+                continue;
+            }
+            match byte {
+                b'"' => self.in_string = true,
+                b'{' => { self.depth += 1; self.started = true; }
+                b'}' => {
+                    self.depth -= 1;
+                    if self.started && self.depth == 0 { return Some(index + 1); }
+                }
+                _ => {}
+            }
+        }
+        None
+    }
 }
 
 #[derive(Debug)]
@@ -65,13 +104,26 @@ pub struct MistralOutputParser {
     content_started: bool,
     held_whitespace: String,
     stop: Option<GlmStop>,
+    /// Emit tool-call argument deltas as they arrive instead of holding the
+    /// whole call until it closes.
+    stream_args: ArgStream,
+    /// The open call's `ToolCall` was emitted to the client: a call that turns
+    /// out unreadable has already been streamed and cannot be retracted.
+    streamed: bool,
 }
 
 impl MistralOutputParser {
-    pub fn new(mut options: MistralParserOptions) -> Self {
+    pub fn new(options: MistralParserOptions) -> Self {
+        Self::with_stream_args(options, false)
+    }
+
+    /// [`Self::new`] with the streaming knob set explicitly, so tests and the
+    /// router can enable it without touching process env.
+    pub fn with_stream_args(mut options: MistralParserOptions, stream_args: bool) -> Self {
         options.stop_sequences.retain(|sequence| !sequence.is_empty());
         Self { options, mode: Mode::Content, pending: String::new(), call: None, calls: 0,
-            content_started: false, held_whitespace: String::new(), stop: None }
+            content_started: false, held_whitespace: String::new(), stop: None,
+            stream_args: ArgStream::new(stream_args), streamed: false }
     }
 
     fn tools_enabled(&self) -> bool { self.options.tools.is_some() }
@@ -141,7 +193,15 @@ impl MistralOutputParser {
             if name.is_empty() || name.contains(MARKUP) {
                 self.lose(if name.is_empty() { "empty name" } else { "markup in the name" }, out);
             } else {
-                self.call.as_mut().expect("a call is open").name = name;
+                self.call.as_mut().expect("a call is open").name = name.clone();
+                // Name check before emitting: a call with an unreadable name is
+                // never streamed as a tool call (it is returned as content on
+                // loss, as in hold mode).
+                if self.stream_args.enabled() && name_is_readable(&name, self.options.tools.as_deref()) {
+                    self.stream_args.begin(out);
+                    self.stream_args.call(&name, out);
+                    self.streamed = true;
+                }
                 self.mode = Mode::Arguments;
             }
             return true;
@@ -156,6 +216,9 @@ impl MistralOutputParser {
 
     /// After `[ARGS]`: exactly one JSON object.
     fn step_arguments(&mut self, finishing: bool, out: &mut Vec<OutputChunk>) -> bool {
+        if self.streamed {
+            return self.step_arguments_streaming(finishing, out);
+        }
         let body = self.pending.trim_start();
         if body.is_empty() {
             if finishing { self.lose("arguments missing", out); return true; }
@@ -184,6 +247,52 @@ impl MistralOutputParser {
         }
     }
 
+    /// Streaming: emit the arguments object's bytes as they arrive. The
+    /// object's end is unambiguous once its braces balance, so nothing is held
+    /// back; a call that turns out malformed has already streamed and is
+    /// counted so the validator rejects it.
+    fn step_arguments_streaming(&mut self, finishing: bool, out: &mut Vec<OutputChunk>) -> bool {
+        let started = self.call.as_ref().expect("a call is open").scan.started;
+        let skipped = if started { 0 } else { self.pending.len() - self.pending.trim_start().len() };
+        let body_len = self.pending.len() - skipped;
+        if body_len == 0 {
+            if finishing { self.lose("arguments cut off", out); return true; }
+            return false;
+        }
+        if !started && !self.pending[skipped..].starts_with('{') {
+            self.lose("arguments are not a JSON object", out);
+            return true;
+        }
+        let closed = {
+            let body = &self.pending[skipped..];
+            self.call.as_mut().expect("a call is open").scan.scan(body)
+        };
+        let emit = closed.unwrap_or(body_len);
+        // Drop the whitespace between `[ARGS]` and the object, as hold mode
+        // does, so the streamed bytes match it exactly.
+        let skipped_text: String = self.pending.drain(..skipped).collect();
+        let text: String = self.pending.drain(..emit).collect();
+        {
+            let call = self.call.as_mut().expect("a call is open");
+            call.text.push_str(&skipped_text);
+            call.text.push_str(&text);
+            call.arguments.push_str(&text);
+        }
+        self.stream_args.delta(&text, out);
+        let Some(_) = closed else { return true; };
+        // The object closed: validate the assembled bytes exactly as the hold
+        // path does, then release.
+        let arguments = std::mem::take(&mut self.call.as_mut().expect("a call is open").arguments);
+        if serde_json::from_str::<Value>(&arguments).is_err() {
+            self.lose("arguments are not JSON", out);
+            return true;
+        }
+        self.call = None;
+        self.calls += 1;
+        self.mode = Mode::AfterCall;
+        true
+    }
+
     /// After a call: another `[TOOL_CALLS]`, or text that is dropped.
     fn step_after_call(&mut self, finishing: bool) -> bool {
         if let Some(at) = self.pending.find(TOOL_CALLS) {
@@ -208,12 +317,21 @@ impl MistralOutputParser {
     }
 
     /// Return an unreadable call's text as content and read on as content.
+    ///
+    /// A call that was already streamed cannot be retracted: it is counted so
+    /// the finish is `tool_calls`, and the validator rejects its assembled
+    /// arguments with a clean 400/SSE error rather than a 500.
     fn lose(&mut self, reason: &'static str, out: &mut Vec<OutputChunk>) {
         let call = self.call.take().expect("a call is open");
-        tracing::warn!(reason, "malformed Mistral tool call returned as content");
-        self.held_whitespace = call.before;
+        if std::mem::take(&mut self.streamed) {
+            self.calls += 1;
+            tracing::warn!(reason, text = %excerpt(&call.text), "Mistral tool call streamed, then found unreadable");
+        } else {
+            tracing::warn!(reason, "malformed Mistral tool call returned as content");
+            self.held_whitespace = call.before;
+            if self.calls == 0 { self.emit_content(&call.text, out); }
+        }
         self.mode = Mode::Content;
-        if self.calls == 0 { self.emit_content(&call.text, out); }
     }
 
     fn halt(&mut self, reason: GlmStop) {
@@ -249,6 +367,14 @@ impl MistralOutputParser {
     }
 }
 
+/// A short excerpt of model text for a log line.
+fn excerpt(text: &str) -> String {
+    match text.char_indices().nth(80) {
+        Some((cut, _)) => format!("{:?}...", &text[..cut]),
+        None => format!("{text:?}"),
+    }
+}
+
 impl TextParser for MistralOutputParser {
     fn push(&mut self, text: &str) -> Vec<OutputChunk> {
         if self.mode == Mode::Done { return Vec::new(); }
@@ -277,14 +403,3 @@ impl TextParser for MistralOutputParser {
 
 /// Characters that cannot be part of a tool name.
 const MARKUP: [char; 5] = ['[', ']', '{', '}', '\n'];
-
-/// Length of the longest suffix of `text` that is a proper prefix of `marker`.
-fn held_prefix(text: &str, marker: &str) -> usize {
-    let longest = text.len().min(marker.len().saturating_sub(1));
-    (1..=longest).rev()
-        .find(|length| {
-            let start = text.len() - length;
-            text.is_char_boundary(start) && marker.starts_with(&text[start..])
-        })
-        .unwrap_or(0)
-}

@@ -1,5 +1,6 @@
 //! Reusable private inputs for one lane's peer attention half.
 use super::*;
+use crate::shared::memory::Tag;
 use crate::shared::memory::{device::Allocation,proposal_replica::{ProposalReplica,ProposalFormat}};
 use crate::families::deepseek_v41::v41_index_selection::IndexSelectionOutput;
 use crate::families::deepseek_v41::v41_compressor::IndexBinding;
@@ -183,7 +184,7 @@ impl<'a> PeerAttentionInputs<'a> {
         let source_buffer=||ProposalReplica::new(source,peer,capacity,ProposalFormat::CompressedFp4);
         Ok(Self { device:peer,window:ProposalReplica::new(source,peer,capacity,ProposalFormat::WindowFp8)?,
             sources:[source_buffer()?,source_buffer()?,source_buffer()?,source_buffer()?],
-            source_bindings:std::array::from_fn(|_|std::cell::Cell::new([None; cuteafd_core::V41_MAX_REQUESTS])),selected:Allocation::new(peer,capacity*2048)?,
+            source_bindings:std::array::from_fn(|_|std::cell::Cell::new([None; cuteafd_core::V41_MAX_REQUESTS])),selected:Allocation::new(peer,capacity*2048,Tag::workspace("v41/peer-attention-inputs"))?,
             copy:peer.run(||peer.library.v41_peer_copy())?,capacity })
     }
     /// # Safety
@@ -276,7 +277,7 @@ mod shared_cache_tests {
         let (offset,count,step)=(metadata[4] as usize,metadata[3] as usize,metadata[5] as usize);
         assert!(count>0);
         let bytes=(offset+(count-1)*step+1)*256;
-        let saved=[Allocation::new(peer,bytes)?,Allocation::new(peer,bytes)?];
+        let saved=[Allocation::new(peer,bytes, crate::shared::memory::TEST)?,Allocation::new(peer,bytes, crate::shared::memory::TEST)?];
         let read=|buffer:CuteafdDeviceBuffer,device:Device<'_>|->Result<Vec<u8>> {
             let mut raw=vec![0;bytes];device.run(||lib.copy_d2h(&mut raw,CuteafdDeviceBuffer {bytes,..buffer}))?;
             Ok((0..count).flat_map(|row|raw[(offset+row*step)*256..(offset+row*step+1)*256].iter().copied()).collect())

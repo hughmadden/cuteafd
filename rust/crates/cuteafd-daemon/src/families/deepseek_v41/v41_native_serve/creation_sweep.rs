@@ -47,8 +47,8 @@ impl Sweep {
 /// arena and alpha, initialized once on a load stream and drained.
 fn fp8_plan(lib: &NativeLibrary, rows: u32, k: u32, n: u32) -> Result<u64> {
     let plan = lib.v41_fp8_matrix_plan(rows, k, n)?;
-    let scratch = DeviceAllocation::new(lib, plan.info().scratch_bytes as usize)?;
-    let alpha = DeviceAllocation::new(lib, 4)?;
+    let scratch = DeviceAllocation::new(lib, plan.info().scratch_bytes as usize, crate::shared::memory::TEST)?;
+    let alpha = DeviceAllocation::new(lib, 4, crate::shared::memory::TEST)?;
     let stream = LoadStream { library: lib, raw: lib.cuda_stream_create()? };
     // SAFETY: scratch and alpha are distinct live allocations on the current
     // device; the stream drains before either is released.
@@ -60,7 +60,7 @@ fn fp8_plan(lib: &NativeLibrary, rows: u32, k: u32, n: u32) -> Result<u64> {
 
 /// A 4 MiB native workspace, as the compressor and vocabulary owners allocate.
 fn workspace(lib: &NativeLibrary) -> Result<DeviceAllocation<'_>> {
-    DeviceAllocation::new(lib, cuteafd_ffi::V41Compressor::WORKSPACE_BYTES)
+    DeviceAllocation::new(lib, cuteafd_ffi::V41Compressor::WORKSPACE_BYTES, crate::shared::memory::TEST)
 }
 
 /// One resident expert layer over zeroed planes in the native packed layout,
@@ -70,7 +70,7 @@ fn synthetic_experts<'a>(device: Device<'a>, layer: crate::families::deepseek_v4
     use crate::shared::memory::weight_arena::{ArenaLayout, ExpectedCoverage, LoadingArena};
     let planes = cuteafd_loader::push_load::native::NativePlanes::with_scale_codes(5120, intermediate, intermediate,
         experts, false, true)?;
-    let arena = LoadingArena::new(device, ArenaLayout::new([planes.bytes], planes.bytes)?, ExpectedCoverage::default())?
+    let arena = LoadingArena::new(device, ArenaLayout::new([planes.bytes], planes.bytes)?, ExpectedCoverage::default(), cuteafd_core::memory_layout::ArenaTag::experts("experts/startup-sweep"))?
         .done()?.initialize(|_| Ok(()))?;
     let budget = crate::families::deepseek_v41::v41_experts::ExpertLoadBudget { resident_bytes: planes.bytes,
         device_staging_bytes: 0, pinned_host_bytes: 0, read_scratch_bytes: 0 };
@@ -153,14 +153,13 @@ fn cuda_v41_two_rtx_startup_handles_create_at_planned_sizes() -> Result<()> {
     ensure!(shape.unit_cap == capacity as usize, "prefill unit {} differs from live rows {capacity}", shape.unit_cap);
     let (slots, reserve) = (shape.waves, shape.reserve_rows());
     let decode = super::DECODE_LANE_ROWS;
-    let width = if args.dspark_draft_limit > 5 { 7 } else { 5 };
+    let width = if args.draft_length.draft_length.unwrap_or(5) > 5 { 7 } else { 5 };
     let requests = args.concurrency;
     let map = CachePlacement::encoder_decoder();
-    let topology = crate::shared::spark_topology::resolve(args.spark_tp, args.spark_ep, args.peers.len(), "serve-native")?;
-    let spark_world = crate::shared::spark_topology::world(topology, args.peers.len())?;
+    let spark_world = crate::shared::spark_topology::world(args.peers.len())?;
     let ranks = spark_world.topology().world_size();
     let snapshot_slots = cuteafd_core::prefix::mark_slots_with_host(0, u64::from(args.resolved_prefix_entries()), 1,
-        u64::MAX, args.host_cache_bytes.enabled()) as usize;
+        u64::MAX, args.prefix.host_cache_bytes.enabled()) as usize;
     eprintln!("SERVE capacity={capacity} aot={aot_capacity} slots={slots} reserve={reserve} decode={decode} \
         width={width} requests={requests} spark_ranks={ranks} snapshot_slots={snapshot_slots}");
 
@@ -277,7 +276,7 @@ fn cuda_v41_two_rtx_startup_handles_create_at_planned_sizes() -> Result<()> {
         // plan must refuse there (and install where the architecture has it).
         sweep.record("attention guard", "BF16 AOT plan", devices[0].run(|| {
             let bf16_aot = cuteafd_core::coordinator_programs::AttentionReductionPlan::new(plan.capacity_rows(),
-                Some(usize::from(args.dspark_draft_limit)), args.attention_plan_rows)?;
+                Some(usize::from(args.draft_length.draft_length.unwrap_or(5))), args.attention_plan_rows)?;
             let mut wave = v41_sparse_attention::SparseAttentionWave::new(&lib, decode as usize,
                 v41_sparse_attention::SparseAttentionWave::device_bytes(decode as usize)?)?;
             let installed = wave.install_attention_plan(bf16_aot);
@@ -404,7 +403,7 @@ fn cuda_v41_two_rtx_startup_handles_create_at_planned_sizes() -> Result<()> {
         let sources: Vec<usize> = [2, 8, 14, 20].into_iter().filter(|&l| usize::from(l >= 20) == g).collect();
         for lane in 0..2 {
             sweep.record("window storage", format!("GPU{g} lane {lane}"), device.run(||
-                v41_window::WindowStorage::new(&lib, decode as usize, decode as usize, &layers, false).map(drop)));
+                v41_window::WindowStorage::new(&lib, decode as usize, decode as usize, &layers).map(drop)));
             planned(&mut sweep, device, decode, 5120, 512, "window producer");
             for &layer in &sources {
                 sweep.record("compressor storage", format!("GPU{g} lane {lane} layer {layer}"), device.run(||
@@ -468,7 +467,7 @@ fn cuda_v41_two_rtx_startup_handles_create_at_planned_sizes() -> Result<()> {
             sweep.record("vocabulary shard", format!("head {head} GPU{}", device.id), device.run(|| {
                 let workspace = workspace(&lib)?;
                 // SAFETY: the workspace outlives the projection, dropped first.
-                unsafe { lib.v41_vocabulary_shard(workspace.buffer, 64640) }?;
+                unsafe { lib.v41_vocabulary_shard(workspace.buffer, 64640, crate::shared::target_head::TargetHead::configured().native_mode()) }?;
                 lib.v41_peer_copy().map(drop)
             }));
             if let Some(scratch) = sweep.record("FP8 head scratch", format!("head {head} GPU{} rows {head_rows}", device.id),
@@ -532,7 +531,7 @@ fn cuda_v41_two_rtx_startup_handles_create_at_planned_sizes() -> Result<()> {
             sweep.record("vocabulary shard", format!("dSpark lane {lane} GPU{}", device.id), device.run(|| {
                 let workspace = workspace(&lib)?;
                 // SAFETY: the workspace outlives the projection, dropped first.
-                unsafe { lib.v41_vocabulary_shard(workspace.buffer, 64640) }?;
+                unsafe { lib.v41_vocabulary_shard(workspace.buffer, 64640, crate::shared::target_head::TargetHead::configured().native_mode()) }?;
                 lib.v41_peer_copy()?;
                 crate::shared::fp8_linear::scratch(&lib, requests.div_ceil(2) as usize * width, &[(5120, 64640)]).map(drop)
             }));
@@ -781,7 +780,7 @@ fn cuda_v41_single_gpu_handles_create_at_every_exported_capacity() -> Result<()>
         }
         sweep.record("attention guard", "BF16 AOT plan", (|| {
             let bf16_aot = cuteafd_core::coordinator_programs::AttentionReductionPlan::new(plan.capacity_rows(),
-                Some(usize::from(args.dspark_draft_limit)), args.attention_plan_rows)?;
+                Some(usize::from(args.draft_length.draft_length.unwrap_or(5))), args.attention_plan_rows)?;
             let rows = cuteafd_core::V41_VERIFY_ROWS;
             let mut wave = v41_sparse_attention::SparseAttentionWave::new(&lib, rows,
                 v41_sparse_attention::SparseAttentionWave::device_bytes(rows)?)?;
@@ -875,9 +874,9 @@ fn cuda_v41_single_gpu_handles_create_at_every_exported_capacity() -> Result<()>
             let workspace = workspace(&lib)?;
             // SAFETY: the workspace outlives the projection, dropped first.
             unsafe { match vocabulary {
-                0 => lib.v41_vocabulary_head(workspace.buffer),
+                0 => lib.v41_vocabulary_head(workspace.buffer, crate::shared::target_head::TargetHead::configured().native_mode()),
                 1 => lib.v41_dspark_markov(workspace.buffer),
-                rows => lib.v41_vocabulary_shard(workspace.buffer, rows),
+                rows => lib.v41_vocabulary_shard(workspace.buffer, rows, crate::shared::target_head::TargetHead::configured().native_mode()),
             } }.map(drop)
         })());
     }

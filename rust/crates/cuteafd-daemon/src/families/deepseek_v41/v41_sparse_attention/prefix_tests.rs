@@ -26,8 +26,15 @@ fn k7_sparse_reservation_preserves_k5_accounting_and_stable_query_storage() -> R
             wave.reserve_decode_rows(64)?;
             assert_eq!(wave.storage.split_scratch.buffer.ptr, scratch);
             assert!(wave.reserve_decode_rows(65).is_err());
-            wave.enable_small_graph_shapes();
-            assert_eq!(wave.graph_limit, 64);
+            let mut banks = 0;
+            wave.visit_graph_banks(&mut |device, site, spans, _| {
+                assert_eq!(device, gpu);
+                assert_eq!(site, "sparse_attention");
+                assert!(!spans);
+                banks += 1;
+                Ok(())
+            })?;
+            assert_eq!(banks, 1, "reserved storage retains its shared-cache owner");
             Ok(())
         })?;
     }
@@ -46,7 +53,7 @@ fn committed_prefix_survives_append_but_private_boundary_stays_exact() -> Result
         .run(|| {
             let kernel = lib.v41_sparse_attention()?;
             let allocate = |bytes, value| -> Result<DeviceAllocation<'_>> {
-                let allocation = DeviceAllocation::new(&lib, bytes)?;
+                let allocation = DeviceAllocation::new(&lib, bytes, crate::shared::memory::TEST)?;
                 lib.copy_h2d(allocation.buffer, &vec![value; bytes])?;
                 Ok(allocation)
             };
@@ -101,7 +108,7 @@ fn committed_prefix_survives_append_but_private_boundary_stays_exact() -> Result
             let appended_scales = allocate(V41Kv::COMPRESSED_SCALE_BYTES, 0x40)?;
             let destination = allocate(8, 0)?;
             lib.copy_h2d(destination.buffer, &1u64.to_ne_bytes())?;
-            let mut append_end = HostAllocation::new(&lib, 8)?;
+            let mut append_end = HostAllocation::new(&lib, 8, crate::shared::memory::TEST)?;
             append_end.bytes_mut().copy_from_slice(&2u64.to_ne_bytes());
             let outputs = allocate(64 * 65536, 0)?;
             let kv = lib.v41_compressed_kv()?;
@@ -216,7 +223,7 @@ fn compact_wave_batch_graph_consumes_local_buffers() -> Result<()> {
             assert_eq!(wave.input().ptr,input);
             assert_eq!(wave.storage.split_scratch.buffer.bytes,64*10*32*514*4);
             let allocate=|bytes,value|->Result<DeviceAllocation<'_>> {
-                let allocation=DeviceAllocation::new(&lib,bytes)?;
+                let allocation=DeviceAllocation::new(&lib,bytes, crate::shared::memory::TEST)?;
                 lib.copy_h2d(allocation.buffer,&vec![value;bytes])?;Ok(allocation)
             };
             let values=allocate(128*512,0x38)?;
@@ -238,12 +245,18 @@ fn compact_wave_batch_graph_consumes_local_buffers() -> Result<()> {
                 wave.storage.descriptors.buffer,wave.storage.replay_begins.buffer,wave.storage.split_scratch.buffer)?;
             assert_eq!(batch.backend_key(),2);
             lib.copy_h2d(wave.storage.descriptors.buffer,batch.bytes())?;
-            let plan=ColdSparse { layer:0,rows:4,sink:sink.buffer,launches:vec![],selected:None,
-                batch:Some(batch),fingerprint:vec![],needed:0,tail_identity:None };
+            use crate::shared::decode_graph::device::{Basis, Cycle, Preference, Site};
+            wave.graphs.attach_device(&lib, gpu, 64 << 20, Site { name: "sparse_attention",
+                cycle: Cycle::Other, preference: Preference::Capture, bootstrap: 2 << 20,
+                basis: Basis::Bytes, spans_devices: false })?;
+            let ticket = wave.graphs.cache_ticket(&(0, vec![]), false, None).expect("test reserve fits");
+            let mut plan=ColdSparse { layer:0,rows:4,sink:sink.buffer,launches:vec![],selected:None,
+                batch:Some(batch),fingerprint:vec![],needed:0,tail_identity:None,ticket };
             unsafe { wave.enqueue(plan.sink,&plan.launches,None,plan.batch.as_ref())?; }
             wave.synchronize()?;
-            let graph=unsafe { wave.capture_plan(&plan,&mut None)? };
-            wave.insert_graph(0,vec![],graph)?;
+            let graph=unsafe { wave.capture_plan(&mut plan,&mut None)? };
+            wave.insert_graph((0,vec![]),graph.0,plan.ticket,graph.1,graph.2,graph.3)?;
+            let graph = graph.0;
             for replay in 0..2 {
                 if replay==1 { lib.copy_h2d(values.buffer,&vec![0;values.buffer.bytes])?; }
                 unsafe { lib.cuda_graph_launch(graph,wave.storage.stream.raw)?; }

@@ -31,6 +31,9 @@ type DraftProbe<'a> = RefCell<Option<crate::shared::memory::device::DeviceOwner<
     crate::shared::draft::probe::RoundProbe<'a>>>>;
 
 pub(crate) struct Execution<'a> {
+    pub skip_routed_experts: bool,
+    pub expert_usage: Option<Rc<cuteafd_ffi::expert_usage::ExpertUsage<'a>>>,
+    pub usage_phase: Cell<cuteafd_ffi::expert_usage::UsagePhase>,
     pub plan: LayerExecutionPlan,
     lanes: Vec<LaneJoins<'a>>,
     entry_lane: Cell<Option<usize>>,
@@ -94,7 +97,7 @@ impl<'a> Execution<'a> {
             let narrow = streams[0].device.run(|| streams[0].device.library.f32_bf16_narrow())?;
             Ok(LaneJoins { streams, produced, landed, reducer, narrow })
         }).collect::<Result<_>>()?;
-        Ok(Self { plan, lanes, entry_lane: Cell::new(None), state_ready, state_pending })
+        Ok(Self { skip_routed_experts: false, expert_usage: None, usage_phase: Cell::new(cuteafd_ffi::expert_usage::UsagePhase::Prefill), plan, lanes, entry_lane: Cell::new(None), state_ready, state_pending })
     }
 
     /// The family has no second scheduler: use the shared layer-major pipeline
@@ -309,6 +312,23 @@ fn join_producers(producers: [*mut c_void; 2], mut record: impl FnMut(usize, *mu
     Ok(())
 }
 
+trait ContextRankKernels {
+    fn wait_prior_commit(&mut self, reader: usize, owner: usize) -> Result<()>;
+    fn attention_commit(&mut self, rank: usize) -> Result<()>;
+    fn record_commit(&mut self, rank: usize) -> Result<()>;
+}
+
+fn context_pair_with(kernels: &mut impl ContextRankKernels) -> Result<()> {
+    // Snapshot both ranks' previous event generations before either event is
+    // re-recorded. Either next-unit gather reads both persistent owner pools.
+    for reader in 0..2 { for owner in 0..2 { kernels.wait_prior_commit(reader, owner)?; }}
+    for rank in 0..2 {
+        kernels.attention_commit(rank)?;
+        kernels.record_commit(rank)?;
+    }
+    Ok(())
+}
+
 fn producer_streams(streams: impl Iterator<Item = [*mut c_void; 2]>, lane: usize)
     -> Result<[*mut c_void; 2]> {
     streams.into_iter().nth(lane).context("Kimi producer lane outside admission")
@@ -328,7 +348,7 @@ fn validate_rank_geometry(modes: &[LayerMode], spec: cuteafd_loader::placement::
             && modes.iter().all(|mode| *mode == LayerMode::Whole { gpu: 0, ffn: FfnMode::Owner }),
             "single-device Kimi requires one whole attention/FFN owner and a local head"),
         2 => ensure!(spec.head_gpu == 1 && spec.terminal == TerminalHome::Replicated
-            && modes.iter().all(|mode| matches!(mode, LayerMode::HeadSplit
+            && modes.iter().all(|mode| matches!(mode, LayerMode::HeadSplit | LayerMode::ContextSplit
                 | LayerMode::Whole { ffn: FfnMode::Split, .. })), "Kimi TP2 requires split FFNs"),
         _ => anyhow::bail!("Kimi needs one or two physical ranks"),
     }
@@ -366,6 +386,98 @@ fn validate_streams(streams: &[[(i32, *mut c_void); 2]], devices: [i32; 2]) -> R
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gathered_unit_history_requires_both_prior_owner_commits() {
+        #[derive(Clone, Copy)]
+        enum Step { Wait { unit: usize, owner: usize }, Gather(usize), Commit(usize) }
+
+        // Explore every interleaving, not one favorable rank order: host enqueue
+        // order does not order the two GPU streams' remote history reads.
+        fn check(streams: &[Vec<Step>; 2]) -> std::result::Result<(), (usize, usize, usize)> {
+            let mut pending = vec![[0; 2]];
+            let mut visited = std::collections::HashSet::new();
+            while let Some(at) = pending.pop() {
+                if !visited.insert(at) { continue; }
+                let committed = |owner: usize, unit: usize| streams[owner][..at[owner]].iter()
+                    .any(|step| matches!(step, Step::Commit(done) if *done == unit));
+                let mut progressed = false;
+                for rank in 0..2 {
+                    let Some(step) = streams[rank].get(at[rank]) else { continue; };
+                    match *step {
+                        Step::Wait { unit, owner } if !committed(owner, unit) => continue,
+                        Step::Gather(unit) if unit > 0 => {
+                            for owner in 0..2 {
+                                if !committed(owner, unit - 1) { return Err((rank, unit, owner)); }
+                            }
+                        }
+                        _ => {}
+                    }
+                    progressed = true;
+                    let mut next = at;
+                    next[rank] += 1;
+                    pending.push(next);
+                }
+                assert!(progressed || at == streams.each_ref().map(Vec::len),
+                    "gathered owner-commit waits deadlock at {at:?}");
+            }
+            Ok(())
+        }
+
+        struct Recording {
+            streams: [Vec<Step>; 2], unit: usize, calls: Vec<(&'static str, usize, usize)>,
+        }
+        impl ContextRankKernels for Recording {
+            fn wait_prior_commit(&mut self, reader: usize, owner: usize) -> Result<()> {
+                self.calls.push(("wait", reader, owner));
+                if self.unit > 0 {
+                    self.streams[reader].push(Step::Wait { unit: self.unit - 1, owner });
+                }
+                Ok(())
+            }
+            fn attention_commit(&mut self, rank: usize) -> Result<()> {
+                use crate::shared::peer_split::context::{gathered_prefill_with, GatheredKernels};
+                self.calls.push(("attention", rank, rank));
+                struct Gathered<'a> { stream: &'a mut Vec<Step>, unit: usize }
+                impl GatheredKernels for Gathered<'_> {
+                    fn gather(&mut self, _: usize) -> Result<()> {
+                        self.stream.push(Step::Gather(self.unit)); Ok(())
+                    }
+                    fn produce(&mut self) -> Result<()> { Ok(()) }
+                    fn attention(&mut self) -> Result<()> { Ok(()) }
+                    fn commit(&mut self) -> Result<()> {
+                        self.stream.push(Step::Commit(self.unit)); Ok(())
+                    }
+                    fn output(&mut self) -> Result<()> { Ok(()) }
+                }
+                gathered_prefill_with(&mut Gathered { stream: &mut self.streams[rank], unit: self.unit })
+            }
+            fn record_commit(&mut self, rank: usize) -> Result<()> {
+                self.calls.push(("record", rank, rank)); Ok(())
+            }
+        }
+        let mut recording = Recording { streams: std::array::from_fn(|_| Vec::new()),
+            unit: 0, calls: Vec::new() };
+        for unit in 0..4 {
+            recording.unit = unit;
+            context_pair_with(&mut recording).unwrap();
+        }
+        for calls in recording.calls.chunks_exact(8) {
+            assert!(calls[..4].iter().all(|call| call.0 == "wait"),
+                "both previous event generations must be consumed before either re-record");
+        }
+        let streams = recording.streams;
+        assert_eq!(check(&streams), Ok(()));
+        for reader in 0..2 { for unit in 1..4 {
+            let peer = 1 - reader;
+            let mut missing_peer_wait = streams.clone();
+            missing_peer_wait[reader].retain(|step| !matches!(*step,
+                Step::Wait { unit: prior, owner } if prior == unit - 1 && owner == peer));
+            // Removing only the peer edge must expose a read of stale owner
+            // pages even though the reader still waits for its own commit.
+            assert_eq!(check(&missing_peer_wait), Err((reader, unit, peer)));
+        }}
+    }
 
     #[test]
     fn batched_route_transfer_keeps_exact_extents_and_rejects_invalid_planes() -> Result<()> {
@@ -451,6 +563,7 @@ mod tests {
 /// The shared pipeline owns layer/lane ordering; this binding supplies only
 /// arithmetic and the exact payload at each planned boundary.
 pub(crate) struct Bindings<'e, 'a, 's> {
+    execution: &'e Execution<'a>,
     scope: &'e SubmissionScope<'s>,
     local: &'e mut [LocalLane<'a>],
     routed: &'e mut RoutedLane<'a>,
@@ -517,16 +630,18 @@ impl<'e, 'a, 's> Bindings<'e, 'a, 's> {
             for rank in 0..local.len() { peer.recv(rank, lane)?; }
             ensure!(peer.slot_bytes() >= rows * 7168 * 2, "Kimi peer slot shorter than hidden rows");
         }
-        Ok(Self { scope, local, routed, experts, protocol, lane, rows, speculative, owners, completed: 0, pending: None, draft: None, probe: None, tap_first: 0, defer_publication: false, packed: None })
+        Ok(Self { execution, scope, local, routed, experts, protocol, lane, rows, speculative, owners, completed: 0, pending: None, draft: None, probe: None, tap_first: 0, defer_publication: false, packed: None })
     }
 
     fn begin_local_ffn(&mut self, layer: usize, owner: Option<usize>) -> Result<FfnTicket> {
         ensure!(owner == Some(0) && self.pending.is_none(), "Kimi single-owner FFN binding");
-        self.local[0].residual(MixSite::Ffn(layer), self.rows)?;
         let dense = self.local[0].config().dense[layer];
+        if !dense { self.local[0].residual(MixSite::Ffn(layer), self.rows)?; }
         let rtx = !dense && self.experts[0].as_ref().is_some_and(|expert| expert.layers().contains(&layer));
         let spark = if dense { None } else {
-            let (routes, wire) = self.local[0].route(layer, self.rows)?;
+            let tally = self.execution.expert_usage.as_ref().map(|usage|
+                usage.routes(self.local[0].stream().device.id, layer, self.execution.usage_phase.get())).transpose()?;
+            let (routes, wire) = self.local[0].route(layer, self.rows, tally)?;
             self.with_probe(|probe| {
                 if probe.wants_ring(false) {
                     let stream = self.local[0].stream();
@@ -535,7 +650,7 @@ impl<'e, 'a, 's> Bindings<'e, 'a, 's> {
                 }
                 Ok(())
             })?;
-            if rtx {
+            if self.execution.skip_routed_experts { None } else if rtx {
                 let stream = self.local[0].stream();
                 let expert = self.experts[0].as_mut().context("Kimi whole expert absent")?;
                 ensure!(expert.shard() == RtxShard::Whole && expert.device() == stream.device.id,
@@ -576,6 +691,7 @@ impl<'e, 'a, 's> Bindings<'e, 'a, 's> {
         } else {
             self.local[0].adopt("delta", shared, self.rows, 7168)?;
         }
+        self.local[0].capture_post_ffn(layer, self.rows)?;
         if let Some(draft) = self.draft { draft.tap_at(layer, &mut self.local[0], self.rows, self.tap_first)?; }
         self.with_probe(|probe| {
             // SAFETY: this mark follows all FFN consumers on the only physical lane stream.
@@ -600,7 +716,12 @@ impl<'e, 'a, 's> Bindings<'e, 'a, 's> {
         ensure!(layer == self.completed && self.pending.is_none(), "Kimi layer order differs from shared pipeline");
         for local in self.local.iter_mut() {
             if layer == 0 { local.seed(self.rows)?; }
-            local.residual(MixSite::Attention(layer), self.rows)?;
+            // Packed members and context buckets stage metadata between the
+            // live-row residual and attention; ordinary attention folds it in.
+            if self.packed.is_some() || self.execution.plan.modes()[layer] == LayerMode::ContextSplit
+                || local.windowed() || !local.attention_resident(layer)?.0 {
+                local.residual(MixSite::Attention(layer), self.rows)?;
+            }
         }
         Ok(())
     }
@@ -648,12 +769,15 @@ impl<'e, 'a, 's> Bindings<'e, 'a, 's> {
         Ok(())
     }
 
-    fn publish_core(&self,ffn:bool)->Result<()> {
-        let name=if ffn {"K6 FFN partial"}else{"K6 attention partial"};
-        ensure!(self.protocol.peer()?.slot_bytes()>=self.rows*7168*2,"Kimi K6 peer slot shorter than BF16 hidden rows");
+    fn publish_core(&self,layer:usize,ffn:bool)->Result<()> {
+        let partials=[self.local[0].core_partial(layer,ffn,self.rows)?,self.local[1].core_partial(layer,ffn,self.rows)?];
+        ensure!(std::mem::discriminant(&partials[0]) == std::mem::discriminant(&partials[1]),
+            "Kimi peer partial precision/basis differs between ranks");
         for rank in 0..2 {
+            let buffer=partials[rank].buffer();
+            ensure!(self.protocol.peer()?.slot_bytes()>=buffer.bytes,"Kimi peer slot shorter than typed partial");
             self.protocol.producers(self.lane,rank)?;
-            self.protocol.peer()?.push(rank,self.lane,self.local[rank].buffer(name)?.ptr,self.rows*7168*2)?;
+            self.protocol.peer()?.push(rank,self.lane,buffer.ptr,buffer.bytes)?;
         }
         Ok(())
     }
@@ -661,7 +785,7 @@ impl<'e, 'a, 's> Bindings<'e, 'a, 's> {
     fn publish_ffn(&self, layer: usize) -> Result<()> {
         if self.local[0].native_ffn(layer)? {
             ensure!(self.local[1].native_ffn(layer)?, "Kimi K6 FFN rank formats differ");
-            self.publish_core(true)
+            self.publish_core(layer,true)
         } else {
             self.publish("ffn output")
         }
@@ -669,8 +793,9 @@ impl<'e, 'a, 's> Bindings<'e, 'a, 's> {
     fn meet_core(&mut self,layer:usize,ffn:bool,destination:&str)->Result<()> {
         for rank in 0..2 {
             self.protocol.peer()?.wait(rank,self.lane)?;
-            let peer=CuteafdDeviceBuffer{ptr:self.protocol.peer()?.recv(rank,self.lane)?,
-                bytes:self.rows*7168*2,device_id:self.local[rank].stream().device.id,flags:0};
+            let partial=self.local[rank].core_partial(layer,ffn,self.rows)?;
+            let peer=partial.received(CuteafdDeviceBuffer{ptr:self.protocol.peer()?.recv(rank,self.lane)?,
+                bytes:partial.buffer().bytes,device_id:self.local[rank].stream().device.id,flags:0})?;
             self.protocol.peer()?.on(rank,||self.local[rank].reduce_core(layer,ffn,self.rows,peer,destination,
                 self.protocol.peer()?.stream(rank)))?;
             self.protocol.consumer(self.lane,rank)?;
@@ -752,14 +877,54 @@ impl LayerKernels for Bindings<'_, '_, '_> {
         for rank in 0..2 { self.attention_rank(layer, rank)?; }
         if self.local[0].native_attention(layer)? {
             ensure!(self.local[1].native_attention(layer)?,"Kimi K6 attention rank formats differ");
-            self.publish_core(false)?;self.meet_core(layer,false,"delta")
+            self.publish_core(layer,false)?;self.meet_core(layer,false,"delta")
         } else {
             self.publish("attention output")?;
             self.meet("attention output", "delta")
         }
     }
-    fn context(&mut self, _: usize, _: usize) -> Result<()> {
-        anyhow::bail!("Kimi context split has no query/LSE exchange ABI")
+    fn context(&mut self, layer: usize, _: usize) -> Result<()> {
+        self.before_attention(layer)?;
+        struct Pair<'b, 'e, 'a, 's> { binding: &'b mut Bindings<'e, 'a, 's>, layer: usize }
+        impl ContextRankKernels for Pair<'_, '_, '_, '_> {
+            fn wait_prior_commit(&mut self, reader: usize, owner: usize) -> Result<()> {
+                let execution = self.binding.protocol.execution;
+                if execution.state_pending[self.layer][owner].get() {
+                    let ready = execution.state_ready[self.layer].borrow();
+                    let stream = self.binding.local[reader].stream();
+                    stream.device.run(|| {
+                        // SAFETY: the event and both exact compute streams are
+                        // retained by Execution; cross-device waits are allowed.
+                        unsafe { stream.device.library.cuda_stream_wait_event(stream.raw, ready[owner].raw) }
+                    })?;
+                }
+                Ok(())
+            }
+            fn attention_commit(&mut self, rank: usize) -> Result<()> {
+                if let Some(members) = &self.binding.packed {
+                    self.binding.local[rank].attention_packed(self.layer, members)
+                } else {
+                    self.binding.local[rank].context_attention(self.layer, self.binding.rows, self.binding.speculative)
+                }
+            }
+            fn record_commit(&mut self, rank: usize) -> Result<()> {
+                let execution = self.binding.protocol.execution;
+                execution.state_ready[self.layer].borrow_mut()[rank]
+                    .record(self.binding.local[rank].stream())?;
+                execution.state_pending[self.layer][rank].set(true);
+                Ok(())
+            }
+        }
+        context_pair_with(&mut Pair { binding: self, layer })?;
+        // Both whole-step replays must be queued before ordinary producer
+        // joins, otherwise rank 0's device wait can block rank 1's publication.
+        if self.local[0].native_attention(layer)? {
+            ensure!(self.local[1].native_attention(layer)?, "Kimi K6 attention rank formats differ");
+            self.publish_core(layer,false)?; self.meet_core(layer, false, "delta")
+        } else {
+            self.publish("attention output")?;
+            self.meet("attention output", "delta")
+        }
     }
     fn owned(&mut self, layer: usize, gpu: usize) -> Result<()> {
         ensure!(gpu < self.local.len(), "Kimi attention owner rank");
@@ -783,16 +948,21 @@ impl PipelineKernels for Bindings<'_, '_, '_> {
     fn begin_ffn(&mut self, layer: usize, owner: Option<usize>) -> Result<FfnTicket> {
         if self.local.len() == 1 { return self.begin_local_ffn(layer, owner); }
         ensure!(owner.is_none() && self.pending.is_none(), "Kimi FFN owner or unfinished wave");
-        for local in self.local.iter_mut() { local.residual(MixSite::Ffn(layer), self.rows)?; }
         let dense = self.local[0].config().dense[layer];
+        if !dense {
+            for local in self.local.iter_mut() { local.residual(MixSite::Ffn(layer), self.rows)?; }
+        }
         let owner = if dense { 0 } else { super::weights::routed_owner(self.local[0].config(), layer)? };
         let rtx = !dense && self.experts.iter().any(|expert|
             expert.as_ref().is_some_and(|e| e.layers().contains(&layer)));
-        let spark = if dense {
+        let spark = if dense || self.execution.skip_routed_experts {
+            if !dense { self.local[owner].route(layer, self.rows, None)?; }
             for local in self.local.iter_mut() { local.ffn(layer, self.rows)?; }
             None
         } else {
-            let (canonical, wire) = self.local[owner].route(layer, self.rows)?;
+            let tally = self.execution.expert_usage.as_ref().map(|usage|
+                usage.routes(self.local[owner].stream().device.id, layer, self.execution.usage_phase.get())).transpose()?;
+            let (canonical, wire) = self.local[owner].route(layer, self.rows, tally)?;
             if rtx || owner == 0 {
                 self.transfer_planes(owner, &[("route ids", canonical.ids.bytes),
                     ("route weights", canonical.weights.bytes), ("expert wire", wire.bytes)])?;
@@ -890,6 +1060,7 @@ impl PipelineKernels for Bindings<'_, '_, '_> {
             if self.local[0].native_ffn(layer)? {self.meet_core(layer,true,"delta")?;}
             else {self.meet("ffn output", "delta")?;}
         }
+        self.local[0].capture_post_ffn(layer, self.rows)?;
         // Checkpoint taps are the completed decoder prefix plus final FFN
         // delta, before the following residual mixer or final output norm.
         if let Some(draft) = self.draft { draft.tap_at(layer, &mut self.local[0], self.rows, self.tap_first)?; }
@@ -921,7 +1092,7 @@ impl UnitHooks<'_, '_, '_, '_> {
     fn select(&mut self, unit: &crate::shared::prefill_pipeline::Unit) -> Result<()> {
         for local in self.binding.local.iter_mut() {
             local.select_subwave(Some(unit.rows.clone()))?;
-            local.select_attention_unit(unit.index, unit.rows.len())?;
+            local.select_core_view_unit(unit.index, unit.rows.len())?;
         }
         self.binding.rows = unit.rows.len();
         self.binding.completed = self.state[unit.index].completed;
@@ -937,7 +1108,7 @@ impl crate::shared::prefill_pipeline::PrefillHooks for UnitHooks<'_, '_, '_, '_>
         // ones hold a wave across hooks.
         let cfg = self.binding.local[0].config();
         let rtx = self.binding.experts.iter().any(|expert| expert.as_ref().is_some_and(|e| e.layers().contains(&layer)));
-        if cfg.dense[layer] || rtx { crate::shared::prefill_pipeline::FfnRoute::Local }
+        if cfg.dense[layer] || rtx || self.binding.execution.skip_routed_experts { crate::shared::prefill_pipeline::FfnRoute::Local }
         else { crate::shared::prefill_pipeline::FfnRoute::Spark }
     }
     fn begin_unit(&mut self, unit: &crate::shared::prefill_pipeline::Unit) -> Result<()> {

@@ -1,4 +1,4 @@
-"""CPU-only static checks for the replicated-group Spark TP2/TP3 native roles.
+"""CPU-only static checks for the Spark TP2/TP3 native roles.
 
 No torch, CUDA or SparkInfer import happens here: the authoritative role tables
 are pure literals inside the exporters, and the native/CMake wiring is checked
@@ -55,7 +55,7 @@ def test_spark_tp2_tp3_geometry_is_exact_and_padding_free() -> None:
     assert native_id["spark_tp2"] == 5
     assert native_id["spark_tp3"] == 6
     # TP6 (role 7) is covered by its own contract test; the historical
-    # replicated-group degrees must not be disturbed by its addition.
+    # Spark TP degrees must not be disturbed by its addition.
     assert {k: degree[k] for k in ("spark", "spark_tp2", "spark_tp3")} == {
         "spark": 4, "spark_tp2": 2, "spark_tp3": 3
     }
@@ -106,7 +106,7 @@ def test_ordinary_exporter_routes_new_roles_only_through_fp8_slices() -> None:
     tables = _literal_assignments(EXPERTS, {"SPARK_ROLES", "SPARK_TP_DEGREES"})
     roles = tables["SPARK_ROLES"]
     degrees = tables["SPARK_TP_DEGREES"]
-    # The replicated-group roles are present with their plan-time degrees; TP6
+    # The Spark TP roles are present with their plan-time degrees; TP6
     # (degree 6) has its own contract test and must not renumber TP2/TP3.
     for role in ("spark", "spark_tp2", "spark_tp3", "spark_tp6"):
         assert role in roles
@@ -255,8 +255,8 @@ import pytest  # noqa: E402
 
 
 def _load_width_fixture():
-    path = Path(__file__).with_name("tp_ep_width_cmake_fixture.py")
-    spec = importlib.util.spec_from_file_location("tp_ep_width_cmake_fixture", path)
+    path = Path(__file__).with_name("spark_tp_width_cmake_fixture.py")
+    spec = importlib.util.spec_from_file_location("spark_tp_width_cmake_fixture", path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module

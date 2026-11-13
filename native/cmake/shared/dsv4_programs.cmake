@@ -16,7 +16,7 @@
 set(CUTEAFD_FAMILY_PROGRAMS OFF)
 if(CUTEAFD_ENABLE_DSV4_AOT OR CUTEAFD_ENABLE_GLM_AOT OR CUTEAFD_ENABLE_MIMO_AOT OR CUTEAFD_ENABLE_GLMF_AOT OR
    CUTEAFD_ENABLE_QWEN4_AOT OR CUTEAFD_ENABLE_QWEN_DENSE_AOT OR CUTEAFD_ENABLE_STEP5_AOT OR CUTEAFD_ENABLE_KIMIK3_AOT OR
-   CUTEAFD_ENABLE_MUSE_AOT OR CUTEAFD_ENABLE_ML4_AOT)
+   CUTEAFD_ENABLE_MUSE_AOT OR CUTEAFD_ENABLE_ML4_AOT OR CUTEAFD_ENABLE_MINIMAX_AOT)
   set(CUTEAFD_FAMILY_PROGRAMS ON)
 endif()
 if(CUTEAFD_CUDA_ARCHITECTURES MATCHES "^120")
@@ -86,9 +86,9 @@ if(CUTEAFD_ENABLE_KIMIK3_AOT)
   # Kimi always packages the native K6 core programs; the runtime selects them
   # from the checkpoint's own headers.
   if(CUTEAFD_PROGRAM_GEOMETRY STREQUAL "")
-    set(CUTEAFD_PROGRAM_GEOMETRY "kimik3,dense_trellis_k6,kimi_split")
+    set(CUTEAFD_PROGRAM_GEOMETRY "kimik3,kimik31,dense_trellis_k6,kimi_split")
   else()
-    set(CUTEAFD_PROGRAM_GEOMETRY "${CUTEAFD_PROGRAM_GEOMETRY},kimik3,dense_trellis_k6,kimi_split")
+    set(CUTEAFD_PROGRAM_GEOMETRY "${CUTEAFD_PROGRAM_GEOMETRY},kimik3,kimik31,dense_trellis_k6,kimi_split")
   endif()
 endif()
 if(CUTEAFD_ENABLE_MUSE_AOT)
@@ -165,6 +165,13 @@ if(CUTEAFD_ENABLE_STEP5_AOT)
     set(CUTEAFD_PROGRAM_GEOMETRY "${CUTEAFD_PROGRAM_GEOMETRY},dense_trellis_k6")
   endif()
 endif()
+if(CUTEAFD_ENABLE_MINIMAX_AOT)
+  if(CUTEAFD_PROGRAM_GEOMETRY STREQUAL "")
+    set(CUTEAFD_PROGRAM_GEOMETRY "minimax")
+  else()
+    set(CUTEAFD_PROGRAM_GEOMETRY "${CUTEAFD_PROGRAM_GEOMETRY},minimax")
+  endif()
+endif()
 set(CUTEAFD_DSV4_DIR "${CMAKE_CURRENT_BINARY_DIR}/dsv4_programs")
 string(TOLOWER "${CUTEAFD_CONTEXT_SPLIT_AOT}" context_split_aot)
 if(NOT context_split_aot MATCHES "^(off|on|only)$")
@@ -214,7 +221,7 @@ if(CUTEAFD_ENABLE_EXLR8_AOT)
     --exlr8-family "${exlr8_families}")
 endif()
 set(stamp "${CMAKE_CURRENT_BINARY_DIR}/dsv4_programs.stamp")
-file(GENERATE OUTPUT "${stamp}" CONTENT "${CUTEAFD_DSV4_EXPORT_ARGS}\n")
+file(GENERATE OUTPUT "${stamp}" CONTENT "${CUTEAFD_BUILD_KIND}|${CUTEAFD_DSV4_EXPORT_ARGS}\n")
 # The program list lives in the exporter; objects are collected into one
 # archive so CMake need not know each stem.
 set(CUTEAFD_DSV4_ARCHIVE "${CUTEAFD_DSV4_DIR}/libcuteafd_dsv4_programs.a")
@@ -224,7 +231,7 @@ add_custom_command(
   COMMAND ${CUTEAFD_SPARKINFER_VERIFY_COMMAND}
   COMMAND "${CMAKE_COMMAND}" -E rm -rf "${CUTEAFD_DSV4_DIR}"
   COMMAND "${CMAKE_COMMAND}" -E env ${CUTEAFD_SPARKINFER_PYTHON_ENV}
-    "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/aot/export_b12x_dsv4_aot.py"
+    ${CUTEAFD_EXPORT_LAUNCHER} "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/aot/export_b12x_dsv4_aot.py"
     --output-dir "${CUTEAFD_DSV4_DIR}" ${CUTEAFD_DSV4_EXPORT_ARGS}
   COMMAND sh -c "${CMAKE_AR} qcs '${CUTEAFD_DSV4_ARCHIVE}' '${CUTEAFD_DSV4_DIR}'/*.o"
   DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/aot/export_b12x_dsv4_aot.py" "${stamp}"

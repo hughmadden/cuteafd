@@ -144,6 +144,7 @@ impl EngramGatherTicket {
             Ok(GatherPoll::Ready(lease)) => Ok(EngramGatherPoll::Ready(EngramGatherLease(lease))),
             Err(GatherFailure::Job(error)) => Err(error),
             Err(GatherFailure::Worker(error)) => Err(anyhow::Error::new(error).context("engram gather")),
+            Err(GatherFailure::TimedOut(waited)) => Err(anyhow::anyhow!("engram gather timed out after {waited:?}")),
         }
     }
 }

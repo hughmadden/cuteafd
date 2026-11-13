@@ -1,4 +1,5 @@
 //! Native EXLR8 routed experts on one RTX or the shared paired-expert executor.
+use crate::shared::memory::Tag;
 use super::native::RankCompletion;
 use super::{ExpertInput, PartialDtype, Routes, RtxExpertLayer, RtxShard};
 use crate::shared::experts::exlr8::{grouped_decode_from_row, view, Exlr8Execution, Exlr8PrefillActivations, Exlr8Weights};
@@ -150,13 +151,25 @@ impl<'a> Exlr8RtxWeights<'a> {
             Ok(executions)
         })?;
         let completion = RankCompletion::new(Event::new(device)?);
-        let output = Allocation::new(device, self.max_rows * self.hidden * 2)?;
+        let output = Allocation::new(device, self.max_rows * self.hidden * 2, Tag::workspace("experts/rtx-exlr8-output"))?;
         let sm_copy = device.run(|| device.library.v41_peer_copy())?;
         Ok(Exlr8Rtx { completion, owner: self, executions, output, sm_copy })
     }
 }
 
 impl RtxExpertLayer for Exlr8Rtx<'_> {
+    fn allocation_receipts(&self, inventory: &mut crate::shared::memory::receipts::Inventory<'_>,
+        name: &str) -> Result<()> {
+        for (index, weight) in self.owner.weights.iter().enumerate() {
+            weight.allocation_receipts(inventory, &format!("{name}.weight.{}", self.owner.layers[index]))?;
+        }
+        for (index, execution) in self.executions.iter().enumerate() {
+            inventory.extend(execution.workspace_receipts(&format!("{name}.execution.{index}"),
+                inventory.location(self.owner.device.id)?, self.owner.device.id, inventory.lifetime())?)?;
+        }
+        inventory.device(&format!("{name}.output"), self.output.buffer)
+    }
+
     fn shard(&self) -> RtxShard { self.owner.shard }
     fn partial(&self) -> PartialDtype { PartialDtype::Bf16 }
     fn uses_fp8_input(&self) -> bool { true }

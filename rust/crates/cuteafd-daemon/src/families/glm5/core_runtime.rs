@@ -1,6 +1,6 @@
 //! GLM's native K6 projection seams over shared compressed-weight owners.
 use crate::shared::{dense_trellis::{CoreWeights, Projection, ProjectionLayout, ProjectionScratch},
-    memory::device::{Allocation, Device}};
+    memory::{device::{Allocation, Device}, Tag}};
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::{CuteafdDeviceBuffer as Buffer, dense_trellis::TrellisDType, programs::Programs,
     Bf16F32Add, F32Bf16Narrow, V41PeerCopy};
@@ -10,8 +10,13 @@ use std::{collections::BTreeMap, ffi::c_void};
 /// scratch is serialized; the caller retains split output cores in row slots.
 pub(crate) struct CorePrograms<'a> {
     projections: BTreeMap<(usize, usize, usize, &'static str), Projection<'a>>,
-    layouts: [ProjectionLayout; 2],
+    layouts: [Option<ProjectionLayout>; 2],
     stages: [cuteafd_loader::families::glm5::core::CoreStageLayout; 2],
+    native_bf16: [cuteafd_ffi::draft_projection::DraftProjections<'a>; 2],
+    native_fp8: [[cuteafd_ffi::native_attention::Fp8Projections<'a>; 2]; 2],
+    native_scratch: [usize; 2],
+    native_programs: Vec<String>,
+    pub f32_add: cuteafd_ffi::F32Add<'a>,
     pub add: Bf16F32Add<'a>,
     pub narrow: F32Bf16Narrow<'a>,
     pub copy: V41PeerCopy<'a>,
@@ -36,18 +41,57 @@ impl<'a> CorePrograms<'a> {
             }
             projections.insert(key, projection);
         }
-        if projections.is_empty() {
+        if projections.is_empty() && layers.iter().all(|layer| layer.attention_native.is_empty()) {
             ensure!(admitted.is_none_or(|a| a.body.is_empty()), "GLM K6 admitted body has no loaded owners");
             return Ok(None);
         }
         let admitted = admitted.context("GLM K6 body has no admitted native layout")?;
-        let layouts = [layouts[0].take().context("GLM K6 decode layout")?,
-            layouts[1].take().context("GLM K6 prefill layout")?];
+        let layouts = [layouts[0].take(), layouts[1].take()];
         for (actual, expected) in layouts.iter().zip([admitted.decode.as_ref(), admitted.prefill.as_ref()]) {
-            let expected = expected.context("GLM K6 admitted projection layout")?;
-            ensure!(actual.rows == expected.rows && actual.extents == expected.extents,
+            ensure!(actual.as_ref().map(|layout| (layout.rows, &layout.extents))
+                == expected.map(|layout| (layout.rows, &layout.extents)),
                 "GLM K6 loaded body scratch differs from admission");
         }
+        use cuteafd_ffi::draft_projection::{DraftProjections, ProjectionOutput};
+        use cuteafd_ffi::native_attention::Fp8Projections;
+        use cuteafd_loader::{families::glm5::core::native_output,
+            placement::planner::native_attention::{NativeProgram, NativePrograms}};
+        let native_layouts = layers.iter().flat_map(|layer| layer.attention_native.values())
+            .map(|weight| &weight.layout).collect::<Vec<_>>();
+        let requests = native_layouts.iter().map(|&layout| NativeProgram { layout,
+            output: native_output(layout) }).collect::<Vec<_>>();
+        let mut native_programs = std::collections::BTreeSet::new();
+        for capacity in [super::engine::DECODE_ROWS, unit] {
+            let selected = NativePrograms::resolve(&requests, capacity, None)?;
+            for name in &selected.programs {
+                ensure!(programs.contains(name), "GLM native projection export {name} missing before capture");
+            }
+            native_programs.extend(selected.programs);
+        }
+        let native_programs = native_programs.into_iter().collect();
+        let shapes = |fp8, f32| native_layouts.iter()
+            .filter(|layout| layout.fp8 == fp8 && (native_output(layout) == ProjectionOutput::F32) == f32)
+            .map(|layout| (layout.shape[1], layout.shape[0])).collect::<Vec<_>>();
+        let native_bf16 = [DraftProjections::load_with_output(programs, &shapes(false, false), rows, ProjectionOutput::Bf16)?,
+            DraftProjections::load_with_output(programs, &shapes(false, true), rows, ProjectionOutput::F32)?];
+        let fp8 = |capacity| -> Result<_> { Ok([
+            Fp8Projections::load(programs, &shapes(true, false), capacity, ProjectionOutput::Bf16)?,
+            Fp8Projections::load(programs, &shapes(true, true), capacity, ProjectionOutput::F32)?]) };
+        let native_fp8 = [fp8(super::engine::DECODE_ROWS)?, fp8(unit)?];
+        let mut native_scratch = [0usize; 2];
+        for (index, group) in native_fp8.iter().enumerate() {
+            for (output, registry) in group.iter().enumerate() {
+                for (k, n) in shapes(true, output == 1) {
+                    native_scratch[index] = native_scratch[index].max(registry.scratch_bytes(k, n)?);
+                }
+            }
+        }
+        ensure!(native_scratch == admitted.native_scratch, "GLM native scratch differs from admission");
+        let mut actual = layers.iter().flat_map(|layer| layer.attention_native.values())
+            .map(|weight| weight.layout.clone()).collect::<Vec<_>>();
+        let mut expected = admitted.native.clone();
+        actual.sort_by(|a,b| a.stem.cmp(&b.stem)); expected.sort_by(|a,b| a.stem.cmp(&b.stem));
+        ensure!(actual == expected, "GLM native projection owners differ from admission");
         // Neutral projection and GLM stage namespaces are distinct; both must
         // resolve on this rank before an unmatched peer wait or graph capture.
         programs.load_matching(|name| stage_program(name, ranks))?;
@@ -61,7 +105,8 @@ impl<'a> CorePrograms<'a> {
         let stages = [cuteafd_loader::families::glm5::core::CoreStageLayout::new(cfg, super::engine::DECODE_ROWS, ranks, owned)?,
             cuteafd_loader::families::glm5::core::CoreStageLayout::new(cfg, unit, ranks, owned)?];
         ensure!(admitted.stages.as_ref() == Some(&stages), "GLM K6 loaded BF16 stages differ from admission");
-        Ok(Some(Self { projections, layouts, stages,
+        Ok(Some(Self { projections, layouts, stages, native_bf16, native_fp8, native_scratch, native_programs,
+            f32_add: programs.library().f32_add()?,
             add: programs.library().bf16_f32_add()?, narrow: programs.library().f32_bf16_narrow()?, copy: programs.library().v41_peer_copy()? }))
     }
     /// Include native input/core/output policy entries, including split-K's
@@ -70,28 +115,57 @@ impl<'a> CorePrograms<'a> {
         self.projections.values().flat_map(|projection| {
             let p = projection.program.policy();
             [p.native_input.as_str(), p.native.as_str(), p.output_program.as_str()]
-        })
+        }).chain(self.native_programs.iter().map(String::as_str))
     }
 
     pub(crate) fn projection(&self, weights: &CoreWeights<'_>) -> Result<&Projection<'a>> {
         self.projections.get(&projection_key(weights)).context("GLM K6 geometry not bound before capture")
     }
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn native(&self, weights: &crate::shared::native_attention::NativeAttentionWeights<'_>,
+        scratch: &CoreScratch<'_>, input: Buffer, output: Buffer, rows: usize, stream: *mut c_void) -> Result<()> {
+        let [n, k] = weights.layout.shape;
+        let f32 = usize::from(cuteafd_loader::families::glm5::core::native_output(&weights.layout)
+            == cuteafd_ffi::draft_projection::ProjectionOutput::F32);
+        // SAFETY: rank-local admitted owners and scratch outlive the ordered stream;
+        // typed projection wrappers validate output extents before launch.
+        unsafe {
+            if weights.layout.fp8 {
+                self.native_fp8[usize::from(scratch.prefill)][f32].launch(input.ptr,
+                    weights.values.buffer.ptr, weights.scales.as_ref().context("GLM native scales")?.buffer.ptr,
+                    output, scratch.native.as_ref().context("GLM native FP8 scratch")?.buffer, rows, k, n, stream)?;
+            } else {
+                self.native_bf16[f32].launch_checked(input.ptr, weights.values.buffer.ptr, output, rows, k, n, stream)?;
+            }
+        }
+        Ok(())
+    }
     pub(crate) fn allocate(&self, device: Device<'a>, rows: usize, decode: bool) -> Result<CoreScratch<'a>> {
         let index = usize::from(!decode);
         let layout = &self.layouts[index];
-        ensure!(rows == layout.rows, "GLM K6 scratch differs from admitted row capacity");
-        let projection = layout.allocate(device)?;
+        let projection = layout.as_ref().map(|layout| {
+            ensure!(rows == layout.rows, "GLM K6 scratch differs from admitted row capacity");
+            layout.allocate(device, crate::shared::memory::Tag::workspace("glm/native-projection"))
+        }).transpose()?;
         let stages = self.stages[index].extents.iter().map(|(&name, &bytes)|
-            Ok((name, Allocation::new(device, bytes)?))).collect::<Result<_>>()?;
-        Ok(CoreScratch { projection, stages })
+            Ok((name, Allocation::new(device, bytes, Tag::workspace("glm/core-scratch"))?))).collect::<Result<_>>()?;
+        let native = (self.native_scratch[index] > 0)
+            .then(|| Allocation::new(device, self.native_scratch[index], Tag::workspace("glm/core-scratch"))).transpose()?;
+        Ok(CoreScratch { projection, stages, native, prefill: !decode })
     }
 }
 
 pub(crate) struct CoreScratch<'a> {
-    pub projection: ProjectionScratch<'a>,
+    pub projection: Option<ProjectionScratch<'a>>,
     stages: BTreeMap<&'static str, Allocation<'a>>,
+    pub native: Option<Allocation<'a>>,
+    prefill: bool,
 }
 impl CoreScratch<'_> {
+    pub(crate) fn allocation_stages(&self) -> impl Iterator<Item = (&'static str, Buffer)> + '_ {
+        self.stages.iter().map(|(&name, owner)| (name, owner.buffer))
+    }
+
     pub(crate) fn stage(&self, name: &str) -> Result<Buffer> {
         Ok(self.stages.get(name).with_context(|| format!("GLM K6 missing stage {name}"))?.buffer)
     }
@@ -226,6 +300,10 @@ mod tests {
             .split("/// Input-side projections").next().unwrap();
         assert!(meet.contains("if !Self::core_split(layer, \"down\") { return Ok(()); }"));
         assert!(meet.contains("if rank == 0") && meet.contains("cuda_zero_bytes_async"));
+        assert!(meet.contains("else if self.shared_zero_elided(index, layer)"));
+        let policy = source.split("fn shared_zero_elided(").nth(1).unwrap()
+            .split("/// Native cores").next().unwrap();
+        assert!(policy.contains("!layer.dense && Self::core_split(layer, \"down\") && !self.tp2_layer(index)"));
         let reduce = source.split("fn reduce_projection(").nth(1).unwrap()
             .split("/// The caller").next().unwrap();
         assert!(reduce.contains("if rank == 0 { (local, peer) } else { (peer, local) }"));
@@ -238,21 +316,71 @@ mod tests {
     }
 
     #[test]
-    fn retained_row_views_keep_bf16_planes_and_f32_sum_distinct() {
+    fn one_delta_norm_removes_only_the_known_zero_add() {
+        let narrow = |x: f32| {
+            if x.is_nan() { return x; }
+            let bits = x.to_bits();
+            f32::from_bits(bits.wrapping_add(0x7fff + ((bits >> 16) & 1)) & 0xffff0000)
+        };
+        let mut signed_zero_differences = 0;
+        for bits in 0..=u16::MAX {
+            let delta = f32::from_bits(u32::from(bits) << 16);
+            if delta.is_nan() {
+                // NaN payload propagation is not an exactness contract.
+                assert!((delta + 0.0).is_nan());
+                continue;
+            }
+            let old_delta = narrow(delta + 0.0);
+            if delta != 0.0 { assert_eq!(old_delta.to_bits(), delta.to_bits()); }
+            for residual in [-0.0f32, 0.0, -1.0, 1.0, f32::from_bits(0x00010000)] {
+                let old = narrow(residual + old_delta);
+                let elided = narrow(residual + delta);
+                if old.to_bits() != elided.to_bits() {
+                    assert_eq!(delta.to_bits(), (-0.0f32).to_bits());
+                    assert_eq!(residual.to_bits(), (-0.0f32).to_bits());
+                    assert_eq!(old.to_bits(), 0.0f32.to_bits());
+                    assert_eq!(elided.to_bits(), (-0.0f32).to_bits());
+                    signed_zero_differences += 1;
+                }
+            }
+        }
+        assert_eq!(signed_zero_differences, 1);
+        let native = include_str!("engine/native_dense.rs");
+        let norm = native.split("fn ffn_norm(").nth(1).unwrap()
+            .split("pub(super) fn meet_shared_core").next().unwrap();
+        assert!(norm.contains("if self.shared_zero_elided(index, layer) { 1 } else { 2 }"));
+        let engine = include_str!("engine.rs");
+        assert_eq!(engine.matches("if !self.shared_zero_elided(index, &layers[index]) { self.exchange()?.wait(0, ffn)?; }").count(), 2);
+        assert!(engine.contains("if !self.shared_zero_elided(before, &layers[before]) { self.exchange()?.wait(0, ffn)?; }"));
+        assert!(engine.contains("if !self.shared_zero_elided(index, layer) { exchange.push(1, ffn, out, bytes)?; }"));
+        let owned = include_str!("engine/layers.rs");
+        assert!(owned.contains("rank == 1 || !e.shared_zero_elided(index, self.layer(rank, index))"));
+        assert!(owned.contains("rank == 1 && e.shared_zero_elided(index, layer) { continue; }"));
+    }
+
+    #[test]
+    fn retained_row_views_keep_native_f32_k6_bf16_and_sum_distinct() {
         let source = include_str!("engine.rs");
         let view = source.split("impl<'a> StepRows<'a>").nth(1).unwrap()
             .split("pub(crate) struct GlmPeer").next().unwrap();
         // A common two-byte pitch would silently truncate the F32 sum view.
         assert!(view.contains("let width = arenas[plane].buffer.bytes / self.rows;"));
         assert!(view.contains("Ok([view(0)?, view(1)?, view(2)?])"));
-        assert!(source.contains("Some([allocate(2)?, allocate(2)?, allocate(4)?])"));
+        assert!(source.contains(".ranks[rank].attention_partial_bytes)?"));
+        assert!(source.contains(".ranks[rank].down_partial_bytes)?, allocate(4)?])"));
         let native = include_str!("engine/native_dense.rs");
         let receive = native.split("fn core_received(").nth(1).unwrap()
             .split("pub(super) fn publish_projection").next().unwrap();
-        assert!(receive.contains("let bytes = rows * self.cfg.hidden * 2;"));
+        assert!(receive.contains("let bytes = rows * self.cfg.hidden * element_bytes;"));
         let publish = native.split("pub(super) fn publish_projection").nth(1).unwrap()
             .split("fn reduce_projection(").next().unwrap();
-        assert!(publish.contains("self.core_received(1 - rank, at, rows)?.ptr, rows * self.cfg.hidden * 2)"));
+        assert!(publish.contains("if layer.attention_native.contains_key(key) { 4 } else { 2 }"));
+        assert!(publish.contains("self.core_received(1 - rank, at, rows, element_bytes)?.ptr, rows * self.cfg.hidden * element_bytes)"));
+        let reduction = native.split("fn reduce_projection(").nth(1).unwrap()
+            .split("pub(super) fn projection_norm").next().unwrap();
+        assert!(reduction.contains("if rank == 0 { (local, peer) } else { (peer, local) }"));
+        assert!(reduction.find("programs.f32_add.launch").unwrap()
+            < reduction.find("programs.narrow.launch").unwrap());
     }
 
     #[test]

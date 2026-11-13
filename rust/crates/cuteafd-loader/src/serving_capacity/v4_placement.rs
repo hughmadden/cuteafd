@@ -145,20 +145,25 @@ mod tp2_tests {
     }
     #[test]
     fn real_tp2_costs_match_catalog_reference() {
-        let hub = std::path::Path::new("/mnt/sparknest/hf-home/hub");
+        let inputs = crate::plan::inputs::v4_placement_inputs().unwrap();
+        let hub = std::env::var_os("HF_HOME").map(std::path::PathBuf::from)
+            .unwrap_or_else(|| "/mnt/sparknest/hf-home".into()).join("hub");
         for (model, family, resident, staging) in [
             ("deepseek-ai--DeepSeek-V4-Flash-0731", "flash", 1711276032u64, 6684672u64),
             ("wrldsuksgo2mars--DeepSeek-V4-Pro-0813-EXL3-K2-calibrated-v1", "pro", 3212836864, 0)] {
-            let Some(snapshot) = std::fs::read_dir(hub.join(format!("models--{model}/snapshots"))).ok()
+            let snapshot = std::fs::read_dir(hub.join(format!("models--{model}/snapshots"))).ok()
                 .and_then(|entries| entries.filter_map(|e| e.ok()).map(|e| e.path())
-                    .find(|p| p.join("model.safetensors.index.json").is_file())) else { continue };
+                    .find(|p| p.join("model.safetensors.index.json").is_file()))
+                .unwrap_or_else(|| panic!("required V4 checkpoint {model} missing"));
             let catalog = crate::read_expert_catalog(&snapshot).unwrap();
-            let manifest = std::env::var_os("HOME").map(std::path::PathBuf::from).unwrap()
-                .join(format!(".cache/cuteafd/builds/v4-placement/plans-input/{family}-2-1048576/PROGRAMS.json"));
+            let manifest = inputs.join(format!("{family}-2-1048576/PROGRAMS.json"));
             for rank in 0..2 {
                 let cost = deepseek_v4_tp2_expert_cost(&catalog, catalog.routed_experts().first_layer, rank).unwrap();
                 assert_eq!((cost.resident_bytes, cost.staging_bytes), (resident, staging));
-                if catalog.exl3().is_some() && !manifest.is_file() { continue; }
+                for stage in 0..catalog.routed_experts().draft_stages {
+                    let draft = deepseek_v4_tp2_expert_cost(&catalog, catalog.routed_experts().layers + stage, rank).unwrap();
+                    assert_eq!(draft, cost, "{family} stage {stage} uses the backbone geometry");
+                }
                 let workspace = deepseek_v4_tp2_workspace(&catalog, Some(&manifest), 4096).unwrap();
                 let expected = if family == "flash" {
                     let shape = catalog.routed_experts();
@@ -172,7 +177,17 @@ mod tp2_tests {
                         arena = arena.div_ceil(16) * 16 + plane;
                     }
                     arena + 4096 * h * 4
-                } else { 1343287468 };
+                } else {
+                    let root = manifest.parent().unwrap().join("exl3/exl3-dsv4p-k23/rtx-tp2");
+                    let mut manifests = std::fs::read_dir(root).unwrap().map(|entry| {
+                        let path = entry.unwrap().path().join("v41_exl3.json");
+                        serde_json::from_slice::<serde_json::Value>(&std::fs::read(path).unwrap()).unwrap()
+                    }).collect::<Vec<_>>();
+                    manifests.sort_by_key(|m| m["capacity"].as_u64().unwrap());
+                    assert_eq!(manifests.len(), 8, "published TP2 EXL3 capacity ladder");
+                    super::super::exl3_workspace_bytes(&manifests, true, Exl3Epilogue::Sum).unwrap()
+                        + 4096 * catalog.routed_experts().hidden as u64 * 4
+                };
                 assert_eq!(workspace, expected);
                 eprintln!("TP2 {family} rank{rank}: resident={} staging={} workspace={workspace}", cost.resident_bytes, cost.staging_bytes);
             }

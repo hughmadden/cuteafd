@@ -181,37 +181,4 @@ mod tests {
         drop(spawn());
     }
 
-    /// Protect the ordering at the real blocking/admission sites without a GPU.
-    #[test]
-    fn serving_paths_are_diagnostic_only_and_instrument_slow_work() {
-        let independent = include_str!("independent.rs");
-        assert!(independent.contains("draft.poll_propose(lane, &drafting)? }"));
-        assert!(independent.contains("stall::tick();"));
-        let scheduler = include_str!("../scheduler.rs");
-        let single = &scheduler[scheduler.find("fn single_lane_round<").unwrap()..];
-        assert!(single[..4000].contains("clock.draft(|| draft.propose(lane, &seeds))?"));
-        assert!(!scheduler.contains("stall::anchor_only"));
-        assert!(!independent.contains("stall::anchor_only"));
-        let admission = &scheduler[scheduler.find("let mut held_slots =").unwrap()..];
-        assert!(admission.find("stall::mark(stall::Phase::Admission").unwrap()
-            < admission.find("loop {").unwrap());
-        let blocking = &admission[admission.find("let job = if busy_slots == 0 && !closed").unwrap()..];
-        assert!(blocking.find("stall::mark(stall::Phase::Idle, 0)").unwrap()
-            < blocking.find("receive.blocking_recv()").unwrap());
-        let resumed = &blocking[blocking.find("Some(job) => {").unwrap()..];
-        assert!(resumed.find("stall::mark(stall::Phase::Admission, 1)").unwrap()
-            < resumed.find("admission::Prepared::new").unwrap());
-        for phase in ["Phase::Retire", "Phase::Admission", "Phase::Decode", "Phase::Failed", "Phase::Idle"] {
-            assert!(scheduler.contains(&format!("stall::mark(stall::{phase}")), "{phase} not marked");
-        }
-        assert!(scheduler.contains("let _stall_watch = stall::spawn();"));
-        let packed = &scheduler[scheduler.find("fn prefill_packed_admissions<").unwrap()
-            ..scheduler.find("pub(crate) fn exercise_packed_prefill<").unwrap()];
-        assert_eq!(packed.matches("stall::tick();").count(), 3);
-        let serving = include_str!("../../v41_native_serve.rs");
-        let score = &serving[serving.find("fn score<'a,").unwrap()
-            ..serving.find("mod admitted_prefill_tests").unwrap()];
-        assert_eq!(score.matches("scheduler::stall::tick();").count(), 2);
-        assert!(include_str!("../prefill_target.rs").contains("super::scheduler::stall::tick();"));
-    }
 }

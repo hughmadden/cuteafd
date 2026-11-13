@@ -4,6 +4,20 @@ use socket2::{Domain, SockAddr, Socket, Type};
 use std::{cell::Cell, fs::File, os::fd::AsRawFd, sync::mpsc, thread};
 use tempfile::{NamedTempFile, TempDir};
 
+#[test]
+fn admitted_push_envelope_matches_flash_bytes() {
+    let step = crate::shared::dense_read::STEP_BYTES as u64;
+    for largest in [0, 1, 256, step - 1, step, step + 1, u64::MAX] {
+        for slots in [1usize, 2, cuteafd_ffi::push_ring::DEFAULT_SLOTS] {
+            let slot = cuteafd_ffi::push_ring::DEFAULT_SLOT_BYTES as u64;
+            let capped = largest.min(step);
+            let flash = capped * (2 * slots as u64 + 1) * 2 + slots as u64 * slot + 10 * capped;
+            assert_eq!(admitted_push_envelope(largest, slots, slot).unwrap(), flash);
+        }
+    }
+    assert!(admitted_push_envelope(step, usize::MAX, u64::MAX).is_err());
+}
+
 struct Server {
     _directory: TempDir,
     client: PushClient,
@@ -27,6 +41,7 @@ impl Server {
             client: PushClient {
                 socket: path.to_str().unwrap().into(),
                 timeout: Duration::from_millis(50),
+                setting: "push socket",
             },
             _directory: directory,
             thread,
@@ -228,6 +243,7 @@ fn absent_socket_restarts_whole_group() {
     let client = PushClient {
         socket: directory.path().join("absent").to_str().unwrap().into(),
         timeout: Duration::from_millis(50),
+        setting: "push socket",
     };
     assert_fallback(&client, |c| c.create(vec![], vec![]).map(|_| ()));
 }
@@ -560,6 +576,7 @@ fn full_socket_backlog_cannot_hang_model_loading() {
     let client = PushClient {
         socket: path.to_str().unwrap().into(),
         timeout: Duration::from_millis(50),
+        setting: "push socket",
     };
     assert_fallback(&client, |client| {
         let error = match client.create(vec![], vec![]) {
@@ -665,6 +682,43 @@ fn socket_setting_defaults_and_accepts_an_explicit_endpoint() {
     assert_eq!(PushClient::configured(Some("@isolated-push".into())).socket, "@isolated-push");
 }
 
+#[test]
+fn socket_endpoint_limits_count_bytes_and_distinguish_abstract_names() {
+    for socket in ["x".repeat(107), format!("@{}", "x".repeat(107)), "\u{00e9}".repeat(53)] {
+        assert!(PushClient::at(socket, Duration::from_secs(1)).is_ok());
+    }
+    for (socket, bytes) in [("x".repeat(108), 108),
+        (format!("@{}", "x".repeat(108)), 108), ("\u{00e9}".repeat(54), 108)] {
+        let error = validate_socket_endpoint(&socket).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        let cause = error.get_ref().unwrap().downcast_ref::<SocketEndpointError>().unwrap();
+        assert_eq!((cause.bytes, cause.limit), (bytes, 107));
+        assert!(error.to_string().contains("108 bytes > 107 bytes"));
+        assert!(PushClient::at(socket, Duration::from_secs(1)).is_err());
+    }
+}
+
+#[test]
+fn overlong_env_endpoint_fails_before_create_or_join_connects() {
+    let client = PushClient::configured(Some("x".repeat(108)));
+    let create = match client.create(vec![], vec![]) {
+        Ok(_) => panic!("overlong endpoint accepted"),
+        Err(error) => error,
+    };
+    let join = match client.join(JoinArgs {
+        group: 1, token: 2, rank: 0, ring_fd: -1, slots: 1, slot_bytes: 4096,
+    }) {
+        Ok(_) => panic!("overlong endpoint accepted"),
+        Err(error) => error,
+    };
+    for error in [create, join] {
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        let cause = error.get_ref().unwrap().downcast_ref::<SocketEndpointError>().unwrap();
+        assert_eq!(cause.setting, "CUTEAFD_PUSH_SOCKET");
+        assert!(error.to_string().starts_with("CUTEAFD_PUSH_SOCKET: socket path"));
+    }
+}
+
 /// A joined rank waits through the group's start (its peers still joining,
 /// with no hub events at all) beyond the stream idle deadline; once the group
 /// runs, the idle deadline applies again.
@@ -691,4 +745,30 @@ fn joined_rank_waits_for_the_group_start_then_keeps_the_idle_deadline() {
     assert!(started.elapsed() < Duration::from_millis(800), "the idle deadline applies after the start");
     drop(rank);
     server.finish();
+}
+
+#[test]
+fn host_envelope_validates_geometry_capacity_and_physical_lifetimes() {
+    use crate::placement::planner::{Lifetime, Location, Phase, Refusal};
+    assert!(PushHostEnvelope::new(vec![], vec![], 1, 1).is_err());
+    assert!(PushHostEnvelope::new(vec![1], vec![], 1, 1).is_err());
+    assert!(PushHostEnvelope::new(vec![1], vec![1], 0, 1).is_err());
+    assert!(PushHostEnvelope::new(vec![1], vec![1], u64::MAX, 2).is_err());
+    assert!(PushHostEnvelope::new(vec![u64::MAX], vec![1], 1, 1).is_err());
+    assert!(PushHostEnvelope::with_retained(vec![1], vec![1], vec![], 1, 1).is_err());
+    let admitted = PushHostEnvelope::with_retained(vec![40], vec![80], vec![20], 4, 16).unwrap();
+    let owners = admitted.allocations("push").unwrap();
+    assert_eq!(owners.iter().map(|owner| owner.bytes).sum::<u64>(), admitted.bytes().unwrap());
+    let retained = owners.iter().find(|owner| owner.id == "push.0.retained").unwrap();
+    assert_eq!(retained.location, Location::HOST);
+    assert_eq!(retained.lifetime, Lifetime::RESIDENT);
+    assert!(owners.iter().filter(|owner| owner.id != retained.id)
+        .all(|owner| owner.location == Location::PINNED
+            && owner.lifetime == Lifetime { first: Phase::Load, last: Phase::Load }));
+    let actual = PushHostEnvelope::with_retained(vec![41], vec![81], vec![21], 4, 16).unwrap();
+    let refusal = admitted.validate_usage(&actual).unwrap_err();
+    assert!(matches!(&refusal, Refusal::Capacity { budget, required: 41, available: 40, .. }
+        if budget == "coordinator push expert host rank 0"));
+    assert_eq!(refusal, admitted.validate_usage(&actual).unwrap_err());
+    assert!(admitted.allocations("").is_err());
 }

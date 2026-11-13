@@ -29,10 +29,10 @@ impl<'a> Inputs<'a> {
     fn new(owner: Device<'a>) -> Result<Self> {
         let rows = CAPACITY as usize;
         Ok(Self {
-            hidden: Allocation::new(owner, rows * 10240)?,
-            ids: Allocation::new(owner, padded(rows * 12))?,
-            weights: Allocation::new(owner, padded(rows * 12))?,
-            shared: Allocation::new(owner, rows * 10240)?,
+            hidden: Allocation::new(owner, rows * 10240, crate::shared::memory::TEST)?,
+            ids: Allocation::new(owner, padded(rows * 12), crate::shared::memory::TEST)?,
+            weights: Allocation::new(owner, padded(rows * 12), crate::shared::memory::TEST)?,
+            shared: Allocation::new(owner, rows * 10240, crate::shared::memory::TEST)?,
         })
     }
     fn fill_own(&self, seed: usize) -> Result<()> {

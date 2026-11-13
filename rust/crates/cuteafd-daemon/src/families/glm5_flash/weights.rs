@@ -1,7 +1,7 @@
 //! GLM 5.3 Flash coordinator weights, packed for the exported glmf_* programs.
 //!
-//! The MLA (`q_a|kv_a`, `q_b`, `o_proj`), dense and shared-expert projections
-//! are FP8 only: the primary checkpoint's E4M3 bytes and FP32 128x128 block
+//! Legacy MLA, dense and shared-expert projections use FP8:
+//! the primary checkpoint's E4M3 bytes and FP32 128x128 block
 //! scales, or 128x128 blocks quantized from its BF16 at load (the BF16 is
 //! never resident). Every other matrix operand is BF16, except where an FP8
 //! representation is selected instead: the KDA in/out projections
@@ -30,7 +30,8 @@
 //! KDA activations for its token rows. Quantization runs once before replication.
 use crate::shared::experts::rtx::dense::{Job, Rect};
 use crate::shared::fp8_load_quant::Target;
-use crate::shared::memory::DeviceAllocation;
+use crate::shared::memory::{DeviceAllocation, device::{Allocation, Device}, weight_arena::DeviceWeightArena};
+use cuteafd_loader::families::glm5_flash::weight_layout::joined;
 use crate::shared::peer_split::{Axis, RankDevice};
 use anyhow::{ensure, Context, Result};
 use cuteafd_core::DType;
@@ -44,8 +45,9 @@ use std::os::unix::fs::FileExt;
 
 use crate::shared::placement::layers::AttentionShare;
 use cuteafd_loader::placement::{FfnMode, LayerExecutionPlan, LayerMode};
+use cuteafd_core::memory_layout::ArenaTag;
 
-pub(crate) const PREFIX: &str = "model.language_model.";
+use cuteafd_loader::families::glm5_flash::weight_layout::PREFIX;
 
 pub(crate) struct GlmfLayer<'a> {
     pub attention: GlmNextAttention,
@@ -54,12 +56,29 @@ pub(crate) struct GlmfLayer<'a> {
     pub split: bool,
     pub attention_share: AttentionShare,
     pub(crate) core: std::collections::BTreeMap<String, crate::shared::dense_trellis::CoreWeights<'a>>,
+    pub(crate) attention_native: std::collections::BTreeMap<String, NativeAttentionWeights<'a>>,
     pub(crate) native: HashMap<String, DeviceAllocation<'a>>,
-    pub(crate) native_projections: HashMap<&'static str, crate::shared::experts::exlr8::dense_weights::NativeProjection>,
+    pub(crate) native_projections: HashMap<&'static str, cuteafd_loader::plan::exlr8::dense::requests::NativeProjection>,
     operands: HashMap<&'static str, DeviceAllocation<'a>>,
 }
 
 impl GlmfLayer<'_> {
+    pub(super) fn inventory(&self, inventory: &mut crate::shared::memory::receipts::Inventory<'_>,
+        prefix: &str) -> Result<()> {
+        for (name, owner) in &self.operands { owner.inventory(inventory, &format!("{prefix}.{name}"))?; }
+        for (name, owner) in &self.native { owner.inventory(inventory, &format!("{prefix}.native.{name}"))?; }
+        for (name, owner) in &self.core {
+            owner.payload.inventory(inventory, &format!("{prefix}.{name}.trellis"))?;
+            owner.suh.inventory(inventory, &format!("{prefix}.{name}.suh"))?;
+            owner.svh.inventory(inventory, &format!("{prefix}.{name}.svh"))?;
+        }
+        for (name, owner) in &self.attention_native {
+            owner.values.inventory(inventory, &format!("{prefix}.{name}.values"))?;
+            if let Some(scales) = &owner.scales { scales.inventory(inventory, &format!("{prefix}.{name}.scales"))?; }
+        }
+        Ok(())
+    }
+
     /// The device range of `operand`, when the layer has it.
     pub fn range(&self, operand: &str) -> Option<crate::shared::l2_prefetch::Range> {
         self.operands.get(operand).map(|a| (a.buffer.ptr.cast_const(), a.buffer.bytes))
@@ -90,6 +109,8 @@ impl GlmfLayer<'_> {
         self.operands.values().map(|a| a.buffer.bytes).sum::<usize>()
             + self.core.values().map(|w| w.payload.buffer.bytes + w.suh.buffer.bytes + w.svh.buffer.bytes).sum::<usize>()
             + self.native.values().map(|w| w.buffer.bytes).sum::<usize>()
+            + self.attention_native.values().map(|w| w.values.buffer.bytes
+                + w.scales.as_ref().map_or(0, |s| s.buffer.bytes)).sum::<usize>()
     }
 
     pub fn native(&self, key: &str) -> Result<CuteafdDeviceBuffer> {
@@ -97,10 +118,13 @@ impl GlmfLayer<'_> {
     }
 }
 
+use crate::shared::native_attention::{NativeAttentionWeights, AttentionRecord, attention_records};
+
 pub(crate) struct GlmfWeights<'a> {
     pub layers: Vec<GlmfLayer<'a>>,
     pub norm: DeviceAllocation<'a>,
-    /// The one resident vocabulary head (BF16, or FP8 with --fp8-head).
+    /// The one resident vocabulary head (BF16, FP8 with --fp8-head, or after
+    /// [`super::head::GlmfHead::pack`] the exact 12-bit copy with --fp8-head packed).
     pub head: super::head::GlmfHead<'a>,
 }
 
@@ -110,10 +134,29 @@ pub(crate) struct Residency {
     pub kda_bf16: usize,
     pub kda_fp8: usize,
     pub head_bf16: usize,
+    /// The FP8 head, or a native checkpoint's own (K6, row-FP8) head.
     pub head_fp8: usize,
+    pub head_packed: usize,
 }
 
 impl GlmfWeights<'_> {
+    pub(super) fn allocation_receipts(&self,
+        peers: &[Vec<GlmfLayer<'_>>], devices: cuteafd_loader::placement::planner::CoordinatorDevices<'_>)
+        -> Result<Vec<cuteafd_loader::placement::planner::Receipt>> {
+        use cuteafd_core::memory_layout::Category;
+        use cuteafd_loader::placement::planner::Lifetime;
+        let mut inventory = crate::shared::memory::receipts::Inventory::new(devices,
+            "glm5_flash.target", Lifetime::RESIDENT, Category::Weights, "target weights");
+        self.norm.inventory(&mut inventory, "norm")?;
+        self.head.inventory(&mut inventory)?;
+        for (rank, layers) in std::iter::once(self.layers.as_slice()).chain(peers.iter().map(Vec::as_slice)).enumerate() {
+            for (layer, owner) in layers.iter().enumerate() {
+                owner.inventory(&mut inventory, &format!("rank{rank}.layer{layer}"))?;
+            }
+        }
+        Ok(inventory.receipts)
+    }
+
     pub fn residency(&self) -> Residency {
         let mut r = Residency::default();
         for layer in self.layers.iter().filter(|l| l.attention == GlmNextAttention::Kda) {
@@ -123,31 +166,34 @@ impl GlmfWeights<'_> {
         }
         match &self.head {
             super::head::GlmfHead::Bf16(w) => r.head_bf16 = w.buffer.bytes,
+            head @ super::head::GlmfHead::Packed { .. } => r.head_packed = head.bytes(),
             head => r.head_fp8 = head.bytes(),
         }
         r
     }
 
-    /// Single residency: no KDA layer and no head holds both a BF16 and an FP8
-    /// copy, and the selected representation is the one resident.
-    pub fn check_single_residency(&self, kda_fp8: super::fp8::KdaFp8, fp8_head: bool) -> Result<Residency> {
+    /// Single residency: no KDA layer holds both a BF16 and an FP8 copy, the head is one
+    /// allocation set of one form, and the selected representations are the ones resident.
+    pub fn check_single_residency(&self, kda_fp8: super::fp8::KdaFp8, head: super::head::GlmfHeadFormat)
+        -> Result<Residency> {
         for (index, layer) in self.layers.iter().enumerate().filter(|(_, l)| l.attention == GlmNextAttention::Kda) {
             let (bf16, fp8) = (layer.has("w_in") || layer.has("w_o"), layer.has("w_in_fp8") || layer.has("w_o_fp8"));
             ensure!(!(bf16 && fp8), "KDA layer {index} holds BF16 and FP8 in/out projections");
-            let native = layer.core.contains_key("self_attn.q_proj") || layer.native_projections.contains_key("q");
+            let native = layer.core.contains_key("self_attn.q_proj") || layer.native_projections.contains_key("q")
+                || layer.attention_native.contains_key("self_attn.q_proj");
             ensure!(!native || !(bf16 || fp8), "KDA layer {index} has native and converted copies");
             ensure!(native || fp8 == (kda_fp8 != super::fp8::KdaFp8::Off),
                 "KDA layer {index}: --kda-fp8 {kda_fp8:?} but {} projections are resident", if fp8 { "FP8" } else { "BF16" });
         }
-        ensure!(matches!(self.head, super::head::GlmfHead::K6(_) | super::head::GlmfHead::RowFp8(_))
-            || matches!(self.head, super::head::GlmfHead::Fp8 { .. }) == fp8_head,
-            "--fp8-head {fp8_head} but the resident head is {}", self.head.name());
+        ensure!(self.head.format().is_none_or(|resident| resident == head),
+            "--fp8-head {} but the resident head is {}", head.setting(), self.head.name());
         Ok(self.residency())
     }
 }
 
 #[derive(Clone)]
 pub(crate) struct GlmfLoader<'a> {
+    pub arenas: std::rc::Rc<std::collections::BTreeMap<i32, DeviceWeightArena<'a>>>,
     pub library: &'a NativeLibrary,
     pub checkpoint: &'a Checkpoint,
     pub stream: *mut c_void,
@@ -155,6 +201,9 @@ pub(crate) struct GlmfLoader<'a> {
     /// Replicate FP8 KDA output weights for token-row sharding; requires two GPUs and FP8 KDA.
     pub kda_output_shard: bool,
     pub fp8_head: bool,
+    /// `--fp8-head packed`: the BF16 head lands outside the weight arena, as the transient source
+    /// the exact 12-bit copy packs from (the arena holds that copy, `packed12`).
+    pub packed_head: bool,
     /// Numerics gate only: KDA projections rounded through NVFP4 (Some(search)) and kept in BF16.
     pub kda_nvfp4: Option<bool>,
     /// Scale rule of copies quantized from BF16.
@@ -240,6 +289,44 @@ fn quantize_kda_part(bytes: &[u8], rows: usize, cols: usize, layout: super::fp8:
 }
 
 impl<'a> GlmfLoader<'a> {
+    /// Register the source in the same dense delivery group as the target body.
+    fn head(&self, inventory: &cuteafd_loader::families::glm5_flash::core::CoreInventory) -> Result<super::head::GlmfHead<'a>> {
+        Ok(if let Some(head) = inventory.get_weight("lm_head") {
+                super::head::GlmfHead::K6(self.core_weights(
+                    cuteafd_loader::formats::trellis_core::CoreWeightLayout::new(head,
+                        cuteafd_loader::formats::dense_trellis::TrellisSide::Output, 0, 1)?, 0)?)
+            } else if let Some(head) = inventory.native.get("lm_head").filter(|head| head.fp8) {
+                let layout = cuteafd_loader::formats::native_attention::NativeLayout {
+                    stem: "lm_head".into(), shape: head.shape, fp8: true, rank: 0, ranks: 1,
+                    split: cuteafd_loader::formats::trellis_core::CoreSplit::Whole,
+                };
+                let mut weights = self.native_operands(std::collections::BTreeMap::from([("head".into(), layout)]), 0)?;
+                let head = weights.remove("head").context("Flash block-FP8 head")?;
+                super::head::GlmfHead::BlockFp8 { values: head.values,
+                    scales: head.scales.context("Flash block-FP8 head scales")? }
+            } else if self.fp8_head {
+                let (values, scales) = self.fp8(&["lm_head.weight".to_string()], super::fp8::Layout::Row128)?;
+                super::head::GlmfHead::Fp8 { values, scales }
+            } else if self.packed_head {
+                ensure!(self.tensor("lm_head.weight")?.meta.dtype == DType::Bf16, "--fp8-head packed packs a BF16 head");
+                let _memory_scope = cuteafd_ffi::memory_ledger::scope("staging/glmf.load.head.bf16");
+                let _memory_format = cuteafd_ffi::memory_ledger::format("bf16");
+                super::head::GlmfHead::Bf16(self.whole_in(0, "lm_head.weight", false)?)
+            } else {
+                super::head::GlmfHead::Bf16(self.one("lm_head.weight")?)
+            })
+    }
+
+    pub(super) fn allocate(&self, device: i32, name: &str, bytes: usize) -> Result<Allocation<'a>> {
+        let arena = self.arenas.get(&device).context("Flash target arena absent")?;
+        crate::shared::memory::weight_arena::weight_allocation(Device { library: self.library, id: device },
+            Some(arena), name, bytes, ArenaTag::weights("glmf/target"))
+    }
+
+    fn allocation(&self, rank: usize, name: &str, bytes: usize) -> Result<DeviceAllocation<'a>> {
+        Ok(DeviceAllocation::from_allocation(self.allocate(self.rank_device(rank)?, name, bytes.max(256))?))
+    }
+
     fn tensor(&self, name: &str) -> Result<&CheckpointTensor> {
         cuteafd_ffi::memory_ledger::tensor(name);
         let at = self.checkpoint.tensors.binary_search_by(|t| t.meta.name.as_str().cmp(name))
@@ -297,14 +384,14 @@ impl<'a> GlmfLoader<'a> {
                 }
                 _ => {}
             }
-            ops.insert(w_key, self.upload(&weight)?);
-            ops.insert(s_key, self.upload(&scales)?);
+            ops.insert(w_key, self.upload(&format!("{name}.weight"), &weight)?);
+            ops.insert(s_key, self.upload(&format!("{name}.weight_scale"), &scales)?);
         }
         Ok(true)
     }
 
-    fn upload(&self, bytes: &[u8]) -> Result<DeviceAllocation<'a>> {
-        let allocation = DeviceAllocation::new(self.library, bytes.len().max(256))?;
+    fn upload(&self, name: &str, bytes: &[u8]) -> Result<DeviceAllocation<'a>> {
+        let allocation = self.allocation(0, name, bytes.len())?;
         crate::shared::memory::load_timing::upload(bytes.len(), || self.library.copy_h2d(allocation.buffer, bytes))?;
         Ok(allocation)
     }
@@ -323,7 +410,7 @@ impl<'a> GlmfLoader<'a> {
             return self.gpu_fp8(&parts, layout, false, 0);
         }
         let (values, scales, _) = self.fp8_host(names, layout)?;
-        Ok((self.upload(&values)?, self.upload(&scales)?))
+        Ok((self.upload(&format!("{}.payload", joined(names)), &values)?, self.upload(&format!("{}.scales", joined(names)), &scales)?))
     }
 
     /// Whether every name is a native E4M3 matrix with FP32 128x128 `_scale_inv`
@@ -395,7 +482,7 @@ impl<'a> GlmfLoader<'a> {
             at += bytes;
             grid_at += grid_bytes;
         }
-        Ok((self.landed(rank, values, at)?, self.landed(rank, grids, grid_at)?))
+        Ok((self.landed(rank, &format!("{}.payload", joined(names)), values, at)?, self.landed(rank, &format!("{}.scales", joined(names)), grids, grid_at)?))
     }
 
     /// `parts` row-concatenated and quantized on the current device: E4M3 values
@@ -418,8 +505,9 @@ impl<'a> GlmfLoader<'a> {
         ensure!(rects.iter().all(|r| r.width() == cols * 2), "FP8 rows must share columns");
         let total: usize = rects.iter().map(|r| r.rows.len()).sum();
         let (kb, unit) = (cols / 128, if layout == super::fp8::Layout::Block { 128 } else { 1 });
-        let values = DeviceAllocation::new(self.library, (total * cols).max(256))?;
-        let scales = DeviceAllocation::new(self.library, (total / unit * kb * 4).max(256))?;
+        let key = joined(&rects.iter().map(|r| r.name.clone()).collect::<Vec<_>>());
+        let values = self.allocation(rank, &format!("{key}.payload"), total * cols)?;
+        let scales = self.allocation(rank, &format!("{key}.scales"), total / unit * kb * 4)?;
         self.quant_steps(&rects, layout, rank, |rows| Target {
             // SAFETY: rows `rows` lie inside `values` (allocated for `total` rows).
             q: CuteafdDeviceBuffer { ptr: unsafe { values.buffer.ptr.cast::<u8>().add(rows.start * cols) }.cast(),
@@ -458,10 +546,19 @@ impl<'a> GlmfLoader<'a> {
     }
 
     /// Records or fills one class-2 operand of `bytes` on rank `rank`'s GPU.
-    fn landed(&self, rank: usize, lands: Vec<(Rect, usize)>, bytes: usize) -> Result<DeviceAllocation<'a>> {
+    fn landed(&self, rank: usize, name: &str, lands: Vec<(Rect, usize)>, bytes: usize) -> Result<DeviceAllocation<'a>> {
+        self.landed_in(rank, name, lands, bytes, true)
+    }
+
+    /// [`Self::landed`] into the rank's weight arena (`arena`) or a transient allocation of its own.
+    fn landed_in(&self, rank: usize, name: &str, lands: Vec<(Rect, usize)>, bytes: usize, arena: bool)
+        -> Result<DeviceAllocation<'a>> {
         let device = self.rank_device(rank)?;
         self.on_rank(rank, || {
-            let allocation = DeviceAllocation::new(self.library, bytes.max(256))?;
+            let allocation = if arena { self.allocation(rank, name, bytes)? } else {
+                DeviceAllocation::from_allocation(Allocation::new(Device { library: self.library, id: device },
+                    bytes.max(256), crate::shared::memory::Tag::staging("glmf.load.head.bf16"))?)
+            };
             let operand = crate::shared::experts::rtx::dense::Operand { device, buffer: allocation.buffer, lands, bytes };
             self.dense.operand(operand)?;
             Ok(allocation)
@@ -474,11 +571,14 @@ impl<'a> GlmfLoader<'a> {
     }
 
     /// A whole checkpoint tensor (one row for 1-D) landing unchanged on `rank`.
-    fn whole(&self, rank: usize, name: &str) -> Result<DeviceAllocation<'a>> {
+    fn whole(&self, rank: usize, name: &str) -> Result<DeviceAllocation<'a>> { self.whole_in(rank, name, true) }
+
+    /// [`Self::whole`] into the arena or a transient allocation ([`Self::landed_in`]).
+    fn whole_in(&self, rank: usize, name: &str, arena: bool) -> Result<DeviceAllocation<'a>> {
         let tensor = self.tensor(name)?;
         let rows = if tensor.meta.shape.len() >= 2 { tensor.meta.shape[0] } else { 1 };
         let bytes = tensor.meta.byte_length as usize;
-        self.landed(rank, vec![(rect(self.checkpoint, name, 0..rows, 0..bytes / rows)?, 0)], bytes)
+        self.landed_in(rank, name, vec![(rect(self.checkpoint, name, 0..rows, 0..bytes / rows)?, 0)], bytes, arena)
     }
 
     /// `make(rank)` on every rank: in push mode each rank receives its own copy;
@@ -524,7 +624,7 @@ impl<'a> GlmfLoader<'a> {
             at += bytes;
         }
         ensure!(lands.windows(2).all(|w| w[0].0.width() == w[1].0.width()), "{names:?} do not share columns");
-        self.landed(rank, lands, at)
+        self.landed(rank, &joined(names), lands, at)
     }
 
     /// Whether every name is a BF16 matrix in the source checkpoint (quantized on the GPU).
@@ -549,7 +649,7 @@ impl<'a> GlmfLoader<'a> {
             return self.gpu_fp8(&parts, layout, true, 0);
         }
         let (values, scales, cols) = self.fp8_host(names, layout)?;
-        Ok((self.upload(&values)?, self.upload(&kmajor_scales(&scales, values.len() / cols, cols / 128))?))
+        Ok((self.upload(&format!("{}.payload", joined(names)), &values)?, self.upload(&format!("{}.scales", joined(names)), &kmajor_scales(&scales, values.len() / cols, cols / 128))?))
     }
 
     /// Host bytes of [`Self::fp8`]: E4M3 values, FP32 scales, and the column count.
@@ -605,7 +705,7 @@ impl<'a> GlmfLoader<'a> {
             DType::Bf16 => {
                 let bytes = tensor.meta.byte_length as usize;
                 let rows = if tensor.meta.shape.len() >= 2 { tensor.meta.shape[0] } else { 1 };
-                let out = self.on_rank(rank, || DeviceAllocation::new(self.library, (bytes * 2).max(256)))?;
+                let out = self.on_rank(rank, || self.allocation(rank, name, bytes * 2))?;
                 let whole = rect(self.checkpoint, name, 0..rows, 0..bytes / rows)?;
                 for (parts, window) in crate::shared::experts::rtx::dense::windows(&[whole], 1)? {
                     let width = bytes / rows;
@@ -637,8 +737,8 @@ impl<'a> GlmfLoader<'a> {
         let per = (crate::shared::experts::rtx::dense::TRANSFORM_BYTES / ((nope + v) * lat * 2)).max(1);
         (0..ranks).map(|rank| {
             let (uk, uv) = self.on_rank(rank, || Ok((
-                DeviceAllocation::new(self.library, (heads * lat * nope * 2).max(256))?,
-                DeviceAllocation::new(self.library, (heads * v * lat * 2).max(256))?)))?;
+                self.allocation(rank, &format!("{name}.uk"), heads * lat * nope * 2)?,
+                self.allocation(rank, &format!("{name}.uv"), heads * v * lat * 2)?)))?;
             let mut h = 0;
             while h < heads {
                 let count = per.min(heads - h);
@@ -656,15 +756,16 @@ impl<'a> GlmfLoader<'a> {
     }
 
     fn mla_operands(&self, cfg: &GlmNextConfig, prefix: &str,
-        ops: &mut HashMap<&'static str, DeviceAllocation<'a>>) -> Result<()> {
+        ops: &mut HashMap<&'static str, DeviceAllocation<'a>>, staged: bool) -> Result<()> {
         let a = |name: &str| format!("{prefix}.self_attn.{name}");
         ops.insert("q_a_norm", self.one(&a("q_a_layernorm.weight"))?);
         ops.insert("kv_a_norm", self.one(&a("kv_a_layernorm.weight"))?);
         let (uk, uv) = self.absorbed(cfg, &a("kv_b_proj.weight"), 1)?.remove(0);
         ops.insert("w_uk", uk);
         ops.insert("w_uv", uv);
+        if !staged {
         let block = super::fp8::Layout::Block;
-        let projections: Vec<_> = cuteafd_loader::families::glm5_flash::core_fp8_projections("mla")
+        let projections: Vec<_> = ["q_a_proj.weight", "kv_a_proj_with_mqa.weight", "q_b_proj.weight", "o_proj.weight"]
             .iter().map(|name| a(name)).collect();
         let (q, s) = self.fp8(&projections[..2], block)?;
         ops.insert("w_qkv_a_fp8", q);
@@ -675,6 +776,7 @@ impl<'a> GlmfLoader<'a> {
         let (q, s) = self.fp8(&projections[3..4], block)?;
         ops.insert("w_o_fp8", q);
         ops.insert("w_o_scale", s);
+        }
         let i = |name: &str| a(&format!("indexer.{name}"));
         ops.insert("w_iq", self.one(&i("wq_b.weight"))?);
         ops.insert("w_ik", self.rows_on(0, &[i("wk.weight"), i("weights_proj.weight"),
@@ -691,8 +793,31 @@ impl<'a> GlmfLoader<'a> {
         let stream = if rank == 0 { self.stream } else {
             self.peers.get(rank - 1).context("native K6 load peer")?.stream
         };
-        self.on_rank(rank, || layout.load_recorded(crate::shared::memory::device::Device {
-            library: self.library, id: self.library.cuda_get_device()? }, self.checkpoint, &self.dense, stream))
+        self.on_rank(rank, || layout.load_recorded_with(Device {
+            library: self.library, id: self.rank_device(rank)? }, self.checkpoint, &self.dense, stream,
+                |name, bytes| self.allocate(self.rank_device(rank)?, name, bytes)))
+    }
+
+    fn native_operands(&self, native_layouts: std::collections::BTreeMap<String,
+        cuteafd_loader::formats::native_attention::NativeLayout>, rank: usize)
+        -> Result<std::collections::BTreeMap<String, NativeAttentionWeights<'a>>> {
+        native_layouts.into_iter().map(|(name, layout)| {
+                let selected = self.checkpoint.projection(&layout.stem)?;
+                let [n,k] = layout.shape;
+                let (values, scales) = self.on_rank(rank, || Ok((
+                    self.allocation(rank, &format!("{}.payload", layout.stem), n*k*if layout.fp8 { 1 } else { 2 })?,
+                    if layout.fp8 { Some(self.allocation(rank, &format!("{}.scales", layout.stem), n/128*(k/128)*4)?) } else { None }
+                )))?;
+                let records = attention_records(&self.checkpoint.snapshot, &selected, self.checkpoint.projection_view(&layout.stem),
+                    &layout, self.fp8_scales, values.buffer, scales.as_ref().map(|s| s.buffer))?;
+                for record in records {
+                    match record {
+                        AttentionRecord::Operand(record) => self.dense.operand(record)?,
+                        AttentionRecord::Step(record) => self.dense.step(record, self.rank_stream(rank)?)?,
+                    }
+                }
+                Ok((name, NativeAttentionWeights { layout, values, scales }))
+            }).collect::<Result<_>>()
     }
 
     fn native_layer_shares(&self, cfg: &GlmNextConfig, layer: usize, mode: LayerMode,
@@ -707,6 +832,7 @@ impl<'a> GlmfLoader<'a> {
             "native Flash FFNs retain intermediate ownership");
         let owner = match mode { LayerMode::Whole { gpu, .. } if ranks == 2 => Some(gpu), _ => None };
         let layouts = inventory.layer_weights(cfg, layer, ranks, owner)?;
+        let native_layouts = inventory.layer_native(cfg, layer, ranks, owner)?;
         let attention_shares = AttentionShare::bind(mode, ranks)?;
         let p = format!("{PREFIX}layers.{layer}");
         let a = |leaf: &str| format!("{p}.self_attn.{leaf}");
@@ -745,7 +871,7 @@ impl<'a> GlmfLoader<'a> {
                         let bytes = source.bytes();
                         lands.push((source, at)); at += bytes;
                     }
-                    ops[rank].insert("w_aux", self.landed(rank, lands, at)?);
+                    ops[rank].insert("w_aux", self.landed(rank, &format!("{p}.w_aux"), lands, at)?);
                 }
                 for operand in [KdaOperand::WFg, KdaOperand::ConvW, KdaOperand::ALog,
                     KdaOperand::DtBias, KdaOperand::ONorm] {
@@ -775,19 +901,22 @@ impl<'a> GlmfLoader<'a> {
                 }
             }
         }
-        ops.into_iter().zip(attention_shares).zip(layouts).enumerate().map(|(rank, ((operands, attention_share), layouts))| {
+        ops.into_iter().zip(attention_shares).zip(layouts.into_iter().zip(native_layouts)).enumerate()
+            .map(|(rank, ((operands, attention_share), (layouts, native_layouts)))| {
             let expected = if owner.is_some_and(|owner| usize::from(owner) != rank) { 3 } else { 7 };
-            ensure!(layouts.len() == expected, "native Flash requires complete attention and FFN operator groups");
+            ensure!(layouts.len() + native_layouts.len() == expected,
+                "native Flash requires complete attention and FFN operator groups");
+            let attention_native = self.native_operands(native_layouts, rank)?;
             let core = layouts.into_iter().map(|(name, layout)| Ok((name, self.core_weights(layout, rank)?)))
                 .collect::<Result<_>>()?;
-            Ok(GlmfLayer { attention, dense, split: ranks == 2, attention_share, core, operands,
+            Ok(GlmfLayer { attention, dense, split: ranks == 2, attention_share, core, operands, attention_native,
                 native: HashMap::new(), native_projections: HashMap::new() })
         }).collect()
     }
 
     pub fn layer(&self, cfg: &GlmNextConfig, layer: usize) -> Result<GlmfLayer<'a>> {
         let inventory = cuteafd_loader::families::glm5_flash::core::CoreInventory::from_checkpoint(cfg, self.checkpoint)?;
-        if inventory.projections.keys().any(|stem| stem.starts_with(&format!("{PREFIX}layers.{layer}."))) {
+        if inventory.staged_layer(cfg, layer) {
             return self.native_layer_shares(cfg, layer, LayerMode::HeadSplit, &inventory)?
                 .into_iter().next().context("native Flash lead layer");
         }
@@ -835,12 +964,12 @@ impl<'a> GlmfLoader<'a> {
                         ensure!(dtype == DType::Bf16, "{name}: NVFP4 gate needs BF16");
                         let rounded = super::fp8::nvfp4_roundtrip(&raw, shape[0], shape[1], search);
                         if name.ends_with("o_proj.weight") {
-                            ops.insert("w_o_nvfp4", self.upload(&rounded)?);
+                            ops.insert("w_o_nvfp4", self.upload(&a("o_proj.weight"), &rounded)?);
                         } else {
                             bytes.extend(rounded);
                         }
                     }
-                    ops.insert("w_in", self.upload(&bytes)?);
+                    ops.insert("w_in", self.upload(&format!("{p}.w_in"), &bytes)?);
                 } else {
                     ops.insert("w_in", self.kda_upload(cfg, &p, KdaOperand::WIn)?);
                 }
@@ -856,12 +985,12 @@ impl<'a> GlmfLoader<'a> {
                     ops.insert("w_o", w_o);
                 }
             }
-            GlmNextAttention::Mla => self.mla_operands(cfg, &p, &mut ops)?,
+            GlmNextAttention::Mla => self.mla_operands(cfg, &p, &mut ops, inventory.staged(&a("q_a_proj")))?,
         }
         let mlp = if dense { format!("{p}.mlp") } else { format!("{p}.mlp.shared_experts") };
-        if !(dense && self.nvfp4_dense(cfg, &mlp, &mut ops)?) {
+        if !inventory.staged(&format!("{mlp}.gate_proj")) && !(dense && self.nvfp4_dense(cfg, &mlp, &mut ops)?) {
             let block = super::fp8::Layout::Block;
-            let projections: Vec<_> = cuteafd_loader::families::glm5_flash::core_fp8_projections("mlp")
+            let projections: Vec<_> = ["gate_proj.weight", "up_proj.weight", "down_proj.weight"]
                 .iter().map(|name| format!("{mlp}.{name}")).collect();
             let (q, s) = self.fp8(&projections[..2], block)?;
             ops.insert("w_gate_up_fp8", q);
@@ -875,7 +1004,7 @@ impl<'a> GlmfLoader<'a> {
             ops.insert("gate.bias", self.f32(&[format!("{p}.mlp.gate.e_score_correction_bias")])?);
         }
         Ok(GlmfLayer { attention, dense, split: false, attention_share: AttentionShare::Whole,
-            core: Default::default(), operands: ops, native: HashMap::new(), native_projections: HashMap::new() })
+            core: Default::default(), attention_native: self.native_operands(inventory.layer_native(cfg, layer, 1, None)?.remove(0), 0)?, operands: ops, native: HashMap::new(), native_projections: HashMap::new() })
     }
 
     /// GPUs of the head split this loader fills (1: no split).
@@ -899,7 +1028,12 @@ impl<'a> GlmfLoader<'a> {
         for rank in 0..self.peers.len() {
             let source = out[0].buffer;
             out.push(self.on_rank(rank + 1, || {
-                let copy = DeviceAllocation::new(self.library, source.bytes)?;
+                let lead = self.arenas.get(&source.device_id).context("Flash replica source arena")?;
+                let root = out[0].backing.as_ref().and_then(|a| a.weight_backing()).context("Flash replica source backing")?;
+                let offset = source.ptr as usize - root.buffer.ptr as usize;
+                let name = lead.layout().views().iter().find(|(_, view)| view.offset() == offset && view.bytes() == source.bytes)
+                    .map(|(name, _)| name.as_str()).context("Flash replica source view")?;
+                let copy = self.allocation(rank + 1, name, source.bytes)?;
                 self.dense.peer_copy(source, copy.buffer, source.bytes)?;
                 Ok(copy)
             })?);
@@ -968,7 +1102,7 @@ impl<'a> GlmfLoader<'a> {
                 // rank's active heads uploaded from the staging.
                 let name = Self::kda_name(prefix, KdaRole::ALog);
                 let raw = self.tensor(&name)?.meta.byte_length as usize;
-                let out = self.on_rank(rank, || DeviceAllocation::new(self.library, bytes.max(256)))?;
+                let out = self.on_rank(rank, || self.allocation(rank, &format!("{prefix}.{}", operand.name()), bytes))?;
                 let piece = &pieces[0];
                 self.step(rank, vec![rect(self.checkpoint, &name, 0..1, 0..raw)?], vec![Job::ALog { heads },
                     Job::Upload { at: piece.rows.start * 4, bytes, dst: out.buffer }])?;
@@ -977,10 +1111,10 @@ impl<'a> GlmfLoader<'a> {
             if pieces.iter().all(|p| p.source == plan.dtype) {
                 let mut at = 0;
                 let lands = rects.into_iter().map(|r| { let o = at; at += r.bytes(); (r, o) }).collect();
-                return self.landed(rank, lands, bytes);
+                return self.landed(rank, &format!("{prefix}.{}", operand.name()), lands, bytes);
             }
             // Widened pieces: each a step writing its F32 elements.
-            let out = self.on_rank(rank, || DeviceAllocation::new(self.library, bytes.max(256)))?;
+            let out = self.on_rank(rank, || self.allocation(rank, &format!("{prefix}.{}", operand.name()), bytes))?;
             for (piece, whole) in pieces.iter().zip(rects) {
                 ensure!(piece.source == DType::Bf16 && plan.dtype == DType::F32, "KDA piece needs a widening");
                 let row_elements = piece.window.len();
@@ -1079,8 +1213,8 @@ impl<'a> GlmfLoader<'a> {
             Axis::Cols => (shapes[0].0, cols / ranks),
         };
         let out = (0..ranks).map(|rank| self.on_rank(rank, || Ok((
-            DeviceAllocation::new(self.library, (rank_rows * rank_cols).max(256))?,
-            DeviceAllocation::new(self.library, (rank_rows / 128 * (rank_cols / 128) * 4).max(256))?,
+            self.allocation(rank, &format!("{}.payload", joined(names)), rank_rows * rank_cols)?,
+            self.allocation(rank, &format!("{}.scales", joined(names)), rank_rows / 128 * (rank_cols / 128) * 4)?,
         )))).collect::<Result<Vec<_>>>()?;
         for (rank, (values, grid)) in out.iter().enumerate() {
             let mut row = 0;
@@ -1115,7 +1249,7 @@ impl<'a> GlmfLoader<'a> {
     /// docstring); without a split, [`Self::layer`] alone.
     pub fn layer_shares(&self, cfg: &GlmNextConfig, layer: usize, mode: LayerMode) -> Result<Vec<GlmfLayer<'a>>> {
         let inventory = cuteafd_loader::families::glm5_flash::core::CoreInventory::from_checkpoint(cfg, self.checkpoint)?;
-        if inventory.projections.keys().any(|stem| stem.starts_with(&format!("{PREFIX}layers.{layer}."))) {
+        if inventory.staged_layer(cfg, layer) {
             return self.native_layer_shares(cfg, layer, mode, &inventory);
         }
         let ranks = self.ranks();
@@ -1217,7 +1351,7 @@ impl<'a> GlmfLoader<'a> {
                         loader.stream = self.peers[rank - 1].stream;
                     }
                     loader.peers.clear();
-                    loader.mla_operands(cfg, &p, &mut ops[rank])
+                    loader.mla_operands(cfg, &p, &mut ops[rank], inventory.staged(&a("q_a_proj")))
                 })?;
             }
             GlmNextAttention::Mla => {
@@ -1227,7 +1361,8 @@ impl<'a> GlmfLoader<'a> {
                 let (uk, uv): (Vec<_>, Vec<_>) = self.absorbed(cfg, &a("kv_b_proj.weight"), ranks)?.into_iter().unzip();
                 put(&mut ops, "w_uk", uk);
                 put(&mut ops, "w_uv", uv);
-                let projections: Vec<_> = cuteafd_loader::families::glm5_flash::core_fp8_projections("mla")
+                if !inventory.staged(&a("q_a_proj")) {
+                let projections: Vec<_> = ["q_a_proj.weight", "kv_a_proj_with_mqa.weight", "q_b_proj.weight", "o_proj.weight"]
                     .iter().map(|name| a(name)).collect();
                 let (q, s): (Vec<_>, Vec<_>) = self.on_every_rank_pair(|r| self.fp8_on(r, &projections[..2],
                     super::fp8::Layout::Block))?.into_iter().unzip();
@@ -1239,6 +1374,7 @@ impl<'a> GlmfLoader<'a> {
                 let (q, s): (Vec<_>, Vec<_>) = self.fp8_split(&projections[3..4], Axis::Cols, ranks)?.into_iter().unzip();
                 put(&mut ops, "w_o_fp8", q);
                 put(&mut ops, "w_o_scale", s);
+                }
                 let i = |name: &str| a(&format!("indexer.{name}"));
                 put(&mut ops, "w_iq", self.on_every_rank(|r| self.one_on(r, &i("wq_b.weight")))?);
                 put(&mut ops, "w_ik", self.on_every_rank(|r| self.rows_on(r, &[i("wk.weight"), i("weights_proj.weight"),
@@ -1250,8 +1386,8 @@ impl<'a> GlmfLoader<'a> {
         }
         let mlp = if dense { format!("{p}.mlp") } else { format!("{p}.mlp.shared_experts") };
         // A ModelOpt NVFP4 dense MLP runs whole on rank 0 (rank 1 adds a zero partial).
-        if !(dense && self.nvfp4_dense(cfg, &mlp, &mut ops[0])?) {
-            let projections: Vec<_> = cuteafd_loader::families::glm5_flash::core_fp8_projections("mlp")
+        if !inventory.staged(&format!("{mlp}.gate_proj")) && !(dense && self.nvfp4_dense(cfg, &mlp, &mut ops[0])?) {
+            let projections: Vec<_> = ["gate_proj.weight", "up_proj.weight", "down_proj.weight"]
                 .iter().map(|name| format!("{mlp}.{name}")).collect();
             let (q, s): (Vec<_>, Vec<_>) = self.fp8_split(&projections[..2], Axis::Rows, ranks)?.into_iter().unzip();
             put(&mut ops, "w_gate_up_fp8", q);
@@ -1266,19 +1402,23 @@ impl<'a> GlmfLoader<'a> {
             put(&mut ops, "gate.bias", self.on_every_rank(|r| self.f32_on(r,
                 &[format!("{p}.mlp.gate.e_score_correction_bias")]))?);
         }
-        Ok(ops.into_iter().zip(attention_shares).map(|(operands, attention_share)|
-            GlmfLayer { attention, dense, split: true, attention_share, core: Default::default(), operands,
-                native: HashMap::new(), native_projections: HashMap::new() }).collect())
+        let owner = match mode { LayerMode::Whole { gpu, .. } if ranks == 2 => Some(gpu), _ => None };
+        let layouts = inventory.layer_native(cfg, layer, ranks, owner)?;
+        ops.into_iter().zip(attention_shares).zip(layouts).enumerate().map(|(rank, ((operands, attention_share), layouts))|
+            Ok(GlmfLayer { attention, dense, split: true, attention_share, core: Default::default(),
+                attention_native: self.native_operands(layouts, rank)?, operands,
+                native: HashMap::new(), native_projections: HashMap::new() })).collect()
     }
 
     /// EXLR8 operands follow the shared native records and the admitted layer owners.
     /// Projection bytes stay native; only the original F32 convolution/mHC ABI widens BF16.
     #[allow(clippy::type_complexity)]
     pub fn native_model(&self, cfg: &GlmNextConfig, plan: &LayerExecutionPlan,
-        records: &[crate::shared::experts::exlr8::dense_weights::NativeDenseRecords],
+        records: &[cuteafd_loader::plan::exlr8::dense::requests::NativeDenseRecords],
         vocabulary: std::rc::Rc<crate::shared::token_io::native::NativeVocabulary<'a>>)
         -> Result<(GlmfWeights<'a>, Vec<Vec<GlmfLayer<'a>>>)> {
-        use crate::shared::experts::exlr8::dense_weights::{self, PlainPack};
+        use crate::shared::experts::exlr8::dense_weights;
+        use cuteafd_loader::plan::exlr8::dense::requests::{key, PlainPack};
         ensure!(records.len() == self.ranks() && !records.is_empty() && plan.modes().len() <= cfg.layers,
             "native Flash records or layer plan extent");
         for (rank, records) in records.iter().enumerate() {
@@ -1308,7 +1448,8 @@ impl<'a> GlmfLoader<'a> {
                         vec![PlainPack { name: "conv_w".into(), components: ["q", "k", "v"].iter()
                             .map(|kind| format!("{p}.self_attn.{kind}_conv1d.weight")).collect() }]
                     } else { vec![] };
-                    let mut native = dense_weights::load_layer_packed(self.library, &self.dense, source, &packs, stream)?;
+                    let mut native = dense_weights::load_layer_packed_with(self.library, &self.dense, source, &packs, stream,
+                        |name, bytes| self.allocate(self.rank_device(rank)?, name, bytes))?;
                     let mut operands = HashMap::new();
                     let mut take = |key: &'static str, tensor: String| {
                         if let Some(allocation) = native.remove(&tensor) { operands.insert(key, allocation); }
@@ -1329,7 +1470,7 @@ impl<'a> GlmfLoader<'a> {
                         take(key, format!("{p}.{leaf}"));
                     }
                     for key in ["conv_w", "w_uk_fp8", "w_uk_scale", "w_uv_fp8", "w_uv_scale"] { take(key, key.into()); }
-                    take("gate", dense_weights::key("router", "bf16"));
+                    take("gate", key("router", "bf16"));
                     ensure!(["attn.fn", "attn.scale", "attn.base", "ffn.fn", "ffn.scale", "ffn.base", "input_norm", "post_norm"]
                         .iter().all(|name| operands.contains_key(name)), "{p}: native Flash common operands");
                     if !dense { ensure!(operands.contains_key("gate") && operands.contains_key("gate.bias"),
@@ -1343,13 +1484,14 @@ impl<'a> GlmfLoader<'a> {
                     }
                     Ok(GlmfLayer { attention, dense, split: self.ranks() == 2, attention_share, operands, native,
                         native_projections: source.projections.iter().map(|(&name, (projection, _))| (name, projection.clone())).collect(),
-                        core: Default::default() })
+                        core: Default::default(), attention_native: Default::default() })
                 })?;
                 share.push(part);
             }
         }
-        let norm = dense_weights::landed(self.library, &self.dense, &format!("{PREFIX}norm.weight"),
-            &records[0].norm, cuteafd_loader::plan::exlr8::dense::DenseTransform::Identity, self.stream)?;
+        let norm = dense_weights::landed_with(self.library, &self.dense, &format!("{PREFIX}norm.weight"),
+            &records[0].norm, cuteafd_loader::plan::exlr8::dense::DenseTransform::Identity, self.stream,
+                |name, bytes| self.allocate(self.device, name, bytes))?;
         for (rank, layers) in shares.iter().enumerate() {
             let loaded = layers.iter().map(GlmfLayer::bytes).sum::<usize>()
                 + if rank == 0 { norm.buffer.bytes } else { 0 };
@@ -1375,7 +1517,7 @@ impl<'a> GlmfLoader<'a> {
         let mut shares: Vec<Vec<GlmfLayer<'a>>> = (0..self.ranks()).map(|_| Vec::new()).collect();
         ensure!(plan.modes().len() <= cfg.layers, "attention plan exceeds checkpoint layers");
         for (layer, &mode) in plan.modes().iter().enumerate() {
-            let native = inventory.projections.keys().any(|stem| stem.starts_with(&format!("{PREFIX}layers.{layer}.")));
+            let native = inventory.staged_layer(cfg, layer);
             let parts = if native { self.native_layer_shares(cfg, layer, mode, &inventory)? }
                 else { self.layer_shares(cfg, layer, mode)? };
             for (share, part) in shares.iter_mut().zip(parts) { share.push(part); }
@@ -1384,16 +1526,7 @@ impl<'a> GlmfLoader<'a> {
         let weights = GlmfWeights {
             layers: shares.next().context("rank 0")?,
             norm: self.one(&format!("{PREFIX}norm.weight"))?,
-            head: if let Some(head) = inventory.get_weight("lm_head") {
-                super::head::GlmfHead::K6(self.core_weights(
-                    cuteafd_loader::formats::trellis_core::CoreWeightLayout::new(head,
-                        cuteafd_loader::formats::dense_trellis::TrellisSide::Output, 0, 1)?, 0)?)
-            } else if self.fp8_head {
-                let (values, scales) = self.fp8(&["lm_head.weight".to_string()], super::fp8::Layout::Row128)?;
-                super::head::GlmfHead::Fp8 { values, scales }
-            } else {
-                super::head::GlmfHead::Bf16(self.one("lm_head.weight")?)
-            },
+            head: self.head(&inventory)?,
         };
         crate::shared::memory::staging::release_staging();
         // The pinned GPU-quantization source and tables live only for the load.
@@ -1411,6 +1544,74 @@ mod tests {
     use crate::shared::peer_split::{slice_2d, Axis};
 
     #[test]
+    fn selected_attention_records_preserve_tp_slices_and_fp8_recipe() -> anyhow::Result<()> {
+        use super::{attention_records, AttentionRecord};
+        use cuteafd_loader::{plan::checkpoint::{SelectedProjection, ProjectionStorage, CoreView,
+            CheckpointTensor}, SafetensorsTensorMetadata, families::glm5_flash::core::{NativeLayout, CoreSplit}};
+        use cuteafd_ffi::CuteafdDeviceBuffer;
+        use cuteafd_core::DType;
+        use crate::shared::experts::rtx::dense::Job;
+        let buffer = |bytes| CuteafdDeviceBuffer { ptr: std::ptr::null_mut(), bytes, device_id: 0, flags: 0 };
+        for split in [CoreSplit::Input, CoreSplit::Output] {
+            for rank in 0..2 {
+                for dtype in [DType::Bf16, DType::F8E4M3] {
+                    for mode in [CoreView::Original, CoreView::Fp8Compact] {
+                        let stem = "model.language_model.layers.3.self_attn.o_proj";
+                        let fp8 = dtype == DType::F8E4M3 || mode == CoreView::Fp8Compact;
+                        let shape = if split == CoreSplit::Input { [256, 512] } else { [512, 256] };
+                        let tensor = |name: String, dtype: DType, shape: Vec<usize>, width| CheckpointTensor {
+                            shard: "selected.safetensors".into(), meta: SafetensorsTensorMetadata {
+                                name, dtype, byte_offset: 100, byte_length: shape.iter().product::<usize>() as u64*width,
+                                shape } };
+                        let mut tensors = vec![tensor(format!("{stem}.weight"), dtype.clone(), shape.to_vec(),
+                            if dtype == DType::Bf16 { 2 } else { 1 })];
+                        if dtype == DType::F8E4M3 { tensors.push(tensor(format!("{stem}.weight_scale_inv"),
+                            DType::F32, vec![shape[0]/128,shape[1]/128],4)); }
+                        let selected = SelectedProjection { storage: ProjectionStorage::Native {
+                            dtype: dtype.clone(), shape: shape.to_vec() }, tensors, source_bytes: 0 };
+                        let layout = NativeLayout { stem: stem.into(), shape: [256,256], fp8, rank, ranks: 2, split };
+                        let records = attention_records(std::path::Path::new("/selected"), &selected, mode, &layout,
+                            Fp8Scales::Pow2, buffer(256*256*2), fp8.then(|| buffer(256)));
+                        if dtype == DType::F8E4M3 && mode == CoreView::Fp8Compact {
+                            let error = records.err().expect("already-FP8 conversion must refuse");
+                            assert!(error.downcast_ref::<cuteafd_loader::formats::native_attention::UnsupportedFp8Conversion>().is_some());
+                            continue;
+                        }
+                        let records = records?;
+                        let expected_rows = if split == CoreSplit::Output { rank*256..(rank+1)*256 } else { 0..256 };
+                        let expected_col = if split == CoreSplit::Input { rank*256 } else { 0 };
+                        if dtype == DType::Bf16 && fp8 {
+                            assert_eq!(records.len(),1);
+                            let AttentionRecord::Step(step) = &records[0] else { panic!("missing quant step") };
+                            assert_eq!(step.rects[0].rows,expected_rows);
+                            assert_eq!(step.rects[0].cols,expected_col*2..(expected_col+256)*2);
+                            let Job::Quant { rule, layout, pitch, col0, cols, target, .. } = &step.jobs[0]
+                                else { panic!("missing quant job") };
+                            assert_eq!(*rule,Fp8Scales::Amax);
+                            assert_eq!(*layout,crate::shared::fp8_load_quant::Layout::Block);
+                            assert_eq!((*pitch,*col0,*cols),(256,0,256));
+                            assert_eq!(target.q_stride,256);
+                        } else {
+                            assert_eq!(records.len(),if fp8 { 2 } else { 1 });
+                            let AttentionRecord::Operand(operand) = &records[0] else { panic!("unexpected transform") };
+                            let width = if fp8 { 1 } else { 2 };
+                            assert_eq!(operand.lands[0].0.rows,expected_rows.clone());
+                            assert_eq!(operand.lands[0].0.cols,expected_col*width..(expected_col+256)*width);
+                            assert_eq!(operand.lands[0].0.path,std::path::Path::new("/selected/selected.safetensors"));
+                            if fp8 {
+                                let AttentionRecord::Operand(scales) = &records[1] else { panic!("scale transform") };
+                                assert_eq!(scales.lands[0].0.rows,expected_rows.start/128..expected_rows.end/128);
+                                assert_eq!(scales.lands[0].0.cols,expected_col/128*4..(expected_col+256)/128*4);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
     fn split_reads_bf16_blocks_without_a_companion_or_scale_tensors() {
         use cuteafd_loader::plan::checkpoint::{Checkpoint, CheckpointTensor};
         use cuteafd_loader::SafetensorsTensorMetadata;
@@ -1423,7 +1624,7 @@ mod tests {
             }
         }
         std::fs::write(dir.path().join("weights.bin"), &bytes).unwrap();
-        let checkpoint = Checkpoint { snapshot: dir.path().into(), config: serde_json::json!({}),
+        let checkpoint = Checkpoint { view: None, snapshot: dir.path().into(), config: serde_json::json!({}),
             quantize_config: None, weight_map: Default::default(), missing_shards: vec![], shard_bytes: bytes.len() as u64,
             tensors: vec![CheckpointTensor { shard: "weights.bin".into(), meta: SafetensorsTensorMetadata {
                 name: "projection.weight".into(), dtype: cuteafd_core::DType::Bf16, shape: vec![256, 256],

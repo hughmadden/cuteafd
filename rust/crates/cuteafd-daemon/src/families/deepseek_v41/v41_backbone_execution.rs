@@ -1,5 +1,6 @@
 //! Cache producers and the complete per-layer backbone execution handoff.
 use crate::families::deepseek_v41::v41_backbone_cache::{BackboneCache, CacheBatch, CacheStage, CachePlacement};
+use crate::shared::memory::Tag;
 use crate::shared::memory::device::{Device, DeviceOwner};
 mod placement;
 mod distributed;
@@ -226,6 +227,12 @@ pub(crate) struct CacheProducerWeights<'a> {
     placement: Option<CachePlacement>,
 }
 impl<'a> CacheProducerWeights<'a> {
+    pub(crate) fn inventory(&self, inventory: &mut crate::shared::memory::receipts::Inventory<'_>) -> Result<()> {
+        for window in &self.windows { window.inventory(inventory)?; }
+        for source in &self.sources { source.inventory(inventory)?; }
+        for sinks in &self._sinks { sinks.inventory(inventory)?; }
+        Ok(())
+    }
     fn sinks() -> Vec<String> {
         (0..40)
             .map(|layer| format!("layers.{layer}.attn.attn_sink"))
@@ -246,6 +253,7 @@ impl<'a> CacheProducerWeights<'a> {
         }
         Ok(total)
     }
+    #[cfg(test)]
     pub fn load(
         library: &'a NativeLibrary,
         catalog: &OfficialV41Catalog,
@@ -336,7 +344,7 @@ impl<'a> ProducerStorage<'a> {
     pub(crate) fn new(library: &'a NativeLibrary, rows: usize, unit: usize) -> Result<Self> {
         Ok(Self {
             windows: crate::families::deepseek_v41::v41_window::WindowStorage::new(library, rows, unit,
-                &(0..40).collect::<Vec<_>>(), true)?,
+                &(0..40).collect::<Vec<_>>())?,
             // One compressor storage for the four source layers: one stream
             // orders every slot's productions, scratch is shared (WP2 contract).
             sources: vec![crate::families::deepseek_v41::v41_compressor::CompressorStorage::new(
@@ -383,9 +391,9 @@ impl<'a> WindowBatch<'a> {
         Ok(Self {
             library,
             stream: crate::shared::memory::LoadStream { library, raw: library.cuda_stream_create()? },
-            staging: crate::shared::memory::HostAllocation::new(library, bytes)?,
+            staging: crate::shared::memory::HostAllocation::new(library, bytes, Tag::staging("v41/window-batch"))?,
+            table: crate::shared::memory::DeviceAllocation::new(library, bytes, Tag::staging("v41/window-batch"))?,
             staging_check: crate::shared::memory::staging_check::StagingCheck::new(library, "V4.1 window batch", 1),
-            table: crate::shared::memory::DeviceAllocation::new(library, bytes)?,
             kernel: library.v41_kv_store_layers()?,
             capacity,
         })
@@ -513,6 +521,22 @@ impl Drop for PendingProduction<'_, '_, '_> {
     }
 }
 impl<'w, 'a> BackboneExecution<'w, 'a> {
+    pub(crate) fn capture_startup(&mut self, bank: &BackboneCache<'a>, rows: &[usize]) -> Result<()> {
+        bank.capture_startup_local_producers(&mut self.windows, &mut self.sources, rows)
+    }
+    pub(crate) fn startup_sinks(&self) -> &[cuteafd_ffi::CuteafdDeviceBuffer; 40] { &self.weights.sink_views }
+    pub(crate) fn startup_source(&self, bank: &BackboneCache<'a>, layer: usize, rows: usize)
+        -> Result<crate::families::deepseek_v41::v41_compressor::IndexScoreGeometry> {
+        let index = [2, 8, 14, 20].iter().position(|&source| source == layer)
+            .context("startup index source absent")?;
+        self.sources[index].startup_index_geometry(bank.sources()[index].get(), rows)
+    }
+
+    pub(crate) fn visit_graph_banks(&mut self, f: &mut dyn FnMut(i32, &'static str, bool, &mut dyn crate::shared::decode_graph::CacheAttached) -> Result<()>) -> Result<()> {
+        for wave in &mut self.windows { wave.visit_graph_banks(f)?; }
+        for wave in &mut self.sources { wave.visit_graph_banks(f)?; }
+        Ok(())
+    }
     pub fn window_batch_enabled() -> bool {
         std::env::var("CUTEAFD_WINDOW_BATCH").map_or(true, |v| v != "0")
     }
@@ -541,9 +565,9 @@ impl<'w, 'a> BackboneExecution<'w, 'a> {
             Self::workspace_bytes(weights.library, capacity)? <= budget,
             "cache producer workspace exceeds budget"
         );
-        // A private pass: its layers share scratch, each wave keeps its own stream.
+        // A private pass: its layers share scratch and one producer stream.
         let windows = crate::families::deepseek_v41::v41_window::WindowStorage::new(weights.library,
-            capacity as usize, capacity as usize, &(0..40).collect::<Vec<_>>(), false)?;
+            capacity as usize, capacity as usize, &(0..40).collect::<Vec<_>>())?;
         let sources = SOURCES.iter().map(|&layer| crate::families::deepseek_v41::v41_compressor::CompressorStorage::new(
             weights.library, capacity as usize, capacity as usize, &[layer])).collect::<Result<Vec<_>>>()?;
         Self::on_storage(weights, ProducerStorage { windows, sources, batch_rows: capacity as usize })

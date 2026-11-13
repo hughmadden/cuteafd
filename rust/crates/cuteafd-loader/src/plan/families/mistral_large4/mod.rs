@@ -6,9 +6,10 @@
 //! (`layers.N.attention.wq`, `layers.N.experts.E.w1`, `output`), read from
 //! `config.json:transformers_weights` (`consolidated.safetensors.index.json`).
 //!
-//! Two storage forms pass the tensor contract: the official FP8 block-128
-//! release (the quantization source and fidelity root, inventory only) and
-//! the EXL3 K4 experts + K6 core publication the engine serves. The contract
+//! The official FP8 block-128 release is the quantization source and fidelity
+//! root; its routed experts still need a supported Spark package. Serving accepts
+//! EXL3 experts with the original mixed E4M3/BF16 core, or a stored trellis core.
+//! The original mixed core is not an MC publication. The contract
 //! is exact: every text tensor's name, shape and form comes from the
 //! checkpoint's own config, so a quant that drifts from the recipe is named.
 use std::collections::BTreeMap;
@@ -268,6 +269,7 @@ pub(crate) struct Model {
 impl Model {
     fn open(checkpoint: &Checkpoint) -> Result<Self> {
         let cfg = Ml4Config::from_hf(&checkpoint.config)?;
+        crate::families::mistral_large4::attention::validate(checkpoint, &cfg)?;
         let expected = expected(&cfg);
         // The index names every runtime tensor; its storage form is the
         // tensor contract's verdict (`accepts`), which names recipe drift.
@@ -355,6 +357,8 @@ fn spec(cfg: &Ml4Config, checkpoint: &Checkpoint) -> Result<ModelSpec> {
 }
 
 impl FamilyModel for Model {
+    fn contract_admission(&self) -> bool { true }
+
     fn spec(&self) -> &ModelSpec { &self.spec }
 
 
@@ -382,6 +386,12 @@ impl FamilyModel for Model {
         }
         let e = self.expected.get(stem)
             .ok_or_else(|| format!("{stem}: outside the Mistral Large 4 text tensor contract ({})", describe(operand)))?;
+        if let Encoding::Exl3 { bits } = operand.encoding {
+            require(crate::families::glm5::core::NATIVE_CORE_WIDTHS.contains(&bits), || format!(
+                "Mistral Large 4 {stem}: unsupported dense core width K{bits}; shipping width K6; \
+                K8 core views need ML4 K8 exports: add trellis_linear exporter program and family dispatch \
+                in python/tools/aot/export_b12x_dense_trellis_k6_aot.py (ML4_SHAPES, bits=8)"))?;
+        }
         let core = |operand: &mut QuantOperand, pad: bool| -> Option<Result<(), String>> {
             (operand.encoding == (Encoding::Exl3 { bits: 6 })).then(|| {
                 let padded = pad && operand.logical == [e.shape[0].next_multiple_of(128), e.shape[1]];
@@ -415,7 +425,7 @@ impl FamilyModel for Model {
             package: PACKAGE.into(),
             block: 128,
             spark_worlds: crate::plan::experts::spark_worlds(PACKAGE, moe.intermediate),
-            local: Err("Mistral Large 4 routed experts (about 479 GiB at K4) cannot all be resident on the coordinators".into()),
+            local: Ok("Mistral Large 4 EXL3 RTX expert onboarding package".into()),
         })
     }
 }

@@ -24,7 +24,7 @@ phase fails; the script exits nonzero if anything could not be stopped.
 --config FILE selects an entire alternate configuration file. Its Spark host
 keys define the cleanup scope. Only syntax, known keys, value domains and host
 tokens are validated: a file that is incomplete or invalid for launching (for
-example six hosts without SPARK_TP/SPARK_EP) still stops every host it names.
+example six hosts without SPARK_COUNT) still stops every host it names.
 INSTANCE in that file selects the coordinator container to stop: with INSTANCE
 set it is cuteafd-coordinator-INSTANCE, otherwise the shared cuteafd-coordinator.
 EOF
@@ -55,8 +55,8 @@ release_load_config "$config" stop
 # above validates the configuration first (syntax, known keys, value domains),
 # so a missing, malformed or unsafe file fails before any container or process
 # is touched. Stop mode skips launch-only topology/readiness rules, so a file
-# that is incomplete for launching (for example six hosts without SPARK_TP/
-# SPARK_EP) still cleans every host it names.
+# that is incomplete for launching (for example six hosts without
+# SPARK_COUNT) still cleans every host it names.
 release_select_stop_hosts
 release_need docker
 release_need ssh

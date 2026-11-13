@@ -19,6 +19,7 @@
 //! rank's engine stream.
 use super::engine::RankResources;
 use crate::shared::memory::device::{Allocation, Device};
+use crate::shared::memory::Tag;
 use anyhow::{ensure, Result};
 use cuteafd_engine::prefix::{BoxError, FamilyLayout, MarkSlot, MarkStore, PrefixFamily, ReuseRule, TailCopy};
 use cuteafd_ffi::CuteafdDeviceBuffer;
@@ -91,7 +92,8 @@ impl<'r, 'a> MusePrefix<'r, 'a> {
         }
         let mark = usize::try_from(state.mark_bytes())?;
         let arenas = if slots > 0 {
-            ranks.iter().map(|r| Allocation::new(Device { library, id: r.device.id }, (slots * mark).max(256)).map(Rc::new))
+            ranks.iter().map(|r| Allocation::new(Device { library, id: r.device.id },
+                (slots * mark).max(256), Tag::prefix("muse/prefix-marks")).map(Rc::new))
                 .collect::<Result<Vec<_>>>()?
         } else { Vec::new() };
         let copies = crate::shared::prefix::PrefixCopies::new(library, ranks.iter().zip(streams).map(|(r, &stream)|

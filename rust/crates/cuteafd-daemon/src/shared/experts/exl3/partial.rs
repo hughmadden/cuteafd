@@ -19,22 +19,27 @@ pub(crate) struct PartialEpilogue<'a> {
     bf16: Program<'a>,
     nvfp4: Program<'a>,
     fp8: Program<'a>,
-    /// Device row maps (BF16 region, then the wide region), `capacity` u32 each,
+    /// Device row maps (BF16, wide, then other compressed), `capacity` u32 each,
     /// uploaded from pinned staging (reused only after the worker's stream drains,
     /// as its route staging is).
     row_maps: crate::shared::memory::DeviceAllocation<'a>,
     staging: crate::shared::memory::HostAllocation<'a>,
     capacity: usize,
     library: &'a NativeLibrary,
+    identity: bool,
 }
 
-/// The two region row maps of a plan, in ascending wave-row order.
-pub(crate) fn row_maps(plan: &PartialReplyPlan) -> (Vec<u32>, Vec<u32>) {
-    let (mut bf16, mut wide) = (Vec::new(), Vec::new());
+/// The three region row maps of a plan, in ascending wave-row order.
+pub(crate) fn row_maps(plan: &PartialReplyPlan) -> [Vec<u32>; 3] {
+    let mut maps = [Vec::new(), Vec::new(), Vec::new()];
     for (row, &region) in plan.regions.iter().enumerate() {
-        if region == 0 { bf16.push(row as u32) } else { wide.push(row as u32) }
+        maps[region as usize].push(row as u32);
     }
-    (bf16, wide)
+    maps
+}
+
+fn identity_image(capacity: usize) -> Result<Vec<u8>> {
+    Ok((0..u32::try_from(capacity)?).flat_map(u32::to_le_bytes).collect())
 }
 
 impl<'a> PartialEpilogue<'a> {
@@ -46,11 +51,21 @@ impl<'a> PartialEpilogue<'a> {
         let bf16 = program("expert_partial_bf16")?;
         let nvfp4 = program("expert_partial_nvfp4")?;
         let fp8 = program("expert_partial_fp8")?;
-        let row_maps = crate::shared::memory::DeviceAllocation::named(library, 2 * capacity * 4,
-            "experts/workspace/partial_row_maps")?;
-        let staging = crate::shared::memory::HostAllocation::named(library, 2 * capacity * 4,
-            "experts/workspace/partial_row_map_staging")?;
-        Ok(Self { bf16, nvfp4, fp8, row_maps, staging, capacity, library })
+        let row_maps = crate::shared::memory::DeviceAllocation::new(library, 3 * capacity * 4, crate::shared::memory::tag(crate::shared::memory::MemoryKind::Workspace, "experts/workspace/partial_row_maps"))?;
+        let staging = crate::shared::memory::HostAllocation::new(library, 3 * capacity * 4, crate::shared::memory::tag(crate::shared::memory::MemoryKind::Workspace, "experts/workspace/partial_row_map_staging"))?;
+        Ok(Self { bf16, nvfp4, fp8, row_maps, staging, capacity, library, identity: false })
+    }
+
+    /// Fix this owner's BF16 row map to the identity prefix before any capture.
+    /// This mode is exclusive: generic compressed/mixed plans are rejected.
+    pub(crate) fn initialize_identity(&mut self, stream: *mut c_void) -> Result<()> {
+        if self.identity { return Ok(()); }
+        let image = identity_image(self.capacity)?;
+        // SAFETY: ordered staging owns the upload until completion; this map is
+        // immutable for the remainder of this owner's lifetime.
+        unsafe { self.library.copy_h2d_ordered(self.row_maps.buffer, &image, stream)?; }
+        self.identity = true;
+        Ok(())
     }
 
     /// Write `plan`'s regions of `rows` rows into `out` (the reply payload).
@@ -64,23 +79,27 @@ impl<'a> PartialEpilogue<'a> {
         stream: *mut c_void) -> Result<()> {
         ensure!(rows > 0 && rows <= self.capacity && plan.regions.len() == rows,
             "partial-reply plan of {} regions for {rows} rows (capacity {})", plan.regions.len(), self.capacity);
-        let (bf16_at, wide_at, wide_bytes, total) = plan.payload(topk, width)
-            .map(|(bf16, at, wide, total)| (bf16, at, wide, total))?;
-        ensure!(out.bytes >= total, "partial-reply slot of {} bytes under the {total}-byte payload", out.bytes);
-        let (bf16_rows, wide_rows) = row_maps(plan);
+        ensure!(!self.identity || plan.regions.iter().all(|&region| region == 0),
+            "identity partial epilogue requires an all-BF16 plan");
+        let layout = plan.layout(topk, width)?;
+        ensure!(out.bytes >= layout.total, "partial-reply slot of {} bytes under the {}-byte payload", out.bytes, layout.total);
+        let region_maps = row_maps(plan);
         let maps = self.row_maps.buffer;
         let capacity = self.capacity;
-        {
+        if !self.identity {
             let staged = self.staging.bytes_mut();
-            for (index, map) in [&bf16_rows, &wide_rows].into_iter().enumerate() {
+            for (index, map) in region_maps.iter().enumerate() {
                 for (i, row) in map.iter().enumerate() {
                     staged[(index * capacity + i) * 4..][..4].copy_from_slice(&row.to_le_bytes());
                 }
             }
         }
-        let wide_program = match plan.wide { PartialWire::Nvfp4 => &self.nvfp4, PartialWire::Fp8 => &self.fp8 };
-        let regions = [(&self.bf16, bf16_rows, 0usize, bf16_at), (wide_program, wide_rows, wide_at, wide_bytes)];
-        for (index, (program, map, offset, bytes)) in regions.into_iter().enumerate() {
+        let (wide_program, other_program) = match plan.wide {
+            PartialWire::Nvfp4 => (&self.nvfp4, &self.fp8),
+            PartialWire::Fp8 => (&self.fp8, &self.nvfp4),
+        };
+        for (index, (program, map)) in [&self.bf16, wide_program, other_program].into_iter().zip(region_maps).enumerate() {
+            let (offset, bytes) = (layout.offsets[index], layout.bytes[index]);
             if map.is_empty() { continue; }
             let map_buffer = CuteafdDeviceBuffer { ptr: maps.ptr.cast::<u8>().wrapping_add(index * capacity * 4).cast(),
                 bytes: map.len() * 4, ..maps };
@@ -88,7 +107,9 @@ impl<'a> PartialEpilogue<'a> {
                 .wrapping_add(index * capacity * 4).cast(), bytes: map.len() * 4, ..self.staging.buffer };
             // SAFETY: pinned staging and the map buffer are this epilogue's own allocations; the
             // worker drains `stream` before the next request rewrites the staging.
-            unsafe { self.library.copy_host_buffer_h2d_async(map_buffer, source, map.len() * 4, stream)?; }
+            if !self.identity {
+                unsafe { self.library.copy_host_buffer_h2d_async(map_buffer, source, map.len() * 4, stream)?; }
+            }
             let region = CuteafdDeviceBuffer { ptr: out.ptr.cast::<u8>().wrapping_add(offset).cast(), bytes, ..out };
             let pointers = [sources.fc2.ptr, sources.svh.ptr, ids.ptr, sources.expert_map.ptr, map_buffer.ptr, region.ptr];
             let scalars = [Scalar::I32(i32::try_from(map.len())?), Scalar::I32(i32::try_from(rows)?),
@@ -105,10 +126,22 @@ mod tests {
     use super::*;
 
     #[test]
+    fn immutable_identity_map_has_every_bf16_prefix() -> Result<()> {
+        let image = identity_image(128)?;
+        for rows in [1, 7, 64, 128] {
+            assert_eq!(image[..rows * 4], row_maps(&PartialReplyPlan {
+                wide: PartialWire::Nvfp4, regions: vec![0; rows] })[0].iter()
+                .flat_map(|row| row.to_le_bytes()).collect::<Vec<_>>());
+        }
+        assert!(identity_image(u32::MAX as usize + 1).is_err());
+        Ok(())
+    }
+
+    #[test]
     fn row_maps_partition_the_wave_by_region() {
-        let plan = PartialReplyPlan { wide: PartialWire::Nvfp4, regions: vec![0, 1, 1, 0, 1] };
-        assert_eq!(row_maps(&plan), (vec![0, 3], vec![1, 2, 4]));
+        let plan = PartialReplyPlan { wide: PartialWire::Nvfp4, regions: vec![0, 1, 2, 0, 1] };
+        assert_eq!(row_maps(&plan), [vec![0, 3], vec![1, 4], vec![2]]);
         let empty = PartialReplyPlan { wide: PartialWire::Fp8, regions: vec![0; 3] };
-        assert_eq!(row_maps(&empty), (vec![0, 1, 2], vec![]));
+        assert_eq!(row_maps(&empty), [vec![0, 1, 2], vec![], vec![]]);
     }
 }

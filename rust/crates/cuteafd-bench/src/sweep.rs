@@ -6,7 +6,7 @@
 //! draft-policy gates read). It runs in the driver's own binary, so both arms
 //! of an A/B measure the same workload whatever their server builds contain.
 use crate::client::Client;
-use crate::panels::common::{aggregate, mapped_counters, mapped_interval, median, plain, wave, Timed};
+use crate::panels::common::{aggregate, expert_usage_interval, mapped_interval, median, phase_counters, plain, wave, Timed};
 use crate::panels::speed::CONTENT;
 use crate::text::{corpus, nonce};
 use anyhow::{bail, Context, Result};
@@ -54,6 +54,9 @@ pub struct Point {
     /// Mapped-table counters over the timed wave alone.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub mapped_tables: Vec<Value>,
+    /// Approximate phase deltas from asynchronous device snapshots.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expert_usage: Option<Value>,
 }
 
 /// One cold prefill at a chosen length (after one untimed warm request there).
@@ -61,9 +64,16 @@ pub struct Point {
 pub struct PrefillPoint {
     /// Requested prompt tokens.
     pub length: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shape: Option<crate::report::PrefillShape>,
     pub prompt_tokens: u64,
     pub tok_s: f64,
     pub ttft_s: f64,
+    /// Idle time after the ordinary warm request, outside the timed interval.
+    #[serde(default)]
+    pub idle_seconds: f64,
     /// GPU throttle report over the timed request (`/v1/thermal`; absent without one).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thermal: Option<Value>,
@@ -72,6 +82,9 @@ pub struct PrefillPoint {
     /// Mapped-table counters over the timed request alone (`/v1/stats` before and after).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub mapped_tables: Vec<Value>,
+    /// Approximate phase deltas from asynchronous device snapshots.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expert_usage: Option<Value>,
 }
 
 /// Explicit cold C1 prose cells; omitted seeds retain the original corpus seed.
@@ -104,9 +117,17 @@ pub struct PrefillOptions<'a> {
     /// The timed request re-sends its warm-up's corpus behind a fresh leading
     /// nonce (no prefix-cache reuse): table rows the warm-up read are the same.
     pub repeat: bool,
+    pub idle_seconds: f64,
     /// A cold purge (e.g. `nest drop-caches`), run before each point's warm-up
     /// and again before its timed request.
     pub purge: Option<&'a dyn Fn() -> Result<()>>,
+}
+
+impl PrefillOptions<'_> {
+    pub fn idle_duration(&self) -> Result<std::time::Duration> {
+        std::time::Duration::try_from_secs_f64(self.idle_seconds)
+            .context("prefill idle seconds must be finite, nonnegative and representable")
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -116,6 +137,8 @@ pub struct Sweep {
     pub points: Vec<Point>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub prefill: Vec<PrefillPoint>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub skipped_prefill: Vec<crate::report::SkippedPrefill>,
     /// GPU throttle report per phase (`prefill`, `decode`), warm-ups included: the
     /// sustained heat each phase built up, next to the timed points' own windows.
     #[serde(default, skip_serializing_if = "serde_json::Map::is_empty")]
@@ -195,11 +218,13 @@ fn measure(client: &Client, c: usize, phase: &str, repeat: Option<&Prompts>, tok
     timed(on_timed)?;
     let mark = client.thermal_mark();
     let fabric_mark = client.fabric_mark();
-    let tables = mapped_counters(client);
+    let counters = phase_counters(client);
     let before = c1.and_then(|_| client.decode_counters());
     let results = uncached(batch(&prompts.timed))?;
     let draft_counters = draft_delta(before.as_ref(), c1.and_then(|_| client.decode_counters()).as_ref());
-    let mapped_tables = mapped_interval(&tables, &mapped_counters(client));
+    let after = phase_counters(client);
+    let mapped_tables = mapped_interval(&counters.mapped_tables, &after.mapped_tables);
+    let expert_usage = expert_usage_interval(counters.expert_usage.as_ref(), after.expert_usage.as_ref());
     let fabric = client.fabric_since(fabric_mark, &format!("{phase}/c{c}"), true).map(|p| serde_json::json!(p));
     let thermal = client.thermal_since(mark);
     let errors = results.iter().filter(|r| r.is_err()).count();
@@ -210,7 +235,7 @@ fn measure(client: &Client, c: usize, phase: &str, repeat: Option<&Prompts>, tok
     let mut per: Vec<f64> = ok.iter().map(|r| r.chat.timing.decode_tok_s()).collect();
     let mut ttft: Vec<f64> = ok.iter().map(|r| r.chat.timing.ttft_s).collect();
     let point = Point { c, phase: phase.into(), aggregate_tok_s: aggregate(&ok), per_request_tok_s: median(&mut per),
-        ttft_s: median(&mut ttft), errors, thermal, fabric, mapped_tables,
+        ttft_s: median(&mut ttft), errors, thermal, fabric, mapped_tables, expert_usage,
         context: c1.map(|x| x.0), seed: c1.map(|x| x.1),
         prompt_sha256: c1.map(|_| format!("{:x}", Sha256::digest(prompts.timed[0].as_bytes()))),
         prompt_tokens: c1.map(|_| ok[0].chat.timing.prompt_tokens),
@@ -233,13 +258,16 @@ fn draft_delta(before: Option<&Value>, after: Option<&Value>) -> Option<Value> {
 }
 
 /// Cold prefill at each length: fit tokens per reference token from two short
-/// requests, then per length one untimed warm request and one measured request
+/// requests as an initial estimate, then size exactly through the served tokenizer.
+/// Per length one untimed warm request and one measured request
 /// with a fresh prefix (it must reuse no cached tokens). With `options.repeat`
 /// the measured request re-sends the warm-up's corpus behind a fresh nonce;
 /// with `options.purge` the purge runs before the warm-up and again before the
 /// measured request, so both start from the same cold state.
-fn prefill(client: &Client, lengths: &[u64], max_context: u64, options: &PrefillOptions, on_timed: &mut OnTimed)
+fn prefill(client: &Client, lengths: &[u64], max_context: u64, options: &PrefillOptions, on_timed: &mut OnTimed,
+    skipped: &mut Vec<crate::report::SkippedPrefill>)
     -> Result<Vec<PrefillPoint>> {
+    let idle = options.idle_duration()?;
     let ask = |words: usize, seed: u64| -> Result<crate::client::Chat> {
         client.chat(plain(client, &format!("[{}] Summarize in one word.\n\n{}", nonce(), corpus(seed, words)), 1), None)
     };
@@ -249,25 +277,47 @@ fn prefill(client: &Client, lengths: &[u64], max_context: u64, options: &Prefill
     let (slope, intercept) = if slope.is_finite() && slope > 0.3 { (slope, intercept) } else { (1.0, 20.0) };
     let purge = || options.purge.map_or(Ok(()), |purge| purge());
     let mut points = Vec::new();
-    for &length in lengths {
-        let target = length.min(max_context.saturating_sub(64)) as f64;
-        let words = ((target - intercept) / slope).max(64.0) as usize;
+    let unit = client.prefill_unit_rows()?;
+    let tail = crate::prefill::tail_tokens(unit)?;
+    let mut requested = lengths.to_vec();
+    if requested.contains(&crate::prefill::CARD_TOKENS) && !requested.contains(&tail) { requested.push(tail); }
+    for length in requested {
+        let words = ((length as f64 - intercept) / slope).max(64.0) as usize;
         let (warm_seed, timed_seed) = prefill_seeds(length, options.repeat);
+        let diagnostic = length == tail && !lengths.contains(&length);
+        let sized = crate::prefill::prompts(client, (warm_seed, timed_seed), words, length,
+            max_context, "Summarize in one word.", diagnostic);
+        let (warm_text, timed_text) = match sized {
+            Ok(prompts) => prompts,
+            Err(error) if diagnostic => {
+                skipped.push(crate::report::SkippedPrefill { requested_tokens: length,
+                    label: "8K w/tail".into(), reason: format!("{error:#}"), });
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
         purge().with_context(|| format!("{length}-token prefill purge before warm-up"))?;
-        ask(words, warm_seed).with_context(|| format!("{length}-token prefill warm-up"))?;
+        let warm = client.chat(plain(client, &warm_text.text, 1), None)
+            .with_context(|| format!("{length}-token prefill warm-up"))?;
+        crate::prefill::validate(warm_text.tokens, warm.timing.prompt_tokens)?;
+        if !idle.is_zero() { std::thread::sleep(idle); }
         timed(on_timed)?;
         purge().with_context(|| format!("{length}-token prefill purge before the timed request"))?;
         let mark = client.thermal_mark();
         let fabric_mark = client.fabric_mark();
-        let tables = mapped_counters(client);
-        let chat = ask(words, timed_seed).with_context(|| format!("{length}-token prefill"))?;
-        let mapped_tables = mapped_interval(&tables, &mapped_counters(client));
+        let counters = phase_counters(client);
+        let chat = client.chat(plain(client, &timed_text.text, 1), None).with_context(|| format!("{length}-token prefill"))?;
+        let after = phase_counters(client);
+        let mapped_tables = mapped_interval(&counters.mapped_tables, &after.mapped_tables);
+        let expert_usage = expert_usage_interval(counters.expert_usage.as_ref(), after.expert_usage.as_ref());
         let thermal = client.thermal_since(mark);
         let fabric = client.fabric_since(fabric_mark, &format!("prefill/{length}"), true).map(|p| serde_json::json!(p));
         let t = chat.timing;
         anyhow::ensure!(t.cached_tokens == 0, "{length}-token cold prefill reused {} cached tokens", t.cached_tokens);
-        points.push(PrefillPoint { length, prompt_tokens: t.prompt_tokens, tok_s: t.prefill_tok_s(), ttft_s: t.ttft_s,
-            thermal, fabric, mapped_tables });
+        crate::prefill::validate(timed_text.tokens, t.prompt_tokens)?;
+        points.push(PrefillPoint { length, label: (length == tail).then(|| "8K w/tail".into()),
+            shape: Some(crate::prefill::shape(t.prompt_tokens, unit)), prompt_tokens: t.prompt_tokens, tok_s: t.prefill_tok_s(), ttft_s: t.ttft_s,
+            idle_seconds: options.idle_seconds, thermal, fabric, mapped_tables, expert_usage });
     }
     Ok(points)
 }
@@ -323,6 +373,7 @@ fn run_configured(url: &str, api_key: Option<&str>, levels: &[usize], post_load_
     if tokens > MAX_TOKENS {
         bail!("sweep tokens must be {OMIT_TOKENS} (omit max_tokens) or 1..={MAX_TOKENS}, got {tokens}");
     }
+    prefill_options.idle_duration()?;
     if post_load_repeat && !(post_load_c1 && levels.contains(&1)) {
         bail!("post_load_repeat needs post_load_c1 and a levels list that includes 1 (it replays the levels C1)");
     }
@@ -334,7 +385,7 @@ fn run_configured(url: &str, api_key: Option<&str>, levels: &[usize], post_load_
     if !prefill_lengths.is_empty() {
         let max_context = record["max_context_tokens"].as_u64().unwrap_or(8192);
         let mark = client.thermal_mark();
-        sweep.prefill = prefill(&client, prefill_lengths, max_context, prefill_options, &mut on_timed)?;
+        sweep.prefill = prefill(&client, prefill_lengths, max_context, prefill_options, &mut on_timed, &mut sweep.skipped_prefill)?;
         if let Some(window) = client.thermal_since(mark) { sweep.thermal.insert("prefill".into(), window); }
     }
     let mark = client.thermal_mark();
@@ -448,6 +499,117 @@ mod tests {
         let (warm, timed) = prefill_seeds(8192, false);
         assert_ne!(corpus(warm, 512), corpus(timed, 512));
         assert_ne!(prefill_seeds(8192, true), prefill_seeds(65536, true));
+    }
+
+    #[test]
+    fn exact_prefill_rejects_streamed_warm_and_timed_usage_mismatches() {
+        use std::io::{BufRead, BufReader, Read, Write};
+        use serde_json::json;
+        use std::sync::atomic::Ordering;
+
+        // No mismatch skips the exact target but accepts a neighboring diagnostic
+        // count, then checks an explicitly requested tail still fails strictly.
+        for mismatch_at in [Some(3), Some(4), None] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let address = listener.local_addr().unwrap();
+            let done = Arc::new(AtomicBool::new(false));
+            let stop = done.clone();
+            let server = std::thread::spawn(move || {
+                let mut chats = 0;
+                while !stop.load(Ordering::Relaxed) {
+                    let (mut socket, _) = match listener.accept() {
+                        Ok(connection) => connection,
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(std::time::Duration::from_millis(1)); continue;
+                        }
+                        Err(e) => panic!("{e}"),
+                    };
+                    socket.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+                    let mut reader = BufReader::new(&mut socket);
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    let path = line.split_whitespace().nth(1).unwrap().to_string();
+                    let mut length = 0;
+                    loop {
+                        line.clear(); reader.read_line(&mut line).unwrap();
+                        if line == "\r\n" { break; }
+                        if let Some(value) = line.to_lowercase().strip_prefix("content-length:") {
+                            length = value.trim().parse::<usize>().unwrap();
+                        }
+                    }
+                    let mut bytes = vec![0; length]; reader.read_exact(&mut bytes).unwrap();
+                    let body: Value = if bytes.is_empty() { Value::Null } else { serde_json::from_slice(&bytes).unwrap() };
+                    let count = || {
+                        let n = 17 + body["messages"][0]["content"].as_str().unwrap().chars().count() as u64 / 3;
+                        if mismatch_at.is_none() && n >= 8296 { n + 1 } else { n }
+                    };
+                    let (kind, reply) = match path.as_str() {
+                        "/v1/messages/count_tokens" => ("application/json", json!({"input_tokens": count(), "exact_token_count": true}).to_string()),
+                        "/v1/bench/status" => ("application/json", json!({"settings":[{
+                            "name":"prefill-units", "value":"2752", "source":"resolved"
+                        }]}).to_string()),
+                        "/v1/chat/completions" => {
+                            chats += 1;
+                            assert_eq!(body["stream"], true);
+                            let actual = count();
+                            if (3..=4).contains(&chats) { assert_eq!(actual, crate::prefill::CARD_TOKENS); }
+                            let reported = if Some(chats) == mismatch_at { 8310 } else { actual };
+                            let event = json!({"choices":[{"delta":{"content":"OK"}, "finish_reason":"stop"}],
+                                "usage":{"prompt_tokens":reported, "completion_tokens":1}});
+                            ("text/event-stream", format!("data: {event}\n\ndata: [DONE]\n\n"))
+                        }
+                        "/v1/stats" | "/v1/thermal" => ("application/json", "{}".into()),
+                        _ => panic!("unexpected request {path}"),
+                    };
+                    write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: {kind}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}", reply.len()).unwrap();
+                }
+                chats
+            });
+            let client = Client::new(&format!("http://{address}"), None, Default::default());
+            let mut hook: OnTimed = None;
+            let mut skipped = Vec::new();
+            let result = prefill(&client, &[crate::prefill::CARD_TOKENS], 32768,
+                &PrefillOptions::default(), &mut hook, &mut skipped);
+            if let Some(mismatch_at) = mismatch_at {
+                done.store(true, Ordering::Relaxed);
+                assert_eq!(server.join().unwrap(), mismatch_at);
+                let error = result.unwrap_err().to_string();
+                assert!(error.contains("requested 8192 prompt tokens but server reported 8310"), "{error}");
+                assert!(skipped.is_empty());
+            } else {
+                let points = result.unwrap();
+                assert_eq!(points.len(), 2);
+                assert_eq!(points[0].prompt_tokens, crate::prefill::CARD_TOKENS);
+                assert!(skipped.is_empty());
+                assert_eq!(points[1].length, 8296);
+                assert!(matches!(points[1].prompt_tokens, 8295 | 8297));
+                assert_eq!(points[1].shape, Some(crate::prefill::shape(points[1].prompt_tokens, 2752)));
+                let sweep = Sweep { prefill: points, skipped_prefill: skipped, ..Default::default() };
+                let json = serde_json::to_value(&sweep).unwrap();
+                assert!(json.get("skipped_prefill").is_none());
+                assert!(matches!(json["prefill"][1]["prompt_tokens"].as_u64(), Some(8295 | 8297)));
+                // Explicit user-requested lengths remain strict, even at the diagnostic length.
+                let error = prefill(&client, &[8296], 32768, &PrefillOptions::default(), &mut hook,
+                    &mut Vec::new()).unwrap_err().to_string();
+                assert!(error.contains("16 deterministic corpus variants"), "{error}");
+                done.store(true, Ordering::Relaxed);
+                assert_eq!(server.join().unwrap(), 8);
+            }
+        }
+    }
+
+    #[test]
+    fn prefill_idle_defaults_to_zero_and_rejects_invalid_durations() {
+        assert!(PrefillOptions::default().idle_duration().unwrap().is_zero());
+        for idle_seconds in [-1.0, f64::NAN, f64::INFINITY, f64::MAX] {
+            let options = PrefillOptions { idle_seconds, ..Default::default() };
+            assert!(options.idle_duration().is_err());
+        }
+        let options = PrefillOptions { idle_seconds: 1.5, ..Default::default() };
+        assert_eq!(options.idle_duration().unwrap(), std::time::Duration::from_millis(1500));
+        let point = PrefillPoint { idle_seconds: options.idle_seconds, ..Default::default() };
+        assert_eq!(serde_json::to_value(point).unwrap()["idle_seconds"], 1.5);
     }
 
     #[test]

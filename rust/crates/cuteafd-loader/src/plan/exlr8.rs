@@ -19,7 +19,7 @@ pub mod residency;
 pub mod dense;
 pub mod native;
 mod workspace;
-pub use workspace::{execution_workspace, routed_workspace, shared_workspace, ExecutionVariant, ExecutionWorkspace};
+pub use workspace::{execution_workspace_from_manifest, execution_workspace, routed_workspace, shared_execution_workspace, shared_workspace, ExecutionVariant, ExecutionWorkspace};
 
 /// Native selection is distinct from the ordinary GLM launch description.
 #[derive(Debug, Clone, Serialize)]
@@ -116,8 +116,9 @@ fn native_options(selected: &str, options: &super::PlanOptions, speculator: &str
     let attention = options.attention_placement.unwrap_or(default_attention);
     if family == "glm5" {
         ensure!(world > 0, "GLM EXLR8 native deployment requires canonical Sparks with 1..=8 ranks");
-        ensure!(attention == default_attention,
-            "EXLR8 native deployment with {gpu_count} RTX GPUs requires {default_attention} attention");
+        ensure!(attention == crate::placement::AttentionPlacement::Heads
+            || (gpu_count == 2 && matches!(attention, crate::placement::AttentionPlacement::Context | crate::placement::AttentionPlacement::Layers)),
+            "GLM EXLR8 native deployment requires heads or two-GPU context/layers attention");
     } else {
         ensure!(gpu_count == 2 || attention == crate::placement::AttentionPlacement::Heads,
             "Flash EXLR8 {attention} attention requires two RTX GPUs");
@@ -132,17 +133,23 @@ pub(super) fn native_plan_of(input: &super::PlanInput, selected: &str,
     let family = super::family::detect(checkpoint).context("EXLR8 family is not recognized")?;
     let (world, gpu_count, attention, mut resolved_layout) = native_options(selected, options, speculator, family.id())?;
     let model = family.open(checkpoint)?;
-    let (layers, first_moe_layer, kernels) = native::family_geometry(&checkpoint.config)?;
+    let (layers, first_moe_layer, _) = native::family_geometry(&checkpoint.config)?;
     let snapshot = &checkpoint.snapshot;
     let mut report = super::empty_report(input, options)?;
     report.family = Some(family.id().into());
     report.spec = Some(model.spec().clone());
     report.cache_requirements = crate::serving_capacity::cache_requirements(model.as_ref(), &checkpoint.config)?;
+    // Shared encoder admission precedes native dense/expert accounting.
+    if let Some(vision) = bundled_vision_component(checkpoint)? {
+        report.components.push(vision);
+    }
     if family.id() == "glm5" {
         super::layout::resolve_prefill(input, &mut report, &mut resolved_layout, world, family.prefill_limits())?;
     }
     let catalog_timer = super::PhaseTimer::new(&input.phases.catalog, &[]);
     let metadata = residency::MetadataInput::open(snapshot, selected)?;
+    #[cfg(test)]
+    let metadata = if uncached_census_enabled() { metadata.without_census_cache() } else { metadata };
     let set_id = metadata.identity.clone();
     let shared = shared_expert_resident(&metadata, &(first_moe_layer..layers).collect::<Vec<_>>(), gpu_count)?;
     let programs = read_json(resolved_layout.workspace_manifest.as_deref()
@@ -150,13 +157,17 @@ pub(super) fn native_plan_of(input: &super::PlanInput, selected: &str,
     let records = dense::DenseRecord::inventory(snapshot)?;
     let selection = dense::DenseSelection::from_hf(&checkpoint.config)?;
     let backbone = selection.backbone(&records, layers)?;
-    let plans = (0..gpu_count).map(|rank| dense::DensePlan::for_rank(&backbone, gpu_count, rank))
+    let whole_mla = if family.id() == "glm5" && attention == crate::placement::AttentionPlacement::Layers {
+        let cfg = crate::families::glm5::GlmDsaConfig::from_hf(&checkpoint.config)?;
+        crate::placement::families::glm5::attention_owners(&cfg, layers)?.into_iter().enumerate()
+            .map(|(layer, rank)| (layer, usize::from(rank))).collect()
+    } else { BTreeMap::new() };
+    let plans = (0..gpu_count).map(|rank| dense::DensePlan::for_rank_owned(&backbone, gpu_count, rank, &whole_mla))
         .collect::<std::result::Result<Vec<_>, _>>()?;
     let activations = dense::programs::resolve_activations(&programs, &checkpoint.config, &records,
         layers, &plans, resolved_layout.exlr8_prefill_pin, resolved_layout.exlr8_prefill_activations)?;
     ensure!(activations == resolved_layout.exlr8_prefill_activations,
         "EXLR8 resolved activation differs from requested layout charge");
-    let workspace = shared_workspace(&programs, kernels)?;
     let facts = native::DenseFacts::new(records, selection, layers, shared)?;
     drop(catalog_timer);
     let (memory, placement) = {
@@ -167,8 +178,8 @@ pub(super) fn native_plan_of(input: &super::PlanInput, selected: &str,
             let placement = report.solver_placement.clone().context("Flash EXLR8 native placement was refused")?;
             (memory, placement)
         } else {
-            super::layout::glm5::native_layout_with_metadata(checkpoint, &resolved_layout, &facts.shared_bytes,
-                workspace, world, &programs, Some(selected), Some(&metadata))?
+            super::layout::glm5::native_layout_with_metadata(checkpoint, &resolved_layout,
+                world, &programs, selected, Some(&metadata), Some(attention), Some(&mut report))?
         }
     };
     let layout = &resolved_layout;
@@ -181,8 +192,8 @@ pub(super) fn native_plan_of(input: &super::PlanInput, selected: &str,
     let mut local_routed = 0u64;
     for layer in first_moe_layer..first_spark {
         for rank in 0..gpu_count {
-            local_routed = local_routed.checked_add(metadata.plan(
-                layer, gpu_count, rank, residency::ExpertSet::Routed)?.resident_bytes as u64)
+            local_routed = local_routed.checked_add(metadata.resident_bytes(
+                layer, gpu_count, rank, residency::ExpertSet::Routed)? as u64)
                 .context("EXLR8 local routed residency overflow")?;
         }
     }
@@ -211,11 +222,11 @@ pub(super) fn native_plan_of(input: &super::PlanInput, selected: &str,
             else { layers - first_moe_layer };
         components.insert(component, (count, bytes));
     }
-    report.components = components.into_iter().map(|(component, (tensors, bytes))| super::ComponentPlan {
+    report.components.extend(components.into_iter().map(|(component, (tensors, bytes))| super::ComponentPlan {
         component, owner: if component == Component::RoutedExpert { super::Owner::SparkSliced }
             else { super::Owner::Rtx }, tensors, bytes, formats: BTreeMap::from([("exlr8".into(), tensors)]),
         status: Status::Ready, rejected: 0, rejections: Vec::new(),
-    }).collect();
+    }));
     if placement.onboard_layers > 0 {
         report.components.push(super::ComponentPlan { component: Component::RoutedExpert,
             owner: super::Owner::Rtx, tensors: placement.onboard_layers, bytes: local_routed,
@@ -247,26 +258,85 @@ pub(super) fn native_plan_of(input: &super::PlanInput, selected: &str,
             .filter(|i| matches!(i.category, cuteafd_core::memory_layout::Category::Weights
                 | cuteafd_core::memory_layout::Category::Embedding | cuteafd_core::memory_layout::Category::Experts)).map(|i| i.bytes).sum())]);
     let mut memory = memory;
-    append_spark_devices(&mut memory, layout, &residents);
+    append_spark_devices(&mut memory, layout, &residents)?;
+    append_spark_encoder(&mut memory, report.encoder.as_ref())?;
+    let context = if layout.context_tokens > 0 { layout.context_tokens } else {
+        report.cache_requirements.as_ref().and_then(|cache| cache.checkpoint_max_context_tokens).unwrap_or(0) };
+    let physical = layout.rtx_bytes.iter().map(|&bytes| crate::placement::CoordinatorCard::planned(
+        bytes, layout.physical_sms).physical_bytes).min().unwrap_or(u64::MAX);
+    report.memory_policy_lines = crate::placement::reserve::layout_lines(&memory,
+        family.id(), context, &layout.rtx_bytes, physical);
     report.memory_layout = Some(memory);
     report.solver_placement = Some(placement);
-    {
+    if !model.contract_admission() {
         let _timer = super::PhaseTimer::new(&input.phases.admission, &[]);
         super::layout::charge_host(&mut report, layout, input, true)?;
     }
+    super::finalize_media_report(&mut report, checkpoint, family, model.spec())?;
     Ok(NativePlan { report, selection: NativeSelection { manifest: selected.into(), set_id }, sparks: SparkRequirements { resident_bytes_per_rank: residents,
         k1_workspace: "checked_by_worker_live_admission" } })
 }
 
+pub(super) fn bundled_vision_component(checkpoint: &super::Checkpoint) -> Result<Option<super::ComponentPlan>> {
+    let mut tensors = 0usize;
+    let mut bytes = 0u64;
+    let mut formats = BTreeMap::new();
+    for tensor in &checkpoint.tensors {
+        if !tensor.meta.name.starts_with("model.visual.") { continue; }
+        tensors += 1;
+        bytes = bytes.checked_add(tensor.meta.byte_length).context("EXLR8 vision bytes overflow")?;
+        *formats.entry(serde_json::to_value(&tensor.meta.dtype)?.as_str()
+            .context("EXLR8 vision dtype is not a scalar format")?.to_owned()).or_default() += 1;
+    }
+    Ok((tensors > 0).then_some(super::ComponentPlan {
+        component: super::Component::Vision, owner: super::Owner::Rtx, tensors, bytes, formats,
+        status: super::Status::Ready, rejected: 0, rejections: Vec::new(),
+    }))
+}
+
 fn append_spark_devices(memory: &mut cuteafd_core::memory_layout::MemoryLayout,
-    layout: &super::layout::LayoutOptions, residents: &[u64]) {
+    layout: &super::layout::LayoutOptions, residents: &[u64]) -> Result<()> {
     use cuteafd_core::memory_layout::{Basis, Category, DeviceKind, DeviceLayout, Item};
-    memory.devices.extend(residents.iter().enumerate().map(|(rank, &bytes)| DeviceLayout {
-        kind: DeviceKind::Spark, index: rank as u32,
-        capacity_bytes: layout.spark_bytes, worker_budget_bytes: layout.spark_bytes,
-        items: vec![Item::new(Category::Experts, "routed_expert", "exlr8", bytes, Basis::Exact)],
-        kv_tokens: 0,
-    }));
+    for (rank, &bytes) in residents.iter().enumerate() {
+        if !memory.devices.iter().any(|device| device.kind == DeviceKind::Spark && device.index as usize == rank) {
+            memory.devices.push(DeviceLayout { kind: DeviceKind::Spark, index: rank as u32,
+                capacity_bytes: layout.spark_bytes, worker_budget_bytes: layout.spark_bytes,
+                items: Vec::new(), kv_tokens: 0 });
+        }
+        let device = memory.devices.iter_mut().find(|device|
+            device.kind == DeviceKind::Spark && device.index as usize == rank).expect("Spark ledger exists");
+        device.items.push(Item::new(Category::Experts, "routed_expert", "exlr8", bytes, Basis::Exact));
+        cuteafd_core::memory_layout::charge_spark_runtime(device)
+            .context("EXLR8 Spark arena reserve overflow")?;
+    }
+    Ok(())
+}
+
+fn append_spark_encoder(memory: &mut cuteafd_core::memory_layout::MemoryLayout,
+    encoder: Option<&super::encoder::EncoderPlacement>) -> Result<()> {
+    use cuteafd_core::memory_layout::{Basis, Category, DeviceKind, Item};
+    if let Some(encoder) = encoder {
+        for rank in encoder.spark_ranks() {
+            let device = memory.devices.iter_mut().find(|device|
+                device.kind == DeviceKind::Spark && device.index as usize == rank)
+                .with_context(|| format!("EXLR8 vision owner Spark{rank} has no device ledger"))?;
+            // Flash's joint admission already publishes its tower ledger; GLM's
+            // native adapter leaves these charges to this shared finalization.
+            for (category, group, bytes, basis) in [
+                (Category::Weights, "vision weights", encoder.weights, Basis::Exact),
+                (Category::Workspace, "vision scratch", encoder.scratch, Basis::Formula),
+            ] {
+                let existing = device.items.iter().filter(|item| item.category == category && item.group == group)
+                    .collect::<Vec<_>>();
+                ensure!(existing.is_empty() || (existing.len() == 1 && existing[0].bytes == bytes),
+                    "EXLR8 vision owner Spark{rank} has inconsistent {group} charges");
+                if existing.is_empty() {
+                    device.items.push(Item::new(category, group, "bundled encoder", bytes, basis));
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 fn served_routed_layers(input: &residency::MetadataInput, layers: &[usize]) -> Result<()> {
@@ -287,11 +357,11 @@ pub fn routed_expert_costs(input: &residency::MetadataInput, layers: &[usize])
     served_routed_layers(input, layers)?;
     layers.iter().map(|&layer| {
         let resident = |world, rank| -> Result<Bytes2> {
-            Ok(Bytes2 { resident: u64::try_from(input.plan(layer, world, rank, ExpertSet::Routed)?.resident_bytes)?,
+            Ok(Bytes2 { resident: u64::try_from(input.resident_bytes(layer, world, rank, ExpertSet::Routed)?)?,
                 staging: 0 })
         };
         Ok(ExpertCost { whole: resident(1, 0)?, half: [resident(2, 0)?, resident(2, 1)?],
-            tp2: true, spark_ok: true })
+            tp2: true, whole_supported: true, spark_ok: true })
     }).collect()
 }
 
@@ -300,7 +370,7 @@ pub fn shared_expert_resident(input: &residency::MetadataInput, layers: &[usize]
     served_routed_layers(input, layers)?;
     ensure!(matches!(world, 1 | 2), "EXLR8 shared experts require one/two target ranks");
     (0..world).map(|rank| layers.iter().try_fold(0u64, |sum, &layer| {
-        let bytes = u64::try_from(input.plan(layer, world, rank, residency::ExpertSet::Shared)?.resident_bytes)?;
+        let bytes = u64::try_from(input.resident_bytes(layer, world, rank, residency::ExpertSet::Shared)?)?;
         sum.checked_add(bytes).context("EXLR8 shared residency overflow")
     })).collect()
 }
@@ -326,7 +396,7 @@ fn spark_resident_bytes_of(input: &residency::MetadataInput, layers: &[usize], w
         && layers.last().copied() == extent.checked_sub(1)
         && layers.windows(2).all(|pair| pair[0] + 1 == pair[1]), "EXLR8 selected Spark suffix/rank geometry");
     (0..world).map(|rank| layers.iter().try_fold(0u64, |sum, &layer| {
-        let bytes = input.plan(layer, world, rank, residency::ExpertSet::Routed)?.resident_bytes as u64;
+        let bytes = input.resident_bytes(layer, world, rank, residency::ExpertSet::Routed)? as u64;
         sum.checked_add(bytes).context("EXLR8 Spark suffix residency overflow")
     })).collect()
 }
@@ -447,7 +517,8 @@ pub(crate) fn inventory(snapshot: &Path, config: Value, needed: impl Fn(&str) ->
             // Local native names repeat across shards; bundled plain vision
             // keeps its qualified HF names for the shared encoder loader.
             let name = if native { format!("{shard}::{}", meta.name) } else { meta.name.clone() };
-            weight_map.insert(name.clone(), shard.clone());
+            ensure!(weight_map.insert(name.clone(), shard.clone()).is_none(),
+                "duplicate tensor {name} in native shard {shard}");
             if needed(&name) {
                 meta.name = name;
                 tensors.push(CheckpointTensor { shard: shard.clone(), meta });
@@ -455,7 +526,7 @@ pub(crate) fn inventory(snapshot: &Path, config: Value, needed: impl Fn(&str) ->
         }
     }
     tensors.sort_by(|a, b| a.meta.name.cmp(&b.meta.name));
-    Ok(Checkpoint { snapshot: snapshot.to_path_buf(), config, quantize_config: None,
+    Ok(Checkpoint { view: None, snapshot: snapshot.to_path_buf(), config, quantize_config: None,
         weight_map, tensors, missing_shards: Vec::new(), shard_bytes })
 }
 
@@ -631,7 +702,8 @@ impl ExpertGeometry {
     }
 }
 
-fn architecture(config: &Value) -> Result<&'static str> {
+/// Resolve the native EXLR8 family from its checkpoint configuration without tensor reads.
+pub fn architecture(config: &Value) -> Result<&'static str> {
     match config["architectures"].as_array().and_then(|a| {
         (a.len() == 1).then(|| a[0].as_str()).flatten()
     }) {
@@ -1238,24 +1310,83 @@ mod tests {
                 }).collect(), pool_tokens: 262144, waste: Vec::new(), notes: Vec::new() };
                 let rtx = memory.devices.clone();
                 let residents = (0..ranks).map(|rank| (80 << 30) + rank as u64).collect::<Vec<_>>();
-                append_spark_devices(&mut memory, &layout, &residents);
+                append_spark_devices(&mut memory, &layout, &residents).unwrap();
                 assert_eq!(&memory.devices[..gpus as usize], rtx.as_slice());
                 assert_eq!(memory.pool_tokens, 262144);
                 for (rank, device) in memory.devices[gpus as usize..].iter().enumerate() {
                     assert_eq!(device.index, rank as u32);
                     assert_eq!(device.worker_budget_bytes, budget);
                     assert_eq!(device.capacity_bytes, budget);
-                    assert_eq!(device.items.len(), 1);
+                    assert_eq!(device.items.len(), 3);
+                    assert_eq!(device.used_bytes(), residents[rank]
+                        + cuteafd_core::memory_layout::spark_runtime_reserve_bytes(residents[rank]).unwrap());
                     assert_eq!(device.items[0].bytes, residents[rank]);
                 }
                 let with_sparks = memory.clone();
-                append_spark_devices(&mut memory, &layout, &[]);
+                append_spark_devices(&mut memory, &layout, &[]).unwrap();
                 assert_eq!(memory, with_sparks);
             }
         }
         let body = include_str!("exlr8.rs").split("pub(super) fn native_plan_of(").nth(1).unwrap()
             .split("fn append_spark_devices(").next().unwrap();
         assert!(body.contains("append_spark_devices(&mut memory, layout, &residents)"));
+    }
+
+    #[test]
+    fn native_min_vision_weights_and_scratch_are_on_spark_zero() {
+        use cuteafd_core::memory_layout::{Category, DeviceKind, MemoryLayout};
+        let mut memory = MemoryLayout { devices: Vec::new(), pool_tokens: 2097152,
+            waste: Vec::new(), notes: Vec::new() };
+        let encoder = super::super::encoder::EncoderPlacement {
+            kind: super::super::encoder::EncoderKind::Spark { rank: 0 },
+            weights: 1_128_026_176, scratch: 791_907_584, replicas: Vec::new(),
+            reason: "bundled tower".into(), shortfall: 0,
+        };
+        append_spark_devices(&mut memory, &Default::default(), &[105_213_559_040]).unwrap();
+        append_spark_encoder(&mut memory, Some(&encoder)).unwrap();
+        let device = &memory.devices[0];
+        assert_eq!((device.kind, device.index), (DeviceKind::Spark, 0));
+        assert_eq!(device.items.len(), 5);
+        assert_eq!((device.items[3].category, device.items[3].bytes), (Category::Weights, encoder.weights));
+        assert_eq!((device.items[4].category, device.items[4].bytes), (Category::Workspace, encoder.scratch));
+        assert_eq!(device.items.iter().map(|item| item.bytes).sum::<u64>(), 107_133_492_800
+            + cuteafd_core::memory_layout::spark_runtime_reserve_bytes(105_213_559_040).unwrap());
+        assert_eq!(memory.pool_tokens, 2097152);
+    }
+
+    #[test]
+    fn native_flash_k4_min_merges_tower_and_experts_on_spark_zero() {
+        use cuteafd_core::memory_layout::{Basis, Category, DeviceKind, DeviceLayout, Item, MemoryLayout};
+        let layout = super::super::layout::LayoutOptions::default();
+        let encoder = super::super::encoder::EncoderPlacement {
+            kind: super::super::encoder::EncoderKind::Spark { rank: 0 },
+            weights: 1_128_026_176, scratch: 791_907_584, replicas: Vec::new(),
+            reason: "bundled tower".into(), shortfall: 0,
+        };
+        // The Flash native adapter returns the admitted tower before EXLR8's
+        // shared finalization adds exact routed-expert residency.
+        let runtime = 512 << 20;
+        let experts = 105_213_559_040;
+        let mut memory = MemoryLayout { devices: vec![DeviceLayout {
+            kind: DeviceKind::Spark, index: 0, capacity_bytes: layout.spark_bytes,
+            worker_budget_bytes: layout.spark_bytes, kv_tokens: 0,
+            items: vec![Item::new(Category::Runtime, "context+modules", "tower only", runtime, Basis::Calibrated),
+                Item::new(Category::Weights, "vision weights", "bundled encoder", encoder.weights, Basis::Exact),
+                Item::new(Category::Workspace, "vision scratch", "bundled encoder", encoder.scratch, Basis::Formula)],
+        }], pool_tokens: 2097152, waste: Vec::new(), notes: Vec::new() };
+        append_spark_devices(&mut memory, &layout, &[experts]).unwrap();
+        append_spark_encoder(&mut memory, Some(&encoder)).unwrap();
+        assert_eq!(memory.devices.len(), 1);
+        let device = &memory.devices[0];
+        assert_eq!((device.kind, device.index), (DeviceKind::Spark, 0));
+        assert_eq!(device.worker_budget_bytes, layout.spark_bytes);
+        assert_eq!(device.items.len(), 6);
+        assert_eq!(device.items.iter().filter(|item| item.category == Category::Experts)
+            .map(|item| item.bytes).sum::<u64>(), experts);
+        assert_eq!(device.items.iter().map(|item| item.bytes).sum::<u64>(),
+            runtime + encoder.weights + encoder.scratch + experts
+            + cuteafd_core::memory_layout::spark_runtime_reserve_bytes(experts).unwrap());
+        assert_eq!(memory.pool_tokens, 2097152);
     }
 
     fn write(path: &Path, metadata: Value, tensors: Vec<(&str, &str, Vec<usize>, Vec<u8>)>) {
@@ -1311,11 +1442,10 @@ mod tests {
             for attention in [None, Some(crate::placement::AttentionPlacement::Heads),
                 Some(crate::placement::AttentionPlacement::Context), Some(crate::placement::AttentionPlacement::Layers)] {
                 options.attention_placement = attention;
-                let expected = if gpus == 2 { crate::placement::AttentionPlacement::Context }
-                    else { crate::placement::AttentionPlacement::Heads };
-                // Family-specific attention refusal follows detection, not a hardcoded GLM default.
+                // Explicit Heads and Layers leave the two-GPU Context default unchanged.
                 assert_eq!(native_options("up1", &options, "off", "glm5").is_ok(),
-                    attention.is_none_or(|a| a == expected));
+                    attention.is_none_or(|a| a == crate::placement::AttentionPlacement::Heads
+                        || (gpus == 2 && matches!(a, crate::placement::AttentionPlacement::Context | crate::placement::AttentionPlacement::Layers))));
                 assert_eq!(native_options("k4", &options, "off", "glm5_flash").is_ok(),
                     gpus == 2 || attention.is_none_or(|a| a == crate::placement::AttentionPlacement::Heads));
             }
@@ -1529,7 +1659,63 @@ mod tests {
 }
 
 #[cfg(test)]
+std::thread_local! { static UNCACHED_CENSUS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
+
+#[cfg(test)]
+fn uncached_census_enabled() -> bool { UNCACHED_CENSUS.with(|enabled| enabled.get()) }
+
+#[cfg(test)]
 mod mounted_tests {
+    #[test]
+    #[ignore = "requires installed GLM EXLR8 snapshot, published PROGRAMS and parity output directory"]
+    fn memoized_census_preserves_current_min_max_plan_json_bytes() {
+        use crate::plan::{ExpertPlacement, PlanInput, PlanOptions, layout::LayoutOptions};
+        let snapshot = std::path::PathBuf::from(std::env::var_os("CUTEAFD_EXLR8_TEST_SNAPSHOT").expect("CUTEAFD_EXLR8_TEST_SNAPSHOT"));
+        let programs = std::path::PathBuf::from(std::env::var_os("CUTEAFD_DEPLOYMENT_TEST_PROGRAMS").expect("CUTEAFD_DEPLOYMENT_TEST_PROGRAMS"));
+        crate::plan::inputs::validate_placement_inputs(&programs).unwrap();
+        let output = std::path::PathBuf::from(std::env::var_os("CUTEAFD_EXLR8_PARITY_OUTPUT").expect("CUTEAFD_EXLR8_PARITY_OUTPUT"));
+        std::fs::create_dir_all(&output).unwrap();
+        struct Reset;
+        impl Drop for Reset { fn drop(&mut self) { super::UNCACHED_CENSUS.with(|flag| flag.set(false)); } }
+        let _reset = Reset;
+        for name in ["exlr8-min", "exlr8-max"] {
+            let gpus = if name.ends_with("max") { 2 } else { 1 };
+            let options = PlanOptions {
+                placement: ExpertPlacement::Sparks { ranks: if gpus == 2 { 6 } else { 4 } },
+                attention_placement: Some(if gpus == 2 { crate::placement::AttentionPlacement::Context }
+                    else { crate::placement::AttentionPlacement::Heads }),
+                layout: Some(LayoutOptions { rtx_bytes: vec![crate::placement::inventory::PRO_TOTAL_BYTES; gpus],
+                    host_memory: Some((256 << 30, 256 << 30)), host_cache_bytes: Some(32 << 30),
+                    workspace_manifest: Some(programs.clone()), glm5_drafter_disabled: true, ..Default::default() }),
+                ..Default::default()
+            };
+            let plan = |uncached| {
+                super::UNCACHED_CENSUS.with(|flag| flag.set(uncached));
+                let start = std::time::Instant::now();
+                let input = PlanInput::open(&snapshot).unwrap();
+                let native = input.exlr8_native_plan("up1", &options, "off").unwrap();
+                let elapsed = start.elapsed();
+                assert!(elapsed < std::time::Duration::from_secs(30), "{name}: {elapsed:?}");
+                println!("{name} uncached={uncached} wall_seconds={:.6}", elapsed.as_secs_f64());
+                // Match the complete `cuteafd plan --json` payload, not a layout projection.
+                let bytes = serde_json::to_vec_pretty(&native.report).unwrap();
+                let deployment_options = crate::plan::deployment::DeploymentOptions {
+                    rtx_gpus: gpus, speculator: "off".into(), ..Default::default()
+                };
+                let deployment = crate::plan::deployment::DeploymentSpec::from_exlr8(&native, &deployment_options).unwrap();
+                let deployment_bytes = serde_json::to_vec_pretty(&deployment).unwrap();
+                let arm = if uncached { "uncached" } else { "memoized" };
+                std::fs::write(output.join(format!("{name}-{arm}.json")), &bytes).unwrap();
+                std::fs::write(output.join(format!("{name}-{arm}-deployment.json")), &deployment_bytes).unwrap();
+                (bytes, deployment_bytes)
+            };
+            let cached = plan(false);
+            let uncached = plan(true);
+            assert!(cached.0 == uncached.0, "{name}: complete native plan JSON bytes differ");
+            assert!(cached.1 == uncached.1, "{name}: complete launcher deployment JSON bytes differ");
+        }
+    }
+
     #[test]
     fn inspect_checkpoint_when_explicitly_supplied() {
         let Some(snapshot) = std::env::var_os("CUTEAFD_EXLR8_TEST_SNAPSHOT") else {

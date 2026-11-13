@@ -412,7 +412,8 @@ impl Model {
             ] };
         let mut spec = spec;
         if complete {
-            if let Ok(index) = crate::plan::checkpoint::read_json(&checkpoint.snapshot.join("model.safetensors.index.json")) {
+            let index_name = checkpoint.view.as_ref().map_or("model.safetensors.index.json", |view| view.index_name());
+            if let Ok(index) = crate::plan::checkpoint::read_json(&checkpoint.snapshot.join(index_name)) {
                 if let Some(advertised) = index["metadata"]["total_size"].as_u64() {
                     let headers: u64 = bytes.values().sum();
                     if advertised != headers {
@@ -505,14 +506,16 @@ impl Family for Step5 {
 impl FamilyModel for Model {
     fn spec(&self) -> &ModelSpec { &self.spec }
     fn native_serving_admission(&self) -> bool { true }
+    fn contract_admission(&self) -> bool { true }
     fn vision_mode(&self, mode: crate::plan::MediaMode) -> crate::plan::MediaMode {
         if mode == crate::plan::MediaMode::Auto { crate::plan::MediaMode::Off } else { mode }
     }
     fn cache_geometry(&self, options: crate::serving_capacity::CacheOptions)
         -> Result<Option<crate::serving_capacity::FamilyCacheGeometry>, crate::serving_capacity::CacheGeometryError> {
+        let unit = options.prefill_rows.max(64);
         let layout = crate::serving_capacity::step5::Step5CacheLayout::new(
-            &self.cfg, options.coordinator_ranks, self.cfg.max_context, options.native_mtp_layers, options.prefill_rows.max(64),
-            options.prefill_rows.max(64), options.step5_kv)?;
+            &self.cfg, options.coordinator_ranks, self.cfg.max_context, options.native_mtp_layers, unit,
+            options.prefill_span_rows.max(unit), options.step5_kv)?;
         Ok(Some(layout.geometry))
     }
     fn activation(&self, layer: usize, shared: bool) -> Option<FfnActivation> {
@@ -602,7 +605,9 @@ impl FamilyModel for Model {
         Some(ExpertContract {
             package: package.into(), block: 128,
             spark_worlds: crate::plan::experts::spark_worlds(package, self.cfg.intermediate),
-            local: Err("Step-5 coordinator-local routed experts are not qualified".into()),
+            local: if package == "step5:bf16" {
+                Err("missing RTX expert export step5:bf16 (rtx-tp1/rtx-tp2)".into())
+            } else { Ok(format!("Step-5 native RTX expert package {package} (rtx-tp1/rtx-tp2)")) },
         })
     }
     fn placement(&self, input: &crate::plan::PlanInput, report: &mut crate::plan::PlanReport,
@@ -619,9 +624,17 @@ impl FamilyModel for Model {
 /// its own list. RTX columns are the caller's (golden sizes its own chain).
 pub fn spark_world_admitted(snapshot: &std::path::Path, programs: &std::path::Path, ranks: usize)
     -> anyhow::Result<()> {
+    let view = crate::plan::checkpoint::CheckpointView::select(snapshot,
+        crate::plan::checkpoint::CoreView::Original)?;
+    spark_world_admitted_view(&view, programs, ranks)
+}
+
+/// Golden admission uses the same immutable bundle as its weight/catalog loads.
+pub fn spark_world_admitted_view(view: &crate::plan::checkpoint::CheckpointView,
+    programs: &std::path::Path, ranks: usize) -> anyhow::Result<()> {
     use cuteafd_core::memory_layout::DeviceKind;
     anyhow::ensure!(ranks > 0, "Step-5 golden needs real Spark experts");
-    let report = crate::plan::plan(snapshot, &crate::plan::PlanOptions {
+    let report = crate::plan::PlanInput::open_view(view)?.plan(&crate::plan::PlanOptions {
         placement: crate::plan::ExpertPlacement::from_spark_ranks(ranks),
         draft_ownership: Some(crate::plan::spec::DraftOwnership::None),
         layout: Some(crate::plan::layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)),

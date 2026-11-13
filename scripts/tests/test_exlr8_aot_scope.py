@@ -98,7 +98,6 @@ def test_wip_passes_the_switch_to_both_legs_and_seals_only_when_on():
     expert = wip.split('build_expert() (', 1)[1].split('\n)\n', 1)[0]
     assert coordinator.count('${wip_exlr8_env[@]+"${wip_exlr8_env[@]}"}') == 2  # build + finalize
     assert "${wip_exlr8_env[1]:+ -e '${wip_exlr8_env[1]}' -e 'CUTEAFD_WIP_EXLR8_FAMILIES=${CUTEAFD_WIP_EXLR8_FAMILIES}'}" in expert  # quoted remote build command
-    assert '${wip_exlr8_env[@]+"${wip_exlr8_env[@]}"} "$spark_container"' in expert  # finalize
     assert "wip_exlr8_env=()\n" in wip and 'wip_exlr8_env=(-e CUTEAFD_WIP_EXLR8_AOT=ON -e' in wip
     # The remote-export env file carries every CUTEAFD_* -e of the coordinator build.
     assert "grep -E '^CUTEAFD_[A-Z0-9_]+='" in wip
@@ -168,7 +167,8 @@ def test_wip_artifacts_rejects_invalid_override(tmp_path):
 def test_spark_programs_manifest_is_installed_on_both_roles():
     build = (ROOT / 'scripts/build/build-wip-artifacts.sh').read_text()
     final = build[build.index('# Generic-family tables must come from this build'):]
-    condition = final[final.index('elif [['):final.index(']]; then')]
+    final = final[final.index('elif [[ ('):]
+    condition = final[:final.index(']]; then')]
     # EXLR8 on either role, and a Spark build whose expert scope has a partial-reply family.
     assert '|| "${CUTEAFD_WIP_EXLR8_AOT:-OFF}" == ON' in condition
     assert '$role" == expert' in condition and 'expert_families' in condition and 'v41_expert_aot' in condition
@@ -185,10 +185,10 @@ def test_cmake_spark_programs_are_the_union_of_the_enabled_spark_needs():
     assert 'SM121 builds only the Spark programs' in cmake
     assert '--exlr8-family "${exlr8_families}")' in cmake
     top = (ROOT / 'native/CMakeLists.txt').read_text()
-    gate = 'CUTEAFD_ENABLE_KIMIK3_AOT OR CUTEAFD_ENABLE_MUSE_AOT OR CUTEAFD_ENABLE_ML4_AOT OR CUTEAFD_ENABLE_EXLR8_AOT OR CUTEAFD_PARTIAL_REPLY_PROGRAMS OR CUTEAFD_EXPERT_FAMILIES OR CUTEAFD_FP8_EXPERT_FAMILIES OR CUTEAFD_ENABLE_V41_EXPERT_AOT OR CUTEAFD_ENABLE_V41_NVFP4_AOT OR CUTEAFD_ENABLE_EXL3_PACKAGES)'
+    gate = 'CUTEAFD_ENABLE_KIMIK3_AOT OR CUTEAFD_ENABLE_MUSE_AOT OR CUTEAFD_ENABLE_ML4_AOT OR CUTEAFD_ENABLE_MINIMAX_AOT OR CUTEAFD_ENABLE_EXLR8_AOT OR CUTEAFD_PARTIAL_REPLY_PROGRAMS OR CUTEAFD_EXPERT_FAMILIES OR CUTEAFD_FP8_EXPERT_FAMILIES OR CUTEAFD_ENABLE_V41_EXPERT_AOT OR CUTEAFD_ENABLE_V41_NVFP4_AOT OR CUTEAFD_ENABLE_EXL3_PACKAGES)'
     assert top.count(gate) == 2  # include + link
     assert 'set(CUTEAFD_PARTIAL_REPLY_FAMILIES muse)' in top
-    assert 'CUTEAFD_ENABLE_MUSE_AOT OR CUTEAFD_ENABLE_ML4_AOT OR CUTEAFD_ENABLE_EXLR8_AOT OR CUTEAFD_FP8_EXPERT_FAMILIES)' in top  # SparkInfer AOT runtime
+    assert 'CUTEAFD_ENABLE_MUSE_AOT OR CUTEAFD_ENABLE_ML4_AOT OR CUTEAFD_ENABLE_MINIMAX_AOT OR CUTEAFD_ENABLE_EXLR8_AOT OR CUTEAFD_FP8_EXPERT_FAMILIES)' in top  # SparkInfer AOT runtime
 
 
 def _program_geometry(tmp_path, **flags):
@@ -239,7 +239,7 @@ def test_spark_and_coordinator_program_geometry_by_scope(tmp_path):
     fields, _ = _program_geometry(tmp_path, CUTEAFD_ENABLE_GLM_AOT='ON')
     assert fields['GEOMETRY'] == 'glm,glm2,dense_trellis_k6,glm_stage,glm2_stage,expert_reply'
     fields, _ = _program_geometry(tmp_path, CUTEAFD_ENABLE_KIMIK3_AOT='ON', CUTEAFD_ENABLE_GLM_AOT='ON')
-    assert fields['GEOMETRY'] == 'glm,glm2,kimik3,dense_trellis_k6,kimi_split,glm_stage,glm2_stage,expert_reply'
+    assert fields['GEOMETRY'] == 'glm,glm2,kimik3,kimik31,dense_trellis_k6,kimi_split,glm_stage,glm2_stage,expert_reply'
     # An sm_89 coordinator (V4.1) builds only the Spark reply reducers; table
     # families, EXLR8 and partial replies stay SM120's.
     fields, _ = _program_geometry(tmp_path, CUTEAFD_CUDA_ARCHITECTURES='89', CUTEAFD_ENABLE_V41_EXPERT_AOT='ON')
@@ -349,8 +349,8 @@ def test_kimi_switch_is_forwarded_to_coordinator_and_native_dispatch():
     assert '${CUTEAFD_WIP_KIMIK3_AOT:-OFF}' in dispatch
     cmake = (ROOT / 'native/cmake/shared/dsv4_programs.cmake').read_text()
     block = cmake.split('if(CUTEAFD_ENABLE_KIMIK3_AOT)', 1)[1].split('if(CUTEAFD_ENABLE_EXLR8_AOT)', 1)[0]
-    assert 'set(CUTEAFD_PROGRAM_GEOMETRY "kimik3,dense_trellis_k6,kimi_split")' in block
-    assert 'set(CUTEAFD_PROGRAM_GEOMETRY "${CUTEAFD_PROGRAM_GEOMETRY},kimik3,dense_trellis_k6,kimi_split")' in block
+    assert 'set(CUTEAFD_PROGRAM_GEOMETRY "kimik3,kimik31,dense_trellis_k6,kimi_split")' in block
+    assert 'set(CUTEAFD_PROGRAM_GEOMETRY "${CUTEAFD_PROGRAM_GEOMETRY},kimik3,kimik31,dense_trellis_k6,kimi_split")' in block
 
 
 def test_ml4_switch_is_keyed_only_when_on_and_forwarded():
@@ -448,7 +448,7 @@ def _spark_table(tmp_path, expert_families, exlr8):
     gate = gate[:gate.index('\n')]
     switches = ['DSV4', 'GLM', 'MIMO', 'GLMF', 'QWEN4', 'QWEN_DENSE', 'STEP5', 'KIMIK3', 'MUSE']
     script = tmp_path / 'gate.cmake'
-    script.write_text(''.join(f'set(CUTEAFD_ENABLE_{name}_AOT OFF)\n' for name in switches)
+    script.write_text('cmake_minimum_required(VERSION 3.24)\n' + ''.join(f'set(CUTEAFD_ENABLE_{name}_AOT OFF)\n' for name in switches)
         + f'set(CUTEAFD_ENABLE_EXLR8_AOT {"ON" if exlr8 else "OFF"})\n'
         + f'set(CUTEAFD_EXPERT_FAMILIES "{";".join(expert_families)}")\n' + scan + '\n'
         + gate + '\n  message(STATUS "TABLE=ON PARTIAL=${CUTEAFD_PARTIAL_REPLY_PROGRAMS}")\nelse()\n'
@@ -459,7 +459,8 @@ def _spark_table(tmp_path, expert_families, exlr8):
     partial = 'PARTIAL=ON' in result.stdout + result.stderr
     build = (ROOT / 'scripts/build/build-wip-artifacts.sh').read_text()
     final = build[build.index('# Generic-family tables must come from this build'):]
-    condition = final[final.index('elif [[') + len('elif [['):final.index(']]; then')]
+    final = final[final.index('elif [[ ('): ]
+    condition = final[len('elif [['):final.index(']]; then')]
     env = {'PATH': '/usr/bin:/bin', 'role': 'expert', 'expert_families': ';'.join(expert_families),
            'CUTEAFD_WIP_EXLR8_AOT': 'ON' if exlr8 else 'OFF', 'v41_expert_aot': 'OFF'}
     shell = subprocess.run(['bash', '-c', f'if [[ {condition} ]]; then echo install; else echo none; fi'],
@@ -504,3 +505,16 @@ def test_generic_spark_count_profiles_exist_in_the_package(tmp_path, geometry, c
     import package_exl3_aot
     known = {entry[0] for entry in package_exl3_aot.build_profiles('spark', geometry, all_spark_counts=True)}
     assert requested and requested <= known, (geometry, count, sorted(requested - known))
+
+
+def test_finalize_ssh_keeps_exlr8_values_whole_on_the_remote_shell():
+    """ssh joins argv into one string for the remote shell; a family list with ';' must survive."""
+    wip = (ROOT / 'wip.sh').read_text()
+    expert = wip.split('build_expert() (', 1)[1].split('\n)\n', 1)[0]
+    loop = next(line for line in expert.splitlines() if 'exlr8_remote+=' in line)
+    script = ('wip_exlr8_env=(-e CUTEAFD_WIP_EXLR8_AOT=ON -e "CUTEAFD_WIP_EXLR8_FAMILIES=glm;glmf")\n'
+              'exlr8_remote=()\n' + loop.strip() + '\n'
+              # What ssh does: join the words with spaces and hand them to a remote shell.
+              'bash -c "printf \'%s\\n\' ${exlr8_remote[*]}"')
+    result = subprocess.run(['bash', '-c', script], capture_output=True, text=True, check=True)
+    assert result.stdout.splitlines() == ['-e', 'CUTEAFD_WIP_EXLR8_AOT=ON', '-e', 'CUTEAFD_WIP_EXLR8_FAMILIES=glm;glmf']

@@ -6,6 +6,7 @@ use cuteafd_ffi::{exlr8::KernelFamily, CuteafdDeviceBuffer, programs::Programs};
 use cuteafd_loader::plan::exlr8::residency::{ExpertSet, Residency};
 use cuteafd_transport::{ExpertProtocolV2DeviceResponseRef, ExpertProtocolV2ResponseRef,
     ExpertV2Dtype, ProtocolV2RequestDevicePayload};
+use cuteafd_core::memory_layout::ArenaTag;
 
 const K1_ROWS: usize = cuteafd_core::expert_geometry::EXLR8_EXECUTION_ROWS;
 
@@ -56,7 +57,6 @@ pub(super) struct Worker<'w, 'a> {
     prefill: Option<Exlr8Execution<'a>>,
     weights: &'w [Exlr8Weights<'a>],
     library: &'a NativeLibrary,
-    reply_codec: super::super::reply::ReplyCodec<'a>,
     selected: usize,
     capacity: usize,
     executor_id: u64,
@@ -114,20 +114,29 @@ pub(super) fn load<'a>(library: &'a NativeLibrary, catalog: &OfficialV41Catalog,
     ensure!(peak.load_peak <= config.device_budget && peak.serve_peak <= config.device_budget,
         "EXLR8 admission exceeds budget: load {} serve {} budget {}",
         peak.load_peak, peak.serve_peak, config.device_budget);
-    admit_worker_peak(library, peak.load_peak, peak.serve_peak)?;
     if let Some(stream) = push {
         if let Some(weights) = super::push_exlr8::load(library, config, &plans, &budgets,
             resident, workspace, retained_host, descriptors, stream)? {
             return Ok((backend::Weights::Exlr8(weights), config.device_budget - resident - retained_host));
         }
     }
+    let device = crate::shared::memory::device::Device { library, id: library.cuda_get_device()? };
+    let layout = super::super::weight_layout::layout(device.id, "exlr8",
+        plans.iter().map(|plan| (format!("layer.{}", plan.layer), plan.resident_bytes)))?;
+    let peak = spark_admission_budget(config, layout.bytes(), 0, pinned, scratch, retained)?;
+    ensure!(peak.load_peak <= config.device_budget && peak.serve_peak <= config.device_budget,
+        "physical expert arena startup peak exceeds configured device budget");
+    admit_worker_peak(library, config.rank, peak.load_peak, peak.serve_peak)?;
+    let remaining = config.device_budget.checked_sub(layout.bytes()).context("EXLR8 mount arena exceeds budget")?;
+    let arena = crate::shared::memory::weight_arena::DeviceWeightArena::new(device, layout, ArenaTag::experts("experts/spark-exlr8"))?;
     let mut plans: Vec<_> = plans.into_iter().map(Some).collect();
-    let mut remaining = config.device_budget;
     let weights = crate::shared::experts::load_in_rank_order(&layers, config.rank, |index, _| {
         let plan = plans[index].take().context("EXLR8 resident plan loaded twice")?;
         let bytes = plan.resident_bytes;
-        let weight = Exlr8Weights::load(library, plan, remaining - workspace)?;
-        remaining = remaining.checked_sub(bytes).context("EXLR8 resident budget exhausted")?;
+        let allocation = crate::shared::memory::DeviceAllocation::from_allocation(
+            arena.view(&format!("layer.{}", plan.layer), bytes)?);
+        let weight = Exlr8Weights::load_into(library, plan,
+            config.device_budget - workspace, allocation)?;
         Ok(weight)
     })?;
     tracing::info!(rank = config.rank, resident, workspace, k1_workspace_bytes, fallback_staging, retained_host,
@@ -176,7 +185,6 @@ impl<'w, 'a> Worker<'w, 'a> {
             grouped_decode = grouped_decode.is_some(), decode_bytes, workspace,
             "EXLR8 decode dispatch admitted");
         Ok(Self { stream, execution, grouped_decode, grouped_from_row, prefill, weights, library,
-            reply_codec: super::super::reply::ReplyCodec::load(library)?,
             selected: 0, capacity: config.capacity as usize,
             executor_id: config.spark_world()?.topology().executor_id(config.rank)?, timing,
             deferred: false, pending: super::super::execution::timing::PendingUnits::new(library, 1)?,
@@ -198,7 +206,6 @@ impl<'w, 'a> Worker<'w, 'a> {
     fn execute(&mut self, request: &BackboneRequest<'_>, executor_id: u64,
         exchange: &mut HostExpertExchange, destination: Option<CuteafdDeviceBuffer>,
         mapped: Option<ProtocolV2RequestDevicePayload>) -> Result<()> {
-        ensure!(!request.is_native_group(), "EXLR8 requires canonical requests");
         request.require_input_dtype(ExpertV2Dtype::Fp8E4m3Ue8m0K32 as u32)?;
         ensure!(request.rows() > 0 && request.rows() as usize <= self.capacity,
             "EXLR8 request exceeds admitted capacity");
@@ -244,17 +251,22 @@ impl<'w, 'a> Worker<'w, 'a> {
                     library_copy(self.library, execution.input()?, hidden, hidden.bytes, self.stream.raw)?;
                     self.route_staging.upload(stage, first * topk, routes,
                         execution.ids()?, execution.route_weights()?, self.stream.raw)?;
-                    execution.run(&self.weights[self.selected], rows, self.stream.raw)?;
+                    if compressed {
+                        ensure!(request.partial_plan()?.is_none(), "EXLR8 fused reply requires combined rows");
+                        let stride = request.output_row_bytes()? as usize;
+                        let target = super::super::exlr8::view(destination.context("missing compressed EXLR8 slot")?,
+                            first * stride, rows * stride)?;
+                        execution.run_reply(&self.weights[self.selected], rows, request.output_dtype(), target, self.stream.raw)?;
+                    } else { execution.run(&self.weights[self.selected], rows, self.stream.raw)?; }
                 }
+                if compressed { continue; }
                 let output = super::super::exlr8::view(execution.output()?, 0, rows * output_stride)?;
                 if let Some(destination) = destination {
                     let wire_stride = request.output_row_bytes()? as usize;
                     let target = super::super::exlr8::view(destination, first * wire_stride, rows * wire_stride)?;
                     // SAFETY: the transport owns the destination until the response send completes.
                     unsafe {
-                        if compressed {
-                            self.reply_codec.quantize(request, output, target, rows, self.stream.raw)?;
-                        } else { library_copy(self.library, target, output, output.bytes, self.stream.raw)?; }
+                        library_copy(self.library, target, output, output.bytes, self.stream.raw)?;
                     }
                 }
             }
@@ -417,10 +429,10 @@ mod tests {
     #[test]
     fn exlr8_load_order_starts_after_peak_admission() {
         let source = include_str!("exlr8.rs").split("#[cfg(test)]").next().unwrap();
-        let admission = source.find("admit_worker_peak(library, peak.load_peak, peak.serve_peak)?").unwrap();
+        let admission = source.find("admit_worker_peak(library, config.rank, peak.load_peak, peak.serve_peak)?").unwrap();
         let order = source.find("crate::shared::experts::load_in_rank_order(&layers, config.rank").unwrap();
         let take = source.find("plans[index].take()").unwrap();
-        let upload = source.find("Exlr8Weights::load(library, plan, remaining - workspace)?").unwrap();
+        let upload = source.find("Exlr8Weights::load_into(library, plan,").unwrap();
         assert!(admission < order && order < take && take < upload);
     }
 
@@ -429,7 +441,7 @@ mod tests {
         use cuteafd_transport::worker_selection::{WorkerIdentity, WorkerSelection};
         let root = tempfile::tempdir()?;
         std::fs::write(root.path().join("config.json"), b"{}")?;
-        std::fs::write(root.path().join("model.safetensors.index.json"), b"{}")?;
+        std::fs::write(root.path().join("model.safetensors.index.json"), br#"{"weight_map":{}}"#)?;
         let identity = WorkerIdentity::from_snapshot(root.path(), cuteafd_core::ExpertGeometry::GLM5,
             cuteafd_transport::expert::SparkWorld::canonical(4)?)?;
         let loaded = WorkerSelection::new(identity, &[3])?;

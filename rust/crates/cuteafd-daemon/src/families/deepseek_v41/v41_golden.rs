@@ -39,7 +39,7 @@ pub(crate) struct GoldenArgs {
     /// as a prompt snapshot), repeat it (an exact hit: every generated row must be byte-identical),
     /// then continue it by a short (<128) and a long (>=128) suffix of the golden tokens (exact
     /// ancestor restores, compared with the same request served cold) and branch it at P - 37
-    /// (a partial, approximate replay: generated rows' KL and top-1 against cold). Comma separated.
+    /// (inside the retained frontier: must miss, restores are exact only). Comma separated.
     #[arg(long, value_delimiter = ',')]
     pub resume_at: Vec<usize>,
     /// Generated rows recorded per request in --resume-at.

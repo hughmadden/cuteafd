@@ -17,6 +17,28 @@ pub(crate) enum RouteSource {
     Broadcast,
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error("route source changed after readiness: {previous:?} -> {next:?} at {first_mismatch:?}")]
+pub(crate) struct RouteSourceChanged {
+    previous: RouteSource,
+    next: RouteSource,
+    first_mismatch: Option<(usize, usize)>,
+}
+
+impl RouteSource {
+    pub(crate) fn label(self) -> &'static str {
+        match self { Self::Replicated => "replicated", Self::Broadcast => "broadcast" }
+    }
+
+    /// Startup may select broadcast; a live check cannot change arithmetic identity.
+    pub(crate) fn checked(self, identity: &RouteIdentity, ready: bool) -> Result<Self, RouteSourceChanged> {
+        let next = if identity.source() == Self::Broadcast { Self::Broadcast } else { self };
+        if ready && next != self {
+            Err(RouteSourceChanged { previous: self, next, first_mismatch: identity.first_mismatch })
+        } else { Ok(next) }
+    }
+}
+
 /// One MoE layer's routes from both ranks, as host bytes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RouteCheck {
@@ -87,6 +109,10 @@ struct CheckedUnit {
 }
 
 impl<T> SlotRouteChecks<T> {
+    pub(crate) fn allocation_storage(&self) -> impl Iterator<Item = &T> {
+        self.slots.iter().map(|(storage, _)| storage)
+    }
+
     /// Explicit opt-in diagnostics use `strict`; startup checks keep broadcast fallback.
     pub(crate) fn new(storage: Vec<T>, strict: bool) -> anyhow::Result<Self> {
         anyhow::ensure!(!storage.is_empty(), "route diagnostics need at least one slot");
@@ -148,6 +174,45 @@ impl<T> SlotRouteChecks<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn live_family_route_checks_never_publish_resolved_settings() {
+        for (source, methods) in [
+            (include_str!("../../../families/deepseek_v4/engine/tp2.rs"),
+                &["finish_route_step", "runtime_stats"][..]),
+            (include_str!("../../../families/glm5_flash/engine.rs"),
+                &["finish_unit_route_checks", "finish_route_checks"][..]),
+            (include_str!("pair.rs"), &["check_identity", "finish_unit"][..]),
+        ] {
+            for method in methods {
+                let marker = format!("fn {method}(");
+                let body = source.split_once(&marker).unwrap().1.split_once("\n    }\n").unwrap().0;
+                assert!(!body.contains("set_resolved") && !body.contains("publish_route_source"),
+                    "{method} must publish runtime telemetry, not sealed settings");
+            }
+        }
+        let v4 = include_str!("../../../families/deepseek_v4/serve.rs");
+        assert!(v4.contains("stats[\"v4_runtime\"] = engine.runtime_stats()"));
+        for source in [include_str!("../../../families/deepseek_v4/engine/tp2.rs"),
+            include_str!("../../../families/glm5_flash/engine.rs"), include_str!("pair.rs")] {
+            assert_eq!(source.matches("set_resolved(\"route-source\"").count(), 1,
+                "route identity is published once by startup qualification");
+        }
+    }
+
+    #[test]
+    fn live_route_check_rejects_identity_change_but_startup_can_choose_broadcast() {
+        let mismatch = RouteIdentity { first_mismatch: Some((7, 3)), ..Default::default() };
+        assert_eq!(RouteSource::Replicated.checked(&mismatch, false).unwrap(), RouteSource::Broadcast);
+        let error = RouteSource::Replicated.checked(&mismatch, true).unwrap_err();
+        assert_eq!(error.first_mismatch, Some((7, 3)));
+        assert_eq!(RouteSource::Broadcast.checked(&mismatch, true).unwrap(), RouteSource::Broadcast);
+        for ready in [false, true] {
+            for source in [RouteSource::Replicated, RouteSource::Broadcast] {
+                assert_eq!(source.checked(&RouteIdentity::default(), ready).unwrap(), source);
+            }
+        }
+    }
 
     fn check(layer: usize, rows: usize, a: Vec<u8>, b: Vec<u8>) -> RouteCheck {
         RouteCheck { layer, rows, topk: 2, ranks: [a, b] }

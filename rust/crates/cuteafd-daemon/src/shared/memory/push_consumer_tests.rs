@@ -165,9 +165,9 @@ fn exercise(window: usize, mode: Mode, bytes: usize) -> Result<(usize, f64)> {
     let arena = LoadingArena::new(
         device,
         ArenaLayout::new([device_bytes], device_bytes)?.with_validation(4, 4)?,
-        footprint,
+        footprint, crate::shared::memory::TEST_ARENA
     )?;
-    let ring = RegisteredRing::new(&library, 8, 1024 * 1024)?;
+    let ring = RegisteredRing::new(&library, 8, 1024 * 1024, crate::shared::memory::TEST)?;
     let fd = ring.fd().as_raw_fd();
     let (client, server) = Conn::pair()?;
     client.set_timeout(Some(Duration::from_secs(10)))?;
@@ -431,9 +431,9 @@ fn socket_fake_copy_out_throughput() -> Result<()> {
         let arena = LoadingArena::new(
             device,
             ArenaLayout::new([bytes], bytes)?,
-            ExpectedCoverage::from_plan(&plan, 0)?,
+            ExpectedCoverage::from_plan(&plan, 0)?, crate::shared::memory::TEST_ARENA
         )?;
-        let ring = RegisteredRing::new(&library, 128, 1024 * 1024)?;
+        let ring = RegisteredRing::new(&library, 128, 1024 * 1024, crate::shared::memory::TEST)?;
         let fd = ring.fd().as_raw_fd();
         let (client, server) = Conn::pair()?;
         client.set_timeout(Some(Duration::from_secs(30)))?;

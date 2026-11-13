@@ -75,9 +75,13 @@ pub fn required_tensors(checkpoint: &Checkpoint, role: ReadRole) -> Result<BTree
 }
 
 pub fn open_role(snapshot: &Path, role: ReadRole) -> Result<Checkpoint> {
-    let inventory = Checkpoint::inventory(snapshot)?;
+    open_role_view(&super::checkpoint::CheckpointView::select(snapshot, super::checkpoint::CoreView::Original)?, role)
+}
+
+pub fn open_role_view(view: &super::checkpoint::CheckpointView, role: ReadRole) -> Result<Checkpoint> {
+    let inventory = Checkpoint::inventory_view(view)?;
     let names = required_tensors(&inventory, role)?;
-    Checkpoint::open_required(snapshot, &role.label(), &names)
+    Checkpoint::open_view_for_role(view, &role.label(), |name| names.contains(name))
 }
 
 #[derive(Debug, Serialize)]
@@ -104,8 +108,13 @@ pub fn manifest(snapshot: &Path, role: ReadRole) -> Result<FileManifest> {
 
 /// A host's file list is the union of the processes it runs, never a shard split.
 pub fn manifest_roles(snapshot: &Path, roles: &[ReadRole]) -> Result<FileManifest> {
+    manifest_roles_view(&super::checkpoint::CheckpointView::select(snapshot, super::checkpoint::CoreView::Original)?, roles)
+}
+
+pub fn manifest_roles_view(view: &super::checkpoint::CheckpointView, roles: &[ReadRole]) -> Result<FileManifest> {
+    let snapshot = view.snapshot();
     ensure!(!roles.is_empty(), "a file inventory needs at least one role");
-    let inventory = Checkpoint::inventory(snapshot)?;
+    let inventory = Checkpoint::inventory_view(view)?;
     let mut tensors = BTreeSet::new();
     for role in roles { tensors.extend(required_tensors(&inventory, *role)?); }
     let mut files: BTreeSet<String> = tensors.iter().filter_map(|name| inventory.weight_map.get(name).cloned()).collect();
@@ -122,7 +131,7 @@ pub fn manifest_roles(snapshot: &Path, roles: &[ReadRole]) -> Result<FileManifes
     if roles.contains(&ReadRole::Audio) && snapshot.join("audio_tokenizer").is_dir() {
         collect_directory(snapshot, &snapshot.join("audio_tokenizer"), &mut files)?;
     }
-    manifest_from_files(snapshot, roles.iter().map(|r| r.label()).collect::<Vec<_>>().join(", "), files)
+    manifest_from_files_view(snapshot, roles.iter().map(|r| r.label()).collect::<Vec<_>>().join(", "), files, Some(view))
 }
 
 /// Standalone drafters/encoders have their own config and naming convention;
@@ -138,7 +147,11 @@ pub fn manifest_standalone(snapshot: &Path, role: &str) -> Result<FileManifest> 
 pub fn include_directory(manifest: &mut FileManifest, snapshot: &Path, directory: &str) -> Result<()> {
     let mut files = manifest.files.iter().map(|f| f.path.clone()).collect();
     collect_directory(snapshot, &snapshot.join(directory), &mut files)?;
-    *manifest = manifest_from_files(snapshot, manifest.role.clone(), files)?;
+    manifest.files = files.into_iter().map(|path| {
+        let bytes = std::fs::metadata(snapshot.join(&path)).ok().filter(|m| m.is_file()).map(|m| m.len());
+        RequiredFile { path, bytes }
+    }).collect();
+    manifest.total_bytes = manifest.files.iter().try_fold(0u64, |total, file| total.checked_add(file.bytes?));
     Ok(())
 }
 
@@ -153,7 +166,12 @@ fn collect_directory(root: &Path, directory: &Path, files: &mut BTreeSet<String>
     Ok(())
 }
 
-fn manifest_from_files(snapshot: &Path, role: String, mut files: BTreeSet<String>) -> Result<FileManifest> {
+fn manifest_from_files(snapshot: &Path, role: String, files: BTreeSet<String>) -> Result<FileManifest> {
+    manifest_from_files_view(snapshot, role, files, None)
+}
+
+fn manifest_from_files_view(snapshot: &Path, role: String, mut files: BTreeSet<String>,
+    view: Option<&super::checkpoint::CheckpointView>) -> Result<FileManifest> {
     // Named inputs opened by checkpoint, tokenizer, template and processor
     // loaders. Weight shards remain role-filtered by the checkpoint index.
     for name in ["config.json", "model.safetensors.index.json", "generation_config.json",
@@ -162,10 +180,17 @@ fn manifest_from_files(snapshot: &Path, role: String, mut files: BTreeSet<String
         "tokenizer.model", "spiece.model", "merges.txt", "vocab.txt", "vocab.json",
         "chat_template.jinja", "preprocessor_config.json", "processor_config.json",
         "chat_template.json", "inference/config.json"] {
-        if snapshot.join(name).is_file() { files.insert(name.into()); }
+        let active = view.is_none_or(|view| !matches!(name, "config.json" | "model.safetensors.index.json"
+            | "quantize_config.json" | "quantization_config.json" | "hf_quant_config.json")
+            || name == view.config_name() || name == view.index_name() || view.quant_names().iter().any(|q| q == name));
+        if active && snapshot.join(name).is_file() { files.insert(name.into()); }
     }
     // A checkpoint-declared index (config.json transformers_weights) is opened instead.
-    let index = super::checkpoint::index_name(snapshot)?;
+    if let Some(view) = view {
+        files.insert(view.config_name().into());
+        files.extend(view.quant_names().iter().cloned());
+    }
+    let index = match view { Some(view) => view.index_name().to_owned(), None => super::checkpoint::index_name(snapshot)? };
     if snapshot.join(&index).is_file() { files.insert(index); }
     let files: Vec<_> = files.into_iter().map(|path| {
         let bytes = std::fs::metadata(snapshot.join(&path)).ok().filter(|m| m.is_file()).map(|m| m.len());
@@ -185,6 +210,25 @@ fn manifest_from_files(snapshot: &Path, role: String, mut files: BTreeSet<String
 mod tests {
     use super::*;
     use crate::plan::testing::{mimo_flash_config, mimo_flash_tensors, write_safetensors};
+
+    #[test]
+    fn directory_additions_preserve_selected_bundle_and_auxiliary_snapshots() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        std::fs::write(root.path().join("config.json"), b"{}")?;
+        std::fs::write(root.path().join("config.compact-attention.json"), b"compact")?;
+        std::fs::create_dir(root.path().join("aux"))?;
+        std::fs::write(root.path().join("aux/vector.bin"), b"123")?;
+        let mut manifest = FileManifest { role: "coordinator".into(), snapshot: root.path().display().to_string(),
+            repo_id: None, revision: None, files: vec![RequiredFile {
+                path: "config.compact-attention.json".into(), bytes: Some(7) }], total_bytes: Some(7),
+            additional_snapshots: vec![manifest_standalone(root.path(), "drafter")?] };
+        include_directory(&mut manifest, root.path(), "aux")?;
+        assert_eq!(manifest.files.iter().map(|file| file.path.as_str()).collect::<Vec<_>>(),
+            ["aux/vector.bin", "config.compact-attention.json"]);
+        assert_eq!(manifest.total_bytes, Some(10));
+        assert_eq!(manifest.additional_snapshots.len(), 1);
+        Ok(())
+    }
 
     #[test]
     fn all_family_loader_inputs_are_in_the_role_inventory() {

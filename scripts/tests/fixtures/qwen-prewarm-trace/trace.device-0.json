@@ -1,0 +1,169 @@
+{
+ "schema_version": 2,
+ "cache": {
+  "device": 0,
+  "reserve": 3221225472,
+  "charged": 8388608,
+  "pinned": 0,
+  "pending_capture": 0,
+  "cycles": {},
+  "pools": {},
+  "basis": {
+   "kind": "bytes"
+  },
+  "sampled_at_ms": 10000,
+  "telemetry_bytes": 0,
+  "top_hits": [],
+  "top_churn": []
+ },
+ "graphs": [
+  {
+   "device": 0,
+   "site": "qwen4.segment",
+   "bank": 0,
+   "key_id": 64,
+   "shape": "GraphKey { segment: 0, rows: 64, spec: false, long: false, pool_width: 64, page_stride: 64, pool_stride: 128 }",
+   "cycle": "decode",
+   "count": 100,
+   "cycles": {
+    "decode": 100,
+    "verify": 0,
+    "prefill": 0,
+    "wave": 0,
+    "other": 0
+   },
+   "first_seen_ms": 0,
+   "hits": 100,
+   "misses": 1,
+   "captures": 1,
+   "evictions": 0,
+   "recaptures": 0,
+   "ghost_hits": 0,
+   "last_hit_ms": 9000,
+   "hit_histogram": {
+    "rolling": true,
+    "interval_ms": 10000,
+    "start_ms": 0,
+    "counts": [
+     2,
+     0,
+     0,
+     0,
+     0
+    ]
+   },
+   "capture_bytes": 1048576,
+   "nodes": 10,
+   "executables": 1,
+   "basis": {
+    "kind": "bytes"
+   },
+   "permanent_bytes": 1048576,
+   "pinned": false,
+   "declared_capture_streams": 1,
+   "max_parallel_width": 1,
+   "spans_devices": false
+  },
+  {
+   "device": 0,
+   "site": "qwen4.segment",
+   "bank": 0,
+   "key_id": 1064,
+   "shape": "GraphKey { segment: 1, rows: 64, spec: false, long: false, pool_width: 64, page_stride: 64, pool_stride: 128 }",
+   "cycle": "decode",
+   "count": 100,
+   "cycles": {
+    "decode": 100,
+    "verify": 0,
+    "prefill": 0,
+    "wave": 0,
+    "other": 0
+   },
+   "first_seen_ms": 0,
+   "hits": 100,
+   "misses": 1,
+   "captures": 1,
+   "evictions": 0,
+   "recaptures": 0,
+   "ghost_hits": 0,
+   "last_hit_ms": 9000,
+   "hit_histogram": {
+    "rolling": true,
+    "interval_ms": 10000,
+    "start_ms": 0,
+    "counts": [
+     2,
+     0,
+     0,
+     0,
+     0
+    ]
+   },
+   "capture_bytes": 2097152,
+   "nodes": 10,
+   "executables": 1,
+   "basis": {
+    "kind": "bytes"
+   },
+   "permanent_bytes": 2097152,
+   "pinned": false,
+   "declared_capture_streams": 1,
+   "max_parallel_width": 1,
+   "spans_devices": false
+  },
+  {
+   "device": 0,
+   "site": "qwen4.segment",
+   "bank": 0,
+   "key_id": 1128,
+   "shape": "GraphKey { segment: 1, rows: 128, spec: false, long: false, pool_width: 64, page_stride: 64, pool_stride: 128 }",
+   "cycle": "decode",
+   "count": 1,
+   "cycles": {
+    "decode": 1,
+    "verify": 0,
+    "prefill": 0,
+    "wave": 0,
+    "other": 0
+   },
+   "first_seen_ms": 0,
+   "hits": 1,
+   "misses": 1,
+   "captures": 1,
+   "evictions": 0,
+   "recaptures": 0,
+   "ghost_hits": 0,
+   "last_hit_ms": 9000,
+   "hit_histogram": {
+    "rolling": true,
+    "interval_ms": 10000,
+    "start_ms": 0,
+    "counts": [
+     2,
+     0,
+     0,
+     0,
+     0
+    ]
+   },
+   "capture_bytes": 4194304,
+   "nodes": 10,
+   "executables": 1,
+   "basis": {
+    "kind": "bytes"
+   },
+   "permanent_bytes": 4194304,
+   "pinned": false,
+   "declared_capture_streams": 1,
+   "max_parallel_width": 1,
+   "spans_devices": false
+  }
+ ],
+ "sites": {
+  "qwen4.segment": {
+   "samples": 3,
+   "total_bytes": 7340032,
+   "largest_bytes": 4194304
+  }
+ }
+}

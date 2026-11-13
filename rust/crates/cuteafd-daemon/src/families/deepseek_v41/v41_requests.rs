@@ -107,8 +107,28 @@ pub(crate) struct Requests<'a> {
     prefetched: prefetch::PrefetchSlot<CacheLease, EngramWave>,
     /// Requests released so far; admission waiters retry when it moves.
     releases: u64,
+    reconciliation: FirstRequestReconciliation,
+}
+/// Retirement only marks local state. The joined scheduler samples once after
+/// completed graph observation; a lane must never sample while its peer runs.
+#[derive(Default)]
+struct FirstRequestReconciliation { retired: bool, sampled: bool }
+impl FirstRequestReconciliation {
+    fn retire(&mut self, successful: bool) { self.retired |= successful; }
+    fn completed_boundary(&mut self) -> bool {
+        if !self.retired || self.sampled { return false }
+        self.sampled = true;
+        true
+    }
 }
 impl<'a> Requests<'a> {
+    pub(crate) fn mark_retired(&mut self, successful: bool) { self.reconciliation.retire(successful); }
+    pub(crate) fn reconcile_completed(&mut self) {
+        if self.reconciliation.completed_boundary() {
+            crate::shared::memory_report::reconcile::capture("first_request");
+        }
+    }
+
     pub fn engram_host_formulas(&self) -> [(&'static str, u64); 2] {
         let shape = self.pipeline.shape();
         [("v41/engram-prefill", shape.host_resident_bytes() as u64),
@@ -139,6 +159,7 @@ impl<'a> Requests<'a> {
             image_requests: 0,
             prefetched: Default::default(),
             releases: 0,
+            reconciliation: Default::default(),
         })
     }
     pub fn new_distributed(
@@ -159,6 +180,7 @@ impl<'a> Requests<'a> {
             image_requests: 0,
             prefetched: Default::default(),
             releases: 0,
+            reconciliation: Default::default(),
         })
     }
     pub fn cache(&self) -> &BackboneCache<'a> {
@@ -168,7 +190,7 @@ impl<'a> Requests<'a> {
         pages:[usize;4],map:crate::families::deepseek_v41::v41_backbone_cache::CachePlacement,budgets:[usize;2])->Result<Self> {
         Ok(Self { cache:BackboneCache::new_replicated(library,map,slots,pages,budgets)?,
             prefix_leases:[None,None],pipeline,slots:(0..slots).map(|_|None).collect(),units:vec![Vec::new();slots],
-            released_units:Vec::new(),image_requests:0, prefetched: Default::default(),releases:0 })
+            released_units:Vec::new(),image_requests:0, prefetched: Default::default(),releases:0, reconciliation: Default::default() })
     }
     fn request_identity(&self, lease: CacheLease) -> Result<&Request> {
         self.slots.iter().flatten().find(|r| r.lease == lease).context("request history missing")
@@ -415,44 +437,12 @@ impl<'a> Requests<'a> {
             .expect("validated restored request").history = history;
         Ok(())
     }
-    fn encoder_history_at(&self, lease: CacheLease, start: usize, prompt: &[u32]) -> Result<EngramHistory> {
-        ensure!(start <= prompt.len(), "encoder history position exceeds prompt");
-        let recent_start = start.saturating_sub(3);
-        let image_mask = self.request(lease)?.images.mask(recent_start as u64, start - recent_start)?
-            .map(|m| m.into_iter().map(u8::from).collect::<Vec<_>>());
-        self.pipeline.history_at(start as u64, &prompt[recent_start..start], image_mask.as_deref())
-    }
-    /// A partial hit: sources hold the snapshot's rows through the even-aligned `end`; encoder
-    /// windows restart empty at `end - 128` and Engram history is rebuilt there from the
-    /// prompt's native token ids. Returns the replay start.
-    pub fn restore_encoder_prefix(&mut self, lease: CacheLease, end: usize, prompt: &[u32]) -> Result<usize> {
-        let request = self.request(lease)?;
-        ensure!(
-            request.history.position() == 0 && request.prefill.is_none() && end <= prompt.len(),
-            "invalid encoder history restore"
-        );
-        let start = end.saturating_sub(128);
-        let history = self.encoder_history_at(lease, start, prompt)?;
-        if let Err(error) = self.cache.restore_encoder_prefix(lease, end as u64, prompt.len() as u64) {
-            if let Err(cleanup) = self.release_if_present(lease) {
-                tracing::error!(%cleanup, "releasing failed encoder history restore");
-            }
-            return Err(error);
-        }
-        self.slots
-            .iter_mut()
-            .flatten()
-            .find(|r| r.lease == lease)
-            .expect("validated restored request")
-            .history = history;
-        Ok(start)
-    }
     pub fn validate(&self, batch: &RequestBatch) -> Result<()> {
         ensure!(!batch.finished, "request batch finished");
         self.cache.validate_batch(&batch.cache)?;
         for &lease in &batch.leases {
             ensure!(
-                self.request(lease)?.history.position() == self.cache.history_end(lease)?,
+                self.request(lease)?.history.position() == self.cache.committed_end(lease)?,
                 "engram and backbone history differ"
             );
         }
@@ -512,7 +502,7 @@ impl<'a> Requests<'a> {
             ensure!(request.prefill.is_none(), "reserved encoder requires reservation preparation");
             let history = &request.history;
             ensure!(
-                history.position() == self.cache.history_end(r.lease)?,
+                history.position() == self.cache.committed_end(r.lease)?,
                 "request histories differ"
             );
             ensure!(
@@ -969,3 +959,20 @@ mod tests {
 #[cfg(test)]
 mod image_tests;
 
+
+#[cfg(test)]
+mod reconciliation_tests {
+    use super::FirstRequestReconciliation;
+    #[test]
+    fn retirement_marks_only_and_joined_boundary_samples_once() {
+        let mut state = FirstRequestReconciliation::default();
+        assert!(!state.completed_boundary());
+        state.retire(false);
+        assert!(!state.completed_boundary());
+        state.retire(true);
+        assert!(!state.sampled, "retirement inside a live lane must not sample");
+        assert!(state.completed_boundary());
+        state.retire(true);
+        assert!(!state.completed_boundary());
+    }
+}

@@ -27,7 +27,7 @@ fn layouts() -> HookBuffers {
         maximum_pages: 16,
         native: Some([native(64), native(128)]),
         core: Some(CoreRankLayout {
-            body: vec![],
+            body: vec![], native: vec![], native_scratch: [0; 2], attention_partial_bytes: 2, down_partial_bytes: 2,
             stages: Some([
                 CoreStageLayout::new(&cfg, 64, 2, false).unwrap(),
                 CoreStageLayout::new(&cfg, 128, 2, false).unwrap(),
@@ -45,6 +45,7 @@ fn layouts() -> HookBuffers {
             bytes: 3072, rows: 64, top_k: 1, max_groups: 4, hidden: 128, units: 16,
             unit_limit: 16, intermediate_bytes: 256, compact: false, unit_tables: false,
         }),
+        full_prefill_logits: false,
     }
 }
 
@@ -55,7 +56,7 @@ fn native_hooks_name_physical_owners_and_k6_route_aliases_once() {
         64,
         16,
         2,
-        Facts { resident_weights: vec![],
+        Facts { allocation_granularity: vec![], driver_page_tables: vec![], resident_weights: vec![],
             phase_order: crate::placement::planner::PhaseOrder::DRAFT_THEN_TARGET,
             allocations: vec![],
             deferred: vec![],
@@ -117,27 +118,14 @@ fn native_hooks_name_physical_owners_and_k6_route_aliases_once() {
             .all(|a| a.location == Location::coordinator(1))
     );
     // Retained row planes and peer suffix belong to their own recipes, not these hooks.
-    let expected: u64 = hooks
-        .native
-        .as_ref()
-        .unwrap()
-        .iter()
-        .map(|l| l.bytes().unwrap() as u64)
-        .sum::<u64>()
+    // Serving prefill hooks live in lanes the first live prefill allocates, after
+    // Ready, so Ready charges only the decode halo and the two heads.
+    let expected: u64 = hooks.native.as_ref().unwrap()[0].bytes().unwrap() as u64
         + hooks
             .core
             .as_ref()
             .unwrap()
             .decode
-            .as_ref()
-            .unwrap()
-            .bytes()
-            .unwrap() as u64
-        + hooks
-            .core
-            .as_ref()
-            .unwrap()
-            .prefill
             .as_ref()
             .unwrap()
             .bytes()
@@ -166,11 +154,10 @@ fn native_hooks_name_physical_owners_and_k6_route_aliases_once() {
             .unwrap()
             .stages
             .as_ref()
-            .unwrap()
-            .iter()
-            .map(|s| s.bytes().unwrap() as u64)
-            .sum::<u64>()
-        + 2 * hooks.shared_workspace.as_ref().unwrap().bytes as u64;
+            .unwrap()[0]
+            .bytes()
+            .unwrap() as u64
+        + hooks.shared_workspace.as_ref().unwrap().bytes as u64;
     for kind in ["decode", "prefill"] {
         assert_eq!(get(&format!("{kind}.native.shared.arena")).bytes, 3072);
         assert_eq!(get(&format!("{kind}.native.shared.fc2")).view.as_ref().unwrap().backing,

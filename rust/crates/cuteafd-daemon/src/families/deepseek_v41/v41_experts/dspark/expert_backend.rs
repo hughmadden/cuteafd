@@ -16,12 +16,6 @@ impl<'a> DraftExperts<'_, 'a> {
             Self::Tp2(v) => Some(v.peer_stream()),
         }
     }
-    pub fn stream(&self) -> *mut c_void {
-        match self {
-            Self::Full(v) => v.stream(),
-            Self::Tp2(v) => v.stream(),
-        }
-    }
     pub fn synchronize(&self) -> Result<()> {
         match self {
             Self::Full(v) => v.synchronize(),

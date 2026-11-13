@@ -2,7 +2,7 @@
 """Run a family golden subcommand, a native test or a command from sealed WIP slots
 on raptor's RTX GPUs, optionally against real expert workers on Sparks.
 
-  scripts/bench/golden-run.py --task NAME --family dsv4|glm|glmf|mimo|qwen4|qwen35|step5 \\
+  scripts/bench/golden-run.py --task NAME --family dsv4|glm|glmf|mimo|qwen4|qwen35|step5|kimi|muse|minimax \\
       --model HF_ID_OR_SNAPSHOT_DIR --arm A=WIP_INSTANCE:SLOT [--arm B=...] \\
       [--arm-env A:KEY=VALUE] [--arm-arg A:TOKEN] [--env KEY=VALUE] [--gpus 0,1] [--repeats N] \\
       [--timeout SECONDS] [--preflight CMD] [--compare-logits A:B] \\
@@ -62,8 +62,7 @@ pairs share conditions. Slots, images, Spark hosts and container names are check
 before enqueue and again at grant; --preflight adds a shell check at both points, like
 hwlock's. Each container (golden-TASK-ARM) first checks it sees its GPUs (exit 86 when
 not), is removed on any exit before the locks are released, and runs under a per-arm
-timeout. --dry-run runs the checks and prints every docker and worker command without
-taking locks.
+timeout. --dry-run runs the checks and reports the lock set without taking locks or printing argv.
 
 Output, under ~/.cache/cuteafd/builds/TASK/golden/: ARM/rN/{log,exit,argv.json,
 workers/HOST.log} and whatever the run wrote to {out}; argv.json holds the exact docker
@@ -97,9 +96,8 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[2]
 SUBCOMMANDS = {'dsv4': 'dsv4-golden', 'v41': 'v41-golden', 'glm': 'glm-golden', 'glmf': 'glmf-golden',
                'mimo': 'mimo-golden', 'qwen4': 'qwen4-golden', 'qwen35': 'qwen35-golden',
-               'step5': 'step5-golden'}
-# Families without a golden subcommand yet: native tests and commands only.
-RAW_FAMILIES = ('kimi', 'muse')
+               'step5': 'step5-golden', 'muse': 'muse-golden', 'kimi': 'kimi-golden',
+               'minimax': 'minimax-golden'}
 NAME = re.compile(r'[A-Za-z0-9][A-Za-z0-9_.-]*\Z')
 ROW_FILE = re.compile(r'row-[0-9]+\.safetensors\Z')
 ENV_KEY = re.compile(r'[A-Za-z_][A-Za-z0-9_]*\Z')
@@ -112,7 +110,7 @@ KEY_LINE = re.compile(r'(?i)(admission|prefill logits|decode logits|logits diges
 TEST_RESULT = re.compile(r'test result: (\w+)\. (\d+) passed; (\d+) failed')
 GPU_CHECK_EXIT = 86
 # Golden flags that write files: only the arm's {out} directory is writable.
-WRITERS = ('--save-logits', '--bench-dump', '--replay-dump', '--geometry-trace')
+WRITERS = ('--dump-dir', '--save-logits', '--bench-dump', '--replay-dump', '--geometry-trace')
 CONTAINER_HOME = '/tmp/cuteafd-home'
 OUT = '/out'
 SLOT_LIB, SLOT_BIN, SLOT_SHARE = '/opt/cuteafd/lib', '/opt/cuteafd/bin', '/opt/cuteafd/share'
@@ -801,6 +799,95 @@ def container_exists(name):
     return name in names
 
 
+def sealed_help(slot, subcommand):
+    """Ask the exact sealed executable, without GPUs, networking or a hardware lease."""
+    art = Path(slot['root']) / 'workspace/.cuteafd-wip'
+    result = run(['docker', 'run', '--rm', '--network', 'none',
+                  '--user', f'{os.getuid()}:{os.getgid()}',
+                  '-e', 'LD_LIBRARY_PATH=/opt/cuteafd/lib',
+                  '-e', 'COLUMNS=240', '-v', f'{art}:/opt/cuteafd/lib:ro',
+                  '--entrypoint', '/usr/bin/timeout', slot['image_id'],
+                  '45', '/opt/cuteafd/lib/cuteafd', subcommand, '--help'], timeout=60)
+    return ANSI.sub('', result.stdout)
+
+
+class GoldenCLI(argparse.ArgumentParser):
+    def error(self, message):
+        # Do not echo argv (tokens and paths can contain private data).
+        if message.startswith('unrecognized arguments:'):
+            message = 'unrecognized arguments: ' + ', '.join(re.findall(r'--[\w-]+', message))
+        raise ValueError(f'sealed golden CLI: {message}')
+
+
+def cli_from_help(text):
+    """Build the option schema from Clap help, including required usage operands."""
+    parser = GoldenCLI(add_help=False, allow_abbrev=False)
+    defaults = {}
+    # Clap wraps descriptions/defaults onto following indented lines.
+    entries = list(re.finditer(r'^(?: {6}| {2}-\w, )(--[\w-]+)([^\n]*)', text, re.M))
+    for index, match in enumerate(entries):
+        flag, declaration = match.groups()
+        entry = text[match.start():entries[index + 1].start() if index + 1 < len(entries) else len(text)]
+        operand = re.match(r'(?:[ =]|\[=)(<[^>]+>)(\.\.\.)?', declaration)
+        optional = declaration.startswith('[=')
+        default = re.search(r'\[default: ([^]]+)\]', entry)
+        defaults[flag] = default[1] if default else None
+        choices = re.search(r'\[possible values: ([^]]+)\]', entry)
+        kwargs = {'choices': choices[1].split(', ')} if choices else {}
+        if operand:
+            parser.add_argument(flag, nargs='?' if optional else '+' if operand[2] else None,
+                                required=bool(re.search(re.escape(flag) + r'[ =]<',
+                                                       text.split('Options:', 1)[0]))
+                                and flag not in ('--native-lib', '--manifest'), **kwargs)
+        else:
+            parser.add_argument(flag, action='store_true')
+    if not parser._actions:
+        raise ValueError('sealed golden CLI: no options found in --help')
+    return parser, defaults
+
+
+def validate_golden_cli(state, arm, text):
+    parser, defaults = cli_from_help(text)
+    argv = run_args(state, arm)[1:]
+    parsed = vars(parser.parse_args(argv))
+    for flag in WRITERS:
+        value = parsed.get(flag[2:].replace('-', '_'))
+        if value is not None and not (value == OUT or value.startswith(OUT + '/')):
+            raise ValueError(f'{flag}: write outputs under the arm directory ({flag} {{out}}/NAME)')
+
+    def number(flag):
+        value = parsed.get(flag[2:].replace('-', '_'))
+        value = value if value is not None else defaults.get(flag)
+        if value is None:
+            return None
+        try:
+            return int(value)
+        except (ValueError, TypeError):
+            raise ValueError(f'sealed golden CLI: {flag} must be an integer') from None
+
+    for flag in ('--device', '--split-device'):
+        device = number(flag)
+        if device is not None and not 0 <= device < len(state['gpus']):
+            raise ValueError(f'{flag} must name a container-visible logical ordinal '
+                             f'0..{len(state["gpus"]) - 1}; the GPU selection option names physical GPUs')
+    count = number('--rtx-gpus')
+    if count is not None and not 1 <= count <= len(state['gpus']):
+        raise ValueError('--rtx-gpus exceeds the container-visible GPU count')
+    for flag in ('--prefill-rows', '--prefill-batch-tokens'):
+        rows = number(flag)
+        if rows == 0 and defaults.get(flag) == '0':
+            continue  # This sealed CLI uses zero for automatic prefill resolution.
+        if rows is not None and not (64 <= rows <= 4096 and rows % 64 == 0):
+            raise ValueError(f'{flag} must be page-aligned (64-row pages), in 64..4096')
+        if rows is not None and state['family'] == 'v41' and rows < 256:
+            raise ValueError(f'{flag}: V4.1 prefill unit cap must equal its live rows (at least 256)')
+    waves = number('--prefill-waves')
+    if waves == 0 and defaults.get('--prefill-waves') == '0':
+        return
+    if waves is not None and not 1 <= waves <= 4:
+        raise ValueError('--prefill-waves must be in 1..4')
+
+
 def preflight(state, arms, at_grant=True):
     """CPU-only checks, before enqueue and again at grant: every slot sealed and
     unchanged, its image present, no container of ours left over and, with
@@ -810,6 +897,8 @@ def preflight(state, arms, at_grant=True):
         slot = verify_slot(arm)
         verify_sparkinfer(slot)
         slot['image_record'] = image_record(slot['image_id'])
+        if state['mode'] == 'golden':
+            validate_golden_cli(state, arm, sealed_help(slot, state['golden'][0]))
         if container_exists(container_name(state['task'], name)):
             raise ValueError(f"container {container_name(state['task'], name)} already exists "
                              '(a previous run of this task left it; inspect and docker rm it)')
@@ -928,6 +1017,9 @@ def docker_command(state, name, arm, slot, out_dir, golden, packages=None):
     values = placeholder_values(state)
     for key, value in arm['env'].items():
         env[key] = substitute([value], state['snapshot_container'], **values)[0]
+    # Metadata always describes the sealed image actually launched, not a caller override.
+    env['CUTEAFD_REFERENCE_IMAGE'] = slot['image_id']
+    env['CUTEAFD_REFERENCE_IMAGE_SHA256'] = slot['image_id']
     for key, value in env.items():
         cmd += ['-e', f'{key}={value}']
     # The container first proves it sees its GPUs (a systemd daemon-reload on the
@@ -1148,6 +1240,38 @@ def row_dump_dirs(directory):
                    if p.is_file() and ROW_FILE.fullmatch(p.name)})
 
 
+def bin_token_args(a_path, b_path, vocab):
+    """Align scored-only logits rows with their next-token positions."""
+    tokens = a_path.parent / 'tokens.bin'
+    if a_path.name != 'logits.bin' or not tokens.is_file():
+        return []
+    rows, remainder = divmod(a_path.stat().st_size, 4 * vocab)
+    token_count, token_remainder = divmod(tokens.stat().st_size, 4)
+    if remainder or token_remainder or not rows:
+        raise ValueError('invalid logits or token byte count for NLL alignment')
+    meta = a_path.parent / 'meta.json'
+    positions = json.loads(meta.read_text()).get('positions') if meta.is_file() else None
+    if positions is None:
+        if rows not in (token_count - 1, token_count):
+            raise ValueError('scored-only logits require meta.json positions for NLL alignment')
+        positions = list(range(1, rows + 1))
+    if (not isinstance(positions, list) or len(positions) != rows
+            or any(type(p) is not int for p in positions)
+            or positions[0] < 1 or positions[-1] > token_count
+            or (positions[-1] == token_count and positions[0] != 1)
+            or positions != list(range(positions[0], positions[0] + rows))):
+        raise ValueError('logits positions must be contiguous next-token indices matching every row')
+    other_meta = b_path.parent / 'meta.json'
+    if other_meta.is_file():
+        other_positions = json.loads(other_meta.read_text()).get('positions')
+        if other_positions is not None and other_positions != positions:
+            raise ValueError('logits arms have different scored positions')
+    other_tokens = b_path.parent / 'tokens.bin'
+    if other_tokens.is_file() and other_tokens.read_bytes() != tokens.read_bytes():
+        raise ValueError('logits arms have different token sequences')
+    return ['--tokens', str(tokens), '--offset', str(positions[0] - 1)]
+
+
 def compare_pairs(state, pairs, repeats):
     """Compare saved logits of arm pairs, per repeat, file by file."""
     results = []
@@ -1163,10 +1287,11 @@ def compare_pairs(state, pairs, repeats):
             for name in files:
                 dumped = True
                 out = Path(state['root']) / f'compare-{a}-{b}-r{repeat}-{name.replace("/", "_")}.json'
-                extra = []
-                tokens = (da / name).parent / 'tokens.bin'
-                if Path(name).name == 'logits.bin' and tokens.is_file():
-                    extra = ['--tokens', str(tokens)]
+                try:
+                    extra = bin_token_args(da / name, db / name, state['vocab'])
+                except (ValueError, OSError) as error:
+                    results.append(dict(a=a, b=b, repeat=repeat, file=name, error=str(error)))
+                    continue
                 args = [str(da / name), str(db / name), str(state['vocab']), *extra, '--json', str(out)]
                 results.append(compare_one(state, python, tool, args, out, dict(a=a, b=b, repeat=repeat, file=name)))
             # Per-row dumps: each directory of row-NNNNNNNN.safetensors compares as
@@ -1308,6 +1433,8 @@ def build_state(args, arms):
     elif args.expert_layers or args.worker_env or args.arm_worker_env or args.worker_arg or args.worker_memory_bytes is not None:
         raise ValueError('--expert-layers, --worker-env, --arm-worker-env, --worker-arg and --worker-memory-bytes need --spark-hosts')
     mode = 'native-test' if args.native_test else 'command' if args.command else 'golden'
+    if mode == 'golden' and snapshot.is_relative_to(namespace_root()) and not (args.rdma or sparks):
+        raise ValueError('SparkNest snapshots require push loading: add --rdma (host network and verbs)')
     if mode == 'golden':
         golden = golden_args(args.family, args.golden, sparks=sparks is not None)
     else:
@@ -1353,7 +1480,7 @@ def parse_pairs(values, arms):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('--task', required=True, help='output under ~/.cache/cuteafd/builds/TASK/golden')
-    parser.add_argument('--family', required=True, choices=sorted({*SUBCOMMANDS, *RAW_FAMILIES}),
+    parser.add_argument('--family', required=True, choices=sorted(SUBCOMMANDS),
                         help='family (its golden subcommand; raw-only families need --native-test/--command)')
     parser.add_argument('--model', required=True, help='HF id (ORG/NAME[@REV]) or snapshot directory; {snapshot} in ARGS')
     parser.add_argument('--arm', action='append', default=[], metavar='NAME=WIP_INSTANCE:SLOT')
@@ -1415,8 +1542,6 @@ def main(argv=None):
             raise ValueError('invalid --task, --repeats or --timeout')
         if not args.golden and not args.native_test:
             raise ValueError('missing args after --')
-        if args.family in RAW_FAMILIES and not (args.native_test or args.command):
-            raise ValueError(f'family {args.family} has no golden subcommand yet; use --native-test or --command')
         arms = parse_arms(args.arm)
         if not arms:
             raise ValueError('at least one --arm is required')
@@ -1436,20 +1561,13 @@ def main(argv=None):
         if not args.preflight_at_grant:
             hwlock.check_preflight(args.preflight, args.preflight_timeout)
     except (ValueError, OSError, subprocess.SubprocessError, hwlock.PreflightFailed) as error:
-        print(f'golden-run: {error}', file=sys.stderr)
+        message = 'sealed CLI/container check failed' if isinstance(error, subprocess.SubprocessError) else str(error)
+        print(f'golden-run: {message}', file=sys.stderr)
         return 78 if isinstance(error, hwlock.PreflightFailed) else 2
     order = list(schedule(arms, args.repeats, not args.no_interleave))
     if args.preflight_only or args.dry_run:
         if args.dry_run:
             print(f"# locks (fair queue, in order): {','.join(state['locks'])}")
-            for name, repeat in order:
-                out = Path(state['root']) / name / f'r{repeat}'
-                packages = Path(state['root']) / name / 'spark-packages' if state.get('sparks') else None
-                for rank, host in enumerate(state['sparks']['hosts'] if state.get('sparks') else ()):
-                    print(f'# {name} r{repeat} expert rank {rank} on {host}\n'
-                          f"ssh {host} {shlex.quote(shlex.join(worker_command(state, name, rank, state['slots'][name]['sparks'][host])))}")
-                cmd, _ = docker_command(state, name, arms[name], state['slots'][name], out, run_args(state, arms[name]), packages)
-                print(f'# {name} r{repeat}\n{shlex.join(cmd)}')
         print('golden-run: preflight pass')
         return 0
     root = Path(state['root'])
@@ -1494,7 +1612,8 @@ def main(argv=None):
         print(f'golden-run: interrupted ({error}); containers removed, locks released', file=sys.stderr)
         code = 130
     except (ValueError, OSError, subprocess.SubprocessError) as error:
-        print(f'golden-run: {error}', file=sys.stderr)
+        message = 'sealed CLI/container check failed' if isinstance(error, subprocess.SubprocessError) else str(error)
+        print(f'golden-run: {message}', file=sys.stderr)
         code = 2
     finally:
         for signum, handler in previous.items():

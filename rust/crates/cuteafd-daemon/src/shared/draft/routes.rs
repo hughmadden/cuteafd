@@ -34,6 +34,11 @@ pub(crate) struct RoundRoutes {
 }
 
 impl RoundRoutes {
+    pub(crate) fn allocation_receipts(&self,
+        inventory: &mut crate::shared::memory::receipts::Inventory<'_>, name: &str) -> anyhow::Result<()> {
+        inventory.host(&format!("{name}.ids"), &self.ids)?;
+        inventory.host(&format!("{name}.filled"), &self.filled)
+    }
     pub fn new(layers: usize, topk: usize) -> Self {
         Self { layers, topk, rows: 0, ids: Vec::new(), filled: vec![false; layers] }
     }

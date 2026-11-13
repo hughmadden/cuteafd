@@ -12,6 +12,7 @@ pub const DEFAULT_SLOTS: usize = 128;
 
 pub struct RegisteredRing<'a> {
     library: &'a NativeLibrary,
+    tag: crate::memory_ledger::Tag,
     fd: OwnedFd,
     ptr: *mut c_void,
     bytes: usize,
@@ -21,7 +22,12 @@ pub struct RegisteredRing<'a> {
     registered: bool,
 }
 impl<'a> RegisteredRing<'a> {
-    pub fn new(library: &'a NativeLibrary, slots: usize, slot_bytes: usize) -> Result<Self> {
+    /// `tag` names what the pushed bytes are staged for (`Staging`, owner such
+    /// as `experts/spark-push-ring`); the registered mapping is recorded under
+    /// it as host-registered memory and retired after a successful unregister.
+    #[track_caller]
+    pub fn new(library: &'a NativeLibrary, slots: usize, slot_bytes: usize,
+        tag: crate::memory_ledger::Tag) -> Result<Self> {
         ensure!(
             (1..=4096).contains(&slots)
                 && slot_bytes >= 4096
@@ -72,6 +78,7 @@ impl<'a> RegisteredRing<'a> {
         ensure!(ptr != libc::MAP_FAILED, "ring mmap failed");
         let mut ring = Self {
             library,
+            tag,
             fd,
             ptr,
             bytes,
@@ -80,16 +87,21 @@ impl<'a> RegisteredRing<'a> {
             device,
             registered: false,
         };
-        type Register = unsafe extern "C" fn(*mut c_void, usize) -> i32;
-        // SAFETY: native registration accepts this live shared mapping.
+        type Register = unsafe extern "C" fn(*mut c_void, usize, u32, *const std::ffi::c_char) -> i32;
+        let owner = CString::new(tag.owner).context("push ring owner contains NUL")?;
+        // SAFETY: native registration accepts this live shared mapping; the
+        // owner string lives through the synchronous call.
         let status = unsafe {
             let register: Symbol<Register> = library.lib.get(b"cuteafd_register_host_mapping")?;
-            register(ptr, bytes)
+            register(ptr, bytes, tag.kind.as_raw(), owner.as_ptr())
         };
         library.status_to_result("cuteafd_register_host_mapping", status)?;
         ring.registered = true;
+        crate::memory_ledger::record_tagged(crate::memory_ledger::Space::Host, -1, ptr as usize, bytes, tag);
         Ok(ring)
     }
+    /// What the registered mapping was recorded as.
+    pub fn tag(&self) -> crate::memory_ledger::Tag { self.tag }
     pub fn fd(&self) -> BorrowedFd<'_> {
         self.fd.as_fd()
     }
@@ -167,6 +179,7 @@ impl Drop for RegisteredRing<'_> {
                 tracing::error!(%error, "retaining registered push mapping");
                 return;
             }
+            crate::memory_ledger::record_released(self.ptr as usize);
         }
         // SAFETY: unique mapping owner, no registration or queued accesses remain.
         unsafe {
@@ -193,10 +206,10 @@ mod tests {
             (1, 8193),
             (1, 2 * DEFAULT_SLOT_BYTES),
         ] {
-            assert!(RegisteredRing::new(&library, slots, bytes).is_err());
+            assert!(RegisteredRing::new(&library, slots, bytes, crate::memory_ledger::TEST).is_err());
         }
         library.cuda_set_device(1)?;
-        let ring = RegisteredRing::new(&library, 2, 4096)?;
+        let ring = RegisteredRing::new(&library, 2, 4096, crate::memory_ledger::TEST)?;
         assert!(ring.belongs_to(&library, 1));
         assert!(!ring.belongs_to(&library, 0));
         // SAFETY: valid descriptor, querying its immutable resize seals.
@@ -216,6 +229,27 @@ mod tests {
         drop(ring);
         assert_eq!(library.cuda_get_device()?, 0);
         assert_eq!(fixture.events()?, "Gg");
+        Ok(())
+    }
+
+    /// The registered mapping is recorded under the ring's tag as host
+    /// registration and leaves the ledger only after a successful unregister.
+    #[test]
+    fn registered_ring_records_its_tag_and_retires_after_unregister() -> Result<()> {
+        use crate::memory_ledger::{self, Space, Tag};
+        let _ledger = memory_ledger::test_guard();
+        let fixture = Fixture::build_for_tests()?;
+        let library = fixture.load()?;
+        let tag = Tag::staging("test/push-ring");
+        let ring = RegisteredRing::new(&library, 2, 4096, tag)?;
+        assert_eq!(ring.tag(), tag);
+        let address = ring.payload(0, 0, 1)?.ptr as usize;
+        assert_eq!(memory_ledger::tag_of(address), Some(tag));
+        let host = |snapshot: &memory_ledger::Snapshot| snapshot.rows.iter()
+            .filter(|row| row.key.space == Space::Host && row.key.tag == tag).map(|row| row.bytes).sum::<usize>();
+        assert_eq!(host(&memory_ledger::snapshot()), 8192);
+        drop(ring);
+        assert_eq!(host(&memory_ledger::snapshot()), 0);
         Ok(())
     }
 }

@@ -454,4 +454,9 @@ fn render_literals(body: &Value, thinking: bool, literal: &mut dyn FnMut(&str) -
 }
 
 #[cfg(test)]
+pub(crate) fn fixture_encoding() -> KimiEncoding {
+    KimiEncoding { eos: vec![257] }
+}
+
+#[cfg(test)]
 mod tests;

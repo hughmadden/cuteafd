@@ -31,6 +31,9 @@ from pathlib import Path
 os.environ["B12X_COMPILE_DISK_CACHE"] = "0"
 os.environ["B12X_COMPILE_MEMORY_CACHE"] = "0"
 import _pinned_sparkinfer
+import contextlib
+# Present only when the export cache's recorder runs this process (sitecustomize).
+_export_cache = _sys.modules.get("_export_cache")
 
 SCALAR_KINDS = {"int32": "i", "int64": "l", "float32": "f"}
 PAGE_ROWS = 64
@@ -47,6 +50,7 @@ CHECKPOINT_CONTEXTS = {
     "qwen38": ("Qwen/Qwen3.8-27B", 262144),
     "step5": ("stepfun-ai/Step-5-Preview", 1048576),
     "kimik3": ("moonshotai/Kimi-K3", 1048576),
+    "kimik31": ("moonshotai/Kimi-K3.1-Pro", 1048576),
     "ml4": ("mistralai/Mistral-Large-4-1T-A52B", 1048576),
 }
 
@@ -82,6 +86,94 @@ def exl3_reply_programs(max_rows):
             for width, topk in shapes for format in (1, 2)]
 
 
+def flash_native_bf16_shapes():
+    # GLM Flash native attention and dense/shared FFNs, whole/TP2 slices (K, N).
+    return {(1536, 16384), (1536, 8192), (16384, 4096),
+            (8192, 4096), (4096, 4096), (4096, 1536), (4096, 512),
+            (4096, 12288), (4096, 6144), (12288, 4096), (6144, 4096),
+            (4096, 2048), (4096, 1024), (2048, 4096), (1024, 4096)}
+
+
+def native_attention_shapes():
+    """Native core projection [N,K] shapes from the published tensor headers."""
+    return {
+        "glm": {(16384, 2048), (8192, 2048), (6144, 16384), (6144, 8192)},
+        "kimik3": {(18432, 1536), (9216, 1536), (7168, 12288), (7168, 6144)},
+        "step5": {(4096, 12288), (4096, 6144)},
+        "muse": {(8192, 8192), (8192, 4096)},
+        "ml4": {(8192, 6144), (4096, 6144), (6144, 8192), (6144, 4096),
+                (24576, 6144), (12288, 6144), (6144, 6144), (3072, 6144),
+                (6144, 24576), (6144, 12288), (6144, 3072)},
+    }
+
+
+def native_attention_f32_shapes():
+    return {(7168, 6144), (4096, 6144), (8192, 4096), (6144, 8192), (6144, 4096),
+            (6144, 12288), (6144, 3072)}
+
+
+def native_attention_bf16_f32_shapes():
+    # ML4 q/o and FFNs ship FP8; these split-output shapes need no BF16 fallback.
+    return native_attention_f32_shapes() - {(6144, 4096), (6144, 12288), (6144, 3072)}
+
+
+def compile_native_attention_projection(n, k, max_rows, output="bf16"):
+    # CuTe resolves deferred JIT annotations in module globals, not this factory's locals.
+    global cute, cuda, Int32, Int64
+    import torch
+    import cutlass
+    import cutlass.cute as cute
+    import cuda.bindings.driver as cuda
+    from cutlass import Int32, Int64
+    from b12x.integration.cuteafd._fp8_weights import Fp8Projection
+    from b12x.integration.cuteafd._common import Operand, Scalar, compile_program
+    if output not in ("bf16", "f32") or max_rows not in (64, 4096):
+        raise ValueError("native attention requires BF16/F32 output and capacity 64/4096")
+    dtype = torch.bfloat16 if output == "bf16" else torch.float32
+    cute_dtype = cutlass.BFloat16 if output == "bf16" else cutlass.Float32
+
+    class Projection:
+        def __init__(self):
+            self.projection = Fp8Projection(n, k, decode_rows=64, out_dtype=cute_dtype)
+
+        @cute.jit
+        def __call__(self, x: cute.Pointer, weight: cute.Pointer, scales: cute.Pointer,
+                     out: cute.Pointer, scratch: cute.Pointer, rows: Int32, stream: cuda.CUstream):
+            self.projection(x, weight, scales, out, rows, Int32(64), Int64(scratch.toint()), stream)
+
+    launch = Projection()
+    return compile_program(launch, name="native_attention_projection", operands=(
+        Operand("x", torch.bfloat16, f"[rows,{k}]"),
+        Operand("weight", torch.uint8, f"[{n},{k}]"),
+        Operand("scales", torch.float32, f"[{n//128},{k//128}]"),
+        Operand("out", dtype, f"[rows,{n}]", "out"),
+        Operand("scratch", torch.uint8, "[projection_scratch]", "scratch")),
+        scalars=(Scalar("rows"),), key=(n, k, max_rows, output, launch.projection.key()),
+        scratch={"scratch": lambda rows: max(256, launch.projection.prefill_scratch_bytes(rows))},
+        geometry=dict(input_features=k, output_features=n, output_dtype=str(dtype),
+            max_rows=max_rows, scale_block=128, storage="row_major_e4m3", decode_rows=64,
+            reduction="canonical_fp8_gemv64_w8a16"))
+
+
+def native_attention_programs():
+    from functools import partial
+    out = []
+    for n, k in sorted(set().union(*native_attention_shapes().values())):
+        for output in (("bf16", "f32") if (n, k) in native_attention_f32_shapes() else ("bf16",)):
+            for rows in (64, 4096):
+                suffix = "_f32" if output == "f32" else ""
+                out.append((f"n{n}_k{k}_m{rows}{suffix}", "attention_projection",
+                    dict(max_rows=rows), partial(compile_native_attention_projection, n, k, rows, output)))
+    return out
+
+
+def native_attention_bf16_shapes():
+    # Muse original K/V are separate projections, whole and TP2 output splits.
+    shapes = {(k, n) for family, operands in native_attention_shapes().items()
+              if family != "ml4" for n, k in operands}
+    return shapes | {(6144, 512), (6144, 576), (8192, 1024), (8192, 512), (8192, 4096)}
+
+
 def draft_bf16_shapes():
     # hidden, query heads, KV heads, head width, MLP width, tap count
     families = {
@@ -97,6 +189,10 @@ def draft_bf16_shapes():
         "dflash2-muse-radix": (8192, 64, 8, 128, 28672, 5),
         "dflash2-muse-nvidia": (8192, 128, 16, 64, 24576, 5),
     }
+    for family in ("dflash-mimo-pro", "dflash-mimo-flash", "dflash2-glmf",
+                   "dflash2-muse-radix", "dflash2-muse-nvidia"):
+        h, heads, kv, d, inter, taps = families[family]
+        families[f"{family}-tp2"] = (h, heads // 2, kv // 2, d, inter // 2, taps)
     result = {}
     for family, (h, heads, kv, d, inter, taps) in families.items():
         for k, n in ((h * taps, h), (h, (heads + 2 * kv) * d),
@@ -111,21 +207,34 @@ def draft_bf16_shapes():
     for h in (2048, 4096, 5120, 6144):
         result.setdefault((2 * h, h), []).append("mimo/qwen-mtp")
     result.setdefault((30720, 6144), []).append("ml4-context-fc")
+    for shape in flash_native_bf16_shapes():
+        result.setdefault(shape, []).append("native-glmf")
+    for shape in native_attention_bf16_shapes():
+        result.setdefault(shape, []).append("native-core")
     return result
 
 
-def compile_draft_bf16_projection(k, n):
+def compile_draft_bf16_projection(k, n, output="bf16"):
+
     import torch
     from b12x.gemm.bf16_gemv._skinny import TmaBf16Projection
     from b12x.integration.cuteafd._common import Operand, Scalar, compile_program
-    tiles = ((16, 1, 4, 16, 64, 6),)
-    launch = TmaBf16Projection(n, k, tiles_by_rows=tiles)
+    import cutlass
+    from b12x.gemm.bf16_gemv._skinny import DECODE_TMA_TILES
+    if output not in ("bf16", "f32"):
+        raise ValueError("projection output is bf16 or f32")
+    dtype = torch.bfloat16 if output == "bf16" else torch.float32
+    # Preserve fixed-M16 routes already shared by GLM Flash, MiMo and drafters.
+    native_shapes = native_attention_bf16_shapes() - {(6144, 512), (6144, 576), (8192, 4096)}
+    tiles = DECODE_TMA_TILES.get((n, k), ()) if (k, n) in native_shapes else ((16, 1, 4, 16, 64, 6),)
+    launch = TmaBf16Projection(n, k, out_dtype=cutlass.BFloat16 if output == "bf16" else cutlass.Float32,
+                               tiles_by_rows=tiles)
     return compile_program(launch, name="draft_bf16_projection", operands=(
         Operand("x", torch.bfloat16, f"[rows,{k}]"),
         Operand("w", torch.bfloat16, f"[{n},{k}]"),
-        Operand("out", torch.bfloat16, f"[rows,{n}]", "out")),
-        scalars=(Scalar("rows"),), key=launch.key(), geometry=dict(
-            width=k, outputs=n, output_dtype="torch.bfloat16",
+        Operand("out", dtype, f"[rows,{n}]", "out")),
+        scalars=(Scalar("rows"),), key=(output, launch.key()) if output != "bf16" else launch.key(), geometry=dict(
+            width=k, outputs=n, output_dtype=str(dtype),
             reduction="ordered_k16", tiles_by_rows=tiles))
 
 
@@ -148,6 +257,45 @@ def geometry_context(name: str, requested: int) -> int:
     base = name[:-1] if name.endswith("2") else name
     checkpoint = CHECKPOINT_CONTEXTS.get(base)
     return min(requested, checkpoint[1]) if checkpoint else requested
+
+
+def minimax_sparse_programs(decode_rows: int, prefill_rows: int, max_context: int):
+    from functools import partial
+    from b12x.integration.cuteafd.minimax_indexer import compile_minimax_index_aot
+    from b12x.integration.cuteafd.minimax_attention import compile_minimax_attention_aot
+
+    max_pages = (geometry_context("minimax", max_context) + 63) // 64
+    result = []
+    for mode, rows in (("decode", decode_rows), ("prefill", prefill_rows)):
+        params = dict(max_rows=rows, max_pages=max_pages, mode=mode)
+        result.append((f"index_{mode}", "minimax_index", params,
+                       partial(compile_minimax_index_aot, **params)))
+    for mode, rows in (("decode", decode_rows), ("extend", prefill_rows)):
+        params = dict(max_rows=rows, max_batch=decode_rows, mode=mode)
+        result.append((f"attention_{mode}", "minimax_attention", params,
+                       partial(compile_minimax_attention_aot, **params)))
+    return result
+
+
+def minimax_producer_programs(prefill_rows: int):
+    from functools import partial
+    from b12x.integration.cuteafd.minimax_producer import (
+        compile_minimax_norm_rope_aot, compile_minimax_index_producer_aot,
+        compile_minimax_oai_split_aot,
+    )
+
+    result = []
+    for heads in (64, 4):
+        result.append((f"norm_rope_h{heads}", "minimax_norm_rope",
+                       dict(heads=heads, max_rows=prefill_rows),
+                       partial(compile_minimax_norm_rope_aot, heads=heads)))
+    result.append(("index_producer", "minimax_index_producer",
+                   dict(max_rows=prefill_rows), compile_minimax_index_producer_aot))
+    for width in (3072, 12288):
+        result.append((f"oai_split_i{width}", "minimax_oai_split",
+                       dict(width=width, max_rows=prefill_rows),
+                       partial(compile_minimax_oai_split_aot, width=width)))
+    return result
 
 
 def validate_table_residency(stem: str, geometry: dict, *, diagnostic: bool = False) -> None:
@@ -287,7 +435,8 @@ def glmf_stage_programs(g, decode_rows: int, prefill_rows: int):
     from b12x.integration.cuteafd.glmf_split import (
         compile_glmf_kda_core_aot, compile_glmf_stage_aot,
         compile_glmf_projected_kda_aot, compile_glmf_fp8_stage_aot,
-        compile_glmf_projected_index_c_aot, compile_glmf_projected_index_keys_aot)
+        compile_glmf_projected_index_c_aot, compile_glmf_projected_index_keys_aot,
+        compile_glmf_fp8_linear_aot)
     out = []
     # Wide decode still selects the narrow stage for batches of at most 64 rows.
     decode_caps = {decode_rows} | ({64} if decode_rows == 128 else set())
@@ -321,6 +470,17 @@ def glmf_stage_programs(g, decode_rows: int, prefill_rows: int):
         params = dict(max_rows=rows)
         out.append((f"index_projected_keys_m{rows}", "index_producer", params,
                     partial(compile_glmf_projected_index_keys_aot, g, **params)))
+    # Append standalone seams; never reorder the existing fused exports.
+    for rows in sorted(decode_caps | {prefill_rows}):
+        shapes = {(g.hidden, g.dense_inter), (g.dense_inter, g.hidden),
+                  (g.hidden, g.moe_inter), (g.moe_inter, g.hidden),
+                  (g.q_lora_rank, g.heads*g.qk_nope_dim), (g.heads*g.v_head_dim, g.hidden),
+                  (g.hidden, g.kda_width), (g.kda_width, g.hidden),
+                  (g.hidden, g.q_lora_rank), (g.hidden, g.kv_lora_rank)}
+        for k, n in sorted(shapes):
+            params = dict(input_features=k, output_features=n, max_rows=rows, decode=rows in decode_caps)
+            out.append((f"fp8_linear_k{k}_n{n}_m{rows}", "attention_projection", params,
+                        partial(compile_glmf_fp8_linear_aot, **params)))
     return out
 
 
@@ -364,9 +524,11 @@ def glm_programs(g, decode_rows: int, prefill_rows: int, max_context: int):
              lambda r=rows: attn.compile_glm_index_producer_aot(g, max_rows=r)),
             (f"o_bf16_m{rows}", "o", {"max_rows": rows, "weights": "bf16"},
              lambda r=rows: attn.compile_glm_o_aot(g, max_rows=r)),
-            (f"ffn_i{g.moe_inter}_bf16_m{rows}", "ffn", {"max_rows": rows, "inter": g.moe_inter, "weights": "bf16"},
-             lambda r=rows: ffn.compile_glm_ffn_aot(g, inter=g.moe_inter, max_rows=r)),
         ]
+        for inter in dict.fromkeys((g.moe_inter, g.dense_inter)):
+            out.append((f"ffn_i{inter}_bf16_m{rows}", "ffn",
+                        {"max_rows": rows, "inter": inter, "weights": "bf16"},
+                        lambda r=rows, i=inter: ffn.compile_glm_ffn_aot(g, inter=i, max_rows=r)))
     # ModelOpt declares static W8A8 for these dense MLPs at every row count.
     for rows in (decode_rows, prefill_rows):
         out.append((f"ffn_i{g.dense_inter}_pt_m{rows}", "ffn",
@@ -451,6 +613,43 @@ def mimo_head_split_programs(g, decode_rows: int, prefill_rows: int, max_context
     return [item for item in mimo_programs(g, decode_rows, prefill_rows, max_context) if item[0].startswith(keep)]
 
 
+def compile_glmf_head_block_fp8(g, vocab=154880):
+    """Block-128 FP8 head: skinny GEMV through 16 rows, exact-BF16 W8A16 above."""
+    global cute, cuda, Int32
+    import torch
+    import cutlass
+    import cutlass.cute as cute
+    import cuda.bindings.driver as cuda
+    from cutlass import Int32
+    from b12x.integration.cuteafd._fp8_weights import MmaFp8Gemv, TmaFp8Gemm, fp8_gemv_tuning, fp8_gemv_shipped_warps
+    from b12x.integration.cuteafd._common import Operand, Scalar, compile_program
+    warps, groups = fp8_gemv_tuning(vocab, g.hidden,
+        warps=fp8_gemv_shipped_warps(vocab, g.hidden, warps=4))
+
+    class Head:
+        def __init__(self):
+            self.gemv = MmaFp8Gemv(vocab, g.hidden, max_rows=16, warps=warps,
+                groups=groups, out_dtype=cutlass.Float32)
+            self.gemm = TmaFp8Gemm(vocab, g.hidden, scales="block", out_dtype=cutlass.Float32)
+
+        @cute.jit
+        def __call__(self, x: cute.Pointer, w_fp8: cute.Pointer, scale: cute.Pointer,
+                     logits: cute.Pointer, rows: Int32, stream: cuda.CUstream):
+            if rows <= Int32(16):
+                self.gemv(x, w_fp8, scale, logits, rows, stream)
+            else:
+                self.gemm(x, w_fp8, scale, logits, rows, stream)
+
+    launch = Head()
+    return compile_program(launch, name="glmf_head_block_fp8", operands=(
+        Operand("x", torch.bfloat16, f"[rows,{g.hidden}]"),
+        Operand("w_fp8", torch.uint8, f"[{vocab},{g.hidden}]"),
+        Operand("scale", torch.float32, f"[{vocab//128},{g.hidden//128}]", align=4),
+        Operand("logits", torch.float32, f"[rows,{vocab}]", "out")),
+        scalars=(Scalar("rows"),), key=(vocab, launch.gemv.key(), launch.gemm.key()),
+        geometry=dict(hidden=g.hidden, vocab=vocab, max_rows=4096, scale_block=128, gemv_rows=16))
+
+
 def glmf_programs(g, decode_rows: int, prefill_rows: int, max_context: int):
     """GLM 5.3 Flash programs, same (stem suffix, op, params, thunk) shape as ``programs``.
     mHC is the DeepSeek V4 program set at this model's width and epsilons."""
@@ -466,6 +665,7 @@ def glmf_programs(g, decode_rows: int, prefill_rows: int, max_context: int):
         ("mhc_post", "mhc_post", {}, lambda: mhc.compile_dsv4_mhc_post_aot(mg)),
         ("head", "head", {}, lambda: glmf.compile_glmf_head_aot(g)),
         ("head_fp8", "head_fp8", {}, lambda: glmf.compile_glmf_head_fp8_aot(g)),
+        ("head_block_fp8", "head_fp8", {}, lambda: compile_glmf_head_block_fp8(g)),
         ("add", "add", {}, lambda: glmf.compile_glmf_add_aot(g)),
         ("router_scores", "router_scores", {}, lambda: glmf.compile_glmf_router_scores_aot(g)),
         ("expert_input_quant", "expert_input_quant", {}, lambda: glmf.compile_glmf_expert_input_quant_aot(g)),
@@ -815,7 +1015,8 @@ def kimi_kda_programs(g, decode_rows: int, prefill_rows: int, max_context: int):
     out = [("kda_commit", "kda_commit", {}, lambda: glmf.compile_glmf_kda_commit_aot(g))]
     for rows in sorted({decode_rows, prefill_rows}):
         decode = rows == decode_rows
-        params = {"max_rows": rows, "output_kind": "norm", "decode": decode}
+        params = {"max_rows": rows, "output_kind": "norm", "decode": decode,
+                  "bf16_wide": not decode}
         out.append((f"kda_m{rows}", "kda", params,
                     lambda kw=params: glmf.compile_glmf_kda_aot(g, **kw)))
     for heads in (48, 96):
@@ -835,22 +1036,125 @@ def kimi_kda_programs(g, decode_rows: int, prefill_rows: int, max_context: int):
                             {"mode": mode, "max_rows": rows, "heads": heads, "kv_cache": cache},
                             lambda m=mode, r=rows, g=mla: kimi_mla.compile_kimi_dense_mla_aot(
                                 g, max_rows=r, max_context=max_context, mode=m)))
-    out.extend(kimi_w8_programs())
-    out.extend(kimi_latent_programs())
-    out.extend(kimi_route_programs())
+    out.extend(kimi_context_programs(decode_rows, max_context))
+    out.extend(kimi_shared_programs())
     out.extend(mla_draft_programs(decode_rows, max_context))
+    return out
+
+
+def kimi_k31_programs(g, decode_rows: int, prefill_rows: int, max_context: int):
+    """K3.1 uses shared KDA/MLA, native index math and global DSA selection.
+
+    Keep this inventory separate from K3's dense attention exports: K3's rank
+    normalization remains 1e-6, while K3.1 requires 1e-5 in every core view.
+    No K3 drafter is exported here until hidden-state compatibility is qualified.
+    """
+    from b12x.integration.cuteafd import context_split, glmf, kimi_dsa, kimi_mla
+
+    index = kimi_dsa.KimiDsaGeometry()
+    pages = (max_context + PAGE_ROWS - 1) // PAGE_ROWS
+
+    def selector(compile_topk, params):
+        program = compile_topk(index, **params)
+        # The shared scored selector omits capacities from its geometry. Carry
+        # them in the installed contract so FFI cannot accept a truncated table.
+        return dataclasses.replace(program, geometry={**program.geometry, **params})
+
+    out = [("kda_commit", "kda_commit", {}, lambda: glmf.compile_glmf_kda_commit_aot(g)),
+           ("lse_combine2", "lse_combine2", {"heads": 48, "has_sink": False},
+            lambda: context_split.compile_lse_combine2_aot(heads=48, has_sink=False)),
+           ("dsa_candidate_merge", "dsa_candidate_merge", {"topk": 2048},
+            lambda: context_split.compile_dsa_candidate_merge_aot(topk=2048))]
+    for rows in sorted({decode_rows, prefill_rows}):
+        decode = rows == decode_rows
+        params = {"max_rows": rows, "output_kind": "norm", "decode": decode, "bf16_wide": not decode}
+        out.append((f"kda_m{rows}", "kda", params,
+                    lambda kw=params: glmf.compile_glmf_kda_aot(g, **kw)))
+        out.append((f"index_producer_m{rows}", "index_producer", {"max_rows": rows},
+                    lambda r=rows: kimi_dsa.compile_kimi_index_producer_aot(index, max_rows=r)))
+        mode = "decode" if decode else "prefill"
+        for stem, compile_topk in (("index_topk", kimi_dsa.compile_kimi_index_topk_aot),
+                                   ("scored_index_topk", kimi_dsa.compile_kimi_context_index_topk_aot)):
+            params = {"max_rows": rows, "max_pages": pages, "mode": mode}
+            out.append((f"{stem}_{mode}_m{rows}", stem, params,
+                        lambda fn=compile_topk, kw=params: selector(fn, kw)))
+        for heads in (48, 96):
+            suffix = "" if heads == 48 else "_h96"
+            for cache in ("bf16", "fp8"):
+                mla = kimi_mla.KimiMlaGeometry(heads=heads, kv_cache=cache, norm_eps=1e-5)
+                cache_suffix = "" if cache == "bf16" else "_fp8"
+                params = {"max_rows": rows, "heads": heads, "kv_cache": cache}
+                out.append((f"mla_producer{suffix}{cache_suffix}_m{rows}", "mla_producer", params,
+                            lambda r=rows, g=mla: kimi_mla.compile_kimi_mla_producer_aot(g, max_rows=r)))
+                out.append((f"sparse_mla{suffix}{cache_suffix}_m{rows}", "sparse_mla", params,
+                            lambda r=rows, g=mla: kimi_dsa.compile_kimi_sparse_mla_aot(g, max_rows=r)))
+                if cache == "bf16":
+                    out.append((f"mla_output{suffix}_m{rows}", "mla_output", params,
+                                lambda r=rows, g=mla: kimi_mla.compile_kimi_mla_output_aot(g, max_rows=r)))
+                if heads == 96:
+                    for begin in (0, 48):
+                        out.append((f"sparse_mla_partial{cache_suffix}_h{begin}_m{rows}", "sparse_mla_partial",
+                                    {**params, "head_begin": begin, "head_count": 48},
+                                    lambda r=rows, g=mla, b=begin: kimi_dsa.compile_kimi_sparse_mla_partial_aot(
+                                        g, max_rows=r, head_begin=b)))
+    for cache in ("bf16", "fp8"):
+        record_bytes = 1152 if cache == "bf16" else 656
+        suffix = "" if cache == "bf16" else "_fp8"
+        out.append((f"paged_staging_gather{suffix}", "paged_staging_gather",
+                    {"row_bytes": record_bytes, "page_rows": PAGE_ROWS},
+                    lambda rb=record_bytes: context_split.compile_paged_staging_gather_aot(
+                        row_bytes=rb, page_rows=PAGE_ROWS)))
+    return out
+
+
+def kimi_shared_programs():
+    """K3/K3.1 residual, FFN, latent and routing programs retain one namespace."""
+    return kimi_w8_programs() + kimi_latent_programs() + kimi_route_programs()
+
+
+def kimi_context_programs(decode_rows: int, max_context: int):
+    """Kimi h96-query owned-page partials, h48 combine and format-native gathers."""
+    from b12x.integration.cuteafd import context_split, kimi_mla
+    tiles = (8, 16)
+    routes = [kimi_mla.kimi_context_heads_per_tile(rows=rows) for rows in range(1, decode_rows + 1)]
+    if any(tile not in tiles for tile in routes):
+        raise ValueError("Kimi context tile policy requires an unexported tile")
+
+    def partial(g, begin, tile):
+        program = kimi_mla.compile_kimi_mla_partial_aot(
+            g, max_rows=decode_rows, max_context=max_context, head_begin=begin,
+            head_count=48, num_splits=16, device_splits=True, heads_per_tile=tile)
+        return dataclasses.replace(program, geometry={**program.geometry,
+            "context_heads_per_tile": routes})
+
+    out = [("lse_combine2", "lse_combine2", {"heads": 48, "has_sink": False},
+            lambda: context_split.compile_lse_combine2_aot(heads=48, has_sink=False))]
+    for cache in ("bf16", "fp8"):
+        g = kimi_mla.KimiMlaGeometry(kv_cache=cache)
+        suffix = "" if cache == "bf16" else "_fp8"
+        for begin in (0, 48):
+            for tile in tiles:
+                out.append((f"mla_partial{suffix}_h{begin}_t{tile}_m{decode_rows}", "mla_partial",
+                            {"max_rows": decode_rows, "max_context": max_context, "head_begin": begin,
+                             "head_count": 48, "num_splits": 16, "device_splits": True,
+                             "heads_per_tile": tile, "kv_cache": cache},
+                            lambda g=g, begin=begin, tile=tile: partial(g, begin, tile)))
+        out.append((f"paged_staging_gather{suffix}", "paged_staging_gather",
+                    {"row_bytes": g.record_bytes, "page_rows": PAGE_ROWS},
+                    lambda g=g: context_split.compile_paged_staging_gather_aot(
+                        row_bytes=g.record_bytes, page_rows=PAGE_ROWS)))
     return out
 
 
 def mla_draft_programs(max_rows: int, max_context: int):
     """Shared rotary MLA drafter; checkpoint scales are runtime ABI inputs."""
-    from b12x.integration.cuteafd import kimi_mla
+    from b12x.integration.cuteafd import context_split, kimi_mla
 
     def build(op, window=None, cache="bf16"):
         g = kimi_mla.MlaDraftGeometry(window_size=window, kv_cache=cache)
         fn = getattr(kimi_mla, f"compile_mla_draft_{op}_aot")
         kwargs = {"max_rows": max_rows}
-        if op == "attention":
+        if op in ("attention", "partial"):
             kwargs["max_context"] = max_context
         return fn(g, **kwargs)
 
@@ -865,6 +1169,11 @@ def mla_draft_programs(max_rows: int, max_context: int):
             out.append((f"mla_draft_attention_{suffix}{cache_suffix}_m{max_rows}", "mla_draft_attention",
                         {"max_rows": max_rows, "window_size": window, "max_context": max_context, "kv_cache": cache},
                         lambda w=window, c=cache: build("attention", w, c)))
+            out.append((f"mla_draft_partial_{suffix}{cache_suffix}_m{max_rows}", "mla_draft_partial",
+                        {"max_rows": max_rows, "window_size": window, "max_context": max_context, "kv_cache": cache},
+                        lambda w=window, c=cache: build("partial", w, c)))
+    out.append(("mla_draft_lse_combine2", "lse_combine2", {"heads": 64, "has_sink": False},
+                lambda: context_split.compile_lse_combine2_aot(heads=64, has_sink=False)))
     return out
 
 
@@ -891,13 +1200,13 @@ def kimi_latent_programs():
 
     def projection(width, outputs):
         from b12x.integration.cuteafd import pointwise
-        return pointwise.compile_bf16_projection_aot(width=width, outputs=outputs)
+        return pointwise.compile_bf16_projection_aot(width=width, outputs=outputs, wide=True)
 
     return [(f"rmsnorm_h{width}", "rmsnorm", {"hidden": width},
              lambda w=width: norm(w)) for width in (3584, 7168)] + [
-        ("latent_down", "bf16_projection", {"width": 7168, "outputs": 3584},
+        ("latent_down", "bf16_projection", {"width": 7168, "outputs": 3584, "wide": True},
          lambda: projection(7168, 3584)),
-        ("latent_up", "bf16_projection", {"width": 3584, "outputs": 7168},
+        ("latent_up", "bf16_projection", {"width": 3584, "outputs": 7168, "wide": True},
          lambda: projection(3584, 7168)),
     ]
 
@@ -932,6 +1241,9 @@ def kimi_w8_programs():
                     lambda w=width: build_situ(w)))
         for op, params in (("gate_up", {"width": 7168, "outputs": 2 * width}),
                            ("down", {"width": width, "outputs": 7168})):
+            # The wide route's floors were measured on these Kimi BF16 shapes only.
+            if (params["outputs"], params["width"]) in ((6144, 7168), (7168, 3072), (7168, 6144)):
+                params = {**params, "wide": True}
             out.append((f"ffn_{op}_i{width}", "bf16_projection", params,
                         lambda kw=params: build_projection(kw)))
         # Speed-first default; compensation is for informational F32 comparisons.
@@ -1139,10 +1451,11 @@ def main() -> None:
                              "qwen4 (Qwen 3.8 Flash Next), qwen35 (Qwen 3.5 9B), qwen38 (Qwen 3.8 27B), "
                              "kimik3 (Kimi K3 KDA, 48 heads per TP2 rank), "
                              "step5/step52 (Step-5 full/two-GPU head split), exlr8 (the fork's EXLR8 programs "
-                             "for --exlr8-role, after every other family), exlr8_dense (shared native dense operands), "
+                             "for --exlr8-role, after every other family), exlr8_dense (shared native dense operands), minimax (vendor MXFP8 A8), "
                              "glm_stage/glm2_stage (full/TP2 GLM primitive boundaries), "
                              "glmf_stage/glmf2_stage (full/TP2 GLM Flash primitive boundaries), "
-                             "dense_trellis_k6 (native K6 core projections)")
+                             "dense_trellis_k6 (native K6 core projections), "
+                             "native_attention (block-128 FP8 projection stages)")
     parser.add_argument("--dense-trellis-families",
                         help="architecture tables for dense_trellis_k6 and exlr8_dense: kimik3,glm,glmf,step5,muse,ml4 "
                              "(defaults: K6 kimik3; EXLR8 --exlr8-family; no checkpoint reads)")
@@ -1161,9 +1474,9 @@ def main() -> None:
     parser.add_argument("--max-context", type=int, default=DEFAULT_MAX_CONTEXT)
     parser.add_argument("--only", help="comma-separated stem suffixes (diagnostics)")
     parser.add_argument("--context-split-only", action="store_true",
-                        help="export K1 primitives for flash/pro/glm/glmf, no engine wiring")
+                        help="export K1 primitives for flash/pro/glm/glmf/kimik3, no engine wiring")
     parser.add_argument("--context-split", choices=("off", "on", "only"), default="off",
-                        help="token-split attention primitives for flash/pro/glm/glmf: on appends them after "
+                        help="token-split attention primitives for flash/pro/glm/glmf/kimik3: on appends them after "
                              "every other program (existing stems unchanged); only exports nothing else")
     args = parser.parse_args()
     if args.context_split_only:
@@ -1186,13 +1499,13 @@ def main() -> None:
     except ValueError as error:
         raise SystemExit(str(error)) from error
     if not geometries or any(name not in ("flash", "flash2", "pro", "pro2", "glm", "glm2", "mimo", "mimo2", "mimop",
-                                          "mimop2", "mimof", "mimof2", "glmf", "glmf2", "qwen4", "qwen35", "qwen38", "step5", "step52", "muse", "muse2", "ml4", "expert_partial", "expert_reply", "exlr8", "exlr8_dense", "glm_stage", "glm2_stage", "glmf_stage", "glmf2_stage", "dense_trellis_k6", "kimi_split", "kimik3") for name in geometries):
+                                          "mimop2", "mimof", "mimof2", "glmf", "glmf2", "qwen4", "qwen35", "qwen38", "step5", "step52", "muse", "muse2", "ml4", "expert_partial", "expert_reply", "exlr8", "exlr8_dense", "minimax", "glm_stage", "glm2_stage", "glmf_stage", "glmf2_stage", "dense_trellis_k6", "kimi_split", "kimik3", "kimik31", "native_attention") for name in geometries):
         raise SystemExit("--geometry takes flash, flash2, pro, pro2, glm, glm2, mimo, mimo2, mimop, mimop2, mimof, mimof2, "
-                         "glmf, glmf2, qwen4, qwen35, qwen38, step5, step52, muse, muse2, ml4, expert_partial, exlr8, exlr8_dense, glm_stage, glm2_stage, glmf_stage, glmf2_stage, dense_trellis_k6, kimi_split and/or kimik3")
-    if args.context_split_only and any(name not in ("flash", "pro", "glm", "glmf") for name in geometries):
-        raise SystemExit("--context-split-only takes flash, pro, glm and/or glmf")
+                         "glmf, glmf2, qwen4, qwen35, qwen38, step5, step52, muse, muse2, ml4, expert_partial, exlr8, exlr8_dense, minimax, glm_stage, glm2_stage, glmf_stage, glmf2_stage, dense_trellis_k6, kimi_split, kimik3, kimik31 and/or native_attention")
+    if args.context_split_only and any(name not in ("flash", "pro", "glm", "glmf", "kimik3") for name in geometries):
+        raise SystemExit("--context-split-only takes flash, pro, glm, glmf and/or kimik3")
     kimi_kda = None
-    if "kimik3" in geometries:
+    if any(name in geometries for name in ("kimik3", "kimik31")):
         from b12x.integration.cuteafd import KDAGeometry
         kimi_kda = KDAGeometry(hidden=7168, kda_heads=96).head_split(2)
     props = torch.cuda.get_device_properties(0)
@@ -1220,6 +1533,10 @@ def main() -> None:
     entries, includes = [], []
     work = []
     for name in geometries:
+        if name == "native_attention":
+            manifest["families"][name] = {"scale_block": 128, "decode_rows": 64}
+            work += [(name, *item) for item in native_attention_programs()]
+            continue
         if name in ("glmf_stage", "glmf2_stage"):
             g = GLM53_FLASH
             if name == "glmf2_stage":
@@ -1246,12 +1563,26 @@ def main() -> None:
                 compile_expert_reply_reduce_aot, compile_expert_reply_reduce_tier_aot)
             manifest["families"][name] = {"fp8_block": 32, "nvfp4_block": 16}
             if capability != (8, 9):
-                # An sm_89 coordinator only decodes Spark replies (and has no
-                # E2M1 conversion for the quantizer).
                 for suffix, quantize, stage in (("quantize", True, False), ("dequantize", False, False), ("stage", False, True)):
                     work.append((name, suffix, "expert_reply", {"max_rows": args.prefill_rows},
                                  lambda q=quantize, s=stage: compile_expert_reply_aot(quantize=q, stage=s)))
-                work += [(name, *item) for item in exl3_reply_programs(args.prefill_rows)]
+                if os.environ.get("CUTEAFD_BUILD_KIND", "development") == "release":
+                    work += [(name, *item) for item in exl3_reply_programs(args.prefill_rows)]
+                    from native_reply import compile_native_reply_aot
+                    for width in (2048, 2560, 3072, 3584, 4096, 5120, 6144, 7168, 8192):
+                        for format in (1, 2):
+                            work.append((name, f"native_h{width}_{format}", "expert_reply",
+                                         {"max_rows": args.prefill_rows},
+                                         lambda w=width, f=format: compile_native_reply_aot(w, f)))
+                    from b12x.integration.cuteafd.expert_reply import compile_fp8_reply_aot
+                    from b12x.integration.cuteafd.fp8_moe import GEOMETRIES as FP8_GEOMETRIES
+                    for width, topk in sorted({(g.hidden, g.top_k) for g in FP8_GEOMETRIES.values()}):
+                        for format in (1, 2):
+                            for segmented in (False, True):
+                                suffix = f"fp8_h{width}_k{topk}_{format}" + ("_segmented" if segmented else "")
+                                work.append((name, suffix, "expert_reply", {"max_rows": args.prefill_rows},
+                                    lambda w=width, k=topk, f=format, s=segmented:
+                                        compile_fp8_reply_aot(hidden=w, top_k=k, format=f, row_addresses=s)))
             work.append((name, "reduce", "expert_reply", {"max_rows": args.prefill_rows},
                          compile_expert_reply_reduce_aot))
             if capability != (12, 1):
@@ -1297,6 +1628,8 @@ def main() -> None:
             }
             work += [(name, *item) for item in dense_programs(families=dense_families, input_dtype="bf16")]
             continue
+        if name == "minimax":
+            continue  # appended after existing programs to preserve their indices
         if name == "exlr8_dense":
             from export_b12x_exlr8_dense_aot import programs as dense_programs
             if not native_families:
@@ -1346,10 +1679,10 @@ def main() -> None:
              "glm2": glm2, "mimo": MIMO_V2_FLASH, "mimop": MIMO_V26_PRO,
              "mimo2": mimo2, "mimop2": mimop2, "mimof": MIMO_V26_FLASH, "mimof2": mimof2, "glmf": GLM53_FLASH, "glmf2": glmf2, "qwen4": QWEN38_FLASH_NEXT,
              "qwen35": QWEN35_9B, "qwen38": QWEN38_27B,
-             "kimik3": kimi_kda}[name]
+             "kimik3": kimi_kda, "kimik31": kimi_kda}[name]
         family = {"flash": "dsv4f", "flash2": "dsv4f2", "pro": "dsv4p", "pro2": "dsv4p2", "glm": "glm", "glm2": "glm2", "mimo": "mimo", "mimop": "mimop",
                   "mimo2": "mimo2", "mimop2": "mimop2", "mimof": "mimof", "mimof2": "mimof2", "glmf": "glmf", "glmf2": "glmf2", "qwen4": "qwen4",
-                  "qwen35": "qwen35", "qwen38": "qwen38", "kimik3": "kimik3"}[name]
+                  "qwen35": "qwen35", "qwen38": "qwen38", "kimik3": "kimik3", "kimik31": "kimik31"}[name]
         manifest["families"][family] = {k: v for k, v in vars(g).items()}
         extent = geometry_context(name, args.max_context)
         manifest["family_capacities"][family] = {"max_context": extent}
@@ -1358,16 +1691,23 @@ def main() -> None:
                 "mimo2": mimo_head_split_programs, "mimop2": mimo_head_split_programs,
                 "mimof": mimo_programs, "mimof2": mimo_head_split_programs,
                 "glmf": glmf_programs, "glmf2": glmf_head_split_programs,
-                "qwen4": qwen4_programs, "kimik3": kimi_kda_programs}.get(name, programs)
+                "qwen4": qwen4_programs, "kimik3": kimi_kda_programs, "kimik31": kimi_k31_programs}.get(name, programs)
         if name in ("qwen35", "qwen38"):
             # These exports target the named official checkpoints' native norm storage.
             norm_dtype = torch.float32 if name == "qwen35" else torch.bfloat16
             family_work = qwen_dense_programs(g, args.decode_rows, args.prefill_rows, extent,
                                               norm_dtype=norm_dtype)
+        elif args.context_split_only:
+            family_work = (kimi_context_programs(args.decode_rows, extent) if name == "kimik3" else
+                           context_split_programs(g, args.decode_rows, extent))
         else:
-            family_work = (context_split_programs(g, args.decode_rows, extent) if args.context_split_only else
-                           make(g, args.decode_rows, args.prefill_rows, extent))
+            family_work = make(g, args.decode_rows, args.prefill_rows, extent)
         work += [(family, *item) for item in family_work]
+    if "kimik31" in geometries and not args.context_split_only and "kimik3" not in geometries:
+        # Runtime intentionally shares these unchanged K3 kernels. A K3.1-only
+        # package must publish them too, without exporting duplicate K3 modules.
+        manifest["families"]["kimik3"] = {k: v for k, v in vars(kimi_kda).items()}
+        work += [("kimik3", *item) for item in kimi_shared_programs()]
     if "glmf" in geometries and not args.context_split_only:
         # Last, so every program above compiles exactly as before.
         work += [("glmf", *item) for item in glmf_wide_decode_programs(GLM53_FLASH, args.decode_rows,
@@ -1415,14 +1755,42 @@ def main() -> None:
                                            "programs": [f"{family}_{item[0]}" for item in exlr8_work]}
             work += [(family, *item) for item in exlr8_work]
     # Append shared drafter exports after all existing objects: table indices stay stable.
-    if any(name in geometries for name in ("glm", "glm2", "glmf", "glmf2", "mimo", "mimo2", "mimop", "mimop2", "mimof", "mimof2", "qwen4", "qwen35", "qwen38", "kimik3", "ml4", "muse", "muse2")):
-        work += [("draft_bf16", f"k{k}_n{n}", "bf16_projection", {"max_rows": 2048},
+    if any(name in geometries for name in ("glm", "glm2", "glmf", "glmf2", "mimo", "mimo2", "mimop", "mimop2", "mimof", "mimof2", "qwen4", "qwen35", "qwen38", "kimik3", "kimik31", "ml4", "muse", "muse2", "step5", "step52")):
+        work += [("draft_bf16", f"k{k}_n{n}", "bf16_projection",
+                  {"max_rows": 4096 if (k, n) in flash_native_bf16_shapes()
+                      or "native-core" in draft_bf16_shapes()[(k, n)] else 2048},
                   lambda k=k, n=n: compile_draft_bf16_projection(k, n))
                  for k, n in sorted(draft_bf16_shapes())]
+        work += [("draft_bf16", f"k{k}_n{n}_f32", "bf16_projection", {"max_rows": 4096},
+                  lambda k=k, n=n: compile_draft_bf16_projection(k, n, "f32"))
+                 for n, k in sorted(native_attention_bf16_f32_shapes())]
+    if "native_attention" not in geometries and any(name in geometries for name in
+            ("glm", "glm2", "kimik3", "kimik31", "step5", "step52", "muse", "muse2", "ml4")):
+        work += [("native_attention", *item) for item in native_attention_programs()]
+    if "minimax" in geometries:
+        from export_b12x_exlr8_dense_aot import minimax_programs
+        manifest["families"]["minimax"] = {"abi_version": 1}
+        work += [("minimax", *item) for item in minimax_programs()]
+        manifest["family_capacities"]["minimax"] = {"max_context": geometry_context("minimax", args.max_context)}
+        work += [("minimax", *item) for item in minimax_sparse_programs(
+            args.decode_rows, args.prefill_rows, args.max_context)]
+        work += [("minimax", *item) for item in minimax_producer_programs(args.prefill_rows)]
+    # Per-program reuse (python/tools/lib/_export_cache.py): only under the export
+    # cache's recorder. Programs compile independently of which others the
+    # geometry list requests; their recipes read every argument except these.
+    program_cache = _export_cache.ProgramCache(output) if _export_cache else None
+    if program_cache is not None:
+        program_cache.start()
     for family, suffix, op, params, thunk in work:
         if selected is not None and suffix not in selected:
             continue
-        stem = suffix if family == "kimi_split" else f"{family}_{suffix}"
+        stem = (suffix if family == "kimi_split" else
+                f"exlr8_dense_{suffix}" if family == "minimax" and op in ("dense_mxfp8", "dense_mxfp8_quant")
+                else f"{family}_{suffix}")
+        object_selection = globals().get("_selected_object_labels")
+        if object_selection is not None and not any(label == stem or label.startswith(stem + "_sm")
+                                                   for label in object_selection):
+            continue
         # Card-specific split/merge plans retain their numerics and matching
         # scratch layouts. Native load selects once, before graph capture.
         plan_sms = (170, 188) if props.minor == 0 and op == "sparse_mla" and params.get("route") == "decode" else (None,)
@@ -1432,22 +1800,64 @@ def main() -> None:
         minimum_sms = 0
         for sms in plan_sms:
             label = stem if sms is None else f"{stem}_sm{sms}"
-            with exportable_compilation():
-                program = thunk() if sms is None else thunk(sm_count=sms)
-            validate_table_residency(stem, program.geometry, diagnostic=selected is not None)
-            minimum_sms = max(minimum_sms, program_minimum_sms(stem, program.geometry))
-            if abi is not None and program.abi != abi:
+            if object_selection is not None and label not in object_selection:
+                continue
+            # What this program compiles: its recipe's captured values (code is a
+            # recorded read), never which other programs the scope requested.
+            try:
+                recipe = _export_cache.recipe_identity(thunk) if program_cache is not None else None
+            except _export_cache.Unidentifiable as error:
+                recipe = None
+                program_cache.unidentified.append(f"{label}: {error}")
+            identity = {"exporter": "export_b12x_dsv4_aot.py", "family": family, "suffix": suffix, "op": op,
+                        "params": params, "label": label, "plan_sms": sms, "capacity": capacity,
+                        "device": [props.major, props.minor, props.multi_processor_count],
+                        "diagnostic": selected is not None, "recipe": recipe,
+                        "build_kind": os.environ.get("CUTEAFD_BUILD_KIND", "development")}
+            cacheable = program_cache is not None and object_selection is None and recipe is not None
+            reused = program_cache.lookup(identity) if cacheable else None
+            records = globals().get("_program_records")
+            if reused is not None and records is not None and records.active and "ir_record" not in reused:
+                reused = None  # stored without an IR record: a records worker compiles it
+            if reused is not None:
+                geometry, plan_scratch, program_abi, checked = (
+                    reused["geometry"], reused["scratch"], reused["abi"], reused["checked"])
+                if records is not None:
+                    records.restore_plan(label, geometry, program_abi)
+                    if records.active:
+                        records.restore(output, label, reused["ir_record"])
+            else:
+                def construct():
+                    with exportable_compilation():
+                        program = thunk() if sms is None else thunk(sm_count=sms)
+                    # Include scratch callbacks in the measured dependency set.
+                    return program, program.scratch_bytes(capacity)
+                with (program_cache.scope() if program_cache is not None else contextlib.nullcontext()) as scope:
+                    program, plan_scratch = globals().get("_record_construction", lambda fn: fn())(construct)
+                    # The serving-table gate precedes writing any object.
+                    validate_table_residency(stem, program.geometry, diagnostic=selected is not None)
+                    program.export_to_c(str(output), label, "cuteafd_" + label)
+                    checked = validate_exported_header(program, output / f"{label}.h", "cuteafd_" + label)
+                # The JSON form, as a reused program carries it, so plans compare alike.
+                geometry, program_abi = json.loads(json.dumps(dict(program.geometry))), json.loads(json.dumps(program.abi))
+            program_abi = {**program_abi, "scalars": [tuple(item) for item in program_abi["scalars"]]}
+            validate_table_residency(stem, geometry, diagnostic=selected is not None)
+            minimum_sms = max(minimum_sms, program_minimum_sms(stem, geometry))
+            if abi is not None and program_abi != abi:
                 raise ValueError(f"{stem}: card plans disagree on their ABI")
-            abi = program.abi
-            kinds, public_scalars = native_scalar_abi(stem, program.geometry, abi["scalars"])
-            program.export_to_c(str(output), label, "cuteafd_" + label)
-            checked = validate_exported_header(program, output / f"{label}.h", "cuteafd_" + label)
+            abi = program_abi
+            kinds, public_scalars = native_scalar_abi(stem, geometry, abi["scalars"])
             if checked["argument_count"] != len(abi["pointers"]) + len(kinds) + 1:
                 raise ValueError(f"{label}: header argument count disagrees with the ABI")
-            plan_scratch = program.scratch_bytes(capacity)
+            if reused is None and cacheable:
+                metadata = {"geometry": geometry, "scratch": plan_scratch, "checked": checked, "abi": abi}
+                ir_record = records.record(output, label) if records is not None and records.active else None
+                if ir_record is not None:
+                    metadata["ir_record"] = ir_record
+                program_cache.store_program(identity, scope, [f"{label}.o", f"{label}.h"], metadata)
             for key, size in plan_scratch.items():
                 scratch[key] = max(scratch.get(key, 0), size)
-            plans.append({"sm_count": sms, "label": label, "geometry": dict(program.geometry),
+            plans.append({"sm_count": sms, "label": label, "geometry": dict(geometry),
                           "scratch_bytes_at_capacity": plan_scratch, "entry": checked["symbol"],
                           "object_sha256": hashlib.sha256((output / f"{label}.o").read_bytes()).hexdigest()})
             includes.append(f'#include "{label}.h"')
@@ -1464,6 +1874,8 @@ def main() -> None:
         extra = ", " + modules[1] if len(modules) > 1 else ""
         entries.append(f'{{"{stem}", {modules[0]}, {len(abi["pointers"])}, "{kinds}", {minimum_sms}{extra}}}')
         print(f"exported {stem}: {len(abi['pointers'])} pointers, scalars '{kinds}', plans {plan_sms}", flush=True)
+    if program_cache is not None:
+        program_cache.report()
     if not entries:
         raise SystemExit("no programs selected")
     (output / "dsv4_programs.h").write_text("\n".join([

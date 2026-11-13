@@ -1,6 +1,6 @@
 //! Flash adapter facts; execution and storage remain in the shared native backend.
 use super::{engine, fp8, EngineArgs, GlmNextConfig};
-use crate::shared::experts::exlr8::dense_weights::NativeDenseRecords;
+use cuteafd_loader::plan::exlr8::dense::requests::NativeDenseRecords;
 use crate::shared::token_io::native::VocabularyPlan;
 use anyhow::{ensure, Context, Result};
 use cuteafd_loader::plan::checkpoint::CheckpointFormat;
@@ -22,7 +22,7 @@ pub(super) fn prefill_activations(value: &str)
 
 pub(super) fn normalize(args: &mut EngineArgs) {
     args.kda_fp8 = fp8::KdaFp8::Off;
-    args.fp8_head = false;
+    args.head_format = super::head::GlmfHeadFormat::Bf16;
     args.kda_fp32_partials = false;
     args.kda_output_shard = false;
     args.kda_prefill_expanded = false;
@@ -31,12 +31,27 @@ pub(super) fn normalize(args: &mut EngineArgs) {
     args.fp8_prefill.push(super::Fp8PrefillGroup::None);
 }
 
+pub(super) fn normalize_head(args: &mut EngineArgs, native_head: bool) {
+    if native_head {
+        if args.head_format != super::head::GlmfHeadFormat::Bf16 {
+            tracing::warn!(requested = args.head_format.setting(), "--fp8-head does not apply to the metadata-selected native head");
+        }
+    }
+    args.head_format = args.head_format.resolve(native_head, 1 + usize::from(args.split_device.is_some()));
+}
+
+pub(super) fn publish_resolved(args: &EngineArgs) {
+    for (name, value) in resolved_settings(args) { cuteafd_bench::context::set_resolved(name, &value); }
+}
+
 pub(super) fn resolved_settings(args: &EngineArgs) -> Vec<(&'static str, String)> {
     vec![("kda-output-shard", args.kda_output_shard.to_string()),
         ("kda-prefill-expanded", args.kda_prefill_expanded.to_string()),
         ("kda-fp32-partials", args.kda_fp32_partials.to_string()),
-        ("fp8-head", args.fp8_head.to_string()), ("kda-fp8", "off".into()),
-        ("fp8-prefill", "none".into())]
+        ("fp8-head", args.head_format.setting().into()),
+        ("kda-fp8", match args.kda_fp8 { fp8::KdaFp8::Off => "off", fp8::KdaFp8::Channel => "channel", fp8::KdaFp8::Row128 => "row128" }.into()),
+        ("kda-nvfp4-gate", args.kda_nvfp4_gate.clone().unwrap_or_else(|| "off".into())),
+        ("fp8-prefill", { use clap::ValueEnum; args.fp8_prefill.iter().map(|value| value.to_possible_value().unwrap().get_name().to_owned()).collect::<Vec<_>>().join(",") })]
 }
 
 pub(super) fn validate_headers(format: CheckpointFormat, legacy: impl FnOnce() -> Result<()>) -> Result<()> {
@@ -106,8 +121,33 @@ impl Admission {
         Ok(Self { facts, metadata, dense, charges, resident })
     }
 
+    pub(super) fn arena_layouts(&self, cfg: &GlmNextConfig, embedding_rank: usize)
+        -> Result<Vec<cuteafd_loader::serving_capacity::WeightArenaLayout>> {
+        Self::target_layouts(&self.facts, &self.dense, cfg, embedding_rank)
+    }
+
+    /// The loader recipe admission charges; this loader binds its views.
+    fn target_layouts(facts: &DenseFacts, dense: &[NativeDenseRecords], cfg: &GlmNextConfig, embedding_rank: usize)
+        -> Result<Vec<cuteafd_loader::serving_capacity::WeightArenaLayout>> {
+        cuteafd_loader::families::glm5_flash::weight_layout::native_target(facts, dense, cfg, embedding_rank)
+    }
+
+    pub(super) fn load_owners(&self, cfg: &GlmNextConfig)
+        -> Result<cuteafd_loader::placement::families::glm5_flash::admission::NativeLoad> {
+        use cuteafd_loader::plan::exlr8::residency::ExpertSet;
+        let world = self.dense.len();
+        let vocabulary = VocabularyPlan::new(&self.facts.records, &self.facts.selection, world, 0,
+            cfg.hidden, cfg.vocab_size)?;
+        let shared = (0..world).map(|rank| (0..cfg.layers).filter(|&layer| !cfg.dense[layer])
+            .map(|layer| self.metadata.plan(layer, world, rank, ExpertSet::Shared))
+            .collect::<std::result::Result<Vec<_>, _>>()).collect::<std::result::Result<Vec<_>, _>>()?;
+        cuteafd_loader::placement::families::glm5_flash::admission::NativeLoad::from_plans(
+            &self.dense.iter().map(|rank| rank.plan.clone()).collect::<Vec<_>>(), vocabulary.dense_plan(), &shared)
+    }
+
     pub(super) fn load_shared<'a>(&self, args: &EngineArgs, cfg: &GlmNextConfig,
-        library: &'a cuteafd_ffi::NativeLibrary, programs: &cuteafd_ffi::programs::Programs<'_>)
+        library: &'a cuteafd_ffi::NativeLibrary, programs: &cuteafd_ffi::programs::Programs<'_>,
+        admitted: &cuteafd_loader::placement::families::glm5_flash::admission::NativeLoad)
         -> Result<Vec<crate::shared::experts::exlr8::NativeExperts<'a>>> {
         use crate::shared::{experts::exlr8::{NativeExperts, NativePlan}, memory::device::Device};
         let first = cfg.dense.iter().position(|dense| !dense).context("Flash routed suffix")?;
@@ -120,7 +160,7 @@ impl Admission {
                 && plan.workspace as u64 == self.charges.ranks[rank].shared_workspace,
                 "native Flash shared weights/workspace differ from admission");
             let expected = plan.resident;
-            let shared = NativeExperts::load(library, plan)?;
+            let shared = NativeExperts::load_validated(library, plan, |plans| admitted.validate_shared(plans))?;
             ensure!(shared.resident_bytes() as u64 == expected, "native Flash uploaded shared bytes differ from admission");
             Ok(shared)
         })).collect()
@@ -128,22 +168,23 @@ impl Admission {
 
     pub(super) fn load<'a>(&self, library: &'a cuteafd_ffi::NativeLibrary,
         programs: &'a cuteafd_ffi::programs::Programs<'a>, loader: &super::weights::GlmfLoader<'a>,
-        cfg: &GlmNextConfig, execution: &cuteafd_loader::placement::LayerExecutionPlan, embedding_device: i32)
+        cfg: &GlmNextConfig, execution: &cuteafd_loader::placement::LayerExecutionPlan, embedding_device: i32,
+        admitted: &cuteafd_loader::placement::families::glm5_flash::admission::NativeLoad)
         -> Result<(crate::shared::token_io::TokenEmbedding<'a>,
             (super::weights::GlmfWeights<'a>, Vec<Vec<super::weights::GlmfLayer<'a>>>))> {
         use crate::shared::token_io::{native::NativeVocabulary, TokenEmbedding};
-        let (_, available) = cuteafd_loader::formats::mapped_preload::host_memory()?;
-        let available = usize::try_from(available)?;
-        let peak = self.dense.iter().try_fold(0usize, |sum, rank|
-            sum.checked_add(rank.plan.read_staging_bytes).context("native Flash loading peak overflow"))?;
-        ensure!(peak <= available, "native Flash dense loading peak {peak} exceeds host availability {available}");
+        ensure!(&self.load_owners(cfg)? == admitted,
+            "native Flash body/shared reader extents differ from admission");
         let plan = VocabularyPlan::new(&self.facts.records, &self.facts.selection, self.dense.len(), 0,
             cfg.hidden, cfg.vocab_size)?;
-        let vocabulary = std::rc::Rc::new(NativeVocabulary::load_with_embedding_device(
-            library, programs, plan, available, 0, peak, embedding_device)?
+        admitted.validate_vocabulary(plan.staging_bytes() as u64)?;
+        let vocabulary = std::rc::Rc::new(NativeVocabulary::load_prepared_with(
+            library, programs, plan, admitted.vocabulary, embedding_device,
+            |name, bytes| loader.allocate(library.cuda_get_device()?, name, bytes))?
             .context("native Flash rank0 owns vocabulary")?);
         let source = embedding_source(&self.facts.records, &self.facts.selection, cfg.hidden, cfg.vocab_size)?;
-        let embedding = TokenEmbedding::row_fp8(library, source, vocabulary.clone())?;
+        let embedding = TokenEmbedding::row_fp8_with(library, source, vocabulary.clone(),
+            |name, bytes| loader.allocate(library.cuda_get_device()?, name, bytes))?;
         let model = loader.native_model(cfg, execution, &self.dense, vocabulary)?;
         Ok((embedding, model))
     }
@@ -173,6 +214,76 @@ fn owners_resident(facts: &DenseFacts, body: &[DensePlan], cfg: &GlmNextConfig)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn installed_native_admission_arenas_equal_runtime_requests() -> Result<()> {
+        use cuteafd_loader::{placement::families::glm5_flash::{admission::ProcessOwners, GlmfInputs},
+            placement::{planner::allocation_granularity_forecast, Baseline}, plan::exlr8::residency::ExpertSet};
+        let Some(snapshot) = std::env::var_os("CUTEAFD_EXLR8_FLASH_SNAPSHOT") else { return Ok(()); };
+        let snapshot = std::path::Path::new(&snapshot);
+        let checkpoint = cuteafd_loader::plan::Checkpoint::coordinator(snapshot, false, false)?;
+        let cfg = GlmNextConfig::read(snapshot)?;
+        let config = serde_json::from_slice(&std::fs::read(snapshot.join("config.json"))?)?;
+        for selected in ["k2", "k3", "k4"] {
+            let metadata = MetadataInput::open(snapshot, selected)?;
+            for ranks in [1, 2] {
+                let first = cfg.dense.iter().position(|dense| !dense).context("native routed suffix")?;
+                let shared = exlr8::shared_expert_resident(&metadata, &(first..cfg.layers).collect::<Vec<_>>(), ranks)?;
+                let facts = DenseFacts::new(DenseRecord::inventory(snapshot)?, DenseSelection::from_hf(&config)?, cfg.layers, shared)?;
+                for mode in if ranks == 1 { vec![cuteafd_loader::placement::AttentionPlacement::Heads] }
+                    else { vec![cuteafd_loader::placement::AttentionPlacement::Heads, cuteafd_loader::placement::AttentionPlacement::Layers] } {
+                    let attention = engine::GlmfAttention { mode, ..Default::default() };
+                    let owners = whole_mla(&cfg, cfg.layers, attention);
+                    let dense = (0..ranks).map(|rank| NativeDenseRecords::new(snapshot, cfg.layers, ranks, rank, &owners))
+                        .collect::<Result<Vec<_>>>()?;
+                    let resident = cuteafd_loader::families::glm5_flash::resident::native_resident(
+                        &facts.selection, cfg.layers, &facts.plans(&owners)?, &facts.shared_bytes)?;
+                    // Only the target recipe fields participate in this header-only check.
+                    let input = GlmfInputs { cfg: &cfg, layers: cfg.layers, attention, resident: resident.clone(),
+                        gpus: vec![(96 << 30, Baseline::Planned { context_bytes: 0, loaded_bytes: 0 }); ranks],
+                        ..native_test_inputs(&cfg, ranks) };
+                    let mut process = ProcessOwners::new((512 << 30, 512 << 30), 8 << 30);
+                    process.target(&checkpoint, &input, Some((&facts, &metadata)))?;
+                    for home in 0..ranks {
+                        let runtime = Admission::target_layouts(&facts, &dense, &cfg, home)?;
+                        assert_eq!(process.target_arenas[home], runtime);
+                        // Rebuilding records cannot change packing through HashMap iteration.
+                        let rebuilt = (0..ranks).map(|rank| NativeDenseRecords::new(snapshot, cfg.layers, ranks, rank, &owners))
+                            .collect::<Result<Vec<_>>>()?;
+                        assert_eq!(runtime, Admission::target_layouts(&facts, &rebuilt, &cfg, home)?);
+                        for (rank, layout) in runtime.iter().enumerate() {
+                            let mut bytes = layout.bytes() as u64;
+                            let mut tail = allocation_granularity_forecast(&[bytes])?;
+                            for (id, extent) in &process.shared_arenas[rank] {
+                                let layer: usize = id.split(".layer.").nth(1).unwrap().split('.').next().unwrap().parse()?;
+                                assert_eq!(*extent, metadata.plan(layer, ranks, rank, ExpertSet::Shared)?.resident_bytes as u64);
+                                bytes += extent;
+                                tail += allocation_granularity_forecast(&[*extent])?;
+                            }
+                            let old = resident[rank].weights + if rank == home { resident.iter().map(|r| r.embedding).sum() } else { 0 };
+                            eprintln!("FLASH_CHARGE native-target manifest={selected} attention={mode:?} embedding={home} ranks={ranks} rank={rank} old={old} B={bytes} tail={tail} new={} delta={} old_rounding=no",
+                                bytes + tail, i128::from(bytes + tail) - i128::from(old));
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn native_test_inputs(cfg: &GlmNextConfig, ranks: usize) -> cuteafd_loader::placement::families::glm5_flash::GlmfInputs<'_> {
+        use cuteafd_loader::placement::{families::glm5_flash::GlmfInputs, planner, Onboard};
+        GlmfInputs { blas_head: cuteafd_loader::placement::planner::serving::BlasHead::Native, cfg, layers: cfg.layers, attention: Default::default(), resident: vec![], gpus: vec![],
+            context: planner::Context::pinned(262_144), resident_weight_limit: None,
+            spark_reply_format: cuteafd_core::SparkReplyFormat::Bf16, pending_code: vec![0; ranks],
+            local_tp2_exl3: false, headroom_bytes: 0, spark_ranks: 4, prefill_lanes: 2, prefill_rows: 4096,
+            decode_rows: 64, partial_bytes: 2, max_context: 262_144, sequences: 8, speculation: false,
+            state_slots: 8, mark_slots: 8, pool_marks: false, index: Default::default(), kda_state_bytes: 4,
+            shared_replay: false, representation: Default::default(), workspace: vec![], local_workspace: vec![],
+            experts: vec![], expert_workspace: 0,
+            tp2_workspace: [0; 2], drafter_bytes: 0, drafter_weights: Default::default(), drafter_scratch: vec![0; ranks], drafter_requests: None,
+            drafter_bridge: None, requested_pool: None, onboard: Onboard::Auto, full_prefill_logits: 0 }
+    }
 
     #[test]
     fn native_headers_never_enter_bf16_or_k6_validation() {
@@ -250,6 +361,25 @@ mod tests {
             let facts = DenseFacts::new(records.clone(), selection.clone(), cfg.layers, shared.clone())?;
             let body = (0..world).map(|rank| NativeDenseRecords::new(root.path(), cfg.layers, world, rank, &BTreeMap::new())
                 .map(|r| r.plan)).collect::<Result<Vec<_>>>()?;
+            let mut dense = (0..world).map(|rank| NativeDenseRecords::new(root.path(), cfg.layers, world, rank, &BTreeMap::new()))
+                .collect::<Result<Vec<_>>>()?;
+            // This sparse header fixture represents only its first KDA and MLA layers.
+            for rank in &mut dense {
+                rank.layers.retain(|layer| !layer.plain.is_empty() || !layer.projections.is_empty() || layer.kv_b.is_some());
+            }
+            for embedding_rank in 0..world {
+                let layouts = Admission::target_layouts(&facts, &dense, &cfg, embedding_rank)?;
+                let vocabulary = VocabularyPlan::new(&facts.records, &selection, world, 0, cfg.hidden, cfg.vocab_size)?;
+                let embedding_bytes = cuteafd_loader::plan::exlr8::dense::requests::row_requests(&vocabulary.dense_plan().tensors[0])?
+                    .into_iter().map(|(_, bytes)| bytes).sum::<usize>();
+                for (rank, layout) in layouts.iter().enumerate() {
+                    let expected = body[rank].resident_bytes + if rank == 0 { vocabulary.resident_bytes() - embedding_bytes + 256 } else { 0 }
+                        + if rank == embedding_rank { embedding_bytes } else { 0 };
+                    assert_eq!(layout.payload_bytes(), expected, "native rank {rank}, embedding rank {embedding_rank}");
+                    assert_eq!(layout.bytes(), layout.payload_bytes() + layout.padding_bytes());
+                    assert!(layout.views().values().all(|view| view.offset() % 256 == 0));
+                }
+            }
             let actual = owners_resident(&facts, &body, &cfg)?;
             let canonical = cuteafd_loader::families::glm5_flash::resident::native_resident(
                 &selection, cfg.layers, &facts.plans(&BTreeMap::new())?, &shared)?;

@@ -121,6 +121,13 @@ def main() -> int:
                       ("torch-extensions", "TORCH_EXTENSIONS_DIR"), ("xdg", "XDG_CACHE_HOME"),
                       ("roce", "B12X_ROCE_CACHE_DIR")):
         leaf(name, root / "jit" / args.toolchain / arch / name, container_home / name, env)
+    # AOT export products by recorded inputs (scripts/build/export-cache.py). One
+    # store per host and architecture, shared by WIP builds, release builds and
+    # placement-input republishes; entries name their compiler image themselves.
+    if enabled:
+        leaf("export-cache", root / "export-cache" / arch, Path("/opt/cuteafd-export-cache"), "CUTEAFD_EXPORT_CACHE")
+    else:
+        argv.extend(["-e", "CUTEAFD_EXPORT_CACHE=off"])
     # Cache-off must override the dev image and explicit compiler-cache settings.
     argv.extend(["-e", "CUTEAFD_KACHE=", "-e", "CUTEAFD_SCCACHE_CUDA=0", "-e", "CUTEAFD_KACHE_REMOTE="])
     if enabled and os.environ.get("CUTEAFD_KACHE", "1"):

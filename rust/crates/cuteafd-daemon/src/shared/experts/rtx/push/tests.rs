@@ -8,6 +8,58 @@ use cuteafd_loader::{plan::testing::{qwen4_config, qwen4_exl3, write_snapshot},
 use std::{fs::File, net::TcpStream, os::unix::fs::FileExt, time::Duration};
 
 #[test]
+fn packed_head_push_delivers_transient_source_before_arena_pack() -> Result<()> {
+    crate::families::deepseek_v41::v41_tensors::packed_head_push_delivers_transient_source_before_arena_pack(
+        |device, root, sockets, records| {
+            receive_pushed(device, None, root, sockets, records, None, 0, 0)?;
+            Ok(())
+        })
+}
+
+#[test]
+fn join_stage_errors_name_rank_device_stage_and_requested_bytes() {
+    for (stage, bytes) in [("expert arena", 8 << 30), ("host-ring registration", 128 << 20)] {
+        let error = join_stage::<()>(7, 6, 0, stage, bytes,
+            || anyhow::bail!("injected allocation refusal")).unwrap_err();
+        let typed = error.downcast_ref::<RankJoinError>().unwrap();
+        assert_eq!((typed.rank, typed.device, typed.stage, typed.bytes), (6, 0, stage, bytes));
+        assert!(error.to_string().contains("injected allocation refusal"));
+    }
+}
+
+#[test]
+fn stalled_sparknest_join_times_out_with_rank_and_ring_bytes() -> Result<()> {
+    use std::os::fd::AsRawFd;
+    let root = tempfile::tempdir()?;
+    let socket = root.path().join("join.sock").to_string_lossy().into_owned();
+    let listener = crate::shared::memory::push_testing::bind(&socket)?;
+    let (release, released) = std::sync::mpsc::channel::<()>();
+    let server_socket = socket.clone();
+    let server = std::thread::spawn(move || -> Result<()> {
+        let conn = crate::shared::memory::push_testing::accept_within(&listener, &server_socket, Duration::from_secs(2))?;
+        conn.set_timeout(Some(Duration::from_secs(2)))?;
+        assert!(matches!(conn.next_request()?.context("Join request")?.0, Request::Join { rank: 6, .. }));
+        let _ = released.recv_timeout(Duration::from_secs(2));
+        Ok(())
+    });
+    let client = PushClient::at(socket, Duration::from_millis(50))?;
+    let ring = tempfile::tempfile()?;
+    let started = std::time::Instant::now();
+    let result = join_stage(7, 6, 0, "SparkNest client.join", 128 << 20, || {
+        Ok(client.join(cuteafd_loader::push_load::JoinArgs { group: 7, token: 11, rank: 6,
+            ring_fd: ring.as_raw_fd(), slots: 128, slot_bytes: 1 << 20 })?)
+    });
+    drop(release);
+    server.join().unwrap()?;
+    let error = result.err().context("stalled join must fail")?;
+    let typed = error.downcast_ref::<RankJoinError>().context("typed join boundary")?;
+    assert_eq!((typed.rank, typed.bytes), (6, 128 << 20));
+    assert_eq!(typed.source.downcast_ref::<std::io::Error>().unwrap().kind(), std::io::ErrorKind::TimedOut);
+    assert!(started.elapsed() < Duration::from_secs(2));
+    Ok(())
+}
+
+#[test]
 fn whole_binding_requires_exact_selected_inventory_and_admission() -> Result<()> {
     use crate::shared::experts::layer::ExpertLayer::BackboneFull;
     let expected = [(BackboneFull { layer: 0 }, 256), (BackboneFull { layer: 1 }, 512)];
@@ -61,6 +113,31 @@ fn whole_owners_preserve_checkpoint_shards_on_either_dense_rank() -> Result<()> 
     for owners in [vec![], vec![owner(2)], vec![owner(0), owner(0)],
         vec![WholeOwner { selections: vec![], ..owner(0) }]] {
         assert!(CoordinatorExperts::Whole { owners }.validate_ranks(2).is_err());
+    }
+    Ok(())
+}
+
+#[test]
+fn exlr8_coordinator_plan_uses_actual_world_and_committed_native_inventory() -> Result<()> {
+    use cuteafd_loader::plan::exlr8::residency::{ExpertSet, Residency};
+    let root = tempfile::tempdir()?;
+    cuteafd_loader::plan::testing::exlr8::fixture(root.path(), false);
+    let catalog = crate::shared::memory::push_exlr8::tests::fixture_catalog(root.path())?;
+    for world in [1, 2] {
+        let budgets = (0..world).map(|rank| Residency::plan(root.path(), "mixed", 3,
+            world, rank, ExpertSet::Routed).map(|layout| layout.resident_bytes)).collect::<std::result::Result<Vec<_>, _>>()?;
+        let experts = CoordinatorExperts::Exlr8 { manifest: "mixed".into(), layers: vec![3], budgets: budgets.clone() };
+        experts.validate_ranks(world)?;
+        assert!(experts.validate_ranks(3 - world).is_err());
+        for (rank, budget) in budgets.into_iter().enumerate() {
+            let plan = experts.plan(&catalog, rank)?.context("native expert owner")?;
+            assert_eq!((plan.world, plan.gpu, plan.layout.bytes()), (world, rank, budget));
+            assert_eq!((plan.exlr8[0].world, plan.exlr8[0].rank), (world, rank));
+            assert_eq!(plan.exlr8[0].compact_unit_limit(), 3usize.div_ceil(world));
+            let checked = plan.checked(&catalog, root.path(), world + 4, rank + 4)?;
+            assert!(!checked.plan.entries.is_empty());
+            assert!(checked.plan.entries.iter().all(|entry| entry.rank as usize == rank + 4));
+        }
     }
     Ok(())
 }
@@ -121,6 +198,18 @@ fn staging_uses_actual_sizes_and_charges_disconnected_transforms_in_full() -> Re
     assert_eq!(HostStaging::for_steps(mixed.iter().map(Vec::as_slice), 0)?.staging_bytes, 1024 * 8192);
     let overlapping = vec![vec![rect(0, 4096)]; 1024];
     assert_eq!(HostStaging::for_steps(overlapping.iter().map(Vec::as_slice), 0)?.staging_bytes, 1024 * 4096);
+    // TP column slices have overlapping source envelopes, but successive row
+    // windows only overlap their neighbours, not an entire projection at once.
+    let streamed = (0..8192).map(|i| vec![Rect { name: "K6 TP".into(), path: "shard".into(),
+        base: 0, row_bytes: 192 * 384, rows: i * 32..i * 32 + 48,
+        cols: 0..192 * 192 }]).collect::<Vec<_>>();
+    let bound = HostStaging::for_steps(streamed.iter().map(Vec::as_slice), 0)?;
+    let bytes = 48 * 192 * 192;
+    assert_eq!(bound.staging_bytes, 2 * 128 * ((1 << 20) + 2 * bytes) + 2 * bytes);
+    assert!(bound.staging_bytes < streamed.len() * bytes / 8);
+    // A missing slot may leave both overlapping windows open. Their entire
+    // buffers, not just the overlapping source bytes, are covered.
+    assert!(bound.staging_bytes >= 2 * bytes);
     Ok(())
 }
 
@@ -279,7 +368,7 @@ fn coordinator_tp2_pair_is_mount_exact_on_two_devices_and_drops_before_retry() -
             let rank = sparks + gpu;
             let socket = root.path().join(format!("{}-{gpu}.sock", if fail { "fail" } else { "good" }))
                 .to_string_lossy().into_owned();
-            let listener = Listener::bind(&socket)?;
+            let listener = crate::shared::memory::push_testing::bind(&socket)?;
             let packed = pack(&checked[gpu], root.path(), rank as u32, DEFAULT_SLOT_BYTES)?;
             let (mut coordinator, worker) = control_pair()?;
             let server_socket = socket.clone();
@@ -428,7 +517,7 @@ fn combined_rank_lands_dense_operands_and_tp2_halves_exactly() -> Result<()> {
     plan.append_at(&mut builder, &catalog, rank as u32, base)?;
     let combined = builder.finish()?;
     let socket = root.path().join("combined.sock").to_string_lossy().into_owned();
-    let listener = Listener::bind(&socket)?;
+    let listener = crate::shared::memory::push_testing::bind(&socket)?;
     let packed = pack(&combined, root.path(), rank as u32, DEFAULT_SLOT_BYTES)?;
     let (mut coordinator, mut worker) = control_pair()?;
     let server_socket = socket.clone();
@@ -724,7 +813,7 @@ pub(crate) fn receive_pushed<'a>(device: Device<'a>, catalog: Option<&cuteafd_lo
     use crate::shared::experts::rtx::dense::RankLayout;
     let rank = sparks + gpu;
     let layout = RankLayout::new(records.operands.clone(), records.steps.clone(), device.id)?
-        .with_finishes(&records.finishes);
+        .with_finishes(&records.finishes).with_hosts(records.host_operands.iter().filter(|h| h.device == device.id).cloned().collect())?;
     let dense_plan = layout.plan();
     let (base, host) = (dense_plan.base, dense_plan.host_bytes);
     let tp2_bytes = tp2.as_ref().map_or(0, |p| p.logical_bytes());
@@ -744,7 +833,7 @@ pub(crate) fn receive_pushed<'a>(device: Device<'a>, catalog: Option<&cuteafd_lo
         &layout.checked(root, sparks + 2, rank)?, rank as u32)?;
     let dense = crate::shared::experts::rtx::dense::DenseArena::new(device, layout, expected)?;
     let socket = socket_dir.join(format!("g{gpu}.sock")).to_string_lossy().into_owned();
-    let listener = Listener::bind(&socket)?;
+    let listener = crate::shared::memory::push_testing::bind(&socket)?;
     let (mut coordinator, mut worker) = control_pair()?;
     for stream in [&coordinator, &worker] { stream.set_read_timeout(Some(Duration::from_secs(600)))?; }
     let streamed = build()?;
@@ -846,7 +935,7 @@ fn receive_pushed_replays_dense_records_and_tp2_halves() -> Result<()> {
         .map(|t| Rect { name: t.metadata.name.clone(), path: root.path().join(&t.shard), base: t.metadata.byte_offset,
             row_bytes: t.metadata.byte_length as usize, rows: 0..1, cols: 0..t.metadata.byte_length as usize })
         .collect::<Vec<_>>();
-    let allocations = dense.iter().map(|r| crate::shared::memory::DeviceAllocation::new(&library, r.bytes().max(256)))
+    let allocations = dense.iter().map(|r| crate::shared::memory::DeviceAllocation::new(&library, r.bytes().max(256), crate::shared::memory::TEST))
         .collect::<Result<Vec<_>>>()?;
     let mut records = Records::default();
     anyhow::ensure!(dense.len() == 2, "fixture has two dense tensors");
@@ -873,7 +962,7 @@ fn receive_pushed_replays_dense_records_and_tp2_halves() -> Result<()> {
 fn fake_source_accept_is_bounded() -> Result<()> {
     let root = tempfile::tempdir()?;
     let socket = root.path().join("idle.sock").to_string_lossy().into_owned();
-    let listener = Listener::bind(&socket)?;
+    let listener = crate::shared::memory::push_testing::bind(&socket)?;
     let started = std::time::Instant::now();
     let error = crate::shared::memory::push_testing::accept_within(&listener, &socket, Duration::from_secs(1)).err().context("an idle source must fail")?;
     assert!(error.to_string().contains("no rank connected"), "{error}");
@@ -918,7 +1007,7 @@ fn scales_first_shard_uploads_land_without_transform_staging() -> Result<()> {
     let device = Device { library: &library, id: 0 };
     let sockets = tempfile::tempdir_in(fixture.directory())?;
     // Old shape: each step stages [scale (front), weight (back)].
-    let staged = crate::shared::memory::DeviceAllocation::new(&library, experts * (scale + weight))?;
+    let staged = crate::shared::memory::DeviceAllocation::new(&library, experts * (scale + weight), crate::shared::memory::TEST)?;
     let mut mixed = Records::default();
     for e in 0..experts {
         // SAFETY: expert e's complete image lies inside the retained allocation.
@@ -939,8 +1028,8 @@ fn scales_first_shard_uploads_land_without_transform_staging() -> Result<()> {
         assert_eq!(&actual[base + scale..base + scale + weight], &file[weight_at(e)..weight_at(e) + weight]);
     }
     // New shape: weights-only steps, scales as operands.
-    let scales = crate::shared::memory::DeviceAllocation::new(&library, experts * scale)?;
-    let weights = crate::shared::memory::DeviceAllocation::new(&library, experts * weight)?;
+    let scales = crate::shared::memory::DeviceAllocation::new(&library, experts * scale, crate::shared::memory::TEST)?;
+    let weights = crate::shared::memory::DeviceAllocation::new(&library, experts * weight, crate::shared::memory::TEST)?;
     let mut split = Records::default();
     for e in 0..experts {
         // SAFETY (offsets): expert e's slices lie inside both allocations.
@@ -1129,14 +1218,14 @@ fn coordinator_ranks_alone_push_dense_records_exactly() -> Result<()> {
         let rects: Vec<_> = pair.iter().map(|(name, path, base, bytes)| Rect { name: name.clone(), path: path.clone(),
             base: *base, row_bytes: *bytes, rows: 0..1, cols: 0..*bytes }).collect();
         let allocations = devices[gpu].run(|| rects.iter().map(|r|
-            crate::shared::memory::DeviceAllocation::new(&library, r.bytes().max(256))).collect::<Result<Vec<_>>>())?;
+            crate::shared::memory::DeviceAllocation::new(&library, r.bytes().max(256), crate::shared::memory::TEST)).collect::<Result<Vec<_>>>())?;
         records.operands.push(Operand { device: gpu as i32, buffer: allocations[0].buffer,
             lands: vec![(rects[0].clone(), 0)], bytes: rects[0].bytes() });
         records.steps.push(Step { device: gpu as i32, rects: vec![rects[1].clone()],
             jobs: vec![Job::Upload { at: 0, bytes: rects[1].bytes(), dst: allocations[1].buffer }] });
         owned.push((rects, allocations));
     }
-    let replica = devices[0].run(|| crate::shared::memory::DeviceAllocation::new(&library, owned[1].0[0].bytes()))?;
+    let replica = devices[0].run(|| crate::shared::memory::DeviceAllocation::new(&library, owned[1].0[0].bytes(), crate::shared::memory::TEST))?;
     library.copy_h2d(replica.buffer, &vec![0xa5; replica.buffer.bytes])?;
     records.peer_copies.push(crate::shared::experts::rtx::dense::PeerCopy::new(
         owned[1].1[0].buffer, replica.buffer, replica.buffer.bytes)?);
@@ -1168,7 +1257,7 @@ fn coordinator_ranks_alone_push_dense_records_exactly() -> Result<()> {
     let (allow_commit, commit_allowed) = std::sync::mpsc::channel();
     let sockets = tempfile::tempdir_in(fixture.directory())?;
     let socket = sockets.path().join("hub.sock").to_string_lossy().into_owned();
-    let listener = Listener::bind(&socket)?;
+    let listener = crate::shared::memory::push_testing::bind(&socket)?;
     let push = CoordinatorPush::prepare_alone_at(root.path(), None, 2, None, Some(socket.clone()))?;
     let hub = fake_hub(listener, socket.clone(), root.path().to_path_buf(), 2, commit_allowed);
     let (pushed, observed) = push.receive_with(devices.to_vec(), None, 0, Some(Ok(dense)), || -> Result<()> {
@@ -1298,7 +1387,7 @@ fn combined_exlr8_tp2_rank_is_mount_exact_and_drains_on_rejection() -> Result<()
                 let combined = builder.finish()?;
                 let packed = pack(&combined, root.path(), rank as u32, DEFAULT_SLOT_BYTES)?;
                 let socket = root.path().join("c.sock").to_string_lossy().into_owned();
-                let listener = Listener::bind(&socket)?;
+                let listener = crate::shared::memory::push_testing::bind(&socket)?;
                 let (mut coordinator, mut worker) = control_pair()?;
                 let events_path = fixture.directory().join("events");
                 let before = fixture.events()?.len();
@@ -1435,7 +1524,7 @@ pub(crate) fn push_records_alone(snapshot: &std::path::Path, sockets: &std::path
     let (plans, destinations) = crate::shared::experts::rtx::dense::plan_records(snapshot, records, &devices, 0)?;
     let planned = plans.iter().map(|plan| (plan.base, plan.host_bytes)).collect::<Vec<_>>();
     let socket = sockets.join("hub.sock").to_string_lossy().into_owned();
-    let listener = Listener::bind(&socket)?;
+    let listener = crate::shared::memory::push_testing::bind(&socket)?;
     let push = CoordinatorPush::prepare_alone_at(snapshot, None, 2, None, Some(socket.clone()))?;
     let (allow_commit, commit_allowed) = std::sync::mpsc::channel();
     let hub = fake_hub(listener, socket, snapshot.to_path_buf(), 2, commit_allowed);
@@ -1498,5 +1587,54 @@ fn dspark_tp2_halves_push_byte_exact_on_two_gpus() -> Result<()> {
         assert_planes_equal(&library, pushed[rank].stages().iter().zip(mounted[rank].stages()), &format!("GPU {rank} stage"))?;
         eprintln!("GPU {rank}: {charge} B of draft expert halves pushed byte-exact against the mount (planner {charge})");
     }
+    Ok(())
+}
+
+#[test]
+fn admitted_push_host_checks_never_resample_capacity() -> Result<()> {
+    use cuteafd_loader::push_load::PushHostEnvelope;
+    let admitted = PushHostEnvelope::new(vec![2048, 4096], vec![8192, 16384], 128, 1 << 20)?;
+    let actual = PushHostEnvelope::new(vec![1024, 4096], vec![4096, 16384], 128, 1 << 20)?;
+    // The same pure envelope check is called by prepare and by receive before
+    // offers. No host-memory sampler exists on this admitted execution branch.
+    super::validate_push_host(Some(&admitted), &actual)?;
+    super::validate_push_host(Some(&admitted), &actual)?;
+    let mut excessive = actual.clone();
+    excessive.dense_bytes[1] += 1;
+    let error = super::validate_push_host(Some(&admitted), &excessive).unwrap_err();
+    assert!(matches!(error.downcast_ref::<cuteafd_loader::placement::planner::Refusal>(),
+        Some(cuteafd_loader::placement::planner::Refusal::Capacity { .. })));
+    let owners = admitted.allocations("push")?;
+    assert_eq!(owners.iter().map(|owner| owner.bytes).sum::<u64>(), admitted.bytes()?);
+    assert!(owners.iter().all(|owner| owner.lifetime.first == cuteafd_loader::placement::planner::Phase::Load
+        && owner.lifetime.last == cuteafd_loader::placement::planner::Phase::Load));
+    let source = include_str!("../push.rs");
+    let sample = "mapped_preload::host_memory()";
+    assert_eq!(source.matches(sample).count(), 1, "only the unported adapter may sample");
+    for method in ["fn prepare_with_host(", "fn receive_with<"] {
+        let body = source.split(method).nth(1).expect("execution method exists");
+        assert!(body.contains("validate_push_host(host_envelope.as_ref(), &actual)?"));
+    }
+    let admitted_branch = source.split("fn validate_push_host(").nth(1).unwrap()
+        .split("/// Temporary adapter").next().unwrap();
+    assert!(admitted_branch.contains("Some(admitted) => Ok(admitted.validate_usage(actual)?)"));
+    Ok(())
+}
+
+#[test]
+fn selected_view_group_rejects_cross_mode_expert_catalog() -> Result<()> {
+    use cuteafd_loader::plan::checkpoint::{CoreView, CheckpointView};
+    let root = tempfile::tempdir()?;
+    let (tensors, _) = qwen4_exl3(1, 4);
+    cuteafd_loader::plan::testing::write_mc_snapshot(root.path(), &qwen4_config(1), &tensors,
+        &std::collections::BTreeMap::from([("lm_head.weight".into(), vec![128, 128])]));
+    let original = CheckpointView::select(root.path(), CoreView::Original)?;
+    let compact = CheckpointView::select(root.path(), CoreView::K8Compact)?;
+    let selected = cuteafd_loader::read_expert_catalog_view(&original)?;
+    validate_selected_catalog(&original, Some(&selected))?;
+    assert!(validate_selected_catalog(&compact, Some(&selected)).is_err());
+    let legacy = cuteafd_loader::read_expert_catalog(root.path())?;
+    assert!(validate_selected_catalog(&original, Some(&legacy)).is_err());
+    validate_selected_catalog(&compact, None)?;
     Ok(())
 }

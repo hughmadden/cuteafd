@@ -18,6 +18,10 @@ pub(crate) struct IndexLaneWeights<'a> {
     placement: Option<CachePlacement>,
 }
 impl<'a> IndexLaneWeights<'a> {
+    pub(crate) fn inventory(&self, inventory: &mut crate::shared::memory::receipts::Inventory<'_>) -> Result<()> {
+        for weights in &self.weights { weights.inventory(inventory)?; }
+        Ok(())
+    }
     pub fn device_bytes(library: &NativeLibrary, catalog: &OfficialV41Catalog) -> Result<usize> {
         LAYERS.into_iter().try_fold(0usize, |total, layer| {
             total
@@ -25,6 +29,7 @@ impl<'a> IndexLaneWeights<'a> {
                 .context("index weight budget overflow")
         })
     }
+    #[cfg(test)]
     pub fn load(
         library: &'a NativeLibrary,
         catalog: &OfficialV41Catalog,
@@ -61,6 +66,48 @@ pub(crate) struct IndexLane<'w, 'a> {
     invalid: bool,
 }
 impl<'w, 'a> IndexLane<'w, 'a> {
+    pub(crate) fn visit_graph_banks(&mut self, f: &mut dyn FnMut(i32, &'static str, bool, &mut dyn crate::shared::decode_graph::CacheAttached) -> Result<()>) -> Result<()> {
+        self.source.visit_graph_banks(f)?;
+        if let Some(reindex) = &mut self.reindex { reindex.visit_graph_banks(f)?; }
+        self.query.visit_graph_banks(f)
+    }
+    pub(crate) fn startup_selections(&self) -> Vec<Option<cuteafd_ffi::CuteafdDeviceBuffer>> {
+        (0..40).map(|layer| {
+            if layer < 2 { None }
+            else if layer < 24 { Some(self.source.startup_outputs().0) }
+            else { self.reindex.as_ref().map(|wave| wave.startup_outputs().0) }
+        }).collect()
+    }
+    pub(crate) fn capture_startup(&mut self, rows: &[usize],
+        mut source: impl FnMut(usize, usize) -> Result<crate::families::deepseek_v41::v41_compressor::IndexScoreGeometry>) -> Result<()> {
+        ensure!(!self.invalid && self.ready.is_none(), "startup index lane requires idle owner");
+        let layers: Vec<_> = (0..LAYERS.len()).filter(|&i|
+            self.device.is_none_or(|gpu| self.weights.weights[i].device.id == gpu)).collect();
+        let original = self.next;
+        let result = (|| -> Result<()> {
+            let shared = self.source.startup_outputs().1;
+            for &i in &layers {
+                self.query.rebind(&self.weights.weights[i])?;
+                for &row in rows {
+                    self.query.capture_startup(row as u32)?;
+                    let query = self.query.startup_geometry(row)?;
+                    let geometry = source(if LAYERS[i] >= 20 { 20 } else { LAYERS[i] }, row)?;
+                    // SAFETY: closure supplies real stable source planes; recording never publishes a query.
+                    unsafe {
+                        if LAYERS[i] > 20 {
+                            self.reindex.as_mut().context("startup follower absent")?
+                                .capture_startup(&query, geometry, Some(shared), row)?;
+                        } else { self.source.capture_startup(&query, geometry, None, row)?; }
+                    }
+                    crate::shared::decode_graph::device::observe_device(self.weights.weights[i].device.library,
+                        self.weights.weights[i].device.id)?;
+                }
+            }
+            Ok(())
+        })();
+        let restored = if original < LAYERS.len() { self.query.rebind(&self.weights.weights[original]) } else { Ok(()) };
+        result.and(restored)
+    }
     pub fn workspace_bytes(library: &NativeLibrary, capacity: u32) -> Result<[usize; 3]> {
         Ok([
             IndexQueryWave::device_bytes(library, capacity)?,
@@ -151,11 +198,6 @@ impl<'w, 'a> IndexLane<'w, 'a> {
         self.next = Self::next_owned(self.weights, self.device, self.next + 1);
     }
     /// Begin a new batch after all consumers finish; also recovers failed work.
-    pub fn enable_small_graph_shapes(&mut self) {
-        self.query.enable_small_graph_shapes();
-        self.source.enable_small_graph_shapes();
-        if let Some(reindex) = &mut self.reindex { reindex.enable_small_graph_shapes(); }
-    }
     pub fn restart(&mut self) -> Result<()> {
         self.restart_at(0)
     }
@@ -486,7 +528,7 @@ mod shared_storage_tests {
         }
         let reader = Stream::new(reader_device)?;
         let copies = expected[0][0].iter().map(|bytes|
-            reader_device.own(|| DeviceAllocation::new(&library, bytes.len())))
+            reader_device.own(|| DeviceAllocation::new(&library, bytes.len(), crate::shared::memory::TEST)))
             .collect::<Result<Vec<_>>>()?;
         let copy_outputs = |buffers: Vec<CuteafdDeviceBuffer>| -> Result<()> {
             reader_device.run(|| {

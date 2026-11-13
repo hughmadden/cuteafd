@@ -1,6 +1,7 @@
 //! Real backbone low-rank query projection, normalization and rotary graphs.
 use crate::families::deepseek_v41::v41_attention_binding::QueryBinding;
-use crate::shared::decode_graph::LayerGraphs;
+use crate::shared::decode_graph::{CacheAttached, LayerGraphs};
+use crate::shared::memory::Tag;
 use crate::shared::memory::{DeviceAllocation, HostAllocation, LoadStream};
 use crate::families::deepseek_v41::v41_tensors::NativeRtxTensors;
 use anyhow::{ensure, Context, Result};
@@ -29,7 +30,14 @@ pub(crate) struct AttentionQueryWeights<'a> {
     split_query_b: bool,
 }
 impl<'a> AttentionQueryWeights<'a> {
-    fn names(layer: usize) -> Result<[String; 5]> {
+    pub(crate) fn inventory(&self, inventory: &mut crate::shared::memory::receipts::Inventory<'_>) -> Result<()> {
+        self.tensors.inventory(inventory)?;
+        for (index, scales) in self.scales.iter().enumerate() {
+            scales.inventory(inventory, &cuteafd_loader::placement::families::deepseek_v41::weight_layout::packed_scale_name(&self.names[index * 2]))?;
+        }
+        Ok(())
+    }
+    pub(super) fn names(layer: usize) -> Result<[String; 5]> {
         ensure!(layer < 40, "invalid backbone query layer");
         Ok([
             format!("layers.{layer}.attn.wq_a.weight"),
@@ -57,6 +65,7 @@ impl<'a> AttentionQueryWeights<'a> {
         }
         Ok(bytes)
     }
+    #[cfg(test)]
     pub fn load(
         library: &'a NativeLibrary,
         catalog: &OfficialV41Catalog,
@@ -66,8 +75,14 @@ impl<'a> AttentionQueryWeights<'a> {
     ) -> Result<Self> {
         Self::load_with_split(library,catalog,layer,budget,staging,false)
     }
+    #[cfg(test)]
     pub fn load_with_split(library:&'a NativeLibrary,catalog:&OfficialV41Catalog,layer:usize,
         budget:usize,staging:usize,split_query_b:bool)->Result<Self> {
+        Self::load_in(library, catalog, layer, budget, staging, split_query_b, None)
+    }
+    pub fn load_in(library: &'a NativeLibrary, catalog: &OfficialV41Catalog, layer: usize,
+        budget: usize, staging: usize, split_query_b: bool,
+        arena: Option<&crate::shared::memory::weight_arena::DeviceWeightArena<'a>>) -> Result<Self> {
         ensure!(
             Self::device_bytes_with_split(library, catalog, layer,split_query_b)? <= budget,
             "attention query weights exceed budget"
@@ -75,7 +90,7 @@ impl<'a> AttentionQueryWeights<'a> {
         let names = Self::names(layer)?;
         let selected:Vec<_>=names.iter().enumerate().filter(|(i,_)|!split_query_b || !matches!(i,2|3))
             .map(|(_,name)|name.clone()).collect();
-        let tensors = NativeRtxTensors::load(library, catalog, &selected, budget, staging)?;
+        let tensors = NativeRtxTensors::load_in(library, catalog, &selected, budget, staging, arena)?;
         let stream = LoadStream {
             library,
             raw: library.cuda_stream_create()?,
@@ -83,8 +98,9 @@ impl<'a> AttentionQueryWeights<'a> {
         let mut scales = vec![];
         for (i, (k, n)) in MATRICES.into_iter().take(if split_query_b {1} else {2}).enumerate() {
             let kernel = library.v41_fp8_matrix_kernel(1, k, n)?;
-            let scale =
-                DeviceAllocation::new(library, kernel.info().packed_weight_scale_bytes as usize)?;
+            let scale = super::v41_tensors::allocation(library, arena,
+                &cuteafd_loader::placement::families::deepseek_v41::weight_layout::packed_scale_name(&names[i * 2]),
+                kernel.info().packed_weight_scale_bytes as usize)?;
             let launched = unsafe {
                 crate::shared::experts::rtx::dense::v41_pack_scales(&kernel, tensors.get(&names[i * 2 + 1])?, scale.buffer, stream.raw)
             };
@@ -129,18 +145,18 @@ impl<'a> AttentionQueryWeights<'a> {
             .collect::<Result<Vec<_>>>()?;
         let scratch = kernels
             .iter()
-            .map(|k| DeviceAllocation::new(self.library, k.info().scratch_bytes as usize))
+            .map(|k| DeviceAllocation::new(self.library, k.info().scratch_bytes as usize, Tag::workspace("v41/attention-query")))
             .collect::<Result<Vec<_>>>()?;
         let storage = AttentionQueryStorage {
             stream,
             kernels,
             scratch,
-            alpha: DeviceAllocation::new(self.library, 4)?,
+            alpha: DeviceAllocation::new(self.library, 4, Tag::workspace("v41/attention-query"))?,
             buffers: ROW_BYTES
                 .into_iter().enumerate()
                 .map(|(i, n)| {
                     if i == 4 && !cfg!(test) { Ok(None) }
-                    else { DeviceAllocation::new(self.library, n * unit as usize).map(Some) }
+                    else { DeviceAllocation::new(self.library, n * unit as usize, Tag::workspace("v41/attention-query")).map(Some) }
                 })
                 .collect::<Result<Vec<_>>>()?,
             guard: crate::shared::memory::row_window::ScratchGuard::new(self.library, readers)?,
@@ -162,14 +178,14 @@ impl<'a> AttentionQueryWeights<'a> {
     pub fn on_storage(&self, storage: std::rc::Rc<AttentionQueryStorage<'a>>) -> Result<AttentionQueryWave<'_, 'a>> {
         ensure!(storage.kernels.len() == self.scales.len(), "attention query storage plans differ from the weights");
         let value = AttentionQueryWave {
-            position_staging: HostAllocation::new(self.library, storage.unit as usize * 8)?,
+            position_staging: HostAllocation::new(self.library, storage.unit as usize * 8, Tag::staging("v41/attention-query"))?,
             position_check: crate::shared::memory::staging_check::StagingCheck::new(self.library, "V4.1 attention query positions", 1),
             norm: self.library.v41_attention_ops()?,
             weights: self,
             capacity: storage.unit,
-            graphs: LayerGraphs::new(self.library, cuteafd_core::V41_VERIFY_ROWS as u32),
+            graphs: LayerGraphs::new(self.library, cuteafd_core::V41_VERIFY_ROWS as u32, "deepseek_v41"),
             window: crate::shared::memory::row_window::RowWindow::NONE,
-            tp2_prefix_graphs: LayerGraphs::new(self.library, cuteafd_core::V41_VERIFY_ROWS as u32),
+            tp2_prefix_graphs: LayerGraphs::new(self.library, cuteafd_core::V41_VERIFY_ROWS as u32, "deepseek_v41"),
             ready: None,
             binding: None,
             tokens: Vec::new(),
@@ -253,6 +269,12 @@ pub(crate) struct AttentionQueryWave<'w, 'a> {
     tokens: Vec<u64>,
 }
 impl<'w, 'a> AttentionQueryWave<'w, 'a> {
+    pub(crate) fn visit_graph_banks(&mut self, f: &mut dyn FnMut(i32, &'static str, bool, &mut dyn CacheAttached) -> Result<()>) -> Result<()> {
+        let device = self.input().device_id;
+        f(device, "v41.attention.query", false, &mut self.graphs)?;
+        f(device, "v41.attention.query.tp2_prefix", true, &mut self.tp2_prefix_graphs)
+    }
+
     /// Reuse this lane's storage with another layer's weights. Existing output
     /// borrows must end first. Cached graphs retain their original weight owners.
     pub fn rebind(&mut self, weights: &'w AttentionQueryWeights<'a>) -> Result<()> {
@@ -419,20 +441,35 @@ impl AttentionQueryWave<'_, '_> {
         self.tokens.clear();
         unsafe { self.capture_ready(rows) }
     }
+    pub(crate) fn capture_startup(&mut self, rows: u32) -> Result<()> {
+        self.validate(rows)?;
+        self.storage.stream.require_complete()?;
+        // SAFETY: capture records only this owner's stable buffers and bound
+        // weights. It does not execute kernels or publish a query binding.
+        unsafe { self.capture_ready_kind(rows, self.weights.split_query_b) }
+    }
     /// Capture only after the input producer and warmup have completed.
     unsafe fn capture_ready(&mut self, rows: u32) -> Result<()> {
+        unsafe { self.capture_ready_kind(rows, false) }
+    }
+    unsafe fn capture_ready_kind(&mut self, rows: u32, prefix: bool) -> Result<()> {
+        let graphs = if prefix { &mut self.tp2_prefix_graphs } else { &mut self.graphs };
+        let Some(mut ticket) = graphs.cache_ticket(&(self.weights.layer, rows), super::graph_policy::pinned_shape(self.storage.buffers[0].as_ref().unwrap().buffer.device_id, rows), None) else {
+            super::graph_policy::note_miss(format!("attention_query rows={rows} layer={}", self.weights.layer), || "graph cache selected eager".into());
+            return Ok(());
+        };
         unsafe {
-            self.storage.stream
+            ticket.capture_result(self.storage.stream
                 .library
-                .cuda_graph_begin_capture(self.storage.stream.raw)?;
+                .cuda_graph_begin_capture(self.storage.stream.raw))?;
         }
-        let launched = unsafe { self.enqueue(rows) };
-        let captured = unsafe { self.storage.stream.library.cuda_graph_end_capture(self.storage.stream.raw) };
+        let launched = unsafe { if prefix { self.enqueue_rank(rows) } else { self.enqueue(rows) } };
+        let captured = unsafe { ticket.capture_result(self.storage.stream.library.cuda_graph_end_capture_topology(self.storage.stream.raw)) };
         match (launched, captured) {
-            (Ok(()), Ok(graph)) => {
+            (Ok(()), Ok((graph, nodes, width, spans, _))) => {
+                let graphs = if prefix { &mut self.tp2_prefix_graphs } else { &mut self.graphs };
                 if let Err(error) = unsafe {
-                    self.graphs
-                        .insert(self.weights.layer, self.weights, rows, graph)
+                    graphs.cache_insert(self.weights.layer, self.weights, rows, graph, ticket, nodes as u64, width, spans || prefix)
                 } {
                     unsafe {
                         self.storage.stream.library.cuda_graph_exec_destroy(graph)?;
@@ -441,12 +478,13 @@ impl AttentionQueryWave<'_, '_> {
                 }
                 Ok(())
             }
-            (Err(e), Ok(graph)) => {
+            (Err(e), Ok((graph, _, _, _, _))) => {
                 unsafe {
                     self.storage.stream.library.cuda_graph_exec_destroy(graph)?;
                 }
                 Err(e)
             }
+            (Ok(()), Err(error)) if cuteafd_ffi::is_small_graph(&error) => Ok(()),
             (Err(e), Err(_)) | (Ok(()), Err(e)) => Err(e),
         }
     }
@@ -454,10 +492,9 @@ impl AttentionQueryWave<'_, '_> {
     /// Same matching initialized inputs as execute. Captured live row count is fixed.
     pub unsafe fn replay(&mut self, rows: u32) -> Result<AttentionQueryOutput<'_>> {
         self.validate(rows)?;
-        let (graph, count) = self
-            .graphs
-            .get_shape(self.weights.layer, self.weights, rows)
-            .context("attention query graph missing")?;
+        let Some((graph, count)) = self.graphs.cached_launch(self.weights.layer, self.weights, rows) else {
+            return unsafe { self.execute(rows) };
+        };
         ensure!(count == rows, "attention query capture row count differs");
         let launched = unsafe {
             self.storage.stream
@@ -557,7 +594,7 @@ impl AttentionQueryWave<'_, '_> {
         for (dst, token) in self.position_staging.bytes_mut().chunks_exact_mut(8).zip(tokens) {
             dst.copy_from_slice(&token.to_ne_bytes());
         }
-        let graph = if self.window.is_windowed() { None } else { self.graphs.get_shape(self.weights.layer, self.weights, rows) };
+        let graph = if self.window.is_windowed() { None } else { self.graphs.cached_launch(self.weights.layer, self.weights, rows) };
         let queued = (|| -> Result<()> { unsafe {
             crate::shared::memory::chain::join(self.storage.stream.library, self.storage.stream.raw)?;
             self.acquire_scratch()?;
@@ -576,7 +613,8 @@ impl AttentionQueryWave<'_, '_> {
         if graph.is_none() {
             // Eager output is complete; capture only records the next execution.
             // Replaying now would duplicate work whenever a shape was evicted.
-            if !self.window.is_windowed() && super::graph_policy::captures_shape(rows) && !crate::shared::decode_graph::census::eager("layer_row") {
+            if !self.window.is_windowed() && super::graph_policy::captures_shape(rows)
+                && !crate::shared::decode_graph::census::eager("layer_row") {
                 unsafe { self.capture_ready(rows)?; }
             }
         }
@@ -618,8 +656,9 @@ impl AttentionQueryWave<'_, '_> {
                 }
             }
         }
-        let mut guard=Drain { stream:&self.storage.stream,complete:false };
-        let graph=if self.window.is_windowed() { None } else { self.tp2_prefix_graphs.get_shape(self.weights.layer,self.weights,rows) };
+        let storage = std::rc::Rc::clone(&self.storage);
+        let mut guard=Drain { stream:&storage.stream,complete:false };
+        let graph=if self.window.is_windowed() { None } else { self.tp2_prefix_graphs.cached_launch(self.weights.layer,self.weights,rows) };
         unsafe {
             // The projection's own stream writes `b(3)` after this stream's
             // rank stage, so this acquire orders it too.
@@ -639,18 +678,7 @@ impl AttentionQueryWave<'_, '_> {
         }
         if !self.window.is_windowed() && graph.is_none() && super::graph_policy::captures_shape(rows)
             && !crate::shared::decode_graph::census::eager("layer_row") {
-            unsafe { self.storage.stream.library.cuda_graph_begin_capture(self.storage.stream.raw)?; }
-            let queued=unsafe { self.enqueue_rank(rows) };
-            let captured=unsafe { self.storage.stream.library.cuda_graph_end_capture(self.storage.stream.raw) };
-            match (queued,captured) {
-                (Ok(()),Ok(graph))=> {
-                    if let Err(error)=unsafe { self.tp2_prefix_graphs.insert(self.weights.layer,self.weights,rows,graph) } {
-                        unsafe { self.storage.stream.library.cuda_graph_exec_destroy(graph)?; }return Err(error);
-                    }
-                },
-                (Err(error),Ok(graph))=> { unsafe { self.storage.stream.library.cuda_graph_exec_destroy(graph)?; }return Err(error); },
-                (Err(error),Err(_)) | (Ok(()),Err(error))=>return Err(error),
-            }
+            unsafe { self.capture_ready_kind(rows, true)?; }
         }
         guard.complete=true;drop(guard);
         self.ready=Some(rows);self.tokens.extend_from_slice(tokens);self.binding=Some(binding);
@@ -677,7 +705,6 @@ impl AttentionQueryWave<'_, '_> {
             _owner: PhantomData,
         })
     }
-    pub fn enable_small_graph_shapes(&mut self) { self.graphs.enable_small_shapes(); self.tp2_prefix_graphs.enable_small_shapes(); }
     /// Evict all shapes for the current layer; other layers remain cached.
     pub fn clear_graph(&mut self) -> Result<()> {
         self.ready = None;
@@ -740,8 +767,7 @@ mod tp2_tests {
                 Weights::load_peak_device_bytes(&library,Kind::QueryB)?)?]];
             let mut projection=Wave::new([&halves[0],&halves[1]],capacity,owner,
                 Wave::device_bytes(&library,Kind::QueryB,capacity,owner)?)?;
-            let input=Allocation::new(device,capacity as usize*10240)?;
-            query.enable_small_graph_shapes();
+            let input=Allocation::new(device,capacity as usize*10240, crate::shared::memory::TEST)?;
             for (cycle,rows) in [1,6,16,6,1].into_iter().enumerate() {
                 let host:Vec<u8>=(0..capacity as usize*5120).flat_map(|i| {
                     let value=((i+cycle*3)%23) as f32/32.0-0.25;
@@ -831,7 +857,7 @@ mod guarded_scratch_tests {
         }).collect() };
         let tokens = |seed: usize| -> Vec<u64> { (0..rows).map(|i| (seed * 4096 + i * 3) as u64).collect() };
         let sources = [input(0), input(1)].map(|host| -> Result<crate::shared::memory::DeviceAllocation<'_>> {
-            let buffer = crate::shared::memory::DeviceAllocation::new(&library, host.len())?;
+            let buffer = crate::shared::memory::DeviceAllocation::new(&library, host.len(), crate::shared::memory::TEST)?;
             library.copy_h2d(buffer.buffer, &host)?;
             Ok(buffer)
         }).into_iter().collect::<Result<Vec<_>>>()?;
@@ -839,7 +865,7 @@ mod guarded_scratch_tests {
         let reader = Stream::new(Device { library: &library, id: reader_device })?;
         let rotated_bytes = rows * ROW_BYTES[3];
         library.cuda_set_device(reader_device)?;
-        let copy = crate::shared::memory::DeviceAllocation::new(&library, rotated_bytes)?;
+        let copy = crate::shared::memory::DeviceAllocation::new(&library, rotated_bytes, crate::shared::memory::TEST)?;
         library.cuda_set_device(0)?;
         let chains = [StageChain::on_devices(&library, &devices)?, StageChain::on_devices(&library, &devices)?];
         for chain in &chains { chain.set_device_order(true); }
@@ -932,4 +958,79 @@ mod guarded_scratch_tests {
     #[test]
     #[ignore = "requires CUTEAFD_NATIVE_LIB, CUTEAFD_SNAPSHOT and two GPUs"]
     fn guarded_query_scratch_waits_for_a_fork_reader_on_the_other_gpu() -> Result<()> { run(1, true) }
+}
+
+#[cfg(test)]
+mod bounded_graph_tests {
+    use super::*;
+    use crate::shared::decode_graph::{device::{Basis, Cycle, Preference, Site}, RowGraphs};
+
+    #[test]
+    fn primitive_wrappers_full_reserve_dispatch_eager_without_refusal() -> Result<()> {
+        let (_directory, fixture) = crate::shared::memory::cpu_stream_fixture()?;
+        let library = fixture.load()?;
+        let site = Site { name: "v41.primitive.full-reserve", cycle: Cycle::Wave,
+            preference: Preference::Capture, bootstrap: 10, basis: Basis::Bytes, spans_devices: false };
+        let weights = ();
+        let mut layers = LayerGraphs::new(&library, 64, "deepseek_v41");
+        let mut rows = RowGraphs::new(&library, "engram", 64, "deepseek_v41");
+        layers.attach_device(&library, -88441, 20, site)?;
+        rows.attach_device(&library, -88441, 20, site)?;
+        let ticket = layers.cache_ticket(&(0, 1), true, None).expect("pinned seed fits");
+        // SAFETY: the CPU fixture records no device work. Weights outlive the
+        // fake executable and every consumer completes before bank destruction.
+        unsafe {
+            library.cuda_graph_begin_capture(std::ptr::null_mut())?;
+            let raw = library.cuda_graph_end_capture(std::ptr::null_mut())?;
+            layers.cache_insert(0, &weights, 1, raw, ticket, 1, 1, false)?;
+        }
+        layers.cache_measured(20);
+        let mut eager_runs = 0;
+        for _ in 0..3 {
+            assert!(layers.cache_ticket(&(0, 16), false, None).is_none());
+            assert!(rows.cache_ticket(&16, false, None).is_none());
+            assert!(layers.get_shape(0, &weights, 1).is_some(), "full reserve cannot evict its pin");
+            let graph = layers.cached_launch(0, &weights, 16).map(|(raw, _)| raw);
+            // SAFETY: eager closure has no device operands; the cache miss must
+            // choose it rather than trying to launch a nonexistent executable.
+            unsafe {
+                crate::shared::decode_graph::census::dispatch(&library, std::ptr::null_mut(), c"layer_row", 16,
+                    graph, || { eager_runs += 1; Ok(()) })?;
+                crate::shared::decode_graph::census::dispatch(&library, std::ptr::null_mut(), c"layer_row", 16,
+                    rows.cached_launch(16), || { eager_runs += 1; Ok(()) })?;
+            }
+        }
+        assert_eq!(eager_runs, 6);
+        assert_eq!(layers.len(), 1);
+        assert_eq!(rows.len(), 0);
+        assert!(layers.cached_launch(0, &weights, 1).is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn primitive_native_capture_inventory_uses_ticket_topology_and_visitor() {
+        let sites = [
+            (include_str!("v41_attention_query.rs"), 1),
+            (include_str!("v41_attention_output.rs"), 1),
+            (include_str!("v41_backbone_router.rs"), 1),
+            (include_str!("v41_backbone_shared.rs"), 1),
+            (include_str!("v41_index_query.rs"), 1),
+            (include_str!("v41_projection_tp2.rs"), 2),
+            (include_str!("v41_engram/layer.rs"), 1),
+        ];
+        for (source, count) in sites {
+            // Only count the production declarations, excluding CPU fixture
+            // captures and this source-inventory test itself.
+            let production = source.split("#[cfg(test)]\nmod bounded_graph_tests").next().unwrap();
+            assert_eq!(production.matches(".cuda_graph_begin_capture(").count(), count);
+            assert_eq!(production.matches(".cuda_graph_end_capture_topology(").count(), count);
+            assert_eq!(production.matches(".cache_ticket(").count(), count);
+            assert_eq!(production.matches(".cache_insert(").count(), count);
+            assert!(production.contains("fn visit_graph_banks("));
+            assert!(production.contains(".cached_launch("));
+            assert!(!production.contains(".capture_allowed("));
+            assert!(!production.contains(".declare_startup("));
+            assert!(!production.contains(".finish_startup("));
+        }
+    }
 }

@@ -44,6 +44,7 @@
 use super::engine::{GlmfEngine, GlmfPlacement, IndexCache, KdaState, PagedLayer, KEY_BYTES, KPOOL, PAGE_ROWS,
     RECORD_BYTES, UNIT_PAGES, UNIT_ROWS};
 use crate::shared::memory::device::{Allocation, Device};
+use crate::shared::memory::Tag;
 use std::rc::Rc;
 use crate::shared::prefix::MarkRule;
 use crate::shared::prefix::view;
@@ -161,7 +162,6 @@ impl<'e, 'a> GlmfPrefix<'e, 'a> {
     pub(crate) fn finish_request(&self) -> Result<()> { self.engine.finish_request() }
 
     pub fn new(engine: &'e GlmfEngine<'a>, marks: PrefixMarks, slots: impl FnOnce(usize) -> usize) -> Result<Self> {
-        let _memory_scope = cuteafd_ffi::memory_ledger::scope("prefix");
         let paged: Vec<_> = (0..engine.ranks())
             .flat_map(|rank| engine.paged_buffers_on(rank).into_iter().map(move |buffers| (rank, buffers))).collect();
         let units = engine.local_units();
@@ -196,7 +196,7 @@ impl<'e, 'a> GlmfPrefix<'e, 'a> {
         let arenas = parts.into_iter().enumerate().map(|(rank, part)| -> Result<_> {
             let arena = if slots > 0 { Some(engine.on(rank, || {
                 let device = Device { library: engine.library, id: engine.library.cuda_get_device()? };
-                Allocation::new(device, slots * part).map(Rc::new)
+                Allocation::new(device, slots * part, Tag::prefix("glmf/prefix-marks")).map(Rc::new)
             })?) }
                 else { None };
             Ok((part, arena))

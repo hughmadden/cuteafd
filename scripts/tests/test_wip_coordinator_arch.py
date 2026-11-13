@@ -1,6 +1,7 @@
 """An sm_89 coordinator slot carries DeepSeek V4.1's SM89 exports, compiled offline
 on the build host with no GPU; SM120 exports keep their GPU turn."""
 import os
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -66,7 +67,7 @@ wip_capped_export() {{ printf "capped %s\\n" "$*" >> "$TRACE"; }}
 wip_remote_export() {{ printf "remote\\n" >> "$TRACE"; return 75; }}
 slot=test coordinator_container=owned COORDINATOR_DOCKER_DEV=image bf16_families= audio_aot=OFF
 wip_export_locks=on wip_coordinator_arch={arch}
-''' + _modes() + function + '\nbuild_coordinator\n'
+''' + _modes() + '\nwip_cached_exports() { return 1; }\n' + function + '\nbuild_coordinator\n'
     tools = _tools(tmp_path)
     defaults = {'CUTEAFD_EXPORT_HOST': '', 'CUTEAFD_WIP_COORDINATOR_EXPORT': 'auto', 'CUTEAFD_WIP_BUILD_SLOT': 'off'}
     result = _run(script, {**tools, **defaults, **env})
@@ -127,10 +128,10 @@ def test_no_export_routing_probes_for_sm89_hosts():
     assert 'for mode in $(wip_coordinator_export_modes); do' in WIP
 
 
-SWITCHES = ['v41_candidate_aot', 'exl3_aot', 'nvfp4_aot', 'audio_aot', 'exlr8_aot']
+SWITCHES = ['v41_candidate_aot', 'v41_nvfp4_aot', 'exl3_aot', 'nvfp4_aot', 'audio_aot', 'exlr8_aot']
 # Follows coordinator_aot on every architecture, sm_89 included.
 KEPT_SWITCHES = ['v41_hc_lagged_aot']
-FAMILY_SWITCHES = ['DSV4', 'GLM', 'GLMF', 'MIMO', 'QWEN4', 'QWEN_DENSE', 'STEP5', 'KIMIK3', 'MUSE', 'ML4',
+FAMILY_SWITCHES = ['DSV4', 'GLM', 'GLMF', 'MIMO', 'QWEN4', 'QWEN_DENSE', 'STEP5', 'KIMIK3', 'MUSE', 'ML4', 'MINIMAX',
                    'VISION_ATTENTION']
 
 
@@ -144,7 +145,7 @@ def test_sm89_coordinator_keeps_the_v41_exports_and_turns_the_rest_off(role, arc
     report = 'printf "<%s> <%s> %s" "$expert_families" "$bf16_families" "$coordinator_aot"\n'
     report += ''.join(f'printf " %s" "${name}"\n' for name in SWITCHES + KEPT_SWITCHES)
     report += ''.join(f'printf " %s" "$CUTEAFD_WIP_{name}_AOT"\n' for name in FAMILY_SWITCHES)
-    script = (f'set -u\nrole={role} cuda_arch={arch} coordinator_aot={coordinator_aot} '
+    script = (f'set -u\nrole={role} cuda_arch={arch} coordinator_aot={coordinator_aot} v41_coordinator_aot={coordinator_aot} '
               f'expert_families=dsv4f:fp8 bf16_families=glm {preset}\n' + ARTIFACTS[start:end] + report)
     result = _run(script)
     assert result.returncode == 0, result.stderr
@@ -167,17 +168,17 @@ def test_sm89_coordinator_keeps_the_v41_exports_and_turns_the_rest_off(role, arc
 def test_v41_switches_reach_cmake():
     cmake = ARTIFACTS[ARTIFACTS.index('\ncmake \\\n'):ARTIFACTS.index('-DCUTEAFD_CUDA_ARCHITECTURES="$cuda_arch"')]
     for flag in ('V41_FP8_AOT', 'V41_LOCAL_EXPERT_AOT', 'V41_TP2_EXPERT_AOT'):
-        assert f'-DCUTEAFD_ENABLE_{flag}="$coordinator_aot"' in cmake, flag
+        assert f'-DCUTEAFD_ENABLE_{flag}="$v41_coordinator_aot"' in cmake, flag
     for flag in ('V41_ATTENTION_AOT', 'V41_NARROW_AOT'):
         assert f'-DCUTEAFD_ENABLE_{flag}="$v41_candidate_aot"' in cmake, flag
     assert '-DCUTEAFD_ENABLE_V41_HC_LAGGED_AOT="$v41_hc_lagged_aot"' in cmake
     # The dSpark coordinator experts are always built (upstream names the switch).
     assert '-DCUTEAFD_ENABLE_V41_EXPERT_AOT="$v41_expert_aot"' in cmake
-    assert '\nv41_expert_aot=ON\n' in ARTIFACTS
-    assert '-DCUTEAFD_ENABLE_V41_NVFP4_AOT="$nvfp4_aot"' in cmake
-    # Every slot ships the exported dSpark coordinator manifest; there is no disabled form.
+    assert '  v41_expert_aot=ON\n' in ARTIFACTS
+    assert '-DCUTEAFD_ENABLE_V41_NVFP4_AOT="$v41_nvfp4_aot"' in cmake
+    # V4.1 scopes ship the exported dSpark coordinator manifest.
     assert 'install -m 0644 "$build_dir/native/v41_experts/v41_experts.json" "$output_dir/V41_EXPERT_AOT.json"' in ARTIFACTS
-    assert '"enabled":false}\' >"$output_dir/V41_EXPERT_AOT.json"' not in ARTIFACTS
+    assert 'if [[ "$v41_expert_aot" == ON ]]; then' in ARTIFACTS
 
 
 def test_v41_cmake_admits_sm89_for_every_enabled_role_and_refuses_the_rest():
@@ -206,3 +207,23 @@ def test_coordinator_build_key_names_a_non_default_arch_only():
     # SM120 keeps its key material (and so its key) unchanged.
     assert keys['120'] == 'k coordinator image'
     assert keys['89'] == 'k coordinator image\narch 89'
+
+
+@pytest.mark.skipif(shutil.which('cmake') is None, reason='needs cmake')
+@pytest.mark.parametrize('arch,codec,expected', [('89', None, False), ('89', 'OFF', False),
+                                              ('89', 'ON', True), ('120', None, True)])
+def test_native_reply_table_requires_sm89_codec_opt_in(tmp_path, arch, codec, expected):
+    """V4.1 backbone exports alone must not make SM89 depend on reply codecs."""
+    source = (ROOT / 'native/CMakeLists.txt').read_text()
+    start = source.index('option(CUTEAFD_ENABLE_SM89_REPLY_AOT')
+    end = source.index('if(CUTEAFD_ENABLE_V41_LOCAL_EXPERT_AOT)', start)
+    gate = source[start:end].replace('include(cmake/shared/dsv4_programs.cmake)',
+                                      'message(STATUS "REPLY_TABLE_INCLUDED")')
+    script = tmp_path / 'reply-table.cmake'
+    script.write_text('cmake_minimum_required(VERSION 3.24)\n'
+                      f'set(CUTEAFD_CUDA_ARCHITECTURES {arch})\n'
+                      'set(CUTEAFD_ENABLE_V41_EXPERT_AOT ON)\n'
+                      + (f'set(CUTEAFD_ENABLE_SM89_REPLY_AOT {codec})\n' if codec else '') + gate)
+    result = subprocess.run(['cmake', '-P', str(script)], capture_output=True, text=True, timeout=30)
+    assert result.returncode == 0, result.stderr
+    assert ('REPLY_TABLE_INCLUDED' in result.stdout) == expected

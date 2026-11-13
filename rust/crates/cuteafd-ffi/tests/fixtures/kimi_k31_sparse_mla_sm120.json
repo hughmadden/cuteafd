@@ -1,0 +1,1670 @@
+{
+  "source_manifest_sha256": "96c656825d517d3d976bc46f4613c6abc9d33b5fa554f22ff6ffb0e97cb0b847",
+  "sparkinfer_revision": "f44d97769fd540fafd7ed341ae6966554fa80ea7",
+  "programs": [
+    {
+      "name": "kimik31_sparse_mla_m64",
+      "family": "kimik31",
+      "op": "sparse_mla",
+      "params": {
+        "max_rows": 64,
+        "heads": 48,
+        "kv_cache": "bf16"
+      },
+      "geometry": {
+        "name": "kimi_k3_mla",
+        "hidden": 7168,
+        "heads": 48,
+        "q_lora_rank": 1536,
+        "kv_lora_rank": 512,
+        "qk_nope_dim": 128,
+        "qk_rope_dim": 64,
+        "v_head_dim": 128,
+        "norm_eps": 1e-05,
+        "page_rows": 64,
+        "kv_cache": "bf16",
+        "num_splits": 16,
+        "chunks_per_split": 2,
+        "partial_output_bytes": 50331648,
+        "partial_lse_bytes": 196608,
+        "scratch_bytes": 50528256,
+        "max_rows": 64,
+        "topk": 2048,
+        "page_size": 1,
+        "lse_base": "e"
+      },
+      "pointers": [
+        {
+          "name": "query",
+          "dtype": "bfloat16",
+          "shape": "[rows,48,576]",
+          "role": "in"
+        },
+        {
+          "name": "kv_cache",
+          "dtype": "uint8",
+          "shape": "[pool_tokens,1152]",
+          "role": "in"
+        },
+        {
+          "name": "page_table",
+          "dtype": "int32",
+          "shape": "[rows,2048]",
+          "role": "in"
+        },
+        {
+          "name": "cache_seqlens",
+          "dtype": "int32",
+          "shape": "[rows]",
+          "role": "in"
+        },
+        {
+          "name": "cu_seqlens_q",
+          "dtype": "int32",
+          "shape": "[rows+1]",
+          "role": "in"
+        },
+        {
+          "name": "attn",
+          "dtype": "bfloat16",
+          "shape": "[rows,48,512]",
+          "role": "out"
+        },
+        {
+          "name": "lse",
+          "dtype": "float32",
+          "shape": "[rows,48]",
+          "role": "out"
+        },
+        {
+          "name": "scratch",
+          "dtype": "uint8",
+          "shape": "[sparse_mla_scratch_bytes]",
+          "role": "scratch"
+        }
+      ],
+      "scalars": [
+        {
+          "name": "rows",
+          "type": "int32"
+        },
+        {
+          "name": "batch",
+          "type": "int32"
+        },
+        {
+          "name": "page_table_width",
+          "type": "int64"
+        },
+        {
+          "name": "active_splits",
+          "type": "int32"
+        }
+      ],
+      "scratch_bytes_at_capacity": {
+        "scratch": 50528256
+      },
+      "capacity_rows": 64,
+      "entry": "_mlir_cuteafd_kimik31_sparse_mla_m64__mlir_ciface_cutlass___call___b12xintegrationcuteafdkimi_mla_Attention_object_at__Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_____CUstream0x0",
+      "object_sha256": "3b8ec465f96108ff0815c691ec81e73443690db5496fe9c5c6e4c2be4cc6b609"
+    },
+    {
+      "name": "kimik31_sparse_mla_fp8_m64",
+      "family": "kimik31",
+      "op": "sparse_mla",
+      "params": {
+        "max_rows": 64,
+        "heads": 48,
+        "kv_cache": "fp8"
+      },
+      "geometry": {
+        "name": "kimi_k3_mla",
+        "hidden": 7168,
+        "heads": 48,
+        "q_lora_rank": 1536,
+        "kv_lora_rank": 512,
+        "qk_nope_dim": 128,
+        "qk_rope_dim": 64,
+        "v_head_dim": 128,
+        "norm_eps": 1e-05,
+        "page_rows": 64,
+        "kv_cache": "fp8",
+        "num_splits": 16,
+        "chunks_per_split": 2,
+        "partial_output_bytes": 50331648,
+        "partial_lse_bytes": 196608,
+        "scratch_bytes": 50528256,
+        "max_rows": 64,
+        "topk": 2048,
+        "page_size": 1,
+        "lse_base": "e"
+      },
+      "pointers": [
+        {
+          "name": "query",
+          "dtype": "bfloat16",
+          "shape": "[rows,48,576]",
+          "role": "in"
+        },
+        {
+          "name": "kv_cache",
+          "dtype": "uint8",
+          "shape": "[pool_tokens,656]",
+          "role": "in"
+        },
+        {
+          "name": "page_table",
+          "dtype": "int32",
+          "shape": "[rows,2048]",
+          "role": "in"
+        },
+        {
+          "name": "cache_seqlens",
+          "dtype": "int32",
+          "shape": "[rows]",
+          "role": "in"
+        },
+        {
+          "name": "cu_seqlens_q",
+          "dtype": "int32",
+          "shape": "[rows+1]",
+          "role": "in"
+        },
+        {
+          "name": "attn",
+          "dtype": "bfloat16",
+          "shape": "[rows,48,512]",
+          "role": "out"
+        },
+        {
+          "name": "lse",
+          "dtype": "float32",
+          "shape": "[rows,48]",
+          "role": "out"
+        },
+        {
+          "name": "scratch",
+          "dtype": "uint8",
+          "shape": "[sparse_mla_scratch_bytes]",
+          "role": "scratch"
+        }
+      ],
+      "scalars": [
+        {
+          "name": "rows",
+          "type": "int32"
+        },
+        {
+          "name": "batch",
+          "type": "int32"
+        },
+        {
+          "name": "page_table_width",
+          "type": "int64"
+        },
+        {
+          "name": "active_splits",
+          "type": "int32"
+        }
+      ],
+      "scratch_bytes_at_capacity": {
+        "scratch": 50528256
+      },
+      "capacity_rows": 64,
+      "entry": "_mlir_cuteafd_kimik31_sparse_mla_fp8_m64__mlir_ciface_cutlass___call___b12xintegrationcuteafdkimi_mla_Attention_object_at__Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_____CUstream0x0",
+      "object_sha256": "be75a26d4644db5d16eec6576b6158346b160c30d9b50e11a595203727dc6acc"
+    },
+    {
+      "name": "kimik31_sparse_mla_h96_m64",
+      "family": "kimik31",
+      "op": "sparse_mla",
+      "params": {
+        "max_rows": 64,
+        "heads": 96,
+        "kv_cache": "bf16"
+      },
+      "geometry": {
+        "name": "kimi_k3_mla",
+        "hidden": 7168,
+        "heads": 96,
+        "q_lora_rank": 1536,
+        "kv_lora_rank": 512,
+        "qk_nope_dim": 128,
+        "qk_rope_dim": 64,
+        "v_head_dim": 128,
+        "norm_eps": 1e-05,
+        "page_rows": 64,
+        "kv_cache": "bf16",
+        "num_splits": 16,
+        "chunks_per_split": 2,
+        "partial_output_bytes": 100663296,
+        "partial_lse_bytes": 393216,
+        "scratch_bytes": 101056512,
+        "max_rows": 64,
+        "topk": 2048,
+        "page_size": 1,
+        "lse_base": "e"
+      },
+      "pointers": [
+        {
+          "name": "query",
+          "dtype": "bfloat16",
+          "shape": "[rows,96,576]",
+          "role": "in"
+        },
+        {
+          "name": "kv_cache",
+          "dtype": "uint8",
+          "shape": "[pool_tokens,1152]",
+          "role": "in"
+        },
+        {
+          "name": "page_table",
+          "dtype": "int32",
+          "shape": "[rows,2048]",
+          "role": "in"
+        },
+        {
+          "name": "cache_seqlens",
+          "dtype": "int32",
+          "shape": "[rows]",
+          "role": "in"
+        },
+        {
+          "name": "cu_seqlens_q",
+          "dtype": "int32",
+          "shape": "[rows+1]",
+          "role": "in"
+        },
+        {
+          "name": "attn",
+          "dtype": "bfloat16",
+          "shape": "[rows,96,512]",
+          "role": "out"
+        },
+        {
+          "name": "lse",
+          "dtype": "float32",
+          "shape": "[rows,96]",
+          "role": "out"
+        },
+        {
+          "name": "scratch",
+          "dtype": "uint8",
+          "shape": "[sparse_mla_scratch_bytes]",
+          "role": "scratch"
+        }
+      ],
+      "scalars": [
+        {
+          "name": "rows",
+          "type": "int32"
+        },
+        {
+          "name": "batch",
+          "type": "int32"
+        },
+        {
+          "name": "page_table_width",
+          "type": "int64"
+        },
+        {
+          "name": "active_splits",
+          "type": "int32"
+        }
+      ],
+      "scratch_bytes_at_capacity": {
+        "scratch": 101056512
+      },
+      "capacity_rows": 64,
+      "entry": "_mlir_cuteafd_kimik31_sparse_mla_h96_m64__mlir_ciface_cutlass___call___b12xintegrationcuteafdkimi_mla_Attention_object_at__Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_____CUstream0x0",
+      "object_sha256": "d2ebfe6d8f5247bd13b1bb5ec086d779eb4d0a0e8e3ced92cc4d28009c8cc919"
+    },
+    {
+      "name": "kimik31_sparse_mla_partial_h0_m64",
+      "family": "kimik31",
+      "op": "sparse_mla_partial",
+      "params": {
+        "max_rows": 64,
+        "heads": 96,
+        "kv_cache": "bf16",
+        "head_begin": 0,
+        "head_count": 48
+      },
+      "geometry": {
+        "name": "kimi_k3_mla",
+        "hidden": 7168,
+        "heads": 96,
+        "q_lora_rank": 1536,
+        "kv_lora_rank": 512,
+        "qk_nope_dim": 128,
+        "qk_rope_dim": 64,
+        "v_head_dim": 128,
+        "norm_eps": 1e-05,
+        "page_rows": 64,
+        "kv_cache": "bf16",
+        "max_rows": 64,
+        "topk": 2048,
+        "head_begin": 0,
+        "head_count": 48,
+        "num_splits": 16,
+        "page_size": 1,
+        "lse_base": 2
+      },
+      "pointers": [
+        {
+          "name": "query",
+          "dtype": "bfloat16",
+          "shape": "[rows,96,576]",
+          "role": "in"
+        },
+        {
+          "name": "kv_cache",
+          "dtype": "uint8",
+          "shape": "[pool_tokens,1152]",
+          "role": "in"
+        },
+        {
+          "name": "page_table",
+          "dtype": "int32",
+          "shape": "[rows,2048]",
+          "role": "in"
+        },
+        {
+          "name": "cache_seqlens",
+          "dtype": "int32",
+          "shape": "[rows]",
+          "role": "in"
+        },
+        {
+          "name": "cu_seqlens_q",
+          "dtype": "int32",
+          "shape": "[rows+1]",
+          "role": "in"
+        },
+        {
+          "name": "attn",
+          "dtype": "bfloat16",
+          "shape": "[rows,48,512]",
+          "role": "out"
+        },
+        {
+          "name": "lse",
+          "dtype": "float32",
+          "shape": "[rows,48]",
+          "role": "out"
+        },
+        {
+          "name": "scratch",
+          "dtype": "uint8",
+          "shape": "[sparse_mla_scratch_bytes]",
+          "role": "scratch"
+        }
+      ],
+      "scalars": [
+        {
+          "name": "rows",
+          "type": "int32"
+        },
+        {
+          "name": "page_table_width",
+          "type": "int64"
+        },
+        {
+          "name": "active_splits",
+          "type": "int32"
+        }
+      ],
+      "scratch_bytes_at_capacity": {
+        "scratch": 50528256
+      },
+      "capacity_rows": 64,
+      "entry": "_mlir_cuteafd_kimik31_sparse_mla_partial_h0_m64__mlir_ciface_cutlass___call___b12xintegrationcuteafdkimi_mla_ContextPartial_object_at__Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem____CUstream0x0",
+      "object_sha256": "b5895b26b822dcfe0b45b42af414c008be16508074220458c3eab3e7c73f56fd"
+    },
+    {
+      "name": "kimik31_sparse_mla_partial_h48_m64",
+      "family": "kimik31",
+      "op": "sparse_mla_partial",
+      "params": {
+        "max_rows": 64,
+        "heads": 96,
+        "kv_cache": "bf16",
+        "head_begin": 48,
+        "head_count": 48
+      },
+      "geometry": {
+        "name": "kimi_k3_mla",
+        "hidden": 7168,
+        "heads": 96,
+        "q_lora_rank": 1536,
+        "kv_lora_rank": 512,
+        "qk_nope_dim": 128,
+        "qk_rope_dim": 64,
+        "v_head_dim": 128,
+        "norm_eps": 1e-05,
+        "page_rows": 64,
+        "kv_cache": "bf16",
+        "max_rows": 64,
+        "topk": 2048,
+        "head_begin": 48,
+        "head_count": 48,
+        "num_splits": 16,
+        "page_size": 1,
+        "lse_base": 2
+      },
+      "pointers": [
+        {
+          "name": "query",
+          "dtype": "bfloat16",
+          "shape": "[rows,96,576]",
+          "role": "in"
+        },
+        {
+          "name": "kv_cache",
+          "dtype": "uint8",
+          "shape": "[pool_tokens,1152]",
+          "role": "in"
+        },
+        {
+          "name": "page_table",
+          "dtype": "int32",
+          "shape": "[rows,2048]",
+          "role": "in"
+        },
+        {
+          "name": "cache_seqlens",
+          "dtype": "int32",
+          "shape": "[rows]",
+          "role": "in"
+        },
+        {
+          "name": "cu_seqlens_q",
+          "dtype": "int32",
+          "shape": "[rows+1]",
+          "role": "in"
+        },
+        {
+          "name": "attn",
+          "dtype": "bfloat16",
+          "shape": "[rows,48,512]",
+          "role": "out"
+        },
+        {
+          "name": "lse",
+          "dtype": "float32",
+          "shape": "[rows,48]",
+          "role": "out"
+        },
+        {
+          "name": "scratch",
+          "dtype": "uint8",
+          "shape": "[sparse_mla_scratch_bytes]",
+          "role": "scratch"
+        }
+      ],
+      "scalars": [
+        {
+          "name": "rows",
+          "type": "int32"
+        },
+        {
+          "name": "page_table_width",
+          "type": "int64"
+        },
+        {
+          "name": "active_splits",
+          "type": "int32"
+        }
+      ],
+      "scratch_bytes_at_capacity": {
+        "scratch": 50528256
+      },
+      "capacity_rows": 64,
+      "entry": "_mlir_cuteafd_kimik31_sparse_mla_partial_h48_m64__mlir_ciface_cutlass___call___b12xintegrationcuteafdkimi_mla_ContextPartial_object_at__Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem____CUstream0x0",
+      "object_sha256": "34b058bb60a9d4b14ae5bacd4bc5c77cc5cc3a37d252ce6319c7f34839167ec0"
+    },
+    {
+      "name": "kimik31_sparse_mla_h96_fp8_m64",
+      "family": "kimik31",
+      "op": "sparse_mla",
+      "params": {
+        "max_rows": 64,
+        "heads": 96,
+        "kv_cache": "fp8"
+      },
+      "geometry": {
+        "name": "kimi_k3_mla",
+        "hidden": 7168,
+        "heads": 96,
+        "q_lora_rank": 1536,
+        "kv_lora_rank": 512,
+        "qk_nope_dim": 128,
+        "qk_rope_dim": 64,
+        "v_head_dim": 128,
+        "norm_eps": 1e-05,
+        "page_rows": 64,
+        "kv_cache": "fp8",
+        "num_splits": 16,
+        "chunks_per_split": 2,
+        "partial_output_bytes": 100663296,
+        "partial_lse_bytes": 393216,
+        "scratch_bytes": 101056512,
+        "max_rows": 64,
+        "topk": 2048,
+        "page_size": 1,
+        "lse_base": "e"
+      },
+      "pointers": [
+        {
+          "name": "query",
+          "dtype": "bfloat16",
+          "shape": "[rows,96,576]",
+          "role": "in"
+        },
+        {
+          "name": "kv_cache",
+          "dtype": "uint8",
+          "shape": "[pool_tokens,656]",
+          "role": "in"
+        },
+        {
+          "name": "page_table",
+          "dtype": "int32",
+          "shape": "[rows,2048]",
+          "role": "in"
+        },
+        {
+          "name": "cache_seqlens",
+          "dtype": "int32",
+          "shape": "[rows]",
+          "role": "in"
+        },
+        {
+          "name": "cu_seqlens_q",
+          "dtype": "int32",
+          "shape": "[rows+1]",
+          "role": "in"
+        },
+        {
+          "name": "attn",
+          "dtype": "bfloat16",
+          "shape": "[rows,96,512]",
+          "role": "out"
+        },
+        {
+          "name": "lse",
+          "dtype": "float32",
+          "shape": "[rows,96]",
+          "role": "out"
+        },
+        {
+          "name": "scratch",
+          "dtype": "uint8",
+          "shape": "[sparse_mla_scratch_bytes]",
+          "role": "scratch"
+        }
+      ],
+      "scalars": [
+        {
+          "name": "rows",
+          "type": "int32"
+        },
+        {
+          "name": "batch",
+          "type": "int32"
+        },
+        {
+          "name": "page_table_width",
+          "type": "int64"
+        },
+        {
+          "name": "active_splits",
+          "type": "int32"
+        }
+      ],
+      "scratch_bytes_at_capacity": {
+        "scratch": 101056512
+      },
+      "capacity_rows": 64,
+      "entry": "_mlir_cuteafd_kimik31_sparse_mla_h96_fp8_m64__mlir_ciface_cutlass___call___b12xintegrationcuteafdkimi_mla_Attention_object_at__Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_____CUstream0x0",
+      "object_sha256": "541536bb477fd9053e298bc5dbc1a0376c208c24d6c6b5dba117492bd81113d8"
+    },
+    {
+      "name": "kimik31_sparse_mla_partial_fp8_h0_m64",
+      "family": "kimik31",
+      "op": "sparse_mla_partial",
+      "params": {
+        "max_rows": 64,
+        "heads": 96,
+        "kv_cache": "fp8",
+        "head_begin": 0,
+        "head_count": 48
+      },
+      "geometry": {
+        "name": "kimi_k3_mla",
+        "hidden": 7168,
+        "heads": 96,
+        "q_lora_rank": 1536,
+        "kv_lora_rank": 512,
+        "qk_nope_dim": 128,
+        "qk_rope_dim": 64,
+        "v_head_dim": 128,
+        "norm_eps": 1e-05,
+        "page_rows": 64,
+        "kv_cache": "fp8",
+        "max_rows": 64,
+        "topk": 2048,
+        "head_begin": 0,
+        "head_count": 48,
+        "num_splits": 16,
+        "page_size": 1,
+        "lse_base": 2
+      },
+      "pointers": [
+        {
+          "name": "query",
+          "dtype": "bfloat16",
+          "shape": "[rows,96,576]",
+          "role": "in"
+        },
+        {
+          "name": "kv_cache",
+          "dtype": "uint8",
+          "shape": "[pool_tokens,656]",
+          "role": "in"
+        },
+        {
+          "name": "page_table",
+          "dtype": "int32",
+          "shape": "[rows,2048]",
+          "role": "in"
+        },
+        {
+          "name": "cache_seqlens",
+          "dtype": "int32",
+          "shape": "[rows]",
+          "role": "in"
+        },
+        {
+          "name": "cu_seqlens_q",
+          "dtype": "int32",
+          "shape": "[rows+1]",
+          "role": "in"
+        },
+        {
+          "name": "attn",
+          "dtype": "bfloat16",
+          "shape": "[rows,48,512]",
+          "role": "out"
+        },
+        {
+          "name": "lse",
+          "dtype": "float32",
+          "shape": "[rows,48]",
+          "role": "out"
+        },
+        {
+          "name": "scratch",
+          "dtype": "uint8",
+          "shape": "[sparse_mla_scratch_bytes]",
+          "role": "scratch"
+        }
+      ],
+      "scalars": [
+        {
+          "name": "rows",
+          "type": "int32"
+        },
+        {
+          "name": "page_table_width",
+          "type": "int64"
+        },
+        {
+          "name": "active_splits",
+          "type": "int32"
+        }
+      ],
+      "scratch_bytes_at_capacity": {
+        "scratch": 50528256
+      },
+      "capacity_rows": 64,
+      "entry": "_mlir_cuteafd_kimik31_sparse_mla_partial_fp8_h0_m64__mlir_ciface_cutlass___call___b12xintegrationcuteafdkimi_mla_ContextPartial_object_at__Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem____CUstream0x0",
+      "object_sha256": "d837d4fe99254b901a538579ef5e06ab9b43080463453bd0e920c9cf8d734ec2"
+    },
+    {
+      "name": "kimik31_sparse_mla_partial_fp8_h48_m64",
+      "family": "kimik31",
+      "op": "sparse_mla_partial",
+      "params": {
+        "max_rows": 64,
+        "heads": 96,
+        "kv_cache": "fp8",
+        "head_begin": 48,
+        "head_count": 48
+      },
+      "geometry": {
+        "name": "kimi_k3_mla",
+        "hidden": 7168,
+        "heads": 96,
+        "q_lora_rank": 1536,
+        "kv_lora_rank": 512,
+        "qk_nope_dim": 128,
+        "qk_rope_dim": 64,
+        "v_head_dim": 128,
+        "norm_eps": 1e-05,
+        "page_rows": 64,
+        "kv_cache": "fp8",
+        "max_rows": 64,
+        "topk": 2048,
+        "head_begin": 48,
+        "head_count": 48,
+        "num_splits": 16,
+        "page_size": 1,
+        "lse_base": 2
+      },
+      "pointers": [
+        {
+          "name": "query",
+          "dtype": "bfloat16",
+          "shape": "[rows,96,576]",
+          "role": "in"
+        },
+        {
+          "name": "kv_cache",
+          "dtype": "uint8",
+          "shape": "[pool_tokens,656]",
+          "role": "in"
+        },
+        {
+          "name": "page_table",
+          "dtype": "int32",
+          "shape": "[rows,2048]",
+          "role": "in"
+        },
+        {
+          "name": "cache_seqlens",
+          "dtype": "int32",
+          "shape": "[rows]",
+          "role": "in"
+        },
+        {
+          "name": "cu_seqlens_q",
+          "dtype": "int32",
+          "shape": "[rows+1]",
+          "role": "in"
+        },
+        {
+          "name": "attn",
+          "dtype": "bfloat16",
+          "shape": "[rows,48,512]",
+          "role": "out"
+        },
+        {
+          "name": "lse",
+          "dtype": "float32",
+          "shape": "[rows,48]",
+          "role": "out"
+        },
+        {
+          "name": "scratch",
+          "dtype": "uint8",
+          "shape": "[sparse_mla_scratch_bytes]",
+          "role": "scratch"
+        }
+      ],
+      "scalars": [
+        {
+          "name": "rows",
+          "type": "int32"
+        },
+        {
+          "name": "page_table_width",
+          "type": "int64"
+        },
+        {
+          "name": "active_splits",
+          "type": "int32"
+        }
+      ],
+      "scratch_bytes_at_capacity": {
+        "scratch": 50528256
+      },
+      "capacity_rows": 64,
+      "entry": "_mlir_cuteafd_kimik31_sparse_mla_partial_fp8_h48_m64__mlir_ciface_cutlass___call___b12xintegrationcuteafdkimi_mla_ContextPartial_object_at__Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem____CUstream0x0",
+      "object_sha256": "d1f7a82e79e5393e89bad74c0c1dfb6e5f56b49a5852a264a5c11429641103ff"
+    },
+    {
+      "name": "kimik31_sparse_mla_m4096",
+      "family": "kimik31",
+      "op": "sparse_mla",
+      "params": {
+        "max_rows": 4096,
+        "heads": 48,
+        "kv_cache": "bf16"
+      },
+      "geometry": {
+        "name": "kimi_k3_mla",
+        "hidden": 7168,
+        "heads": 48,
+        "q_lora_rank": 1536,
+        "kv_lora_rank": 512,
+        "qk_nope_dim": 128,
+        "qk_rope_dim": 64,
+        "v_head_dim": 128,
+        "norm_eps": 1e-05,
+        "page_rows": 64,
+        "kv_cache": "bf16",
+        "num_splits": 16,
+        "chunks_per_split": 2,
+        "partial_output_bytes": 3221225472,
+        "partial_lse_bytes": 12582912,
+        "scratch_bytes": 3233808384,
+        "max_rows": 4096,
+        "topk": 2048,
+        "page_size": 1,
+        "lse_base": "e"
+      },
+      "pointers": [
+        {
+          "name": "query",
+          "dtype": "bfloat16",
+          "shape": "[rows,48,576]",
+          "role": "in"
+        },
+        {
+          "name": "kv_cache",
+          "dtype": "uint8",
+          "shape": "[pool_tokens,1152]",
+          "role": "in"
+        },
+        {
+          "name": "page_table",
+          "dtype": "int32",
+          "shape": "[rows,2048]",
+          "role": "in"
+        },
+        {
+          "name": "cache_seqlens",
+          "dtype": "int32",
+          "shape": "[rows]",
+          "role": "in"
+        },
+        {
+          "name": "cu_seqlens_q",
+          "dtype": "int32",
+          "shape": "[rows+1]",
+          "role": "in"
+        },
+        {
+          "name": "attn",
+          "dtype": "bfloat16",
+          "shape": "[rows,48,512]",
+          "role": "out"
+        },
+        {
+          "name": "lse",
+          "dtype": "float32",
+          "shape": "[rows,48]",
+          "role": "out"
+        },
+        {
+          "name": "scratch",
+          "dtype": "uint8",
+          "shape": "[sparse_mla_scratch_bytes]",
+          "role": "scratch"
+        }
+      ],
+      "scalars": [
+        {
+          "name": "rows",
+          "type": "int32"
+        },
+        {
+          "name": "batch",
+          "type": "int32"
+        },
+        {
+          "name": "page_table_width",
+          "type": "int64"
+        },
+        {
+          "name": "active_splits",
+          "type": "int32"
+        }
+      ],
+      "scratch_bytes_at_capacity": {
+        "scratch": 3233808384
+      },
+      "capacity_rows": 4096,
+      "entry": "_mlir_cuteafd_kimik31_sparse_mla_m4096__mlir_ciface_cutlass___call___b12xintegrationcuteafdkimi_mla_Attention_object_at__Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_____CUstream0x0",
+      "object_sha256": "7514940bd9610ca87f60d31d5d2f98ab23cd8b4f0b2685ab133c3a98485a4117"
+    },
+    {
+      "name": "kimik31_sparse_mla_fp8_m4096",
+      "family": "kimik31",
+      "op": "sparse_mla",
+      "params": {
+        "max_rows": 4096,
+        "heads": 48,
+        "kv_cache": "fp8"
+      },
+      "geometry": {
+        "name": "kimi_k3_mla",
+        "hidden": 7168,
+        "heads": 48,
+        "q_lora_rank": 1536,
+        "kv_lora_rank": 512,
+        "qk_nope_dim": 128,
+        "qk_rope_dim": 64,
+        "v_head_dim": 128,
+        "norm_eps": 1e-05,
+        "page_rows": 64,
+        "kv_cache": "fp8",
+        "num_splits": 16,
+        "chunks_per_split": 2,
+        "partial_output_bytes": 3221225472,
+        "partial_lse_bytes": 12582912,
+        "scratch_bytes": 3233808384,
+        "max_rows": 4096,
+        "topk": 2048,
+        "page_size": 1,
+        "lse_base": "e"
+      },
+      "pointers": [
+        {
+          "name": "query",
+          "dtype": "bfloat16",
+          "shape": "[rows,48,576]",
+          "role": "in"
+        },
+        {
+          "name": "kv_cache",
+          "dtype": "uint8",
+          "shape": "[pool_tokens,656]",
+          "role": "in"
+        },
+        {
+          "name": "page_table",
+          "dtype": "int32",
+          "shape": "[rows,2048]",
+          "role": "in"
+        },
+        {
+          "name": "cache_seqlens",
+          "dtype": "int32",
+          "shape": "[rows]",
+          "role": "in"
+        },
+        {
+          "name": "cu_seqlens_q",
+          "dtype": "int32",
+          "shape": "[rows+1]",
+          "role": "in"
+        },
+        {
+          "name": "attn",
+          "dtype": "bfloat16",
+          "shape": "[rows,48,512]",
+          "role": "out"
+        },
+        {
+          "name": "lse",
+          "dtype": "float32",
+          "shape": "[rows,48]",
+          "role": "out"
+        },
+        {
+          "name": "scratch",
+          "dtype": "uint8",
+          "shape": "[sparse_mla_scratch_bytes]",
+          "role": "scratch"
+        }
+      ],
+      "scalars": [
+        {
+          "name": "rows",
+          "type": "int32"
+        },
+        {
+          "name": "batch",
+          "type": "int32"
+        },
+        {
+          "name": "page_table_width",
+          "type": "int64"
+        },
+        {
+          "name": "active_splits",
+          "type": "int32"
+        }
+      ],
+      "scratch_bytes_at_capacity": {
+        "scratch": 3233808384
+      },
+      "capacity_rows": 4096,
+      "entry": "_mlir_cuteafd_kimik31_sparse_mla_fp8_m4096__mlir_ciface_cutlass___call___b12xintegrationcuteafdkimi_mla_Attention_object_at__Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_____CUstream0x0",
+      "object_sha256": "2b54043647975fdc1ebec6bb85367ad5983791f80c3f0fb2a89f586d0c989994"
+    },
+    {
+      "name": "kimik31_sparse_mla_h96_m4096",
+      "family": "kimik31",
+      "op": "sparse_mla",
+      "params": {
+        "max_rows": 4096,
+        "heads": 96,
+        "kv_cache": "bf16"
+      },
+      "geometry": {
+        "name": "kimi_k3_mla",
+        "hidden": 7168,
+        "heads": 96,
+        "q_lora_rank": 1536,
+        "kv_lora_rank": 512,
+        "qk_nope_dim": 128,
+        "qk_rope_dim": 64,
+        "v_head_dim": 128,
+        "norm_eps": 1e-05,
+        "page_rows": 64,
+        "kv_cache": "bf16",
+        "num_splits": 16,
+        "chunks_per_split": 2,
+        "partial_output_bytes": 6442450944,
+        "partial_lse_bytes": 25165824,
+        "scratch_bytes": 6467616768,
+        "max_rows": 4096,
+        "topk": 2048,
+        "page_size": 1,
+        "lse_base": "e"
+      },
+      "pointers": [
+        {
+          "name": "query",
+          "dtype": "bfloat16",
+          "shape": "[rows,96,576]",
+          "role": "in"
+        },
+        {
+          "name": "kv_cache",
+          "dtype": "uint8",
+          "shape": "[pool_tokens,1152]",
+          "role": "in"
+        },
+        {
+          "name": "page_table",
+          "dtype": "int32",
+          "shape": "[rows,2048]",
+          "role": "in"
+        },
+        {
+          "name": "cache_seqlens",
+          "dtype": "int32",
+          "shape": "[rows]",
+          "role": "in"
+        },
+        {
+          "name": "cu_seqlens_q",
+          "dtype": "int32",
+          "shape": "[rows+1]",
+          "role": "in"
+        },
+        {
+          "name": "attn",
+          "dtype": "bfloat16",
+          "shape": "[rows,96,512]",
+          "role": "out"
+        },
+        {
+          "name": "lse",
+          "dtype": "float32",
+          "shape": "[rows,96]",
+          "role": "out"
+        },
+        {
+          "name": "scratch",
+          "dtype": "uint8",
+          "shape": "[sparse_mla_scratch_bytes]",
+          "role": "scratch"
+        }
+      ],
+      "scalars": [
+        {
+          "name": "rows",
+          "type": "int32"
+        },
+        {
+          "name": "batch",
+          "type": "int32"
+        },
+        {
+          "name": "page_table_width",
+          "type": "int64"
+        },
+        {
+          "name": "active_splits",
+          "type": "int32"
+        }
+      ],
+      "scratch_bytes_at_capacity": {
+        "scratch": 6467616768
+      },
+      "capacity_rows": 4096,
+      "entry": "_mlir_cuteafd_kimik31_sparse_mla_h96_m4096__mlir_ciface_cutlass___call___b12xintegrationcuteafdkimi_mla_Attention_object_at__Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_____CUstream0x0",
+      "object_sha256": "9656b40f2fdef1c0a1aa66186fe8d92669b7b2052a66238b7c8a7e4c7c683809"
+    },
+    {
+      "name": "kimik31_sparse_mla_partial_h0_m4096",
+      "family": "kimik31",
+      "op": "sparse_mla_partial",
+      "params": {
+        "max_rows": 4096,
+        "heads": 96,
+        "kv_cache": "bf16",
+        "head_begin": 0,
+        "head_count": 48
+      },
+      "geometry": {
+        "name": "kimi_k3_mla",
+        "hidden": 7168,
+        "heads": 96,
+        "q_lora_rank": 1536,
+        "kv_lora_rank": 512,
+        "qk_nope_dim": 128,
+        "qk_rope_dim": 64,
+        "v_head_dim": 128,
+        "norm_eps": 1e-05,
+        "page_rows": 64,
+        "kv_cache": "bf16",
+        "max_rows": 4096,
+        "topk": 2048,
+        "head_begin": 0,
+        "head_count": 48,
+        "num_splits": 16,
+        "page_size": 1,
+        "lse_base": 2
+      },
+      "pointers": [
+        {
+          "name": "query",
+          "dtype": "bfloat16",
+          "shape": "[rows,96,576]",
+          "role": "in"
+        },
+        {
+          "name": "kv_cache",
+          "dtype": "uint8",
+          "shape": "[pool_tokens,1152]",
+          "role": "in"
+        },
+        {
+          "name": "page_table",
+          "dtype": "int32",
+          "shape": "[rows,2048]",
+          "role": "in"
+        },
+        {
+          "name": "cache_seqlens",
+          "dtype": "int32",
+          "shape": "[rows]",
+          "role": "in"
+        },
+        {
+          "name": "cu_seqlens_q",
+          "dtype": "int32",
+          "shape": "[rows+1]",
+          "role": "in"
+        },
+        {
+          "name": "attn",
+          "dtype": "bfloat16",
+          "shape": "[rows,48,512]",
+          "role": "out"
+        },
+        {
+          "name": "lse",
+          "dtype": "float32",
+          "shape": "[rows,48]",
+          "role": "out"
+        },
+        {
+          "name": "scratch",
+          "dtype": "uint8",
+          "shape": "[sparse_mla_scratch_bytes]",
+          "role": "scratch"
+        }
+      ],
+      "scalars": [
+        {
+          "name": "rows",
+          "type": "int32"
+        },
+        {
+          "name": "page_table_width",
+          "type": "int64"
+        },
+        {
+          "name": "active_splits",
+          "type": "int32"
+        }
+      ],
+      "scratch_bytes_at_capacity": {
+        "scratch": 3233808384
+      },
+      "capacity_rows": 4096,
+      "entry": "_mlir_cuteafd_kimik31_sparse_mla_partial_h0_m4096__mlir_ciface_cutlass___call___b12xintegrationcuteafdkimi_mla_ContextPartial_object_at__Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem____CUstream0x0",
+      "object_sha256": "9bb6d4d2128d8b9eafb9ab03f46f29cc83f818baf0c7762d2032a4307ffb01c7"
+    },
+    {
+      "name": "kimik31_sparse_mla_partial_h48_m4096",
+      "family": "kimik31",
+      "op": "sparse_mla_partial",
+      "params": {
+        "max_rows": 4096,
+        "heads": 96,
+        "kv_cache": "bf16",
+        "head_begin": 48,
+        "head_count": 48
+      },
+      "geometry": {
+        "name": "kimi_k3_mla",
+        "hidden": 7168,
+        "heads": 96,
+        "q_lora_rank": 1536,
+        "kv_lora_rank": 512,
+        "qk_nope_dim": 128,
+        "qk_rope_dim": 64,
+        "v_head_dim": 128,
+        "norm_eps": 1e-05,
+        "page_rows": 64,
+        "kv_cache": "bf16",
+        "max_rows": 4096,
+        "topk": 2048,
+        "head_begin": 48,
+        "head_count": 48,
+        "num_splits": 16,
+        "page_size": 1,
+        "lse_base": 2
+      },
+      "pointers": [
+        {
+          "name": "query",
+          "dtype": "bfloat16",
+          "shape": "[rows,96,576]",
+          "role": "in"
+        },
+        {
+          "name": "kv_cache",
+          "dtype": "uint8",
+          "shape": "[pool_tokens,1152]",
+          "role": "in"
+        },
+        {
+          "name": "page_table",
+          "dtype": "int32",
+          "shape": "[rows,2048]",
+          "role": "in"
+        },
+        {
+          "name": "cache_seqlens",
+          "dtype": "int32",
+          "shape": "[rows]",
+          "role": "in"
+        },
+        {
+          "name": "cu_seqlens_q",
+          "dtype": "int32",
+          "shape": "[rows+1]",
+          "role": "in"
+        },
+        {
+          "name": "attn",
+          "dtype": "bfloat16",
+          "shape": "[rows,48,512]",
+          "role": "out"
+        },
+        {
+          "name": "lse",
+          "dtype": "float32",
+          "shape": "[rows,48]",
+          "role": "out"
+        },
+        {
+          "name": "scratch",
+          "dtype": "uint8",
+          "shape": "[sparse_mla_scratch_bytes]",
+          "role": "scratch"
+        }
+      ],
+      "scalars": [
+        {
+          "name": "rows",
+          "type": "int32"
+        },
+        {
+          "name": "page_table_width",
+          "type": "int64"
+        },
+        {
+          "name": "active_splits",
+          "type": "int32"
+        }
+      ],
+      "scratch_bytes_at_capacity": {
+        "scratch": 3233808384
+      },
+      "capacity_rows": 4096,
+      "entry": "_mlir_cuteafd_kimik31_sparse_mla_partial_h48_m4096__mlir_ciface_cutlass___call___b12xintegrationcuteafdkimi_mla_ContextPartial_object_at__Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem____CUstream0x0",
+      "object_sha256": "fc6e829d6d9f26475adc6b78fc740a5edf36eb6f45bc75320ec5e60c77312848"
+    },
+    {
+      "name": "kimik31_sparse_mla_h96_fp8_m4096",
+      "family": "kimik31",
+      "op": "sparse_mla",
+      "params": {
+        "max_rows": 4096,
+        "heads": 96,
+        "kv_cache": "fp8"
+      },
+      "geometry": {
+        "name": "kimi_k3_mla",
+        "hidden": 7168,
+        "heads": 96,
+        "q_lora_rank": 1536,
+        "kv_lora_rank": 512,
+        "qk_nope_dim": 128,
+        "qk_rope_dim": 64,
+        "v_head_dim": 128,
+        "norm_eps": 1e-05,
+        "page_rows": 64,
+        "kv_cache": "fp8",
+        "num_splits": 16,
+        "chunks_per_split": 2,
+        "partial_output_bytes": 6442450944,
+        "partial_lse_bytes": 25165824,
+        "scratch_bytes": 6467616768,
+        "max_rows": 4096,
+        "topk": 2048,
+        "page_size": 1,
+        "lse_base": "e"
+      },
+      "pointers": [
+        {
+          "name": "query",
+          "dtype": "bfloat16",
+          "shape": "[rows,96,576]",
+          "role": "in"
+        },
+        {
+          "name": "kv_cache",
+          "dtype": "uint8",
+          "shape": "[pool_tokens,656]",
+          "role": "in"
+        },
+        {
+          "name": "page_table",
+          "dtype": "int32",
+          "shape": "[rows,2048]",
+          "role": "in"
+        },
+        {
+          "name": "cache_seqlens",
+          "dtype": "int32",
+          "shape": "[rows]",
+          "role": "in"
+        },
+        {
+          "name": "cu_seqlens_q",
+          "dtype": "int32",
+          "shape": "[rows+1]",
+          "role": "in"
+        },
+        {
+          "name": "attn",
+          "dtype": "bfloat16",
+          "shape": "[rows,96,512]",
+          "role": "out"
+        },
+        {
+          "name": "lse",
+          "dtype": "float32",
+          "shape": "[rows,96]",
+          "role": "out"
+        },
+        {
+          "name": "scratch",
+          "dtype": "uint8",
+          "shape": "[sparse_mla_scratch_bytes]",
+          "role": "scratch"
+        }
+      ],
+      "scalars": [
+        {
+          "name": "rows",
+          "type": "int32"
+        },
+        {
+          "name": "batch",
+          "type": "int32"
+        },
+        {
+          "name": "page_table_width",
+          "type": "int64"
+        },
+        {
+          "name": "active_splits",
+          "type": "int32"
+        }
+      ],
+      "scratch_bytes_at_capacity": {
+        "scratch": 6467616768
+      },
+      "capacity_rows": 4096,
+      "entry": "_mlir_cuteafd_kimik31_sparse_mla_h96_fp8_m4096__mlir_ciface_cutlass___call___b12xintegrationcuteafdkimi_mla_Attention_object_at__Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_____CUstream0x0",
+      "object_sha256": "22ac5c3a65c1f2f5ba1d6deda35d6d92512e966483649523f8f4f7a594a36ca3"
+    },
+    {
+      "name": "kimik31_sparse_mla_partial_fp8_h0_m4096",
+      "family": "kimik31",
+      "op": "sparse_mla_partial",
+      "params": {
+        "max_rows": 4096,
+        "heads": 96,
+        "kv_cache": "fp8",
+        "head_begin": 0,
+        "head_count": 48
+      },
+      "geometry": {
+        "name": "kimi_k3_mla",
+        "hidden": 7168,
+        "heads": 96,
+        "q_lora_rank": 1536,
+        "kv_lora_rank": 512,
+        "qk_nope_dim": 128,
+        "qk_rope_dim": 64,
+        "v_head_dim": 128,
+        "norm_eps": 1e-05,
+        "page_rows": 64,
+        "kv_cache": "fp8",
+        "max_rows": 4096,
+        "topk": 2048,
+        "head_begin": 0,
+        "head_count": 48,
+        "num_splits": 16,
+        "page_size": 1,
+        "lse_base": 2
+      },
+      "pointers": [
+        {
+          "name": "query",
+          "dtype": "bfloat16",
+          "shape": "[rows,96,576]",
+          "role": "in"
+        },
+        {
+          "name": "kv_cache",
+          "dtype": "uint8",
+          "shape": "[pool_tokens,656]",
+          "role": "in"
+        },
+        {
+          "name": "page_table",
+          "dtype": "int32",
+          "shape": "[rows,2048]",
+          "role": "in"
+        },
+        {
+          "name": "cache_seqlens",
+          "dtype": "int32",
+          "shape": "[rows]",
+          "role": "in"
+        },
+        {
+          "name": "cu_seqlens_q",
+          "dtype": "int32",
+          "shape": "[rows+1]",
+          "role": "in"
+        },
+        {
+          "name": "attn",
+          "dtype": "bfloat16",
+          "shape": "[rows,48,512]",
+          "role": "out"
+        },
+        {
+          "name": "lse",
+          "dtype": "float32",
+          "shape": "[rows,48]",
+          "role": "out"
+        },
+        {
+          "name": "scratch",
+          "dtype": "uint8",
+          "shape": "[sparse_mla_scratch_bytes]",
+          "role": "scratch"
+        }
+      ],
+      "scalars": [
+        {
+          "name": "rows",
+          "type": "int32"
+        },
+        {
+          "name": "page_table_width",
+          "type": "int64"
+        },
+        {
+          "name": "active_splits",
+          "type": "int32"
+        }
+      ],
+      "scratch_bytes_at_capacity": {
+        "scratch": 3233808384
+      },
+      "capacity_rows": 4096,
+      "entry": "_mlir_cuteafd_kimik31_sparse_mla_partial_fp8_h0_m4096__mlir_ciface_cutlass___call___b12xintegrationcuteafdkimi_mla_ContextPartial_object_at__Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem____CUstream0x0",
+      "object_sha256": "a2d33b123b63c970567743f342f06ebc70c3674b06581734058759227005d832"
+    },
+    {
+      "name": "kimik31_sparse_mla_partial_fp8_h48_m4096",
+      "family": "kimik31",
+      "op": "sparse_mla_partial",
+      "params": {
+        "max_rows": 4096,
+        "heads": 96,
+        "kv_cache": "fp8",
+        "head_begin": 48,
+        "head_count": 48
+      },
+      "geometry": {
+        "name": "kimi_k3_mla",
+        "hidden": 7168,
+        "heads": 96,
+        "q_lora_rank": 1536,
+        "kv_lora_rank": 512,
+        "qk_nope_dim": 128,
+        "qk_rope_dim": 64,
+        "v_head_dim": 128,
+        "norm_eps": 1e-05,
+        "page_rows": 64,
+        "kv_cache": "fp8",
+        "max_rows": 4096,
+        "topk": 2048,
+        "head_begin": 48,
+        "head_count": 48,
+        "num_splits": 16,
+        "page_size": 1,
+        "lse_base": 2
+      },
+      "pointers": [
+        {
+          "name": "query",
+          "dtype": "bfloat16",
+          "shape": "[rows,96,576]",
+          "role": "in"
+        },
+        {
+          "name": "kv_cache",
+          "dtype": "uint8",
+          "shape": "[pool_tokens,656]",
+          "role": "in"
+        },
+        {
+          "name": "page_table",
+          "dtype": "int32",
+          "shape": "[rows,2048]",
+          "role": "in"
+        },
+        {
+          "name": "cache_seqlens",
+          "dtype": "int32",
+          "shape": "[rows]",
+          "role": "in"
+        },
+        {
+          "name": "cu_seqlens_q",
+          "dtype": "int32",
+          "shape": "[rows+1]",
+          "role": "in"
+        },
+        {
+          "name": "attn",
+          "dtype": "bfloat16",
+          "shape": "[rows,48,512]",
+          "role": "out"
+        },
+        {
+          "name": "lse",
+          "dtype": "float32",
+          "shape": "[rows,48]",
+          "role": "out"
+        },
+        {
+          "name": "scratch",
+          "dtype": "uint8",
+          "shape": "[sparse_mla_scratch_bytes]",
+          "role": "scratch"
+        }
+      ],
+      "scalars": [
+        {
+          "name": "rows",
+          "type": "int32"
+        },
+        {
+          "name": "page_table_width",
+          "type": "int64"
+        },
+        {
+          "name": "active_splits",
+          "type": "int32"
+        }
+      ],
+      "scratch_bytes_at_capacity": {
+        "scratch": 3233808384
+      },
+      "capacity_rows": 4096,
+      "entry": "_mlir_cuteafd_kimik31_sparse_mla_partial_fp8_h48_m4096__mlir_ciface_cutlass___call___b12xintegrationcuteafdkimi_mla_ContextPartial_object_at__Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem_Ptrgmem____CUstream0x0",
+      "object_sha256": "06fd54284c611ed1bb60873b4f9e225fda0f5c0ac367ffa90ae5dd206e44d52e"
+    }
+  ]
+}

@@ -286,13 +286,20 @@ pub fn draft_geometry(config: &serde_json::Value) -> Result<(GlmDraftGeometry, u
     }, int(d, "block_size")?))
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DraftResidency {
+    pub owned: u64,
+    pub scratch: u64,
+    pub weights: crate::placement::ResidentWeights,
+}
+
 pub fn draft_resident_bytes(config: &serde_json::Value, slots: usize, sequences: usize, sms: u64, kv_cache: crate::families::qwen4::Qwen4KvCache)
-    -> Result<(u64, u64), GlmDraftStorageError> {
+    -> Result<DraftResidency, GlmDraftStorageError> {
     draft_resident_bytes_with_mode(config, slots, sequences, sms, GlmDraftRepresentation::Fp8Only, 2, kv_cache)
 }
 
 pub fn draft_resident_bytes_with_mode(config: &serde_json::Value, slots: usize, sequences: usize, sms: u64,
-    representation: GlmDraftRepresentation, mode: u8, kv_cache: crate::families::qwen4::Qwen4KvCache) -> Result<(u64, u64), GlmDraftStorageError> {
+    representation: GlmDraftRepresentation, mode: u8, kv_cache: crate::families::qwen4::Qwen4KvCache) -> Result<DraftResidency, GlmDraftStorageError> {
     if mode > 2 || sms == 0 || sms > 4096 { return Err(GlmDraftStorageError::Unsupported("invalid draft scratch mode or SM count")); }
     if is_dspark(config) {
         return dspark_resident_bytes(config, slots, sequences.min(32), sms, representation, mode, kv_cache);
@@ -302,11 +309,13 @@ pub fn draft_resident_bytes_with_mode(config: &serde_json::Value, slots: usize, 
     let layout = GlmDraftRuntimeLayout::new(g, representation, capacity, 2048)?;
     let (workspace, scratch) = draft_workspace_bytes(g, capacity, block,
         representation == GlmDraftRepresentation::Fp8Only, sms, mode, kv_cache)?;
-    Ok((add(layout.weights.resident_bytes()?, workspace)?, scratch))
+    let weights = layout.weights.resident_bytes()?;
+    Ok(DraftResidency { owned: add(weights, workspace)?, scratch,
+        weights: crate::placement::ResidentWeights(weights) })
 }
 
 fn dspark_resident_bytes(config: &serde_json::Value, slots: usize, sequences: usize, sms: u64,
-    representation: GlmDraftRepresentation, mode: u8, kv_cache: crate::families::qwen4::Qwen4KvCache) -> Result<(u64, u64), GlmDraftStorageError> {
+    representation: GlmDraftRepresentation, mode: u8, kv_cache: crate::families::qwen4::Qwen4KvCache) -> Result<DraftResidency, GlmDraftStorageError> {
     block_dspark_resident_bytes(config, slots, sequences, sms, representation, mode, 2048, kv_cache)
 }
 
@@ -315,7 +324,7 @@ fn dspark_resident_bytes(config: &serde_json::Value, slots: usize, sequences: us
 #[allow(clippy::too_many_arguments)]
 pub fn block_dspark_resident_bytes(config: &serde_json::Value, slots: usize, sequences: usize, sms: u64,
     representation: GlmDraftRepresentation, mode: u8, capacity: usize, kv_cache: crate::families::qwen4::Qwen4KvCache)
-    -> Result<(u64, u64), GlmDraftStorageError> {
+    -> Result<DraftResidency, GlmDraftStorageError> {
     if mode > 2 || sms == 0 || sms > 4096 {
         return Err(GlmDraftStorageError::Unsupported("invalid draft scratch mode or SM count"));
     }
@@ -362,7 +371,8 @@ pub fn block_dspark_resident_bytes(config: &serde_json::Value, slots: usize, seq
     let mut scratch_shapes = shapes.to_vec(); scratch_shapes.push((h,mul(2,kv)?));
     let scratch = if fp8 { scratch_shapes.iter().map(|&(k,n)|
         draft_fp8_scratch_bytes(rows.max(2048),k,n,sms,mode)).max().unwrap_or(256) } else { 0 };
-    Ok((sum([weights,owned,workspace])?,add(scratch,attention_scratch)?))
+    Ok(DraftResidency { owned: sum([weights,owned,workspace])?, scratch: add(scratch,attention_scratch)?,
+        weights: crate::placement::ResidentWeights(weights) })
 }
 
 /// Shared-pool inventory: replace the legacy slot-local full-context planes
@@ -371,19 +381,19 @@ pub fn block_dspark_resident_bytes(config: &serde_json::Value, slots: usize, seq
 pub fn block_dspark_paged_resident_bytes(config: &serde_json::Value, slots: usize, sequences: usize,
     sms: u64, representation: GlmDraftRepresentation, mode: u8, context: usize,
     target_tokens: usize, kv: crate::families::qwen4::Qwen4KvCache)
-    -> Result<(u64, u64), GlmDraftStorageError> {
+    -> Result<DraftResidency, GlmDraftStorageError> {
     let cfg = crate::formats::block_dspark::BlockDsparkConfig::from_json(config)
         .map_err(|_| GlmDraftStorageError::Unsupported("invalid dSpark checkpoint"))?;
     let layout = cfg.paged_cache_layout(slots, context, target_tokens, kv)
         .map_err(|_| GlmDraftStorageError::Unsupported("invalid dSpark paged admission"))?;
-    let (owned, scratch) = block_dspark_resident_bytes(config, slots, sequences, sms,
+    let residency = block_dspark_resident_bytes(config, slots, sequences, sms,
         representation, mode, context, kv)?;
-    if cfg.window.is_some() { return Ok((owned, scratch)); }
+    if cfg.window.is_some() { return Ok(residency); }
     let old = mul(mul(mul(slots as u64, context as u64)?, cfg.layers as u64)?,
         mul(2, kv.plane_record_bytes(cfg.kv_heads, cfg.head_dim) as u64)?)?;
     let tables = layout.page_table_bytes.max(256);
-    Ok((add(owned.checked_sub(old).ok_or(GlmDraftStorageError::Overflow)?,
-        add(layout.full_bytes, tables)?)?, scratch))
+    Ok(DraftResidency { owned: add(residency.owned.checked_sub(old).ok_or(GlmDraftStorageError::Overflow)?,
+        add(layout.full_bytes, tables)?)?, ..residency })
 }
 
 #[cfg(test)]
@@ -436,9 +446,9 @@ mod tests {
             (Some(4),16,(4,4,32)), (None,64,(64,32,256))] {
             let cap = flash_draft_capacity(&config,slots,sequences).unwrap();
             assert_eq!((cap.context_slots,cap.max_batch_sequences,cap.block_rows),expected);
-            let (owned,scratch) = draft_resident_bytes(&config,cap.context_slots,cap.max_batch_sequences,
+            let residency = draft_resident_bytes(&config,cap.context_slots,cap.max_batch_sequences,
                 188,crate::families::qwen4::Qwen4KvCache::Bf16).unwrap();
-            assert!(owned > 0 && scratch > 0);
+            assert!(residency.owned > residency.weights.0 && residency.weights.0 > 0 && residency.scratch > 0);
         }
         let mut specforge = config["transformer_layer_config"].clone();
         for field in ["architectures","block_size","markov_rank","markov_head_type",
@@ -486,9 +496,10 @@ mod tests {
         for (format, plane) in [(Qwen4KvCache::Bf16, 8 * 128 * 2), (Qwen4KvCache::Fp8, 1056)] {
             let bytes = |capacity| block_dspark_resident_bytes(&config, 1, 1, 188,
                 GlmDraftRepresentation::Bf16Only, 0, capacity, format).unwrap();
-            let (small, _) = bytes(2048);
-            let (large, _) = bytes(8192);
-            assert_eq!(large - small, (8192 - 2048) * 5 * 2 * plane);
+            let small = bytes(2048);
+            let large = bytes(8192);
+            assert_eq!(large.owned - small.owned, (8192 - 2048) * 5 * 2 * plane);
+            assert_eq!(large.weights, small.weights);
             assert!(block_dspark_resident_bytes(&config, 1, 1, 188,
                 GlmDraftRepresentation::Bf16Only, 0, 0, format).is_err());
             assert!(block_dspark_resident_bytes(&config, usize::MAX, 1, 188,

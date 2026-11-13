@@ -251,7 +251,7 @@ impl<'a> Engine<'a> {
                 }).transpose()?;
                 let mut hooks = super::prefill::UnitHooks { engine: self, placement: sequences[0].0,
                     tokens: &tokens, tables: &tables, w, w1, transport, logit_rows: 0, download: false,
-                    on_layer: None, logits: Vec::new(), landed: 0, packed: Some(&members),
+                    on_layer: None, scoring: None, logits: Vec::new(), landed: 0, packed: Some(&members),
                     context_plans: vec![Default::default(); self.prefill_waves], staging_owner: [None; 2] };
                 prefill_pipeline::run_prefill_units(&mut hooks, &units, 1)?;
                 self.finish_route_step()?;
@@ -329,7 +329,7 @@ impl<'a> Engine<'a> {
                     total * self.cfg.dim * 2, self.stream_of(rank)) }
             })?;
             let weights = if rank == 0 { &self.weights.layers[layer] } else { &self.peer()?.layers[layer] };
-            self.attention_back(rank, weights, lane, work, rows, self.prefill_rows, work.delta.buffer.ptr)?;
+            self.attention_back(rank, layer, false, weights, lane, work, rows, self.prefill_rows, work.delta.buffer.ptr)?;
             if rank == 1 {
                 self.run_on(1, weights.ffn_split, &format!("shared_ffn_m{}", self.prefill_kernel_rows), &[
                     ("x", work.y.buffer.ptr), ("w13", weights.ptr("w13")?), ("w13_scale", weights.ptr("w13_scale")?),

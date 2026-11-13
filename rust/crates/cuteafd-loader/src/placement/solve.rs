@@ -84,9 +84,30 @@ pub fn solve_with_marks(request: &PlacementRequest, legacy_slots: u64, minimum_s
 /// Places `request`. Pure arithmetic over the request: the planner and the
 /// runtime get the same answer for the same inputs.
 pub fn solve(request: &PlacementRequest) -> Result<Placement, PlacementError> {
+    let overridden;
+    let request = if cuteafd_core::memory_policy::MemoryPolicy::current().gpu_reserve.is_some() {
+        overridden = reserve_override(request);
+        &overridden
+    } else { request };
     let mut placement = solve_attention(request)?;
-    placement.max_pool_tokens_no_onboard = max_pool_without_onboard(request, &placement);
+    placement.max_pool_tokens_no_onboard = Some(max_pool_without_onboard(request, &placement));
     Ok(placement)
+}
+
+/// `GPU_RESERVE` replaces every built-in GPU reserve component (runtime,
+/// graph and reserved fixed demands and startup peaks); each GPU keeps the
+/// override free instead. A measured baseline stays: its bytes are held.
+fn reserve_override(request: &PlacementRequest) -> PlacementRequest {
+    let mut request = request.clone();
+    let reserve = |demand: &Demand| matches!(demand.category, Category::Runtime | Category::Reserved);
+    request.fixed.retain(|demand| !reserve(demand));
+    request.startup.retain(|demand| !reserve(demand));
+    let bytes = super::reserve::gpu("");
+    for gpu in &mut request.inventory.gpus {
+        gpu.reserve_bytes = bytes;
+        if let Baseline::Planned { context_bytes, .. } = &mut gpu.baseline { *context_bytes = 0; }
+    }
+    request
 }
 
 /// One extra solve: the same request and attention modes with the RTX
@@ -101,6 +122,8 @@ fn max_pool_without_onboard(request: &PlacementRequest, placement: &Placement) -
     trial.expert_tier = None;
     trial.minimum_expert_layers = 0;
     trial.pool.requested = None;
+    // A diagnostic: the largest pool the build indexes, not KV_MAX_TOKENS.
+    trial.pool.ceiling = u64::MAX;
     trial.pool.target = trial.pool.ceiling;
     let chosen = placement.attention_by_kind.clone();
     solve_once(&trial, &chosen, None).map_or(placement.pool_tokens, |free| free.pool_tokens.max(placement.pool_tokens))
@@ -304,15 +327,19 @@ fn solve_once(request: &PlacementRequest, flips: &[(AttentionClass, AttentionPla
     // 2. Fixed demands, including mode-dependent layer weights.
     let mut items: Vec<Vec<Item>> = vec![Vec::new(); gpus];
     let mut used = vec![0u64; gpus];
+    let mut resident_weights = vec![ResidentWeights::default(); gpus];
     let charge = |items: &mut Vec<Vec<Item>>, used: &mut Vec<u64>, gpu: usize, item: Item| -> Result<(), PlacementError> {
         used[gpu] = used[gpu].checked_add(item.bytes).ok_or(Overflow("fixed demands"))?;
-        items[gpu].push(item);
+        // Resource-only facts describe baseline owners, not new allocations.
+        if item.bytes > 0 { items[gpu].push(item); }
         Ok(())
     };
     let context = modes.contains(&LayerMode::ContextSplit);
     let context_demands = if context { request.context_buffers.demands()? } else { Vec::new() };
     for demand in request.fixed.iter().chain(&context_demands) {
         charge(&mut items, &mut used, usize::from(demand.gpu), demand.item())?;
+        let gpu = usize::from(demand.gpu);
+        resident_weights[gpu] = resident_weights[gpu].checked_add(demand.resident_weights)?;
     }
     let mut layer_weights = vec![0u64; gpus];
     let mut unit_bytes = request.pool_overhead.clone();
@@ -331,6 +358,7 @@ fn solve_once(request: &PlacementRequest, flips: &[(AttentionClass, AttentionPla
         }
     }
     for (gpu, &bytes) in layer_weights.iter().enumerate() {
+        resident_weights[gpu] = resident_weights[gpu].checked_add(ResidentWeights(bytes))?;
         if bytes > 0 { charge(&mut items, &mut used, gpu, Item::new(Category::Weights, "layers", "", bytes, Basis::Exact))?; }
     }
     for (gpu, &bytes) in layer_fixed.iter().enumerate() {
@@ -340,6 +368,7 @@ fn solve_once(request: &PlacementRequest, flips: &[(AttentionClass, AttentionPla
         for demand in &layer.extra {
             for gpu in 0..gpus {
                 if demand.on_gpu(mode, gpu) {
+                    resident_weights[gpu] = resident_weights[gpu].checked_add(demand.resident_weights)?;
                     charge(&mut items, &mut used, gpu,
                         Item::new(demand.category, demand.group.clone(), "", demand.bytes, demand.basis))?;
                 }
@@ -352,11 +381,14 @@ fn solve_once(request: &PlacementRequest, flips: &[(AttentionClass, AttentionPla
         if bytes > 0 { charge(&mut items, &mut used, gpu, Item::new(Category::Transport, "residual hops", "", bytes, Basis::Formula))?; }
     }
     let available = request.inventory.gpus.iter().map(GpuBudget::available).collect::<Vec<_>>();
+    for (gpu, &weights) in resident_weights.iter().enumerate() {
+        check_resident_weights(request, gpu, weights)?;
+    }
 
     // 3. Mandatory movables, largest first. Conditional reservations participate
     // in candidate choice; ordinary movables retain the most-free-GPU policy.
     let mut order: Vec<usize> = (0..request.movables.len()).collect();
-    let totals = request.movables.iter().map(|m| m.parts.iter().try_fold(0u64, |n, p| n.checked_add(p.resident))
+    let totals = request.movables.iter().map(|m| m.parts.iter().try_fold(0u64, |n, p| n.checked_add(p.memory.resident))
         .ok_or(Overflow("movable"))).collect::<Result<Vec<_>, _>>()?;
     order.sort_by_key(|&i| std::cmp::Reverse(totals[i]));
     let mut arenas: Vec<Arena> = (0..gpus).map(|_| Arena::default()).collect();
@@ -365,9 +397,10 @@ fn solve_once(request: &PlacementRequest, flips: &[(AttentionClass, AttentionPla
     for index in order {
         let movable = &request.movables[index];
         if !movable.conditional.is_empty() {
-            let (gpu, candidate_used, candidate_arenas, demands) = conditional_movable(
-                request, movable, &available, &used, &arenas, &unit_bytes, context)?;
+            let (gpu, candidate_used, candidate_weights, candidate_arenas, demands) = conditional_movable(
+                request, movable, &available, &used, &resident_weights, &arenas, &unit_bytes, context)?;
             used = candidate_used;
+            resident_weights = candidate_weights;
             arenas = candidate_arenas;
             // An itemized movable (every byte in its conditional demands) has no opaque item.
             if !movable.expert_arena && totals[index] > 0 {
@@ -375,21 +408,33 @@ fn solve_once(request: &PlacementRequest, flips: &[(AttentionClass, AttentionPla
                     totals[index], Basis::Exact));
             }
             selected_fixed.extend(demands.iter().cloned());
-            for demand in demands {
+            for demand in demands.into_iter().filter(|demand| demand.bytes > 0) {
                 items[usize::from(demand.gpu)].push(demand.item());
             }
             movables.push((movable.id, gpu as u8));
             continue;
         }
-        let gpu = usize::from(*movable.allowed.iter()
+        let weights = movable.parts.iter().try_fold(ResidentWeights::default(), |sum, p| sum.checked_add(p.resident_weights))?;
+        let mut allowed = Vec::new();
+        let mut refusal = None;
+        for &home in &movable.allowed {
+            let gpu = usize::from(home);
+            let total = resident_weights[gpu].checked_add(arenas[gpu].resident_weights)?.checked_add(weights)?;
+            match check_resident_weights(request, gpu, total) {
+                Ok(()) => allowed.push(home),
+                Err(error) => { refusal.get_or_insert(error); }
+            }
+        }
+        let gpu = usize::from(*allowed.iter()
             .max_by_key(|&&g| (available[usize::from(g)].saturating_sub(used[usize::from(g)] + arenas[usize::from(g)].peak), std::cmp::Reverse(g)))
-            .expect("allowed is non-empty"));
+            .ok_or_else(|| refusal.unwrap_or(PlacementError::Inventory("no movable candidate")))?);
         if movable.expert_arena {
             let arena = &mut arenas[gpu];
             arena.open(request.expert_workspace);
-            for part in &movable.parts { arena.add(*part)?; }
+            for part in &movable.parts { arena.add(part.memory, part.resident_weights)?; }
         } else {
-            let bytes = movable.parts.iter().try_fold(0u64, |n, p| n.checked_add(p.resident)).ok_or(Overflow("movable"))?;
+            resident_weights[gpu] = resident_weights[gpu].checked_add(weights)?;
+            let bytes = movable.parts.iter().try_fold(0u64, |n, p| n.checked_add(p.memory.resident)).ok_or(Overflow("movable"))?;
             charge(&mut items, &mut used, gpu, Item::new(Category::Drafter, format!("{:?}", movable.id), "", bytes, Basis::Exact))?;
         }
         movables.push((movable.id, gpu as u8));
@@ -442,12 +487,14 @@ fn solve_once(request: &PlacementRequest, flips: &[(AttentionClass, AttentionPla
                 } else { (0..=count).rev().collect() };
                 let mut best = None;
                 let mut most = 0;
+                let mut weight_refusal = None;
                 for on_first in splits {
                     let mut mandatory = arenas.clone();
                     let caps = [if request.expert_gpus > 0 { on_first } else { 0 },
                         if gpus == 2 { count - on_first } else { 0 }];
-                    let (_, homes, next, _) = place_experts(request, &available, &used, &mut mandatory,
+                    let (_, homes, next, _, refused) = place_experts(request, &available, &used, &resident_weights, &mut mandatory,
                         first_moe, end, &caps)?;
+                    if let Some(error) = refused { weight_refusal.get_or_insert(error); }
                     let placed = homes.iter().filter(|h| matches!(h, ExpertHome::RtxWhole { .. } | ExpertHome::RtxTp2)).count();
                     most = most.max(placed);
                     if next >= end && placed >= count {
@@ -457,17 +504,24 @@ fn solve_once(request: &PlacementRequest, flips: &[(AttentionClass, AttentionPla
                         }
                     }
                 }
-                best.ok_or(PlacementError::ExpertLayers { requested: count, placed: most })?
+                best.ok_or_else(|| weight_refusal.unwrap_or(PlacementError::ExpertLayers { requested: count, placed: most }))?
             };
             let units = pool_units(request, if context { fit / 2 * 2 } else { fit }, &limits)?;
             let pool_used = with_pool(request, &used, &unit_bytes, units)?;
             let caps = if tier.is_some() { [0, 0] } else {
                 [if request.expert_gpus > 0 { usize::MAX } else { 0 }, if request.expert_gpus > 1 { usize::MAX } else { 0 }]
             };
-            let (ranges, homes, _, tp2_range) = place_experts(request, &available, &pool_used, &mut arenas, first_moe,
+            let (ranges, homes, _, tp2_range, _) = place_experts(request, &available, &pool_used, &resident_weights, &mut arenas, first_moe,
                 request.layers.len(), &caps)?;
-            let tier_placement = tier.map(|tier| place_tier(request, tier, &available, &pool_used, &mut arenas, None))
+            let tier_placement = tier.map(|tier| place_tier(request, tier, &available, &pool_used, &resident_weights, &mut arenas, None))
                 .transpose()?;
+            // The layout is fixed for the target; an automatic pool then grows
+            // into what it leaves, up to KV_MAX_TOKENS.
+            let units = if request.pool.requested.is_none() {
+                let after = pool_fit(request, &available, &used, &arenas, &unit_bytes);
+                units.max(after.min(request.pool.max_units()))
+            } else { units };
+            let units = if context { units / 2 * 2 } else { units };
             // Successful diagnostics describe installed experts, not the larger
             // pre-onboarding capacity used to choose the pool-first reservation.
             let limits = pool_limits(request, &available, &used, &arenas, &unit_bytes);
@@ -483,17 +537,19 @@ fn solve_once(request: &PlacementRequest, flips: &[(AttentionClass, AttentionPla
                 Option<ExpertTierPlacement>)> = None;
             let splits: Vec<usize> = if tp2 || gpus == 1 || request.expert_gpus < 2 { vec![n] } else { (0..=n).rev().collect() };
             let mut most = 0;
+            let mut weight_refusal = None;
             for on_first in splits {
                 let mut trial = arenas.clone();
                 let caps = [if request.expert_gpus > 0 { on_first } else { 0 }, if gpus == 2 { n - on_first } else { 0 }];
-                let (ranges, homes, next, tp2_range) = place_experts(request, &available, &used, &mut trial, first_moe, end, &caps)?;
+                let (ranges, homes, next, tp2_range, refused) = place_experts(request, &available, &used, &resident_weights, &mut trial, first_moe, end, &caps)?;
+                if let Some(error) = refused { weight_refusal.get_or_insert(error); }
                 let placed = homes.iter().filter(|h| matches!(h, ExpertHome::RtxWhole { .. } | ExpertHome::RtxTp2)).count();
                 most = most.max(placed);
                 if next < end || placed < n { continue; }
                 // A fixed tier is charged before the pool, which is the output.
                 let tier_placement = match tier {
                     Some(tier @ ExpertTierRequest { size: ExpertTierSize::Experts(count), .. }) =>
-                        Some(place_tier(request, tier, &available, &used, &mut trial, Some(*count))?),
+                        Some(place_tier(request, tier, &available, &used, &resident_weights, &mut trial, Some(*count))?),
                     _ => None,
                 };
                 let fit = pool_fit(request, &available, &used, &trial, &unit_bytes);
@@ -503,6 +559,7 @@ fn solve_once(request: &PlacementRequest, flips: &[(AttentionClass, AttentionPla
                 }
             }
             let Some((fit, ranges, homes, tp2_range, limits, tier_placement)) = best else {
+                if let Some(error) = weight_refusal { return Err(error); }
                 return Err(if spark_free { PlacementError::SparkFree { layers: routed, placed: most } }
                     else { PlacementError::ExpertLayers { requested: n, placed: most } });
             };
@@ -588,7 +645,7 @@ fn solve_once(request: &PlacementRequest, flips: &[(AttentionClass, AttentionPla
                     .and_then(|n| n.checked_add(sum))).ok_or(Overflow("context peer rows"))?
         } else { 0 },
         onboard_layers,
-        max_pool_tokens_no_onboard: pool_tokens,
+        max_pool_tokens_no_onboard: Some(pool_tokens),
         layers: modes.into_iter().zip(homes).map(|(mode, experts)| LayerAssignment { mode, experts }).collect(),
         movables,
         expert_ranges: ranges,
@@ -708,20 +765,23 @@ fn residual_plan(modes: &[LayerMode], spec: &HopSpec, gpus: usize) -> Result<(Ve
 /// movables retain their historical most-free-device policy.
 #[allow(clippy::type_complexity)]
 fn conditional_movable(request: &PlacementRequest, movable: &Movable, available: &[u64],
-    used: &[u64], arenas: &[Arena], unit_bytes: &[u64], context: bool)
-    -> Result<(usize, Vec<u64>, Vec<Arena>, Vec<Demand>), PlacementError> {
-    let resident = movable.parts.iter().try_fold(0u64, |n, p| n.checked_add(p.resident))
+    used: &[u64], resident_weights: &[ResidentWeights], arenas: &[Arena], unit_bytes: &[u64], context: bool)
+    -> Result<(usize, Vec<u64>, Vec<ResidentWeights>, Vec<Arena>, Vec<Demand>), PlacementError> {
+    let resident = movable.parts.iter().try_fold(0u64, |n, p| n.checked_add(p.memory.resident))
         .ok_or(PlacementError::Overflow("movable"))?;
-    let mut best: Option<((u64, u64, std::cmp::Reverse<u8>), usize, Vec<u64>, Vec<Arena>, Vec<Demand>)> = None;
+    let weights = movable.parts.iter().try_fold(ResidentWeights::default(), |sum, p| sum.checked_add(p.resident_weights))?;
+    let mut best: Option<((u64, u64, std::cmp::Reverse<u8>), usize, Vec<u64>, Vec<ResidentWeights>, Vec<Arena>, Vec<Demand>)> = None;
     let mut refusal = None;
     for &home in &movable.allowed {
         let gpu = usize::from(home);
         let mut trial_used = used.to_vec();
+        let mut trial_weights = resident_weights.to_vec();
         let mut trial_arenas = arenas.to_vec();
         if movable.expert_arena {
             trial_arenas[gpu].open(request.expert_workspace);
-            for &part in &movable.parts { trial_arenas[gpu].add(part)?; }
+            for part in &movable.parts { trial_arenas[gpu].add(part.memory, part.resident_weights)?; }
         } else {
+            trial_weights[gpu] = trial_weights[gpu].checked_add(weights)?;
             trial_used[gpu] = trial_used[gpu].checked_add(resident)
                 .ok_or(PlacementError::Overflow("movable"))?;
         }
@@ -731,6 +791,13 @@ fn conditional_movable(request: &PlacementRequest, movable: &Movable, available:
             let charged = usize::from(demand.gpu);
             trial_used[charged] = trial_used[charged].checked_add(demand.bytes)
                 .ok_or(PlacementError::Overflow("movable conditional demand"))?;
+            trial_weights[charged] = trial_weights[charged].checked_add(demand.resident_weights)?;
+        }
+        let weight_check = trial_weights.iter().zip(&trial_arenas).enumerate().try_for_each(|(gpu, (&weights, arena))|
+            check_resident_weights(request, gpu, weights.checked_add(arena.resident_weights)?));
+        if let Err(error) = weight_check {
+            refusal.get_or_insert(error);
+            continue;
         }
         let totals = trial_used.iter().zip(&trial_arenas).map(|(&bytes, arena)|
             bytes.checked_add(arena.peak).ok_or(PlacementError::Overflow("movable candidate peak")))
@@ -759,11 +826,18 @@ fn conditional_movable(request: &PlacementRequest, movable: &Movable, available:
         }
         let score = (fit, available[gpu] - totals[gpu], std::cmp::Reverse(home));
         if best.as_ref().is_none_or(|(previous, ..)| score > *previous) {
-            best = Some((score, gpu, trial_used, trial_arenas, demands));
+            best = Some((score, gpu, trial_used, trial_weights, trial_arenas, demands));
         }
     }
-    best.map(|(_, gpu, used, arenas, demands)| (gpu, used, arenas, demands))
+    best.map(|(_, gpu, used, weights, arenas, demands)| (gpu, used, weights, arenas, demands))
         .ok_or_else(|| refusal.unwrap_or(PlacementError::Inventory("no movable candidate")))
+}
+
+fn check_resident_weights(request: &PlacementRequest, gpu: usize, weights: ResidentWeights) -> Result<(), PlacementError> {
+    if let Some(limit) = request.resident_weight_limit {
+        weights.check(gpu as u8, limit)?;
+    }
+    Ok(())
 }
 
 /// Whole units every KV-owning GPU holds beside what is charged and its arena.
@@ -845,11 +919,15 @@ fn nth_moe_end(request: &PlacementRequest, first: usize, n: usize) -> usize {
 /// One contiguous RTX prefix from the first MoE layer up to `limit`: GPU0's
 /// range, then GPU1's, each in its own arena and holding at most `caps[gpu]`
 /// routed layers. Returns the ranges, homes and the first layer not placed.
-fn place_experts(request: &PlacementRequest, available: &[u64], used: &[u64], arenas: &mut [Arena],
-    first_moe: usize, limit: usize, caps: &[usize]) -> Result<(Vec<ExpertRange>, Vec<ExpertHome>, usize, Option<Tp2Range>), PlacementError> {
+type ExpertPlacement = (Vec<ExpertRange>, Vec<ExpertHome>, usize, Option<Tp2Range>, Option<PlacementError>);
+
+fn place_experts(request: &PlacementRequest, available: &[u64], used: &[u64],
+    resident_weights: &[ResidentWeights], arenas: &mut [Arena],
+    first_moe: usize, limit: usize, caps: &[usize]) -> Result<ExpertPlacement, PlacementError> {
+    let mut weight_refusal = None;
     if available.len() == 2 && request.inventory.peer_access
         && request.layers.iter().any(|l| l.experts.is_some_and(|c| c.tp2)) {
-        return place_tp2(request, available, used, arenas, first_moe, limit, caps[0]);
+        return place_tp2(request, available, used, resident_weights, arenas, first_moe, limit, caps[0]);
     }
     if request.policy.expert_ownership == ExpertOwnership::AlternatingWhole {
         let mut homes = vec![ExpertHome::Spark; request.layers.len()];
@@ -861,11 +939,17 @@ fn place_experts(request: &PlacementRequest, available: &[u64], used: &[u64], ar
         let mut ordinal = 0;
         while next < limit {
             let Some(cost) = request.layers[next].experts else { next += 1; continue; };
+            if !cost.whole_supported { break; }
             let gpu = ordinal % request.expert_gpus.max(1);
             if gpu >= arenas.len() || counts[gpu] >= caps[gpu] { break; }
             let mut candidate = arenas[gpu].clone();
             candidate.open(request.expert_workspace);
-            candidate.add(cost.whole)?;
+            candidate.add(cost.whole, ResidentWeights(cost.whole.resident))?;
+            if let Err(error) = check_resident_weights(request, gpu,
+                resident_weights[gpu].checked_add(candidate.resident_weights)?) {
+                weight_refusal.get_or_insert(error);
+                break;
+            }
             if candidate.peak > available[gpu].saturating_sub(used[gpu]) { break; }
             arenas[gpu] = candidate;
             let range = &mut ranges[gpu];
@@ -877,7 +961,7 @@ fn place_experts(request: &PlacementRequest, available: &[u64], used: &[u64], ar
             ordinal += 1;
             next += 1;
         }
-        return Ok((ranges, homes, next, None));
+        return Ok((ranges, homes, next, None, weight_refusal));
     }
     let mut next = first_moe;
     let mut ranges = Vec::new();
@@ -889,9 +973,15 @@ fn place_experts(request: &PlacementRequest, available: &[u64], used: &[u64], ar
         let mut placed = 0;
         while next < limit && placed < caps[gpu] {
             let Some(cost) = request.layers[next].experts else { next += 1; continue };
+            if !cost.whole_supported { break; }
             let mut candidate = trial.clone();
             candidate.open(request.expert_workspace);
-            candidate.add(cost.whole)?;
+            candidate.add(cost.whole, ResidentWeights(cost.whole.resident))?;
+            if let Err(error) = check_resident_weights(request, gpu,
+                resident_weights[gpu].checked_add(candidate.resident_weights)?) {
+                weight_refusal.get_or_insert(error);
+                break;
+            }
             if candidate.peak > budget { break; }
             trial = candidate;
             homes[next] = ExpertHome::RtxWhole { gpu: gpu as u8 };
@@ -901,7 +991,7 @@ fn place_experts(request: &PlacementRequest, available: &[u64], used: &[u64], ar
         *arena = trial;
         ranges.push(ExpertRange { first, layers: next - first, peak_bytes: arena.peak });
     }
-    Ok((ranges, homes, next, None))
+    Ok((ranges, homes, next, None, weight_refusal))
 }
 
 /// Whether the inventory can run `mode`: a head split, a split FFN or any
@@ -938,13 +1028,15 @@ struct Arena {
     resident: u64,
     peak: u64,
     staging: u64,
+    resident_weights: ResidentWeights,
 }
 
 impl Arena {
     fn open(&mut self, workspace: u64) {
         if !self.opened { self.opened = true; self.resident = workspace; self.peak = workspace; }
     }
-    fn add(&mut self, part: Bytes2) -> Result<(), PlacementError> {
+    fn add(&mut self, part: Bytes2, weights: ResidentWeights) -> Result<(), PlacementError> {
+        self.resident_weights = self.resident_weights.checked_add(weights)?;
         let loading = self.resident.checked_add(part.resident).and_then(|n| n.checked_add(part.staging))
             .ok_or(PlacementError::Overflow("expert arena peak"))?;
         self.peak = self.peak.max(loading);
@@ -955,9 +1047,10 @@ impl Arena {
 
 /// TP1 movable arenas remain alive beside distinct TP2 backbone arenas. Both
 /// peaks are reserved; fixed onboard never searches a whole-layer GPU split.
-fn place_tp2(request: &PlacementRequest, available: &[u64], used: &[u64], tp1: &mut [Arena],
-    first: usize, limit: usize, cap: usize)
-    -> Result<(Vec<ExpertRange>, Vec<ExpertHome>, usize, Option<Tp2Range>), PlacementError> {
+fn place_tp2(request: &PlacementRequest, available: &[u64], used: &[u64],
+    resident_weights: &[ResidentWeights], tp1: &mut [Arena],
+    first: usize, limit: usize, cap: usize) -> Result<ExpertPlacement, PlacementError> {
+    let mut weight_refusal = None;
     let ranges = tp1.iter().map(|a| ExpertRange { first, layers: 0, peak_bytes: a.peak }).collect();
     let mut halves = [Arena::default(), Arena::default()];
     let mut homes = vec![ExpertHome::Spark; request.layers.len()];
@@ -968,11 +1061,14 @@ fn place_tp2(request: &PlacementRequest, available: &[u64], used: &[u64], tp1: &
         let mut candidate = halves.clone();
         for gpu in 0..2 {
             candidate[gpu].open(request.tp2_workspace[gpu]);
-            candidate[gpu].add(cost.half[gpu])?;
+            candidate[gpu].add(cost.half[gpu], ResidentWeights(cost.half[gpu].resident))?;
             candidate[gpu].staging = candidate[gpu].staging.max(cost.half[gpu].staging);
             candidate[gpu].peak = candidate[gpu].resident.checked_add(candidate[gpu].staging)
                 .ok_or(PlacementError::Overflow("TP2 resident plus largest staging"))?;
         }
+        let weights = (0..2).try_for_each(|gpu| check_resident_weights(request, gpu,
+            resident_weights[gpu].checked_add(tp1[gpu].resident_weights)?.checked_add(candidate[gpu].resident_weights)?));
+        if let Err(error) = weights { weight_refusal = Some(error); break; }
         if (0..2).any(|g| candidate[g].peak > available[g].saturating_sub(used[g]).saturating_sub(tp1[g].peak)) { break; }
         halves = candidate;
         homes[next] = ExpertHome::RtxTp2;
@@ -984,8 +1080,9 @@ fn place_tp2(request: &PlacementRequest, available: &[u64], used: &[u64], tp1: &
     for gpu in 0..2 {
         tp1[gpu].peak = tp1[gpu].peak.checked_add(halves[gpu].peak)
             .ok_or(PlacementError::Overflow("TP1 and TP2 arena peaks"))?;
+        tp1[gpu].resident_weights = tp1[gpu].resident_weights.checked_add(halves[gpu].resident_weights)?;
     }
-    Ok((ranges, homes, next, range))
+    Ok((ranges, homes, next, range, weight_refusal))
 }
 
 /// The GPU expert tier: a prefix of `tier.order` resident beside the Sparks
@@ -996,7 +1093,7 @@ fn place_tp2(request: &PlacementRequest, available: &[u64], used: &[u64], tp1: &
 /// otherwise the longest prefix that fits, up to `tier.useful`. Either way the
 /// pinned whole layers must fit. An empty tier charges nothing.
 fn place_tier(request: &PlacementRequest, tier: &ExpertTierRequest, available: &[u64], used: &[u64],
-    arenas: &mut [Arena], exact: Option<usize>) -> Result<ExpertTierPlacement, PlacementError> {
+    resident_weights: &[ResidentWeights], arenas: &mut [Arena], exact: Option<usize>) -> Result<ExpertTierPlacement, PlacementError> {
     use PlacementError::{Inventory, Overflow};
     let gpus = available.len();
     let tp2 = gpus == 2 && request.inventory.peer_access
@@ -1033,12 +1130,19 @@ fn place_tier(request: &PlacementRequest, tier: &ExpertTierRequest, available: &
         for gpu in charged.clone() {
             let part = super::expert_tier::per_expert(&cost, tp2, gpu, experts).expect("checked above");
             candidate[gpu].open(workspace(gpu));
-            candidate[gpu].add(part)?;
+            candidate[gpu].add(part, ResidentWeights(part.resident))?;
             candidate[gpu].staging = candidate[gpu].staging.max(part.staging);
             candidate[gpu].peak = candidate[gpu].resident.checked_add(candidate[gpu].staging)
                 .ok_or(Overflow("GPU expert tier resident plus largest staging"))?;
         }
         if charged.clone().any(|gpu| candidate[gpu].peak > budget[gpu]) { break; }
+        let weights = charged.clone().try_for_each(|gpu| check_resident_weights(request, gpu,
+            resident_weights[gpu].checked_add(arenas[gpu].resident_weights)?
+                .checked_add(candidate[gpu].resident_weights)?));
+        if let Err(error) = weights {
+            if exact.is_some() || placed < tier.pinned { return Err(error); }
+            break;
+        }
         arena = candidate;
         placed += 1;
     }
@@ -1054,6 +1158,7 @@ fn place_tier(request: &PlacementRequest, tier: &ExpertTierRequest, available: &
         for gpu in charged.clone() {
             resident_bytes[gpu] = arena[gpu].resident - workspace(gpu);
             peak_bytes[gpu] = arena[gpu].peak;
+            arenas[gpu].resident_weights = arenas[gpu].resident_weights.checked_add(arena[gpu].resident_weights)?;
             arenas[gpu].peak = arenas[gpu].peak.checked_add(arena[gpu].peak)
                 .ok_or(Overflow("TP1 and GPU expert tier arena peaks"))?;
         }

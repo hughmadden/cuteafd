@@ -19,7 +19,7 @@ impl<'a> PlacedProducerStorage<'a> {
         for gpu in 0..2 {
             if !windows[gpu].is_empty() {
                 storage.windows[gpu] = Some(device(gpu).own(|| crate::families::deepseek_v41::v41_window::WindowStorage::new(
-                    library, rows, unit, &windows[gpu], true))?);
+                    library, rows, unit, &windows[gpu]))?);
             }
             if !sources[gpu].is_empty() {
                 storage.sources[gpu] = Some(device(gpu).own(|| crate::families::deepseek_v41::v41_compressor::CompressorStorage::new(
@@ -387,7 +387,7 @@ impl<'w, 'a> PlacedProducerWaves<'w, 'a> {
                     let shared = match &storage[gpu] {
                         Some(shared) => shared.clone(),
                         None => crate::families::deepseek_v41::v41_window::WindowStorage::new(weights.device.library,
-                            capacity as usize, capacity as usize, &layers[gpu], false)?,
+                            capacity as usize, capacity as usize, &layers[gpu])?,
                     };
                     storage[gpu] = Some(shared.clone());
                     weights.on_storage(shared)
@@ -500,6 +500,7 @@ impl<'a> CacheProducerWeights<'a> {
         }
         Ok(bytes)
     }
+    #[cfg(test)]
     pub fn load_distributed(
         library: &'a NativeLibrary,
         catalog: &OfficialV41Catalog,
@@ -517,11 +518,19 @@ impl<'a> CacheProducerWeights<'a> {
         );
         Self::load_placed(library, catalog, staging, Some(placement))
     }
+    #[cfg(test)]
     pub(super) fn load_placed(
         library: &'a NativeLibrary,
         catalog: &OfficialV41Catalog,
         staging: usize,
         placement: Option<CachePlacement>,
+    ) -> Result<Self> {
+        Self::load_in(library, catalog, staging, placement, None)
+    }
+    pub(crate) fn load_in(
+        library: &'a NativeLibrary, catalog: &OfficialV41Catalog, staging: usize,
+        placement: Option<CachePlacement>,
+        arenas: Option<&crate::families::deepseek_v41::weight_layout::TargetArenas<'a>>,
     ) -> Result<Self> {
         let original = library.cuda_get_device()?;
         let device_for = |layer| -> Result<Device<'a>> {
@@ -535,13 +544,15 @@ impl<'a> CacheProducerWeights<'a> {
         };
         let windows = (0..40)
             .map(|layer| {
-                device_for(layer)?.own(|| {
-                    WindowWeights::load(
+                let device = device_for(layer)?;
+                let arena = arenas.map(|arenas| arenas.get(device.id)).transpose()?;
+                device.own(|| {
+                    WindowWeights::load_in(
                         library,
                         catalog,
                         layer,
                         WindowWeights::device_bytes(library, catalog, layer)?,
-                        staging,
+                        staging, arena,
                     )
                 })
             })
@@ -549,13 +560,15 @@ impl<'a> CacheProducerWeights<'a> {
         let sources = SOURCES
             .into_iter()
             .map(|layer| {
-                device_for(layer)?.own(|| {
-                    CompressorWeights::load(
+                let device = device_for(layer)?;
+                let arena = arenas.map(|arenas| arenas.get(device.id)).transpose()?;
+                device.own(|| {
+                    CompressorWeights::load_in(
                         library,
                         catalog,
                         layer,
                         CompressorWeights::device_bytes(catalog, layer)?,
-                        staging,
+                        staging, arena,
                     )
                 })
             })
@@ -579,13 +592,11 @@ impl<'a> CacheProducerWeights<'a> {
             if names.is_empty() {
                 continue;
             }
+            let arena = arenas.map(|arenas| arenas.get(id)).transpose()?;
             sinks.push(Device { library, id }.own(|| {
-                NativeRtxTensors::load(
-                    library,
-                    catalog,
-                    &names,
-                    NativeRtxTensors::plan(catalog, &names)?,
-                    staging,
+                NativeRtxTensors::load_in(
+                    library, catalog, &names, NativeRtxTensors::plan(catalog, &names)?,
+                    staging, arena,
                 )
             })?);
         }

@@ -525,7 +525,7 @@ impl V41CompactReducer<'_> {
 
     /// Sum `ranks` physical-rank BF16 [rows,5120] partial planes in rank order in
     /// FP32, add the optional BF16 shared expert exactly once, then round once to
-    /// BF16. This is the replicated-group contract: every physical rank returns
+    /// BF16. Every physical rank returns
     /// one plane directly to the coordinator, with no group-local reduction.
     /// # Safety
     /// `planes[0..ranks]` must be live non-null CUDA BF16 [rows,5120] views on the
@@ -584,10 +584,7 @@ impl V41RouteReducer<'_> {
     ) -> Result<()> {
         let status =
             unsafe { (self.reduce)(planes.as_ptr(), shared, output, rows, ranks, topk, stream) };
-        ensure!(
-            status == 0,
-            "V4.1 route reduction failed with CUDA status {status}"
-        );
+        self._library.status_to_result("V4.1 route reduction", status)?;
         Ok(())
     }
 }
@@ -758,17 +755,17 @@ impl NativeLibrary {
         self.expert_info_for(capacity,4)
     }
 
-    /// Replicated-group Spark TP2 shard metadata (intermediate 1152, SM121).
+    /// Spark TP2 shard metadata (intermediate 1152, SM121).
     pub fn v41_spark_tp2_expert_info(&self, capacity: u32) -> Result<V41ExpertInfo> {
         self.expert_info_for(capacity, 8)
     }
 
-    /// Replicated-group Spark TP3 shard metadata (intermediate 768, SM121).
+    /// Spark TP3 shard metadata (intermediate 768, SM121).
     pub fn v41_spark_tp3_expert_info(&self, capacity: u32) -> Result<V41ExpertInfo> {
         self.expert_info_for(capacity, 9)
     }
 
-    /// Pure `TP6EP1` Spark shard metadata (intermediate 384, SM121). Six
+    /// Spark TP6 shard metadata (intermediate 384, SM121). Six
     /// disjoint intermediate slices of every routed expert, no storage padding.
     pub fn v41_spark_tp6_expert_info(&self, capacity: u32) -> Result<V41ExpertInfo> {
         self.expert_info_for(capacity, 11)
@@ -895,7 +892,7 @@ impl NativeLibrary {
     fn expert_info_for(&self, capacity: u32, interface: u8) -> Result<V41ExpertInfo> {
         // 5..7 select the W4A4 ModelOpt NVFP4 family (RTX TP2, Spark TP4, full
         // RTX); 0..4 select the native W4A8 family; 8/9/11 select the native
-        // replicated-group Spark TP2/TP3 and pure TP6 shards. All may live in
+        // Spark TP2/TP3 and pure TP6 shards. All may live in
         // one library.
         let name: &[u8] = match interface {
             2 => b"cuteafd_v41_local_expert_info",
@@ -948,7 +945,7 @@ impl NativeLibrary {
             "unsupported native expert input representation"
         );
         if matches!(interface, 8 | 9 | 11 | 14) {
-            // Replicated-group and pure TP6 Spark shards are always exported
+            // Spark TP shards are always exported
             // from the native FP8 K32 wire format; reject a BF16-hidden
             // artifact explicitly.
             ensure!(
@@ -1009,17 +1006,17 @@ impl NativeLibrary {
         self.expert_kernel_for(capacity,4)
     }
 
-    /// Replicated-group Spark TP2 shard kernels (native FP8 K32, SM121).
+    /// Spark TP2 shard kernels (native FP8 K32, SM121).
     pub fn v41_spark_tp2_expert_kernel(&self, capacity: u32) -> Result<V41ExpertKernel<'_>> {
         self.expert_kernel_for(capacity, 8)
     }
 
-    /// Replicated-group Spark TP3 shard kernels (native FP8 K32, SM121).
+    /// Spark TP3 shard kernels (native FP8 K32, SM121).
     pub fn v41_spark_tp3_expert_kernel(&self, capacity: u32) -> Result<V41ExpertKernel<'_>> {
         self.expert_kernel_for(capacity, 9)
     }
 
-    /// Pure `TP6EP1` Spark shard kernels (native FP8 K32, SM121): six disjoint
+    /// Spark TP6 shard kernels (native FP8 K32, SM121): six disjoint
     /// intermediate slices of every routed expert, no storage padding.
     pub fn v41_spark_tp6_expert_kernel(&self, capacity: u32) -> Result<V41ExpertKernel<'_>> {
         self.expert_kernel_for(capacity, 11)
@@ -1230,10 +1227,7 @@ impl V41ExpertKernel<'_> {
     /// every captured graph replay, with stream ordering enforced by the caller.
     pub unsafe fn launch(&self, args: &V41ExpertLaunchArgs) -> Result<()> {
         let status = unsafe { (self.launch)(self.handle.as_ptr(), args) };
-        ensure!(
-            status == 0,
-            "V4.1 expert launch failed with CUDA status {status}"
-        );
+        self._library.status_to_result("V4.1 expert launch", status)?;
         Ok(())
     }
 }
@@ -1283,7 +1277,7 @@ mod tests {
 
     #[test]
     fn expected_geometry_covers_spark_tp2_tp3_tp6_without_touching_rtx_tp2() {
-        // Replicated-group Spark shards: TP2 1152 and TP3 768 are unpadded, and
+        // Spark shards: TP2 1152 and TP3 768 are unpadded, and
         // pure TP6 384 stores exactly its 2304/6 slice with no padding.
         assert_eq!(expected_expert_geometry(V41, false, 5, 1152), Some((384, 1152, 1152, 6)));
         assert_eq!(expected_expert_geometry(V41, false, 6, 768), Some((384, 768, 768, 6)));
@@ -1413,6 +1407,7 @@ mod tests {
     #[test]
     #[ignore = "requires CUTEAFD_NATIVE_LIB and CUDA; nonzero deterministic BF16 route oracle"]
     fn bf16_route_reducers_match_exact_nonzero_oracle() -> Result<()> {
+        let _ledger = crate::memory_ledger::test_guard();
         let library = unsafe { NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?)? };
         library.cuda_set_device(0)?;
         let compact = library.v41_compact_reducer()?;
@@ -1420,9 +1415,9 @@ mod tests {
         // Nonuniform rows, columns, routes and ranks catch prefix-only copies,
         // dtype reinterpretation, wrong strides and omitted top-k reduction.
         let capacity = 80usize;
-        let mut rank0 = library.alloc_device_buffer(capacity * 6 * 5120 * 2)?;
-        let mut rank1 = library.alloc_device_buffer(capacity * 6 * 5120 * 2)?;
-        let mut output = library.alloc_device_buffer(capacity * 5120 * 2)?;
+        let mut rank0 = library.alloc_device_buffer(capacity * 6 * 5120 * 2, crate::memory_ledger::TEST)?;
+        let mut rank1 = library.alloc_device_buffer(capacity * 6 * 5120 * 2, crate::memory_ledger::TEST)?;
+        let mut output = library.alloc_device_buffer(capacity * 5120 * 2, crate::memory_ledger::TEST)?;
         let result = (|| -> Result<()> {
             for rows in [1usize, 16, 80, 3, 1] {
                 let mut sources = [Vec::new(), Vec::new()];
@@ -1472,14 +1467,15 @@ mod tests {
     #[test]
     #[ignore = "requires CUTEAFD_NATIVE_LIB and CUDA; local BF16 route/shared oracle"]
     fn local_bf16_routes_preserve_compact_boundary() -> Result<()> {
+        let _ledger = crate::memory_ledger::test_guard();
         let library = unsafe { NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?)? };
         library.cuda_set_device(0)?;
         let reducer = library.v41_local_expert_reducer()?;
         let capacity = 80usize;
-        let mut routes = library.alloc_device_buffer(capacity * 6 * 5120 * 2)?;
-        let mut fp32_routes = library.alloc_device_buffer(capacity * 6 * 5120 * 4)?;
-        let mut shared = library.alloc_device_buffer(capacity * 5120 * 2)?;
-        let mut output = library.alloc_device_buffer(capacity * 5120 * 2)?;
+        let mut routes = library.alloc_device_buffer(capacity * 6 * 5120 * 2, crate::memory_ledger::TEST)?;
+        let mut fp32_routes = library.alloc_device_buffer(capacity * 6 * 5120 * 4, crate::memory_ledger::TEST)?;
+        let mut shared = library.alloc_device_buffer(capacity * 5120 * 2, crate::memory_ledger::TEST)?;
+        let mut output = library.alloc_device_buffer(capacity * 5120 * 2, crate::memory_ledger::TEST)?;
         let bf16 = |value: f32| {
             let bits = value.to_bits();
             ((bits.wrapping_add(0x7fff + ((bits >> 16) & 1))) >> 16) as u16
@@ -1548,14 +1544,15 @@ mod tests {
     #[test]
     #[ignore = "requires CUTEAFD_NATIVE_LIB and CUDA; TP2/TP4 compact BF16 oracle"]
     fn compact_planes_sum_in_fp32_before_shared_and_final_rounding() -> Result<()> {
+        let _ledger = crate::memory_ledger::test_guard();
         let library = unsafe { NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?)? };
         library.cuda_set_device(0)?;
         let reducer = library.v41_compact_reducer()?;
         let capacity = 80usize;
-        let mut planes = (0..4).map(|_| library.alloc_device_buffer(capacity * 10240))
+        let mut planes = (0..4).map(|_| library.alloc_device_buffer(capacity * 10240, crate::memory_ledger::TEST))
             .collect::<Result<Vec<_>>>()?;
-        let mut shared = library.alloc_device_buffer(capacity * 10240)?;
-        let mut output = library.alloc_device_buffer(capacity * 10240)?;
+        let mut shared = library.alloc_device_buffer(capacity * 10240, crate::memory_ledger::TEST)?;
+        let mut output = library.alloc_device_buffer(capacity * 10240, crate::memory_ledger::TEST)?;
         let bf16 = |value: f32| {
             let bits = value.to_bits();
             ((bits.wrapping_add(0x7fff + ((bits >> 16) & 1))) >> 16) as u16
@@ -1785,7 +1782,7 @@ impl V41ExpertInputQuantizer<'_> {
                 stream,
             )
         };
-        ensure!(status == 0, "expert input quantization failed: {status}");
+        self._library.status_to_result("expert input quantization", status)?;
         Ok(())
     }
 }
@@ -1931,6 +1928,39 @@ impl V41LocalExpertReducer<'_> {
         output: *mut u16, rows: u32, token_sums: bool, stream: *mut c_void) -> Result<()> {
         let status = unsafe { (self.finish)(routed, shared, output, rows, u32::from(token_sums), stream) };
         ensure!(status == 0, "local expert reduction failed with CUDA status {status}");
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod draft_failure_tests {
+    use super::*;
+    #[test]
+    fn expert_reducer_and_input_quantizer_native_failures_are_tagged() -> Result<()> {
+        let library = crate::tests::draft_failure_library()?;
+        unsafe extern "C" fn launch(_: *mut c_void, _: *const V41ExpertLaunchArgs) -> i32 { 98 }
+        unsafe extern "C" fn bind(_: *mut c_void, _: *mut c_void, _: u64, _: *mut *mut c_void) -> i32 { 0 }
+        unsafe extern "C" fn init(_: *mut c_void, _: *mut c_void, _: u64, _: *mut c_void) -> i32 { 0 }
+        unsafe extern "C" fn groups(_: i32, _: i32, _: *mut u32) -> i32 { 0 }
+        unsafe extern "C" fn reduce(_: *const *const f32, _: *const u16, _: *mut u16,
+            _: u32, _: u32, _: u32, _: *mut c_void) -> i32 { 98 }
+        unsafe extern "C" fn quantize(_: *mut c_void, _: *const u16, _: *mut u8, _: u32, _: *mut c_void) -> i32 { 98 }
+        let info = V41ExpertInfo { capacity_rows: 1, topk: 6, ..Default::default() };
+        let kernel = V41ExpertKernel { _library: &library, handle: NonNull::dangling(), launch,
+            bind_scratch: bind, initialize_scratch: init, info, output_kind: V41ExpertOutputKind::Fp32Routes,
+            group_rows: 1, query_group_rows: groups };
+        let b = CuteafdDeviceBuffer { ptr: NonNull::<u16>::dangling().as_ptr().cast(),
+            bytes: 10240, device_id: 0, flags: 0 };
+        let args = V41ExpertLaunchArgs::new(&info, [b.ptr; V41_EXPERT_POINTER_COUNT], 1, std::ptr::null_mut())?;
+        let reducer = V41RouteReducer { _library: &library, reduce };
+        let quantizer = V41ExpertInputQuantizer { _library: &library, handle: NonNull::dangling(), launch: quantize };
+        // SAFETY: these injected native callbacks return a status without dereferencing pointers.
+        unsafe {
+            crate::tests::assert_draft_native_failure(kernel.launch(&args));
+            crate::tests::assert_draft_native_failure(reducer.launch([b.ptr.cast(); 4], b.ptr.cast(),
+                b.ptr.cast(), 1, 4, 6, std::ptr::null_mut()));
+            crate::tests::assert_draft_native_failure(quantizer.launch(b, b, 1, std::ptr::null_mut()));
+        }
         Ok(())
     }
 }

@@ -1,7 +1,7 @@
 //! Shared scheduler adapter; a native Step is the only pending verify evidence.
 use super::{cache::CacheRank, execution::Execution, prefix::{Frontier, Placement, Step5Prefix},
     transaction::{Pending, SequenceRows, Step}};
-use crate::shared::{draft::routes::RoundRoutes, memory::device::{Allocation, Device},
+use crate::shared::{draft::routes::RoundRoutes, memory::{device::{Allocation, Device}, Tag},
     prefix::{CudaCopyEngine, PrefixArgs, Toggle}, qwen::scheduler::{self, Backend},
     token_io::{DeviceLogits, TokenEmbedding}};
 use anyhow::{ensure, Context, Result};
@@ -123,9 +123,9 @@ impl<'a> Inputs<'a> {
 
     pub(super) fn allocate(device: Device<'a>, rows: usize, available: u64) -> Result<Self> {
         ensure!(Self::bytes(rows)? <= available, "Step-5 input storage exceeds admission");
-        Ok(Self { ids: Allocation::new(device, rows * 4)?,
-            bf16: Allocation::new(device, rows * H * 2)?,
-            residual: Allocation::new(device, rows * H * 4)?, rows })
+        Ok(Self { ids: Allocation::new(device, rows * 4, Tag::workspace("step5/inputs"))?,
+            bf16: Allocation::new(device, rows * H * 2, Tag::workspace("step5/inputs"))?,
+            residual: Allocation::new(device, rows * H * 4, Tag::workspace("step5/inputs"))?, rows })
     }
 }
 
@@ -150,6 +150,7 @@ pub(super) struct Step5Backend<'e, 'a> {
     prefill: (usize, usize),
     depth: Option<crate::shared::prefill_depth::PrefillDepth>,
     packed_row_cap: Option<usize>,
+    admitted_host: Option<(u64, cuteafd_core::prefix::HostCacheGeometry)>,
 }
 
 impl<'e, 'a> Step5Backend<'e, 'a> {
@@ -182,7 +183,19 @@ impl<'e, 'a> Step5Backend<'e, 'a> {
         };
         Ok(Self { state: BackendState::new(fail_verify_once), execution, ranks, embedding, inputs,
             profile: RefCell::new([0.0; 2]), rows, context, sequences, library, mtp: None,
-            full_prefill_logits: false, prefill: (rows, 1), depth: None, packed_row_cap: None })
+            full_prefill_logits: false, prefill: (rows, 1), depth: None, packed_row_cap: None, admitted_host: None })
+    }
+
+    pub(super) fn with_served_context(mut self, context: usize) -> Result<Self> {
+        ensure!(context > 0 && context <= self.context, "served context exceeds compiled Step-5 cache extent");
+        self.context = context;
+        Ok(self)
+    }
+
+    pub(super) fn with_admitted_host(mut self, bytes: u64,
+        geometry: cuteafd_core::prefix::HostCacheGeometry) -> Self {
+        self.admitted_host = Some((bytes, geometry));
+        self
     }
 
     /// Prefill units: `depth`'s waves of its unit, cut from the step's rows.
@@ -226,6 +239,50 @@ impl<'e, 'a> Step5Backend<'e, 'a> {
     pub(super) fn with_mtp(mut self, mtp: &'e super::mtp::Runtime<'a>) -> Self {
         self.mtp = Some(mtp);
         self
+    }
+
+    /// Startup owns slot zero and disposable pages before the scheduler exists.
+    /// Run the real joins, but never publish a scratch proposal or prefix mark.
+    pub(super) fn warm_decode_graphs(&self,
+        layout: Option<cuteafd_loader::serving_capacity::step5_graphs::Step5GraphLayout>) -> Result<()> {
+        let selected = cuteafd_loader::serving_capacity::step5_graphs::selected_rows(
+            layout, self.prefill.0.min(self.rows).min(self.context))?;
+        if selected.is_empty() { return Ok(()); }
+        self.state.retire();
+        let page_count = usize::try_from(self.ranks[0].borrow().page_count())?;
+        let mut pool = RefPagePool::new(page_count, 64);
+        let reset = || -> Result<()> {
+            for rank in &self.ranks { rank.borrow().reset_sequence(0)?; }
+            Ok(())
+        };
+        let result = self.execution.warming_graphs(|| -> Result<()> {
+            for &(rows, _) in &selected {
+                let pages = pool.alloc(rows.div_ceil(64)).context("Step-5 graph prewarm scratch pages")?;
+                let mut placement = Placement { pages, sequence: 0, committed: 0 };
+                let tokens = vec![0u32; rows];
+                // First-touch eagerly, seed after lazy module/workspace setup,
+                // then capture the same persistent geometry on the next pass.
+                let warmed = (|| -> Result<()> {
+                    for pass in 0..2 {
+                        reset()?;
+                        let (step, _) = self.execute_inner(&[(&mut placement, &tokens)], &pool,
+                            cuteafd_transport::ExpertV2SourceKind::MtpVerify, Some(0))?;
+                        drop(step);
+                        if pass == 0 { self.execution.observe_graph_startup()?; }
+                    }
+                    Ok(())
+                })();
+                pool.release(&placement.pages);
+                reset()?;
+                warmed?;
+            }
+            Ok(())
+        });
+        let cleaned = reset();
+        result?;
+        cleaned?;
+        tracing::info!(?layout, rows = ?selected, "Step-5 graph prewarm completed on scratch state");
+        Ok(())
     }
 
     /// Score retained packed target rows before another target pass replaces them.
@@ -331,10 +388,7 @@ impl<'e, 'a> Step5Backend<'e, 'a> {
             ensure!(device.id == meta.stream.device.id, "Step-5 final output/head device mismatch");
             let cache = self.ranks[head_rank].borrow();
             if let Some(history) = cache.layout().ranks[head_rank].mtp_hidden {
-                let ring = cuteafd_core::prefix::AppendRing {
-                    window: cache.layout().mtp_hidden_rows - cache.layout().step_rows,
-                    step: cache.layout().step_rows, rows: cache.layout().mtp_hidden_rows,
-                };
+                let ring = cache.layout().mtp_history.context("Step-5 MTP hidden history ring")?;
                 for sequence in &descriptors {
                     let target = cache.request_component(history, sequence.sequence)?;
                     for run in ring.proposal(sequence.base as u64, sequence.rows as u64)
@@ -428,7 +482,21 @@ impl<'e, 'a> Backend<'a> for Step5Backend<'e, 'a> {
         let shape = self.geometry();
         let args = args.with_scoring(shape.decode_rows, shape.decode_rows, V)?;
         let layout = family.layout();
-        let host = args.host_config(layout, shape.max_context, lanes)?.map(|config|
+        let config = match self.admitted_host {
+            Some((0, _)) => None,
+            Some((bytes, geometry)) => {
+                ensure!(geometry.unit_rows == layout.page_rows as u64
+                    && geometry.page_bytes == layout.page_bytes as u64
+                    && geometry.mark_bytes == layout.mark_bytes as u64
+                    && geometry.draft_bytes == layout.draft_bytes as u64,
+                    "Step-5 live prefix geometry differs from admitted host owner");
+                let mut fixed = args.clone();
+                fixed.host_cache_bytes = crate::shared::prefix::budget::HostBudget::Bytes(bytes);
+                fixed.resolve_host_config(layout, shape.max_context, lanes)?
+            }
+            None => args.host_config(layout, shape.max_context, lanes)?,
+        };
+        let host = config.map(|config|
             CudaCopyEngine::registered_owned(self.library, family.snapshot_owners()).map(|copy| (config, copy))).transpose()?;
         let host_bytes = host.as_ref().map_or(0, |(config, _)| config.bytes);
         let config = PrefixConfig { entries: args.prefix_cache_entries, mark_slots: family.slots(),
@@ -486,6 +554,36 @@ impl<'e, 'a> Backend<'a> for Step5Backend<'e, 'a> {
         if logit_rows == 0 { return Ok(None); }
         Ok(Some(logits))
     }
+    fn streamed_prefill_scoring(&self) -> bool { true }
+    fn prefill_scoring(&self, placement: &mut Placement, tokens: &[u32], logit_rows: usize,
+        position: usize, probe: &crate::shared::probe::ProbeRef, pool: &RefPagePool)
+        -> Result<Option<crate::shared::probe::ScoreLogits>> {
+        if logit_rows <= 1 || self.full_prefill_logits {
+            return Ok(self.prefill_device(placement, tokens, logit_rows, pool)?
+                .map(crate::shared::probe::ScoreLogits::Device));
+        }
+        ensure!(logit_rows <= tokens.len(), "Step-5 scoring logits extent");
+        self.state.submit(|| {
+            let (mut step, _) = self.state.post_execution(self.execute_inner(&[(&mut *placement, tokens)], pool,
+                cuteafd_transport::ExpertV2SourceKind::Prefill, Some(0))?)?;
+            let rank = self.execution.ownership().execution().spec().head_gpu as usize;
+            let head = self.execution.head()?;
+            let scoring = crate::shared::probe::ScoringRows { probe, position };
+            // The complete transformer call stays intact. Its terminal residual
+            // was retained in the independent input owner before head scratch reuse.
+            step.compose(rank, head, |head, meta| {
+                for span in crate::shared::probe::head_spans(logit_rows, self.rows.min(64))? {
+                    let source = super::mtp::slice(self.inputs.residual.buffer,
+                        (tokens.len() - logit_rows + span.start) * H * 4, span.len() * H * 4)?;
+                    let logits = head.device_logits_on(source, span.len(), meta.stream)?;
+                    scoring.record(self.library, span.start, &logits)?;
+                }
+                Ok(())
+            })?;
+            step.publish_wave(&mut [(placement, tokens.len())])?;
+            Ok(Some(crate::shared::probe::ScoreLogits::Recorded))
+        })
+    }
     fn packed_limits(&self) -> Option<crate::shared::prefill_packing::Limits> {
         Some(self.packing_limits())
     }
@@ -532,21 +630,24 @@ impl<'e, 'a> Backend<'a> for Step5Backend<'e, 'a> {
         kind: scheduler::UngraphedKind, pool: &RefPagePool) -> Result<Option<DeviceLogits>> {
         self.state.retire();
         let source = ungraphed_kind(speculative, kind);
-        if speculative { self.state.verify(|| self.execute(sequences, pool, source, None)).map(Some) }
-        else { self.immediate(sequences, pool, source, None).map(Some) }
+        self.execution.without_graphs(|| {
+            if speculative { self.state.verify(|| self.execute(sequences, pool, source, None)).map(Some) }
+            else { self.immediate(sequences, pool, source, None).map(Some) }
+        })
     }
     fn verify_bucket_rows(&self, rows: usize, _speculative: bool, _diagnostic: bool) -> usize { rows }
-    fn verify_attention_trace(&self, contexts: &[Vec<usize>], rows: usize) -> serde_json::Value {
-        serde_json::json!({"kind":"step5_swa512_csa64", "rows":rows, "contexts":contexts,
-            "attention":"eager_per_sequence", "arithmetic":"eager"})
+    fn verify_attention_trace(&self, contexts: &[Vec<usize>], rows: usize) -> crate::shared::speculation_trace::Deferred {
+        let contexts = contexts.to_vec();
+        crate::shared::speculation_trace::Deferred::new(move || serde_json::json!({"kind":"step5_swa512_csa64", "rows":rows, "contexts":contexts,
+            "attention":"eager_per_sequence", "arithmetic":"eager"}))
     }
-    fn draft_geometry(&self, snapshot: &Path, width: usize) -> Result<cuteafd_core::PolicyGeometry> {
+    fn draft_geometry(&self, _snapshot: &Path, width: usize) -> Result<cuteafd_core::PolicyGeometry> {
         ensure!(self.mtp.is_some(), "Step-5 MTP runtime is not admitted");
-        self.execution.draft_geometry(snapshot, width, self.geometry().decode_rows)
+        self.execution.draft_geometry(width, self.geometry().decode_rows)
     }
     fn arm_draft_probe(&self) -> Result<()> {
         ensure!(self.mtp.is_some(), "Step-5 MTP runtime is not admitted");
-        Ok(())
+        self.execution.arm_draft_probe()
     }
     fn prefill_draft(&self, placement: &Placement, start: usize, chunk: &[u32], _next: Option<u32>,
         draft: &mut NoDraft) -> Result<()> {
@@ -554,7 +655,7 @@ impl<'e, 'a> Backend<'a> for Step5Backend<'e, 'a> {
         mtp.prefill(&self.ranks[mtp.rank()].borrow(), placement, start, chunk, draft, self.embedding)
     }
     fn draft(&self, sequences: &mut [scheduler::DraftSeq<'_, Placement, NoDraft>],
-        timing: &mut scheduler::DraftTiming) -> Result<Vec<Vec<u32>>> {
+        timing: &mut scheduler::DraftTiming, _selector: &mut crate::shared::token_io::TokenSelector<'_>) -> Result<Vec<Vec<u32>>> {
         let mtp = self.mtp.context("Step-5 MTP runtime is not admitted")?;
         let started = std::time::Instant::now();
         let cache = self.ranks[mtp.rank()].borrow();
@@ -597,14 +698,50 @@ impl<'e, 'a> Backend<'a> for Step5Backend<'e, 'a> {
         }
         Ok(())
     }
-    fn probe_begin(&self, _rows: usize) {}
-    fn probe_end(&self) {}
-    fn probe_finish<T>(&self, _observe: impl FnOnce(&RoundRoutes, &[Option<f64>]) -> T) -> Option<T> { None }
+    fn probe_begin(&self, rows: usize) { self.execution.probe_begin(rows); }
+    fn probe_end(&self) { self.execution.probe_end(); }
+    fn probe_finish<T>(&self, observe: impl FnOnce(&RoundRoutes, &[Option<f64>]) -> T) -> Option<T> {
+        self.execution.probe_finish(observe)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scoring_consumes_bounded_heads_before_transaction_publication() {
+        let source = include_str!("backend.rs");
+        let scoring = source.split("fn prefill_scoring(").nth(1).unwrap()
+            .split("fn packed_limits(").next().unwrap();
+        assert!(source.contains("fn streamed_prefill_scoring(&self) -> bool { true }"));
+        assert!(scoring.contains("ExpertV2SourceKind::Prefill, Some(0)"));
+        assert!(scoring.contains("head_spans(logit_rows, self.rows.min(64))"));
+        assert!(scoring.contains("self.inputs.residual.buffer"));
+        assert!(scoring.find("step.compose(").unwrap() < scoring.find("scoring.record(").unwrap());
+        assert!(scoring.find("scoring.record(").unwrap() < scoring.find("step.publish_wave(").unwrap());
+        assert!(scoring.contains("ScoreLogits::Recorded"));
+        assert!(!scoring.contains("Allocation::new"));
+        let execute = source.split("fn execute_inner(").nth(1).unwrap()
+            .split("fn immediate(").next().unwrap();
+        assert!(execute.contains("if rows == 0"));
+        assert!(execute.contains("input.residual.buffer, output, meta.rows * H * 4"));
+    }
+
+    #[test]
+    fn scoring_head_spans_cover_suffix_without_changing_transformer_rows() {
+        for total in [2, 63, 64, 65, 2048, 8192, 12345] {
+            for wanted in [2, total] {
+                if wanted > total { continue; }
+                let mut seen = Vec::new();
+                for span in crate::shared::probe::head_spans(wanted, 64).unwrap() {
+                    assert!(span.len() <= 64);
+                    seen.extend(total - wanted + span.start..total - wanted + span.end);
+                }
+                assert_eq!(seen, (total - wanted..total).collect::<Vec<_>>());
+            }
+        }
+    }
 
     #[test]
     fn packed_check_cancellation_is_member_local_and_heads_finish_before_scratch_reuse() {
@@ -631,7 +768,7 @@ mod tests {
         use crate::shared::prefill_packing::{groups, plan, Limits};
         let identity: WorkerIdentity = serde_json::from_value(serde_json::json!({
             "checkpoint": "0".repeat(64), "manifest": null, "geometry": [4096, 352, 8, 1536, 91],
-            "world": 4, "topology": [4, 1], "ownership_wire": false }))?;
+            "world": 4 }))?;
         let variant = |cut| InstalledExpertVariant::from_queries(256, |_| Ok(64))?
             .with_arithmetic_routes(|rows| Ok(Some(if rows <= cut { (1, cut) } else { (2, 256) })));
         let report = InstalledExpertGrouping::new(WorkerSelection::new(identity.clone(), &[3, 4])?,

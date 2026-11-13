@@ -1,6 +1,15 @@
 cmake_minimum_required(VERSION 3.24)
 project(cuteafd_native LANGUAGES C CXX)
 
+# Internal script identity, not CMAKE_BUILD_TYPE (WIP also optimizes kernels).
+if(NOT DEFINED CUTEAFD_BUILD_KIND)
+  set(CUTEAFD_BUILD_KIND "development")
+endif()
+set(CUTEAFD_BUILD_KIND "${CUTEAFD_BUILD_KIND}" CACHE INTERNAL "Artifact build identity")
+if(NOT CUTEAFD_BUILD_KIND MATCHES "^(development|release)$")
+  message(FATAL_ERROR "Invalid internal artifact build identity")
+endif()
+
 # Read target and drafter row budgets from the same source used by Rust.
 set(CUTEAFD_V41_CAPACITY_SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/../rust/crates/cuteafd-core/src/dspark_verify.rs")
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${CUTEAFD_V41_CAPACITY_SOURCE}")
@@ -45,10 +54,11 @@ option(CUTEAFD_ENABLE_CUDA "Build CUDA kernels and CUDA-backed ABI functions" OF
 option(CUTEAFD_ENABLE_VISION_ATTENTION_AOT "Build shared Qwen/GLM BF16 vision attention" OFF)
 option(CUTEAFD_ENABLE_AUDIO_AOT "Build bundled MiMo FP32 and Muse BF16 PCM audio towers" OFF)
 option(CUTEAFD_ENABLE_V41_LOCAL_EXPERT_AOT "Build full RTX backbone expert kernels alongside dSpark" OFF)
+option(CUTEAFD_EXPORT_LINEINFO "Keep source line info in AOT exports (profiling; checkout-path dependent)" OFF)
 option(CUTEAFD_ENABLE_V41_TP2_EXPERT_AOT "Build dual RTX TP2 encoder expert kernels" OFF)
 option(CUTEAFD_V41_TP2_COMPACT_EXPERIMENT "Use experimental native compact TP2 experts at capacities 1/16" OFF)
 option(CUTEAFD_V41_SPARK_COMPACT_EXPERIMENT "Use experimental compact Spark experts through two live rows" OFF)
-# Opt-in replicated-group Spark TP2/TP3 expert shards. Empty (the default)
+# Opt-in Spark TP2/TP3 expert shards. Empty (the default)
 # compiles/links no new object or symbol, so every release default behaves
 # exactly as the historical Spark TP4 shard. Set to a semicolon list of
 # `tp2`/`tp3` on the SM121 expert build to pre-compile those AOT capacity
@@ -56,7 +66,7 @@ option(CUTEAFD_V41_SPARK_COMPACT_EXPERIMENT "Use experimental compact Spark expe
 # `spark_tp_degree` manifest field, so byte identity of exported JSON is not
 # claimed either way.)
 set(CUTEAFD_SPARK_TP_ROLES "" CACHE STRING
-  "Extra replicated-group Spark expert TP roles to build (tp2;tp3;tp6;tp8); empty builds only TP4")
+  "Extra Spark expert TP roles to build (tp2;tp3;tp6;tp8); empty builds only TP4")
 # Deprecated spelling, accepted for one release.
 if(DEFINED CUTEAFD_V41_SPARK_TP_ROLES AND NOT CUTEAFD_V41_SPARK_TP_ROLES STREQUAL "")
   message(DEPRECATION "CUTEAFD_V41_SPARK_TP_ROLES is deprecated; use CUTEAFD_SPARK_TP_ROLES")
@@ -89,6 +99,7 @@ option(CUTEAFD_ENABLE_STEP5_AOT "Build Step-5 coordinator programs (same table a
 option(CUTEAFD_ENABLE_KIMIK3_AOT "Build Kimi K3 coordinator programs (same table as DeepSeek V4)" OFF)
 option(CUTEAFD_ENABLE_MUSE_AOT "Build Muse Spark coordinator programs, K6 core and the partial-reply epilogue (same table as DeepSeek V4)" OFF)
 option(CUTEAFD_ENABLE_ML4_AOT "Build Mistral Large 4 coordinator programs (ml4 + its K6 core; same table as DeepSeek V4)" OFF)
+option(CUTEAFD_ENABLE_MINIMAX_AOT "Build vendor MiniMax native MXFP8 A8 projections" OFF)
 set(CUTEAFD_EXLR8_FAMILIES "" CACHE STRING "Explicit EXLR8 checkpoint families: glm;glmf")
 option(CUTEAFD_ENABLE_EXLR8_AOT "Build the EXLR8 programs into the program table (SM120: shared-expert K1 and rotated glue beside the family programs; SM121: routed K1 serving alone)" OFF)
 set(CUTEAFD_DSV4_GEOMETRY "flash,pro,flash2,pro2" CACHE STRING
@@ -273,7 +284,7 @@ if(CUTEAFD_EXPERT_FAMILIES MATCHES ":(fp8|nvfp4)" OR "step5:bf16" IN_LIST CUTEAF
 endif()
 if(CUTEAFD_ENABLE_AUDIO_AOT OR CUTEAFD_ENABLE_VISION_ATTENTION_AOT OR CUTEAFD_ENABLE_V41_EXPERT_AOT OR CUTEAFD_ENABLE_V41_LOCAL_EXPERT_AOT OR
    CUTEAFD_ENABLE_V41_TP2_EXPERT_AOT OR CUTEAFD_ENABLE_EXL3_PACKAGES OR CUTEAFD_ENABLE_V41_NVFP4_AOT OR CUTEAFD_ENABLE_V41_FP8_AOT OR CUTEAFD_ENABLE_V41_ATTENTION_AOT OR CUTEAFD_ENABLE_DSV4_AOT OR CUTEAFD_ENABLE_GLM_AOT OR
-   CUTEAFD_ENABLE_MIMO_AOT OR CUTEAFD_ENABLE_GLMF_AOT OR CUTEAFD_ENABLE_QWEN4_AOT OR CUTEAFD_ENABLE_QWEN_DENSE_AOT OR CUTEAFD_ENABLE_STEP5_AOT OR CUTEAFD_ENABLE_KIMIK3_AOT OR CUTEAFD_ENABLE_MUSE_AOT OR CUTEAFD_ENABLE_ML4_AOT OR CUTEAFD_ENABLE_EXLR8_AOT OR CUTEAFD_FP8_EXPERT_FAMILIES)
+   CUTEAFD_ENABLE_MIMO_AOT OR CUTEAFD_ENABLE_GLMF_AOT OR CUTEAFD_ENABLE_QWEN4_AOT OR CUTEAFD_ENABLE_QWEN_DENSE_AOT OR CUTEAFD_ENABLE_STEP5_AOT OR CUTEAFD_ENABLE_KIMIK3_AOT OR CUTEAFD_ENABLE_MUSE_AOT OR CUTEAFD_ENABLE_ML4_AOT OR CUTEAFD_ENABLE_MINIMAX_AOT OR CUTEAFD_ENABLE_EXLR8_AOT OR CUTEAFD_FP8_EXPERT_FAMILIES)
   set(CUTEAFD_BUILD_SPARKINFER_AOT ON)
 endif()
 if(CUTEAFD_BUILD_SPARKINFER_AOT)
@@ -303,6 +314,7 @@ if(CUTEAFD_BUILD_SPARKINFER_AOT)
     --lock "${CUTEAFD_SPARKINFER_LOCK_FILE}"
   )
   set(CUTEAFD_SPARKINFER_PYTHON_ENV
+    "CUTEAFD_BUILD_KIND=${CUTEAFD_BUILD_KIND}"
     "CUTEAFD_SPARKINFER_SOURCE_DIR=${CUTEAFD_SPARKINFER_SOURCE_DIR}"
     "CUTEAFD_SPARKINFER_LOCK_FILE=${CUTEAFD_SPARKINFER_LOCK_FILE}"
     # Persisted objects are executable-only ExternalBinaryModules. AOT export
@@ -318,6 +330,22 @@ if(CUTEAFD_BUILD_SPARKINFER_AOT)
   if(CUTEAFD_CUDA_ARCHITECTURES STREQUAL "89")
     list(APPEND CUTEAFD_SPARKINFER_PYTHON_ENV "CUTEAFD_EXPORT_OFFLINE_TARGET=sm89")
   endif()
+
+  # Triton line info embeds the absolute fork path (PTX .file, DWARF comp_dir),
+  # so the same commit in two checkouts exported different bytes (#1485). SASS
+  # is identical without it; CUTEAFD_EXPORT_LINEINFO=ON keeps it for source-level
+  # profiling (CuTe DSL too), and the export cache keys either choice.
+  if(CUTEAFD_EXPORT_LINEINFO)
+    list(APPEND CUTEAFD_SPARKINFER_PYTHON_ENV "TRITON_DISABLE_LINE_INFO=0" "CUTE_DSL_LINEINFO=1")
+  else()
+    list(APPEND CUTEAFD_SPARKINFER_PYTHON_ENV "TRITON_DISABLE_LINE_INFO=1")
+  endif()
+  # Every export command runs through the content-addressed export cache
+  # (scripts/build/export-cache.py): a pass-through unless CUTEAFD_EXPORT_CACHE
+  # names a store and CUTEAFD_EXPORT_IMAGE_ID the compiler image.
+  set(CUTEAFD_EXPORT_LAUNCHER "${Python3_EXECUTABLE}"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../scripts/build/export-cache.py" run
+    --build-dir "${CMAKE_CURRENT_BINARY_DIR}" --)
   execute_process(
     COMMAND ${CUTEAFD_SPARKINFER_VERIFY_COMMAND}
     RESULT_VARIABLE CUTEAFD_SPARKINFER_VERIFY_RESULT
@@ -400,6 +428,7 @@ if(CUTEAFD_ENABLE_CUDA)
     shared/cuda/expert_pack.cu
     shared/cuda/exl3_wire.cu
     shared/cuda/route_reduce.cu
+    shared/cuda/expert_usage.cu
     families/deepseek_v41/cuda/engram.cu
     families/deepseek_v41/cuda/v41_dspark.cu
     families/deepseek_v41/cuda/v41_hc.cu
@@ -513,8 +542,13 @@ foreach(entry IN LISTS CUTEAFD_EXPERT_FAMILIES)
     set(CUTEAFD_PARTIAL_REPLY_PROGRAMS ON)
   endif()
 endforeach()
-if(CUTEAFD_ENABLE_DSV4_AOT OR CUTEAFD_ENABLE_GLM_AOT OR CUTEAFD_ENABLE_MIMO_AOT OR CUTEAFD_ENABLE_GLMF_AOT OR CUTEAFD_ENABLE_QWEN4_AOT OR CUTEAFD_ENABLE_QWEN_DENSE_AOT OR CUTEAFD_ENABLE_STEP5_AOT OR CUTEAFD_ENABLE_KIMIK3_AOT OR CUTEAFD_ENABLE_MUSE_AOT OR CUTEAFD_ENABLE_ML4_AOT OR CUTEAFD_ENABLE_EXLR8_AOT OR CUTEAFD_PARTIAL_REPLY_PROGRAMS OR CUTEAFD_EXPERT_FAMILIES OR CUTEAFD_FP8_EXPERT_FAMILIES OR CUTEAFD_ENABLE_V41_EXPERT_AOT OR CUTEAFD_ENABLE_V41_NVFP4_AOT OR CUTEAFD_ENABLE_EXL3_PACKAGES)
+# V4.1 backbone exports do not require the generic program table. SM89
+# enables that table only when explicitly building its compressed-reply codecs.
+option(CUTEAFD_ENABLE_SM89_REPLY_AOT "Export SM89 Spark reply codecs" OFF)
+if(NOT CUTEAFD_CUDA_ARCHITECTURES STREQUAL "89" OR CUTEAFD_ENABLE_SM89_REPLY_AOT)
+if(CUTEAFD_ENABLE_DSV4_AOT OR CUTEAFD_ENABLE_GLM_AOT OR CUTEAFD_ENABLE_MIMO_AOT OR CUTEAFD_ENABLE_GLMF_AOT OR CUTEAFD_ENABLE_QWEN4_AOT OR CUTEAFD_ENABLE_QWEN_DENSE_AOT OR CUTEAFD_ENABLE_STEP5_AOT OR CUTEAFD_ENABLE_KIMIK3_AOT OR CUTEAFD_ENABLE_MUSE_AOT OR CUTEAFD_ENABLE_ML4_AOT OR CUTEAFD_ENABLE_MINIMAX_AOT OR CUTEAFD_ENABLE_EXLR8_AOT OR CUTEAFD_PARTIAL_REPLY_PROGRAMS OR CUTEAFD_EXPERT_FAMILIES OR CUTEAFD_FP8_EXPERT_FAMILIES OR CUTEAFD_ENABLE_V41_EXPERT_AOT OR CUTEAFD_ENABLE_V41_NVFP4_AOT OR CUTEAFD_ENABLE_EXL3_PACKAGES)
   include(cmake/shared/dsv4_programs.cmake)
+endif()
 endif()
 if(CUTEAFD_ENABLE_V41_LOCAL_EXPERT_AOT)
   include(cmake/families/deepseek_v41/v41_local_experts.cmake)
@@ -545,7 +579,11 @@ endif()
 if(CUTEAFD_ENABLE_AUDIO_AOT)
   include(cmake/shared/pcm_audio.cmake)
 endif()
+add_library(cuteafd_memory_callbacks OBJECT shared/src/memory_failure.cc)
+set_target_properties(cuteafd_memory_callbacks PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_include_directories(cuteafd_memory_callbacks PRIVATE ${CUTEAFD_NATIVE_INCLUDE_DIRS})
 add_library(cuteafd_native SHARED ${CUTEAFD_NATIVE_SOURCES})
+target_link_libraries(cuteafd_native PRIVATE cuteafd_memory_callbacks ${CMAKE_DL_LIBS})
 if(CUTEAFD_ENABLE_CUDA)
   target_include_directories(cuteafd_native PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
   target_link_options(cuteafd_native PRIVATE "-Wl,--wrap=__cudaRegisterFunction")
@@ -592,11 +630,13 @@ if(CUTEAFD_V41_SPARK_TP_EXPERT_TARGETS)
   add_dependencies(cuteafd_native ${CUTEAFD_V41_SPARK_TP_EXPERT_TARGETS})
   target_include_directories(cuteafd_native PRIVATE ${CUTEAFD_V41_SPARK_TP_EXPERT_INCLUDE_DIRS})
 endif()
-if(CUTEAFD_ENABLE_DSV4_AOT OR CUTEAFD_ENABLE_GLM_AOT OR CUTEAFD_ENABLE_MIMO_AOT OR CUTEAFD_ENABLE_GLMF_AOT OR CUTEAFD_ENABLE_QWEN4_AOT OR CUTEAFD_ENABLE_QWEN_DENSE_AOT OR CUTEAFD_ENABLE_STEP5_AOT OR CUTEAFD_ENABLE_KIMIK3_AOT OR CUTEAFD_ENABLE_MUSE_AOT OR CUTEAFD_ENABLE_ML4_AOT OR CUTEAFD_ENABLE_EXLR8_AOT OR CUTEAFD_PARTIAL_REPLY_PROGRAMS OR CUTEAFD_EXPERT_FAMILIES OR CUTEAFD_FP8_EXPERT_FAMILIES OR CUTEAFD_ENABLE_V41_EXPERT_AOT OR CUTEAFD_ENABLE_V41_NVFP4_AOT OR CUTEAFD_ENABLE_EXL3_PACKAGES)
+if(NOT CUTEAFD_CUDA_ARCHITECTURES STREQUAL "89" OR CUTEAFD_ENABLE_SM89_REPLY_AOT)
+if(CUTEAFD_ENABLE_DSV4_AOT OR CUTEAFD_ENABLE_GLM_AOT OR CUTEAFD_ENABLE_MIMO_AOT OR CUTEAFD_ENABLE_GLMF_AOT OR CUTEAFD_ENABLE_QWEN4_AOT OR CUTEAFD_ENABLE_QWEN_DENSE_AOT OR CUTEAFD_ENABLE_STEP5_AOT OR CUTEAFD_ENABLE_KIMIK3_AOT OR CUTEAFD_ENABLE_MUSE_AOT OR CUTEAFD_ENABLE_ML4_AOT OR CUTEAFD_ENABLE_MINIMAX_AOT OR CUTEAFD_ENABLE_EXLR8_AOT OR CUTEAFD_PARTIAL_REPLY_PROGRAMS OR CUTEAFD_EXPERT_FAMILIES OR CUTEAFD_FP8_EXPERT_FAMILIES OR CUTEAFD_ENABLE_V41_EXPERT_AOT OR CUTEAFD_ENABLE_V41_NVFP4_AOT OR CUTEAFD_ENABLE_EXL3_PACKAGES)
   add_dependencies(cuteafd_native cuteafd_dsv4_programs_export)
   target_include_directories(cuteafd_native PRIVATE "${CUTEAFD_DSV4_DIR}")
   # Whole archive: the table in dsv4_programs.cc names every program symbol.
   target_link_libraries(cuteafd_native PRIVATE "-Wl,--whole-archive" "${CUTEAFD_DSV4_ARCHIVE}" "-Wl,--no-whole-archive")
+endif()
 endif()
 if(CUTEAFD_EXPERT_FAMILY_TARGETS)
   add_dependencies(cuteafd_native ${CUTEAFD_EXPERT_FAMILY_TARGETS})
@@ -744,8 +784,12 @@ if(CUTEAFD_ENABLE_CUDA)
   target_link_libraries(cuteafd_cuda_checked_argmax_selftest PRIVATE cuteafd_native)
   add_test(NAME cuteafd_cuda_checked_argmax_selftest COMMAND cuteafd_cuda_checked_argmax_selftest)
   set_tests_properties(cuteafd_cuda_checked_argmax_selftest PROPERTIES TIMEOUT 15)
+  add_executable(cuteafd_cuda_bf16_gemm_precision_selftest tests/cuda_bf16_gemm_precision_selftest.cc)
+  target_link_libraries(cuteafd_cuda_bf16_gemm_precision_selftest PRIVATE cuteafd_native)
+  add_test(NAME cuteafd_cuda_bf16_gemm_precision_selftest COMMAND cuteafd_cuda_bf16_gemm_precision_selftest)
+  set_tests_properties(cuteafd_cuda_bf16_gemm_precision_selftest PROPERTIES TIMEOUT 120)
   add_executable(cuteafd_cuda_stream_query_selftest tests/cuda_stream_query_selftest.cc)
-  target_link_libraries(cuteafd_cuda_stream_query_selftest PRIVATE cuteafd_native CUDA::cudart)
+  target_link_libraries(cuteafd_cuda_stream_query_selftest PRIVATE cuteafd_native CUDA::cudart CUDA::cuda_driver)
   add_test(NAME cuteafd_cuda_stream_query_selftest COMMAND cuteafd_cuda_stream_query_selftest)
   set_tests_properties(cuteafd_cuda_stream_query_selftest PROPERTIES TIMEOUT 15)
   add_executable(cuteafd_cuda_stream_value_selftest tests/cuda_stream_value_selftest.cc)
@@ -791,7 +835,7 @@ if(CUTEAFD_ENABLE_CUDA)
   set_target_properties(cuteafd_vision_pointwise_selftest PROPERTIES
     CUDA_ARCHITECTURES "${CUTEAFD_CUDA_ARCHITECTURES}")
   target_include_directories(cuteafd_vision_pointwise_selftest PRIVATE ${CUTEAFD_NATIVE_INCLUDE_DIRS})
-  target_link_libraries(cuteafd_vision_pointwise_selftest PRIVATE CUDA::cudart CUDA::cublas)
+  target_link_libraries(cuteafd_vision_pointwise_selftest PRIVATE cuteafd_memory_callbacks CUDA::cudart CUDA::cublas)
   add_test(NAME cuteafd_vision_pointwise_selftest COMMAND cuteafd_vision_pointwise_selftest)
   set_tests_properties(cuteafd_vision_pointwise_selftest PROPERTIES TIMEOUT 30 SKIP_RETURN_CODE 77)
   # V4.1 index top-k: the radix-select and merge paths against an exact CPU
@@ -919,3 +963,48 @@ if(CUTEAFD_ENABLE_CUDA)
   endfunction()
   cmake_language(DEFER CALL cuteafd_reproducible_cuda_objects)
 endif()
+
+# Follow local implementation includes too (the vision test includes a .cu).
+function(cuteafd_source_uses_memory_callbacks source visited result)
+  get_filename_component(path "${source}" ABSOLUTE BASE_DIR "${CMAKE_CURRENT_SOURCE_DIR}")
+  if(NOT EXISTS "${path}" OR path IN_LIST visited)
+    set(${result} FALSE PARENT_SCOPE)
+    return()
+  endif()
+  list(APPEND visited "${path}")
+  file(READ "${path}" text)
+  if(text MATCHES "memory_failure[.]h")
+    set(${result} TRUE PARENT_SCOPE)
+    return()
+  endif()
+  string(REGEX MATCHALL "#[ \t]*include[ \t]*\"[^\"]+\"" includes "${text}")
+  get_filename_component(directory "${path}" DIRECTORY)
+  foreach(include IN LISTS includes)
+    string(REGEX REPLACE ".*\"([^\"]+)\"" "\\1" include "${include}")
+    cuteafd_source_uses_memory_callbacks("${directory}/${include}" "${visited}" uses)
+    if(uses)
+      set(${result} TRUE PARENT_SCOPE)
+      return()
+    endif()
+  endforeach()
+  set(${result} FALSE PARENT_SCOPE)
+endfunction()
+function(cuteafd_check_memory_callback_links)
+  get_property(targets DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}" PROPERTY BUILDSYSTEM_TARGETS)
+  foreach(target IN LISTS targets)
+    if(target STREQUAL "cuteafd_memory_callbacks")
+      continue()
+    endif()
+    get_target_property(sources "${target}" SOURCES)
+    foreach(source IN LISTS sources)
+      cuteafd_source_uses_memory_callbacks("${source}" "" uses)
+      if(uses)
+        get_target_property(links "${target}" LINK_LIBRARIES)
+        if(NOT "cuteafd_memory_callbacks" IN_LIST links AND NOT "cuteafd_native" IN_LIST links)
+          message(FATAL_ERROR "${target} uses wrapped allocators but does not link cuteafd_memory_callbacks")
+        endif()
+      endif()
+    endforeach()
+  endforeach()
+endfunction()
+cmake_language(DEFER CALL cuteafd_check_memory_callback_links)

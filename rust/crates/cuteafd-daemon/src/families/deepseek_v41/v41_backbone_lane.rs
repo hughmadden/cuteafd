@@ -37,6 +37,16 @@ pub(crate) struct BackboneLaneWeights<'a> {
     split_output_b: bool,
 }
 impl<'a> BackboneLaneWeights<'a> {
+    pub(crate) fn inventory(&self, inventory: &mut crate::shared::memory::receipts::Inventory<'_>) -> Result<()> {
+        for layer in &self.layers {
+            layer.hc.inventory(inventory)?;
+            layer.query.inventory(inventory)?;
+            layer.projection.inventory(inventory)?;
+            if let Some(shared) = &layer.shared { shared.inventory(inventory)?; }
+            layer.router.inventory(inventory)?;
+        }
+        Ok(())
+    }
     fn layer_bytes(
         library: &NativeLibrary,
         catalog: &OfficialV41Catalog,
@@ -65,6 +75,7 @@ impl<'a> BackboneLaneWeights<'a> {
                 })
         })
     }
+    #[cfg(test)]
     pub fn load(
         library: &'a NativeLibrary,
         catalog: &OfficialV41Catalog,
@@ -143,6 +154,8 @@ impl LaneL2<'_> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Phase {
     Idle,
+    /// Successful window selection on an otherwise unused idle lane.
+    WindowSelectedIdle,
     Prepared,
     Query,
     Ffn,
@@ -153,6 +166,13 @@ enum Phase {
     Invalid,
 }
 
+fn rearm_startup_prefill(phase: &mut Phase) -> Result<()> {
+    ensure!(matches!(*phase, Phase::Idle | Phase::WindowSelectedIdle),
+        "startup prefill requires an idle lane or its successful window selection");
+    *phase = Phase::Idle;
+    Ok(())
+}
+
 // The containing lane's pending owner drains all consumer work before drop.
 // Keep this bank before the allocations referenced by its graphs.
 struct Tp2FfnGraphs<'w,'a> {
@@ -161,25 +181,28 @@ struct Tp2FfnGraphs<'w,'a> {
 }
 impl<'w,'a> Tp2FfnGraphs<'w,'a> {
     fn new(device:Device<'a>)->Self {
-        let mut bank=crate::shared::decode_graph::LayerGraphs::new(device.library, cuteafd_core::V41_VERIFY_ROWS as u32);
-        bank.enable_small_shapes();Self {device,bank}
+        let bank=crate::shared::decode_graph::LayerGraphs::new(device.library, cuteafd_core::V41_VERIFY_ROWS as u32, "deepseek_v41");
+        Self {device,bank}
     }
     unsafe fn capture_ready(&mut self,block:&mut BackboneBlockWave<'w,'a>,
         weights:&'w BackboneHcWeights<'a>,binding:QueryBinding,rows:usize,
         projected:CuteafdDeviceBuffer,stream:*mut std::ffi::c_void)->Result<()> {
         self.device.run(||unsafe {
+            let Some(mut ticket)=self.bank.cache_ticket(&(binding.layer(),rows as u32),
+                super::graph_policy::pinned_shape(self.device.id, rows as u32),None) else {return Ok(())};
             block.restore_ffn_graph_warmup(binding,rows)?;
-            self.device.library.cuda_graph_begin_capture(stream)?;
+            ticket.capture_result(self.device.library.cuda_graph_begin_capture(stream))?;
             let queued=block.enqueue_ffn(binding,rows,projected,stream);
-            let captured=self.device.library.cuda_graph_end_capture(stream);
+            let captured=ticket.capture_result(self.device.library.cuda_graph_end_capture_topology(stream));
             match (queued,captured) {
-                (Ok(_),Ok(graph))=> {
-                    if let Err(error)=self.bank.insert(binding.layer(),weights,rows as u32,graph) {
+                (Ok(_),Ok((graph,nodes,width,spans,_)))=> {
+                    if let Err(error)=self.bank.cache_insert(binding.layer(),weights,rows as u32,graph,ticket,nodes as u64,width,spans) {
                         self.device.library.cuda_graph_exec_destroy(graph)?;return Err(error);
                     }
                     Ok(())
                 },
-                (Err(error),Ok(graph))=> {self.device.library.cuda_graph_exec_destroy(graph)?;Err(error)},
+                (Err(error),Ok((graph,..)))=> {self.device.library.cuda_graph_exec_destroy(graph)?;Err(error)},
+                (Ok(_),Err(error)) if cuteafd_ffi::is_small_graph(&error) => Ok(()),
                 (Err(error),Err(_)) | (Ok(_),Err(error))=>Err(error),
             }
         })
@@ -193,6 +216,38 @@ impl Drop for Tp2FfnGraphs<'_,'_> {
     }
 }
 
+fn attention_tail_identity(projection: &AttentionOutputWave<'_, '_>, block: &BackboneBlockWave<'_, '_>,
+    split_output: bool) -> Vec<usize> {
+    let mut identity = projection.chain_graph_identity().to_vec();
+    identity.extend(block.chain_graph_identity());
+    identity.push(usize::from(split_output));
+    identity
+}
+
+struct StartupAttentionTail<'s, 'w, 'a> {
+    projection: &'s mut AttentionOutputWave<'w, 'a>,
+    block: &'s mut BackboneBlockWave<'w, 'a>,
+}
+impl crate::families::deepseek_v41::v41_sparse_attention::AttentionGraphTail for StartupAttentionTail<'_, '_, '_> {
+    fn identity(&self) -> Vec<usize> { attention_tail_identity(self.projection, self.block, false) }
+    unsafe fn prepare(&mut self, _: *mut std::ffi::c_void) -> Result<()> {
+        anyhow::bail!("startup tail must not prepare live request metadata")
+    }
+    unsafe fn enqueue(&mut self, attention: &crate::families::deepseek_v41::v41_sparse_attention::QueuedSparseAttention,
+        stream: *mut std::ffi::c_void) -> Result<()> {
+        // SAFETY: the caller is recording stable storage, never executing it.
+        let projected = unsafe { self.projection.enqueue_chain_graph(attention, stream)? };
+        unsafe { self.block.record_startup_ffn(attention.rows, projected, stream)?; }
+        Ok(())
+    }
+    unsafe fn restore_warmup(&mut self) -> Result<()> {
+        anyhow::bail!("startup tail cannot execute a warmup")
+    }
+    unsafe fn replay_state(&mut self) -> Result<()> {
+        anyhow::bail!("startup tail cannot publish replay state")
+    }
+}
+
 struct AttentionTail<'s, 'w, 'a> {
     projection: &'s mut AttentionOutputWave<'w, 'a>,
     block: &'s mut BackboneBlockWave<'w, 'a>,
@@ -202,8 +257,7 @@ struct AttentionTail<'s, 'w, 'a> {
 }
 impl crate::families::deepseek_v41::v41_sparse_attention::AttentionGraphTail for AttentionTail<'_, '_, '_> {
     fn identity(&self) -> Vec<usize> {
-        let mut identity = self.projection.chain_graph_identity().to_vec();
-        identity.extend(self.block.chain_graph_identity()); identity.push(usize::from(self.split_output)); identity
+        attention_tail_identity(self.projection, self.block, self.split_output)
     }
     unsafe fn prepare(&mut self, stream: *mut std::ffi::c_void) -> Result<()> {
         unsafe { self.projection.prepare_chain_graph(self.tokens, stream) }
@@ -258,7 +312,7 @@ impl<'s, 'w, 'a> PendingLaneFfn<'s, 'w, 'a> {
             let weights=&lane.weights.layers[lane.layer].hc;
             let graphs=lane.tp2_ffn_graphs.as_mut().context("TP2 FFN graph owner absent")?;
             let windowed=lane.window.is_windowed();
-            let cached=if windowed { None } else { graphs.bank.get_shape(lane.layer,weights,rows as u32) };
+            let cached=if windowed { None } else { graphs.bank.cached_launch(lane.layer,weights,rows as u32) };
             let library=lane.weights.library;
             let (values,stream,projected)=unsafe { lane.projection.finish_tp2_then(rows as u32,output,producer,
                 |projected,stream| {
@@ -280,7 +334,7 @@ impl<'s, 'w, 'a> PendingLaneFfn<'s, 'w, 'a> {
         let lane = self.lane.take().unwrap();
         let input = unsafe { lane.block.complete_queued_ffn(self.values.unwrap())? };
         lane.phase = Phase::Ffn;
-        Ok(LaneFfn { input, cooperative: true, shared: &mut lane.shared, router: &mut lane.router,
+        Ok(LaneFfn { input, usage_phase: lane.usage_phase, cooperative: true, shared: &mut lane.shared, router: &mut lane.router,
             library: lane.weights.library, phase: &mut lane.phase,
             route_capture: if lane.capture_routes { Some(&mut lane.route_capture) } else { None },
             ffn_split: if lane.capture_timing { Some(&mut lane.ffn_split) } else { None },
@@ -306,6 +360,7 @@ impl Drop for PendingLaneFfn<'_, '_, '_> {
 /// RTX. Both consume the same preserved normalized rows and execution identity.
 pub(crate) struct LaneFfn<'s, 'w, 'a> {
     pub input: FfnInput<'s>,
+    usage_phase: cuteafd_ffi::expert_usage::UsagePhase,
     cooperative: bool,
     shared: &'s mut Option<BackboneSharedWave<'w, 'a>>,
     router: &'s mut BackboneRouterWave<'w, 'a>,
@@ -380,13 +435,13 @@ impl LaneFfn<'_, '_, '_> {
         let mut cancelled = 0;
         for local_mode in [false, true] {
             self.router.set_local_mode(local_mode)?;
-            let routed = unsafe { self.router.execute_ffn(&self.input, image_mask)? };
+            let routed = unsafe { self.router.execute_ffn(&self.input, image_mask, self.usage_phase)? };
             let reference = read(&[routed.ids, routed.routing, routed.expert_input])?;
             self.router.clear_graph()?;
-            cancelled += cancel_once(unsafe { self.router.execute_ffn_cooperative(&self.input, image_mask) }).await as usize;
+            cancelled += cancel_once(unsafe { self.router.execute_ffn_cooperative(&self.input, image_mask, self.usage_phase) }).await as usize;
             for evict in [true, false, true, false] {
                 if evict { self.router.clear_graph()?; }
-                let routed = unsafe { self.router.execute_ffn_cooperative(&self.input, image_mask).await? };
+                let routed = unsafe { self.router.execute_ffn_cooperative(&self.input, image_mask, self.usage_phase).await? };
                 assert_eq!(read(&[routed.ids, routed.routing, routed.expert_input])?, reference);
                 let mut ids = Vec::new();
                 unsafe { routed.capture_route_ids(lib, &mut ids)?; }
@@ -427,6 +482,7 @@ impl LaneFfn<'_, '_, '_> {
     ) -> Result<NativeFfnOutput<'t>> {
         let cooperative = self.cooperative;
         let input = &self.input;
+        let usage_phase = self.usage_phase;
         let router = &mut self.router;
         let shared = &mut self.shared;
         let library = self.library;
@@ -443,8 +499,8 @@ impl LaneFfn<'_, '_, '_> {
             let timing = std::time::Instant::now();
             router.set_local_mode(transport.has_local_layer(input.layer))?;
             let ring = router.ring_capture();
-            let routed = unsafe { if cooperative { router.execute_ffn_cooperative(input, image_mask).await? }
-                else { router.execute_ffn(input, image_mask)? } };
+            let routed = unsafe { if cooperative { router.execute_ffn_cooperative(input, image_mask, usage_phase).await? }
+                else { router.execute_ffn(input, image_mask, usage_phase)? } };
             if transport.has_local_layer(input.layer) {
                 ensure!(!(ring && tracing::enabled!(target: "cuteafd::route_policy", tracing::Level::DEBUG)),
                     "route policy tracing reads host routes; device-ordered passes keep local routes in the ring");
@@ -567,8 +623,8 @@ impl LaneFfn<'_, '_, '_> {
         let started = std::time::Instant::now();
         self.router.set_local_mode(false)?;
         let ring = self.router.ring_capture();
-        let routed = unsafe { if self.cooperative { self.router.execute_ffn_cooperative(&self.input, image_mask).await? }
-            else { self.router.execute_ffn(&self.input, image_mask)? } };
+        let routed = unsafe { if self.cooperative { self.router.execute_ffn_cooperative(&self.input, image_mask, self.usage_phase).await? }
+            else { self.router.execute_ffn(&self.input, image_mask, self.usage_phase)? } };
         if let Some(capture) = self.route_capture.as_deref_mut().filter(|_| !ring) {
             unsafe { routed.capture_route_ids(self.library, &mut capture[self.input.layer])?; }
         }
@@ -623,8 +679,23 @@ async fn complete_ffn<T>(
 pub(crate) struct Capture {
     /// Route ids per layer (router ring, staged ids): the priced policy and the replay trace.
     pub routes: bool,
-    /// Per-layer CUDA-event times and the FFN stage split (implied by `routes`).
+    /// Per-layer CUDA-event times and the FFN stage split, independent of routes.
     pub timing: bool,
+}
+
+impl Capture {
+    /// # Safety
+    /// `stream` is live on the clock's device and its previous marks have no readers.
+    unsafe fn record(self, clock: &mut LayerClock<'_>, layer: usize, stream: *mut std::ffi::c_void,
+        entry: bool) {
+        if !self.timing { return; }
+        let drain = !crate::shared::memory::chain::active();
+        // SAFETY: forwarded from the caller; unchained streams must remain idle for rebinding.
+        unsafe {
+            if entry { clock.mark_entry(layer, stream, drain); }
+            else { clock.mark(layer, stream, drain); }
+        }
+    }
 }
 
 /// One per-GPU prefill reserve, shared by host slots. HC, projection and router
@@ -646,7 +717,8 @@ pub(crate) struct LaneStorage<'a> {
 impl<'a> LaneStorage<'a> {
     fn allocation_groups(rows: u32, query: usize, output: usize, shared: usize,
         sparse: usize, router: usize, placed: bool) -> [usize; 6] {
-        [2 * rows as usize * crate::families::deepseek_v41::v41_hc::HcStorage::ROW_BYTES,
+        [2 * cuteafd_loader::serving_capacity::v41_workspace::hc(rows as usize)
+            .expect("validated mHC reserve rows").bytes(),
             query, output, if placed { 0 } else { shared }, sparse, router]
     }
 
@@ -704,11 +776,10 @@ pub(crate) struct BackboneLane<'w, 'a> {
     router: BackboneRouterWave<'w, 'a>,
     layer: usize,
     phase: Phase,
+    usage_phase: cuteafd_ffi::expert_usage::UsagePhase,
     capture_routes: bool,
     /// Layer clock marks and the FFN stage split (routes or a live console).
     capture_timing: bool,
-    /// Decode-row graph shapes are retained (see `retain_small_graph_shapes`).
-    retain_small_shapes: bool,
     route_capture: Vec<Vec<[u32; 6]>>,
     /// Host FFN stage times summed over the captured pass.
     ffn_split: FfnSplit,
@@ -721,6 +792,101 @@ pub(crate) struct BackboneLane<'w, 'a> {
 }
 
 impl<'w, 'a> BackboneLane<'w, 'a> {
+    pub(crate) fn visit_graph_banks(&mut self, f: &mut dyn FnMut(i32, &'static str, bool, &mut dyn crate::shared::decode_graph::CacheAttached) -> Result<()>) -> Result<()> {
+        if let Some(graphs) = &mut self.tp2_ffn_graphs {
+            f(graphs.device.id, "tp2_ffn", true, &mut graphs.bank)?;
+        }
+        if let Some(sparse) = &mut self.sparse { sparse.visit_graph_banks(f)?; }
+        if let Some(sparse) = &mut self.dual_sparse { sparse.visit_graph_banks(f)?; }
+        self.query.visit_graph_banks(f)?;
+        if let Some(query) = &mut self.tp2_query { query.visit_graph_banks(f)?; }
+        if let Some(output) = &mut self.tp2_output { output.visit_graph_banks(f)?; }
+        self.projection.visit_graph_banks(f)?;
+        if let Some(shared) = &mut self.shared { shared.visit_graph_banks(f)?; }
+        self.router.visit_graph_banks(f)
+    }
+    fn rebind_startup(&mut self, layer: usize) -> Result<()> {
+        ensure!(self.phase == Phase::Idle && !self.window.is_windowed(),
+            "startup rebind requires an idle full lane");
+        let weights = self.weights.layers.get(layer).context("startup layer absent")?;
+        ensure!(weights.device.id == self.block.inputs()[0].device_id,
+            "startup layer belongs to another device");
+        self.query.rebind(&weights.query)?;
+        self.projection.rebind(&weights.projection)?;
+        if let Some(shared) = &mut self.shared {
+            shared.rebind(weights.shared.as_ref().context("startup shared weights absent")?)?;
+        }
+        self.router.rebind(&weights.router)?;
+        self.block.rebind_startup(&weights.hc)?;
+        self.layer = layer;
+        Ok(())
+    }
+    /// Record exact target rows on this device without running a synthetic query.
+    /// Bindings come from the real admitted cache/index owners and must remain
+    /// stable until this lane's graph bank is destroyed.
+    pub(crate) fn capture_startup(
+        &mut self, sinks: &[CuteafdDeviceBuffer], selections: &[Option<CuteafdDeviceBuffer>],
+        aligned: bool, local: &[bool; 40],
+    ) -> Result<()> {
+        self.capture_startup_kind(sinks, selections, aligned, true, local)
+    }
+    /// Warm only nonwindowed prompt/replay primitive shapes. Sparse prefill
+    /// geometry depends on live request history and is captured lazily instead.
+    pub(crate) fn capture_startup_prefill(&mut self, local: &[bool; 40]) -> Result<()> {
+        // Only a successful window selection on an idle lane may be rearmed.
+        // Invalid also represents failed execution and must never be revived.
+        rearm_startup_prefill(&mut self.phase)?;
+        self.capture_startup_kind(&[], &[], false, false, local)
+    }
+    pub(crate) fn startup_prefill_rows(&self) -> Vec<usize> {
+        super::graph_policy::prefill_prewarm_rows(self.block.inputs()[0].device_id as usize, self.capacity)
+    }
+    fn capture_startup_kind(
+        &mut self, sinks: &[CuteafdDeviceBuffer], selections: &[Option<CuteafdDeviceBuffer>],
+        aligned: bool, decode: bool, local: &[bool; 40],
+    ) -> Result<()> {
+        ensure!(self.phase == Phase::Idle && !self.window.is_windowed()
+            && self.dual_sparse.is_none() && self.tp2_query.is_none() && self.tp2_output.is_none()
+            && !self.weights.split_query_b && !self.weights.split_output_b,
+            "startup prototype requires idle unsplit target lanes");
+        let prewarm: Vec<_> = if decode {
+            cuteafd_loader::serving_capacity::v41_graphs::v41_prewarm_rows(crate::families::deepseek_v41::graph_policy::ranks(), self.block.inputs()[0].device_id as usize, cuteafd_core::V41_VERIFY_ROWS)
+                .into_iter().map(|entry| entry.rows).collect()
+        } else { super::graph_policy::prefill_prewarm_rows(self.block.inputs()[0].device_id as usize, self.capacity) };
+        ensure!(prewarm.iter().all(|&row| row <= self.capacity) && (!decode || (sinks.len() == 40 && selections.len() == 40)),
+            "startup target capacity or bindings differ");
+        let device = self.block.inputs()[0].device_id;
+        let layers: Vec<usize> = self.weights.layers.iter().enumerate()
+            .filter_map(|(layer, weights)| (weights.device.id == device).then_some(layer)).collect();
+        let original = self.layer;
+        self.set_attention_decode(decode);
+        let result = (|| -> Result<()> {
+            for &layer in &layers {
+                self.rebind_startup(layer)?;
+                self.router.set_local_mode(local[layer])?;
+                for &rows in &prewarm {
+                    self.query.capture_startup(rows as u32)?;
+                    crate::shared::decode_graph::device::observe_device(self.weights.library, device)?;
+                    self.router.capture_startup(rows as u32)?;
+                    crate::shared::decode_graph::device::observe_device(self.weights.library, device)?;
+                    if !decode { continue; }
+                    // SAFETY: only host phase is armed; sparse capture records
+                    // stable geometry and never executes its descriptor storage.
+                    unsafe { self.block.prepare_startup_ffn(rows)?; }
+                    let mut tail = StartupAttentionTail { projection: &mut self.projection, block: &mut self.block };
+                    let captured = unsafe { self.sparse.as_mut().context("startup sparse owner absent")?
+                        .capture_startup(layer, rows, sinks[layer], selections[layer], aligned, Some(&mut tail)) };
+                    self.block.reset();
+                    captured?;
+                    crate::shared::decode_graph::device::observe_device(self.weights.library, device)?;
+                }
+            }
+            Ok(())
+        })();
+        self.block.reset();
+        let restored = self.rebind_startup(original);
+        result.and(restored)
+    }
     pub fn workspace_bytes(library: &NativeLibrary, capacity: u32) -> Result<[usize; 6]> {
         ensure!(
             (1..=4096).contains(&capacity),
@@ -772,9 +938,9 @@ impl<'w, 'a> BackboneLane<'w, 'a> {
             router: first.router.wave(capacity, sizes[5])?,
             layer: first_layer,
             phase: Phase::Idle,
+            usage_phase: cuteafd_ffi::expert_usage::UsagePhase::Prefill,
             capture_routes: false,
             capture_timing: false,
-            retain_small_shapes: false,
             route_capture: Vec::new(),
             ffn_split: FfnSplit::default(),
             layer_clock: LayerClock::new(weights.library, 40)?,
@@ -796,8 +962,8 @@ impl<'w, 'a> BackboneLane<'w, 'a> {
             shared: first.shared.as_ref().zip(storage.shared.as_ref()).map(|(w,s)| w.on_storage(s.clone())).transpose()?,
             sparse: Some(SparseAttentionWave::on_storage(storage.sparse.clone())?), dual_sparse: None,
             capacity: storage.unit as usize, router: first.router.on_storage(storage.router.clone())?,
-            layer: storage.first_layer, phase: Phase::Idle, capture_routes: false, capture_timing: false,
-            retain_small_shapes: false, route_capture: Vec::new(), ffn_split: FfnSplit::default(),
+            layer: storage.first_layer, phase: Phase::Idle, usage_phase: cuteafd_ffi::expert_usage::UsagePhase::Prefill, capture_routes: false, capture_timing: false,
+            route_capture: Vec::new(), ffn_split: FfnSplit::default(),
             layer_clock: LayerClock::new(weights.library, 40)?, l2: None,
         })
     }
@@ -810,6 +976,7 @@ impl<'w, 'a> BackboneLane<'w, 'a> {
     /// layer, the query/output readiness) are dropped as `invalidate` does;
     /// the next use restarts the lane. Pending work still refuses.
     pub(crate) fn select_window(&mut self, window: crate::shared::memory::row_window::RowWindow) -> Result<()> {
+        let was_idle = matches!(self.phase, Phase::Idle | Phase::WindowSelectedIdle);
         self.invalidate();
         self.query.discard_ready();
         self.projection.discard_ready();
@@ -822,6 +989,7 @@ impl<'w, 'a> BackboneLane<'w, 'a> {
         if let Some(projection) = &mut self.tp2_query { projection.select_window(window.clone())?; }
         if let Some(projection) = &mut self.tp2_output { projection.select_window(window.clone())?; }
         self.window = window;
+        if was_idle { self.phase = Phase::WindowSelectedIdle; }
         Ok(())
     }
     #[cfg(test)]
@@ -1033,7 +1201,7 @@ impl<'w, 'a> BackboneLane<'w, 'a> {
         ensure!(self.phase == Phase::Ffn, "backbone lane FFN unavailable");
         let input = self.block.ffn_input(binding)?;
         Ok(LaneFfn {
-            input, cooperative, shared: &mut self.shared, router: &mut self.router,
+            input, usage_phase: self.usage_phase, cooperative, shared: &mut self.shared, router: &mut self.router,
             library: self.weights.library, phase: &mut self.phase,
             route_capture: if self.capture_routes { Some(&mut self.route_capture) } else { None },
             ffn_split: if self.capture_timing { Some(&mut self.ffn_split) } else { None },
@@ -1100,6 +1268,7 @@ impl<'w, 'a> BackboneLane<'w, 'a> {
         self.phase = Phase::Ffn;
         Ok(LaneFfn {
             input,
+            usage_phase: self.usage_phase,
             cooperative: false,
             shared: &mut self.shared,
             router: &mut self.router,
@@ -1257,15 +1426,6 @@ impl<'w, 'a> BackboneLane<'w, 'a> {
     pub fn trace_stream(&self) -> *mut std::ffi::c_void { self.block.trace_stream() }
     /// Keep every decode-row graph shape once captured (sticky): speculative
     /// verification varies its row count every round, with or without route capture.
-    pub fn retain_small_graph_shapes(&mut self) {
-        self.retain_small_shapes = true;
-        self.query.enable_small_graph_shapes();
-        if let Some(sparse)=&mut self.sparse { sparse.enable_small_graph_shapes(); }
-        if let Some(dual)=&mut self.dual_sparse { dual.enable_small_graph_shapes(); }
-        self.projection.enable_small_graph_shapes();
-        if let Some(shared) = &mut self.shared { shared.enable_small_graph_shapes(); }
-        self.router.enable_small_graph_shapes();
-    }
     /// Route ids (router ring and per-layer capture) and, with them, the
     /// pass timing: per-layer CUDA events and the FFN stage split. Disabling
     /// after a pass keeps that pass's routes and marks for reading.
@@ -1275,17 +1435,14 @@ impl<'w, 'a> BackboneLane<'w, 'a> {
         self.capture_timing = false;
         self.router.set_ring_capture(false);
     }
-    /// Before a pass: route ids only for the priced policy or the replay
-    /// trace; timing also while a console viewer is connected (its layer and
-    /// expert-stage panels). Always clears the previous pass's marks, so an
+    /// Before a pass: route ids for pricing or replay, timing only for pricing
+    /// or explicit profiling. Always clears the previous pass's marks, so an
     /// untimed pass reports no layer times rather than stale ones.
     pub fn set_capture(&mut self, capture: Capture) {
         let Capture { routes, timing } = capture;
-        let timing = timing || routes;
         self.capture_routes = routes;
         self.capture_timing = timing;
         self.router.set_ring_capture(routes);
-        if timing { self.retain_small_graph_shapes(); }
         if routes {
             self.route_capture.resize_with(40, Vec::new);
             for rows in &mut self.route_capture { rows.clear(); }
@@ -1315,25 +1472,29 @@ impl<'w, 'a> BackboneLane<'w, 'a> {
     pub fn layer_clock(&self) -> &LayerClock<'a> { &self.layer_clock }
     /// Mark the arrival of the current layer's input from the other GPU.
     pub(crate) fn record_layer_entry(&mut self) {
-        if !self.capture_timing { return; }
-        let stream = self.block.finish_stream();
-        // SAFETY: the FFN-finish stream is live on this lane's device; marks
-        // are read only after the pass completes. Unchained passes drained
-        // this stream and later rebinds require it idle, so wait at once.
-        unsafe { self.layer_clock.mark_entry(self.layer, stream, !crate::shared::memory::chain::active()); }
+        let capture = Capture { routes: self.capture_routes, timing: self.capture_timing };
+        // SAFETY: this lane owns the live finish stream and the pass's unread clock.
+        unsafe { capture.record(&mut self.layer_clock, self.layer, self.block.finish_stream(), true); }
     }
     fn record_layer_finish(&mut self) {
-        if !self.capture_timing { return; }
-        let stream = self.block.finish_stream();
+        let capture = Capture { routes: self.capture_routes, timing: self.capture_timing };
         // SAFETY: as `record_layer_entry`.
-        unsafe { self.layer_clock.mark(self.layer, stream, !crate::shared::memory::chain::active()); }
+        unsafe { capture.record(&mut self.layer_clock, self.layer, self.block.finish_stream(), false); }
     }
     pub fn route_capture_enabled(&self) -> bool { self.capture_routes }
     pub fn install_attention_plan(&mut self, plan: cuteafd_core::coordinator_programs::AttentionReductionPlan) -> Result<()> {
         if let Some(dual) = &mut self.dual_sparse { dual.install_attention_plan(plan) }
         else { self.sparse.as_mut().context("attention wave absent")?.install_attention_plan(plan) }
     }
+    pub(crate) fn install_expert_usage(&mut self, usage: Option<std::rc::Rc<cuteafd_ffi::expert_usage::ExpertUsage<'a>>>) {
+        self.router.install_expert_usage(usage);
+    }
+    pub(crate) fn attention_decode(&self) -> bool {
+        matches!(self.usage_phase, cuteafd_ffi::expert_usage::UsagePhase::Decode)
+    }
     pub fn set_attention_decode(&mut self, decode: bool) {
+        self.usage_phase = if decode { cuteafd_ffi::expert_usage::UsagePhase::Decode }
+            else { cuteafd_ffi::expert_usage::UsagePhase::Prefill };
         if let Some(dual) = &mut self.dual_sparse { dual.set_decode(decode); }
         else if let Some(sparse) = &mut self.sparse { sparse.set_decode(decode); }
         // Prefill never prefetches: its own work fills the exchange.
@@ -1350,8 +1511,7 @@ impl<'w, 'a> BackboneLane<'w, 'a> {
     pub fn enable_dual_attention(&mut self,peer:Device<'a>,budgets:[usize;2])->Result<()> {
         ensure!(self.phase==Phase::Idle && self.dual_sparse.is_none(),"dual attention requires an unused lane");
         let source=Device { library:self.weights.library,id:self.query.input().device_id };
-        let mut dual=crate::families::deepseek_v41::v41_sparse_attention::dual::DualAttentionWave::new([source,peer],self.capacity,budgets)?;
-        if self.retain_small_shapes { dual.enable_small_graph_shapes(); }
+        let dual=crate::families::deepseek_v41::v41_sparse_attention::dual::DualAttentionWave::new([source,peer],self.capacity,budgets)?;
         source.run(|| { self.sparse=None; Ok(()) })?;
         self.dual_sparse=Some(dual);Ok(())
     }
@@ -1403,6 +1563,61 @@ impl<'w, 'a> BackboneLane<'w, 'a> {
 mod tests {
     use super::*;
     use cuteafd_loader::read_official_v41_catalog;
+
+    #[test]
+    fn startup_prefill_rearms_only_successfully_selected_idle_lanes() -> Result<()> {
+        for initial in [Phase::Idle, Phase::WindowSelectedIdle] {
+            let mut phase = initial;
+            rearm_startup_prefill(&mut phase)?;
+            assert_eq!(phase, Phase::Idle);
+        }
+        for initial in [Phase::Invalid, Phase::Prepared, Phase::Query, Phase::Ffn,
+            Phase::UnitPending, Phase::SharedReady, Phase::Complete] {
+            let mut phase = initial;
+            assert!(rearm_startup_prefill(&mut phase).is_err());
+            assert_eq!(phase, initial);
+        }
+        let source = include_str!("v41_backbone_lane.rs");
+        let select = source.split("pub(crate) fn select_window(").nth(1).unwrap()
+            .split("#[cfg(test)]").next().unwrap();
+        assert!(select.contains("if was_idle { self.phase = Phase::WindowSelectedIdle; }"));
+        assert!(select.find("self.window = window;").unwrap()
+            < select.find("self.phase = Phase::WindowSelectedIdle").unwrap());
+        Ok(())
+    }
+
+    #[test]
+    fn replay_capture_never_drains_layer_events_without_profiling() -> Result<()> {
+        use crate::families::deepseek_v41::v41_native_serve::speculative::round_capture;
+        use cuteafd_core::{DraftMode, DraftPolicy, PolicySeed};
+        let (_directory, fixture) = crate::shared::memory::cpu_stream_fixture()?;
+        let library = fixture.load()?;
+        let mut clock = LayerClock::new(&library, 2)?;
+        let mut policy = DraftPolicy::new(cuteafd_core::PolicyGeometry {
+            layers: vec![cuteafd_core::LayerResource { class: Some(0), slice_bytes: 1024., group_rows: 16, timed: true }; 2],
+            experts: 384, topk: 6, max_requests: 16, max_positions: 7, widths: vec![7],
+            classes: vec![cuteafd_core::ResourceClass::rtx()], group_rows_by_rows: Vec::new(), regimes: 2,
+        }, PolicySeed::weak(7), false)?;
+        policy.set_draft_mode(DraftMode::Simple);
+        for profiling in [false, true] {
+            clock.reset();
+            let before = fixture.events()?;
+            let capture = round_capture(Some(&policy), true, true, profiling);
+            assert!(capture.routes);
+            // SAFETY: the CPU fixture accepts a synthetic stream and owns all events.
+            unsafe {
+                capture.record(&mut clock, 0, std::ptr::null_mut(), true);
+                capture.record(&mut clock, 0, std::ptr::null_mut(), false);
+                capture.record(&mut clock, 1, std::ptr::null_mut(), false);
+            }
+            let after = fixture.events()?;
+            let calls = &after[before.len()..];
+            assert_eq!(calls.matches('R').count(), if profiling { 3 } else { 0 });
+            assert_eq!(calls.matches('S').count(), if profiling { 3 } else { 0 });
+            assert_eq!(clock.read().iter().any(Option::is_some), profiling);
+        }
+        Ok(())
+    }
 
     #[test]
     fn l2_plan_prefetches_the_next_layer_only_on_the_gpu_holding_both() {

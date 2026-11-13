@@ -22,13 +22,14 @@ const SOURCE: [(&str, &str); 3] = [
 
 #[derive(Debug, clap::Args)]
 pub(crate) struct GoldenArgs {
+    #[command(flatten)]
+    pub(crate) attention: crate::cli::CoreViewArgs,
     #[arg(long, default_value = "fp8")] kv_cache: cuteafd_core::MlaCacheFormat,
-    /// Prefill unit rows for scoring chunks; unset keeps whole chunks as one unit.
+    /// Prefill unit rows for scoring chunks; unset uses the shared serving policy.
     #[arg(long)] prefill_rows: Option<usize>,
-    /// Prefill units in flight while scoring (N=1 against N=2 at the same
-    /// units is byte-identical).
-    #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u8).range(1..=4))] prefill_waves: u8,
-    #[arg(long)] snapshot: PathBuf,
+    /// Prefill units in flight while scoring; unset uses the shared serving policy.
+    #[arg(long, value_parser = clap::value_parser!(u8).range(1..=4))] prefill_waves: Option<u8>,
+    #[arg(long)] pub(crate) snapshot: PathBuf,
     #[arg(long, env = "CUTEAFD_NATIVE_LIB")] native_lib: Option<PathBuf>,
     #[arg(long, default_value = "/opt/cuteafd/share/PROGRAMS.json")] manifest: PathBuf,
     /// Read-only cuteafd.kimi.layer-state/1 export, never a qualified reference panel.
@@ -43,15 +44,17 @@ pub(crate) struct GoldenArgs {
     #[arg(long, requires = "nll")] golden: Option<PathBuf>,
     /// New output directory for the shared probe row dumps and fidelity metrics.
     #[arg(long, requires = "nll")] save_logits: Option<PathBuf>,
-    #[arg(long, value_delimiter = ',')] peers: Vec<SocketAddr>,
+    #[arg(long, value_delimiter = ',', conflicts_with = "skip_routed_experts")] peers: Vec<SocketAddr>,
+    /// Golden only: run router and shared experts, with zero routed contribution.
+    #[arg(long, requires = "nll")] skip_routed_experts: bool,
     #[arg(long, default_value_t = 0)] device: i32,
     /// Optional distinct physical peer; absent scores on the primary device alone.
     #[arg(long)] split_device: Option<i32>,
+    #[arg(long, env = "CUTEAFD_ATTENTION_PLACEMENT", default_value = "auto",
+        value_parser = ["auto", "heads", "context", "layers"])] attention_placement: String,
     #[arg(long)] check_headers: bool,
-    /// Routed layers split across both coordinator GPUs (rtx-tp2).
-    #[arg(long, default_value_t = 0)] rtx_expert_layers: usize,
-    /// Complete per-rank allocation ceiling; still an offline estimate.
-    #[arg(long)] spark_budget_gib: Option<f64>,
+    /// Routed layers on coordinator GPUs: auto (startup planner), all or N.
+    #[arg(long, default_value = "auto")] rtx_expert_layers: cuteafd_loader::placement::OnboardSetting,
     /// Informational F32 comparison only; direct gate/up is the speed-first default.
     #[arg(long, env = "CUTEAFD_KIMI_COMPENSATED_FFN")]
     compensated_ffn: bool,
@@ -62,15 +65,146 @@ pub(crate) struct GoldenArgs {
     /// the C1 serving verify shape, with the prompt prefilled up to score_from.
     #[arg(long, requires = "nll", value_parser = clap::value_parser!(u16).range(2..=64))] verify_rows: Option<u16>,
     /// With --verify-rows: replay startup verify graphs (on) or run eagerly (off).
+    /// Explicit context placement always needs startup graphs, including prefill scoring.
     #[arg(long, requires = "verify_rows", default_value = "on", value_parser = ["on", "off"])] graphs: String,
     /// Grouped K6 KDA q/k/v/g input launch (on) or the four standalone launches
     /// (off; eager scoring only, since startup graphs capture the grouped launch).
     #[arg(long, default_value = "on", value_parser = ["on", "off"])] grouped_kda: String,
     /// With --verify-rows: score only the first N verify rows of each window.
     #[arg(long, requires = "verify_rows")] verify_limit: Option<usize>,
+    /// Bounded prefill-only native/residual/router diagnostics, below --save-logits.
+    #[arg(long, value_delimiter = ',', requires_all = ["capture_rows", "nll", "window", "save_logits"], conflicts_with = "verify_rows")]
+    capture_layers: Vec<usize>,
+    /// Half-open input-row interval, at most 64 rows in one prefill unit.
+    #[arg(long, requires = "capture_layers", value_parser = capture_rows)]
+    capture_rows: Option<std::ops::Range<usize>>,
 }
 
 struct Reference { tokens: Vec<u32>, hidden: Vec<f32> }
+
+fn capture_rows(value: &str) -> std::result::Result<std::ops::Range<usize>, String> {
+    let (first, end) = value.split_once(':').ok_or("capture rows must be FIRST:END")?;
+    let first = first.parse::<usize>().map_err(|_| "invalid first capture row")?;
+    let end = end.parse::<usize>().map_err(|_| "invalid capture row end")?;
+    if first >= end || end - first > 64 { return Err("capture needs 1..=64 rows".into()); }
+    Ok(first..end)
+}
+
+/// Golden-only owner, attached after startup and armed for one prefill call.
+/// All blocking readback stays here, never in the serving operator off path.
+pub(crate) struct Capture {
+    root: PathBuf,
+    layers: Vec<usize>,
+    rows: std::ops::Range<usize>,
+    call: std::cell::Cell<Option<usize>>,
+    provenance: Value,
+}
+
+fn router_top17(scores: &[f32], bias: &[f32], selected: &[u32]) -> Result<Value> {
+    ensure!(scores.len() == 896 && bias.len() == 896 && selected.len() == 16,
+        "Kimi captured router geometry differs");
+    let corrected = scores.iter().zip(bias).map(|(score, bias)| score + bias).collect::<Vec<_>>();
+    ensure!(corrected.iter().all(|score| score.is_finite()), "nonfinite captured router score");
+    let mut ids = (0..896usize).collect::<Vec<_>>();
+    ids.sort_by(|&a, &b| corrected[b].partial_cmp(&corrected[a]).unwrap().then(a.cmp(&b)));
+    ensure!(ids[..16].iter().copied().eq(selected.iter().map(|&id| id as usize)),
+        "CPU corrected top16 differs from actual GPU selected IDs; do not interpret margin");
+    Ok(serde_json::json!({"ids":&ids[..17],
+        "corrected_scores":ids[..17].iter().map(|&id| corrected[id]).collect::<Vec<_>>(),
+        "margin_16_17":corrected[ids[15]] - corrected[ids[16]], "gpu_top16_equal":true}))
+}
+
+impl Capture {
+    pub(super) fn after_ffn(capture: Option<&Self>, layer: usize,
+        work: impl FnOnce(&Self) -> Result<()>) -> Result<()> {
+        if let Some(capture) = capture.filter(|capture|
+            capture.call.get().is_some() && capture.layers.contains(&layer)) {
+            work(capture)?;
+        }
+        Ok(())
+    }
+
+    fn new(args: &GoldenArgs, windows: &[cuteafd_bench::reference::Window], capacity: usize,
+        unit_rows: usize, provenance: Value) -> Result<Option<std::rc::Rc<Self>>> {
+        let Some(rows) = args.capture_rows.clone() else { return Ok(None); };
+        ensure!(args.nll && args.verify_rows.is_none() && windows.len() == 1
+            && !args.capture_layers.is_empty() && args.capture_layers.iter().all(|&layer| layer < 93),
+            "Kimi capture requires one prefill window and valid layers");
+        let chunks = forward_chunks(windows[0].tokens.len(), capacity)?;
+        let chunk = chunks.iter().find(|chunk| chunk.contains(&rows.start))
+            .context("capture rows outside live input")?;
+        ensure!(chunk.len() > 64 && rows.end <= chunk.end
+            && (rows.start - chunk.start) / unit_rows == (rows.end - 1 - chunk.start) / unit_rows,
+            "capture rows must fit one >64-row forward and one prefill unit");
+        Ok(Some(std::rc::Rc::new(Self {
+            root: args.save_logits.as_ref().context("capture output missing")?.join("capture"),
+            layers: args.capture_layers.clone(), rows, call: std::cell::Cell::new(None), provenance,
+        })))
+    }
+
+    fn arm(&self, first: usize, rows: usize) {
+        self.call.set((first <= self.rows.start && self.rows.end <= first + rows).then_some(first));
+    }
+
+    pub(crate) fn record(&self, stream: &crate::shared::memory::device::Stream<'_>, mut site: Value,
+        tensors: &[(&str, cuteafd_ffi::CuteafdDeviceBuffer, usize, &str)],
+        bias: Option<cuteafd_ffi::CuteafdDeviceBuffer>) -> Result<()> {
+        let Some(first) = self.call.get() else { return Ok(()); };
+        let layer = site["layer"].as_u64().context("capture layer absent")? as usize;
+        if !self.layers.contains(&layer) { return Ok(()); }
+        let unit = site["unit_offset"].as_u64().context("capture unit absent")? as usize;
+        let live = site["live_rows"].as_u64().context("capture rows absent")? as usize;
+        if first + unit > self.rows.start || self.rows.end > first + unit + live { return Ok(()); }
+        let start = self.rows.start - first - unit;
+        let rows = self.rows.len();
+        // Hooks run before scratch reuse; drain only this exact producer stream.
+        stream.drain()?;
+        let download = |buffer: cuteafd_ffi::CuteafdDeviceBuffer| stream.device.run(|| {
+            let mut bytes = vec![0; buffer.bytes];
+            stream.device.library.copy_d2h(&mut bytes, buffer)?;
+            Ok(bytes)
+        });
+        let rank = site["rank"].as_u64().context("capture rank absent")?;
+        let kind = site["kind"].as_str().context("capture kind absent")?;
+        let dir = self.root.join(format!("layer-{layer:02}-rank-{rank}-{kind}"));
+        std::fs::create_dir_all(&dir)?;
+        let mut entries = Vec::new();
+        let mut values = Vec::new();
+        for &(name, buffer, width, dtype) in tensors {
+            let element = if dtype == "BF16" { 2 } else { 4 };
+            let buffer = crate::shared::prefix::view(buffer, start * width * element, rows * width * element)?;
+            let bytes = download(buffer)?;
+            let file = format!("{name}.bin");
+            let mut output = std::fs::OpenOptions::new().write(true).create_new(true).open(dir.join(&file))?;
+            std::io::Write::write_all(&mut output, &bytes)?;
+            entries.push(serde_json::json!({"name":name,"file":file,"dtype":dtype,
+                "shape":[rows,width],"byte_order":"little","sha256":digest(&bytes)}));
+            values.push(bytes);
+        }
+        if let Some(bias) = bias {
+            let bias = download(crate::shared::prefix::view(bias, 0, 896 * 4)?)?;
+            let floats = |bytes: &[u8]| bytes.chunks_exact(4)
+                .map(|v| f32::from_le_bytes(v.try_into().unwrap())).collect::<Vec<_>>();
+            let scores = floats(&values[0]);
+            let correction = floats(&bias);
+            let ids = values[1].chunks_exact(4).map(|v| u32::from_le_bytes(v.try_into().unwrap())).collect::<Vec<_>>();
+            let top = (0..rows).map(|row| router_top17(&scores[row*896..(row+1)*896],
+                &correction, &ids[row*16..(row+1)*16])).collect::<Result<Vec<_>>>()?;
+            std::fs::write(dir.join("bias.f32.bin"), &bias)?;
+            site["router"] = serde_json::json!({"score_semantics":"post-GPU-sigmoid; add F32 bias once",
+                "bias_file":"bias.f32.bin","bias_sha256":digest(&bias),"top17":top});
+        }
+        site["schema"] = serde_json::json!("cuteafd.kimi.capture/1");
+        site["call_offset"] = serde_json::json!(first);
+        site["input_rows"] = serde_json::json!([self.rows.start,self.rows.end]);
+        site["tensors"] = serde_json::json!(entries);
+        site["provenance"] = self.provenance.clone();
+        // A metadata file is the completion marker, published only after all data and checks.
+        let out = std::fs::OpenOptions::new().write(true).create_new(true).open(dir.join("metadata.json"))?;
+        serde_json::to_writer(out, &site)?;
+        Ok(())
+    }
+}
 
 impl GoldenArgs {
     fn ffn_mode(&self) -> cuteafd_ffi::KimiFfnMode {
@@ -78,12 +212,78 @@ impl GoldenArgs {
         else { cuteafd_ffi::KimiFfnMode::default() }
     }
 
+    fn prefill(&self) -> Result<cuteafd_loader::serving_capacity::prefill_waves::PrefillPlan> {
+        use cuteafd_loader::serving_capacity::prefill_waves::{prefill_shape, PrefillOverrides};
+        Ok(prefill_shape(self.peers.len(), cuteafd_loader::plan::Family::prefill_limits(
+            &cuteafd_loader::plan::families::kimi::KIMI_K3), PrefillOverrides {
+            unit_rows: self.prefill_rows.map(|rows| rows as u64),
+            waves: self.prefill_waves.map(u64::from), span_rows: None, reserve_rows: None,
+        })?)
+    }
+
+    fn startup_graphs(&self) -> Result<bool> {
+        let context = self.resolved_attention() == cuteafd_loader::placement::AttentionPlacement::Context;
+        ensure!(!context || self.graphs == "on", "Kimi context cannot score without startup decode graphs");
+        Ok((context || self.verify_rows.is_some()) && self.graphs == "on")
+    }
+
+    fn role(&self) -> super::startup::Role {
+        super::startup::Role::Golden { skip_routed_experts: self.skip_routed_experts }
+    }
+
+    fn hosted(&self, cfg: &KimiK3Config) -> Result<Option<Vec<usize>>> {
+        if self.skip_routed_experts {
+            ensure!(self.peers.is_empty() && matches!(self.rtx_expert_layers,
+                cuteafd_loader::placement::OnboardSetting::Auto | cuteafd_loader::placement::OnboardSetting::Layers(0)),
+                "Kimi skipped-routed golden refuses real peers and explicit expert onboarding");
+            return Ok(None);
+        }
+        let hosted = hosted_layers(&std::env::var("CUTEAFD_GOLDEN_EXPERT_LAYERS")?)?;
+        check_hosted_hint(self.rtx_expert_layers, cfg, &hosted)?;
+        ensure!((1..=8).contains(&self.peers.len()), "Kimi golden requires 1..8 real expert ranks");
+        Ok(Some(hosted))
+    }
+
+    fn reference_receipt(&self) -> Result<Value> {
+        let bytes = std::fs::read(self.golden.as_ref().context("golden reference missing")?.join("manifest.json"))?;
+        let manifest: Value = serde_json::from_slice(&bytes)?;
+        Ok(serde_json::json!({"config":manifest["config"], "revision":manifest["revision"], "tier":"quick",
+            "manifest_sha256":digest(&bytes), "treatment":if self.skip_routed_experts {
+                "dense/attention/DSA golden with routed experts skipped; not a full-model golden"
+            } else { "full-model" }}))
+    }
+
     fn provenance(&self) -> Value {
         serde_json::json!({"schema": "cuteafd.kimi.run/1", "ffn_mode": self.ffn_mode().name(), "kv_cache": self.kv_cache.label(),
             "gate_up_programs": ([3072, 16896].map(|width| self.ffn_mode().gate_up_stem(width))),
-            "rtx_expert_layers":self.rtx_expert_layers, "window": self.window, "last_layer": self.last_layer, "diagnostic_only": !self.nll,
-            "verify_rows": self.verify_rows, "graphs": self.verify_rows.map(|_| &self.graphs), "grouped_kda": self.grouped_kda,
+            "rtx_expert_layers":self.rtx_expert_layers.to_string(), "attention_placement": self.attention_placement, "window": self.window, "last_layer": self.last_layer, "diagnostic_only": !self.nll || self.skip_routed_experts,
+            "skip_routed_experts": self.skip_routed_experts,
+            "resolved_attention_placement": self.resolved_attention(),
+            "verify_rows": self.verify_rows, "graphs": (self.verify_rows.is_some() || self.resolved_attention() == cuteafd_loader::placement::AttentionPlacement::Context).then_some(&self.graphs), "grouped_kda": self.grouped_kda,
             "verify_limit": self.verify_limit, "prefill_rows": self.prefill_rows, "prefill_waves": self.prefill_waves})
+    }
+
+    fn selected_provenance(&self, view: &cuteafd_loader::plan::checkpoint::CheckpointView) -> Value {
+        use cuteafd_loader::plan::checkpoint::{view::FP8_RECIPE, CoreView};
+        let mut provenance = self.provenance();
+        provenance["core_view"] = serde_json::json!(view.mode());
+        provenance["core_view_fingerprint"] = serde_json::json!(view.fingerprint());
+        provenance["core_fp8_recipe"] = serde_json::json!(
+            if view.mode() == CoreView::Fp8Compact { FP8_RECIPE } else { "none" });
+        provenance
+    }
+
+    fn loaded_provenance(&self, view: &cuteafd_loader::plan::checkpoint::CheckpointView,
+        ownership: &super::startup::Ownership) -> Value {
+        let mut provenance = self.selected_provenance(view);
+        provenance["resolved_ownership"] = serde_json::json!(ownership);
+        provenance
+    }
+
+    fn resolved_attention(&self) -> cuteafd_loader::placement::AttentionPlacement {
+        cuteafd_loader::families::kimi_k3::resolve_attention(
+            cuteafd_loader::placement::attention::parse(&self.attention_placement).expect("clap validated attention"),
+            if self.split_device.is_some() { 2 } else { 1 })
     }
 }
 
@@ -170,6 +370,22 @@ fn hosted_layers(value: &str) -> Result<Vec<usize>> {
     value.split(',').map(|s| s.parse::<usize>().context("Kimi hosted layer ID")).collect()
 }
 
+fn check_hosted_hint(setting: cuteafd_loader::placement::OnboardSetting,
+    cfg: &KimiK3Config, hosted: &[usize]) -> Result<()> {
+    let routed = cfg.dense.iter().enumerate().filter_map(|(layer, dense)| (!dense).then_some(layer))
+        .collect::<Vec<_>>();
+    ensure!(hosted.iter().all(|layer| routed.binary_search(layer).is_ok()),
+        "Kimi worker layer hint includes a non-routed layer");
+    if let cuteafd_loader::placement::Onboard::Layers(count) = setting.resolve(routed.len()) {
+        ensure!(count <= routed.len(), "Kimi onboarding exceeds routed layer count");
+        super::startup::check_hosted_layers(setting, &routed[count..], hosted)?;
+    } else {
+        ensure!(hosted.windows(2).all(|pair| pair[0] < pair[1]),
+            "Kimi worker layer hint must be sorted and unique");
+    }
+    Ok(())
+}
+
 pub(crate) async fn run_golden(args: GoldenArgs) -> Result<()> {
     on_engine_thread(move || run(args)).await
 }
@@ -182,19 +398,21 @@ async fn on_engine_thread(work: impl FnOnce() -> Result<()> + Send + 'static) ->
 fn run(args: GoldenArgs) -> Result<()> {
     if args.nll { return full_run(args); }
     tracing::info!(ffn_mode = args.ffn_mode().name(), "Kimi FFN numerics selection");
-    println!("Kimi run provenance: {}", args.provenance());
     let last = args.last_layer.context("prefix requires --last-layer")?;
     let panel: Value = serde_json::from_slice(&std::fs::read(args.windows.as_ref().context("prefix requires --windows")?)?)?;
     let reference = reference(args.reference_state.as_deref().context("prefix requires --reference-state")?,
         &panel, args.window.as_deref().context("prefix requires --window")?, last)?;
-    let checkpoint = cuteafd_loader::plan::Checkpoint::coordinator(&args.snapshot, false, false)?;
+    let view = args.attention.selected_view.clone().map(Ok)
+        .unwrap_or_else(|| args.attention.select(&args.snapshot))?;
+    args.attention.validate_view(&view)?;
+    let checkpoint = cuteafd_loader::plan::Checkpoint::coordinator_view(&view, false, false)?;
+    println!("Kimi run provenance: {}", args.selected_provenance(checkpoint.view.as_ref()
+        .context("Kimi golden requires the immutable selected checkpoint view")?));
     let full = KimiK3Config::from_hf(&checkpoint.config)?;
     full.release_geometry()?;
+    full.validate_attention_role(true)?;
     let cfg = admission::prefix(&full, last.checked_add(1).context("Kimi last-layer overflow")?)?;
-    let hosted = hosted_layers(&std::env::var("CUTEAFD_GOLDEN_EXPERT_LAYERS")?)?;
-    ensure!((1..=8).contains(&args.peers.len()) && hosted == cfg.dense.iter().enumerate()
-        .filter_map(|(layer, dense)| (!dense).then_some(layer)).skip(args.rtx_expert_layers).collect::<Vec<_>>(),
-        "Kimi diagnostic needs exactly the selected routed layers on the selected real ranks");
+    args.hosted(&cfg)?;
     if args.check_headers {
         println!("Kimi diagnostic reference/header binding valid: layers=0..{} rows={}; no numerical qualification",
             last, reference.tokens.len());
@@ -203,17 +421,142 @@ fn run(args: GoldenArgs) -> Result<()> {
     native(&args, &checkpoint, &full, &cfg, reference, None)
 }
 
-fn full_reference(args: &GoldenArgs) -> Result<Vec<cuteafd_bench::reference::Window>> {
+fn diagnostic_source(root: &Path, manifest: &Value, cfg: &KimiK3Config) -> Result<()> {
+    ensure!(KimiK3Config::from_hf(&manifest["checkpoint_config"])? == *cfg
+        && manifest["vocab"].as_u64() == Some(cfg.vocab_size as u64),
+        "Kimi diagnostic checkpoint config/vocabulary differs");
+    let revision = if cfg.dsa.is_some() { "6d0a0202956796543364d666ab19c6ad1a494ee1" } else { REVISION };
+    ensure!(manifest["revision"] == revision
+        && manifest["source_pin"]["revision"] == revision
+        && manifest["snapshot_identity"]["snapshot_revision"] == revision,
+        "Kimi diagnostic source/snapshot revision differs");
+    for (key, bytes) in [
+        ("reference_runner_sha256", include_bytes!("../../../../../../python/reference/families/kimi_k3/golden.py").as_slice()),
+        ("reference_adapter_sha256", include_bytes!("../../../../../../python/reference/families/kimi_k3/model.py").as_slice()),
+    ] {
+        ensure!(manifest["source_pin"][key] == digest(bytes), "Kimi diagnostic source pin differs: {key}");
+    }
+    let pins = &manifest["source_pin"];
+    let base = if cfg.dsa.is_some() { &pins["base_decoder"] } else { pins };
+    ensure!(base["revision"] == REVISION, "Kimi diagnostic base decoder revision differs");
+    for (key, expected) in SOURCE {
+        ensure!(base[key] == expected, "Kimi diagnostic base decoder source differs: {key}");
+    }
+    for key in ["fla_source_sha256", "transformers_source_sha256", "compressed_tensors_source_sha256"] {
+        ensure!(sha(&pins[key]), "Kimi diagnostic runtime source digest missing: {key}");
+    }
+    ensure!(sha(&manifest["set_sha256"]) && sha(&manifest["checkpoint_config_sha256"])
+        && manifest["checkpoint_config_sha256"] == manifest["snapshot_identity"]["config_sha256"]
+        && sha(&manifest["snapshot_identity"]["tokenizer_sha256"]),
+        "Kimi diagnostic config/tokenizer/set binding differs");
+    if cfg.dsa.is_some() {
+        for (key, bytes) in [
+            ("dsa_adapter_sha256", include_bytes!("../../../../../../python/reference/families/kimi_k3/k31.py").as_slice()),
+            ("indexer_ops_sha256", include_bytes!("../../../../../../python/reference/families/mistral_large4/ops.py").as_slice()),
+            ("shape_invariant_sha256", include_bytes!("../../../../../../python/reference/shape_invariant.py").as_slice()),
+        ] {
+            ensure!(pins[key] == digest(bytes), "Kimi diagnostic DSA source differs: {key}");
+        }
+    }
+    let config_bytes = std::fs::read(root.join("checkpoint-config.json"))?;
+    ensure!(manifest["checkpoint_config_sha256"] == digest(&config_bytes)
+        && serde_json::from_slice::<Value>(&config_bytes)? == manifest["checkpoint_config"],
+        "Kimi diagnostic raw checkpoint config differs");
+    Ok(())
+}
+
+fn skipped_reference(root: &Path, manifest: &Value, cfg: &KimiK3Config)
+    -> Result<cuteafd_bench::reference::Reference> {
+    ensure!(manifest["schema"] == "cuteafd.kimi.skipped-routed/1"
+        && manifest["diagnostic_only"] == true && manifest["tier"] == "quick"
+        && manifest["treatment"] == "router+shared-experts; routed contribution zero",
+        "Kimi skipped-routed golden requires a matching diagnostic reference, not a full-model reference");
+    diagnostic_source(root, manifest, cfg)?;
+    let proof = &manifest["prefix_qualification"];
+    ensure!(proof["schema"] == "cuteafd.fidelity.prefix/1" && proof["passed"] == true
+        && proof["finite"] == true && proof["different_rows"] == serde_json::json!([])
+        && proof["argmax_disagreements"] == 0 && proof["rows"] == 512
+        && proof["score_from"] == 64 && proof["lengths"] == serde_json::json!([576, 640])
+        && proof["fixed_rows"] == 128 && proof["family"] == if cfg.dsa.is_some() { "kimi_k31" } else { "kimi_k3" }
+        && proof["set_sha256"] == manifest["set_sha256"]
+        && proof["snapshot_identity"] == manifest["snapshot_identity"],
+        "Kimi diagnostic reference prefix qualification differs");
+    let bytes = std::fs::read(root.join("reference.json"))?;
+    ensure!(manifest["reference_sha256"] == digest(&bytes), "Kimi diagnostic reference checksum differs");
+    let reference: cuteafd_bench::reference::Reference = serde_json::from_slice(&bytes)?;
+    reference.validate()?;
+    ensure!(reference.set_sha256 == manifest["set_sha256"].as_str().context("diagnostic set hash")?
+        && reference.checkpoint == manifest["checkpoint"].as_str().context("diagnostic checkpoint")?
+        && reference.vocab == cfg.vocab_size, "Kimi diagnostic reference identity differs");
+    Ok(reference)
+}
+
+fn arithmetic_reference(root: &Path, manifest: &Value, cfg: &KimiK3Config,
+    args: &GoldenArgs) -> Result<cuteafd_bench::reference::Reference> {
+    ensure!(args.skip_routed_experts && !args.capture_layers.is_empty() && args.capture_rows.is_some()
+        && args.window.is_some() && args.verify_rows.is_none()
+        && manifest["schema"] == "cuteafd.kimi.arithmetic-diagnostic/1"
+        && manifest["diagnostic_only"] == true && manifest["qualification_reference"] == false
+        && manifest["diagnostic"]["arithmetic"] == "f32"
+        && manifest["diagnostic"]["window"].as_str() == args.window.as_deref()
+        && manifest["treatment"] == "router+shared-experts; routed contribution zero",
+        "Kimi arithmetic diagnostic is capture-only, never an NLL qualification reference");
+    diagnostic_source(root, manifest, cfg)?;
+    let binding = &manifest["binding"];
+    ensure!(binding["source_pin"] == manifest["source_pin"]
+        && binding["snapshot_identity"] == manifest["snapshot_identity"]
+        && binding["set_sha256"] == manifest["set_sha256"]
+        && binding["skip_routed_experts"] == true && binding["state_dtype"] == "float32",
+        "Kimi arithmetic diagnostic binding differs");
+    let platform_bytes = std::fs::read(root.join("platform.json"))?;
+    let platform: Value = serde_json::from_slice(&platform_bytes)?;
+    ensure!(manifest["platform_sha256"] == digest(&platform_bytes) && manifest["platform"] == platform
+        && sha(&platform["image_sha256"])
+        && binding["image_sha256"].as_str() == platform["image_sha256"].as_str()
+            .map(|hash| format!("sha256:{hash}")).as_deref(),
+        "Kimi arithmetic diagnostic image/platform binding differs");
+    let bytes = std::fs::read(root.join("reference.json"))?;
+    ensure!(manifest["reference_sha256"] == digest(&bytes), "Kimi arithmetic reference checksum differs");
+    let reference: cuteafd_bench::reference::Reference = serde_json::from_slice(&bytes)?;
+    reference.validate()?;
+    ensure!(reference.windows.len() == 1 && reference.windows[0].id == *args.window.as_ref().unwrap()
+        && Some(reference.set_sha256.as_str()) == manifest["set_sha256"].as_str()
+        && Some(reference.checkpoint.as_str()) == manifest["checkpoint"].as_str()
+        && reference.vocab == cfg.vocab_size, "Kimi arithmetic reference window/identity differs");
+    let window = &reference.windows[0];
+    ensure!(binding["windows"][&window.id] == digest(&serde_json::to_vec(&window.tokens)?),
+        "Kimi arithmetic window tokens differ");
+    let logits = root.join("windows").join(&window.id).join("logits.bin");
+    ensure!(logits.metadata()?.len() == (window.positions.len() * cfg.vocab_size * 4) as u64
+        && manifest["logits_sha256"][&window.id] == digest(&std::fs::read(logits)?),
+        "Kimi arithmetic logits checksum/shape differs");
+    Ok(reference)
+}
+
+fn full_reference(args: &GoldenArgs, cfg: &KimiK3Config) -> Result<Vec<cuteafd_bench::reference::Window>> {
     use cuteafd_bench::fidelity_dataset;
     let root = args.golden.as_deref().context("--nll requires --golden")?;
     let bytes = std::fs::read(root.join("manifest.json"))?;
-    ensure!(digest(&bytes) == fidelity_dataset::KIMI_K3_MANIFEST_SHA256,
-        "Kimi F32 reference manifest differs from immutable publication");
     let manifest: Value = serde_json::from_slice(&bytes)?;
-    ensure!(manifest["config"] == fidelity_dataset::KIMI_K3_CONFIG && manifest["vocab"] == 163840,
-        "Kimi F32 reference config/vocabulary differs");
-    let reference = fidelity_dataset::load(root, &manifest)?;
-    let mut windows = fidelity_dataset::quick_windows(&reference)?;
+    let reference = if manifest["schema"] == "cuteafd.kimi.arithmetic-diagnostic/1" {
+        arithmetic_reference(root, &manifest, cfg, args)?
+    } else if args.skip_routed_experts {
+        skipped_reference(root, &manifest, cfg)?
+    } else {
+        let (hash, config) = if cfg.dsa.is_some() {
+            (fidelity_dataset::KIMI_K31_MANIFEST_SHA256, fidelity_dataset::KIMI_K31_CONFIG)
+        } else { (fidelity_dataset::KIMI_K3_MANIFEST_SHA256, fidelity_dataset::KIMI_K3_CONFIG) };
+        ensure!(digest(&bytes) == hash, "Kimi F32 reference manifest differs from immutable publication");
+        ensure!(manifest["config"] == config && manifest["vocab"].as_u64() == Some(cfg.vocab_size as u64),
+            "Kimi F32 reference config/vocabulary differs");
+        fidelity_dataset::load(root, &manifest)?
+    };
+    let mut windows = if manifest["schema"] == "cuteafd.kimi.arithmetic-diagnostic/1" {
+        // The strict capture-only envelope already selected its one explicit window.
+        reference.windows
+    } else {
+        fidelity_dataset::quick_windows(&reference)?
+    };
     if let Some(id) = &args.window {
         windows.retain(|window| &window.id == id);
         ensure!(windows.len() == 1, "Kimi smoke window must belong to the sealed quick subset");
@@ -225,17 +568,18 @@ fn full_reference(args: &GoldenArgs) -> Result<Vec<cuteafd_bench::reference::Win
 }
 
 fn full_run(args: GoldenArgs) -> Result<()> {
-    let windows = full_reference(&args)?;
-    let checkpoint = cuteafd_loader::plan::Checkpoint::coordinator(&args.snapshot, false, false)?;
+    let view = args.attention.selected_view.clone().map(Ok)
+        .unwrap_or_else(|| args.attention.select(&args.snapshot))?;
+    args.attention.validate_view(&view)?;
+    let checkpoint = cuteafd_loader::plan::Checkpoint::coordinator_view(&view, false, false)?;
     let cfg = KimiK3Config::from_hf(&checkpoint.config)?;
     cfg.release_geometry()?;
-    let hosted = hosted_layers(&std::env::var("CUTEAFD_GOLDEN_EXPERT_LAYERS")?)?;
-    ensure!((1..=8).contains(&args.peers.len()) && hosted == cfg.dense.iter().enumerate()
-        .filter_map(|(layer, dense)| (!dense).then_some(layer)).skip(args.rtx_expert_layers).collect::<Vec<_>>(),
-        "Kimi full-forward needs the planned Spark routed subset on the selected real ranks");
-    println!("Kimi all-layer run provenance: {}", args.provenance());
-    println!("Kimi F32 reference: config={} revision={} windows={} scored_rows={}",
-        cuteafd_bench::fidelity_dataset::KIMI_K3_CONFIG, cuteafd_bench::fidelity_dataset::KIMI_K3_REVISION,
+    cfg.validate_attention_role(true)?;
+    args.hosted(&cfg)?;
+    let windows = full_reference(&args, &cfg)?;
+    println!("Kimi all-layer run provenance: {}", args.selected_provenance(checkpoint.view.as_ref()
+        .context("Kimi golden requires the immutable selected checkpoint view")?));
+    println!("Kimi F32 reference: {} windows={} scored_rows={}", args.reference_receipt()?,
         windows.len(), windows.iter().map(|w| w.positions.len()).sum::<usize>());
     if args.check_headers { return Ok(()); }
     let output = args.save_logits.as_deref().context("--nll requires --save-logits")?;
@@ -253,12 +597,15 @@ fn forward_chunks(tokens: usize, capacity: usize) -> Result<Vec<std::ops::Range<
 }
 
 fn score_windows(args: &GoldenArgs, engine: &Engine<'_>, pool: &mut cuteafd_engine::prefix::RefPagePool,
-    windows: &[cuteafd_bench::reference::Window], capacity: usize) -> Result<()> {
+    windows: &[cuteafd_bench::reference::Window], capacity: usize, ownership: &super::startup::Ownership) -> Result<()> {
     use cuteafd_api::openai::probe::{Probe, ProbeSpec};
     use cuteafd_bench::{fidelity_rows, reference::Fidelity};
     use std::io::Write;
     let root = args.save_logits.as_deref().context("--nll requires --save-logits")?;
     std::fs::create_dir(root).context("Kimi logits output must be a new directory")?;
+    let capture = Capture::new(args, windows, capacity, args.prefill()?.unit_rows as usize,
+        args.loaded_provenance(engine.target_view(), ownership))?;
+    if let Some(capture) = &capture { engine.attach_capture(capture.clone())?; }
     let mut records = Vec::new();
     engine.reset_cold_state()?;
     for window in windows {
@@ -272,9 +619,10 @@ fn score_windows(args: &GoldenArgs, engine: &Engine<'_>, pool: &mut cuteafd_engi
             top_k: 32, want: window.want(), dump_rows: Some(dump.clone()), ..Default::default() });
         probe.admitted("kimi_k3", &window.tokens, 0);
         probe.selected_score_path("prefill");
-        probe.provenance(args.provenance());
+        probe.provenance(args.loaded_provenance(engine.target_view(), ownership));
         for chunk in chunks {
             let (first, end) = (chunk.start, chunk.end);
+            if let Some(capture) = &capture { capture.arm(first, end - first); }
             let sequences = vec![vec![super::device::SequenceRows {
                 slot: 0, start: first, rows: end - first, pages: &pages }]];
             engine.forward(&[window.tokens[first..end].to_vec()], &sequences, pool,
@@ -310,10 +658,8 @@ fn score_windows(args: &GoldenArgs, engine: &Engine<'_>, pool: &mut cuteafd_engi
         score.positions, score.top1 * 100.0, score.nll, score.kl);
     let out = std::fs::OpenOptions::new().write(true).create_new(true).open(root.join("fidelity.json"))?;
     serde_json::to_writer(out, &serde_json::json!({"schema":"cuteafd.kimi.golden/1",
-        "reference_config":cuteafd_bench::fidelity_dataset::KIMI_K3_CONFIG,
-        "reference_revision":cuteafd_bench::fidelity_dataset::KIMI_K3_REVISION,
-        "reference_manifest_sha256":cuteafd_bench::fidelity_dataset::KIMI_K3_MANIFEST_SHA256,
-        "path_shape":"prefill-shaped","kl_kind":"top1024+tail","provenance":args.provenance(),"score":score}))?;
+        "reference":args.reference_receipt()?,
+        "path_shape":"prefill-shaped","kl_kind":"top1024+tail","provenance":args.loaded_provenance(engine.target_view(), ownership),"score":score}))?;
     Ok(())
 }
 
@@ -323,7 +669,8 @@ fn score_windows(args: &GoldenArgs, engine: &Engine<'_>, pool: &mut cuteafd_engi
 /// startup graphs on, every exact width up to `verify` replays; the final
 /// shorter cycle uses its own exact width.
 fn score_verify(args: &GoldenArgs, engine: &Engine<'_>, pool: &mut cuteafd_engine::prefix::RefPagePool,
-    windows: &[cuteafd_bench::reference::Window], capacity: usize, verify: usize, graphs: bool) -> Result<()> {
+    windows: &[cuteafd_bench::reference::Window], capacity: usize, verify: usize, graphs: bool,
+    ownership: &super::startup::Ownership) -> Result<()> {
     use cuteafd_api::openai::probe::{Probe, ProbeSpec};
     use cuteafd_bench::{fidelity_rows, reference::Fidelity};
     use cuteafd_engine::prefix::PrefixFamily;
@@ -348,7 +695,7 @@ fn score_verify(args: &GoldenArgs, engine: &Engine<'_>, pool: &mut cuteafd_engin
             top_k: 32, want: window.want(), dump_rows: Some(dump.clone()), ..Default::default() });
         probe.admitted("kimi_k3", &window.tokens, 0);
         probe.selected_score_path(if graphs { "verify-graphs" } else { "verify-eager" });
-        probe.provenance(args.provenance());
+        probe.provenance(args.loaded_provenance(engine.target_view(), ownership));
         // Prompt prefix: rows 0..score_from-1, chunked at the lane capacity.
         let prefix = window.score_from - 1;
         for first in (0..prefix).step_by(capacity) {
@@ -391,18 +738,19 @@ fn score_verify(args: &GoldenArgs, engine: &Engine<'_>, pool: &mut cuteafd_engin
         family.discard(&mut placement).map_err(|error| anyhow::anyhow!("{error}"))?;
         pool.release(&units);
     }
+    // The bounded controller captures a returning unpinned width on its second
+    // miss (the shorter final verify cycle has its own width, and speculative
+    // row one is never in the startup geometry). That is the intended adaptive
+    // policy, not a startup seal; report the count beside the replays.
     let steady = cuteafd_ffi::graph_captures() - captures;
-    ensure!(steady == 0, "Kimi verify scoring captured {steady} graphs after startup");
     let replays = engine.graph_replays()?;
     let score = Fidelity::from_records(records);
     println!("Kimi verify logits: verify={verify} graphs={graphs} replays={replays} steady_captures={steady} rows={} top-1 agreement {:.4}% | mean NLL engine {:.8} | mean KL(top1024+tail) {:.8}",
         score.positions, score.top1 * 100.0, score.nll, score.kl);
     let out = std::fs::OpenOptions::new().write(true).create_new(true).open(root.join("fidelity.json"))?;
     serde_json::to_writer(out, &serde_json::json!({"schema":"cuteafd.kimi.golden/1",
-        "reference_config":cuteafd_bench::fidelity_dataset::KIMI_K3_CONFIG,
-        "reference_revision":cuteafd_bench::fidelity_dataset::KIMI_K3_REVISION,
-        "reference_manifest_sha256":cuteafd_bench::fidelity_dataset::KIMI_K3_MANIFEST_SHA256,
-        "path_shape":"verify-shaped","kl_kind":"top1024+tail","provenance":args.provenance(),
+        "reference":args.reference_receipt()?,
+        "path_shape":"verify-shaped","kl_kind":"top1024+tail","provenance":args.loaded_provenance(engine.target_view(), ownership),
         "graph_replays":replays,"score":score}))?;
     Ok(())
 }
@@ -412,16 +760,17 @@ fn load_target<'a, const RANKS: usize>(args: &GoldenArgs, library: &'a Arc<cutea
     full: &KimiK3Config, cfg: &KimiK3Config, devices: [i32; RANKS],
     prefill: cuteafd_loader::serving_capacity::prefill_waves::PrefillPlan, graphs: bool, verify: usize)
     -> Result<super::startup::Loaded<'a>> {
-    super::startup::load(library, programs, checkpoint, full, cfg, super::startup::Options {
+    super::startup::load(library, programs, checkpoint, full, cfg, super::startup::Options { role: args.role(), expert_usage: false, expert_usage_reader: Default::default(),
         cache_format: args.kv_cache, devices,
+        attention: cuteafd_loader::placement::attention::parse(&args.attention_placement).map_err(anyhow::Error::msg)?,
         native_lib: args.native_lib.as_deref().context("--native-lib required")?,
-        peers: args.peers.clone(), rtx_expert_layers: cuteafd_loader::placement::OnboardSetting::Layers(args.rtx_expert_layers),
-        spark_budget_gib: args.spark_budget_gib,
+        manifest: &args.manifest,
+        peers: args.peers.clone(), rtx_expert_layers: args.rtx_expert_layers,
         rows: usize::try_from(prefill.span_rows)?, waves: usize::try_from(prefill.waves)?,
         prefill_rows: Some(usize::try_from(prefill.unit_rows)?),
-        slots: 1, marks: 1, max_context: cuteafd_loader::families::kimi_k3::COMPILED_CONTEXT,
-        pool_tokens: Some(1_048_576), graphs, draft: None, ffn_mode: args.ffn_mode(),
-        hosted_layers: Some(hosted_layers(&std::env::var("CUTEAFD_GOLDEN_EXPERT_LAYERS")?)?), verify_rows: verify,
+        context: cuteafd_loader::placement::planner::Context::pinned(cuteafd_loader::families::kimi_k3::COMPILED_CONTEXT as u64), slots: 1, marks: 1, max_context: cuteafd_loader::families::kimi_k3::COMPILED_CONTEXT,
+        pool_tokens: Some(1_048_576), graphs, full_prefill_logits: false, draft: None, ffn_mode: args.ffn_mode(),
+        hosted_layers: args.hosted(cfg)?, verify_rows: verify, prefix: None,
     })
 }
 
@@ -430,21 +779,20 @@ fn native(args: &GoldenArgs, checkpoint: &cuteafd_loader::plan::Checkpoint,
     scoring: Option<&[cuteafd_bench::reference::Window]>) -> Result<()> {
     cuteafd_core::set_expert_geometry(ExpertGeometry::KIMI_K3)
         .map_err(|_| anyhow::anyhow!("Kimi golden needs an isolated process"))?;
-    super::startup::preflight(&args.manifest, args.native_lib.as_deref().context("--native-lib required")?)?;
+    if !args.skip_routed_experts {
+        super::startup::preflight(&args.manifest, args.native_lib.as_deref().context("--native-lib required")?)?;
+    }
     // SAFETY: sealed runner supplies the DSO; all borrowing owners drop before it.
     let library = Arc::new(unsafe { cuteafd_ffi::NativeLibrary::load(args.native_lib.as_ref().context("--native-lib required")?)? });
     let programs = library.programs()?.with_manifest(&args.manifest)?;
-    use cuteafd_loader::serving_capacity::prefill_waves::{prefill_shape, PrefillOverrides};
-    let prefill = prefill_shape(args.peers.len(), cuteafd_loader::plan::Family::prefill_limits(&cuteafd_loader::plan::families::kimi::KIMI_K3), PrefillOverrides {
-        unit_rows: args.prefill_rows.map(|rows| rows as u64),
-        waves: Some(u64::from(args.prefill_waves)), span_rows: None, reserve_rows: None,
-    })?;
+    let prefill = args.prefill()?;
+    cuteafd_bench::context::ResolvedSettings::prefill(prefill).publish();
     let rows = usize::try_from(prefill.span_rows)?;
     let verify = args.verify_rows.map(usize::from);
-    let graphs = verify.is_some() && args.graphs == "on";
+    let graphs = args.startup_graphs()?;
     ensure!(args.device >= 0 && args.split_device.is_none_or(|peer| peer >= 0 && peer != args.device),
         "Kimi golden devices must name distinct physical owners");
-    let super::startup::Loaded { engine, admission_free, admitted_bytes } = match args.split_device {
+    let super::startup::Loaded { engine, admission_free, admitted_bytes, ownership } = match args.split_device {
         Some(peer) => load_target(args, &library, &programs, checkpoint, full, cfg,
             [args.device, peer], prefill, graphs, verify.unwrap_or(0))?,
         None => load_target(args, &library, &programs, checkpoint, full, cfg,
@@ -454,7 +802,7 @@ fn native(args: &GoldenArgs, checkpoint: &cuteafd_loader::plan::Checkpoint,
     // Diagnostic A/B: the four standalone launches; refused once graphs are captured.
     if args.grouped_kda == "off" { engine.set_grouped_kda(false)?; }
     use cuteafd_engine::prefix::PrefixFamily;
-    let pages = engine.prefix_family()?.layout().pages;
+    let layout = engine.prefix_family()?.layout();
     let loaded = RuntimeInventory::measure(&library, &devices, InventoryPhase::PostLoad, |_| Ok(()))?;
     loaded.record(if scoring.is_some() { "kimi_k3-full-loaded" } else { "kimi_k3-prefix-loaded" }, &admission_free);
     for (rank, sample) in loaded.gpus.iter().enumerate() {
@@ -462,12 +810,12 @@ fn native(args: &GoldenArgs, checkpoint: &cuteafd_loader::plan::Checkpoint,
             measured_growth_bytes = admission_free[rank].saturating_sub(sample.free_bytes),
             "Kimi diagnostic loaded usage against admission");
     }
-    let mut pool = cuteafd_engine::prefix::RefPagePool::new(pages, cuteafd_ffi::MLA_PAGE_ROWS);
+    let mut pool = super::prefix::diagnostic_pool(layout);
     let actual = if let Some(windows) = scoring {
         if let Some(verify) = verify {
-            score_verify(args, &engine, &mut pool, windows, rows, verify, graphs)?;
+            score_verify(args, &engine, &mut pool, windows, rows, verify, graphs, &ownership)?;
         } else {
-            score_windows(args, &engine, &mut pool, windows, rows)?;
+            score_windows(args, &engine, &mut pool, windows, rows, &ownership)?;
         }
         None
     } else {
@@ -582,6 +930,15 @@ mod tests {
         assert_eq!(parsed.last_layer, Some(3));
         assert_eq!(parsed.kv_cache, cuteafd_core::MlaCacheFormat::Fp8);
         assert_eq!(parsed.split_device, None);
+        use cuteafd_loader::placement::OnboardSetting;
+        assert_eq!(parsed.rtx_expert_layers, OnboardSetting::Auto);
+        for (value, expected) in [("auto", OnboardSetting::Auto), ("all", OnboardSetting::All),
+            ("0", OnboardSetting::Layers(0)), ("5", OnboardSetting::Layers(5))] {
+            let crate::cli::Commands::KimiGolden(selected) = crate::cli::Cli::try_parse_from(
+                args.into_iter().chain(["--rtx-expert-layers", value]))?.command else { panic!("Kimi command"); };
+            assert_eq!(selected.rtx_expert_layers, expected);
+            assert_eq!(selected.provenance()["rtx_expert_layers"], value);
+        }
         let crate::cli::Commands::KimiGolden(pair) = crate::cli::Cli::try_parse_from(
             args.into_iter().chain(["--device", "0", "--split-device", "1"]))?.command else { panic!("Kimi command"); };
         assert_eq!((pair.device, pair.split_device), (0, Some(1)));
@@ -595,6 +952,292 @@ mod tests {
                 .filter_map(|(index, arg)| (!(at..at + 2).contains(&index)).then_some(*arg))).is_err());
         }
         assert!(crate::cli::Cli::try_parse_from(args.into_iter().chain(["--nll"])).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn post_ffn_capture_is_inert_without_an_armed_selected_layer() -> Result<()> {
+        let calls = std::cell::Cell::new(0);
+        Capture::after_ffn(None, 0, |_| { calls.set(calls.get() + 1); Ok(()) })?;
+        let capture = Capture { root: PathBuf::new(), layers: vec![3], rows: 1..2,
+            call: std::cell::Cell::new(None), provenance: Value::Null };
+        Capture::after_ffn(Some(&capture), 3, |_| { calls.set(calls.get() + 1); Ok(()) })?;
+        capture.call.set(Some(0));
+        Capture::after_ffn(Some(&capture), 2, |_| { calls.set(calls.get() + 1); Ok(()) })?;
+        assert_eq!(calls.get(), 0);
+        Capture::after_ffn(Some(&capture), 3, |_| { calls.set(calls.get() + 1); Ok(()) })?;
+        assert_eq!(calls.get(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn capture_is_bounded_prefill_only_and_checks_actual_router_ids() -> Result<()> {
+        use clap::Parser;
+        let base = ["cuteafd", "kimi-golden", "--snapshot", "/checkpoint", "--nll",
+            "--golden", "/reference", "--save-logits", "/output"];
+        let capture = ["--window", "a00", "--capture-layers", "0,3,14,92", "--capture-rows", "1440:1500"];
+        let crate::cli::Commands::KimiGolden(args) = crate::cli::Cli::try_parse_from(
+            base.into_iter().chain(capture))?.command else { panic!("Kimi command"); };
+        assert_eq!(args.capture_layers, [0,3,14,92]);
+        assert_eq!(args.capture_rows, Some(1440..1500));
+        let mut window = cuteafd_bench::reference::Window { id: "a00".into(), block: "a".into(),
+            bucket: "0-2K".into(), tokens: vec![0;1835], roles: vec![], score_from: 1323,
+            top_k: 32, positions: vec![], media: vec![] };
+        assert!(Capture::new(&args, &[window.clone()], 8256, 2752, Value::Null)?.is_some());
+        assert!(Capture::new(&args, &[window.clone()], 1000, 1000, Value::Null)?.is_some());
+        assert!(Capture::new(&args, &[window.clone()], 1460, 1460, Value::Null).is_err());
+        assert!(Capture::new(&args, &[window.clone()], 8256, 1460, Value::Null).is_err());
+        assert!(Capture::new(&args, &[window.clone(),window.clone()], 8256, 2752, Value::Null).is_err());
+        window.tokens.truncate(1450);
+        assert!(Capture::new(&args, &[window], 8256, 2752, Value::Null).is_err());
+        for bad in [vec!["--capture-rows", "0:1"], vec!["--capture-layers", "3"],
+            vec!["--capture-layers", "3", "--capture-rows", "0:65", "--window", "a00"],
+            vec!["--capture-layers", "3", "--capture-rows", "1:1", "--window", "a00"],
+            vec!["--capture-layers", "3", "--capture-rows", "0:1"],
+            capture.into_iter().chain(["--verify-rows", "8"]).collect()] {
+            assert!(crate::cli::Cli::try_parse_from(base.into_iter().chain(bad)).is_err());
+        }
+        let scores = vec![0.5f32;896];
+        let mut bias = vec![0.0f32;896];
+        let ids = (0..16).collect::<Vec<u32>>();
+        let top = router_top17(&scores, &bias, &ids)?;
+        assert_eq!(top["ids"], serde_json::json!((0..17).collect::<Vec<_>>()));
+        assert_eq!(top["margin_16_17"], 0.0);
+        bias[16] = 0.25;
+        assert!(router_top17(&scores, &bias, &ids).is_err());
+        let ids = std::iter::once(16).chain(0..15).collect::<Vec<_>>();
+        assert!(router_top17(&scores, &bias, &ids).is_ok());
+        bias[0] = f32::NAN;
+        assert!(router_top17(&scores, &bias, &ids).is_err());
+        Ok(())
+    }
+
+    fn skipped_fixture(root: &Path, k31: bool) -> Result<(KimiK3Config, Value)> {
+        let mut config = cuteafd_loader::plan::testing::kimi_k3_config();
+        if k31 {
+            config["model_type"] = json!("kimi_k31");
+            config["architectures"] = json!(["KimiK31ForConditionalGeneration"]);
+            config["text_config"]["dsa_config"] = json!({
+                "dsa_layers":config["text_config"]["linear_attn_config"]["full_attn_layers"],
+                "index_num_heads":32,"index_head_dim":128,"index_topk":2048,
+                "index_rope_dim":0,"index_k_norm_type":"layernorm","index_topk_freq":1,
+                "index_skip_topk_offset":1});
+        }
+        let cfg = KimiK3Config::from_hf(&config)?;
+        let config_bytes = serde_json::to_vec(&config)?;
+        std::fs::write(root.join("checkpoint-config.json"), &config_bytes)?;
+        let revision = if k31 { "6d0a0202956796543364d666ab19c6ad1a494ee1" } else { REVISION };
+        let mut base = json!({"revision":REVISION});
+        for (key, value) in SOURCE { base[key] = json!(value); }
+        let mut pins = if k31 { json!({"revision":revision,"base_decoder":base}) } else { base };
+        for (key, bytes) in [
+            ("reference_runner_sha256", include_bytes!("../../../../../../python/reference/families/kimi_k3/golden.py").as_slice()),
+            ("reference_adapter_sha256", include_bytes!("../../../../../../python/reference/families/kimi_k3/model.py").as_slice()),
+            ("dsa_adapter_sha256", include_bytes!("../../../../../../python/reference/families/kimi_k3/k31.py").as_slice()),
+            ("indexer_ops_sha256", include_bytes!("../../../../../../python/reference/families/mistral_large4/ops.py").as_slice()),
+            ("shape_invariant_sha256", include_bytes!("../../../../../../python/reference/shape_invariant.py").as_slice()),
+        ] { pins[key] = json!(digest(bytes)); }
+        for key in ["fla_source_sha256", "transformers_source_sha256", "compressed_tensors_source_sha256"] {
+            pins[key] = json!("a".repeat(64));
+        }
+        let identity = json!({"snapshot_revision":revision,"config_sha256":digest(&config_bytes),
+            "tokenizer_sha256":"b".repeat(64)});
+        let reference = json!({"name":"skipped diagnostic","models":["fixture"],"vocab":cfg.vocab_size,
+            "expect":{"kl_max":0.03,"top1_min":0.95},"schema":"cuteafd.fidelity.reference/2",
+            "checkpoint":"fixture","set_sha256":"c".repeat(64),"quick_windows":["w"],
+            "windows":[{"id":"w","block":"a","bucket":"0-2K","tokens":[1,2],
+                "roles":["ctx","gen"],"score_from":1,"top_k":1,"positions":[{
+                    "pos":1,"next":2,"next_lp":-1.0,"top":[{"id":2,"lp":-1.0}],"tail_lp":-0.5}]}]});
+        let bytes = serde_json::to_vec(&reference)?;
+        std::fs::write(root.join("reference.json"), &bytes)?;
+        let manifest = json!({"schema":"cuteafd.kimi.skipped-routed/1","diagnostic_only":true,"tier":"quick",
+            "treatment":"router+shared-experts; routed contribution zero","checkpoint_config":config,
+            "checkpoint_config_sha256":digest(&config_bytes),"vocab":cfg.vocab_size,"revision":revision,
+            "source_pin":pins,"snapshot_identity":identity,"set_sha256":"c".repeat(64),
+            "checkpoint":"fixture","reference_sha256":digest(&bytes),"prefix_qualification":{
+                "schema":"cuteafd.fidelity.prefix/1","passed":true,"finite":true,"different_rows":[],
+                "argmax_disagreements":0,"rows":512,"score_from":64,"lengths":[576,640],"fixed_rows":128,
+                "family":if k31 { "kimi_k31" } else { "kimi_k3" },"set_sha256":"c".repeat(64),
+                "snapshot_identity":identity}});
+        Ok((cfg, manifest))
+    }
+
+    #[test]
+    fn skipped_reference_binds_treatment_config_sources_proof_and_logits() -> Result<()> {
+        for k31 in [false, true] {
+            let tmp = tempfile::tempdir()?;
+            let (cfg, manifest) = skipped_fixture(tmp.path(), k31)?;
+            assert_eq!(skipped_reference(tmp.path(), &manifest, &cfg)?.windows.len(), 1);
+            let mut paths = vec!["/schema", "/diagnostic_only", "/tier", "/treatment", "/vocab", "/revision",
+                "/checkpoint_config/text_config/hidden_size", "/checkpoint_config_sha256",
+                "/source_pin/reference_runner_sha256", "/source_pin/reference_adapter_sha256",
+                "/source_pin/fla_source_sha256", "/snapshot_identity/config_sha256",
+                "/snapshot_identity/tokenizer_sha256", "/prefix_qualification/fixed_rows",
+                "/prefix_qualification/lengths", "/prefix_qualification/score_from",
+                "/prefix_qualification/family", "/prefix_qualification/passed",
+                "/prefix_qualification/snapshot_identity", "/set_sha256", "/reference_sha256"];
+            if k31 { paths.extend(["/source_pin/dsa_adapter_sha256", "/source_pin/indexer_ops_sha256",
+                "/source_pin/shape_invariant_sha256", "/source_pin/base_decoder/modeling_kimi_linear_sha256"]); }
+            else { paths.push("/source_pin/modeling_kimi_linear_sha256"); }
+            for path in paths {
+                let mut changed = manifest.clone();
+                *changed.pointer_mut(path).with_context(|| format!("fixture path missing: {path}"))? = Value::Null;
+                assert!(skipped_reference(tmp.path(), &changed, &cfg).is_err(), "k31={k31} {path}");
+            }
+            std::fs::write(tmp.path().join("checkpoint-config.json"), b"{}")?;
+            assert!(skipped_reference(tmp.path(), &manifest, &cfg).is_err());
+            let (cfg, manifest) = skipped_fixture(tmp.path(), k31)?;
+            std::fs::write(tmp.path().join("reference.json"), b"{}")?;
+            assert!(skipped_reference(tmp.path(), &manifest, &cfg).is_err());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn arithmetic_reference_requires_capture_and_rejects_nll_qualification() -> Result<()> {
+        use clap::Parser;
+        let tmp = tempfile::tempdir()?;
+        let (cfg, mut manifest) = skipped_fixture(tmp.path(), true)?;
+        manifest["schema"] = json!("cuteafd.kimi.arithmetic-diagnostic/1");
+        manifest["qualification_reference"] = json!(false);
+        manifest["diagnostic"] = json!({"arithmetic":"f32","window":"w"});
+        let platform = json!({"image_sha256":"d".repeat(64)});
+        let bytes = serde_json::to_vec(&platform)?;
+        std::fs::write(tmp.path().join("platform.json"), &bytes)?;
+        manifest["platform_sha256"] = json!(digest(&bytes));
+        manifest["platform"] = platform;
+        manifest["binding"] = json!({"source_pin":manifest["source_pin"],
+            "snapshot_identity":manifest["snapshot_identity"],"set_sha256":manifest["set_sha256"],
+            "skip_routed_experts":true,"state_dtype":"float32","image_sha256":format!("sha256:{}","d".repeat(64)),
+            "windows":{"w":digest(&serde_json::to_vec(&vec![1u32,2])?)}});
+        let folder = tmp.path().join("windows/w");
+        std::fs::create_dir_all(&folder)?;
+        let logits = vec![0u8; cfg.vocab_size * 4];
+        std::fs::write(folder.join("logits.bin"), &logits)?;
+        manifest["logits_sha256"] = json!({"w":digest(&logits)});
+        let base = ["cuteafd", "kimi-golden", "--snapshot", "/checkpoint", "--nll",
+            "--golden", "/reference", "--save-logits", "/output", "--skip-routed-experts"];
+        let crate::cli::Commands::KimiGolden(mut args) = crate::cli::Cli::try_parse_from(base)?.command
+            else { panic!("Kimi golden"); };
+        assert!(arithmetic_reference(tmp.path(), &manifest, &cfg, &args).is_err());
+        args.window = Some("w".into());
+        assert!(arithmetic_reference(tmp.path(), &manifest, &cfg, &args).is_err());
+        args.capture_layers = vec![0];
+        args.capture_rows = Some(0..1);
+        assert_eq!(arithmetic_reference(tmp.path(), &manifest, &cfg, &args)?.windows.len(), 1);
+        std::fs::write(tmp.path().join("manifest.json"), serde_json::to_vec(&manifest)?)?;
+        args.golden = Some(tmp.path().to_path_buf());
+        assert_eq!(full_reference(&args, &cfg)?[0].id, "w");
+        let selected = std::mem::take(&mut args.capture_layers);
+        assert!(full_reference(&args, &cfg).is_err());
+        args.capture_layers = selected;
+        for path in ["/qualification_reference", "/diagnostic/arithmetic", "/binding/source_pin",
+            "/platform_sha256", "/source_pin/reference_runner_sha256", "/logits_sha256/w"] {
+            let mut changed = manifest.clone();
+            *changed.pointer_mut(path).context("arithmetic fixture path")? = Value::Null;
+            assert!(arithmetic_reference(tmp.path(), &changed, &cfg, &args).is_err(), "{path}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn skipped_routed_flag_is_golden_only_and_conflicts_with_peers() -> Result<()> {
+        use clap::Parser;
+        let base = ["cuteafd", "kimi-golden", "--snapshot", "/checkpoint", "--nll",
+            "--golden", "/reference", "--save-logits", "/output", "--skip-routed-experts"];
+        let crate::cli::Commands::KimiGolden(args) = crate::cli::Cli::try_parse_from(base)?.command
+            else { panic!("Kimi golden"); };
+        assert!(args.role().skip_routed_experts());
+        let cfg = KimiK3Config::from_hf(&cuteafd_loader::plan::testing::kimi_k3_config())?;
+        assert!(args.hosted(&cfg)?.is_none());
+        assert!(crate::cli::Cli::try_parse_from(base.into_iter().chain(["--peers", "127.0.0.1:1234"])).is_err());
+        let serve = ["cuteafd", "serve-kimi", "--snapshot", "/checkpoint", "--native-lib", "/native",
+            "--peers", "127.0.0.1:1234"];
+        assert!(crate::cli::Cli::try_parse_from(serve).is_ok());
+        assert!(crate::cli::Cli::try_parse_from(serve.into_iter().chain(["--skip-routed-experts"])).is_err());
+        assert_eq!(args.provenance()["diagnostic_only"], true);
+        Ok(())
+    }
+
+    #[test]
+    fn golden_prefill_defaults_and_overrides_match_serving() -> Result<()> {
+        use clap::Parser;
+        for ranks in [0, 6] {
+            let peers = (0..ranks).map(|rank| format!("127.0.0.1:{}", rank + 1))
+                .collect::<Vec<_>>().join(",");
+            for extra in [vec![], vec!["--prefill-waves", "2"],
+                vec!["--prefill-rows", "2048", "--prefill-waves", "1"]] {
+                let mut common = extra.clone();
+                if ranks > 0 { common.extend(["--peers", peers.as_str()]); }
+                let crate::cli::Commands::KimiGolden(golden) = crate::cli::Cli::try_parse_from(
+                    ["cuteafd", "kimi-golden", "--snapshot", "/checkpoint", "--nll",
+                        "--golden", "/reference", "--save-logits", "/output"].into_iter()
+                        .chain(common.iter().copied()))?.command else { panic!("Kimi golden"); };
+                let crate::cli::Commands::ServeKimi(serve) = crate::cli::Cli::try_parse_from(
+                    ["cuteafd", "serve-kimi", "--snapshot", "/checkpoint", "--native-lib", "/native.so"].into_iter()
+                        .chain(common.iter().copied()))?.command else { panic!("Kimi serve"); };
+                assert_eq!(golden.prefill()?, serve.prefill()?);
+                if extra.is_empty() {
+                    assert_eq!(golden.prefill_waves, None);
+                    let shape = golden.prefill()?;
+                    assert_eq!((shape.unit_rows, shape.waves, shape.span_rows),
+                        if ranks == 0 { (4096, 1, 4096) } else { (2752, 3, 8256) });
+                }
+            }
+        }
+        for value in ["0", "5"] {
+            assert!(crate::cli::Cli::try_parse_from(["cuteafd", "kimi-golden", "--snapshot",
+                "/checkpoint", "--nll", "--golden", "/reference", "--save-logits", "/output",
+                "--prefill-waves", value]).is_err());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn golden_provenance_binds_selected_mode_bundle_and_fp8_refusal() -> Result<()> {
+        use clap::Parser;
+        use cuteafd_loader::plan::checkpoint::{CoreView, CheckpointView};
+        let dir = tempfile::tempdir()?;
+        let config = cuteafd_loader::plan::testing::kimi_k3_config();
+        let tensors = cuteafd_loader::plan::testing::kimi_k3_tensors(false);
+        let expected = tensors.iter().map(|(name, _, shape)| (name.clone(), shape.clone())).collect();
+        let shapes = tensors.iter().filter(|(name, ..)| name.strip_suffix(".weight")
+            .is_some_and(|stem| cuteafd_loader::families::kimi_k3::core::split(stem).is_some()))
+            .map(|(name, _, shape)| (name.clone(), shape.clone())).collect();
+        cuteafd_loader::plan::testing::write_mc_snapshot(dir.path(), &config, &tensors, &shapes);
+        let crate::cli::Commands::KimiGolden(args) = crate::cli::Cli::try_parse_from([
+            "cuteafd", "kimi-golden", "--snapshot", "/checkpoint", "--nll",
+            "--golden", "/reference", "--save-logits", "/output"])?.command
+            else { panic!("Kimi command"); };
+        let mut fingerprints = std::collections::BTreeSet::new();
+        for mode in [CoreView::Original, CoreView::K6Compact, CoreView::K8Compact] {
+            let view = CheckpointView::select(dir.path(), mode)?;
+            let provenance = args.selected_provenance(&view);
+            assert_eq!(provenance["core_view"], serde_json::to_value(mode)?);
+            assert_eq!(provenance["core_view_fingerprint"], view.fingerprint());
+            assert_eq!(provenance["core_fp8_recipe"], "none");
+            if mode == CoreView::Original {
+                let checkpoint = cuteafd_loader::plan::Checkpoint::open_view(&view)?;
+                let cfg = KimiK3Config::from_hf(&checkpoint.config)?;
+                let core = cuteafd_loader::families::kimi_k3::core::CoreInventory::from_checkpoint(
+                    &cfg, &checkpoint, &expected)?;
+                assert!(core.native.is_empty(), "original view must schedule zero FP8 conversions");
+            }
+            fingerprints.insert(view.fingerprint().to_owned());
+        }
+        assert_eq!(fingerprints.len(), 3);
+        let view = CheckpointView::select(dir.path(), CoreView::Fp8Compact)?;
+        let provenance = args.selected_provenance(&view);
+        assert_eq!(provenance["core_view"], "fp8-compact");
+        assert_eq!(provenance["core_view_fingerprint"], view.fingerprint());
+        assert_eq!(provenance["core_fp8_recipe"], cuteafd_loader::plan::checkpoint::view::FP8_RECIPE);
+        assert!(fingerprints.insert(view.fingerprint().to_owned()));
+        let checkpoint = cuteafd_loader::plan::Checkpoint::open_view(&view)?;
+        let cfg = KimiK3Config::from_hf(&checkpoint.config)?;
+        let error = cuteafd_loader::families::kimi_k3::core::CoreInventory::from_checkpoint(
+            &cfg, &checkpoint, &expected).unwrap_err().to_string();
+        assert!(error.contains("language_model.lm_head.weight")
+            && error.contains("role vocabulary head") && error.contains("family Kimi"), "{error}");
         Ok(())
     }
 
@@ -624,6 +1267,35 @@ mod tests {
         for bad in [&["--verify-rows", "1"][..], &["--verify-rows", "65"], &["--graphs", "off"], &["--verify-limit", "4"],
             &["--grouped-kda", "maybe"]] {
             assert!(crate::cli::Cli::try_parse_from(args.into_iter().chain(bad.iter().copied())).is_err(), "{bad:?}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn context_golden_requires_graphs_even_without_verify_scoring() -> Result<()> {
+        use clap::Parser;
+        let argv = ["cuteafd", "kimi-golden", "--snapshot", "/checkpoint", "--nll",
+            "--golden", "/reference", "--save-logits", "/output"];
+        for ranks in [1, 2] {
+            for mode in ["auto", "heads", "layers", "context"] {
+                let mut argv = argv.to_vec();
+                if ranks == 2 { argv.extend(["--split-device", "1"]); }
+                let context = mode == "context" || (mode == "auto" && ranks == 2);
+                let crate::cli::Commands::KimiGolden(args) = crate::cli::Cli::try_parse_from(argv.iter().copied()
+                    .chain(["--attention-placement", mode]))?.command else { panic!("Kimi command"); };
+                assert_eq!(args.startup_graphs()?, context);
+                assert_eq!(args.provenance()["graphs"], if context { serde_json::json!("on") }
+                    else { serde_json::Value::Null });
+                assert_eq!(args.resolved_attention(), cuteafd_loader::families::kimi_k3::resolve_attention(
+                    cuteafd_loader::placement::attention::parse(mode).unwrap(), ranks));
+                for graphs in ["on", "off"] {
+                    let crate::cli::Commands::KimiGolden(args) = crate::cli::Cli::try_parse_from(argv.iter().copied()
+                        .chain(["--attention-placement", mode, "--verify-rows", "8", "--graphs", graphs]))?.command
+                        else { panic!("Kimi command"); };
+                    if context && graphs == "off" { assert!(args.startup_graphs().is_err()); }
+                    else { assert_eq!(args.startup_graphs()?, graphs == "on"); }
+                }
+            }
         }
         Ok(())
     }
@@ -679,7 +1351,7 @@ mod tests {
         let parsed = crate::cli::Cli::try_parse_from(["cuteafd", "kimi-golden", "--snapshot", "/checkpoint",
             "--nll", "--golden", &root, "--save-logits", "/output"])?;
         let crate::cli::Commands::KimiGolden(mut args) = parsed.command else { panic!("Kimi command"); };
-        let windows = full_reference(&args)?;
+        let windows = full_reference(&args, &KimiK3Config::from_hf(&cuteafd_loader::plan::testing::kimi_k3_config())?)?;
         assert_eq!(windows.len(), 8);
         assert_eq!(windows.iter().map(|w| w.positions.len()).sum::<usize>(), 4096);
         for id in cuteafd_bench::fidelity_dataset::QUICK_WINDOWS {
@@ -689,9 +1361,9 @@ mod tests {
             assert!(window.positions.iter().all(|p| positions.contains(&p.pos)));
         }
         args.window = Some("legacy".into());
-        assert_eq!(full_reference(&args)?.len(), 1);
+        assert_eq!(full_reference(&args, &KimiK3Config::from_hf(&cuteafd_loader::plan::testing::kimi_k3_config())?)?.len(), 1);
         args.window = Some("a01".into());
-        assert!(full_reference(&args).is_err());
+        assert!(full_reference(&args, &KimiK3Config::from_hf(&cuteafd_loader::plan::testing::kimi_k3_config())?).is_err());
         Ok(())
     }
 
@@ -798,7 +1470,7 @@ mod tests {
         for rank in 0..2 {
             let code = cuteafd_loader::placement::inventory::loaded_code_allowance("kimik3", "exl3", true,
                 rank as u8, arch, Some(&selected));
-            fixed.push(code_demand(rank, code.bytes, arch.cublas_bytes, 1)?);
+            fixed.push(code_demand(rank, code.bytes)?);
         }
         // No CUDA baseline is claimed: conservatively reserve context plus a
         // separate 2 GiB module allowance in this CPU-only forecast.
@@ -820,16 +1492,16 @@ mod tests {
             crate::shared::placement::spark_rings(cuteafd_transport::TcpTransportConfig::default().max_frame_bytes)?,
             cuteafd_loader::families::kimi_k3::SPARK_DEFAULT_BUDGET_BYTES,
             cuteafd_loader::families::kimi_k3::spark::reserve_bytes(6, 2, rows as u64)?)?;
-        let graph_set = super::super::graphs::owned_inventory(&cfg, 1, rows, slots, 0)?;
-        let admitted = admission::admit(admission::Inputs { cfg: &cfg, core: Default::default(), cache_format: cuteafd_core::MlaCacheFormat::Bf16, gpus: [GpuBudget {
-            capacity_bytes: 96 << 30, headroom_bytes: 2 << 30,
+        let admitted = admission::admit(admission::Inputs { skip_routed_experts: false, expert_usage: false, cfg: &cfg, core: Default::default(),
+            resident_weight_limit: cuteafd_loader::placement::ResidentWeights::DEFAULT_LIMIT, cache_format: cuteafd_core::MlaCacheFormat::Bf16, gpus: [GpuBudget {
+            capacity_bytes: 96 << 30, reserve_bytes: 2 << 30,
             baseline: cuteafd_loader::placement::Baseline::Measured { free_bytes: (96 << 30) - reserve } }; 2],
-            devices: [0, 1], peer_access: true, spark_ranks: 6, attention: None,
-            requested_pool: Some(1_048_576), state_slots: slots, prefix_marks: marks, rows, lanes: 1, waves: 2, unit_rows: None,
+            devices: [0, 1], peer_access: true, spark_ranks: 6, attention: None, context: None, serving_context: cuteafd_loader::placement::planner::Context::pinned(1_048_576),
+            requested_pool: Some(1_048_576), state_slots: slots, prefix_marks: marks, rows, lanes: 1, waves: 2, unit_rows: None, full_prefill_logits: false,
             lane_layouts: vec![std::array::from_fn(|_| super::super::device::LaneLayout::new(&cfg, rows, (rows).min(4096),
                 1048576, native_scratch).unwrap())], fixed,
-            startup: (0..2).map(|rank| super::super::graphs::demand(&graph_set.inventory, rank)).collect(),
-            pool_bounded: vec![], rtx: Some(rtx), spark_budget: Some(spark.clone()), draft: None, verify_rows: 0 })?;
+            startup: cuteafd_loader::families::kimi_k3::allocation::graph_reserve_demands(cuteafd_loader::serving_capacity::kimi_prewarm::KimiCoreFormat::Bf16, 2)?,
+            pool_bounded: vec![], rtx: Some(rtx), spark_budget: Some(spark.clone()), draft: None, verify_rows: 0, prefix: None })?;
         let onboard = admitted.placement.onboard_layers;
         assert!(onboard >= spark.minimum_rtx_layers()?);
         assert_eq!(admitted.working_set().rtx_layers, (1..=onboard).collect::<Vec<_>>());
@@ -859,22 +1531,20 @@ mod tests {
     }
 
     #[test]
-    fn shared_code_allowance_and_each_private_head_are_reserved() -> Result<()> {
+    fn selected_code_allowance_excludes_private_head_and_peer_storage() -> Result<()> {
         use cuteafd_loader::placement::{ArchContext, ProgramSet, inventory::loaded_code_allowance};
         let arch = ArchContext::for_device(cuteafd_core::GpuArch::Sm120, 96 << 30);
         let programs = ProgramSet::from_names(&["kimik3"], ["kimik3_kda_m64", "other_m64"]);
         for rank in 0..2 {
             let code = loaded_code_allowance("kimik3", "exl3", true, rank as u8, arch, Some(&programs));
-            assert_eq!(code.basis, Basis::Formula);
-            assert_eq!(code.bytes, arch.cublas_bytes + programs.module_bytes() + arch.peer_context_bytes);
-            for lanes in [1, 2] {
-                let demand = code_demand(rank, code.bytes, arch.cublas_bytes, lanes)?;
-                assert_eq!(demand.basis, Basis::Formula);
-                assert_eq!(demand.bytes, code.bytes + if rank == 1 { lanes as u64 * arch.cublas_bytes } else { 0 });
-            }
+            assert_eq!(code.basis, Basis::Estimated);
+            assert_eq!(code.bytes, programs.module_bytes());
+            let demand = code_demand(rank, code.bytes)?;
+            assert_eq!(demand.basis, Basis::Estimated);
+            assert_eq!(demand.bytes, code.bytes);
+            assert_eq!(code.pending(arch.context_bytes + code.bytes, arch.context_bytes), 0);
         }
-        assert!(code_demand(2, 0, 0, 1).is_err());
-        assert!(code_demand(1, u64::MAX, 1, 1).is_err());
+        assert!(code_demand(2, 0).is_err());
         Ok(())
     }
 

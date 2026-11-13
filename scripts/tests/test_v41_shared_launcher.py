@@ -71,9 +71,15 @@ def tmp_root(tmp_path_factory):
     return root
 
 
-@pytest.mark.parametrize("case", CASES)
+SHOWCASE_BASELINES = {
+    f"deepseek-v41-mxfp4-max-{codec}-reply": "deepseek-v41-mxfp4-max"
+    for codec in ("fp8", "nvfp4")
+}
+
+
+@pytest.mark.parametrize("case", (*CASES, *SHOWCASE_BASELINES))
 def test_shared_launcher_matches_the_private_v41_path(case: str, tmp_root) -> None:
-    golden = json.loads((FIXTURES / f"{case}.json").read_text())
+    golden = json.loads((FIXTURES / f"{SHOWCASE_BASELINES.get(case, case)}.json").read_text())
     current = capture(ROOT, case)
     assert [c["host"] for c in current["containers"]] == [c["host"] for c in golden["containers"]]
     for old, new in zip(golden["containers"], current["containers"]):
@@ -93,8 +99,8 @@ def test_shared_launcher_matches_the_private_v41_path(case: str, tmp_root) -> No
             expected_options.append("--init")
         assert after["options"] == sorted(expected_options), where
         # shared_thermal_args also mounts the host power governor's state read-only
-        # when gpu-powerd runs on this host (#114).
-        governor = ["/run/gpu-powerd:/run/gpu-powerd:ro"] if role == "coordinator" and os.path.isdir("/run/gpu-powerd") else []
+        # when gpu-powerd runs on the host (#114); the capture seeds that directory.
+        governor = ["/run/gpu-powerd:/run/gpu-powerd:ro"] if role == "coordinator" else []
         # The coordinator also shares the host fidelity reference cache with the dashboard.
         fidelity = [f"<root>/hosts/{old['host']}/.cache/cuteafd/fidelity:/run/cuteafd/fidelity"] \
             if role == "coordinator" else []
@@ -111,22 +117,32 @@ def test_shared_launcher_matches_the_private_v41_path(case: str, tmp_root) -> No
         link = added.pop("CUTEAFD_CONSOLE_LINK_COMMAND", None)
         if role == "coordinator":
             assert link and link.startswith('echo "http://') and "$(cat ~/.cache/cuteafd/console/secret)" in link, where
-        assert added == INTENDED[role], where
+        expected_added = dict(INTENDED[role])
+        if case in SHOWCASE_BASELINES and role == "coordinator":
+            codec = case.removeprefix("deepseek-v41-mxfp4-max-").removesuffix("-reply")
+            expected_added.update({f"CUTEAFD_SPARK_{phase}_REPLY_FORMAT": codec
+                                   for phase in ("PREFILL", "DECODE")})
+        assert added == expected_added, where
         # The fingerprint now also covers the shared executor's prefill waves.
         fingerprinted = {key: value for key, value in before["env"].items() if key != "CUTEAFD_RELEASE_CONFIG_SHA256"}
         assert {key: after["env"][key] for key in fingerprinted} == fingerprinted, where
         # The serve command is the same set of flags and values (clap ignores order;
         # --usage now precedes nothing it depends on).
         assert after["command"][:3] == before["command"][:3], where
-        # The planner's prefill waves and reserve reach the shared executor,
-        # and serving applies the deployment plan's coordinator weight cap.
+        planned_budget = {plan[plan.index("--coordinator-weight-budget-gib") + 1]
+                          for plan in current["plans"] if "--coordinator-weight-budget-gib" in plan}
+        # The planner's prefill waves and reserve reach the shared executor.
         value = lambda flag: after["command"][after["command"].index(flag) + 1]
-        plan = current["plans"][-1]
-        plan_cap = plan[plan.index("--coordinator-weight-budget-gib") + 1]
         expected_command = before["command"] + (["--mapped-scale-preload-gib", "0",
             "--prefill-waves", value("--prefill-waves"),
-            "--prefill-reserve-rows", value("--prefill-reserve-rows"),
-            "--coordinator-weight-budget-gib", plan_cap] if role == "coordinator" else [])
+            "--prefill-reserve-rows", value("--prefill-reserve-rows")] if role == "coordinator" else [])
+        if role == "coordinator":
+            expected_command.append("--expert-usage")
+            # Serve admits resident weights against the planner's budget (captures
+            # predate passing it and fell back to the 80 GiB default).
+            assert len(planned_budget) == 1, where
+            expected_command += ["--coordinator-weight-budget-gib", next(iter(planned_budget))]
+            expected_command[expected_command.index("--max-context-tokens") + 1] = "auto"
         # With Sparks, serve's unit is the planner's third of the reserve (fixed depth 3).
         if role == "coordinator" and value("--prefill-waves") == "3" and "--prefill-batch-tokens" in expected_command:
             expected_command[expected_command.index("--prefill-batch-tokens") + 1] = "2752"
@@ -146,14 +162,18 @@ def test_shared_launcher_matches_the_private_v41_path(case: str, tmp_root) -> No
         # These captures pin no device override: auto stays with the planner.
         budget_index = expected.index("--spark-budget-gib")
         del expected[budget_index:budget_index + 2]
+        # The logical GPU ceiling is the memory policy's GPU cap, in bytes.
+        cap_index = expected.index("--coordinator-gpu-budget-gib")
+        expected[cap_index:cap_index + 2] = ["--gpu-memory-cap",
+                                             str(int(float(expected[cap_index + 1]) * 2**30))]
+        expected[expected.index("--max-context-tokens") + 1] = "auto"
         expected.insert(expected.index("--require-ready"), "--deployment")
         if case in KIT_CARDS:
             expected.remove("--require-ready")
         coordinator = parse_run(golden["containers"][0]["argv"])
         command = coordinator["command"]
         additions = []
-        # Derived native_ownership makes TP explicit in serving argv, not in
-        # planner argv. Only user-supplied topology keys reach the planner.
+        # The shared exchange derives its TP degree from the deployment plan.
         if case in KIT_CARDS:
             kit = json.loads((ROOT / "scripts/bench/kits/gate/matrix-gate.json").read_text())
             entry = next(e for e in kit["entries"] if e["name"] == case)
@@ -162,11 +182,8 @@ def test_shared_launcher_matches_the_private_v41_path(case: str, tmp_root) -> No
         else:
             config = ROOT / "examples/configs" / f"{case}.config"
             overrides = {}
-        explicit_topology = any(line.startswith(("SPARK_TP=", "SPARK_EP="))
-                                for line in config.read_text().splitlines()) or any(
-                                    key in overrides for key in ("SPARK_TP", "SPARK_EP"))
-        for flag in ("--spark-tp", "--spark-ep", "--kv-pool-size", "--memory-reservation", "--dspark-draft-limit"):
-            if flag in command and (flag not in ("--spark-tp", "--spark-ep") or explicit_topology):
+        for flag in ("--kv-pool-size", "--draft-length"):
+            if flag in command:
                 additions += [flag, command[command.index(flag) + 1]]
         cache = command[command.index("--host-cache-bytes") + 1] if "--host-cache-bytes" in command else "0"
         expected[expected.index("--prefix-cache-entries") + 2:expected.index("--prefix-cache-entries") + 2] = ["--host-cache-bytes", cache]
@@ -175,11 +192,15 @@ def test_shared_launcher_matches_the_private_v41_path(case: str, tmp_root) -> No
         expected[expected.index("--rtx"):expected.index("--rtx")] = additions
         index = expected.index("--available-sparks") + 2
         expected[index:index] = ["--mapped-scale-preload-gib", "0", "--config", "/run/cuteafd-plan.config"]
+        if case in SHOWCASE_BASELINES:
+            codec = case.rsplit("-", 2)[1]
+            expected[index + 4:index + 4] = ["--spark-prefill-reply-format", codec,
+                                            "--spark-decode-reply-format", codec]
         enabled = command[command.index("--rtx-gpus") + 1] == "2" and "--dspark" in command
-        draft_limit = command[command.index("--dspark-draft-limit") + 1] if "--dspark-draft-limit" in command else ""
+        draft_limit = command[command.index("--draft-length") + 1] if "--draft-length" in command else ""
         available = int(expected[expected.index("--available-sparks") + 1])
         normalized = (f"TP2_DSPARK_EXPERTS={'on' if enabled else 'off'}\nSPECULATOR=dspark\n"
-                      f"DSPARK_DRAFT_LIMIT={draft_limit}\n"
+                      f"DRAFT_LENGTH={draft_limit}\nEXPERT_USAGE=on\n"
                       + ''.join(f"SPARK_{rank}_HOST={host}\n" for rank, host in enumerate(HOSTS[:available])))
         digest = hashlib.sha256(normalized.encode()).hexdigest()[:16]
         mount_index = expected.index("-v") + 2
@@ -208,17 +229,17 @@ def test_scale_preload_cap_reaches_plan_and_native_serve(tmp_root, monkeypatch, 
         assert args[args.index("--mapped-scale-preload-gib") + 1] == cap
 
 
-@pytest.mark.parametrize("limit", [None, "7"])
-def test_dspark_draft_limit_reaches_plan_and_serve(tmp_root, monkeypatch, limit) -> None:
+@pytest.mark.parametrize("limit", [None, "7", "99"])
+def test_draft_length_reaches_plan_and_serve(tmp_root, monkeypatch, limit) -> None:
     import v41_launch_capture as capture_module
     original = capture_module.example_config
 
     def with_limit(name, directory):
         config = original(name, directory)
         text = "\n".join(line for line in config.read_text().splitlines()
-                         if not line.startswith("DSPARK_DRAFT_LIMIT=")) + "\n"
+                         if not line.startswith("DRAFT_LENGTH=")) + "\n"
         if limit is not None:
-            text += f"DSPARK_DRAFT_LIMIT={limit}\n"
+            text += f"DRAFT_LENGTH={limit}\n"
         config.write_text(text)
         return config
 
@@ -226,8 +247,8 @@ def test_dspark_draft_limit_reaches_plan_and_serve(tmp_root, monkeypatch, limit)
     result = capture_module.capture(ROOT, "deepseek-v41-mxfp4-max")
     command = parse_run(result["containers"][0]["argv"])["command"]
     for args in [command, *result["plans"]]:
-        assert args.count("--dspark-draft-limit") == (limit is not None)
-        resolved = args[args.index("--dspark-draft-limit") + 1] if limit is not None else "5"
+        assert args.count("--draft-length") == (limit is not None)
+        resolved = args[args.index("--draft-length") + 1] if limit is not None else "5"
         assert resolved == (limit or "5")
 
 
@@ -235,7 +256,7 @@ def test_dspark_draft_limit_reaches_plan_and_serve(tmp_root, monkeypatch, limit)
 def test_v41_gpu_expert_tier_and_profile_reach_plan_and_serve(tmp_root, monkeypatch, tier) -> None:
     """GPU_EXPERT_TIER reaches the deployment plan and serve-native, never a
     Spark; GPU_EXPERT_TIER_PROFILE is mounted read-only at one path in both
-    containers. Six Sparks take the planner's owned wire unasked."""
+    containers. Uses the planner's shared Spark exchange."""
     import v41_launch_capture as capture_module
     original = capture_module.example_config
     profile = tmp_root / "routes.json"
@@ -259,32 +280,33 @@ def test_v41_gpu_expert_tier_and_profile_reach_plan_and_serve(tmp_root, monkeypa
         assert not any("expert-tier" in arg for arg in worker["argv"])
 
 
-def test_v41_gpu_expert_tier_refuses_one_rtx_a_bare_profile_and_the_canonical_wire(tmp_root, monkeypatch) -> None:
+def test_v41_gpu_expert_tier_refuses_one_rtx_a_bare_profile_and_accepts_the_shared_wire(tmp_root, monkeypatch) -> None:
     import v41_launch_capture as capture_module
     original = capture_module.example_config
     lines = {"one": "GPU_EXPERT_TIER=24\n", "bare": "GPU_EXPERT_TIER_PROFILE=/dev/null\n",
-             "canonical": "GPU_EXPERT_TIER=24\n", "owned": "GPU_EXPERT_TIER=24\nSPARK_TP=4\nSPARK_EP=1\n"}
+             "canonical": "GPU_EXPERT_TIER=24\n"}
     for case, line in lines.items():
         def with_key(name, directory, line=line, case=case):
             config = original(name, directory)
-            if case in ("canonical", "owned"):
+            if case == "canonical":
                 config.write_text(config.read_text().replace("SPARK_COUNT=6", "SPARK_COUNT=4"))
             return capture_module.append_config(config, line)
         monkeypatch.setattr(capture_module, "example_config", with_key)
         example = "deepseek-v41-mxfp4-min" if case == "one" else "deepseek-v41-mxfp4-max"
-        if case == "owned":
+        if case == "canonical":
             command = parse_run(capture_module.capture(ROOT, example)["containers"][0]["argv"])["command"]
-            assert command[command.index("--spark-tp") + 1] == "4" and "--gpu-expert-tier" in command
+            assert "--gpu-expert-tier" in command
             continue
-        expected = {"one": r"two RTX GPUs", "bare": r"set GPU_EXPERT_TIER",
-                    "canonical": r"GPU_EXPERT_TIER needs an owned Spark topology"}[case]
+        expected = {"one": r"two RTX GPUs", "bare": r"set GPU_EXPERT_TIER"}[case]
         with pytest.raises(RuntimeError, match=expected):
             capture_module.capture(ROOT, example)
 
 
 def test_goldens_cover_every_v41_example_and_gate_card() -> None:
     examples = {p.stem for p in (ROOT / "examples" / "configs").glob("deepseek-v41-*.config")}
-    assert examples <= set(CASES)
+    assert examples <= set(CASES) | set(SHOWCASE_BASELINES)
+    assert set(SHOWCASE_BASELINES) <= examples
+    assert set(SHOWCASE_BASELINES.values()) <= set(CASES)
     kit = json.loads((ROOT / "scripts/bench/kits/gate/matrix-gate.json").read_text())
     assert {e["name"] for e in kit["entries"] if e.get("family") == "deepseek_v41"} <= set(KIT_CARDS)
     assert {p.stem for p in FIXTURES.glob("*.json")} == set(CASES)
@@ -296,12 +318,14 @@ def test_v41_sim5090_launches_pinned_single_gpu_tp4() -> None:
     coordinator = containers[0]
     assert coordinator["env"]["CUTEAFD_SPARK_INTAKE"] == "pinned"
     command = dict(flag_values(coordinator["command"]))
-    for flag, value in {"--rtx-gpus": "1", "--spark-tp": "4", "--spark-ep": "1",
-                        "--max-context-tokens": "1048576"}.items():
+    for flag, value in {"--rtx-gpus": "1", "--max-context-tokens": "1048576"}.items():
         assert command[flag] == value
+    assert "--spark-tp" not in command and "--spark-ep" not in command
     assert len(containers) == 5
     for plan in result["plans"]:
-        assert plan[plan.index("--coordinator-gpu-budget-gib") + 1] == "31.8"
+        # The plan takes the resolved cap (the smaller of the card and the key), in bytes.
+        assert plan[plan.index("--gpu-memory-cap") + 1] == str(int(31.8 * 2**30))
+        assert plan.count("--gpu-memory-cap") == 1
         # The planner sizes the reserve: the card pins no prefill rows (0 = automatic).
         assert plan[plan.index("--prefill-rows") + 1] == "0"
 
@@ -395,10 +419,11 @@ def test_serving_containers_keep_namespace_paths_and_host_identity() -> None:
         assert run["command"][run["command"].index("--snapshot") + 1].startswith("<root>/hf/hub/")
 
 
-@pytest.mark.parametrize("value", [None, "off", "draft", "all", "packed"])
-def test_v41_fp8_head_key_reaches_planner_and_coordinator(tmp_root, monkeypatch, value) -> None:
-    """V41_FP8_HEAD=off|draft|all|packed forwards CUTEAFD_V41_FP8_HEAD to the coordinator and
-    the planner (both read it); unset forwards nothing (the engine default, all)."""
+@pytest.mark.parametrize("case", ["deepseek-v41-mxfp4-min", "deepseek-v41-mxfp4-max"])
+@pytest.mark.parametrize("value", [None, "auto", "off", "draft", "all", "packed"])
+def test_v41_fp8_head_key_reaches_planner_and_coordinator(tmp_root, monkeypatch, value, case) -> None:
+    """Plan and serve receive the same unresolved head request on both layouts.
+    Unset forwards nothing; the shared engine resolver selects packed for unset/auto."""
     import v41_launch_capture as capture_module
 
     original = capture_module.example_config
@@ -410,7 +435,7 @@ def test_v41_fp8_head_key_reaches_planner_and_coordinator(tmp_root, monkeypatch,
         return config
 
     monkeypatch.setattr(capture_module, "example_config", with_key)
-    result = capture_module.capture(ROOT, "deepseek-v41-mxfp4-max")
+    result = capture_module.capture(ROOT, case)
     coordinator = parse_run(result["containers"][0]["argv"])["env"]
     plan = result["plans"][0]
     if value is None:
@@ -587,7 +612,7 @@ def test_v41_fp8_head_key_rejects_bad_values_and_env_conflicts(tmp_root, monkeyp
     env["HF_HOME"] = str(tmp_root / "hf")
     result = subprocess.run(["bash", str(ROOT / "run.sh"), "--config", str(config), "--dry-run"],
                             capture_output=True, text=True, env=env)
-    assert result.returncode == 2 and "V41_FP8_HEAD must be off, draft, all or packed" in result.stderr
+    assert result.returncode == 2 and "V41_FP8_HEAD must be auto, off, draft, all or packed" in result.stderr
     result = subprocess.run(["bash", str(ROOT / "run.sh"), "--config", str(config), "--set", "V41_FP8_HEAD=off",
                              "--dry-run"], capture_output=True, text=True,
                             env={**env, "CUTEAFD_V41_FP8_HEAD": "draft"})
@@ -664,3 +689,47 @@ def test_no_literal_sixteen_request_admission_bound() -> None:
             if literal.search(text):
                 offenders.append(f"{path.relative_to(ROOT)}:{line}: {text.strip()}")
     assert not offenders, "\n".join(offenders)
+
+
+def test_v41_serve_admits_weights_against_the_planned_budget(tmp_root) -> None:
+    """serve-native receives the same --coordinator-weight-budget-gib the planner used,
+    so startup admission never falls back to the 80 GiB default the plan did not assume."""
+    import v41_launch_capture as capture_module
+
+    result = capture_module.capture(ROOT, "deepseek-v41-mxfp4-max")
+    command = parse_run(result["containers"][0]["argv"])["command"]
+    budgets = {plan[plan.index("--coordinator-weight-budget-gib") + 1]
+               for plan in result["plans"] if "--coordinator-weight-budget-gib" in plan}
+    assert len(budgets) == 1
+    assert command[command.index("--coordinator-weight-budget-gib") + 1] == budgets.pop()
+
+
+@pytest.mark.parametrize('key,value,env_key', [('SPARK_STAGING', 'copy-engine', 'CUTEAFD_SPARK_STAGING'),
+                                               ('SPARK_LANDING', 'copy-engine', 'CUTEAFD_SPARK_LANDING')])
+def test_fork_staging_keys_reach_the_coordinator(tmp_root, monkeypatch, key, value, env_key):
+    import v41_launch_capture as capture_module
+    original = capture_module.example_config
+    monkeypatch.setattr(capture_module, 'example_config', lambda name, directory:
+        capture_module.append_config(original(name, directory), f'{key}={value}\n'))
+    result = capture_module.capture(ROOT, 'deepseek-v41-mxfp4-max')
+    assert parse_run(result['containers'][0]['argv'])['env'][env_key] == value
+    assert all(env_key not in parse_run(worker['argv'])['env'] for worker in result['containers'][1:])
+
+
+@pytest.mark.parametrize('override', ['', 'SPARK_DECODE_REPLY_FORMAT=bf16\n', 'GPU_EXPERT_TIER=24\n'])
+def test_fork_reply_format_maps_to_both_phases_and_tier_refuses_compression(tmp_root, monkeypatch, override):
+    import v41_launch_capture as capture_module
+    original = capture_module.example_config
+    monkeypatch.setattr(capture_module, 'example_config', lambda name, directory:
+        capture_module.append_config(original(name, directory), 'SPARK_REPLY_FORMAT=fp8\n' + override))
+    if 'GPU_EXPERT_TIER' in override:
+        with pytest.raises(RuntimeError, match='GPU_EXPERT_TIER requires BF16 Spark replies'):
+            capture_module.capture(ROOT, 'deepseek-v41-mxfp4-max')
+        return
+    result = capture_module.capture(ROOT, 'deepseek-v41-mxfp4-max')
+    env = parse_run(result['containers'][0]['argv'])['env']
+    for phase in ('prefill', 'decode'):
+        expected = 'bf16' if phase == 'decode' and override else 'fp8'
+        assert env[f'CUTEAFD_SPARK_{phase.upper()}_REPLY_FORMAT'] == expected
+        for plan in result['plans']:
+            assert plan[plan.index(f'--spark-{phase}-reply-format') + 1] == expected

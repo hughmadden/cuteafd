@@ -193,7 +193,12 @@ async fn lane<'a, P: VerificationTarget<'a>, C: DraftChain<'a>>(lease: LaneLease
             let (drafted, draft_us) = if drafting.is_empty() { (Vec::new(), 0) } else { loop {
                 let proposed = {
                     let mut draft = draft.borrow_mut();
-                    if let Some(draft) = draft.as_deref_mut() { draft.poll_propose(lane, &drafting)? }
+                    // W64-1: a failed proposal verifies the anchors only while the
+                    // draft is still live; a terminal draft fails the round.
+                    if let Some(draft) = draft.as_deref_mut() { match draft.poll_propose(lane, &drafting) {
+                        Ok(proposed) => proposed,
+                        Err(error) => Some((draft.anchor_fallback(lane, &drafting, &error)?, 0)),
+                    } }
                     else { Some((drafting.iter().map(|r| vec![r.1]).collect(), 0)) }
                 };
                 if let Some(inputs) = proposed { break inputs; }
@@ -210,7 +215,7 @@ async fn lane<'a, P: VerificationTarget<'a>, C: DraftChain<'a>>(lease: LaneLease
             super::prefetch_drafts(&requests.borrow(), &active.borrow(), &members, &inputs);
             let proposal = console::Proposal::capture(&inputs, console::live());
             let shared = active.borrow().iter().flatten().any(|r| r.lane() != lane);
-            let (inputs, mut batch, capture, retain_shapes) = {
+            let (inputs, mut batch, capture) = {
                 let active = active.borrow();
                 let mut requests = requests.borrow_mut();
                 let mut draft = draft.borrow_mut();
@@ -232,8 +237,7 @@ async fn lane<'a, P: VerificationTarget<'a>, C: DraftChain<'a>>(lease: LaneLease
                 }
                 bound_inputs(&mut inputs);
                 let batch = prepare_decode_lane(&mut requests, &active, &members, &inputs, draft.is_some())?;
-                (inputs, Some(batch), draft.as_deref().map(DraftRuntime::capture).unwrap_or_default(),
-                    draft.as_deref().is_some_and(DraftRuntime::has_policy))
+                (inputs, Some(batch), draft.as_deref().map(DraftRuntime::capture).unwrap_or_default())
             };
             let prepared_us = started.elapsed().as_micros() as u64;
             round_id += 1;
@@ -242,7 +246,6 @@ async fn lane<'a, P: VerificationTarget<'a>, C: DraftChain<'a>>(lease: LaneLease
             tracing::debug!(target: "cuteafd::lane_schedule", lane, round_id, requests=members.len(),
                 "independent verifier issued");
             let operation: Result<()> = async {
-                if retain_shapes { pass.retain_small_graph_shapes()?; }
                 pass.set_capture(capture)?;
                 // Device-ordered passes while the other lane is idle; two busy
                 // lanes interleave on host waits, or on paced device-ordered
@@ -455,7 +458,9 @@ async fn retire<'a, C: DraftChain<'a>>(lane: usize, mut request: Active<'a>, req
         if let Err(error) = &state { probe.fail(format!("state diagnostic: {error:#}")); }
         probe.finish_state();
     }
-    target.and(speculative.map(|_| ())).and(state)
+    let retired = target.and(speculative.map(|_| ())).and(state);
+    requests.borrow_mut().mark_retired(retired.is_ok() && request.finished && !request.failed);
+    retired
 }
 
 /// Whether lane `lane` retires a request owned by `owner` at its boundary: a finished one, or one

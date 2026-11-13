@@ -287,7 +287,7 @@ impl V41PeerCopy<'_> {
         ensure!(bytes>0 && bytes<=destination.bytes && bytes<=source.bytes
             && destination.flags==0 && source.flags==0,"invalid peer copy extent or buffer flags");
         let status=unsafe { (self.launch)(destination.ptr,source.ptr,bytes as u64,stream) };
-        ensure!(status==0,"SM peer copy failed with CUDA status {status}");
+        self._library.status_to_result("SM peer copy", status)?;
         Ok(())
     }
     /// # Safety
@@ -304,7 +304,27 @@ impl V41PeerCopy<'_> {
         }
         let status=unsafe { (self.rows)(destination.ptr,source.ptr,width as u64,rows as u64,
             destination_pitch as u64,source_pitch as u64,stream) };
-        ensure!(status==0,"SM pitched copy failed with CUDA status {status}");Ok(())
+        self._library.status_to_result("SM pitched copy", status)?;Ok(())
     }
 
+}
+
+#[cfg(test)]
+mod draft_failure_tests {
+    use super::*;
+    #[test]
+    fn peer_copy_native_failure_is_tagged() -> Result<()> {
+        let library = crate::tests::draft_failure_library()?;
+        unsafe extern "C" fn launch(_: *mut c_void, _: *const c_void, _: u64, _: *mut c_void) -> i32 { 98 }
+        unsafe extern "C" fn rows(_: *mut c_void, _: *const c_void, _: u64, _: u64, _: u64, _: u64, _: *mut c_void) -> i32 { 98 }
+        let copy = V41PeerCopy { _library: &library, launch, rows };
+        let b = CuteafdDeviceBuffer { ptr: std::ptr::NonNull::<u16>::dangling().as_ptr().cast(),
+            bytes: 16, device_id: 0, flags: 0 };
+        // SAFETY: the injected entry points do not dereference synthetic buffers.
+        unsafe {
+            crate::tests::assert_draft_native_failure(copy.launch(b, CuteafdDeviceBuffer { device_id: 1, ..b }, 16, std::ptr::null_mut()));
+            crate::tests::assert_draft_native_failure(copy.launch_rows(b, b, 8, 2, 8, 8, std::ptr::null_mut()));
+        }
+        Ok(())
+    }
 }

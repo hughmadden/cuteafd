@@ -10,6 +10,39 @@ use serde_json::{json, Map, Value};
 use std::collections::BTreeMap;
 use std::time::Duration;
 
+pub(crate) mod reconcile;
+
+pub(crate) fn register_inputs(matches: &clap::ArgMatches, policy: &cuteafd_core::memory_policy::MemoryPolicy, weight_budget: Option<f64>) {
+    let mut inputs = serde_json::to_value(policy).unwrap_or(Value::Null).as_object().cloned().unwrap_or_default();
+    inputs.insert("coordinator_weight_budget_gib".into(), json!(weight_budget.unwrap_or(80.0)));
+    // Allowlist only numeric/enum reservation inputs; never arbitrary arguments,
+    // paths, credentials, prompts, or an environment dump.
+    if let Some((_, args)) = matches.subcommand() {
+        for key in ["max_context_tokens", "max_sequences", "prefill_rows", "pool_tokens", "max_prefill_tokens",
+            "kv_page_tokens", "prefix_cache_bytes", "speculator", "speculation_depth"] {
+            if let Ok(Some(values)) = args.try_get_raw(key) {
+                inputs.insert(key.into(), json!(values.map(|v| v.to_string_lossy().into_owned()).collect::<Vec<_>>()));
+            }
+        }
+    }
+    memory_ledger::fault::set_inputs(Value::Object(inputs));
+}
+
+/// Reuse the launcher's existing instance/run mounts; never write into source cwd.
+pub(crate) fn dump_location(matches: &clap::ArgMatches) -> Option<(String, std::path::PathBuf)> {
+    dump_location_with(matches, std::env::var_os("CUTEAFD_PROFILE_DIR").map(std::path::PathBuf::from))
+}
+fn dump_location_with(matches: &clap::ArgMatches, profile: Option<std::path::PathBuf>) -> Option<(String, std::path::PathBuf)> {
+    let (command, args) = matches.subcommand()?;
+    let role = if command == "expertd-native" {
+        format!("rank{}", args.try_get_one::<u32>("rank").ok().flatten().copied().unwrap_or(0))
+    } else if command.starts_with("serve") { "coordinator".into() }
+    else { return None };
+    let directory = profile
+        .or_else(|| args.try_get_one::<std::path::PathBuf>("usage_dir").ok().flatten().map(|dir| dir.join("memory")))?;
+    Some((role, directory))
+}
+
 fn meminfo() -> Value {
     let Ok(text) = std::fs::read_to_string("/proc/meminfo") else { return Value::Null };
     let mut out = Map::new();
@@ -26,24 +59,57 @@ fn meminfo() -> Value {
     Value::Object(out)
 }
 
-/// Builds one report. Queries each device on the calling thread and restores
-/// nothing: call it from a thread that does not launch work, or restore the
-/// device afterwards (see [`log`]).
+/// Query active primary contexts only, restoring the exact prior driver context.
 pub(crate) fn report(stage: &str) -> Value {
-    let snapshot = memory_ledger::snapshot();
+    report_snapshot(stage, &memory_ledger::snapshot(), &memory_ledger::fault::device_memory)
+}
+
+/// Bytes by memory kind, plus the zero untagged counter required by the census.
+fn kinds(snapshot: &memory_ledger::Snapshot, space: Space, device: i32) -> Value {
+    let (kinds, untagged) = snapshot.by_kind(space, device);
+    json!({"kinds": kinds.into_iter().map(|(kind, bytes)| (kind.label(), bytes)).collect::<BTreeMap<_, _>>(),
+        "untagged": untagged})
+}
+
+fn report_snapshot(stage: &str, snapshot: &memory_ledger::Snapshot,
+    device_memory: &impl Fn(i32) -> Option<(usize, usize)>) -> Value {
     let mut per_device = Vec::new();
     // Only devices this process allocated on: querying another would create a context there.
     for device in snapshot.devices() {
         let tracked = snapshot.total(Space::Device, device) + snapshot.total(Space::Managed, device);
         let scopes: BTreeMap<&str, usize> = snapshot.by_scope(Space::Device, device);
+        // Live allocations behind every scope, so a scope's bytes can be read
+        // beside the number of physical requests that carry rounding.
+        let scope_allocations: BTreeMap<&str, usize> = snapshot.rows.iter()
+            .filter(|row| row.key.space == Space::Device && row.key.device == device)
+            .fold(BTreeMap::new(), |mut out, row| {
+                *out.entry(row.key.scope).or_default() += row.allocations;
+                out
+            });
         let mut entry = json!({
             "device": device,
             "cuda_memory_scope": "raw cudaMemGetInfo; GB10 under-reports reclaimable page cache; host MemAvailable is allocatable headroom",
             "tracked": tracked,
             "peak": snapshot.peak.get(&(Space::Device, device)).copied().unwrap_or(0),
             "scopes": scopes,
+            "scope_allocations": scope_allocations,
+            "by_kind": kinds(snapshot, Space::Device, device),
+            "managed_by_kind": kinds(snapshot, Space::Managed, device),
         });
-        if let Some((free, total)) = memory_ledger::device_memory(device) {
+        if let Some(g) = snapshot.granularity.get(&(Space::Device, device)) {
+            // SM120 direct-device rounding already inside the measured bytes used.
+            entry["granularity"] = json!({"tail": g.tail, "large_requests": g.large_requests,
+                "small_bytes": g.small_bytes});
+        }
+        let unclaimed = snapshot.by_unclaimed(Space::Device, device);
+        if !unclaimed.is_empty() {
+            // Measured physical owners with no allocation request behind them
+            // (mapped pinned host backings' device page tables): named here so
+            // the untracked residual is read with them beside it.
+            entry["unclaimed"] = json!(unclaimed);
+            entry["unclaimed_bytes"] = json!(snapshot.unclaimed(Space::Device, device));
+        }
+        if let Some((free, total)) = device_memory(device) {
             let used = total - free;
             entry["used"] = json!(used);
             entry["total"] = json!(total);
@@ -65,6 +131,12 @@ pub(crate) fn report(stage: &str) -> Value {
             "tracked": snapshot.total(Space::Pinned, -1),
             "peak": snapshot.peak.get(&(Space::Pinned, -1)).copied().unwrap_or(0),
             "scopes": snapshot.by_scope(Space::Pinned, -1),
+            "by_kind": kinds(snapshot, Space::Pinned, -1),
+        },
+        // Native malloc backing registered for RDMA (not CUDA-pinned).
+        "host_registered": {
+            "tracked": snapshot.total(Space::Host, -1),
+            "by_kind": kinds(snapshot, Space::Host, -1),
         },
         "weights": weights,
         "dual_formats": dual,
@@ -73,12 +145,68 @@ pub(crate) fn report(stage: &str) -> Value {
 }
 
 /// Logs a report from a helper thread (the caller's device selection is untouched).
+fn publish_dashboard(value: &Value) {
+    let inputs = memory_ledger::fault::inputs();
+    let admitted: Map<String, Value> = inputs.as_object().into_iter().flatten()
+        .filter(|(key, _)| key.starts_with("device."))
+        .map(|(key, value)| (key.clone(), value.clone())).collect();
+    cuteafd_api::openai::publish_memory_inventory(json!({
+        "sampled_unix_s": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+            .ok().map(|duration| duration.as_secs_f64()),
+        "refresh_seconds": 10, "stage": value["stage"],
+        "plan": inputs["memory_dashboard_plan"], "host_admission": inputs["host_admission"],
+        "admitted": admitted, "kv_geometry": inputs["kv_geometry"],
+        "devices": value["devices"], "pinned": value["pinned"],
+        "host_registered": value["host_registered"], "host": value["host"],
+    }));
+}
+
 pub(crate) fn log(stage: &str) {
+    if stage == "ready" {
+        memory_ledger::fault::ready();
+        let summary = memory_ledger::fault::compact_summary(stage);
+        tracing::info!(target: "cuteafd::memory", "{summary}");
+    }
     let stage = stage.to_owned();
-    let value = std::thread::spawn(move || report(&stage)).join();
-    if let Ok(value) = value {
+    let value = std::thread::spawn(move || {
+        if stage == "ready" { reconcile::capture(&stage); }
+        report(&stage)
+    }).join();
+    if let Ok(mut value) = value {
+        publish_dashboard(&value);
+        // Bounded diagnostic boundary: the process-wide stream census and the
+        // current device's CUDA pool retention. Both are queries: no
+        // allocation, no synchronization, no device switch.
+        let (live, peak) = cuteafd_ffi::stream_census();
+        value["streams"] = json!({"live": live, "peak": peak,
+            "scope": "process-wide cudaStreamCreate/Destroy census; a context's driver slabs follow its live streams at 2 MiB per four (#1511)"});
+        if let Some(pool) = memory_ledger::current_cuda_memory_snapshot() {
+            value["cuda_pool"] = pool;
+        }
         tracing::info!(target: "cuteafd::memory", report = %value, "memory ledger");
     }
+}
+
+/// One final error-boundary report for every command/family. Native failures
+/// retain the pre-unwind sample; other errors report the remaining live owners.
+pub(crate) fn finish<T>(result: anyhow::Result<T>) -> anyhow::Result<T> {
+    if let Err(error) = &result {
+        let retained = error.chain().find_map(|cause| cause.downcast_ref::<memory_ledger::FailureSnapshot>());
+        if let Some(report) = retained.and_then(|failure| failure.report.as_ref()) {
+            tracing::error!(target: "cuteafd::memory", path = %report.path.display(), complete = report.complete,
+                error = %error, "retained memory failure dump\n{}", report.summary);
+            return result;
+        }
+        let mut value = match retained {
+            Some(failure) => report_snapshot("failure", &failure.ledger,
+                &|device| failure.device_memory.get(&device).copied()),
+            None => report("failure"),
+        };
+        value["error"] = json!(format!("{error:#}"));
+        value["pre_unwind"] = json!(retained.is_some());
+        tracing::error!(target: "cuteafd::memory", report = %value, error = %error, "memory ledger");
+    }
+    result
 }
 
 /// Logs a report now and again whenever device use or the ledger moves by at
@@ -92,7 +220,20 @@ pub(crate) fn monitor(stage: &'static str, period: Duration) {
         let mut last: Option<Vec<i64>> = None;
         let mut sequence = 0u64;
         loop {
-            let value = report(stage);
+            // Timestamp before the ledger/query so an overlapping completed
+            // boundary always wins over this asynchronous physical sample.
+            let sampled_at = std::time::Instant::now();
+            let ledger = memory_ledger::snapshot();
+            // Ledger-before-CUDA skew can double-subtract concurrent growth: conservative, choosing eager rather than over-admitting.
+            let value = report_snapshot(stage, &ledger, &|device| {
+                let sample = memory_ledger::fault::device_memory(device);
+                if let Some((free, _)) = sample {
+                    crate::shared::decode_graph::device::monitor_physical(device, sampled_at,
+                        free as u64, ledger.total(Space::Device, device) as u64);
+                }
+                sample
+            });
+            publish_dashboard(&value);
             if value["devices"].as_array().is_none_or(Vec::is_empty) && value["pinned"]["tracked"] == 0 {
                 std::thread::sleep(period);
                 continue;
@@ -150,6 +291,86 @@ pub(crate) fn kv_shortfall(error: &anyhow::Error) -> bool {
 #[cfg(test)]
 mod budget_tests {
     use super::*;
+
+    #[test]
+    fn command_error_emits_one_final_failure_report() {
+        use std::sync::{Arc, Mutex};
+        #[derive(Clone)]
+        struct Output(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Output {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+        }
+        let output = Output(Arc::new(Mutex::new(Vec::new())));
+        let writer = output.clone();
+        let subscriber = tracing_subscriber::fmt().without_time().with_ansi(false)
+            .with_writer(move || writer.clone()).finish();
+        tracing::subscriber::with_default(subscriber, || {
+            assert_eq!(finish(Ok(7)).unwrap(), 7);
+            let failure = memory_ledger::FailureSnapshot::new(
+                anyhow::anyhow!("startup fixture failure"), memory_ledger::Snapshot::default(), BTreeMap::new());
+            let wrapped = anyhow::Error::new(crate::shared::experts::rtx::push::PushStartupError::Planning(
+                anyhow::Error::new(failure))).context("family initialization");
+            assert!(finish::<()>(Err(wrapped)).is_err());
+        });
+        let text = String::from_utf8(output.0.lock().unwrap().clone()).unwrap();
+        assert_eq!(text.matches("memory ledger").count(), 1, "{text}");
+        assert!(text.contains(r#""stage":"failure""#), "{text}");
+        assert!(text.contains("startup fixture failure"), "{text}");
+        assert!(text.contains(r#""pre_unwind":true"#), "{text}");
+    }
+
+    #[test]
+    fn readiness_forwarding_keeps_snapshot_and_emits_both_ready_outputs() {
+        use std::sync::{Arc, Mutex};
+        #[derive(Clone)] struct Output(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Output {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes); Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+        }
+        let output = Output(Arc::new(Mutex::new(Vec::new())));
+        let writer = output.clone();
+        let subscriber = tracing_subscriber::fmt().without_time().with_ansi(false)
+            .with_writer(move || writer.clone()).finish();
+        tracing::subscriber::with_default(subscriber, || {
+            log("ready");
+            let (send, receive) = std::sync::mpsc::channel();
+            let error = anyhow::Error::new(memory_ledger::FailureSnapshot::new(
+                anyhow::anyhow!("original typed failure"), memory_ledger::Snapshot::default(), BTreeMap::new()));
+            crate::shared::serve::forward_initialization(Err(error), true, "fixture startup", |error|
+                send.send(error).map_err(|error| error.0)).unwrap();
+            let error = receive.recv().unwrap();
+            assert!(error.chain().any(|cause| cause.is::<memory_ledger::FailureSnapshot>()));
+            assert!(finish::<()>(Err(error)).is_err());
+        });
+        let text = String::from_utf8(output.0.lock().unwrap().clone()).unwrap();
+        assert!(text.contains("memory summary stage=ready"), "{text}");
+        assert!(text.contains(r#""stage":"ready""#), "{text}");
+        assert!(text.contains(r#""pre_unwind":true"#), "{text}");
+        assert!(text.contains("original typed failure"), "{text}");
+    }
+
+    #[test]
+    fn dump_location_requires_serving_and_an_existing_output_contract() {
+        use clap::{Arg, Command};
+        use std::path::PathBuf;
+        let command = || Command::new("fixture")
+            .subcommand(Command::new("serve-step5").arg(Arg::new("usage_dir").long("usage-dir").value_parser(clap::value_parser!(PathBuf))))
+            .subcommand(Command::new("expertd-native").arg(Arg::new("rank").long("rank").value_parser(clap::value_parser!(u32))))
+            .subcommand(Command::new("plan"));
+        let serve = command().try_get_matches_from(["fixture", "serve-step5", "--usage-dir", "/instance/usage"]).unwrap();
+        assert_eq!(dump_location_with(&serve, None), Some(("coordinator".into(), "/instance/usage/memory".into())));
+        let worker = command().try_get_matches_from(["fixture", "expertd-native", "--rank", "3"]).unwrap();
+        assert_eq!(dump_location_with(&worker, Some("/run/output".into())), Some(("rank3".into(), "/run/output".into())));
+        assert!(dump_location_with(&worker, None).is_none());
+        let plan = command().try_get_matches_from(["fixture", "plan"]).unwrap();
+        assert!(dump_location_with(&plan, Some("/run/output".into())).is_none());
+    }
 
     #[test]
     fn only_memory_refusals_are_kv_shortfalls() {

@@ -1,4 +1,4 @@
-// Exact-reference check for the replicated-group N-plane compact reducer.
+// Exact-reference check for the Spark N-plane compact reducer.
 //
 // Independent host scalar reference: each physical rank contributes one BF16
 // [rows,5120] plane, the 1..8 planes are summed in rank order in FP32, the

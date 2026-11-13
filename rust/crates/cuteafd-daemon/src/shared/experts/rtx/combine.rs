@@ -13,6 +13,7 @@ use cuteafd_ffi::{
     CuteafdDeviceBuffer, NativeLibrary, RtxPartialDtype, RtxTp2Combine, V41Tp2ExpertReducer,
 };
 use std::ffi::c_void;
+use crate::shared::memory::Tag;
 
 /// The dtype of the FFN exchange payload under [`Combine::FusedAllReduce`].
 pub(crate) type ExchangeDtype = RtxPartialDtype;
@@ -343,8 +344,8 @@ impl<'a> OwnerReduce<'a> {
         Ok(Self {
             transfer: PeerTransfer::new(devices[1 - owner as usize], local)?,
             local_ready: Event::new(local)?,
-            staging: Allocation::new(local, staging_bytes)?,
-            output: Allocation::new(local, output_bytes)?,
+            staging: Allocation::new(local, staging_bytes, Tag::transport("experts/tp2-combine"))?,
+            output: Allocation::new(local, output_bytes, Tag::workspace("experts/tp2-combine"))?,
             reducer: local.run(|| local.library.v41_tp2_expert_reducer())?,
             capacity,
             local_rank: owner,
@@ -505,7 +506,7 @@ impl<'a> OwnerReduce<'a> {
 mod token_owner_tests {
     use super::*;
     use std::cell::{Cell, RefCell};
-    use crate::shared::experts::rtx::pair::{submit_scoped, TerminalStepError};
+    use crate::shared::experts::rtx::pair::{submit_scoped, StepFailure};
 
     struct Protocol {
         owner: usize,
@@ -741,7 +742,7 @@ mod token_owner_tests {
                             result
                         })));
                     if cancel { assert!(result.is_err()); }
-                    else { assert!(result.unwrap().unwrap_err().downcast_ref::<TerminalStepError>().is_some()); }
+                    else { assert!(StepFailure::is_terminal(&result.unwrap().unwrap_err())); }
                     assert_eq!(drained.get(), 1);
                     assert!(protocol.borrow().retired.get());
                     assert!(submit_scoped(|| protocol.borrow().require_live(),

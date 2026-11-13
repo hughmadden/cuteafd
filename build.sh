@@ -82,8 +82,8 @@ Cargo target dirs and staging stay deletable without sudo. The home is
 BUILD_ROOT/container-home when a build root is set and /tmp/cuteafd-home inside
 the container otherwise.
 
-Release exports derive from CUTEAFD_RELEASE_MATRIX (default:
-scripts/bench/release-smoke-v4.json). --scope / CUTEAFD_RELEASE_SCOPE selects all
+Release exports derive from CUTEAFD_RELEASE_MATRIX (default: the shipping matrix
+reported by scripts/build/release-scope.py default-matrix). --scope / CUTEAFD_RELEASE_SCOPE selects all
 (default), comma-separated family or entry names, or explicit (raw knobs only).
 Raw CUTEAFD_RELEASE_* export knobs add to selected cards; OFF/empty cannot remove
 required exports. Narrow or explicit builds are for development, not release tags.
@@ -146,7 +146,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 release_scope="${CUTEAFD_RELEASE_SCOPE:-all}"
-release_matrix="${CUTEAFD_RELEASE_MATRIX:-$repo_root/scripts/bench/release-smoke-v4.json}"
+release_matrix="${CUTEAFD_RELEASE_MATRIX:-$repo_root/$(python3 "$repo_root/scripts/build/release-scope.py" default-matrix)}"
 release_matrix_sha256="$(sha256sum "$release_matrix" | awk '{print $1}')"
 release_scope_exports="$(python3 "$repo_root/scripts/build/release-scope.py" derive \
   --matrix "$release_matrix" --scope "$release_scope" --shell)"
@@ -182,13 +182,12 @@ spark_release_version="${SPARK_EXPERT_DOCKER_INFERENCE##*:}"
 [[ "$spark_release_version" == "$release_version" ]] ||
   release_die "coordinator and Spark inference image release tags must match"
 
-# Spark expert roles are universal by default: the ARM64 (SM121) image carries the
-# TP2, TP3 and TP6 replicated-group shards on top of the always-built TP4 shard,
-# so one published pair serves every approved native topology (TP4EP1, TP2EP2,
-# TP2EP3, TP3EP2, TP6EP1) and ./run.sh selects the mode. The x86_64 coordinator
-# needs no Spark role: roles are expert-only, so it is topology-independent.
-# CUTEAFD_RELEASE_SPARK_TP_ROLES is an explicit SUBSET override for a bounded
-# topology A/B or a legacy TP4-only rebuild (empty).
+# Spark expert roles are universal by default: the ARM64 (SM121) image carries
+# every other native Spark TP shard on top of the always-built TP4 shard, so one
+# published pair serves every planned Spark count and ./run.sh requires the role
+# the plan names. The x86_64 coordinator needs no Spark role: roles are
+# expert-only. CUTEAFD_RELEASE_SPARK_TP_ROLES is an explicit SUBSET override for
+# a bounded A/B or a legacy TP4-only rebuild (empty).
 # release-spark-tp-roles:start
 release_universal_spark_tp_roles="$(release_spark_tp_roles_default)"
 # `${VAR-default}`, not `:-`, so an explicitly empty override stays the legacy
@@ -196,10 +195,10 @@ release_universal_spark_tp_roles="$(release_spark_tp_roles_default)"
 spark_tp_roles="$(release_spark_tp_roles_canonical \
   "${CUTEAFD_RELEASE_SPARK_TP_ROLES-$release_universal_spark_tp_roles}")"
 [[ "$spark_tp_roles" == "$release_universal_spark_tp_roles" ]] ||
-  echo "== NON-UNIVERSAL expert role subset '${spark_tp_roles:-<none>}'; this pair cannot serve every approved native topology =="
+  echo "== NON-UNIVERSAL expert role subset '${spark_tp_roles:-<none>}'; this pair cannot serve every planned Spark count =="
 # Repeated by --dry-run and the build summary so a subset build is never mistaken
 # for the universal default.
-spark_tp_roles_note='universal, covers every approved native topology'
+spark_tp_roles_note='universal, covers every planned Spark count'
 [[ "$spark_tp_roles" == "$release_universal_spark_tp_roles" ]] ||
   spark_tp_roles_note='explicit subset, not universal'
 # release-spark-tp-roles:end
@@ -331,6 +330,7 @@ case "$release_dev_image_source" in registry|build) ;; *) release_die "CUTEAFD_R
 if ((dry_run)); then
   release_toolchain_hash="$(python3 "$repo_root/scripts/build/dev-toolchain.py")"
   echo "  release scope: $release_scope"
+  echo "  release matrix: $release_matrix"
   printf '%s\n' "$release_scope_exports"
   echo "Build dry-run passed; no image, container, SSH or submodule was touched."
   echo "  config: $RELEASE_CONFIG"
@@ -349,6 +349,10 @@ if ((dry_run)); then
     echo "  Spark dev image: build Dockerfile.dev locally on ${RELEASE_BUILD_HOSTS[0]:-}"
   fi
   echo "  build legs: $release_leg_plan"
+  echo "  coordinator export cache container args (ID resolved at image admission):"
+  cuteafd_export_cache_docker_args '${COORDINATOR_DOCKER_DEV}' /output/EXPORT_CACHE_STATS.jsonl
+  echo "  Spark export cache container args (ID resolved on seed at image admission):"
+  cuteafd_export_cache_docker_args '${dev_image}' /output/EXPORT_CACHE_STATS.jsonl
   echo "  release tag: $release_version"
   echo "  V41 Spark expert roles: ${spark_tp_roles:-<legacy TP4 only>} ($spark_tp_roles_note)"
   echo "  coordinator image: $COORDINATOR_DOCKER_INFERENCE"
@@ -833,6 +837,7 @@ coordinator_export_status=0
 compiler_cache_args=()
 cache_plan="$(cuteafd_build_cache_docker_args "${release_build_root:-$release_source_parent}" "$(release_build_container_home "$release_build_root")" "$release_toolchain_hash")" || release_die "cache plan failed"
 mapfile -t compiler_cache_args <<<"$cache_plan"
+mapfile -t export_cache_args < <(cuteafd_export_cache_docker_args "$COORDINATOR_DOCKER_DEV" /output/EXPORT_CACHE_STATS.jsonl)
 cuteafd_cdi_gpu_args "$export_gpu_uuid" || exit 2
 timeout --foreground "$export_timeout" docker run --rm --name "$coordinator_export_container" \
   "${CUTEAFD_CDI_ARGS[@]}" \
@@ -842,6 +847,7 @@ timeout --foreground "$export_timeout" docker run --rm --name "$coordinator_expo
   -e "NVIDIA_VISIBLE_DEVICES=$export_gpu_uuid" \
   "${release_build_user_args[@]}" \
   "${compiler_cache_args[@]}" \
+  "${export_cache_args[@]}" \
   -e "CUTEAFD_RELEASE_COORDINATOR_FEATURES=${CUTEAFD_RELEASE_COORDINATOR_FEATURES:-}" \
   -e "CUTEAFD_RELEASE_EXPERT_FAMILIES=${CUTEAFD_RELEASE_EXPERT_FAMILIES:-}" \
   -e "CUTEAFD_RELEASE_GENERIC_SPARK_COUNTS=${CUTEAFD_RELEASE_GENERIC_SPARK_COUNTS:-}" \
@@ -861,6 +867,7 @@ timeout --foreground "$export_timeout" docker run --rm --name "$coordinator_expo
   -e "CUTEAFD_RELEASE_KIMIK3_AOT=${CUTEAFD_RELEASE_KIMIK3_AOT:-OFF}" \
   -e "CUTEAFD_RELEASE_MUSE_AOT=${CUTEAFD_RELEASE_MUSE_AOT:-OFF}" \
   -e "CUTEAFD_RELEASE_ML4_AOT=${CUTEAFD_RELEASE_ML4_AOT:-OFF}" \
+  -e "CUTEAFD_RELEASE_MINIMAX_AOT=${CUTEAFD_RELEASE_MINIMAX_AOT:-OFF}" \
   -e "CUTEAFD_RELEASE_EXLR8_AOT=${CUTEAFD_RELEASE_EXLR8_AOT:-OFF}" \
   -e "CUTEAFD_RELEASE_EXLR8_FAMILIES=${CUTEAFD_RELEASE_EXLR8_FAMILIES:-}" \
   ${release_build_root_args[@]+"${release_build_root_args[@]}"} \
@@ -1114,12 +1121,14 @@ container_home=/tmp/cuteafd-home
 [[ -z "$release_build_root" ]] || container_home="$release_build_root/container-home"
 cache_plan="$(cuteafd_build_cache_docker_args "${release_build_root:-$HOME/.cache/cuteafd/builds/release-cache-fallback}" "$container_home" "$(python3 scripts/build/dev-toolchain.py)")" || exit 2
 mapfile -t compiler_cache_args <<<"$cache_plan"
+mapfile -t export_cache_args < <(cuteafd_export_cache_docker_args "$dev_image" /output/EXPORT_CACHE_STATS.jsonl)
 # The export is stopped by name from three directions: the contention watchdog
 # while it runs, and this shell's own EXIT/HUP when the caller's timeout kills
 # the ssh client (a dying docker client does not stop its container).
 cuteafd_cdi_gpu_args all || exit 2
 docker run --rm --name "$export_container" \
   "${compiler_cache_args[@]}" \
+  "${export_cache_args[@]}" \
   --user "$(id -u):$(id -g)" \
   -e "HOME=$container_home" \
   -e "USER=$(id -un)" \
@@ -1338,6 +1347,20 @@ python3 "$repo_root/scripts/build/select-dev-image.py" merge \
   --coordinator "$release_dev_reuse_manifest" --spark "$release_leg_log_dir/spark-dev-image.json" \
   --output "$repo_root/dist/DEV_IMAGE_REUSE.json"
 dist_source_manifest+=(DEV_IMAGE_REUSE.json)
+# Receipts are informational: never retain a stale prior build's stats.
+rm -f "$repo_root/dist/EXPORT_CACHE_STATS.coordinator.jsonl" "$repo_root/dist/EXPORT_CACHE_STATS.spark.jsonl"
+if install -m 0644 "$artifact_dir/EXPORT_CACHE_STATS.jsonl" "$repo_root/dist/EXPORT_CACHE_STATS.coordinator.jsonl"; then
+  dist_source_manifest+=(EXPORT_CACHE_STATS.coordinator.jsonl)
+else
+  echo "WARNING: coordinator export cache receipt unavailable" >&2
+fi
+if release_sync "$seed_host:$remote_dir/.cuteafd-release-image/EXPORT_CACHE_STATS.jsonl" \
+  "$repo_root/dist/EXPORT_CACHE_STATS.spark.jsonl"; then
+  dist_source_manifest+=(EXPORT_CACHE_STATS.spark.jsonl)
+else
+  rm -f "$repo_root/dist/EXPORT_CACHE_STATS.spark.jsonl"
+  echo "WARNING: Spark export cache receipt unavailable" >&2
+fi
 if [[ -n "$source_manifest" ]]; then
   install -m 0644 "$source_manifest" "$repo_root/dist/SOURCE_SHA256SUMS"
   dist_source_manifest+=(SOURCE_SHA256SUMS)
@@ -1538,6 +1561,14 @@ echo "  expert roles: ${spark_tp_roles:-<none>} ($spark_tp_roles_note)"
 echo "  coordinator: $COORDINATOR_DOCKER_INFERENCE"
 echo "  spark:       $SPARK_EXPERT_DOCKER_INFERENCE"
 echo "  artifacts:   $repo_root/dist"
+for leg in coordinator spark; do
+  echo "  $leg export cache (hits, misses, bypassed; invocation and program layers):"
+  if [[ -f "$repo_root/dist/EXPORT_CACHE_STATS.$leg.jsonl" ]]; then
+    python3 "$repo_root/scripts/build/export-cache.py" stats "$repo_root/dist/EXPORT_CACHE_STATS.$leg.jsonl"
+  else
+    echo "WARNING: $leg export cache receipt unavailable" >&2
+  fi
+done
 
 # Publish the requested local tags only after both inventories and identity gates pass.
 docker tag "$COORDINATOR_DOCKER_INFERENCE" "$complete_coordinator_image"

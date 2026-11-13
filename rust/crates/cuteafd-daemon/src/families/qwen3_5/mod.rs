@@ -21,7 +21,7 @@ pub(crate) struct GoldenArgs {
     pub native_lib: Option<PathBuf>,
     #[arg(long, default_value = "/opt/cuteafd/share/PROGRAMS.json")]
     pub manifest: PathBuf,
-    /// Independent reference dump or sealed fidelity golden/ directory.
+    /// Full-logits reference, or pinned compact dataset for packed/graph qualification.
     #[arg(long)]
     pub golden: Option<PathBuf>,
     /// Window in a sealed fidelity golden; ignored for a legacy full-row dump.
@@ -86,29 +86,33 @@ pub(crate) async fn run_golden(args: GoldenArgs) -> Result<()> {
     ensure!((1..=4096).contains(&args.prefill_chunk), "prefill chunk must be 1..4096");
     ensure!(args.nll_tolerance.is_finite() && args.nll_tolerance >= 0.0, "invalid NLL tolerance");
     let golden = args.golden.as_ref().context("dense golden requires --golden reference directory")?;
-    let packed_windows = if args.packed_check.is_some() && golden.join("manifest.json").is_file() {
-        use cuteafd_bench::fidelity_dataset;
-        use sha2::{Digest, Sha256};
-        let bytes = std::fs::read(golden.join("manifest.json"))?;
-        let manifest: serde_json::Value = serde_json::from_slice(&bytes)?;
-        let expected = match (cfg.hidden, manifest["config"].as_str()) {
-            (5120, Some(fidelity_dataset::QWEN38_27B_CONFIG)) => fidelity_dataset::QWEN38_27B_MANIFEST_SHA256,
-            (4096, Some(fidelity_dataset::QWEN35_9B_CONFIG)) => fidelity_dataset::QWEN35_9B_MANIFEST_SHA256,
-            _ => anyhow::bail!("unsupported dense packed reference"),
-        };
-        ensure!(format!("{:x}", Sha256::digest(&bytes)) == expected, "dense packed reference publication differs");
-        let reference = fidelity_dataset::load(golden, &manifest)?;
-        ensure!(reference.vocab == cfg.vocab, "dense packed reference vocabulary differs");
+    let published = if golden.join("manifest.json").is_file() {
+        ensure!(args.packed_check.is_some() || (cuteafd_loader::serving_capacity::qwen35_graphs::enabled()
+            && args.spec_decode.is_none() && args.draft.is_none() && args.mtp_golden.is_none()
+            && args.save_logits.is_none()),
+            "compact dense graph oracle requires graphs enabled and no draft/MTP or full-logits output; use the standard card for external quality");
+        Some(published_reference(golden, cfg.hidden, cfg.vocab)?)
+    } else { None };
+    let packed_windows = if let (Some(members), Some(reference)) = (args.packed_check, &published) {
         Some(crate::shared::qwen::packed_check::reference_windows(&reference.windows,
-            &args.window, args.packed_check.unwrap(),
+            &args.window, members,
             args.prefill_packing == crate::shared::prefill_packing::PackingMode::Unrestricted)?)
     } else { None };
-    let (directory, positions) = if packed_windows.is_some() { (golden.to_owned(), None) } else {
+    let graph_window = if args.packed_check.is_none() {
+        published.as_ref().map(|reference| reference.windows.iter().find(|window| window.id == args.window)
+            .context("dense graph reference window not found")).transpose()?
+    } else { None };
+    let compact = packed_windows.is_some() || graph_window.is_some();
+    let (directory, positions) = if compact {
+        (golden.to_owned(), graph_window.map(|window| window.positions.iter().map(|p| p.pos).collect()))
+    } else {
         let reference = reference_snapshot(&args.snapshot, args.model_id.as_deref(), &cuteafd_bench::fidelity_match::hub())?;
         reference_window(golden, &args.window, &args.snapshot, &reference, cfg.vocab)?
     };
     let token_bytes = if let Some(windows) = &packed_windows {
         windows[0].tokens.iter().flat_map(|t| t.to_le_bytes()).collect()
+    } else if let Some(window) = graph_window {
+        window.tokens.iter().flat_map(|t| t.to_le_bytes()).collect()
     } else { std::fs::read(directory.join("tokens.bin"))? };
     ensure!(token_bytes.len() >= 8 && token_bytes.len() % 4 == 0, "invalid reference token payload");
     let tokens: Vec<_> = token_bytes.chunks_exact(4).map(|b| u32::from_le_bytes(b.try_into().unwrap())).collect();
@@ -116,9 +120,9 @@ pub(crate) async fn run_golden(args: GoldenArgs) -> Result<()> {
     let positions = positions.unwrap_or_else(|| (1..tokens.len()).collect());
     ensure!(!positions.is_empty() && positions.iter().all(|&p| p > 0 && p < tokens.len())
         && positions.windows(2).all(|p| p[0] < p[1]), "invalid reference score positions");
-    let reference = if packed_windows.is_some() { Vec::new() } else { std::fs::read(directory.join("logits.bin"))? };
+    let reference = if compact { Vec::new() } else { std::fs::read(directory.join("logits.bin"))? };
     let reference_rows = if golden.join("windows.json").is_file() { positions.len() } else { tokens.len() };
-    ensure!(packed_windows.is_some() || reference.len() == reference_rows * cfg.vocab * 4, "reference logits shape mismatch");
+    ensure!(compact || reference.len() == reference_rows * cfg.vocab * 4, "reference logits shape mismatch");
     let reference: Vec<_> = reference.chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect();
     ensure!(reference.iter().all(|v| v.is_finite()), "nonfinite reference logits");
     let checkpoint = cuteafd_loader::plan::checkpoint::Checkpoint::open(&args.snapshot)?;
@@ -140,12 +144,14 @@ pub(crate) async fn run_golden(args: GoldenArgs) -> Result<()> {
     let reader = crate::shared::qwen::weights::WeightReader { library: &library, checkpoint: &checkpoint };
     let mtp_admission = args.packed_mtp.then(|| engine::mtp::Admission::new(&reader, cfg, &programs)).transpose()?;
     let mut engine = engine::DenseEngine::with_prefix(&library, &programs, &checkpoint, cfg.clone(),
-        args.pool_tokens, mtp_admission.as_ref().map(|a| a.bytes), slots, marks, args.kv_cache, false)?;
+        args.pool_tokens, mtp_admission.as_ref().map(|a| a.bytes.clone()), slots, marks, args.kv_cache, false, None, args.verify_check)?;
+    engine.warm_decode_graphs()?;
     if args.verify_check {
         engine.verify_check(&tokens)?;
         if args.state_slots > 1 { engine.multislot_verify_check(&tokens)?; }
     }
     let engine = std::cell::RefCell::new(engine);
+    if args.verify_check { serve::DenseBackend::new(&engine, &library).check_diagnostic_graph_bypass(&tokens)?; }
     if let Some(members) = args.packed_check {
         ensure!(args.prefill_packing == crate::shared::prefill_packing::PackingMode::Exact || packed_windows.is_some(),
             "unrestricted packed check needs the sealed official reference");
@@ -158,6 +164,17 @@ pub(crate) async fn run_golden(args: GoldenArgs) -> Result<()> {
     }
     if args.prefix_check { engine::prefix::check(&engine, &tokens)?; }
     let mut engine = engine.into_inner();
+    if let Some(window) = graph_window {
+        let (off, on) = engine.golden_decode_graphs(&tokens, &positions, args.prefill_chunk)?
+            .context("compact dense graph oracle requires an enabled graph cache")?;
+        let targets: Vec<_> = positions.iter().map(|&p| tokens[p]).collect();
+        let off_nll = scored_nll(&off, &targets, cfg.vocab)?;
+        let on_nll = scored_nll(&on, &targets, cfg.vocab)?;
+        ensure!(off_nll.to_bits() == on_nll.to_bits(), "dense graph-on/off NLL differs");
+        println!("dense graph NLL: window {}, {} scored rows, off {off_nll:.8}, measured-on {on_nll:.8}; external top-1024 quality is qualified separately by the standard card",
+            window.id, positions.len());
+        return Ok(());
+    }
     let mut logits = Vec::with_capacity(tokens.len() * cfg.vocab);
     let mut first = 0;
     for chunk in tokens.chunks(args.prefill_chunk) {
@@ -179,6 +196,14 @@ pub(crate) async fn run_golden(args: GoldenArgs) -> Result<()> {
     let targets: Vec<_> = positions.iter().map(|&p| tokens[p]).collect();
     let nll = scored_nll(&ours, &targets, cfg.vocab)?;
     let reference_nll = scored_nll(&theirs, &targets, cfg.vocab)?;
+    if let Some((off, on)) = engine.golden_decode_graphs(&tokens, &positions, args.prefill_chunk)? {
+        let off_nll = scored_nll(&off, &targets, cfg.vocab)?;
+        let on_nll = scored_nll(&on, &targets, cfg.vocab)?;
+        ensure!(off_nll.to_bits() == on_nll.to_bits(), "dense graph-on/off NLL differs");
+        println!("dense graph NLL: off {off_nll:.8}, on {on_nll:.8}, evaluate {nll:.8}, reference {reference_nll:.8}; decode minus evaluate {:.8}", off_nll - nll);
+        ensure!((on_nll - reference_nll).abs() <= args.nll_tolerance,
+            "dense graph decode NLL differs from reference by {:.8}", on_nll - reference_nll);
+    }
     let (mean_kl, max_kl) = scored_kl(&theirs, &ours, cfg.vocab)?;
     let argmax = |row: &[f32]| row.iter().enumerate()
         .max_by(|a, b| a.1.total_cmp(b.1).then_with(|| b.0.cmp(&a.0))).unwrap().0;
@@ -189,6 +214,23 @@ pub(crate) async fn run_golden(args: GoldenArgs) -> Result<()> {
     ensure!((nll - reference_nll).abs() <= args.nll_tolerance,
         "dense mean NLL differs by {:.8}, tolerance {}", (nll - reference_nll).abs(), args.nll_tolerance);
     Ok(())
+}
+
+fn published_reference(root: &std::path::Path, hidden: usize, vocab: usize)
+    -> Result<cuteafd_bench::reference::Reference> {
+    use cuteafd_bench::fidelity_dataset;
+    use sha2::{Digest, Sha256};
+    let bytes = std::fs::read(root.join("manifest.json"))?;
+    let manifest: serde_json::Value = serde_json::from_slice(&bytes)?;
+    let expected = match (hidden, manifest["config"].as_str()) {
+        (5120, Some(fidelity_dataset::QWEN38_27B_CONFIG)) => fidelity_dataset::QWEN38_27B_MANIFEST_SHA256,
+        (4096, Some(fidelity_dataset::QWEN35_9B_CONFIG)) => fidelity_dataset::QWEN35_9B_MANIFEST_SHA256,
+        _ => anyhow::bail!("unsupported dense published reference"),
+    };
+    ensure!(format!("{:x}", Sha256::digest(&bytes)) == expected, "dense reference publication differs");
+    let reference = fidelity_dataset::load(root, &manifest)?;
+    ensure!(reference.vocab == vocab, "dense reference vocabulary differs");
+    Ok(reference)
 }
 
 fn reference_snapshot(snapshot: &std::path::Path, model: Option<&str>, hub: &std::path::Path) -> Result<PathBuf> {
@@ -263,6 +305,21 @@ mod tests {
             "--packed-check", "8", "--window", "a00", "--packed-mtp", "--pool-tokens", "262144",
             "--prefill-packing", "unrestricted"])?;
         tokio::runtime::Builder::new_current_thread().enable_all().build()?.block_on(super::run_golden(parsed.args))
+    }
+
+    #[test]
+    fn compact_graph_reference_rejects_unpinned_or_wrong_family_publications() -> anyhow::Result<()> {
+        use cuteafd_bench::fidelity_dataset;
+        let root = tempfile::tempdir()?;
+        std::fs::write(root.path().join("manifest.json"), serde_json::json!({
+            "config": fidelity_dataset::QWEN38_27B_CONFIG,
+            "vocab": 248320
+        }).to_string())?;
+        assert!(super::published_reference(root.path(), 5120, 248320).unwrap_err()
+            .to_string().contains("publication differs"));
+        assert!(super::published_reference(root.path(), 4096, 248320).unwrap_err()
+            .to_string().contains("unsupported dense published reference"));
+        Ok(())
     }
 
     #[test]

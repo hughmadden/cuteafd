@@ -11,17 +11,20 @@
 extern "C" {
 #endif
 
-// words (16): [0] packed contract (all bytes required):
-//   bits 0..7: ABI version 5 (old unversioned contracts are rejected)
+// words (18): [0] packed contract (all bytes required):
+//   bits 0..7: ABI version 6 (old unversioned contracts are rejected)
 //   bits 8..15: storage 1=FP8 block128, 2=MXFP4, 4=NVFP4 W4A4, 5=BF16
 //   bits 16..23: activation 1=pre-SiLU clamp + BF16 SiLU/product rounding,
-//                          2=post-SiLU clamp + FP32 product/final BF16 rounding
+//                          2=post-SiLU clamp + FP32 product/final BF16 rounding,
+//                          3=SwiGLU-OAI FP32 gate*sigmoid(alpha*gate)*(up+beta)
 //   bits 24..31: projection 1=BF16 gate/up and down outputs
 // Both activations clamp up to [-limit, limit]; limit zero disables clamping.
 // [1] hidden, [2] slice, [3] experts, [4] top-k,
 // [5] intermediate, [6] tp, [7] input dtype (7 = FP8 E4M3 + UE8M0 K32 wire
 // rows: Spark packages; 1 = BF16 rows: coordinator packages), [8] SwiGLU limit (FP32 bits, 0 = none), [9] capacity count n,
-// [10 .. 10+n) capacities.
+// [10 .. 10+n) capacities (n <= 6), [16] alpha FP32 bits, [17] beta FP32 bits.
+// SiLU requires alpha=1, beta=0. OAI requires NVFP4, alpha>0 and limit>0;
+// gate is capped above limit and up clamped to [-limit, limit] before activation.
 int32_t cuteafd_fp8moe_info(uint32_t* words, uint32_t count);
 int32_t cuteafd_fp8moe_scratch_bytes(uint32_t capacity, uint64_t* bytes);
 // Static arithmetic interval for the launch-selected capacity/form (including
@@ -52,6 +55,16 @@ int32_t cuteafd_fp8moe_segment_scratch_bytes(uint32_t rows, uint64_t* bytes);
 // Same operands, except x/out are uint64 row-address tables. Populate them on
 // stream before launch and retain all addressed rows until completion.
 int32_t cuteafd_fp8moe_launch_segments(void* context, void* const* pointers, int32_t rows, void* stream);
+// Core variants omit only MoeCombine, preserving all arithmetic and scratch.
+int32_t cuteafd_fp8moe_launch_core(void* context, uint32_t capacity, void* const* pointers,
+                                  int32_t rows, void* stream);
+int32_t cuteafd_fp8moe_launch_segments_core(void* context, void* const* pointers,
+                                           int32_t rows, void* stream);
+// Static query using the launch form fallback; segmented is 0 or 1. Four u64
+// words: layout version (1), pair_pos offset, BF16 y offset, y extent in bytes.
+// Offsets refer to the existing scratch, with live rows and planned metadata.
+int32_t cuteafd_fp8moe_reply_layout(uint32_t capacity, uint32_t form, uint32_t rows,
+                                   uint32_t segmented, uint64_t* words, uint32_t count);
 void cuteafd_fp8moe_destroy(void* context);
 // options: the large-row form of FP8 programs. 0 the package default (wire rows
 // W8A8: block-scaled E4M3 x E4M3 gate/up; BF16 rows W8A16, exact), 1 W8A16 (the

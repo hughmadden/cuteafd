@@ -1,13 +1,14 @@
 use crate::shared::decode_graph::{fatal_drain, BindingGraphs};
 use super::DsparkWeights;
-use crate::shared::memory::{DeviceAllocation, LoadStream};
+use crate::shared::memory::Tag;
+use crate::shared::memory::{DeviceAllocation};
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::{CuteafdDeviceBuffer, V41DsparkConfidence};
 use std::ffi::c_void;
 
 /// Stable per-wave confidence inputs/output; borrowed weights outlive its graph.
 pub(crate) struct DsparkConfidence<'weights, 'library> {
-    stream: LoadStream<'library>,
+    standalone: &'weights crate::shared::memory::StandaloneStream<'library>,
     hidden: DeviceAllocation<'library>,
     markov: DeviceAllocation<'library>,
     output: DeviceAllocation<'library>,
@@ -33,16 +34,13 @@ impl<'library> DsparkWeights<'library> {
         // Resolve the final-stage checkpoint weight before allocating workspace.
         self.tensor("mtp.2.confidence_head.proj.weight")?;
         Ok(DsparkConfidence {
-            stream: LoadStream {
-                library,
-                raw: library.cuda_stream_create()?,
-            },
-            hidden: DeviceAllocation::new(library, capacity * 10240)?,
-            markov: DeviceAllocation::new(library, capacity * 512)?,
-            output: DeviceAllocation::new(library, capacity * 4)?,
+            standalone: &self.standalone,
+            hidden: DeviceAllocation::new(library, capacity * 10240, Tag::drafter_workspace("v41/draft-confidence"))?,
+            markov: DeviceAllocation::new(library, capacity * 512, Tag::drafter_workspace("v41/draft-confidence"))?,
+            output: DeviceAllocation::new(library, capacity * 4, Tag::drafter_workspace("v41/draft-confidence"))?,
             kernel,
             weights: self,
-            graph: BindingGraphs::new(library)?,
+            graph: BindingGraphs::new(library, "dspark_confidence")?,
             capacity,
             ready_rows: None,
         })
@@ -70,7 +68,7 @@ impl DsparkConfidence<'_, '_> {
         Ok(())
     }
     unsafe fn enqueue(&self, rows: usize) -> Result<()> {
-        unsafe { self.enqueue_on(rows, self.stream.raw) }
+        unsafe { self.enqueue_on(rows, self.standalone.get()?.raw) }
     }
     pub(super) unsafe fn enqueue_on(&self, rows: usize, stream: *mut c_void) -> Result<()> {
         self.validate_rows(rows)?;
@@ -89,7 +87,7 @@ impl DsparkConfidence<'_, '_> {
         [self.output.buffer]
     }
     fn synchronize(&self) -> Result<()> {
-        unsafe { self.stream.library.cuda_stream_synchronize(self.stream.raw) }
+        self.standalone.drain()
     }
     /// # Safety
     /// Both owned inputs must be initialized for these rows and producer work
@@ -105,49 +103,17 @@ impl DsparkConfidence<'_, '_> {
         self.output()
     }
     /// # Safety
-    /// Same input contract as execute; warms the launch before graph capture.
-    pub unsafe fn capture(&mut self, rows: usize) -> Result<()> {
-        ensure!(self.graph.is_none(), "confidence graph already captured");
-        unsafe {
-            self.execute(rows)?;
-        }
-        self.ready_rows = None;
-        unsafe {
-            self.stream
-                .library
-                .cuda_graph_begin_capture(self.stream.raw)?;
-        }
-        let launch = unsafe { self.enqueue(rows) };
-        let capture = unsafe { self.stream.library.cuda_graph_end_capture(self.stream.raw) };
-        match (launch, capture) {
-            (Ok(()), Ok(graph)) => {
-                // SAFETY: wave pins captured storage through drained teardown.
-                unsafe { self.graph.insert(rows, graph)?; }
-                Ok(())
-            }
-            (Err(error), Ok(graph)) => {
-                if let Err(cleanup) = unsafe { self.stream.library.cuda_graph_exec_destroy(graph) }
-                {
-                    tracing::error!(%cleanup, "destroying failed confidence capture");
-                }
-                Err(error)
-            }
-            (Err(error), Err(_)) | (Ok(()), Err(error)) => Err(error),
-        }
-    }
-    /// # Safety
     /// Same input contract as execute; rows must match the captured shape.
     pub unsafe fn replay(&mut self, rows: usize) -> Result<CuteafdDeviceBuffer> {
         self.ready_rows = None;
-        let (graph, captured_rows) = self.graph.get().context("confidence graph is not captured")?;
-        ensure!(
-            rows == captured_rows,
-            "confidence replay shape differs from capture"
-        );
+        let Some(graph) = self.graph.cached_launch(&rows) else {
+            // SAFETY: replay and eager execution have the same input contract.
+            return unsafe { self.execute(rows) };
+        };
         unsafe {
-            self.stream
+            self.standalone.device
                 .library
-                .cuda_graph_launch(graph, self.stream.raw)?;
+                .cuda_graph_launch(graph, self.standalone.get()?.raw)?;
         }
         self.synchronize()?;
         self.ready_rows = Some(rows);
@@ -175,5 +141,12 @@ impl Drop for DsparkConfidence<'_, '_> {
         fatal_drain(self.synchronize(), "dSpark confidence");
         // SAFETY: owning stream has drained before executable retirement.
         fatal_drain(unsafe { self.graph.clear() }, "dSpark confidence graphs");
+    }
+}
+
+impl DsparkConfidence<'_, '_> {
+    pub(crate) fn visit_graph_banks(&mut self, f: &mut super::chain::GraphVisitor<'_>) -> Result<()> {
+        f(self.standalone.device.id, "dspark_confidence", false, &mut self.graph)?;
+        Ok(())
     }
 }

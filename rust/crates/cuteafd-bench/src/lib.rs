@@ -20,6 +20,7 @@ pub mod fidelity_rows;
 pub mod http;
 pub mod panels;
 pub mod profiles;
+pub mod prefill;
 pub mod publish;
 pub mod quality;
 pub mod reference;
@@ -94,6 +95,7 @@ pub fn ready(listener: &tokio::net::TcpListener) {
         if GRACEFUL.load(std::sync::atomic::Ordering::Relaxed) { return; }
         stopping(reason);
         settle().await;
+        cuteafd_ffi::memory_ledger::fault::shutdown();
         std::process::exit(if reason == "SIGINT" { 130 } else { 143 });
     });
 }

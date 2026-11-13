@@ -16,6 +16,14 @@ fn head_spans(total: usize, wanted: usize, capacity: usize) -> impl Iterator<Ite
 
 enum Ticket { Spark(crate::shared::spark_waves::WaveTicket), Mixed(layers::Ticket) }
 
+/// Record both old tails before either new stream can wait on its peer.
+fn boundary_edges(mut record: impl FnMut(usize) -> Result<()>,
+    mut wait: impl FnMut(usize, usize) -> Result<()>) -> Result<()> {
+    for rank in 0..2 { record(rank)?; }
+    for rank in 0..2 { wait(rank, 1 - rank)?; }
+    Ok(())
+}
+
 /// The MLA ordinal, not the absolute layer, selects Flash's two staging views.
 fn staging_turn(owners: &mut [Option<(usize, usize)>; 2], ordinal: usize, layer: usize, unit: usize) -> bool {
     let owner = &mut owners[ordinal % 2];
@@ -24,7 +32,7 @@ fn staging_turn(owners: &mut [Option<(usize, usize)>; 2], ordinal: usize, layer:
     reuse
 }
 
-struct UnitHooks<'e, 'a, 'w, 'd, 'f, 't, 'n> {
+struct UnitHooks<'e, 'a, 'w, 'd, 'f, 't, 'n, 's> {
     engine: &'e GlmfEngine<'a>,
     /// The Spark link's transport worker (every Spark layer's waves).
     transport: Option<&'t mut crate::shared::spark_waves::Waves<'n>>,
@@ -39,13 +47,14 @@ struct UnitHooks<'e, 'a, 'w, 'd, 'f, 't, 'n> {
     wanted: usize,
     device: bool,
     logits: Vec<f32>,
+    scoring: Option<crate::shared::probe::ScoringRows<'s>>,
     result: Option<DeviceLogits>,
     media: Option<&'w cuteafd_engine::media::RequestMedia>,
     on_layer: Option<&'d mut dyn FnMut(usize, &[u8]) -> Result<()>>,
     forced: Option<&'f dyn Fn(usize) -> Option<Vec<u8>>>,
 }
 
-impl<'a> UnitHooks<'_, 'a, '_, '_, '_, '_, '_> {
+impl<'a> UnitHooks<'_, 'a, '_, '_, '_, '_, '_, '_> {
     fn rows(&self, unit: &Unit) -> usize { unit.rows.len() }
     fn peer(&self, unit: &Unit) -> Result<Option<&Workspace<'a>>> {
         self.peer.map(|p| p.get(unit.slot)).transpose()
@@ -104,7 +113,7 @@ impl<'a> UnitHooks<'_, 'a, '_, '_, '_, '_, '_> {
     }
 }
 
-impl PrefillHooks for UnitHooks<'_, '_, '_, '_, '_, '_, '_> {
+impl PrefillHooks for UnitHooks<'_, '_, '_, '_, '_, '_, '_, '_> {
     type Ticket = Ticket;
     fn route(&self, layer: usize) -> FfnRoute {
         if !self.engine.weights.layers[layer].dense
@@ -257,8 +266,13 @@ impl PrefillHooks for UnitHooks<'_, '_, '_, '_, '_, '_, '_> {
                 let capacity = logits_capacity(w.logits.buffer.bytes, e.cfg.vocab_size)?;
                 for rows in head_spans(unit.rows.len(), wanted, capacity) {
                     e.logits(w, rows.end, rows.len(), false)?;
-                    self.logits.extend(e.download(&w.logits, rows.len() * e.cfg.vocab_size * 4)?
-                        .chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())));
+                    if let Some(scoring) = self.scoring {
+                        scoring.record(e.library, unit.rows.start + rows.start - (self.total - self.wanted),
+                            &e.device_logits(w, rows.len(), false))?;
+                    } else {
+                        self.logits.extend(e.download(&w.logits, rows.len() * e.cfg.vocab_size * 4)?
+                            .chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())));
+                    }
                 }
             }
         }
@@ -272,21 +286,35 @@ impl<'a> GlmfEngine<'a> {
         steps: &[(StepTables, &[u32])], logit_rows: usize, device: bool,
         media: Option<&cuteafd_engine::media::RequestMedia>, max_waves: usize,
         on_layer: Option<&mut dyn FnMut(usize, &[u8]) -> Result<()>>,
-        forced: Option<&dyn Fn(usize) -> Option<Vec<u8>>>) -> Result<Option<StepLogits>> {
+        forced: Option<&dyn Fn(usize) -> Option<Vec<u8>>>,
+        scoring: Option<crate::shared::probe::ScoringRows<'_>>) -> Result<Option<StepLogits>> {
         let waves = max_waves.min(self.prefill_waves).min(steps.len()).max(1);
         ensure!(on_layer.is_none() && forced.is_none() || waves == 1,
             "prefill diagnostics require executor N=1");
         ensure!(forced.is_none() || self.peer.is_none(), "teacher forcing runs without a head split");
         let work = self.prefill_slots_of(0, waves)?;
         let peer = self.peer_workspaces(false, Some(waves))?;
-        for rank in 0..self.ranks() {
-            // SAFETY: one call-boundary drain, never a per-dispatch stream wait.
-            self.on(rank, || unsafe { self.library.cuda_stream_synchronize(self.stream_of(rank)) })?;
+        let boundary = if self.peer.is_some() {
+            (0..2).map(|rank| crate::shared::memory::device::Event::new(
+                crate::shared::memory::device::Device { library: self.library,
+                    id: if rank == 0 { self.device } else { self.peer()?.device } }))
+                .collect::<Result<Vec<_>>>()?
+        } else { Vec::new() };
+        if !boundary.is_empty() {
+            boundary_edges(|rank| self.on(rank, || {
+                // SAFETY: the engine owns both streams; events remain live through
+                // submission. Record every old tail before either cross-wait.
+                unsafe { self.library.cuda_event_record(boundary[rank].raw, self.stream_of(rank)) }
+            }), |rank, peer| self.on(rank, || {
+                // SAFETY: cross-device waits order previous peer readers before
+                // workspace reuse without blocking the issuing thread.
+                unsafe { self.library.cuda_stream_wait_event(self.stream_of(rank), boundary[peer].raw) }
+            }))?;
         }
         let total: usize = steps.iter().map(|(t, _)| t.positions.len()).sum();
         let capacity = logits_capacity(work[0].logits.buffer.bytes, self.cfg.vocab_size)?;
         ensure!(!device || logit_rows <= capacity, "device prefill logits exceed admitted rows");
-        ensure!(logit_rows <= total && (self.full_prefill_logits || logit_rows <= DECODE_ROWS),
+        ensure!(logit_rows <= total && (scoring.is_some() || self.full_prefill_logits || logit_rows <= DECODE_ROWS),
             "prefill logits exceed admitted rows");
         let mut ranked = Vec::new();
         let mut units = Vec::new();
@@ -318,7 +346,7 @@ impl<'a> GlmfEngine<'a> {
         let run = |transport: Option<&mut crate::shared::spark_waves::Waves<'_>>| {
             let mut hooks = UnitHooks { engine: self, transport, steps, ranked, work: &work, peer: peer.as_ref(),
                 released, consumed, waves, total, wanted: logit_rows, device, logits: Vec::new(), result: None,
-                media, on_layer, forced };
+                media, on_layer, forced, scoring };
             run_prefill_units(&mut hooks, &units, waves).map(|()| (hooks.result, hooks.logits))
         };
         // Spark waves build, post and land on the link's exchange worker
@@ -346,10 +374,10 @@ impl<'a> GlmfEngine<'a> {
         };
         complete?;
         // Partial layer sets are diagnostics read on the host. A chunk without logits
-        // stays queued: the next call's boundary drain (above) or the next reader
-        // (selection, prefix capture) waits for it.
+        // stays queued: rank-local stream order and the next call's peer events
+        // protect reuse; selection/prefix capture waits before a host read.
         if self.weights.layers.len() < self.cfg.layers { self.synchronize()?; return Ok(None); }
-        if logit_rows == 0 { return Ok(None); }
+        if logit_rows == 0 || scoring.is_some() { return Ok(None); }
         Ok(Some(if device { StepLogits::Device(result.context("last-unit logits")?) }
             else { StepLogits::Host(logits) }))
     }
@@ -360,6 +388,66 @@ mod tests {
     use super::*;
     use crate::shared::prefill_pipeline::{prefill_schedule, sequence_units, Step};
     use std::collections::VecDeque;
+
+    #[test]
+    fn back_to_back_boundaries_record_old_tails_before_peer_workspace_reuse() -> Result<()> {
+        let calls = std::cell::RefCell::new(Vec::new());
+        for call in 0..2 {
+            boundary_edges(|rank| { calls.borrow_mut().push((call, "record", rank, rank)); Ok(()) },
+                |rank, peer| { calls.borrow_mut().push((call, "wait", rank, peer)); Ok(()) })?;
+            calls.borrow_mut().push((call, "reuse", 0, 1));
+        }
+        for (call, edges) in calls.borrow().chunks_exact(5).enumerate() {
+            assert_eq!(edges, [(call, "record", 0, 0), (call, "record", 1, 1),
+                (call, "wait", 0, 1), (call, "wait", 1, 0), (call, "reuse", 0, 1)]);
+        }
+        let source = include_str!("units.rs");
+        let entry = source.split("pub(super) fn step_units_inner").nth(1).unwrap()
+            .split("let total:").next().unwrap();
+        assert!(!entry.contains("cuda_stream_synchronize"));
+        assert!(entry.contains("boundary_edges("));
+        Ok(())
+    }
+
+    #[test]
+    fn boundary_event_failures_retire_instead_of_recovering_or_reusing_workspaces() {
+        use crate::shared::experts::rtx::pair::{self, StepFailure};
+        use std::cell::Cell;
+        for failed_edge in 0..4 {
+            let edge = Cell::new(0);
+            let retired = Cell::new(false);
+            let cancelled = Cell::new(false);
+            let reused = Cell::new(false);
+            let submit_edge = |operation: &str| -> Result<()> {
+                let current = edge.replace(edge.get() + 1);
+                if current == failed_edge {
+                    return Err(cuteafd_ffi::NativeStatusError {
+                        context: operation.into(), status: cuteafd_ffi::CUTEAFD_STATUS_CUDA_UNAVAILABLE,
+                        detail: "injected boundary event failure".into(),
+                    }.into());
+                }
+                Ok(())
+            };
+            let error = pair::submit_recoverable(|| Ok(()),
+                |_| { cancelled.set(true); Ok(()) },
+                || { retired.set(true); Ok(()) }, |_| {
+                    boundary_edges(|_| submit_edge("cuda_event_record"),
+                        |_, _| submit_edge("cuda_stream_wait_event"))?;
+                    reused.set(true);
+                    Ok(())
+                }).unwrap_err();
+            assert!(StepFailure::is_terminal(&error), "{error:#}");
+            assert!(retired.get());
+            assert!(!cancelled.get(), "CUDA event failures must not take request-local recovery");
+            assert!(!reused.get(), "a failed fence must prevent workspace reuse");
+            assert_eq!(edge.get(), failed_edge + 1);
+        }
+        let source = include_str!("../engine.rs");
+        let entry = source.split("fn step_units_with(").nth(1).unwrap()
+            .split("/// A prefill's logits").next().unwrap();
+        assert!(entry.contains("pair::submit_recoverable("));
+        assert!(entry.contains("|scope| self.step_units_inner(scope,"));
+    }
 
     #[test]
     fn head_tiles_cover_only_wanted_rows_in_order_with_bounded_tails() {
@@ -373,6 +461,27 @@ mod tests {
         }
         assert_eq!(head_spans(4096, 129, 64).collect::<Vec<_>>(),
             vec![3967..4031, 4031..4095, 4095..4096]);
+    }
+
+    #[test]
+    fn streamed_tiles_map_unit_rows_to_contiguous_probe_positions() {
+        for lengths in [vec![1], vec![63, 65], vec![2752, 2752, 2752], vec![4096, 257]] {
+            let total: usize = lengths.iter().sum();
+            for wanted in [1, total / 2, total].into_iter().filter(|&n| n > 0) {
+                let mut first = 0;
+                let mut recorded = Vec::new();
+                for n in &lengths {
+                    let unit = first..first + n;
+                    let keep = unit.end.saturating_sub((total - wanted).max(unit.start));
+                    for rows in head_spans(*n, keep, DECODE_ROWS) {
+                        let offset = unit.start + rows.start - (total - wanted);
+                        recorded.extend(offset..offset + rows.len());
+                    }
+                    first = unit.end;
+                }
+                assert_eq!(recorded, (0..wanted).collect::<Vec<_>>());
+            }
+        }
     }
 
     #[test]

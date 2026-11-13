@@ -131,11 +131,9 @@ nice 19 with 16 jobs (`CARGO_BUILD_JOBS=16`, `RUST_TEST_THREADS=16`).
   both arms matched.
 - **Adaptive draft C8 swings ±10-18% between launches** on V4.1 max. One
   matched pair cannot decide C8 there. Use 3 interleaved pairs with
-  alternating order, plus a fixed-policy control (`DSPARK_DRAFT_POLICY=full`).
-  That control exists **only on V4.1**. V4's dSpark proposes a fixed block, but
-  which of its rows are verified goes through the shared draft policy, as in
-  every family. On V4, isolate speculation with a `SPECULATOR=off` pair, and
-  check prompt dependence with a second nonce seed.
+  alternating order, plus a fixed-policy control (`DRAFT_LENGTH=5`).
+  Fixed mode is shared by every family; native head width and the step row
+  budget cap the requested length. Unset remains adaptive (V4.1 maximum 5).
   A shared-build toggle (`--arm-wip`) isolates a flag from the build.
 - **Judge on the paired median**, not on the ratio of arm medians, and report
   the raw pairs and their order.
@@ -288,7 +286,7 @@ orchestrator's to use; TJ isn't using these subscriptions.
 | CLI | Model | Launch flags | Expected strengths |
 |---|---|---|---|
 | `grok` (X Premium+) | `grok-4.7` (default), `grok-4.7-build-fast` | `--always-approve`, `--prompt-file`, `--reasoning-effort` | mechanical work; a fallback when Codex is down or out of quota |
-| `agy` (Google Antigravity) | `gemini-4-argon-high`/`-medium`/`-low`, `gemini-3.8-flash-*` | `--dangerously-skip-permissions`, `-p`, `--effort`, `--add-dir` | second opinions on hard kernel and technical problems, vision, deep research and search |
+| `agy` (Google Antigravity) | `gemini-4-carbon-high` (default, TJ 2026-11-11), `gemini-4-carbon-medium`/`-low`, `gemini-4-argon-*`, `gemini-3.8-flash-*` | `--dangerously-skip-permissions`, `-p`, `--effort`, `--add-dir` | second opinions on hard kernel and technical problems, vision, deep research and search |
 
 Use the interactive stdlib driver for a worker that needs steering or answers:
 
@@ -354,6 +352,12 @@ report). Missing/empty reports, timeouts and moved HEADs fail closed, including
 with `--base`. Report failing test IDs, not merely exit codes or counts. Commit
 before starting the gate; never move HEAD during it.
 
+Keep maxq busy (TJ, 2026-11-07). Raptor (32 cores) carries cards, seals and
+most agents, and maxq (12 cores) is often idle. When maxq has no CPU gate
+running, run the next gate there, from a worktree at the pushed commit,
+with `~/.cache/cuteafd/gate-venv` linked as `.venv`; otherwise use raptor.
+Don't move all work to maxq.
+
 ## Running agents
 
 - Workers update current state with `scripts/dev/pr-sync push` at checkpoints
@@ -394,7 +398,13 @@ before starting the gate; never move HEAD during it.
   systemd expands `$VAR`/`${...}` in the unit command line itself, which
   mangles bash arrays, `$?` and `$(...)` meant for the inner shell: pass
   `--expand-environment=no`, or put the commands in a script file and run
-  `bash /path/script.sh`.
+  `bash /path/script.sh`. Give the unit's executable as an absolute path
+  (or run it through `bash -c`/`python3`): systemd resolves a bare relative
+  executable such as `scripts/dev/cpu-gate` before applying
+  `--working-directory`, so it can silently run the main checkout's copy.
+  Pass `cpu-gate --source <worktree>` too, and check that the receipt's
+  HEAD is your commit.
+- **Don't nest hardware locks.** `wip-cards` takes every lock its cards need in one fair turn, so run it bare. If you wrap it in `hwlock.py`, the outer call must request the full union of locks (for example sparks,gpu0,gpu1,rhea,moa); a partial outer lock makes `wip-cards` queue a second, newer ticket that deadlocks behind the locks you already hold (#1679).
 - Keep systemd's stop defaults on those units (KillMode=control-group,
   TimeoutStopSec=90 s): never pass `-p KillMode=mixed|process` or a shorter
   `TimeoutStopSec`. On stop, `cuteafd bench smoke` removes its coordinator
@@ -466,7 +476,7 @@ For a second opinion on a risky branch, have a different model review it
 than the one that wrote it (Opus or Astra reviewing Sol), given the diff and
 the gates, not the author's conclusion.
 
-Every big integration, port or shared-mechanism change gets a Gemini 4 Argon
+Every big integration, port or shared-mechanism change gets a Gemini 4 Carbon
 review before merge, as a standing step (TJ, 2026-10-28). Run it read-only on
 pinned SHAs, give it the problem classes seen so far as examples rather than
 limits, and run it alongside the A/B cards, not after them. It always runs
@@ -511,3 +521,4 @@ duplicating it. Record the lesson in the table below.
 | "Model at capacity" ended a run | Retry after a few minutes; resume with a note |
 | ~2,700 hand-written driver scripts; most of one day's failures came from them (wrong container prefix, stale markers, dropped trace, missing --interleave) | The preamble's two commands; wip-cards preflights before queuing, `--resume` replaces retries, and agents ask for tooling instead of writing drivers |
 | Codex subscription hit its weekly limit; 6 agents stopped at once | Read `usage_limit_reached`; relaunch on another model from STATUS.md |
+| Six `while pgrep -f "PATTERN"` waiters never exited: the pattern appears in the loop's own `bash -c` argv, so `pgrep -f` always matched itself | Wait on a PID (`tail --pid=N -f /dev/null`), a systemd unit (`systemctl --user is-active`) or a result file, never on `pgrep -f` of a pattern your own command line contains |

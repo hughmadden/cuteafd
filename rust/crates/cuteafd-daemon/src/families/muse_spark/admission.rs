@@ -17,8 +17,6 @@ pub(crate) struct SparkPlan {
     pub model: ModelAdmission,
     /// The coordinator transport's frame budget: the endpoint's own frame.
     pub max_frame_bytes: usize,
-    /// First layer whose experts live on the Sparks (the bootstrap layer).
-    pub first_spark_layer: usize,
 }
 
 pub(crate) fn spark_plan(placement: &Placement, prefill: PrefillPlan, cutoff: Cutoff, sequences: usize,
@@ -31,7 +29,8 @@ pub(crate) fn spark_plan(placement: &Placement, prefill: PrefillPlan, cutoff: Cu
     ensure!(spark_layers.len() + rtx_layers.len() == placement.layers.len(),
         "Muse places every layer's experts on the Sparks or an RTX (all layers are MoE)");
     ensure!(rtx_layers.len() == placement.onboard_layers, "Muse onboarded layers differ from the placement count");
-    let first_spark_layer = *spark_layers.first().context("Muse serves with at least one Spark layer")?;
+    // Current RTX capacities refuse an all-local Muse plan before this runtime path.
+    ensure!(!spark_layers.is_empty(), "Muse serves with at least one Spark layer");
     let (endpoint, rings) = shared::spark_endpoint(prefill, cutoff, sequences)?;
     let max_frame_bytes = endpoint.frame_bytes(geometry, rings).context("Muse Spark endpoint frame")?;
     let rings = cuteafd_core::SparkRings { max_frame_bytes, ..rings };
@@ -39,7 +38,7 @@ pub(crate) fn spark_plan(placement: &Placement, prefill: PrefillPlan, cutoff: Cu
     let model = ModelAdmission::new(vec![endpoint], rings, executions)?;
     model.validate(geometry)?;
     let working = SparkWorkingSet { rtx_layers, spark_layers, spark_ranks, prefill_lanes: shared::LANES };
-    Ok(SparkPlan { working, model, max_frame_bytes, first_spark_layer })
+    Ok(SparkPlan { working, model, max_frame_bytes })
 }
 
 #[cfg(test)]

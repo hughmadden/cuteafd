@@ -4,20 +4,111 @@ use std::path::PathBuf;
 
 pub(crate) const DEFAULT_REAL_FULL_MAX_CONTEXT_TOKENS: usize = 128 * 1024;
 
-/// Inspect original argv: clap normalizes aliases before exposing matches.
-pub(crate) fn deprecated_budget_flags(args: impl IntoIterator<Item = impl AsRef<str>>) -> Vec<&'static str> {
-    let mut replacements = Vec::new();
-    for arg in args {
-        let replacement = match arg.as_ref().split('=').next().unwrap_or("") {
-            "--rtx-budget-gib" | "--rtx-gib" => Some("--coordinator-gpu-budget-gib"),
-            "--coordinator-budget-gib" => Some("--coordinator-weight-budget-gib"),
-            _ => None,
-        };
-        if let Some(replacement) = replacement {
-            if !replacements.contains(&replacement) { replacements.push(replacement); }
+pub(crate) fn tp2_dflash_default(family: &str, split: bool, draft: bool) -> bool {
+    matches!(family, "mimo_v2" | "kimi_k3" | "glm5_flash" | "muse_spark") && split && draft
+}
+
+/// Resolve the topology-dependent bool once, without losing an explicit false.
+pub(crate) fn resolve_tp2_dflash(command: &mut Commands, matches: &clap::ArgMatches) {
+    let explicit = matches.subcommand().is_some_and(|(_, sub)|
+        sub.try_contains_id("tp2_dflash").is_ok_and(|present| present)
+            && sub.value_source("tp2_dflash") == Some(clap::parser::ValueSource::CommandLine));
+    let glmf = match command {
+        Commands::ServeGlmf(args) => Some(&mut args.engine),
+        Commands::GlmfGolden(args) => Some(&mut args.engine),
+        _ => None,
+    };
+    if let Some(engine) = glmf {
+        engine.tp2_dflash_auto = !explicit && engine.split_device.is_some()
+            && engine.draft.as_ref().is_some_and(|path|
+                crate::families::glm5_flash::dspark::is_dspark(path).is_ok_and(|plain| !plain));
+        return;
+    }
+    let (enabled, family, split, draft) = match command {
+        Commands::ServeMimo(args) => (&mut args.engine.tp2_dflash, "mimo_v2", args.engine.split_device.is_some(), args.engine.draft.is_some()),
+        Commands::MimoGolden(args) => (&mut args.engine.tp2_dflash, "mimo_v2", args.engine.split_device.is_some(), args.engine.draft.is_some()),
+        Commands::ServeKimi(args) => (&mut args.tp2_dflash, "kimi_k3", args.split_device.is_some(), args.draft.is_some()),
+        Commands::ServeMuse(args) => (&mut args.tp2_dflash, "muse_spark", args.split_device.is_some(), args.draft.is_some()),
+        _ => return,
+    };
+    let Some((_, sub)) = matches.subcommand() else { return };
+    if sub.value_source("tp2_dflash") != Some(clap::parser::ValueSource::CommandLine) {
+        *enabled = tp2_dflash_default(family, split, draft);
+    }
+}
+
+fn parse_size(text: &str) -> std::result::Result<u64, String> {
+    text.parse::<cuteafd_core::memory_policy::Size>().map(|size| size.0).map_err(|error| error.to_string())
+}
+
+/// One device memory policy (`cuteafd_core::memory_policy`). Every size takes
+/// B, MB, GB, MiB or GiB. Each device's cap holds weights, KV, workspaces and
+/// the reserve; the layout is fixed for the KV target and the pool then grows
+/// into what is left, up to the KV max.
+#[derive(Debug, Clone, Copy, Default, clap::Args)]
+pub(crate) struct MemoryArgs {
+    /// Total per-GPU ceiling (default: the full device). Leaves SM count and L2 unchanged.
+    #[arg(long, global = true, value_parser = parse_size)]
+    pub(crate) gpu_memory_cap: Option<u64>,
+    /// Total per-Spark ceiling (default: the family's Spark default). Leaves room for the OS.
+    #[arg(long, global = true, value_parser = parse_size)]
+    pub(crate) spark_memory_cap: Option<u64>,
+    /// Whole GPU reserve; every built-in GPU reserve component becomes 0. Still inside the cap.
+    #[arg(long, global = true, value_parser = parse_size)]
+    pub(crate) gpu_reserve: Option<u64>,
+    /// Whole Spark reserve; every built-in Spark reserve component becomes 0.
+    #[arg(long, global = true, value_parser = parse_size)]
+    pub(crate) spark_reserve: Option<u64>,
+    /// Named per-GPU reserve added to the measured components (default: the family constant).
+    #[arg(long, global = true, value_parser = parse_size)]
+    pub(crate) family_reserve: Option<u64>,
+    /// Per-GPU release allowance inside the cap (default 100MiB); GPU_RESERVE replaces it.
+    #[arg(long, global = true, value_parser = parse_size)]
+    pub(crate) memory_padding: Option<u64>,
+    /// Graph node/executable padding: percentage (default 2.5%), bytes per coefficient, or rtx=VALUE,spark=VALUE; independent of GPU_RESERVE.
+    #[arg(long, global = true)]
+    pub(crate) graph_node_padding: Option<cuteafd_core::memory_policy::GraphNodePadding>,
+    /// KV tokens the layout is sized for (default 2M; 1M on cards of 32 GiB or less).
+    #[arg(long, global = true)]
+    pub(crate) kv_target_tokens: Option<u64>,
+    /// Refuse the launch below this many KV tokens (default: min(256K, model context)).
+    #[arg(long, global = true)]
+    pub(crate) kv_min_tokens: Option<u64>,
+    /// Grow the pool into memory left after the layout is fixed, up to this (default: the target).
+    #[arg(long, global = true)]
+    pub(crate) kv_max_tokens: Option<u64>,
+}
+
+impl MemoryArgs {
+    /// The family argv wins key by key over the outer `serve`/`golden` argv.
+    pub(crate) fn or(self, outer: Self) -> Self {
+        Self {
+            gpu_memory_cap: self.gpu_memory_cap.or(outer.gpu_memory_cap),
+            spark_memory_cap: self.spark_memory_cap.or(outer.spark_memory_cap),
+            gpu_reserve: self.gpu_reserve.or(outer.gpu_reserve),
+            spark_reserve: self.spark_reserve.or(outer.spark_reserve),
+            family_reserve: self.family_reserve.or(outer.family_reserve),
+            memory_padding: self.memory_padding.or(outer.memory_padding),
+            graph_node_padding: self.graph_node_padding.or(outer.graph_node_padding),
+            kv_target_tokens: self.kv_target_tokens.or(outer.kv_target_tokens),
+            kv_min_tokens: self.kv_min_tokens.or(outer.kv_min_tokens),
+            kv_max_tokens: self.kv_max_tokens.or(outer.kv_max_tokens),
         }
     }
-    replacements
+
+    pub(crate) fn policy(self) -> cuteafd_core::memory_policy::MemoryPolicy {
+        cuteafd_core::memory_policy::MemoryPolicy {
+            gpu_cap: self.gpu_memory_cap, spark_cap: self.spark_memory_cap,
+            gpu_reserve: self.gpu_reserve, spark_reserve: self.spark_reserve,
+            family_reserve: self.family_reserve, memory_padding: self.memory_padding, kv_target: self.kv_target_tokens,
+            kv_min: self.kv_min_tokens, kv_max: self.kv_max_tokens,
+            graph_node_padding: self.graph_node_padding.unwrap_or_default(),
+        }
+    }
+
+    pub(crate) fn any_gpu(self) -> bool {
+        self.gpu_memory_cap.is_some() || self.gpu_reserve.is_some() || self.family_reserve.is_some() || self.memory_padding.is_some() || self.graph_node_padding.is_some()
+    }
 }
 
 /// A positive number of seconds (fractions allowed).
@@ -30,10 +121,16 @@ fn parse_idle_park(text: &str) -> std::result::Result<f64, String> {
 #[derive(Debug, Parser)]
 #[command(name = "cuteafd", about = "CUTEAFD phase0 runtime CLI")]
 pub(crate) struct Cli {
-    /// Spark prefill expert replies; decode/verify and <=64-row requests stay BF16.
-    /// Omission keeps BF16 combined replies and Muse's NVFP4 partial replies.
-    #[arg(long, global = true, env = "CUTEAFD_SPARK_REPLY_FORMAT")]
-    pub(crate) spark_reply_format: Option<cuteafd_core::SparkReplyFormat>,
+    /// Minimum physical GPU free bytes after graph capture (default MEMORY_PADDING/2); size or gpuN=size, 0 disables.
+    #[arg(long, global = true)]
+    pub(crate) graph_disable_low_mem: Option<String>,
+    /// Spark prefill expert replies. Explicit selections apply even to small units.
+    /// Omission keeps BF16 combined replies and Muse's split NVFP4 partial replies.
+    #[arg(long, global = true, env = "CUTEAFD_SPARK_PREFILL_REPLY_FORMAT")]
+    pub(crate) spark_prefill_reply_format: Option<cuteafd_core::SparkReplyFormat>,
+    /// Spark decode and speculative verify replies (BF16 when omitted).
+    #[arg(long, global = true, env = "CUTEAFD_SPARK_DECODE_REPLY_FORMAT")]
+    pub(crate) spark_decode_reply_format: Option<cuteafd_core::SparkReplyFormat>,
     #[arg(long, global = true, env = "VISION")]
     pub(crate) vision: Option<cuteafd_loader::plan::MediaMode>,
     #[arg(long, global = true, env = "AUDIO")]
@@ -44,10 +141,13 @@ pub(crate) struct Cli {
     /// Remote image URL policy; inline data URLs work in every mode.
     #[arg(long, global = true)]
     pub(crate) image_url_fetch: Option<cuteafd_api::openai::media::ImageUrlFetch>,
-    /// Logical GiB ceiling per coordinator GPU (weights, KV, workspaces,
-    /// graphs and drafts); leaves physical GPU capacity/SM/L2 unchanged.
-    #[arg(long, global = true, aliases = ["rtx-budget-gib", "rtx-gib"])]
-    pub(crate) coordinator_gpu_budget_gib: Option<f64>,
+    /// Device caps, reserves and KV target/min/max (one memory policy for every family).
+    #[command(flatten)]
+    pub(crate) memory: MemoryArgs,
+    /// Retained checkpoint weights per coordinator GPU, including drafter
+    /// weights (default 80 GiB); independent of KV, workspace and total memory.
+    #[arg(long, global = true)]
+    pub(crate) coordinator_weight_budget_gib: Option<f64>,
     /// How host threads wait while serving: `block` (default: each
     /// critical-path wait spins 10 ms, then sleeps; the Spark exchange worker
     /// spins as long, then paces its polling; a less loaded machine) or `spin` (spins throughout,
@@ -130,6 +230,9 @@ pub(crate) enum Commands {
     /// execution engine is not built yet, so startup stops after admission.
     #[command(hide = true)]
     ServeMuse(crate::families::muse_spark::serve::ServeArgs),
+    /// Qualify Muse packed prefill against the immutable official reference.
+    #[command(hide = true)]
+    MuseGolden(crate::families::muse_spark::packed_check::GoldenArgs),
     /// Serve dense Qwen BF16 through the shared Qwen scheduler.
     #[command(hide = true)]
     ServeQwen35(crate::families::qwen3_5::serve::ServeArgs),
@@ -204,8 +307,27 @@ pub(crate) fn exlr8_prefill_activations_parser()
         .map(|name| name.parse().expect("clap admits only the listed values"))
 }
 
+/// Model-lifetime core selection shared by planner, serve and golden commands.
+#[derive(Debug, Clone, Default, Args)]
+pub(crate) struct CoreViewArgs {
+    #[arg(skip)]
+    pub selected_view: Option<cuteafd_loader::plan::checkpoint::CheckpointView>,
+    /// Select a complete dense-core view; compact widths require an MC checkpoint.
+    #[arg(long, env = "CUTEAFD_CORE_VIEW", default_value = "original")]
+    pub core_view: cuteafd_loader::plan::checkpoint::CoreView,
+}
+impl CoreViewArgs {
+    pub fn mode(&self) -> cuteafd_loader::plan::checkpoint::CoreView { self.core_view }
+    pub fn validate_view(&self, _view: &cuteafd_loader::plan::checkpoint::CheckpointView) -> anyhow::Result<()> { Ok(()) }
+    pub fn select(&self, snapshot: &std::path::Path) -> anyhow::Result<cuteafd_loader::plan::checkpoint::CheckpointView> {
+        cuteafd_loader::plan::checkpoint::CheckpointView::select(snapshot, self.mode())
+    }
+}
+
 #[derive(Debug, Clone, Args)]
 pub(crate) struct PlanArgs {
+    #[command(flatten)]
+    pub attention: CoreViewArgs,
     /// Published EXLR8 manifest name (defaults to bit325).
     #[arg(long)]
     pub(crate) exlr8_manifest: Option<String>,
@@ -249,31 +371,23 @@ pub(crate) struct PlanArgs {
     /// Header-only Spark count policy for both coordinator card columns.
     #[arg(long, conflicts_with_all = ["deployment", "files", "fetch", "role"])]
     pub(crate) spark_range: bool,
-    /// Routed-expert weight budget per Spark rank, GiB (unset: the family's
-    /// default, 100 GiB for most; Kimi K3 108 GiB).
-    #[arg(long)]
-    pub(crate) spark_budget_gib: Option<f64>,
-    /// Weight budget of the coordinator GPU, GiB (its own tensors, plus every
-    /// routed expert with --spark-ranks 0).
-    #[arg(long, alias = "coordinator-budget-gib", default_value_t = 80.0)]
+    /// Resolved global resident-weight ceiling, including drafter weights.
+    #[arg(skip = 80.0)]
     pub(crate) coordinator_weight_budget_gib: f64,
+    /// Resolved global memory policy (caps, reserves, KV target/min/max).
+    #[arg(skip)]
+    pub(crate) memory: MemoryArgs,
     #[arg(long, default_value_t = false)]
     pub(crate) json: bool,
     /// Emit typed launch decisions; live artifact verification stays with the launcher.
     #[arg(long, conflicts_with_all = ["files", "fetch", "role", "file_layout"])]
     pub(crate) deployment: bool,
-    #[arg(long, requires = "deployment", requires = "spark_ep", value_parser = clap::value_parser!(u8).range(1..=8))]
-    pub(crate) spark_tp: Option<u8>,
-    #[arg(long, requires = "deployment", requires = "spark_tp", value_parser = clap::value_parser!(u8).range(1..=3))]
-    pub(crate) spark_ep: Option<u8>,
     /// Ordered endpoint inventory; selected ranks take its prefix.
     #[arg(long = "deployment-peers", requires = "deployment", value_delimiter = ',')]
     pub(crate) deployment_peers: Vec<String>,
     /// Preserve launch admission spelling; checked by the native admission parser.
     #[arg(long, requires = "deployment")]
     pub(crate) kv_pool_size: Option<String>,
-    #[arg(long, requires = "deployment")]
-    pub(crate) memory_reservation: Option<String>,
     /// Emit snapshot-relative paths suitable for rsync --files-from.
     #[arg(long)]
     pub(crate) files: bool,
@@ -323,9 +437,12 @@ pub(crate) struct PlanArgs {
     /// Separately configured drafter checkpoint to include in JSON inventory.
     #[arg(long)]
     pub(crate) drafter_snapshot: Option<PathBuf>,
-    /// Charge native MLA DFlash FP8 residency instead of BF16.
-    #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
-    pub(crate) draft_fp8: bool,
+    /// Charge DFlash FP8 residency (GLM Flash defaults to FP8); explicit false uses BF16.
+    #[arg(long, action = clap::ArgAction::Set)]
+    pub(crate) draft_fp8: Option<bool>,
+    /// GLM Flash FP8 drafter GEMM row mode.
+    #[arg(long, default_value = "w8a16")]
+    pub(crate) draft_linear: crate::shared::fp8_linear::Fp8Rows,
     /// Separately configured vision checkpoint to include in JSON inventory.
     #[arg(long)]
     pub(crate) vision_snapshot: Option<PathBuf>,
@@ -345,10 +462,6 @@ pub(crate) struct PlanArgs {
     /// Attention placement: auto is the qualified family default (heads until decided).
     #[arg(long, default_value = "auto", value_parser = ["auto", "context", "layers", "heads"])]
     pub(crate) attention_placement: String,
-    /// Resolved global logical GPU ceiling; defaults to the CUDA total of the
-    /// coordinator arch's reference card (PRO 94.97 GiB, RTX 4090 D 47.45 GiB).
-    #[arg(skip)]
-    pub(crate) coordinator_gpu_budget_gib: Option<f64>,
     /// Coordinator GPU architecture to plan for: sm_120 (RTX 5090 / RTX PRO 6000)
     /// or sm_89 (RTX 4090 class). Selects the card class every coordinator plan charges.
     #[arg(long, default_value = "sm_120")]
@@ -363,18 +476,19 @@ pub(crate) struct PlanArgs {
     #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
     pub(crate) fp8_decode: bool,
     /// Qwen head residency for --layout.
-    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
     pub(crate) mtp_fp8_head: bool,
-    /// GLM Flash KDA projection residency (default: launcher's row128).
-    #[arg(long, value_enum, default_value = "row128")]
+    /// GLM Flash KDA projection residency (default: native BF16).
+    #[arg(long, value_enum, default_value = "off")]
     pub(crate) kda_fp8: crate::families::glm5_flash::fp8::KdaFp8,
     /// GLM Flash recurrent state storage for --layout.
     #[arg(long, value_enum, default_value = "f32")]
     pub(crate) kda_state: crate::families::glm5_flash::engine::KdaState,
-    /// GLM Flash shared target/draft head residency (default: launcher's FP8).
-    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
-    pub(crate) fp8_head: bool,
-    /// GLM Flash BF16 target head arithmetic; FP8 heads use their own program.
+    /// GLM Flash shared target/draft head residency: `auto` (packed TP1, FP8 TP2), `true` (also
+    /// `fp8`), `false` (BF16; also `bf16`) or `packed` (the exact 12-bit copy, one GPU).
+    #[arg(long = "fp8-head", default_value = "auto", action = clap::ArgAction::Set)]
+    pub(crate) head_format: crate::families::glm5_flash::head::GlmfHeadFormat,
+    /// GLM Flash BF16 target head arithmetic; FP8 and packed heads use their own GEMVs.
     #[arg(long, value_enum)]
     pub(crate) target_head: Option<crate::shared::target_head::TargetHead>,
     /// GLM Flash draft head arithmetic; it borrows the target's resident copy.
@@ -383,7 +497,8 @@ pub(crate) struct PlanArgs {
     /// Immutable GLM/Qwen attention scratch override.
     #[arg(long, env = "CUTEAFD_ATTENTION_PLAN_ROWS")]
     pub(crate) attention_plan_rows: Option<usize>,
-    /// External drafter GiB on the last GPU for --layout (DFlash).
+    /// Checkpoint-resident drafter WEIGHT GiB for --layout, counted against the
+    /// weight cap; no runtime storage is inferred. Actual drafter headers must agree.
     #[arg(long, default_value_t = 0.0)]
     pub(crate) drafter_gib: f64,
     /// Families on the shared placement solver (V4): `auto` (pool first),
@@ -409,15 +524,19 @@ pub(crate) struct PlanArgs {
     /// V4: force FP32 FFN exchange for prefill as well as decode.
     #[arg(long)]
     pub(crate) exchange_f32: bool,
-    /// Compiled maximum context for table and workspace reservations (0: family/image default).
-    #[arg(long, default_value_t = 0)]
-    pub(crate) context_tokens: u64,
+    /// Served context: auto fits the admitted pool; a positive count pins it.
+    #[arg(long = "max-context-tokens", value_parser = crate::shared::context::parse_tokens::<u64>)]
+    pub(crate) context_tokens: Option<u64>,
     /// Prefill workspace capacity for --layout (0: family/image default; GLM 5.3 Flash: per lane).
     #[arg(long, default_value_t = 0)]
     pub(crate) prefill_rows: u64,
     /// Include the diagnostic all-row prefill head reservation in --layout.
     #[arg(long)]
     pub(crate) full_prefill_logits: bool,
+    /// Include executed-route telemetry owners in --layout (disable with =false).
+    #[arg(long, action = clap::ArgAction::Set, num_args = 0..=1,
+        default_missing_value = "true", require_equals = true)]
+    pub(crate) expert_usage: Option<bool>,
     /// Prefill units in flight for --layout (0: the family default).
     #[arg(long, default_value_t = 0)]
     pub(crate) prefill_waves: u64,
@@ -435,27 +554,22 @@ pub(crate) struct PlanArgs {
     /// GLM 5.3 Flash's DSA index storage for --layout (compact is single-GPU only).
     #[arg(long, value_enum, default_value = "keys")]
     pub(crate) index_cache: crate::families::glm5_flash::engine::IndexCache,
-    /// GPU memory (GiB) each coordinator GPU keeps free for runtime growth in --layout (the
-    /// engines' --headroom-gib).
-    #[arg(long, default_value_t = 2.0)]
-    pub(crate) headroom_gib: f64,
-    /// Decode graph budget (MiB) for --layout (GLM 5.3 Flash's --graph-budget-mib; unset: the
-    /// family's graph allowance). One GPU with Spark experts and an automatic pool keeps the budget
-    /// itself, as its measured admission does; other layouts keep at least the allowance.
-    #[arg(long)]
-    pub(crate) graph_budget_mib: Option<u64>,
-    /// GLM 5.3 Flash's replay records for --layout (`shared`: in the prefill scratch, one GPU).
+    /// GLM 5.3 Flash's replay records for --layout (`shared`: in the prefill scratch, one GPU;
+    /// `auto`: `shared` on one GPU with an automatic pool and admitted Spark experts, else `own`).
     #[arg(long, value_enum, default_value = "own")]
-    pub(crate) replay_records: crate::families::glm5_flash::engine::ReplayRecords,
+    pub(crate) replay_records: PlanReplayRecords,
     /// Concurrent sequences for --layout (0: family serving default; otherwise 8 at <=32 GiB, 16 above).
     #[arg(long, default_value_t = 0, value_parser = clap::value_parser!(u64).range(0..=64))]
     pub(crate) concurrency: u64,
-    /// V4.1 proposal limit for --layout (otherwise DSPARK_DRAFT_LIMIT or five).
-    #[arg(long, value_parser = clap::value_parser!(u8).range(1..=7))]
-    pub(crate) dspark_draft_limit: Option<u8>,
+    /// Fixed draft length for --layout (otherwise DRAFT_LENGTH or adaptive).
+    #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+    pub(crate) draft_length: Option<u64>,
     /// V4.1 native dSpark routed-expert TP2; requires --layout, --rtx 2 and dSpark.
     #[arg(long, requires = "layout")]
     pub(crate) tp2_dspark_experts: bool,
+    /// Split MiMo/Kimi/GLM Flash DFlash over both target GPUs (explicit false wins over config).
+    #[arg(long, action = clap::ArgAction::Set)]
+    pub(crate) tp2_dflash: Option<bool>,
     /// Diagnostic recurrent-state slots for --layout; automatic serving storage equals concurrency.
     #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
     pub(crate) state_slots: Option<u64>,
@@ -502,9 +616,12 @@ pub(crate) struct PlanArgs {
     /// Explicit MiMo drafter context arena for --layout.
     #[arg(long)]
     pub(crate) draft_context_slots: Option<u64>,
-    /// MiMo segmented decode graph storage (off by default).
-    #[arg(long)]
-    pub(crate) mimo_decode_graphs: bool,
+    /// MiMo segmented decode graph storage (matches serving; on by default).
+    #[arg(long, default_value = "on", value_parser = ["on", "off"])]
+    pub(crate) mimo_decode_graphs: String,
+    /// Step-5 decode/verify layer sections (matches serving; on by default).
+    #[arg(long, default_value = "on", value_parser = ["on", "off"])]
+    pub(crate) step5_decode_graphs: String,
     /// Physical coordinator SM count for memory-budget simulations.
     #[arg(long)]
     pub(crate) physical_sms: Option<u32>,
@@ -529,6 +646,13 @@ pub(crate) struct PlanArgs {
     pub(crate) workspace_manifest: Option<PathBuf>,
 }
 
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PlanReplayRecords {
+    Auto,
+    Own,
+    Shared,
+}
+
 #[derive(Debug, Args)]
 pub(crate) struct DoctorArgs {
     #[arg(long, default_value = "coordinator")]
@@ -549,6 +673,8 @@ pub(crate) struct DoctorArgs {
 
 #[derive(Debug, Args)]
 pub(crate) struct NativeExpertDaemonArgs {
+    #[command(flatten)]
+    pub attention: CoreViewArgs,
     /// Load the checkpoint vision tower in this expert process.
     #[arg(long, conflicts_with = "encoder_only")]
     pub(crate) encoder: bool,
@@ -605,12 +731,6 @@ pub(crate) struct NativeExpertDaemonArgs {
     /// Spark tensor-parallel world; one rank supports whole Qwen EXL3 experts.
     #[arg(long, default_value_t = 4, value_parser = clap::value_parser!(u32).range(1..=8))]
     pub(crate) world: u32,
-    /// Replicated-group tensor-parallel degree inside one group (opt-in; all-or-none with --spark-ep).
-    #[arg(long, requires = "spark_ep", value_parser = parse_spark_tp)]
-    pub(crate) spark_tp: Option<u8>,
-    /// Number of replicated expert groups, each holding all 384 experts (opt-in; all-or-none with --spark-tp).
-    #[arg(long, requires = "spark_tp", value_parser = clap::value_parser!(u8).range(1..=3))]
-    pub(crate) spark_ep: Option<u8>,
     /// Total device bytes allowed for resident weights, loading and execution.
     #[arg(long)]
     pub(crate) device_budget_bytes: usize,
@@ -702,6 +822,79 @@ pub(crate) struct TransportCapabilitiesArgs {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn memory_policy_flags_parse_sizes_and_reject_percentages() {
+        use clap::Parser;
+        let cli = super::Cli::try_parse_from(["cuteafd", "--gpu-memory-cap", "32GiB", "--spark-memory-cap", "100GiB",
+            "--gpu-reserve", "3GiB", "--spark-reserve", "512MiB", "--family-reserve", "2GB", "--memory-padding", "100MiB", "--graph-node-padding", "rtx=2.5%,spark=100", "--kv-target-tokens", "1048576",
+            "--kv-min-tokens", "65536", "--kv-max-tokens", "4194304", "plan", "/model"]).unwrap();
+        let policy = cli.memory.policy();
+        assert_eq!(policy, cuteafd_core::memory_policy::MemoryPolicy { gpu_cap: Some(32 << 30), spark_cap: Some(100 << 30),
+            gpu_reserve: Some(3 << 30), spark_reserve: Some(512 << 20), family_reserve: Some(2_000_000_000), memory_padding: Some(100 << 20),
+            graph_node_padding: "rtx=2.5%,spark=100".parse().unwrap(), kv_target: Some(1 << 20), kv_min: Some(65_536), kv_max: Some(4 << 20) });
+        assert!(policy.validate().is_ok());
+        assert_eq!(super::Cli::try_parse_from(["cuteafd", "plan", "/model"]).unwrap().memory.policy(), Default::default());
+        for (flag, value) in [("--gpu-memory-cap", "50%"), ("--gpu-reserve", "10%"), ("--spark-memory-cap", "1TB"),
+            ("--family-reserve", "-1GiB"), ("--memory-padding", "10%"), ("--kv-max-tokens", "2M")] {
+            assert!(super::Cli::try_parse_from(["cuteafd", flag, value, "plan", "/model"]).is_err(), "{flag} {value}");
+        }
+        // Family argv wins key by key over the outer argv.
+        let outer = super::MemoryArgs { gpu_memory_cap: Some(1), family_reserve: Some(2), ..Default::default() };
+        let inner = super::MemoryArgs { gpu_memory_cap: Some(3), ..Default::default() };
+        assert_eq!((inner.or(outer).gpu_memory_cap, inner.or(outer).family_reserve), (Some(3), Some(2)));
+    }
+
+    #[test]
+    fn graph_physical_floor_is_a_global_size_or_device_selection() {
+        use clap::Parser;
+        for argv in [vec!["cuteafd", "--graph-disable-low-mem", "gpu0=0,gpu1=50MiB", "plan", "/model"],
+            vec!["cuteafd", "plan", "/model", "--graph-disable-low-mem", "gpu0=0,gpu1=50MiB"]] {
+            let cli = super::Cli::try_parse_from(argv).unwrap();
+            assert_eq!(cli.graph_disable_low_mem.as_deref(), Some("gpu0=0,gpu1=50MiB"));
+        }
+    }
+
+    #[test]
+    fn reply_phase_flags_are_independent_global_selections() {
+        use clap::Parser;
+        use cuteafd_core::SparkReplyFormat;
+        for prefill in ["bf16", "fp8", "nvfp4"] {
+            for decode in ["bf16", "fp8", "nvfp4"] {
+                for argv in [vec!["cuteafd", "--spark-prefill-reply-format", prefill,
+                        "--spark-decode-reply-format", decode, "plan", "/model"],
+                    vec!["cuteafd", "plan", "/model", "--spark-prefill-reply-format", prefill,
+                        "--spark-decode-reply-format", decode]] {
+                    let cli = super::Cli::try_parse_from(argv).unwrap();
+                    assert_eq!(cli.spark_prefill_reply_format, Some(prefill.parse::<SparkReplyFormat>().unwrap()));
+                    assert_eq!(cli.spark_decode_reply_format, Some(decode.parse::<SparkReplyFormat>().unwrap()));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn glmf_tp2_dflash_default_requires_compatible_draft_and_preserves_off() {
+        use clap::{CommandFactory, FromArgMatches};
+        let draft = tempfile::tempdir().unwrap();
+        for (config, compatible) in [("{}", true), (r#"{"speculators_model_type":"dspark"}"#, false)] {
+            std::fs::write(draft.path().join("config.json"), config).unwrap();
+            for split in [false, true] {
+                for explicit in [None, Some("false"), Some("true")] {
+                    let mut argv = vec!["cuteafd", "serve-glmf", "--snapshot", "/model", "--native-lib", "/native.so",
+                        "--draft", draft.path().to_str().unwrap()];
+                    if split { argv.extend(["--split-device", "1"]); }
+                    if let Some(value) = explicit { argv.extend(["--tp2-dflash", value]); }
+                    let matches = super::Cli::command().try_get_matches_from(argv).unwrap();
+                    let mut cli = super::Cli::from_arg_matches(&matches).unwrap();
+                    super::resolve_tp2_dflash(&mut cli.command, &matches);
+                    let super::Commands::ServeGlmf(args) = cli.command else { panic!("expected GLM Flash"); };
+                    assert_eq!(args.engine.tp2_dflash, explicit.is_some_and(|v| v == "true"));
+                    assert_eq!(args.engine.tp2_dflash_auto, explicit.is_none() && split && compatible);
+                }
+            }
+        }
+    }
+
     #[test]
     fn retained_draft_kv_defaults_to_fp8_and_preserves_explicit_bf16() {
         use clap::Parser;
@@ -1010,7 +1203,7 @@ mod tests {
                 base.into_iter().chain(["--host-cache-bytes", value])).unwrap().command else {
                 panic!("expected native serving");
             };
-            match (args.host_cache_bytes, bytes) {
+            match (args.prefix.host_cache_bytes, bytes) {
                 (HostBudget::Auto, None) => (),
                 (HostBudget::Bytes(actual), Some(expected)) => assert_eq!(actual, expected),
                 _ => panic!("incorrect host budget mode"),
@@ -1021,29 +1214,56 @@ mod tests {
     }
 
     #[test]
-    fn native_limits_default_to_model_maximum_and_allow_smaller_launches() {
+    fn plan_and_every_serve_command_share_context_syntax() {
+        use clap::Parser;
+        let mut commands = vec![vec!["cuteafd", "plan", "/model"]];
+        for family in ["serve-native", "serve-dsv4", "serve-glm", "serve-glmf", "serve-mimo",
+            "serve-qwen4", "serve-qwen35", "serve-kimi", "serve-step5", "serve-muse"] {
+            let mut command = vec!["cuteafd", family, "--snapshot", "/model", "--native-lib", "/native.so"];
+            if family != "serve-qwen35" { command.extend(["--peers", "127.0.0.1:19441"]); }
+            commands.push(command);
+        }
+        for command in commands {
+            for context in ["auto", "1", "634304", "1048576"] {
+                assert!(Cli::try_parse_from(command.iter().copied()
+                    .chain(["--max-context-tokens", context])).is_ok(), "{command:?}: {context}");
+            }
+            for context in ["0", "01", "-1", "+1", "1048577"] {
+                assert!(Cli::try_parse_from(command.iter().copied()
+                    .chain(["--max-context-tokens", context])).is_err(), "{command:?}: {context}");
+            }
+            for removed in ["--context-tokens", "--max-context"] {
+                assert!(Cli::try_parse_from(command.iter().copied()
+                    .chain([removed, "131072"])).is_err(), "{command:?}: {removed}");
+            }
+        }
+    }
+
+    #[test]
+    fn native_limits_default_to_automatic_context_and_allow_pins() {
         use clap::Parser;
         let base = ["cuteafd", "serve-native", "--snapshot", "/model", "--native-lib", "/native.so",
             "--peers", "127.0.0.1:19441"];
         let super::Commands::ServeNative(args) = super::Cli::try_parse_from(base).unwrap().command else {
             panic!("expected native serving");
         };
-        assert_eq!(args.max_context_tokens, 1_048_576);
-        assert_eq!(args.reserve.limits(args.max_context_tokens as usize).unwrap().output(), 131_072);
+        assert_eq!(args.max_context_tokens, 0);
+        // HTTP limits are created after admission resolves the automatic extent.
+        assert_eq!(args.prefix.reserve.limits(1_048_576).unwrap().output(), 131_072);
         assert_eq!(args.concurrency, 16);
         assert_eq!(args.resolved_prefix_entries(), 20);
-        assert_eq!(args.dspark_draft_limit, 5);
+        assert_eq!(args.draft_length.effective(5), 5);
         assert!(!args.adaptive_dspark()); // Target-only remains target-only.
         for (flags, adaptive) in [
             (vec!["--dspark"], true),
             (vec!["--dspark", "--independent-decode-lanes"], true),
-            (vec!["--dspark", "--dspark-fixed"], false),
+            (vec!["--dspark", "--draft-length", "5"], false),
         ] {
             let super::Commands::ServeNative(args) = super::Cli::try_parse_from(
                 base.into_iter().chain(flags)).unwrap().command else { panic!("expected native serving"); };
             assert_eq!(args.adaptive_dspark(), adaptive);
         }
-        assert!(super::Cli::try_parse_from(base.into_iter().chain(["--dspark-fixed"])).is_err());
+        assert!(super::Cli::try_parse_from(base.into_iter().chain(["--draft-length", "5"])).is_ok());
         // The removed policies' flags are rejected rather than silently ignored.
         for removed in [["--dspark", "--dspark-adaptive"].as_slice(),
             &["--dspark", "--dspark-confidence-cutoff", "0.5"],
@@ -1054,32 +1274,35 @@ mod tests {
             (vec!["--dspark"], 5),
             (vec!["--dspark", "--rtx-gpus", "1"], 5),
             (vec!["--dspark", "--rtx-gpus", "2"], 5),
-            (vec!["--dspark", "--rtx-gpus", "2", "--dspark-draft-limit", "5"], 5),
-            (vec!["--dspark", "--dspark-draft-limit", "5", "--rtx-gpus", "2"], 5),
-            (vec!["--dspark", "--dspark-draft-limit", "5"], 5),
-            (vec!["--dspark", "--rtx-gpus", "2", "--dspark-draft-limit", "7"], 7),
+            (vec!["--dspark", "--rtx-gpus", "2", "--draft-length", "5"], 5),
+            (vec!["--dspark", "--draft-length", "5", "--rtx-gpus", "2"], 5),
+            (vec!["--dspark", "--draft-length", "5"], 5),
+            (vec!["--dspark", "--rtx-gpus", "2", "--draft-length", "7"], 7),
         ] {
             let super::Commands::ServeNative(args) = super::Cli::try_parse_from(
                 base.into_iter().chain(flags)).unwrap().command else { panic!("expected native serving"); };
-            assert_eq!(args.dspark_draft_limit, expected);
+            assert_eq!(args.draft_length.draft_length.unwrap_or(5).min(7), expected);
         }
         for limit in ["1", "2", "3", "4", "5", "6", "7"] {
-            assert!(super::Cli::try_parse_from(base.into_iter().chain(["--dspark-draft-limit", limit])).is_ok());
+            assert!(super::Cli::try_parse_from(base.into_iter().chain(["--draft-length", limit])).is_ok());
         }
-        for limit in ["0", "8"] {
-            assert!(super::Cli::try_parse_from(base.into_iter().chain(["--dspark-draft-limit", limit])).is_err());
+        for limit in ["0", "invalid"] {
+            assert!(super::Cli::try_parse_from(base.into_iter().chain(["--draft-length", limit])).is_err());
         }
         for entries in ["0", "2", "24", "128"] {
             assert!(super::Cli::try_parse_from(base.into_iter().chain(["--prefix-cache-entries", entries])).is_ok());
         }
         assert!(super::Cli::try_parse_from(base.into_iter().chain(["--prefix-cache-entries", "160"])).is_ok());
         for concurrency in ["1", "2", "16", "17", "32", "64"] {
-            assert!(super::Cli::try_parse_from(base.into_iter().chain(["--concurrency", concurrency, "--kv-pool-size", "1.5GiB", "--memory-reservation", "87.5%"])).is_ok());
+            assert!(super::Cli::try_parse_from(base.into_iter().chain(["--concurrency", concurrency, "--kv-pool-size", "1.5GiB", "--gpu-memory-cap", "87.5GiB"])).is_ok());
         }
         for concurrency in ["0", "65", "128"] {
             assert!(super::Cli::try_parse_from(base.into_iter().chain(["--concurrency", concurrency])).is_err());
         }
-        for (context, output, valid) in [("256", "128", true), ("0", "128", false),
+        // Sizes only: no percentage ceiling and no removed reservation key.
+        assert!(super::Cli::try_parse_from(base.into_iter().chain(["--gpu-memory-cap", "87.5%"])).is_err());
+        assert!(super::Cli::try_parse_from(base.into_iter().chain(["--memory-reservation", "87.5GiB"])).is_err());
+        for (context, output, valid) in [("256", "128", true), ("auto", "128", true),
             ("1048577", "128", false), ("256", "0", true), ("256", "-1", true), ("256", "393217", true),
             ("256", "12k", false)] {
             let command = base.into_iter().chain(["--max-context-tokens", context, "--max-output-tokens", output]);
@@ -1111,6 +1334,19 @@ mod tests {
     use super::*;
 
     #[test]
+    fn tp2_dflash_deployment_accepts_explicit_on_and_off_without_layout() {
+        for mode in ["--deployment", "--layout", "--spark-range"] {
+            for (value, expected) in [("false", false), ("true", true)] {
+                let Commands::Plan(args) = Cli::try_parse_from([
+                    "cuteafd", "plan", "model", mode, "--rtx", "2",
+                    "--speculator", "dflash2", "--tp2-dflash", value,
+                ]).unwrap().command else { panic!("expected plan command"); };
+                assert_eq!(args.tp2_dflash, Some(expected));
+            }
+        }
+    }
+
+    #[test]
     fn mimo_layout_swa_default_and_explicit_formats_match_serving() {
         use cuteafd_loader::families::mimo_v2::MimoKvCache;
         let parse = |extra: &[&str]| {
@@ -1123,6 +1359,29 @@ mod tests {
         assert_eq!(parse(&[]), MimoKvCache::Int8);
         for (flag, expected) in [("bf16", MimoKvCache::Bf16), ("int8", MimoKvCache::Int8), ("fp8", MimoKvCache::Fp8)] {
             assert_eq!(parse(&["--mimo-swa-kv-cache", flag]), expected);
+        }
+    }
+
+    #[test]
+    fn mimo_graph_defaults_and_explicit_overrides_match_plan_and_serving() {
+        for (plan_flags, serve_flags, expected) in [
+            (vec![], vec![], true),
+            (vec!["--mimo-decode-graphs", "on"], vec!["--decode-graphs", "true"], true),
+            (vec!["--mimo-decode-graphs", "off"], vec!["--decode-graphs", "false"], false),
+        ] {
+            let Commands::Plan(plan) = Cli::try_parse_from(
+                ["cuteafd", "plan", "model"].into_iter().chain(plan_flags)).unwrap().command
+                else { panic!("plan"); };
+            let Commands::ServeMimo(serve) = Cli::try_parse_from(
+                ["cuteafd", "serve-mimo", "--snapshot", "/model", "--native-lib", "/native.so"]
+                    .into_iter().chain(serve_flags)).unwrap().command else { panic!("serve-mimo"); };
+            assert_eq!(plan.mimo_decode_graphs == "on", expected);
+            assert_eq!(serve.engine.decode_graphs, expected);
+        }
+        assert!(cuteafd_loader::plan::layout::LayoutOptions::default().mimo_decode_graphs);
+        for flags in [vec!["--mimo-decode-graphs"], vec!["--mimo-decode-graphs", "true"],
+            vec!["--mimo-decode-graphs", "false"], vec!["--mimo-decode-graphs", "auto"]] {
+            assert!(Cli::try_parse_from(["cuteafd", "plan", "model"].into_iter().chain(flags)).is_err());
         }
     }
 
@@ -1200,43 +1459,17 @@ mod tests {
     }
 
     #[test]
-    fn spark_topology_flags_are_opt_in_all_or_none_and_range_checked() {
+    fn spark_topology_flags_are_gone_and_worker_world_is_range_checked() {
         use clap::Parser;
         let serve = ["cuteafd", "serve-native", "--snapshot", "/model", "--native-lib", "/native.so",
             "--peers", "127.0.0.1:19441"];
         let expert = ["cuteafd", "expertd-native", "--snapshot", "/model", "--native-lib", "/native.so",
             "--device-budget-bytes", "1000", "--rank", "0", "--world", "4"];
-        // Absent keys preserve the legacy launch vector exactly.
         for base in [&serve[..], &expert[..]] {
-            let cli = Cli::try_parse_from(base).unwrap();
-            match cli.command {
-                Commands::ServeNative(args) => {
-                    assert_eq!((args.spark_tp, args.spark_ep), (None, None));
-                }
-                Commands::Expertd(args) => {
-                    assert_eq!((args.spark_tp, args.spark_ep), (None, None));
-                }
-                other => panic!("unexpected command {other:?}"),
+            Cli::try_parse_from(base).unwrap();
+            for flag in ["--spark-tp", "--spark-ep"] {
+                assert!(Cli::try_parse_from(base.iter().copied().chain([flag, "2"])).is_err(), "{flag}");
             }
-        }
-        // Both keys parse for either process.
-        let cli = Cli::try_parse_from(serve.into_iter().chain(["--spark-tp", "2", "--spark-ep", "2"]))
-            .unwrap();
-        let Commands::ServeNative(args) = cli.command else { panic!("serve-native") };
-        assert_eq!((args.spark_tp, args.spark_ep), (Some(2), Some(2)));
-        let cli = Cli::try_parse_from(expert.into_iter()
-            .chain(["--spark-tp", "3", "--spark-ep", "2"])).unwrap();
-        let Commands::Expertd(args) = cli.command else { panic!("expertd-native") };
-        assert_eq!((args.spark_tp, args.spark_ep), (Some(3), Some(2)));
-        // All-or-none and value ranges are enforced at parse time.
-        for flags in [vec!["--spark-tp", "2"], vec!["--spark-ep", "2"]] {
-            assert!(Cli::try_parse_from(serve.into_iter().chain(flags.clone())).is_err());
-            assert!(Cli::try_parse_from(expert.into_iter().chain(flags)).is_err());
-        }
-        for (tp, ep) in [("1", "2"), ("9", "1"), ("2", "0"), ("2", "4")] {
-            let flags = ["--spark-tp", tp, "--spark-ep", ep];
-            assert!(Cli::try_parse_from(serve.into_iter().chain(flags)).is_err(), "{tp}x{ep}");
-            assert!(Cli::try_parse_from(expert.into_iter().chain(flags)).is_err(), "{tp}x{ep}");
         }
         // Whole-expert Qwen TP1 must reach the worker's family validation.
         let one = ["cuteafd", "expertd-native", "--snapshot", "/model", "--native-lib", "/native.so",
@@ -1247,34 +1480,22 @@ mod tests {
         for invalid in ["0", "9"] {
             assert!(Cli::try_parse_from(one.into_iter().chain([invalid])).is_err());
         }
-        // The worker world range also admits the six-rank layouts.
         let cli = Cli::try_parse_from(["cuteafd", "expertd-native", "--snapshot", "/model",
             "--native-lib", "/native.so", "--device-budget-bytes", "1000",
-            "--rank", "5", "--world", "6"]).unwrap();
+            "--rank", "7", "--world", "8"]).unwrap();
         let Commands::Expertd(args) = cli.command else { panic!("expertd-native") };
-        assert_eq!((args.rank, args.world), (5, 6));
-
-        // Pure TP6EP1 parses on both processes; TP9 is outside transport capacity.
-        let six_expert = ["cuteafd", "expertd-native", "--snapshot", "/model", "--native-lib",
-            "/native.so", "--device-budget-bytes", "1000", "--rank", "5", "--world", "6"];
-        for command in [&serve[..], &six_expert[..]] {
-            let cli = Cli::try_parse_from(command.iter().copied()
-                .chain(["--spark-tp", "6", "--spark-ep", "1"])).unwrap();
-            match cli.command {
-                Commands::ServeNative(args) => assert_eq!((args.spark_tp, args.spark_ep), (Some(6), Some(1))),
-                Commands::Expertd(args) => assert_eq!((args.spark_tp, args.spark_ep), (Some(6), Some(1))),
-                other => panic!("unexpected command {other:?}"),
-            }
-            let error = Cli::try_parse_from(command.iter().copied()
-                .chain(["--spark-tp", "9", "--spark-ep", "1"]))
-                .expect_err("TP9 exceeds transport capacity");
-            assert!(error.to_string().contains("expected 2 through 8"), "{error}");
-        }
+        assert_eq!((args.rank, args.world), (7, 8));
     }
 }
 
 #[derive(Debug, Args)]
 pub(crate) struct NativeServeArgs {
+    /// Count executed backbone expert routes by phase (disable with =false).
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set, num_args = 0..=1,
+        default_missing_value = "true", require_equals = true)]
+    pub expert_usage: bool,
+    #[arg(skip)]
+    pub expert_usage_reader: cuteafd_core::expert_usage::Reader,
     /// V4.1 has a fixed pair of decode views; 1 is unsupported.
     #[arg(long, default_value_t = 2, value_parser = clap::value_parser!(u8).range(1..=2))]
     pub decode_lanes: u8,
@@ -1334,12 +1555,8 @@ pub(crate) struct NativeServeArgs {
     pub prefill_reserve_rows: u32,
 
     /// Total prompt plus generated tokens; compressed cache is reserved at startup.
-    #[arg(long, default_value_t = cuteafd_api::openai::MAX_CONTEXT_TOKENS, value_parser = clap::value_parser!(u32).range(1..=1048576))]
+    #[arg(long, default_value = "auto", value_parser = crate::shared::context::parse_tokens::<u32>)]
     pub max_context_tokens: u32,
-
-    /// Output limit and KV decode reservation (`--max-output-tokens`, `--kv-*`).
-    #[command(flatten)]
-    pub reserve: crate::shared::kv_reserve::ReserveArgs,
 
     #[command(flatten)]
     pub loop_abort: crate::shared::loop_abort::LoopAbortArgs,
@@ -1353,10 +1570,6 @@ pub(crate) struct NativeServeArgs {
     #[arg(long, conflicts_with = "kv_pool_size")]
     pub pool_tokens: Option<u64>,
 
-    /// Total device occupancy ceiling (% or B/MB/GB/MiB/GiB); sizes KV after fixed allocations.
-    #[arg(long)]
-    pub memory_reservation: Option<crate::shared::memory::budget::Reservation>,
-
     /// Complete bottom-up RTX routed layers: auto fills available memory, or 0..40.
     #[arg(long, default_value = "auto")]
     pub rtx_expert_layers: crate::shared::memory::budget::LocalLayers,
@@ -1366,18 +1579,14 @@ pub(crate) struct NativeServeArgs {
     /// in place of whole-layer onboarding (`--rtx-expert-layers N` then pins
     /// N whole layers inside it). `off`, `auto` (pool first) or `N` experts
     /// per routed layer (the KV pool is then the output). The Sparks keep
-    /// every expert and need an owned topology (`--spark-tp`/`--spark-ep`).
+    /// every expert and use the admitted Spark placement.
     #[arg(long, default_value = "off", value_parser = |text: &str| text.parse::<cuteafd_loader::placement::ExpertTierSetting>())]
     pub gpu_expert_tier: cuteafd_loader::placement::ExpertTierSetting,
     /// Per-layer expert route counts ranking the tier (the format of `cuteafd
     /// plan --gpu-expert-tier-profile`); uniform popularity without one.
     #[arg(long, requires = "gpu_expert_tier")]
     pub gpu_expert_tier_profile: Option<PathBuf>,
-    /// Retained weight cap per coordinator GPU, GiB, as `cuteafd plan
-    /// --coordinator-weight-budget-gib` applies it: optional tier experts and
-    /// whole layers give way until each GPU's weights fit.
-    #[arg(long, alias = "coordinator-budget-gib", default_value_t = 80.0)]
-    pub coordinator_weight_budget_gib: f64,
+
 
 
     /// Maximum active requests, shared by both execution lanes.
@@ -1392,46 +1601,10 @@ pub(crate) struct NativeServeArgs {
     #[arg(long, default_value_t = 25000)]
     pub http_queue_wait_ms: u64,
 
-    /// Retained completed turns, plus a separate prompt-repeat bank of this size; zero disables reuse.
-    #[arg(long, default_value_t = u32::MAX)]
-    pub prefix_cache_entries: u32,
-
-    /// Pinned snapshot memory: auto sizes full-context KV for concurrency + 4,
-    /// capped at min(32GiB, 25% host RAM); explicit bytes override both; 0 disables it.
-    #[arg(long, default_value = "0", env = "CUTEAFD_HOST_CACHE_BYTES")]
-    pub host_cache_bytes: crate::shared::prefix::HostBudget,
-    /// KV tokens kept free after host pressure eviction (0 disables batching).
-    #[arg(long, default_value_t = cuteafd_core::prefix::DEFAULT_HOST_CACHE_EVICT_TOKENS)]
-    pub host_cache_evict_tokens: u64,
-    /// Pinned allocation and registration granularity for the snapshot cache.
-    #[arg(long, default_value_t = 256 << 20, env = "CUTEAFD_HOST_CACHE_CHUNK_BYTES")]
-    pub host_cache_chunk_bytes: u64,
-    /// When the device-to-host copy of a retained snapshot is issued.
-    #[arg(long, value_enum, default_value_t = HostCacheStore::OnRetain, env = "CUTEAFD_HOST_CACHE_STORE")]
-    pub host_cache_store: HostCacheStore,
-    /// Longest the device-evict path waits for an in-flight store before dropping it uncached.
-    /// A dropped snapshot costs its next visit a full re-prefill (minutes at long contexts), so the
-    /// budget errs long: a bounded stall of the scheduler beats losing the snapshot.
-    #[arg(long, default_value_t = 1000, env = "CUTEAFD_HOST_CACHE_COPY_BUDGET_MS")]
-    pub host_cache_copy_budget_ms: u64,
-    /// Longest a host restore waits before the request falls through to prefill.
-    #[arg(long, default_value_t = 500, env = "CUTEAFD_HOST_CACHE_RESTORE_BUDGET_MS")]
-    pub host_cache_restore_budget_ms: u64,
-    /// Pace prefill chunks against pending host-cache stores: when the oldest in-flight
-    /// store copy is older than this, each prefill chunk boundary waits on its event for at
-    /// most this long again. Zero disables the guard (no holds, no hold metrics). The
-    /// recommended fleet value is 500 ms.
-    #[arg(long, default_value_t = 0, env = "CUTEAFD_HOST_CACHE_STORE_PACE_MS")]
-    pub host_cache_store_pace_ms: u64,
-    /// Snapshots shorter than this are not cached.
-    #[arg(long, default_value_t = 512, env = "CUTEAFD_HOST_CACHE_MIN_TOKENS")]
-    pub host_cache_min_tokens: u32,
-    /// Snapshots longer than this are not cached.
-    #[arg(long, default_value_t = cuteafd_api::openai::MAX_CONTEXT_TOKENS, env = "CUTEAFD_HOST_CACHE_MAX_TOKENS")]
-    pub host_cache_max_tokens: u32,
-    /// Which retention banks the cache serves: `prompt`, `turn`, or `prompt,turn`.
-    #[arg(long, default_value = "prompt,turn", env = "CUTEAFD_HOST_CACHE_KINDS")]
-    pub host_cache_kinds: String,
+    /// Prefix cache (`--prefix-cache-*`, `--host-cache-*`, `--prefix-point-*`) and the output
+    /// limit and KV decode reservation (`--max-output-tokens`, `--kv-*`).
+    #[command(flatten)]
+    pub prefix: crate::shared::prefix::PrefixArgs,
 
     /// Immutable decode/verify attention reduction width; auto uses active draft limit + 1.
     #[arg(long, env = "CUTEAFD_ATTENTION_PLAN_ROWS")]
@@ -1439,16 +1612,8 @@ pub(crate) struct NativeServeArgs {
 
     /// Enable greedy RTX dSpark proposal generation and target verification.
     #[arg(long)] pub dspark: bool,
-    /// Draft width (tokens proposed per request). Defaults to the drafter's
-    /// trained five-token block on both layouts; 7 loads the wider block and
-    /// lets the policy choose 5 or 7 each round (measured slower under
-    /// concurrency, so not the default).
-    #[arg(long, default_value_t = 5, value_parser = clap::value_parser!(u8).range(1..=7))]
-    pub dspark_draft_limit: u8,
-    /// Verify every available draft instead of the online bandwidth-balance
-    /// length selection (the default whenever dSpark is enabled).
-    #[arg(long, requires = "dspark")]
-    pub dspark_fixed: bool,
+    #[command(flatten)]
+    pub draft_length: crate::shared::draft::length::DraftLength,
     /// Compatibility spelling: decode lanes always advance independently.
     #[arg(long, hide = true)]
     pub independent_decode_lanes: bool,
@@ -1474,25 +1639,6 @@ pub(crate) struct NativeServeArgs {
     #[arg(long, env = "CUTEAFD_NATIVE_LIB")] pub native_lib: PathBuf,
     #[arg(long,value_delimiter=',',num_args=1..)] pub peers: Vec<std::net::SocketAddr>,
     #[arg(long,default_value="127.0.0.1:8000")] pub listen: String,
-    /// Replicated-group tensor-parallel degree inside one Spark group (opt-in; all-or-none with --spark-ep).
-    #[arg(long, requires = "spark_ep", value_parser = parse_spark_tp)]
-    pub spark_tp: Option<u8>,
-    /// Number of replicated Spark expert groups, each holding all 384 experts (opt-in; all-or-none with --spark-tp).
-    #[arg(long, requires = "spark_tp", value_parser = clap::value_parser!(u8).range(1..=3))]
-    pub spark_ep: Option<u8>,
-}
-
-/// Parse transport geometry; checkpoint admission checks native package coverage.
-fn parse_spark_tp(value: &str) -> Result<u8, String> {
-    let value: u8 = value
-        .parse()
-        .map_err(|_| "expected a Spark TP degree between 2 and 8".to_string())?;
-    match value {
-        2..=8 => Ok(value),
-        _ => Err(format!(
-            "unsupported Spark TP degree {value}; expected 2 through 8"
-        )),
-    }
 }
 
 /// `cuteafd plan --decode-rows`: GLM 5.3 Flash's decode programs' 64 rows, or the wide programs' 128.
@@ -1506,54 +1652,11 @@ fn plan_decode_rows(value: &str) -> Result<u64, String> {
 
 impl NativeServeArgs {
     pub fn adaptive_dspark(&self) -> bool {
-        self.dspark && !self.dspark_fixed
+        self.dspark && self.draft_length.draft_length.is_none()
     }
-}
-
-/// When the host snapshot cache copies a retained snapshot (see `cuteafd_hostcache::config::StoreMode`).
-impl NativeServeArgs {
+    /// Retained snapshots per bank: `--prefix-cache-entries`, or the concurrency-derived default.
     pub(crate) fn resolved_prefix_entries(&self) -> u32 {
-        if self.prefix_cache_entries == u32::MAX {
-            cuteafd_core::concurrency::prefix_entries(u64::from(self.concurrency)) as u32
-        } else { self.prefix_cache_entries }
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
-pub enum HostCacheStore {
-    OnRetain,
-    OnEvict,
-}
-
-impl NativeServeArgs {
-    /// The host snapshot cache configuration these flags describe (validated by the cache).
-    pub fn host_cache_config(&self) -> anyhow::Result<cuteafd_hostcache::config::Config> {
-        use cuteafd_hostcache::config::{Config, Kinds, StoreMode};
-        let mut kinds = Kinds { prompt: false, turn: false };
-        for kind in self.host_cache_kinds.split(',').map(str::trim).filter(|k| !k.is_empty()) {
-            match kind {
-                "prompt" => kinds.prompt = true,
-                "turn" => kinds.turn = true,
-                other => anyhow::bail!("unknown host cache kind {other:?} (expected prompt or turn)"),
-            }
-        }
-        let config = Config {
-            bytes: self.host_cache_bytes.explicit_bytes(),
-            chunk_bytes: self.host_cache_chunk_bytes,
-            eviction_headroom: [0; 4],
-            store: match self.host_cache_store {
-                HostCacheStore::OnRetain => StoreMode::OnRetain,
-                HostCacheStore::OnEvict => StoreMode::OnEvict,
-            },
-            copy_budget_ns: self.host_cache_copy_budget_ms * 1_000_000,
-            restore_budget_ns: self.host_cache_restore_budget_ms * 1_000_000,
-            store_pace_ns: self.host_cache_store_pace_ms * 1_000_000,
-            min_tokens: self.host_cache_min_tokens,
-            max_tokens: self.host_cache_max_tokens,
-            kinds,
-        };
-        config.validate()?;
-        Ok(config)
+        self.prefix.mark_rule(self.concurrency as usize).entries as u32
     }
 }
 

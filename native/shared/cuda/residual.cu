@@ -1,3 +1,4 @@
+#include "memory_failure.h"
 #include "common.h"
 
 #include <cuda_fp8.h>
@@ -1608,23 +1609,23 @@ extern "C" cuteafd_status_t cuteafd_cuda_summarize_bf16(const uint16_t* input, s
 
   cuteafd_bf16_summary_t* device_out = nullptr;
   cudaError_t err =
-      cudaMalloc(reinterpret_cast<void**>(&device_out), sizeof(cuteafd_bf16_summary_t));
+      CUTEAFD_TRACK_ALLOC("cudaMalloc", reinterpret_cast<void**>(&device_out), sizeof(cuteafd_bf16_summary_t), 0, CUTEAFD_MEMORY_KIND_WORKSPACE, "native/bf16-summary", cudaMalloc(reinterpret_cast<void**>(&device_out), sizeof(cuteafd_bf16_summary_t)));
   if (err != cudaSuccess) {
     return CUTEAFD_STATUS_ALLOCATION_FAILED;
   }
   const cuteafd_status_t launch_status =
       cuteafd_cuda_summarize_bf16_async(input, count, device_out, nullptr);
   if (launch_status != CUTEAFD_STATUS_OK) {
-    cudaFree(device_out);
+    CUTEAFD_TRACK_FREE(device_out, cudaFree(device_out));
     return launch_status;
   }
   err = cudaStreamSynchronize(nullptr);
   if (err != cudaSuccess) {
-    cudaFree(device_out);
+    CUTEAFD_TRACK_FREE(device_out, cudaFree(device_out));
     return status_from_cuda(err);
   }
   err = cudaMemcpy(out, device_out, sizeof(cuteafd_bf16_summary_t), cudaMemcpyDeviceToHost);
-  const cudaError_t free_err = cudaFree(device_out);
+  const cudaError_t free_err = CUTEAFD_TRACK_FREE(device_out, cudaFree(device_out));
   if (err != cudaSuccess) {
     return status_from_cuda(err);
   }

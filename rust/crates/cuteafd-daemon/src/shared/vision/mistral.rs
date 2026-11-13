@@ -169,6 +169,7 @@ mod tests {
         assert_eq!(spec.native.reserved, RESERVED);
         assert_eq!(spec.reads.len(), tower_tensors().len() + 2);
         assert_eq!(spec.native.weight_bytes, resident_weight_bytes());
+        super::super::push::tests::assert_vision_plan(dir.path(), &spec);
         assert!(spec.reads.iter().all(|r| !r.metadata.name.starts_with("layers.")));
         let markers = Markers::from_snapshot(dir.path()).unwrap();
         assert_eq!(markers, Markers { image: 10, row_break: 12, end: 13 });

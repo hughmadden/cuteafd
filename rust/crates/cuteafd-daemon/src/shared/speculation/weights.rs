@@ -1,11 +1,42 @@
 //! Header-only drafter sources and bounded dense load records, shared by block drafters.
 use crate::shared::{experts::rtx::dense::{DenseLoad, Finish, Job, Operand, Rect, Step, STEP_BYTES},
-    fp8_linear::{Fp8Scales, Fp8Weight}, memory::DeviceAllocation};
+    fp8_linear::{Fp8Scales, Fp8Weight}, memory::{DeviceAllocation, device::{Allocation, Device}}};
 use anyhow::{ensure, Context, Result};
 use cuteafd_core::DType;
 use cuteafd_ffi::{CuteafdDeviceBuffer, NativeLibrary};
 use cuteafd_loader::{read_safetensors_metadata, SafetensorsTensorMetadata};
-use std::{collections::HashMap, ffi::c_void, path::{Path, PathBuf}};
+use std::{borrow::Cow, collections::HashMap, ffi::c_void, path::{Path, PathBuf}};
+use crate::shared::memory::Tag;
+
+pub(crate) use cuteafd_loader::families::glm5::draft_physical::{
+    ShardAxis, gqa_weight_recipe, gqa_checkpoint_arena_requests as gqa_arena_requests,
+    mla_weight_recipe, mla_checkpoint_arena_requests as mla_arena_requests, absorb_geometry,
+};
+
+fn shard(mut rect: Rect, axis: ShardAxis, rank: usize, ranks: usize) -> Result<Rect> {
+    ensure!(matches!(ranks, 1 | 2) && rank < ranks, "drafter shard rank {rank} of {ranks}");
+    let range = match axis { ShardAxis::Rows => &mut rect.rows, ShardAxis::Columns => &mut rect.cols };
+    let units = match axis { ShardAxis::Rows => 1, ShardAxis::Columns => 2 };
+    ensure!(range.len() % (ranks * units) == 0, "{}: drafter shard cuts a BF16 element", rect.name);
+    let local = range.len() / ranks;
+    let start = range.start + rank * local;
+    *range = start..start + local;
+    Ok(rect)
+}
+
+fn prefetched_rect<'b>(bytes: &'b [u8], base: usize, rect: &Rect) -> Result<Cow<'b, [u8]>> {
+    let start = base.checked_add(rect.rows.start.checked_mul(rect.row_bytes)
+        .context("drafter prefetched row overflow")?).context("drafter prefetched extent overflow")?;
+    let end = base.checked_add(rect.rows.end.checked_mul(rect.row_bytes)
+        .context("drafter prefetched row overflow")?).context("drafter prefetched extent overflow")?;
+    ensure!(!rect.rows.is_empty() && !rect.cols.is_empty() && rect.cols.end <= rect.row_bytes,
+        "{}: invalid prefetched rectangle", rect.name);
+    let rows = bytes.get(start..end).context("drafter tensor lies past prefetched source")?;
+    if rect.width() == rect.row_bytes { return Ok(Cow::Borrowed(rows)); }
+    let mut out = Vec::with_capacity(rect.bytes());
+    for row in rows.chunks_exact(rect.row_bytes) { out.extend_from_slice(&row[rect.cols.clone()]); }
+    Ok(Cow::Owned(out))
+}
 
 pub(crate) struct Source {
     path: PathBuf,
@@ -15,10 +46,18 @@ pub(crate) struct Source {
 
 impl Source {
     pub fn open(snapshot: &Path) -> Result<Self> {
-        let path = snapshot.join("model.safetensors");
+        Self::open_file(&snapshot.join("model.safetensors"))
+    }
+
+    pub fn open_file(path: &Path) -> Result<Self> {
+        let path = path.canonicalize()?;
         let tensors = read_safetensors_metadata(&path)?.into_iter().map(|t| (t.name.clone(), t)).collect();
         let file_bytes = std::fs::metadata(&path)?.len();
         Ok(Self { path, tensors, file_bytes })
+    }
+
+    fn parts(&self, parts: &[(&str, usize)], cols: usize) -> Result<Vec<Rect>> {
+        parts.iter().map(|(name, rows)| self.rect(name, &[*rows, cols])).collect()
     }
 
     pub fn rect(&self, name: &str, shape: &[usize]) -> Result<Rect> {
@@ -44,26 +83,77 @@ pub(crate) enum Weight<'a> {
     Fp8(Fp8Weight<'a>),
 }
 
-pub(crate) struct Load<'a> {
+impl Weight<'_> {
+    pub(crate) fn allocation_receipts(&self, inventory: &mut crate::shared::memory::receipts::Inventory<'_>,
+        name: &str) -> Result<()> {
+        match self {
+            Self::Bf16(owner) => owner.inventory(inventory, name),
+            Self::Fp8(owner) => owner.inventory(inventory, name),
+        }
+    }
+}
+
+pub(crate) type WeightAllocator<'a, 'b> = dyn FnMut(i32, &str, usize) -> Result<Allocation<'a>> + 'b;
+
+pub(crate) fn standalone<'a>(library: &'a NativeLibrary, device: i32, _: &str, bytes: usize) -> Result<Allocation<'a>> {
+    Allocation::new(Device { library, id: device }, bytes, Tag::drafter_weights("shared/drafter"))
+}
+
+pub(crate) fn checked_allocation<'a>(library: &'a NativeLibrary, name: &str, bytes: usize,
+    allocate: &mut WeightAllocator<'a, '_>) -> Result<DeviceAllocation<'a>> {
+    let device = library.cuda_get_device()?;
+    let owner = allocate(device, name, bytes)?;
+    ensure!(library.cuda_get_device()? == device && std::ptr::eq(owner.device.library, library)
+        && owner.device.id == device && owner.buffer.device_id == device && owner.buffer.bytes == bytes
+        && !owner.buffer.ptr.is_null(), "drafter allocation differs from {device}:{name}/{bytes}");
+    Ok(DeviceAllocation::from_allocation(owner))
+}
+
+pub(crate) struct Load<'a, 'b> {
     library: &'a NativeLibrary,
     source: Source,
     dense: DenseLoad<'a>,
     prefetched: Option<Prefetched>,
+    allocate: Option<std::cell::RefCell<&'b mut WeightAllocator<'a, 'b>>>,
 }
 
 enum Prefetched {
-    File(Vec<u8>),
+    File(std::rc::Rc<Vec<u8>>),
     Tensors(HashMap<String, Vec<u8>>),
 }
 
-impl<'a> Load<'a> {
+impl<'a, 'b> Load<'a, 'b> {
+    pub(crate) fn with_allocator(mut self, allocate: &'b mut WeightAllocator<'a, 'b>) -> Self {
+        self.allocate = Some(std::cell::RefCell::new(allocate));
+        self
+    }
+
+    pub(crate) fn allocation(&self, name: &str, bytes: usize) -> Result<DeviceAllocation<'a>> {
+        if let Some(allocate) = &self.allocate {
+            checked_allocation(self.library, name, bytes, &mut **allocate.borrow_mut())
+        } else {
+            DeviceAllocation::new(self.library, bytes, Tag::drafter_weights("shared/drafter"))
+        }
+    }
     pub fn open(library: &'a NativeLibrary, snapshot: &Path) -> Result<Self> {
-        Ok(Self { library, source: Source::open(snapshot)?, dense: DenseLoad::mount(library), prefetched: None })
+        Self::open_file(library, &snapshot.join("model.safetensors"))
+    }
+
+    pub fn open_file(library: &'a NativeLibrary, path: &Path) -> Result<Self> {
+        Ok(Self { library, source: Source::open_file(path)?, dense: DenseLoad::mount(library), prefetched: None, allocate: None })
     }
 
     /// Preserve the existing overlapped mount read when no Recorder is active.
     pub fn with_prefetched(library: &'a NativeLibrary, snapshot: &Path, bytes: Vec<u8>) -> Result<Self> {
-        let mut load = Self::open(library, snapshot)?;
+        Self::with_prefetched_file(library, &snapshot.join("model.safetensors"), bytes)
+    }
+
+    pub fn with_prefetched_file(library: &'a NativeLibrary, path: &Path, bytes: Vec<u8>) -> Result<Self> {
+        Self::with_shared_prefetched_file(library, path, std::rc::Rc::new(bytes))
+    }
+
+    pub fn with_shared_prefetched_file(library: &'a NativeLibrary, path: &Path, bytes: std::rc::Rc<Vec<u8>>) -> Result<Self> {
+        let mut load = Self { library, source: Source::open_file(path)?, dense: DenseLoad::mount(library), prefetched: None, allocate: None };
         if !crate::shared::experts::rtx::dense::is_recording() { load.prefetched = Some(Prefetched::File(bytes)); }
         Ok(load)
     }
@@ -88,26 +178,38 @@ impl<'a> Load<'a> {
         self.operand(vec![self.source.rect(name, shape)?])
     }
 
+    pub(crate) fn tensor_parts(&self, parts: &[(&str, Vec<usize>)]) -> Result<DeviceAllocation<'a>> {
+        self.operand(parts.iter().map(|(name, shape)| self.source.rect(name, shape)).collect::<Result<_>>()?)
+    }
+
+    pub fn tensor_shard(&self, name: &str, shape: &[usize], axis: ShardAxis,
+        rank: usize, ranks: usize) -> Result<DeviceAllocation<'a>> {
+        self.operand(vec![shard(self.source.rect(name, shape)?, axis, rank, ranks)?])
+    }
+
     fn operand(&self, rects: Vec<Rect>) -> Result<DeviceAllocation<'a>> {
+        let name = rects.iter().map(|r| r.name.as_str()).collect::<Vec<_>>().join("+");
         let bytes = rects.iter().try_fold(0usize, |n, r| n.checked_add(r.bytes())).context("drafter operand overflow")?;
-        let allocation = DeviceAllocation::new(self.library, bytes.max(256))?;
+        self.land_operand(rects, self.allocation(&name, bytes.max(256))?)
+    }
+
+    fn land_operand(&self, rects: Vec<Rect>, allocation: DeviceAllocation<'a>) -> Result<DeviceAllocation<'a>> {
+        let bytes = rects.iter().try_fold(0usize, |n, r| n.checked_add(r.bytes())).context("drafter operand overflow")?;
         let mut at = 0;
         let lands: Vec<_> = rects.into_iter().map(|rect| { let offset = at; at += rect.bytes(); (rect, offset) }).collect();
         if let Some(prefetched) = &self.prefetched {
             for (rect, offset) in &lands {
                 let data = match prefetched {
-                    Prefetched::File(bytes) => {
-                        let start = usize::try_from(rect.base)?;
-                        let end = start.checked_add(rect.bytes()).context("drafter prefetched extent overflow")?;
-                        bytes.get(start..end).context("drafter tensor lies past prefetched file")?
-                    }
+                    Prefetched::File(bytes) => prefetched_rect(bytes, usize::try_from(rect.base)?, rect)?,
                     Prefetched::Tensors(tensors) => {
                         let bytes = tensors.get(&rect.name).with_context(|| format!("{} was not prefetched", rect.name))?;
-                        ensure!(bytes.len() == rect.bytes(), "{}: prefetched tensor extent differs from its header", rect.name);
-                        bytes.as_slice()
+                        let tensor = self.source.tensors.get(&rect.name).context("drafter source metadata disappeared")?;
+                        ensure!(bytes.len() as u64 == tensor.byte_length,
+                            "{}: prefetched tensor extent differs from its header", rect.name);
+                        prefetched_rect(bytes, 0, rect)?
                     }
                 };
-                self.library.copy_h2d(view(allocation.buffer, *offset, data.len())?, data)?;
+                self.library.copy_h2d(view(allocation.buffer, *offset, data.len())?, &data)?;
             }
         } else {
             self.dense.operand(Operand { device: allocation.buffer.device_id, buffer: allocation.buffer, lands, bytes })?;
@@ -119,8 +221,8 @@ impl<'a> Load<'a> {
         stream: *mut c_void) -> Result<(DeviceAllocation<'a>, DeviceAllocation<'a>)> {
         let (rows, _, uk_head, uv_head) = absorb_geometry(heads, nope, value, latent)?;
         let source = self.source.rect(name, &[heads * rows, latent])?;
-        let uk = DeviceAllocation::new(self.library, heads * uk_head)?;
-        let uv = DeviceAllocation::new(self.library, heads * uv_head)?;
+        let uk = self.allocation(&format!("{name}.uk"), heads * uk_head)?;
+        let uv = self.allocation(&format!("{name}.uv"), heads * uv_head)?;
         absorb_into(&self.dense, source, heads, nope, value, latent, uk.buffer, uv.buffer, stream)?;
         Ok((uk, uv))
     }
@@ -135,12 +237,37 @@ impl<'a> Load<'a> {
 
     pub fn matrix(&self, parts: &[(&str, usize)], cols: usize, fp8: bool, scales: Fp8Scales,
         stream: *mut c_void) -> Result<Weight<'a>> {
-        if !fp8 { return self.concat(parts, cols).map(Weight::Bf16); }
-        let rects = self.parts(parts, cols)?;
-        let rows = parts.iter().try_fold(0usize, |n, (_, rows)| n.checked_add(*rows)).context("drafter matrix overflow")?;
+        self.matrix_rects(self.parts(parts, cols)?, fp8, scales, stream)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn matrix_shard(&self, parts: &[(&str, usize)], cols: usize, axis: ShardAxis,
+        rank: usize, ranks: usize, fp8: bool, scales: Fp8Scales, stream: *mut c_void) -> Result<Weight<'a>> {
+        let rects = self.parts(parts, cols)?.into_iter().map(|rect| shard(rect, axis, rank, ranks))
+            .collect::<Result<Vec<_>>>()?;
+        self.matrix_rects(rects, fp8, scales, stream)
+    }
+
+    fn matrix_rects(&self, rects: Vec<Rect>, fp8: bool, scales: Fp8Scales,
+        stream: *mut c_void) -> Result<Weight<'a>> {
+        if !fp8 { return self.operand(rects).map(Weight::Bf16); }
+        let cols = rects.first().context("drafter matrix has no source parts")?.width() / 2;
+        ensure!(cols > 0 && rects.iter().all(|rect| rect.width() == cols * 2), "drafter matrix source widths differ");
+        let rows = rects.iter().try_fold(0usize, |n, rect| n.checked_add(rect.rows.len())).context("drafter matrix overflow")?;
+        let name = rects.iter().map(|rect| rect.name.as_str()).collect::<Vec<_>>().join("+");
+        let mut plane = |name: &str, bytes| -> Result<Allocation<'a>> {
+            if let Some(allocator) = &self.allocate {
+                let device = self.library.cuda_get_device()?;
+                (**allocator.borrow_mut())(device, name, bytes)
+            } else {
+                standalone(self.library, self.library.cuda_get_device()?, name, bytes)
+            }
+        };
         if self.prefetched.is_some() {
-            let source = self.operand(rects)?;
-            let packed = Fp8Weight::pack(self.library, source.buffer.ptr, rows, cols, scales, stream);
+            let bytes = rows.checked_mul(cols).and_then(|n| n.checked_mul(2)).context("drafter source extent overflow")?;
+            // Conversion sources retire after packing and never belong to the immutable arena.
+            let source = self.land_operand(rects, DeviceAllocation::new(self.library, bytes.max(256), Tag::staging("shared/drafter-source"))?)?;
+            let packed = Fp8Weight::pack_with(self.library, source.buffer.ptr, rows, cols, scales, stream, &name, &mut plane);
             // SAFETY: source and pack destinations remain owned until this load stream drains.
             if let Err(error) = unsafe { self.library.cuda_stream_synchronize(stream) } {
                 self.library.quarantine_module_after_failed_drain();
@@ -150,7 +277,7 @@ impl<'a> Load<'a> {
             }
             return packed.map(Weight::Fp8);
         }
-        let packed = Fp8Weight::allocate(self.library, rows, cols)?;
+        let packed = Fp8Weight::allocate_with(self.library, rows, cols, &name, &mut plane)?;
         let (values, scale) = packed.buffers();
         for step in pack_steps(rects, cols, scales, values, scale)? { self.dense.step(step, stream)?; }
         Ok(Weight::Fp8(packed))
@@ -211,18 +338,6 @@ pub(crate) fn absorb_into(dense: &DenseLoad<'_>, source: Rect, heads: usize, nop
     Ok(())
 }
 
-fn absorb_geometry(heads: usize, nope: usize, value: usize, latent: usize) -> Result<(usize, usize, usize, usize)> {
-    ensure!(heads > 0 && nope > 0 && value > 0 && latent > 0, "empty draft absorption geometry");
-    let rows = nope.checked_add(value).context("draft absorption head rows overflow")?;
-    let width = latent.checked_mul(2).context("draft absorption row bytes overflow")?;
-    let head = |rows: usize| rows.checked_mul(width).context("draft absorption head bytes overflow");
-    let (source, uk, uv) = (head(rows)?, head(nope)?, head(value)?);
-    for bytes in [rows, source, uk, uv] {
-        heads.checked_mul(bytes).context("draft absorption total extent overflow")?;
-    }
-    ensure!(source <= STEP_BYTES, "draft absorption head exceeds staging bound");
-    Ok((rows, source, uk, uv))
-}
 
 fn view(buffer: CuteafdDeviceBuffer, at: usize, bytes: usize) -> Result<CuteafdDeviceBuffer> {
     ensure!(at.checked_add(bytes).is_some_and(|end| end <= buffer.bytes), "drafter pack destination out of bounds");
@@ -264,6 +379,28 @@ mod tests {
     use cuteafd_loader::plan::testing::{t, write_safetensors};
     use std::os::unix::fs::FileExt;
 
+    #[test]
+    fn draft_shards_select_exact_rows_and_strided_bf16_columns() -> Result<()> {
+        let rect = Rect { name: "weight".into(), path: PathBuf::new(), base: 7,
+            row_bytes: 8, rows: 0..4, cols: 0..8 };
+        let data: Vec<u8> = (0..32).collect();
+        let mut file = vec![255; 7];
+        file.extend_from_slice(&data);
+        for rank in 0..2 {
+            let rows = shard(rect.clone(), ShardAxis::Rows, rank, 2)?;
+            assert_eq!(prefetched_rect(&file, 7, &rows)?.as_ref(), &data[rank * 16..(rank + 1) * 16]);
+            let columns = shard(rect.clone(), ShardAxis::Columns, rank, 2)?;
+            let expected: Vec<u8> = data.chunks_exact(8).flat_map(|row| row[rank * 4..(rank + 1) * 4].iter().copied()).collect();
+            assert_eq!(prefetched_rect(&file, 7, &columns)?.as_ref(), expected);
+            assert_eq!(prefetched_rect(&data, 0, &columns)?.as_ref(), expected);
+        }
+        assert!(shard(rect.clone(), ShardAxis::Rows, 2, 2).is_err());
+        assert!(shard(rect.clone(), ShardAxis::Rows, 0, 0).is_err());
+        assert!(shard(Rect { cols: 0..6, ..rect.clone() }, ShardAxis::Columns, 0, 2).is_err());
+        assert!(prefetched_rect(&data[..31], 0, &rect).is_err());
+        Ok(())
+    }
+
     fn config() -> super::super::dflash::DflashConfig {
         super::super::dflash::DflashConfig { hidden: 128, intermediate: 128, layers: 2,
             heads: 1, kv_heads: 1, head_dim: 128, eps: 1e-6, theta: 10000., block: 8,
@@ -282,6 +419,141 @@ mod tests {
                 |hash, byte| (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3)).to_le_bytes();
             let bytes = (0..tensor.byte_length).map(|i| (i as u8).wrapping_mul(29) ^ seed[i as usize % seed.len()]).collect::<Vec<_>>();
             file.write_all_at(&bytes, tensor.byte_offset)?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn gqa_final_arena_planes_match_standalone_mount_and_record_bytes() -> Result<()> {
+        use crate::shared::memory::{weight_arena::{DeviceWeightArena, weight_allocation}, receipts::Inventory};
+        use cuteafd_loader::{serving_capacity::WeightArenaLayout,
+            families::glm5::draft_representation::GlmDraftRepresentation,
+            placement::planner::{CoordinatorDevices, Lifetime, Phase}};
+        use cuteafd_core::memory_layout::Category;
+        let fixture = cuteafd_ffi::native_library_lifetime_fixture::Fixture::build_for_tests()?;
+        let library = fixture.load()?;
+        fixture.immediate_copies(&library)?;
+        fixture.configure_memory(&library, 1, 1 << 30)?;
+        let device = Device { library: &library, id: 1 };
+        let root = tempfile::tempdir_in(fixture.directory())?;
+        let snapshot = root.path().join("draft");
+        std::fs::create_dir_all(&snapshot)?;
+        let cfg = super::super::dflash::DflashConfig { hidden: 256, intermediate: 256,
+            heads: 2, kv_heads: 2, ..config() };
+        std::fs::write(snapshot.join("config.json"), serde_json::to_vec(&serde_json::json!({
+            "hidden_size":cfg.hidden, "intermediate_size":cfg.intermediate,
+            "num_hidden_layers":cfg.layers, "num_attention_heads":cfg.heads,
+            "num_key_value_heads":cfg.kv_heads, "head_dim":cfg.head_dim,
+            "rms_norm_eps":cfg.eps, "rope_theta":cfg.theta, "sliding_window":cfg.window,
+            "vocab_size":cfg.vocab, "dflash_config":{"block_size":cfg.block,
+                "conv_group_size":cfg.group, "conv_kernel_size":2, "mask_token_id":0,
+                "selector_rank":cfg.rank, "selector_top_k":16, "target_layer_ids":cfg.taps}
+        }))?)?;
+        let path = snapshot.join("model.safetensors");
+        write_safetensors(&path, &cfg.tensor_shapes().iter().map(|(name, shape)| t(name, "BF16", shape)).collect::<Vec<_>>());
+        let file = std::fs::OpenOptions::new().write(true).open(&path)?;
+        for tensor in read_safetensors_metadata(&path)? {
+            let bytes = (0..tensor.byte_length / 2).flat_map(|i| {
+                let value = (i % 127) as f32 * 0.015625 - 0.75;
+                ((value.to_bits() >> 16) as u16).to_le_bytes()
+            }).collect::<Vec<_>>();
+            file.write_all_at(&bytes, tensor.byte_offset)?;
+        }
+        for representation in [GlmDraftRepresentation::Bf16Only, GlmDraftRepresentation::Fp8Only] {
+            for ranks in [1, 2] { for rank in 0..ranks {
+                let expected = cuteafd_loader::families::glm5::draft_physical::gqa_checkpoint_arena_requests(
+                    &snapshot, representation, rank, ranks)?;
+                assert_eq!(expected, cuteafd_loader::families::glm5::draft_physical::gqa_arena_requests(
+                    &cfg, representation, rank, ranks)?);
+                #[allow(clippy::too_many_arguments)]
+                fn run<'a>(device: Device<'a>, snapshot: &Path, cfg: &super::super::dflash::DflashConfig,
+                    rank: usize, ranks: usize, representation: GlmDraftRepresentation,
+                    expected: &[(String, usize)], arena: Option<&DeviceWeightArena<'a>>)
+                    -> Result<std::collections::BTreeMap<String, Weight<'a>>> {
+                    let library = device.library;
+                    let path = snapshot.join("model.safetensors");
+                    device.run(|| {
+                    let requested = std::cell::RefCell::new(Vec::new());
+                    let mut end = 0usize;
+                    let mut base = None;
+                    let mut allocate = |id, name: &str, bytes| {
+                        assert_eq!(id, device.id);
+                        requested.borrow_mut().push((name.to_owned(), bytes));
+                        let owner = weight_allocation(device, arena, name, bytes, crate::shared::memory::TEST_ARENA)?;
+                        if let Some(arena) = arena {
+                            let offset = end.div_ceil(256) * 256;
+                            let root = *base.get_or_insert(owner.buffer.ptr as usize);
+                            assert_eq!(owner.buffer.ptr as usize - root, offset);
+                            let view = arena.layout().view(name).expect("GQA planned view");
+                            assert_eq!((view.offset(), view.bytes()), (offset, bytes));
+                            end = offset + bytes;
+                        }
+                        Ok(owner)
+                    };
+                    let bytes = if dense::is_recording() { Vec::new() } else { std::fs::read(&path)? };
+                    let load = Load::with_prefetched(&library, &snapshot, bytes)?.with_allocator(&mut allocate);
+                    let owners = std::cell::RefCell::new(std::collections::BTreeMap::new());
+                    gqa_weight_recipe(&cfg, rank, ranks,
+                        |name, shape| { owners.borrow_mut().insert(name.to_owned(), Weight::Bf16(load.tensor(name, shape)?)); Ok(()) },
+                        |parts, cols, axis| {
+                            let value = match axis {
+                                Some(axis) => load.matrix_shard(parts, cols, axis, rank, ranks,
+                                    representation == GlmDraftRepresentation::Fp8Only, Fp8Scales::Best, std::ptr::null_mut())?,
+                                None => load.matrix(parts, cols,
+                                    representation == GlmDraftRepresentation::Fp8Only, Fp8Scales::Best, std::ptr::null_mut())?,
+                            };
+                            owners.borrow_mut().insert(parts.iter().map(|(name, _)| *name).collect::<Vec<_>>().join("+"), value);
+                            Ok(())
+                        })?;
+                    drop(load);
+                    drop(allocate);
+                    assert_eq!(requested.into_inner(), expected);
+                    if let Some(arena) = arena {
+                        assert_eq!(end, arena.layout().bytes());
+                        assert_eq!(expected.len(), arena.layout().views().len());
+                    }
+                    Ok(owners.into_inner())
+                    })
+                }
+                let baseline = run(device, &snapshot, &cfg, rank, ranks, representation, &expected, None)?;
+                let digest = |owners: &std::collections::BTreeMap<String, Weight<'_>>| device.run(|| {
+                    let mut bytes = std::collections::BTreeMap::new();
+                    for (name, owner) in owners {
+                        let buffers = match owner {
+                            Weight::Bf16(owner) => vec![(name.clone(), owner.buffer)],
+                            Weight::Fp8(owner) => { let (payload, scales) = owner.buffers();
+                                vec![(format!("{name}.payload"), payload), (format!("{name}.scales"), scales)] },
+                        };
+                        for (name, buffer) in buffers {
+                            let mut data = vec![0; buffer.bytes];
+                            library.copy_d2h(&mut data, buffer)?;
+                            assert!(data.iter().any(|&value| value != 0), "unfilled {name}");
+                            bytes.insert(name, data);
+                        }
+                    }
+                    Ok(bytes)
+                });
+                let baseline_bytes = digest(&baseline)?;
+                for recorded in [false, true] {
+                    let arena = DeviceWeightArena::new(device, WeightArenaLayout::new("test/draft", expected.clone())?, crate::shared::memory::TEST_ARENA)?;
+                    let owners = if recorded {
+                        let (owners, records) = dense::recording(|| run(device, &snapshot, &cfg, rank, ranks, representation, &expected, Some(&arena)))?;
+                        assert!(!records.operands.is_empty());
+                        // The nested DSO fixture path exceeds Unix socket path limits.
+                        let sockets = tempfile::tempdir()?;
+                        crate::shared::experts::rtx::push::tests::receive_pushed(device, None, root.path(), sockets.path(),
+                            &records, None, 6, 1)?;
+                        owners
+                    } else { run(device, &snapshot, &cfg, rank, ranks, representation, &expected, Some(&arena))? };
+                    drop(arena);
+                    assert_eq!(digest(&owners)?, baseline_bytes, "{representation:?} TP{ranks} rank{rank} record={recorded}");
+                    let mut inventory = Inventory::new(CoordinatorDevices::new(&[1])?, "draft",
+                        Lifetime { first: Phase::DraftLoad, last: Phase::Growth }, Category::Drafter, "draft owners");
+                    for (name, owner) in &owners { owner.allocation_receipts(&mut inventory, name)?; }
+                    assert_eq!(inventory.receipts.iter().filter(|receipt| receipt.allocation.view.is_none()).count(), 1);
+                    assert_eq!(inventory.receipts.iter().filter(|receipt| receipt.allocation.view.is_some()).count(), expected.len());
+                }
+            }}
         }
         Ok(())
     }
@@ -316,6 +588,52 @@ mod tests {
     }
 
     #[test]
+    fn kimi_mla_drafter_joins_target_namespace_at_one_and_two_coordinator_ranks() -> Result<()> {
+        use cuteafd_loader::formats::{dflash::MlaDflashConfig, mla::MlaGeometry,
+            block_dspark::DsparkRotaryPlan};
+        let cfg = MlaDflashConfig { mla: MlaGeometry { hidden: 128, heads: 2,
+            q_rank: 128, kv_rank: 128, nope: 64, rope: 64, value: 64 },
+            intermediate: 128, eps: 1e-5, block: 8, group: 16, selector_rank: 256,
+            selector_top_k: 16, taps: vec![0, 1], vocab: 32, mask_token: 0,
+            max_context: 8192, windows: vec![Some(4096), Some(4096), Some(4096), Some(4096), None],
+            rotary: DsparkRotaryPlan { inv_freq: vec![1.; 32], attention_factor: 1., softmax_factor: 1. },
+            kind: cuteafd_core::coordinator_programs::MlaDraftKind::Dflash2, markov_rank: 0 };
+        let root = tempfile::tempdir()?;
+        let target = root.path().join("hf-home/hub/models--target/snapshots/a");
+        let draft = root.path().join("hf-home/hub/models--lightseekorg--kimi-k3-dflash2/snapshots/b");
+        write_drafter(&target)?;
+        std::fs::create_dir_all(&draft)?;
+        let shapes = cfg.tensor_shapes();
+        let tensors = shapes.iter().map(|(name, shape)| t(name, "BF16", shape)).collect::<Vec<_>>();
+        write_safetensors(&draft.join("model.safetensors"), &tensors);
+        let source = Source::open(&draft)?;
+        source.rect("fc.weight", &[128, 256])?;
+        let expected = shapes.iter().map(|(_, shape)| shape.iter().product::<usize>() * 2).sum::<usize>();
+        for ranks in [1, 2] {
+            let device = ranks as i32 - 1;
+            let mut operands = shapes.iter().map(|(name, shape)| -> Result<_> {
+                let rect = source.rect(name, shape)?;
+                Ok(Operand { device, bytes: rect.bytes(), lands: vec![(rect.clone(), 0)],
+                    buffer: CuteafdDeviceBuffer { bytes: rect.bytes(), device_id: device, ..Default::default() } })
+            }).collect::<Result<Vec<_>>>()?;
+            let target_source = Source::open(&target)?;
+            let rect = target_source.rect("norm.weight", &[128])?;
+            let target_bytes = rect.bytes();
+            operands.push(Operand { device, bytes: target_bytes, lands: vec![(rect, 0)],
+                buffer: CuteafdDeviceBuffer { bytes: target_bytes, device_id: device, ..Default::default() } });
+            let layout = RankLayout::new(operands, Vec::new(), device)?;
+            let plan = layout.checked(root.path(), 6 + ranks, 6 + ranks - 1)?;
+            assert_eq!(plan.plan.files.len(), 2);
+            assert!(plan.plan.files.iter().any(|file| file.contains("models--lightseekorg--kimi-k3-dflash2/")));
+            assert!(plan.plan.files.iter().any(|file| file.contains("models--target/")));
+            assert!(plan.plan.entries.iter().all(|entry| entry.rank as usize == 6 + ranks - 1));
+            assert_eq!(plan.totals.rank_bytes[6 + ranks - 1], (expected + target_bytes) as u64);
+            assert!(layout.checked(&target, 6 + ranks, 6 + ranks - 1).is_err());
+        }
+        Ok(())
+    }
+
+    #[test]
     fn fp8_concat_steps_cover_disjoint_tiles_without_bf16_residency() -> Result<()> {
         let cols = 128;
         let per = STEP_BYTES / (cols * 2);
@@ -339,6 +657,40 @@ mod tests {
             packed_bytes += n * k;
         }
         assert_eq!(packed_bytes, 2 * rows * cols);
+        Ok(())
+    }
+
+    #[test]
+    fn fp8_sharded_steps_preserve_source_windows_and_local_destinations() -> Result<()> {
+        let cols = 128;
+        let rows = STEP_BYTES / (cols * 2) + 32;
+        let source = Rect { name: "down".into(), path: "draft".into(), base: 31,
+            row_bytes: cols * 4, rows: 16..16 + rows * 2, cols: 0..cols * 4 };
+        let selected = shard(shard(source.clone(), ShardAxis::Rows, 1, 2)?, ShardAxis::Columns, 1, 2)?;
+        let mut values = vec![0u8; rows * cols];
+        let mut scales = vec![0u8; rows * cols / 128 * 4];
+        let buffer = |data: &mut [u8]| CuteafdDeviceBuffer { ptr: data.as_mut_ptr().cast(),
+            bytes: data.len(), device_id: 3, ..Default::default() };
+        let steps = pack_steps(vec![selected.clone()], cols, Fp8Scales::Amax,
+            buffer(&mut values), buffer(&mut scales))?;
+        assert_eq!(steps.len(), 2);
+        let mut completed = 0;
+        for step in steps {
+            assert_eq!(step.device, 3);
+            assert!(step.bytes() <= STEP_BYTES);
+            assert_eq!(step.rects.len(), 1);
+            let rect = &step.rects[0];
+            let Job::W8a16Pack { n, k, packed, scale, .. } = step.jobs[0] else { panic!("pack job") };
+            assert_eq!((rect.base, rect.row_bytes, rect.cols.clone()),
+                (source.base, source.row_bytes, cols * 2..cols * 4));
+            assert_eq!(rect.rows, selected.rows.start + completed..selected.rows.start + completed + n);
+            assert_eq!((n % 16, k), (0, cols));
+            assert_eq!(packed.ptr as usize - values.as_ptr() as usize, completed * cols);
+            assert_eq!(scale.ptr as usize - scales.as_ptr() as usize, completed * cols / 128 * 4);
+            assert_eq!((packed.bytes, scale.bytes), (n * cols, n * cols / 128 * 4));
+            completed += n;
+        }
+        assert_eq!(completed, rows);
         Ok(())
     }
 
@@ -384,15 +736,15 @@ mod tests {
         let device = Device { library: &library, id: 1 };
         let load = || device.run(|| {
             let dense = DenseLoad::mount(&library);
-            let uk = DeviceAllocation::new(&library, heads * uk_head)?;
-            let uv = DeviceAllocation::new(&library, heads * uv_head)?;
+            let uk = DeviceAllocation::new(&library, heads * uk_head, crate::shared::memory::TEST)?;
+            let uv = DeviceAllocation::new(&library, heads * uv_head, crate::shared::memory::TEST)?;
             absorb_into(&dense, Rect { name: "kv_b".into(), path: path.clone(), base: 0,
                 row_bytes: latent * 2, rows: 0..heads * rows, cols: 0..latent * 2 },
                 heads, nope, value, latent, uk.buffer, uv.buffer, std::ptr::null_mut())?;
             let mut owners = vec![uk, uv];
             for rect in &norms {
-                let values = DeviceAllocation::new(&library, rect.bytes())?;
-                let output = DeviceAllocation::new(&library, 3 * 4)?;
+                let values = DeviceAllocation::new(&library, rect.bytes(), crate::shared::memory::TEST)?;
+                let output = DeviceAllocation::new(&library, 3 * 4, crate::shared::memory::TEST)?;
                 // Poison output to prove recording does not run a Finish early.
                 library.copy_h2d(output.buffer, &[0xff; 12])?;
                 dense.operand(Operand { device: 1, bytes: rect.bytes(), buffer: values.buffer,
@@ -483,7 +835,7 @@ mod tests {
             let dense = DenseLoad::mount(&library);
             let mut owners = std::collections::BTreeMap::new();
             for weight in layout.weight_destinations() {
-                let owner = DeviceAllocation::new(&library, (weight.shape.iter().product::<usize>() * 2).max(256))?;
+                let owner = DeviceAllocation::new(&library, (weight.shape.iter().product::<usize>() * 2).max(256), crate::shared::memory::TEST)?;
                 if weight.packing == cuteafd_loader::formats::dflash::MlaDraftPacking::UnitScale {
                     library.copy_h2d(owner.buffer, &weight.pack(&mut |_, _| unreachable!())?)?;
                 }
@@ -492,11 +844,11 @@ mod tests {
             mla_weights_into(&dense, layout.weight_destinations(), &cfg.mla,
                 |name| Ok(owners.get(name).context("fixture destination")?.buffer),
                 &|name, shape| source.rect(name, shape), std::ptr::null_mut())?;
-            let norms = DeviceAllocation::new(&library, cfg.vocab * 4)?;
+            let norms = DeviceAllocation::new(&library, cfg.vocab * 4, crate::shared::memory::TEST)?;
             dense.finish(Finish::RowNorms { source: owners["weight.autoregressive_head.output.weight"].buffer,
                 norms: norms.buffer, rows: cfg.vocab, cols: cfg.markov_rank }, std::ptr::null_mut())?;
             owners.insert("markov_norms".into(), norms);
-            let target = DeviceAllocation::new(&library, 256)?;
+            let target = DeviceAllocation::new(&library, 256, crate::shared::memory::TEST)?;
             dense.operand(Operand { device: 1, buffer: target.buffer, bytes: 256,
                 lands: vec![(source.rect("model.norm.weight", &[128])?, 0)] })?;
             owners.insert("target.norm".into(), target);

@@ -18,6 +18,8 @@ typedef enum cuteafd_status_t {
   CUTEAFD_STATUS_INTERNAL_ERROR = 6,
   CUTEAFD_STATUS_RDMA_UNAVAILABLE = 7,
   CUTEAFD_STATUS_NCCL_UNAVAILABLE = 8,
+  CUTEAFD_STATUS_CAPTURE_REQUIRES_PREPARE = 9,
+  CUTEAFD_STATUS_GRAPH_TOO_SMALL = 10,
 } cuteafd_status_t;
 
 typedef enum cuteafd_xgrammar_kind_t {
@@ -63,6 +65,8 @@ typedef enum cuteafd_host_buffer_flags_t {
   CUTEAFD_HOST_BUFFER_FLAG_HOST_FALLBACK = 2,
   CUTEAFD_HOST_BUFFER_FLAG_MAPPED = 4,
 } cuteafd_host_buffer_flags_t;
+
+#include "cuteafd_memory_kind.h"
 
 typedef struct cuteafd_cuda_device_info_t {
   int device_id;
@@ -299,17 +303,17 @@ cuteafd_status_t cuteafd_copy_peer_async(cuteafd_device_buffer_t dst,
 cuteafd_status_t cuteafd_copy_device_rows_async(cuteafd_device_buffer_t dst,
     cuteafd_device_buffer_t src, size_t width, size_t rows,
     size_t dst_pitch, size_t src_pitch, void* cuda_stream);
-cuteafd_status_t cuteafd_alloc_host_buffer(size_t bytes, cuteafd_host_buffer_t* out);
+cuteafd_status_t cuteafd_alloc_host_buffer(size_t bytes, cuteafd_host_buffer_t* out, uint32_t kind, const char* owner);
 // Caller-owned shared mappings: unregister never frees the mapping.
-cuteafd_status_t cuteafd_register_host_mapping(void* ptr, size_t bytes);
+cuteafd_status_t cuteafd_register_host_mapping(void* ptr, size_t bytes, uint32_t kind, const char* owner);
 cuteafd_status_t cuteafd_unregister_host_mapping(void* ptr);
 cuteafd_status_t cuteafd_cuda_host_buffer_device_alias(cuteafd_host_buffer_t host,
                                                     cuteafd_device_buffer_t* out);
 cuteafd_status_t cuteafd_free_host_buffer(cuteafd_host_buffer_t* buf);
 // Recommended allocation granularity for a whole device dma-buf SEND allocation.
 cuteafd_status_t cuteafd_cuda_dmabuf_allocation_granularity(size_t* out);
-cuteafd_status_t cuteafd_alloc_device_buffer(size_t bytes, cuteafd_device_buffer_t* out);
-cuteafd_status_t cuteafd_alloc_managed_device_buffer(size_t bytes, cuteafd_device_buffer_t* out);
+cuteafd_status_t cuteafd_alloc_device_buffer(size_t bytes, cuteafd_device_buffer_t* out, uint32_t kind, const char* owner);
+cuteafd_status_t cuteafd_alloc_managed_device_buffer(size_t bytes, cuteafd_device_buffer_t* out, uint32_t kind, const char* owner);
 cuteafd_status_t cuteafd_free_device_buffer(cuteafd_device_buffer_t* buf);
 cuteafd_status_t cuteafd_cuda_stream_create(void** out_cuda_stream);
 cuteafd_status_t cuteafd_cuda_stream_destroy(void* cuda_stream);
@@ -350,8 +354,19 @@ cuteafd_status_t cuteafd_cuda_event_elapsed_ms(void* start_event, void* end_even
 cuteafd_status_t cuteafd_cuda_graph_census_begin(void* cuda_stream, const char* bank,
     uint64_t rows, int32_t replay, int32_t arm, void** token);
 cuteafd_status_t cuteafd_cuda_graph_census_end(void* token);
+// Prepare before Ready/capture, on the execution thread/device. Each stream
+// retains its own 4 MiB workspace; the no-argument form prepares stream zero.
+cuteafd_status_t cuteafd_cuda_prepare_cublas_stream(void* cuda_stream);
+cuteafd_status_t cuteafd_cuda_prepare_cublas_handle();
 cuteafd_status_t cuteafd_cuda_graph_begin_capture(void* cuda_stream);
 cuteafd_status_t cuteafd_cuda_graph_end_capture(void* cuda_stream, void** out_cuda_graph_exec);
+// Test oracles only: permit tiny graphs for eager/replay exactness checks.
+cuteafd_status_t cuteafd_cuda_graph_end_capture_for_test(void* cuda_stream, void** out_cuda_graph_exec);
+// Topology is queried before destroying the source graph, without synchronizing.
+// Inspection failure retains the executable: width=0 (unknown), diagnostic in
+// cuteafd_last_error. Only capture/instantiation/lifetime errors fail the call.
+cuteafd_status_t cuteafd_cuda_graph_end_capture_topology(void* cuda_stream,
+    void** out_cuda_graph_exec, size_t* out_nodes, size_t* out_width, int* out_spans_devices);
 cuteafd_status_t cuteafd_cuda_graph_end_capture_retained(
     void* cuda_stream, cuteafd_cuda_graph_capture_info_t* out);
 cuteafd_status_t cuteafd_cuda_graph_launch(void* cuda_graph_exec, void* cuda_stream);
@@ -1062,16 +1077,6 @@ cuteafd_status_t cuteafd_cuda_ds4_flash_router_refine_topk_bf16_async(
     const float *correction_bias, float *approximate_logits,
     uint32_t *topk_indices, float *topk_scores, float *topk_weights, size_t rows,
     void *cuda_stream);
-cuteafd_status_t cuteafd_cuda_ds4_pro_router_topk_bf16(
-    const uint16_t *hidden, const uint16_t *router_weight,
-    const float *correction_bias, const int64_t *token_to_experts,
-    const int64_t *token_ids, uint32_t *topk_indices, float *topk_scores,
-    float *topk_weights, size_t rows, int hash_routing);
-cuteafd_status_t cuteafd_cuda_ds4_pro_router_topk_bf16_async(
-    const uint16_t *hidden, const uint16_t *router_weight,
-    const float *correction_bias, const int64_t *token_to_experts,
-    const int64_t *token_ids, uint32_t *topk_indices, float *topk_scores,
-    float *topk_weights, size_t rows, int hash_routing, void *cuda_stream);
 cuteafd_status_t cuteafd_cuda_router_topk_bf16_cub(
     const uint16_t* hidden, const uint16_t* router_weight, const float* correction_bias,
     float* corrected_scores, float* sorted_corrected_scores, uint32_t* unsorted_indices,

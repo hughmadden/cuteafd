@@ -9,8 +9,8 @@ use cuteafd_engine::{media::{EncodeJob, EmbeddingCache, MediaAdmission, MediaKey
     prefix::{PrefixCache, PrefixConfig, PrefixFamily}};
 use cuteafd_ffi::NativeLibrary;
 use std::{cell::RefCell, path::Path, rc::Rc};
-use crate::shared::{fp8_linear::{Fp8Rows, Fp8Scales}, speculation::{
-    block_dspark::{self, DsparkDrafter}, dflash::{ContextRow, DraftSeq, TargetHead, TAP_ROWS}}};
+use crate::shared::speculation::{
+    block_dspark::{self, DsparkDrafter}, dflash::{ContextRow, DraftSeq, TargetHead, TAP_ROWS}};
 use cuteafd_ffi::CuteafdDeviceBuffer;
 
 fn draft_geometry(layers: usize, slots: usize, rows: usize, width: usize) -> cuteafd_core::PolicyGeometry {
@@ -50,7 +50,6 @@ pub(crate) struct DenseBackend<'e, 'a> {
     pub library: &'a NativeLibrary,
     drafter: Option<Rc<DsparkDrafter<'a>>>,
     mtp: Option<Rc<super::engine::mtp::MtpCache<'a>>>,
-    selector: RefCell<Option<crate::shared::token_io::TokenSelector<'a>>>,
     profile: RefCell<[f64; 2]>,
     pending: RefCell<Option<DenseMark<'a>>>,
     probe: RefCell<DenseProbe>,
@@ -58,8 +57,98 @@ pub(crate) struct DenseBackend<'e, 'a> {
 }
 
 impl<'e, 'a> DenseBackend<'e, 'a> {
+    fn prefill_with(&self, placement: &mut Placement, tokens: &[u32], logit_rows: usize,
+        scoring: Option<crate::shared::probe::ScoringRows<'_>>) -> Result<Option<crate::shared::probe::ScoreLogits>> {
+        ensure!(!tokens.is_empty() && logit_rows <= tokens.len(), "dense prefill scoring extent");
+        ensure!(self.pending.borrow().is_none(), "dense prefill during pending verify");
+        let mut engine = self.engine.borrow_mut();
+        ensure!(engine.slot_position(placement.slot)? == placement.len, "dense prefill placement/state frontier differs");
+        engine.bind_slot(placement.slot, &placement.units)?;
+        let mut output = None;
+        // Each tap tile is consumed before the target reuses its residual plane.
+        let tile = if self.drafter.is_some() { TAP_ROWS } else { tokens.len() };
+        for (index, chunk) in tokens.chunks(tile).enumerate() {
+            let first = index * tile;
+            let end = first + chunk.len();
+            let head_first = tokens.len() - logit_rows;
+            ensure!(scoring.is_some() || logit_rows <= chunk.len() || head_first >= end,
+                "dense tapped prefill requires bounded scoring rows");
+            let last_layer = engine.cfg.attention.len() - 1;
+            output = Some(engine.prefill_tapped(placement.slot, chunk,
+                if scoring.is_none() && end == tokens.len() { logit_rows } else { 0 }, |layer, hidden| {
+                    if let Some(draft) = &self.drafter {
+                        draft.tap_streams_at(layer, hidden.ptr, 1, 0, chunk.len(), 0)?;
+                    }
+                    if layer == last_layer {
+                        if let Some(mtp) = &self.mtp { mtp.capture_hidden(hidden, chunk.len())?; }
+                    }
+                    Ok(())
+                })?);
+            if let Some(scoring) = scoring {
+                let first_scored = first.max(head_first);
+                if first_scored < end {
+                    engine.record_prefill_head(chunk.len(), end - first_scored,
+                        crate::shared::probe::ScoringRows { position: scoring.position + first_scored - head_first,
+                            ..scoring })?;
+                }
+            }
+            if let Some(mtp) = &self.mtp {
+                mtp.update_captured(&mut engine, placement.slot, placement.len + first, chunk)?;
+            }
+            if let Some(draft) = &self.drafter {
+                let rows = (0..chunk.len()).map(|tap_row| ContextRow { tap_row, slot: placement.slot,
+                    position: placement.len + first + tap_row }).collect::<Vec<_>>();
+                draft.update(&rows)?;
+            }
+        }
+        let output = output.context("empty dense prefill")?;
+        placement.len += tokens.len();
+        placement.state_len = placement.len;
+        Ok((logit_rows > 0).then_some(if scoring.is_some() { crate::shared::probe::ScoreLogits::Recorded }
+            else { crate::shared::probe::ScoreLogits::Device(output) }))
+    }
+
+    /// Retained weight owners for the opt-in startup census: the target arena
+    /// (with its embedding and head) and the separately admitted drafter arena.
+    fn weight_census(&self, device: i32) -> Result<crate::shared::memory::receipts::Census> {
+        let physical = [device];
+        let devices = cuteafd_loader::placement::planner::CoordinatorDevices::new(&physical)?;
+        let mut census = crate::shared::memory::receipts::Census::default();
+        census.owners(self.engine.borrow().weight_receipts(devices)?);
+        if let Some(drafter) = &self.drafter { census.owners(super::dspark::weight_receipts(drafter, devices)?); }
+        if let Some(mtp) = &self.mtp { census.owners(mtp.weight_receipts(devices)?); }
+        census.normalize(cuteafd_loader::placement::planner::PhaseOrder::TARGET_THEN_DRAFT)?;
+        Ok(census)
+    }
+
+    pub(crate) fn check_diagnostic_graph_bypass(&self, tokens: &[u32]) -> Result<()> {
+        ensure!(tokens.len() >= 2, "dense diagnostic graph check needs two tokens");
+        let device = self.library.cuda_get_device()?;
+        let counters = || crate::shared::decode_graph::device::snapshots().iter()
+            .filter(|row| row.device == device)
+            .flat_map(|row| row.cycles.values()).fold((0, 0), |(captures, hits), cycle|
+                (captures + cycle.captures, hits + cycle.hits));
+        let before = counters();
+        let pool = cuteafd_engine::prefix::RefPagePool::new(self.engine.borrow().pool_tokens / 64, 64);
+        for (speculative, kind) in [(false, scheduler::UngraphedKind::Decode),
+            (true, scheduler::UngraphedKind::Decode), (false, scheduler::UngraphedKind::Scoring)] {
+            self.engine.borrow_mut().reset_slot(0)?;
+            let mut placement = Placement { units: vec![0], slot: 0, len: 0, state_len: 0 };
+            for _ in 0..2 {
+                self.verify_device_ungraphed(&mut [(&mut placement, &tokens[..2])], speculative,
+                    kind, &pool)?.context("diagnostic needs logits")?
+                    .to_host(self.library)?;
+                if let Some(mark) = self.pending.borrow_mut().take() { self.engine.borrow_mut().restore(&mark)?; }
+            }
+        }
+        self.engine.borrow_mut().reset_slot(0)?;
+        ensure!(counters() == before, "dense diagnostic verify captured or replayed a graph");
+        println!("dense diagnostic verify: zero captures and zero replays (plain and speculative)");
+        Ok(())
+    }
+
     pub fn new(engine: &'e RefCell<DenseEngine<'a>>, library: &'a NativeLibrary) -> Self {
-        Self { engine, library, drafter: None, mtp: None, selector: RefCell::new(None),
+        Self { engine, library, drafter: None, mtp: None,
             profile: RefCell::new([0.0; 2]), pending: RefCell::new(None),
             probe: RefCell::new(DenseProbe::default()), packing: Default::default() }
     }
@@ -142,7 +231,7 @@ impl<'e, 'a> Backend<'a> for DenseBackend<'e, 'a> {
     }
     fn library(&self) -> &'a NativeLibrary { self.library }
     fn profile(&self) -> &RefCell<[f64; 2]> { &self.profile }
-    fn prefix_cache(&self, args: &PrefixArgs, lanes: usize) -> Result<(Self::Prefix, PrefixCache<CudaCopyEngine<'a>>)> {
+    fn prefix_cache(&self, args: &PrefixArgs, _lanes: usize) -> Result<(Self::Prefix, PrefixCache<CudaCopyEngine<'a>>)> {
         ensure!(args.prefix_partial == Toggle::Off, "dense Qwen supports exact prefix frontiers only");
         let family = if let Some(mtp) = &self.mtp { DensePrefix::with_mtp(self.engine, mtp.clone())? }
             else { DensePrefix::with_draft(self.engine, self.drafter.clone())? };
@@ -150,7 +239,7 @@ impl<'e, 'a> Backend<'a> for DenseBackend<'e, 'a> {
         let shape = self.geometry();
         let args = &args.with_scoring(if shape.full_prefill_logits { shape.prefill_rows } else { shape.decode_rows },
             shape.prefill_rows, shape.vocab_size)?;
-        let host = args.host_config(layout, shape.max_context, lanes)?.map(|config|
+        let host = self.engine.borrow().admitted_host_config.clone().map(|config|
             CudaCopyEngine::registered_retained(self.library, family.snapshot_owners(),
                 self.drafter.iter().cloned().map(|draft| draft as Rc<dyn crate::shared::prefix::cuda_copy::SnapshotOwner + 'a>)
                     .chain(self.mtp.iter().cloned().map(|mtp| mtp as Rc<dyn crate::shared::prefix::cuda_copy::SnapshotOwner + 'a>))
@@ -195,43 +284,19 @@ impl<'e, 'a> Backend<'a> for DenseBackend<'e, 'a> {
     fn log_table_stats(&self, _phase: &str) {}
     fn prefill_device(&self, placement: &mut Placement, tokens: &[u32], logit_rows: usize,
         _pool: &cuteafd_engine::prefix::RefPagePool) -> Result<Option<DeviceLogits>> {
-        ensure!(self.pending.borrow().is_none(), "dense prefill during pending verify");
-        let mut engine = self.engine.borrow_mut();
-        ensure!(engine.slot_position(placement.slot)? == placement.len, "dense prefill placement/state frontier differs");
-        engine.bind_slot(placement.slot, &placement.units)?;
-        let mut output = None;
-        // Each tap tile is consumed before the target reuses its residual plane.
-        let tile = if self.drafter.is_some() { TAP_ROWS } else { tokens.len() };
-        for (index, chunk) in tokens.chunks(tile).enumerate() {
-            let first = index * tile;
-            let end = first + chunk.len();
-            let head_first = tokens.len() - logit_rows;
-            ensure!(logit_rows <= chunk.len() || head_first >= end,
-                "dense tapped prefill requires bounded scoring rows");
-            let last_layer = engine.cfg.attention.len() - 1;
-            output = Some(engine.prefill_tapped(placement.slot, chunk,
-                if end == tokens.len() { logit_rows } else { 0 }, |layer, hidden| {
-                    if let Some(draft) = &self.drafter {
-                        draft.tap_streams_at(layer, hidden.ptr, 1, 0, chunk.len(), 0)?;
-                    }
-                    if layer == last_layer {
-                        if let Some(mtp) = &self.mtp { mtp.capture_hidden(hidden, chunk.len())?; }
-                    }
-                    Ok(())
-                })?);
-            if let Some(mtp) = &self.mtp {
-                mtp.update_captured(&mut engine, placement.slot, placement.len + first, chunk)?;
-            }
-            if let Some(draft) = &self.drafter {
-                let rows = (0..chunk.len()).map(|tap_row| ContextRow { tap_row, slot: placement.slot,
-                    position: placement.len + first + tap_row }).collect::<Vec<_>>();
-                draft.update(&rows)?;
-            }
+        match self.prefill_with(placement, tokens, logit_rows, None)? {
+            Some(crate::shared::probe::ScoreLogits::Device(logits)) => Ok(Some(logits)),
+            None => Ok(None),
+            Some(_) => unreachable!("ordinary dense prefill returns device logits"),
         }
-        let output = output.context("empty dense prefill")?;
-        placement.len += tokens.len();
-        placement.state_len = placement.len;
-        Ok((logit_rows > 0).then_some(output))
+    }
+    fn streamed_prefill_scoring(&self) -> bool { true }
+    fn prefill_scoring(&self, placement: &mut Placement, tokens: &[u32], logit_rows: usize,
+        position: usize, probe: &crate::shared::probe::ProbeRef, _pool: &cuteafd_engine::prefix::RefPagePool)
+        -> Result<Option<crate::shared::probe::ScoreLogits>> {
+        let streamed = logit_rows > 1 && !self.engine.borrow().full_prefill_logits();
+        self.prefill_with(placement, tokens, logit_rows,
+            streamed.then_some(crate::shared::probe::ScoringRows { probe, position }))
     }
     fn coordinator_packed_cap(&self) -> Result<Option<usize>> {
         if self.packing == crate::shared::prefill_packing::PackingMode::Exact {
@@ -334,7 +399,12 @@ impl<'e, 'a> Backend<'a> for DenseBackend<'e, 'a> {
         kind: scheduler::UngraphedKind, pool: &cuteafd_engine::prefix::RefPagePool) -> Result<Option<DeviceLogits>> {
         let rows = sequences.iter().flat_map(|(placement, tokens)|
             tokens.iter().enumerate().map(|(offset, _)| (placement.slot, placement.len + offset))).collect::<Vec<_>>();
-        let output = self.verify_device(sequences, speculative, pool)?;
+        let output = {
+            // The shared Qwen scheduler submits this single lane synchronously;
+            // the engine-local override never changes the shared device cache.
+            let _bypass = self.engine.borrow().bypass_graphs();
+            self.verify_device(sequences, speculative, pool)?
+        };
         if kind == scheduler::UngraphedKind::Scoring {
             ensure!(!speculative, "dense scoring cannot leave speculative state");
             if let Some(mtp) = &self.mtp {
@@ -357,8 +427,9 @@ impl<'e, 'a> Backend<'a> for DenseBackend<'e, 'a> {
         Ok(output)
     }
     fn verify_bucket_rows(&self, rows: usize, _speculative: bool, _diagnostic: bool) -> usize { rows }
-    fn verify_attention_trace(&self, contexts: &[Vec<usize>], rows: usize) -> serde_json::Value {
-        serde_json::json!({"kind":"causal_gqa", "rows":rows, "contexts":contexts})
+    fn verify_attention_trace(&self, contexts: &[Vec<usize>], rows: usize) -> crate::shared::speculation_trace::Deferred {
+        let contexts = contexts.to_vec();
+        crate::shared::speculation_trace::Deferred::new(move || serde_json::json!({"kind":"causal_gqa", "rows":rows, "contexts":contexts}))
     }
     fn draft_geometry(&self, _snapshot: &Path, width: usize) -> Result<cuteafd_core::PolicyGeometry> {
         if self.mtp.is_some() {
@@ -379,15 +450,13 @@ impl<'e, 'a> Backend<'a> for DenseBackend<'e, 'a> {
         draft.anchor = next;
         Ok(())
     }
-    fn draft(&self, sequences: &mut [scheduler::DraftSeq<'_, Placement, DraftState>], timing: &mut scheduler::DraftTiming)
+    fn draft(&self, sequences: &mut [scheduler::DraftSeq<'_, Placement, DraftState>], timing: &mut scheduler::DraftTiming, selector: &mut crate::shared::token_io::TokenSelector<'_>)
         -> Result<Vec<Vec<u32>>> {
         if let Some(mtp) = &self.mtp {
             use crate::shared::token_io::{RowSelect, SelectBatch};
             let begin = std::time::Instant::now();
             let mut output = vec![Vec::new(); sequences.len()];
             let mut engine = self.engine.borrow_mut();
-            let mut selector = self.selector.borrow_mut();
-            let selector = selector.as_mut().context("dense MTP selector was not admitted")?;
             for (index, sequence) in sequences.iter().enumerate().filter(|(_, sequence)| sequence.depth > 0) {
                 output[index] = mtp.draft_chain(&mut engine, sequence.placement.slot,
                     sequence.seq.anchor.context("dense MTP has no anchor")?, sequence.placement.len,
@@ -510,6 +579,9 @@ pub(crate) struct ServeArgs {
     pub device: i32,
     #[arg(long)]
     pub pool_tokens: Option<u64>,
+    /// Served context: auto fits the admitted pool; a positive count pins it.
+    #[arg(long = "max-context-tokens", value_parser = crate::shared::context::parse_tokens::<u64>)]
+    pub max_context: Option<u64>,
     /// Full-attention KV storage only; GDN recurrence remains FP32.
     #[arg(long, default_value = "fp8")]
     pub kv_cache: cuteafd_loader::families::qwen4::Qwen4KvCache,
@@ -522,8 +594,8 @@ pub(crate) struct ServeArgs {
     /// External checkpoint-native BF16 block dSpark; the launcher resolves its default.
     #[arg(long)]
     pub draft: Option<std::path::PathBuf>,
-    #[arg(long)]
-    pub draft_fixed: Option<usize>,
+    #[command(flatten)]
+    pub draft_length: crate::shared::draft::length::DraftLength,
     /// Checkpoint-native one-layer MTP; external dSpark remains the default.
     #[arg(long, default_value_t = 0, value_parser = clap::value_parser!(u8).range(0..=3), conflicts_with = "draft")]
     pub mtp: u8,
@@ -546,6 +618,7 @@ pub(crate) struct ServeArgs {
 }
 
 pub(crate) async fn run_serve(mut args: ServeArgs) -> Result<()> {
+    args.draft_length.report_inactive(args.draft.is_some() || args.mtp > 0);
     cuteafd_core::concurrency::validate("qwen3_5", args.max_sequences as u64)?;
     args.prefix.resolve_entries(args.max_sequences as usize);
     use cuteafd_api::openai::{chat::qwen4::QwenEncoding, ModelEncoding, ModelProfile};
@@ -585,48 +658,51 @@ pub(crate) async fn run_serve(mut args: ServeArgs) -> Result<()> {
             let draft_config = engine_args.draft.as_ref().map(|snapshot| {
                 block_dspark::check_checkpoint(snapshot, header.config.hidden, header.config.vocab, header.config.attention.len())?;
                 let config = serde_json::from_slice(&std::fs::read(snapshot.join("config.json"))?)?;
-                super::engine::DrafterBytes::block_dspark(&config, lanes, library.sm_count()? as u64, header.config.max_context)
+                super::engine::DrafterBytes::block_dspark(snapshot, &config, lanes, library.sm_count()? as u64, header.config.max_context)
             }).transpose()?;
-            ensure!(engine_args.draft_fixed.is_none() || engine_args.draft.is_some(), "--draft-fixed requires --draft");
+            let startup_audit = crate::shared::inventory::startup_probe_enabled()
+                .then(cuteafd_ffi::memory_ledger::AllocationAudit::begin);
             let engine = RefCell::new(DenseEngine::with_prefix(&library, &programs, &checkpoint,
                 header.config, engine_args.pool_tokens.filter(|&tokens| tokens > 0),
-                draft_config.or_else(|| mtp_admission.as_ref().map(|admission| admission.bytes)), slots,
-                Some(engine_args.prefix.mark_rule(lanes)), engine_args.kv_cache, engine_args.full_prefill_logits)?);
+                draft_config.or_else(|| mtp_admission.as_ref().map(|admission| admission.bytes.clone())), slots,
+                Some(engine_args.prefix.mark_rule(lanes)), engine_args.kv_cache, engine_args.full_prefill_logits,
+                Some((&engine_args.prefix, lanes,
+                    engine_args.token_io.token_select == crate::shared::token_io::SelectPlacement::Device, engine_args.max_context)), false)?);
+            engine.borrow_mut().warm_decode_graphs()?;
             let mut backend = DenseBackend::new(&engine, &library);
             backend.packing = engine_args.prefill_packing;
             let drafts = if let Some(snapshot) = &engine_args.draft {
                 let target = engine.borrow();
                 let config = block_dspark::DsparkConfig::read(snapshot)?;
-                let weights = block_dspark::prefetch(snapshot).join().map_err(|_| anyhow::anyhow!("draft loader panicked"))??;
                 let mask = target.token_embedding().host_rows(&[config.mask_token])?;
-                let draft = Rc::new(DsparkDrafter::load_paged(&library, &programs, snapshot, weights, target.target_stream().raw,
-                    lanes, lanes, mask, cuteafd_loader::families::glm5::draft_representation::GlmDraftRepresentation::Bf16Only,
-                    Fp8Scales::Amax, Fp8Rows::W8a16, target.cfg.max_context, target.pool_tokens,
-                    cuteafd_loader::families::qwen4::Qwen4KvCache::Bf16)?);
+                let draft = Rc::new(super::dspark::load_drafter(&target, &programs, snapshot, lanes, mask)?);
                 draft.prepare_workspace()?;
-                let depth = engine_args.draft_fixed.unwrap_or(config.drafts());
-                ensure!(depth <= config.drafts(), "--draft-fixed exceeds checkpoint draft block");
+                let depth = config.drafts();
                 backend.drafter = Some(draft);
-                scheduler::Drafts::Neural { depth, fixed: engine_args.draft_fixed.is_some() }
+                scheduler::Drafts::Neural { depth }
             } else if let Some(admission) = mtp_admission {
                 backend.mtp = Some(Rc::new(super::engine::mtp::MtpCache::load(&engine.borrow(), &reader, admission)?));
-                backend.selector = RefCell::new(Some(crate::shared::token_io::TokenSelector::new(&library,
-                    crate::shared::token_io::SelectPlacement::Device, engine.borrow().cfg.vocab, 1)?));
-                scheduler::Drafts::Neural { depth: usize::from(engine_args.mtp), fixed: false }
+                scheduler::Drafts::Neural { depth: usize::from(engine_args.mtp) }
             } else { scheduler::Drafts::None };
+            resolved_prefill_settings(backend.geometry().prefill_rows).publish();
             scheduler::schedule(&backend, &engine_args.snapshot, &mut receive, &worker_stats, lanes,
-                drafts, eos, engine_args.decode_share, &engine_args.prefix,
+                drafts, engine_args.draft_length, eos, engine_args.decode_share, &engine_args.prefix,
                 engine_args.loop_abort.config(), engine_args.token_io.token_select, &mut text_media(), None, || {
+                    let history = startup_audit.map(|audit| audit.finish());
+                    let census = crate::shared::inventory::startup_probe_enabled()
+                        .then(|| backend.weight_census(engine_args.device)).transpose()?;
+                    crate::shared::inventory::startup_probe(&library, &[engine_args.device], "qwen3_5/ready",
+                        crate::shared::inventory::StartupEvidence { history: history.as_ref(),
+                            census: census.as_ref(), ..Default::default() })?;
                     if let Some(ready) = ready.take() {
                         let _ = ready.send(Ok(backend.geometry().max_context));
                     }
                     Ok(())
                 })
         })();
-        if let Some(ready) = ready.take() {
-            let _ = ready.send(Err(anyhow::anyhow!("dense initialization failed: {:#}", result.as_ref().unwrap_err())));
-        }
-        result
+        crate::shared::serve::forward_initialization(result, ready.is_some(), "dense initialization failed", |error| {
+            ready.take().expect("pending readiness").send(Err(error)).map_err(|result| match result { Err(error) => error, Ok(_) => unreachable!("sent an error") })
+        })
     });
     let max_context = ready_rx.await.context("dense engine failed before readiness")??;
     let limits = args.prefix.reserve.limits(max_context)?;
@@ -636,12 +712,18 @@ pub(crate) async fn run_serve(mut args: ServeArgs) -> Result<()> {
     let listener = tokio::net::TcpListener::bind(&args.listen).await?;
     cuteafd_bench::ready(&listener);
     crate::shared::memory_report::log("ready");
+    let mut worker = Some(worker);
     tokio::select! {
-        served = axum::serve(listener, api.app(router, hub)
-            .into_make_service_with_connect_info::<std::net::SocketAddr>()) => served?,
-        _ = crate::shared::api::watch_scheduler(worker) => unreachable!(),
+        served = crate::shared::api::serve_http(listener, api.app(router, hub), "qwen3_5") => served?,
+        _ = crate::shared::api::watch_scheduler(&mut worker) => unreachable!(),
     }
+    crate::shared::api::finish_scheduler(&mut worker, "qwen3_5").await?;
     Ok(())
+}
+
+fn resolved_prefill_settings(rows: usize) -> cuteafd_bench::context::ResolvedSettings {
+    cuteafd_bench::context::ResolvedSettings::default()
+        .value("prefill-rows", rows).value("prefill-units", rows)
 }
 
 fn console_layout(args: &ServeArgs, model: &str) -> Result<crate::shared::console::Layout> {
@@ -650,12 +732,12 @@ fn console_layout(args: &ServeArgs, model: &str) -> Result<crate::shared::consol
     layout.hardware = console::hardware(1, 0, true);
     layout.concurrency = usize::from(args.max_sequences);
     layout.speculator = args.draft.as_deref().map(|snapshot| {
-        let depth = args.draft_fixed.unwrap_or(block_dspark::DsparkConfig::read(snapshot)?.drafts());
+        let depth = block_dspark::DsparkConfig::read(snapshot)?.drafts();
         Ok::<_, anyhow::Error>(console::Speculator { name: "dSpark".into(), positions: depth,
-            policy: if args.draft_fixed.is_some() { format!("fixed {depth}") } else { format!("adaptive <= {depth}") } })
+            policy: args.draft_length.label(depth) })
     }).transpose()?;
     if args.mtp > 0 {
-        layout.speculator = Some(console::Speculator { name: "MTP".into(), positions: 1, policy: "adaptive <= 1".into() });
+        layout.speculator = Some(console::Speculator { name: "MTP".into(), positions: usize::from(args.mtp), policy: args.draft_length.label(usize::from(args.mtp)) });
     }
     Ok(layout)
 }
@@ -673,6 +755,156 @@ mod tests {
     struct Cli {
         #[command(flatten)]
         serve: ServeArgs,
+    }
+
+    #[test]
+    fn streamed_heads_are_consumed_before_mtp_or_next_tap_tile() {
+        let source = include_str!("serve.rs");
+        let prefill = source.split_once("    fn prefill_with(").unwrap().1
+            .split_once("    /// Retained weight owners").unwrap().0;
+        assert!(prefill.contains("if self.drafter.is_some() { TAP_ROWS } else { tokens.len() }"));
+        assert!(prefill.contains("if scoring.is_none() && end == tokens.len() { logit_rows } else { 0 }"));
+        assert!(prefill.find("engine.prefill_tapped").unwrap() < prefill.find("engine.record_prefill_head").unwrap());
+        assert!(prefill.find("engine.record_prefill_head").unwrap() < prefill.find("mtp.update_captured").unwrap());
+        assert!(prefill.find("engine.record_prefill_head").unwrap() < prefill.find("draft.update(&rows)").unwrap());
+        let engine = include_str!("engine.rs");
+        let head = engine.split_once("    pub(crate) fn record_prefill_head(").unwrap().1
+            .split_once("    /// Attention keeps").unwrap().0;
+        assert!(head.contains("head_spans(logit_rows, HEAD_ROWS)"));
+        assert!(head.find("self.target_head(").unwrap() < head.find("scoring.record(").unwrap());
+        assert!(!head.contains("alloc"));
+    }
+
+    #[test]
+    fn streamed_suffix_positions_cover_serving_tap_cuts_once() {
+        for rows in [1usize, 63, 64, 65, 511, 512, 513, 4096] {
+            for wanted in [1, rows.div_ceil(2), rows] {
+                for tile in [TAP_ROWS, rows] {
+                    let head_first = rows - wanted;
+                    let mut positions = Vec::new();
+                    for first in (0..rows).step_by(tile) {
+                        let end = (first + tile).min(rows);
+                        let first_scored = first.max(head_first);
+                        if first_scored < end {
+                            for span in crate::shared::probe::head_spans(end - first_scored, 64).unwrap() {
+                                positions.extend(span.map(|row| 1000 + first_scored - head_first + row));
+                            }
+                        }
+                    }
+                    assert_eq!(positions, (1000..1000 + wanted).collect::<Vec<_>>());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn prefill_configuration_reports_the_resolved_native_chunk() {
+        for rows in [TAP_ROWS, 4096] {
+            let settings = super::resolved_prefill_settings(rows);
+            settings.assert_resolved();
+            assert_eq!(settings.0, vec![("prefill-rows".into(), rows.to_string()),
+                ("prefill-units".into(), rows.to_string())]);
+        }
+    }
+
+    #[test]
+    fn reconciliation_reads_dense_admitted_owner_rows() -> Result<()> {
+        const CHILD: &str = "CUTEAFD_DENSE_RECONCILIATION_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            // Admission inputs and reconciliation snapshots are process-global.
+            let status = std::process::Command::new(std::env::current_exe()?)
+                .args(["--exact", "families::qwen3_5::serve::tests::reconciliation_reads_dense_admitted_owner_rows",
+                    "--nocapture"])
+                .env(CHILD, "1").status()?;
+            ensure!(status.success(), "isolated dense reconciliation test failed");
+            return Ok(());
+        }
+        use cuteafd_loader::placement::{families::qwen3_5, planner};
+        use cuteafd_core::memory_layout::{Basis, Category, Item};
+        let budgets = qwen3_5::sampled_budgets(80 << 30, 96 << 30, None,
+            (128 << 30, 128 << 30))?;
+        let gpu = &budgets[0];
+        assert_eq!(gpu.id, "rtx0");
+        assert_eq!(gpu.locations, vec![planner::Location::coordinator(0)]);
+        let owners = cuteafd_loader::placement::reserve::breakdown(gpu.id.clone(),
+            cuteafd_core::memory_policy::DeviceKind::Gpu, gpu.physical_bytes, gpu.headroom,
+            &[Item::new(Category::Weights, "dense target arena", "", 8 << 30, Basis::Exact),
+                Item::new(Category::Reserved, "graph reserve", "graph reserve: qwen3_5.graphs.0",
+                    128 << 20, Basis::Exact)]);
+        cuteafd_ffi::memory_ledger::fault::set_inputs(serde_json::json!({
+            "memory_reconciliation_provenance": {"family": "qwen3_5", "devices": [{"device": 0}]},
+            format!("device.{}", gpu.id): owners
+        }));
+        use crate::shared::memory_report::reconcile;
+        for stage in ["ready", "first_request"] {
+            reconcile::capture(stage);
+            let snapshot = reconcile::snapshot();
+            let rows = snapshot[stage]["devices"].as_array().expect("reconciled rows");
+            assert_eq!(rows.len(), 1, "exactly one physical GPU, no alias rows");
+            let row = &rows[0];
+            assert_eq!(row["device"], "rtx0");
+            assert_eq!(row["owners"]["weights_bytes"].as_u64(), Some(8 << 30));
+            assert_eq!(row["graph_reserve_bytes"].as_u64(), Some(128 << 20));
+            assert!(row["charged_bytes"].as_u64().is_some_and(|bytes| bytes > 0));
+            assert_eq!(row["provenance"]["family"], "qwen3_5");
+            assert!(row.get("delta_vs_measured").is_some());
+            assert!(row.get("graph_reserve_slack").is_some());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn explicit_plan_and_serve_host_quotas_have_identical_recipe_owners() -> Result<()> {
+        use cuteafd_loader::placement::{families::qwen3_5::{self, DenseFacts, NativeBuffers, NativeWeights},
+            planner::{self, Operation, Pin, PrefillShape, Request}};
+        use cuteafd_loader::families::{qwen::{GdnGeometry, GdnOutputGate, HybridAttention}, qwen3_5::Qwen35Config};
+        let cfg = Qwen35Config { hidden: 4096, intermediate: 12288, vocab: 64,
+            attention: vec![HybridAttention::Gdn, HybridAttention::Full], heads: 16, kv_heads: 4, head_dim: 256,
+            gdn: GdnGeometry { key_heads: 16, value_heads: 32, key_dim: 128, value_dim: 128,
+                conv_kernel: 4, output_gate: GdnOutputGate::Silu }, rope_dim: 64, rope_theta: 10000000.,
+            rms_norm_eps: 1e-6, max_context: 262144, mtp_layers: 0, tied_embeddings: false };
+        let buffers = NativeBuffers::new(&cfg, 1024, 4, 2, false)?;
+        let weights = NativeWeights { layers: vec![256; 2], norm: 256, head: 256, embedding: 256 };
+        let target_arena = cuteafd_loader::serving_capacity::WeightArenaLayout::new("qwen3_5/target/gpu0",
+            [("target".into(), 5 * 256)])?;
+        let geometry = qwen3_5::host_prefix_geometry(&cfg, 4096, buffers.mark_bytes as u64);
+        let memory = cuteafd_loader::formats::mapped_preload::host_memory_before_process()?;
+        for (value, context) in ["auto", "0", "1GiB"].into_iter()
+            .flat_map(|value| ["auto", "131072"].map(|context| (value, context))) {
+            let cli = crate::cli::Cli::try_parse_from(["cuteafd", "plan", "/model", "--host-cache-bytes", value])?;
+            let crate::cli::Commands::Plan(plan) = cli.command else { unreachable!() };
+            let serve = Cli::try_parse_from(["serve", "--snapshot", "/model", "--native-lib", "/lib.so",
+                "--host-cache-bytes", value, "--max-context-tokens", context])?.serve;
+            assert_eq!(plan.host_cache_bytes, serve.prefix.host_cache_bytes);
+            let live = serve.prefix.resolve_host_config(cuteafd_engine::prefix::FamilyLayout {
+                page_rows: 64, pages: 4096, page_bytes: geometry.page_bytes as usize,
+                mark_bytes: buffers.mark_bytes, draft_bytes: 0, rule: cuteafd_core::prefix::ReuseRule::EXACT,
+                mark_store: Default::default(), page_owners: Default::default() }, cfg.max_context, 4)?;
+            let quota = if value == "0" { 0 } else { geometry.resolve(
+                if value == "auto" { None } else { Some(plan.host_cache_bytes.explicit_bytes()) },
+                cfg.max_context as u64, 4, memory.0, geometry.chunk_bytes()).unwrap() };
+            let owner = planner::serving::HostPrefixOwners { quota_bytes: quota,
+                chunk_bytes: geometry.chunk_bytes().min(quota) };
+            assert_eq!(live.as_ref().map_or(0, |c| c.bytes), owner.quota_bytes);
+            assert_eq!(live.as_ref().map_or(0, |c| c.chunk_bytes), owner.chunk_bytes);
+            let requested_context = planner::Context::resolve(cfg.max_context as u64, serve.max_context);
+            assert_eq!(requested_context.pin, if context == "auto" { Pin::Auto } else { Pin::Exact(131072) });
+            let admitted = qwen3_5::admit(Request { context: requested_context,
+                pool: Pin::Exact(cfg.max_context as u64), onboard: Pin::Auto,
+                prefill: Pin::Exact(PrefillShape { rows: 4096, waves: 1 }), operation: Operation::Serving,
+                resident_weight_limit: None, spark_reply_formats: Default::default() },
+                qwen3_5::forecast_budgets(cuteafd_loader::placement::ArchContext::for_device(cuteafd_core::GpuArch::Sm120, 96 << 30),
+                    96 << 30, 0, (128 << 30, 128 << 30))?,
+                DenseFacts { graph_variant: "fixture".into(), graphs_enabled: true, cfg: &cfg, weights: &weights, target_arena: &target_arena, buffers: &buffers, slots: 4,
+                    record_bytes: 4096, drafter: None,
+                    blas_head: cuteafd_loader::placement::planner::serving::BlasHead::TensorLt, serving: None, host_prefix: owner, verify_check: false })?;
+            assert_eq!(admitted.request.context, requested_context);
+            assert_eq!(admitted.served_context(), if context == "auto" { cfg.max_context as u64 } else { 131072 });
+            let pinned: u64 = admitted.facts.allocations.iter().filter(|a| a.id.starts_with("host.prefix."))
+                .map(|a| a.bytes).sum();
+            assert_eq!(pinned, if quota == 0 { 0 } else { quota / owner.chunk_bytes * owner.chunk_bytes });
+        }
+        Ok(())
     }
 
     #[test]
@@ -699,22 +931,17 @@ mod tests {
         let cfg = Qwen35Config::read(&snapshot)?;
         let checkpoint = Checkpoint::open(&snapshot)?;
         let config = serde_json::from_slice(&std::fs::read(draft_snapshot.join("config.json"))?)?;
-        let bytes = super::super::engine::DrafterBytes::block_dspark(&config, 4,
+        let bytes = super::super::engine::DrafterBytes::block_dspark(&draft_snapshot, &config, 4,
             library.sm_count()? as u64, cfg.max_context)?;
         let engine = RefCell::new(DenseEngine::with_prefix(&library, &programs, &checkpoint, cfg,
             Some(262144), Some(bytes), 4, Some(crate::shared::prefix::MarkRule {
                 lanes: 4, entries: 4, budget_bytes: 1 << 30, host: false }),
-            std::env::var("CUTEAFD_DENSE_TEST_KV_CACHE").unwrap_or_else(|_| "fp8".into()).parse()?, false)?);
+            std::env::var("CUTEAFD_DENSE_TEST_KV_CACHE").unwrap_or_else(|_| "fp8".into()).parse()?, false, None, false)?);
         let draft = {
             let target = engine.borrow();
             let cfg = block_dspark::DsparkConfig::read(&draft_snapshot)?;
-            let tensors = block_dspark::prefetch(&draft_snapshot).join()
-                .map_err(|_| anyhow::anyhow!("draft loader panicked"))??;
             let mask = target.token_embedding().host_rows(&[cfg.mask_token])?;
-            Rc::new(DsparkDrafter::load_paged(&library, &programs, &draft_snapshot, tensors, target.target_stream().raw,
-                4, 4, mask, cuteafd_loader::families::glm5::draft_representation::GlmDraftRepresentation::Bf16Only,
-                Fp8Scales::Amax, Fp8Rows::W8a16, target.cfg.max_context, target.pool_tokens,
-                cuteafd_loader::families::qwen4::Qwen4KvCache::Bf16)?)
+            Rc::new(super::super::dspark::load_drafter(&target, &programs, &draft_snapshot, 4, mask)?)
         };
         draft.prepare_workspace()?;
         let family = DensePrefix::with_draft(&engine, Some(draft.clone()))?;
@@ -739,26 +966,35 @@ mod tests {
         let reader = crate::shared::qwen::weights::WeightReader { library: &library, checkpoint: &checkpoint };
         let admission = Admission::new(&reader, &cfg, &programs)?;
         let engine = RefCell::new(DenseEngine::with_prefix(&library, &programs, &checkpoint, cfg,
-            Some(262144), Some(admission.bytes), 4, Some(crate::shared::prefix::MarkRule {
+            Some(262144), Some(admission.bytes.clone()), 4, Some(crate::shared::prefix::MarkRule {
                 lanes: 4, entries: 4, budget_bytes: 1 << 30, host: false }),
-            std::env::var("CUTEAFD_DENSE_TEST_KV_CACHE").unwrap_or_else(|_| "fp8".into()).parse()?, false)?);
+            std::env::var("CUTEAFD_DENSE_TEST_KV_CACHE").unwrap_or_else(|_| "fp8".into()).parse()?, false, None, false)?);
         let mtp = Rc::new(MtpCache::load(&engine.borrow(), &reader, admission)?);
         let family = DensePrefix::with_mtp(&engine, mtp.clone())?;
         let mut backend = DenseBackend::new(&engine, &library);
         backend.mtp = Some(mtp);
-        backend.selector = RefCell::new(Some(crate::shared::token_io::TokenSelector::new(&library,
-            crate::shared::token_io::SelectPlacement::Device, engine.borrow().cfg.vocab, 1)?));
         super::super::engine::prefix::check_backend_frontiers(&engine, &[1, 2, 3, 4], &backend, family, true)
+    }
+
+    #[test]
+    fn native_mtp_reuses_the_scheduler_selector() {
+        let source = include_str!("serve.rs");
+        let production = source.split("#[cfg(test)]").next().unwrap();
+        assert!(!production.contains("TokenSelector::new("));
+        assert!(!production.contains("selector: RefCell"));
+        assert!(production.contains("selector.select(&logits, &batch)"));
+        let scheduler = include_str!("../../shared/qwen/scheduler.rs");
+        assert!(scheduler.contains("engine.draft(&mut seqs, &mut lane.timing, selector)"));
     }
 
     #[test]
     fn dense_dspark_preserves_drafting_through_boot_capacity() {
         for c in [1, 16, 17, 32, 33, 64] {
             let args = Cli::try_parse_from(["dense", "--snapshot", "checkpoint", "--native-lib", "native.so",
-                "--draft", "external", "--draft-fixed", "3", "--max-sequences", &c.to_string()]).unwrap().serve;
+                "--draft", "external", "--draft-length", "3", "--max-sequences", &c.to_string()]).unwrap().serve;
             assert_eq!(usize::from(args.max_sequences), c);
-            assert_eq!(args.draft.is_some(), c <= block_dspark::MAX_SEQUENCES);
-            assert_eq!(args.draft_fixed.is_some(), c <= block_dspark::MAX_SEQUENCES);
+            assert!(args.draft.is_some());
+            assert_eq!(args.draft_length.draft_length, Some(3));
         }
     }
 
@@ -813,8 +1049,12 @@ mod tests {
 
     #[test]
     fn dense_defaults_to_compact_kv_without_full_prefill_arena() {
-        let parsed = Cli::try_parse_from(["dense", "--snapshot", "checkpoint", "--native-lib", "native.so"])
+        let mut parsed = Cli::try_parse_from(["dense", "--snapshot", "checkpoint", "--native-lib", "native.so"])
             .unwrap().serve;
+        crate::commands::bench::assert_resolved_family_seam("qwen3_5", &["max-context-tokens", "pool-tokens"], || {
+            parsed.prefix.resolve_entries(parsed.max_sequences as usize);
+            Ok(())
+        }).unwrap();
         assert_eq!(parsed.kv_cache, cuteafd_loader::families::qwen4::Qwen4KvCache::Fp8);
         assert!(!parsed.full_prefill_logits);
     }

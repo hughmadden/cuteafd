@@ -93,7 +93,8 @@ def process_running(pid: int) -> bool:
     try:
         # Reparented children can remain zombies briefly; they are stopped.
         return Path(f"/proc/{pid}/stat").read_text().split(") ", 1)[1][0] != "Z"
-    except FileNotFoundError:
+    except (FileNotFoundError, ProcessLookupError):
+        # A child that exits between open and read raises ESRCH.
         return False
 
 

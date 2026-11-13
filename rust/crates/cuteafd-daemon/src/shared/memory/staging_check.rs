@@ -133,8 +133,8 @@ mod tests {
         let chain = StageChain::on_devices(lib, &[0])?;
         chain.set_device_order(true);
         let (query, attention) = (Stream::new(device)?, Stream::new(device)?);
-        let mut staging = HostAllocation::new(lib, 64)?;
-        let uploaded = Allocation::new(device, 64)?;
+        let mut staging = HostAllocation::new(lib, 64, crate::shared::memory::TEST)?;
+        let uploaded = Allocation::new(device, 64, crate::shared::memory::TEST)?;
         let check = StagingCheck::with(lib, "October regression positions", 1, true);
         let (original, rewritten) = ([0x11u8; 64], [0x77u8; 64]);
         let runtime = tokio::runtime::Builder::new_current_thread().build()?;

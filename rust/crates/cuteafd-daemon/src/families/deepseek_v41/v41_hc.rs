@@ -14,7 +14,8 @@ pub(crate) struct HcBinding<'w, 'a> {
 /// contract: every plane is cross-hook state, so units own disjoint rows; there
 /// is no scratch). Prefill slots share one per GPU; decode lanes own theirs.
 pub(crate) struct HcStorage<'library> {
-    stream: LoadStream<'library>,
+    stream: Option<LoadStream<'library>>,
+    standalone: Option<std::rc::Rc<crate::shared::memory::StandaloneStream<'library>>>,
     residual: DeviceAllocation<'library>,
     incoming_pre: DeviceAllocation<'library>,
     next_pre: DeviceAllocation<'library>,
@@ -28,28 +29,50 @@ pub(crate) struct HcStorage<'library> {
 }
 impl<'library> HcStorage<'library> {
     pub(crate) fn new(library: &'library NativeLibrary, rows: usize) -> Result<std::rc::Rc<Self>> {
+        Self::new_mode(library, rows, None)
+    }
+    fn new_mode(library: &'library NativeLibrary, rows: usize,
+        standalone: Option<std::rc::Rc<crate::shared::memory::StandaloneStream<'library>>>) -> Result<std::rc::Rc<Self>> {
         ensure!((1..=crate::shared::memory::row_window::MAX_RESERVE_ROWS).contains(&rows), "invalid mHC storage rows {rows}");
+        let arena = crate::shared::memory::weight_arena::workspace_arena(library,
+            cuteafd_loader::serving_capacity::v41_workspace::hc(rows)?,
+            cuteafd_core::memory_layout::ArenaTag::workspace("v41/hc"))?;
+        let plane = |name| -> Result<_> {
+            Ok(DeviceAllocation::from_allocation(arena.view(name, arena.layout().view(name).context("mHC plane")?.bytes())?))
+        };
         Ok(std::rc::Rc::new(Self {
-            stream: LoadStream { library, raw: library.cuda_stream_create()? },
-            residual: DeviceAllocation::new(library, rows * 40960)?,
-            incoming_pre: DeviceAllocation::new(library, rows * 16)?,
-            next_pre: DeviceAllocation::new(library, rows * 16)?,
-            post: DeviceAllocation::new(library, rows * 16)?,
-            comb: DeviceAllocation::new(library, rows * 64)?,
-            collapsed: DeviceAllocation::new(library, rows * 10240)?,
-            normalized: DeviceAllocation::new(library, rows * 10240)?,
-            sublayer: DeviceAllocation::new(library, rows * 10240)?,
-            output: DeviceAllocation::new(library, rows * 40960)?,
+            stream: if standalone.is_none() { Some(LoadStream { library, raw: library.cuda_stream_create()? }) } else { None },
+            standalone,
+            residual: plane("residual")?,
+            incoming_pre: plane("incoming_pre")?,
+            next_pre: plane("next_pre")?,
+            post: plane("post")?,
+            comb: plane("comb")?,
+            collapsed: plane("collapsed")?,
+            normalized: plane("normalized")?,
+            sublayer: plane("sublayer")?,
+            output: plane("output")?,
             rows,
         }))
     }
-    /// Bytes per row of every plane together.
-    pub(crate) const ROW_BYTES: usize = 112752;
+    fn raw(&self) -> Result<*mut c_void> {
+        match &self.standalone {
+            Some(stream) => Ok(stream.get()?.raw),
+            None => Ok(self.stream.as_ref().expect("backbone mHC stream").raw),
+        }
+    }
+    fn drain(&self) -> Result<()> {
+        match &self.standalone {
+            Some(stream) => stream.drain(),
+            // SAFETY: backbone stream remains owned until these planes retire.
+            None => unsafe { self.residual.library.cuda_stream_synchronize(self.stream.as_ref().unwrap().raw) },
+        }
+    }
 }
 impl Drop for HcStorage<'_> {
     fn drop(&mut self) {
         // SAFETY: the stream is owned here; its queued work reads only these planes.
-        if let Err(error) = unsafe { self.stream.library.cuda_stream_synchronize(self.stream.raw) } {
+        if let Err(error) = self.drain() {
             tracing::error!(%error, "draining mHC storage");
         }
     }
@@ -84,6 +107,13 @@ impl<'weights, 'library> HcSublayer<'weights, 'library> {
             weights.get(name)?;
         }
         Self::on_storage(library, weights, names, HcStorage::new(library, capacity)?, capacity)
+    }
+    pub(crate) fn standalone(library: &'library NativeLibrary,
+        weights: &'weights NativeRtxTensors<'library>, names: [String; 4], capacity: usize,
+        budget: usize, stream: std::rc::Rc<crate::shared::memory::StandaloneStream<'library>>) -> Result<Self> {
+        ensure!(Self::device_bytes(capacity)? <= budget, "mHC sublayer exceeds budget");
+        Self::on_storage(library, weights, names,
+            HcStorage::new_mode(library, capacity, Some(stream))?, capacity)
     }
     /// A slot's boundary over shared `storage` (one per GPU for prefill slots):
     /// units of at most `unit` rows, each in the window `select_window` sets.
@@ -130,7 +160,10 @@ impl<'weights, 'library> HcSublayer<'weights, 'library> {
         }
         // A stage chain orders all later enqueues after the queued boundary work;
         // rebinding changes only the weights those later enqueues will use.
-        if !crate::shared::memory::chain::active() { self.storage.stream.require_complete()?; }
+        if !crate::shared::memory::chain::active() { match &self.storage.standalone {
+            Some(stream) => stream.require_complete()?,
+            None => self.storage.stream.as_ref().unwrap().require_complete()?,
+        }; }
         Ok(HcBinding { weights, names })
     }
     /// # Safety
@@ -148,7 +181,7 @@ impl<'weights, 'library> HcSublayer<'weights, 'library> {
 impl HcSublayer<'_, '_> {
     pub fn device_bytes(capacity: usize) -> Result<usize> {
         ensure!((1..=4096).contains(&capacity), "invalid mHC capacity");
-        Ok(capacity * 112752)
+        Ok(cuteafd_loader::serving_capacity::v41_workspace::hc(capacity)?.bytes())
     }
     /// Stable BF16 residual [capacity,4,5120] and incoming FP32 pre [capacity,4].
     /// The first stage starts with one-hot [1,0,0,0]; subsequent boundaries receive
@@ -163,19 +196,19 @@ impl HcSublayer<'_, '_> {
     /// A containing owner may enqueue a boundary chain on this stream, provided
     /// it drains the stream before releasing any participating sublayer borrow.
     pub(crate) fn stream_raw(&self) -> *mut c_void {
-        self.storage.stream.raw
+        self.storage.raw().expect("backbone mHC stream is initialized")
     }
     pub(crate) async fn wait_chain(&self) -> Result<()> {
-        unsafe { crate::shared::memory::chain::finish_cooperative(&self.storage.stream).await }
+        unsafe { crate::shared::memory::chain::finish_cooperative(self.storage.stream.as_ref().expect("backbone mHC stream")).await }
     }
     fn synchronize(&self) -> Result<()> {
-        unsafe { self.storage.stream.library.cuda_stream_synchronize(self.storage.stream.raw) }
+        self.storage.drain()
     }
     /// # Safety
     /// Both inputs must be initialized on this device with completed producer
     /// writes. Serialize use; do not overwrite residual/coefficient storage until finish.
     pub unsafe fn begin(&mut self, rows: usize) -> Result<CuteafdDeviceBuffer> {
-        let launched = unsafe { self.enqueue_begin(rows, None, self.storage.stream.raw) };
+        let launched = unsafe { self.enqueue_begin(rows, None, self.storage.raw()?) };
         let drained = self.synchronize();
         match launched.and_then(|output| drained.map(|()| output)) {
             Ok(output) => Ok(output),
@@ -259,7 +292,7 @@ impl HcSublayer<'_, '_> {
                     rows,
                     stream,
                 )?;
-                self.storage.stream.library.cuda_ds4_rmsnorm_bf16_rne_async(
+                self.storage.residual.library.cuda_ds4_rmsnorm_bf16_rne_async(
                     self.window.apply(self.storage.collapsed.buffer, 10240),
                     self.weights.get(&self.names[3])?,
                     normalized,
@@ -279,7 +312,7 @@ impl HcSublayer<'_, '_> {
     /// The BF16 sublayer result must be initialized for the rows returned by begin
     /// and all producer writes complete. Residual/coefficients must remain unchanged.
     pub unsafe fn finish(&mut self) -> Result<[CuteafdDeviceBuffer; 2]> {
-        let launched = unsafe { self.enqueue_finish(None, self.storage.stream.raw) };
+        let launched = unsafe { self.enqueue_finish(None, self.storage.raw()?) };
         let drained = self.synchronize();
         if let Err(error) = launched.and(drained) {
             self.invalidate();
@@ -403,5 +436,35 @@ impl Drop for HcSublayer<'_, '_> {
         if let Err(error) = self.synchronize() {
             tracing::error!(%error,"draining mHC sublayer");
         }
+    }
+}
+
+#[cfg(test)]
+mod arena_tests {
+    use super::*;
+
+    #[test]
+    fn storage_constructor_uses_one_backing_on_each_device() -> Result<()> {
+        let fixture = cuteafd_ffi::native_library_lifetime_fixture::Fixture::build_for_tests()?;
+        let library = fixture.load()?;
+        fixture.strict_device_free(&library, true)?;
+        for device in 0..2 {
+            library.cuda_set_device(device)?;
+            let before = fixture.events()?;
+            let storage = HcStorage::new(&library, 17)?;
+            assert_eq!(fixture.events()?.matches('D').count(), before.matches('D').count() + 1);
+            let planes = [&storage.residual, &storage.incoming_pre, &storage.next_pre,
+                &storage.post, &storage.comb, &storage.collapsed, &storage.normalized,
+                &storage.sublayer, &storage.output];
+            assert!(planes.iter().all(|plane| plane.buffer.device_id == device
+                && plane.buffer.ptr as usize % 256 == 0));
+            let retained = std::rc::Rc::clone(&storage);
+            drop(storage);
+            assert_eq!(fixture.events()?.matches('d').count(), before.matches('d').count());
+            drop(retained);
+            assert_eq!(fixture.events()?.matches('d').count(), before.matches('d').count() + 1);
+        }
+        assert_eq!(fixture.device_free_mismatch(&library)?.0, 0);
+        Ok(())
     }
 }

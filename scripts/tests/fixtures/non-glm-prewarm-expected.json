@@ -1,0 +1,173 @@
+{
+  "deepseek_v4": {
+    "schema_version": 1,
+    "family": "deepseek_v4",
+    "layouts": {
+      "rtx1-spark": {
+        "traced": false,
+        "reserve_base_bytes": [
+          0
+        ],
+        "reserve_extra_bytes": [
+          0
+        ],
+        "bootstrap_bytes": [
+          1048576
+        ],
+        "entries": []
+      },
+      "rtx1-local": {
+        "traced": true,
+        "reserve_base_bytes": [
+          4194304
+        ],
+        "reserve_extra_bytes": [
+          2097152
+        ],
+        "bootstrap_bytes": [
+          2097152
+        ],
+        "entries": [
+          {
+            "rows": 16,
+            "table_width": 512,
+            "pin": true
+          },
+          {
+            "rows": 4,
+            "table_width": 0,
+            "pin": false
+          }
+        ]
+      },
+      "rtx2-spark": {
+        "traced": false,
+        "reserve_base_bytes": [
+          0,
+          0
+        ],
+        "reserve_extra_bytes": [
+          0,
+          0
+        ],
+        "bootstrap_bytes": [
+          1048576,
+          1048576
+        ],
+        "entries": []
+      },
+      "rtx2-local": {
+        "traced": false,
+        "reserve_base_bytes": [
+          0,
+          0
+        ],
+        "reserve_extra_bytes": [
+          0,
+          0
+        ],
+        "bootstrap_bytes": [
+          1048576,
+          1048576
+        ],
+        "entries": []
+      }
+    }
+  },
+  "deepseek_v41": {
+    "schema_version": 2,
+    "family": "deepseek_v41",
+    "layout": 1,
+    "ranks": [
+      {
+        "rank": 0,
+        "reserve_base_bytes": 2097152,
+        "reserve_extra_bytes": 2097152,
+        "entries": [
+          {
+            "rows": 1,
+            "pin": false
+          }
+        ],
+        "prefill_entries": [],
+        "draft_entries": []
+      }
+    ]
+  },
+  "qwen4": {
+    "shape": "single_0spark",
+    "reserve_base_bytes": [
+      4194304
+    ],
+    "reserve_extra_bytes": [
+      2097152
+    ],
+    "trace": {
+      "provenance": "GRAPH_TRACE 1 snapshots at single_0spark; devices [0]; 1 selected shapes; capture base [4194304] + 2097152 extra bytes; 0 zero-replay identities (0 bytes) stay lazy; 0 zero-share selected identities (0 bytes) charged at the device's measured mean capture",
+      "entries": [
+        {
+          "rows": 64,
+          "spec": false,
+          "long": false,
+          "pool_width": 64,
+          "page_stride": 64,
+          "pool_stride": 128,
+          "pin": false
+        }
+      ]
+    }
+  },
+  "mimo_v2": {
+    "schema_version": 2,
+    "family": "mimo_v2",
+    "layouts": [
+      {
+        "variant": "mimof-48",
+        "sparks": true,
+        "ranks": 1,
+        "reserve_base_bytes": [
+          10485760
+        ],
+        "reserve_extra_bytes": [
+          2097152
+        ],
+        "entry_capture_bytes": [
+          [
+            6291456,
+            3145728
+          ]
+        ],
+        "entries": [
+          {
+            "rows": 1,
+            "pin": true
+          },
+          {
+            "rows": 16,
+            "pin": false
+          }
+        ]
+      }
+    ]
+  },
+  "kimi_k3": {
+    "ranks": 1,
+    "layout": "kimi-k3-exl3-k6-min",
+    "reserve_base_bytes": [
+      4194304
+    ],
+    "reserve_extra_bytes": 2097152,
+    "entries": [
+      {
+        "rows": 1,
+        "speculative": false,
+        "op": "ffn",
+        "pin": true,
+        "capture_bytes": [
+          3145728
+        ]
+      }
+    ],
+    "core": "k6"
+  }
+}

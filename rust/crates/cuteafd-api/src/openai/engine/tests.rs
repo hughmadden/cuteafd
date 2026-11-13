@@ -60,10 +60,12 @@ fn families() -> Vec<Family> {
 
 /// One scripted engine: records each job's prompt and answers with `reply`.
 #[derive(Clone, Default)]
-struct Worker { prompts: Arc<Mutex<Vec<String>>>, closed: Arc<Mutex<Vec<bool>>> }
+struct Worker { prompts: Arc<Mutex<Vec<String>>>, closed: Arc<Mutex<Vec<bool>>>, token_ids: Arc<Mutex<Vec<Vec<u32>>>> }
 
 fn serve(mut profile: ModelProfile, snapshot: Option<std::path::PathBuf>, replies: Vec<&'static str>, hold: bool)
     -> (axum::Router, Worker) {
+    if let Some(snapshot) = &snapshot { profile = profile.with_tokenizer(snapshot).unwrap(); }
+    let tokenizer = snapshot.as_ref().map(|snapshot| cuteafd_loader::cached_tokenizer(snapshot).unwrap());
     profile.gateway = Some(Arc::new(GatewayMount { models: crate::gateway::ModelMap::official_names(profile.id.clone()),
         snapshot, options: EngineOptions::default(), search: None, gate: None, origins: Default::default() }));
     let (tx, mut rx) = mpsc::channel::<NativeRequest>(4);
@@ -73,6 +75,9 @@ fn serve(mut profile: ModelProfile, snapshot: Option<std::path::PathBuf>, replie
         let mut replies = replies.into_iter();
         while let Some(job) = rx.recv().await {
             seen.prompts.lock().unwrap().push(job.prompt.clone());
+            if let Some(tokenizer) = &tokenizer {
+                seen.token_ids.lock().unwrap().push(job.encode_prompt(tokenizer).unwrap());
+            }
             let reply = replies.next().unwrap_or("ok");
             let _ = job.events.send(Ok(InferenceChunk::Ready { system_fingerprint: None,
                 prompt_usage: PromptUsage { prompt_tokens: 11, prompt_cache_hit_tokens: 3 } }));
@@ -184,6 +189,43 @@ async fn every_protocol_renders_the_chat_prompt_for_every_family() {
 }
 
 #[tokio::test]
+async fn benchmark_messages_count_matches_chat_template_nonce_and_thinking() {
+    for family in families().into_iter().filter(|family| family.snapshot.is_some()) {
+        for enabled in [false, true] {
+            for system in [None, Some("You are terse.")] {
+                let (app, worker) = serve(family.profile.clone(), family.snapshot.clone(), vec![], false);
+                let text = "[bench-0000000017] Reply with the single word OK.\n\nfn main() { println!(\"hello\"); }";
+                let thinking = json!({"type": if enabled { "enabled" } else { "disabled" }});
+                let user = json!({"role":"user","content":text});
+                let mut messages = vec![];
+                if let Some(system) = system { messages.push(json!({"role":"system","content":system})); }
+                messages.push(user.clone());
+                let chat = json!({"model":family.profile.id,"messages":messages,"max_tokens":1,
+                    "temperature":0,"thinking":thinking,"stream":true});
+                let mut count = json!({"model":family.profile.id,"messages":[user],"max_tokens":1,"thinking":thinking});
+                if let Some(system) = system { count["system"] = json!(system); }
+                let (status, reply) = post(&app, "/v1/messages/count_tokens", count.clone()).await;
+                assert_eq!(status, StatusCode::OK, "{}: {reply}", family.name);
+                let counted = serde_json::from_str::<Value>(&reply).unwrap()["input_tokens"].as_u64().unwrap();
+                let (status, reply) = post(&app, "/v1/chat/completions", chat).await;
+                assert_eq!(status, StatusCode::OK, "{}: {reply}", family.name);
+                let (status, reply) = post(&app, "/v1/messages", count).await;
+                assert_eq!(status, StatusCode::OK, "{}: {reply}", family.name);
+                let prompts = worker.prompts.lock().unwrap();
+                assert_eq!(prompts[0], prompts[1], "{} thinking={enabled} system={system:?}", family.name);
+                assert!(prompts[0].contains("bench-0000000017"));
+                if let Some(snapshot) = &family.snapshot {
+                    let ids = cuteafd_loader::encode_tokenizer_text(snapshot, &prompts[0], false).unwrap().token_ids;
+                    assert_eq!(counted, ids.len() as u64, "{} thinking={enabled} system={system:?}", family.name);
+                    eprintln!("exact benchmark count parity: {} thinking={enabled} system={} tokens={counted}",
+                        family.name, system.is_some());
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test]
 async fn count_tokens_is_exact_through_the_tokenizer() {
     for family in families().into_iter().filter(|f| f.snapshot.is_some()) {
         let snapshot = family.snapshot.clone().unwrap();
@@ -196,6 +238,66 @@ async fn count_tokens_is_exact_through_the_tokenizer() {
         let prompt = worker.prompts.lock().unwrap()[0].clone();
         let expected = cuteafd_loader::encode_tokenizer_text(&snapshot, &prompt, false).unwrap().token_ids.len() as u64;
         assert_eq!(counted, expected, "{}", family.name);
+    }
+}
+
+#[tokio::test]
+async fn count_tokens_matches_serving_for_tiktoken_and_json_snapshots() {
+    let native = tempfile::tempdir().unwrap();
+    cuteafd_loader::plan::testing::write_kimi_tokenizer(native.path());
+    assert!(!native.path().join("tokenizer.json").exists());
+    let json_snapshot = tempfile::tempdir().unwrap();
+    std::fs::write(json_snapshot.path().join("tokenizer.json"),
+        cuteafd_loader::cached_tokenizer(native.path()).unwrap().grammar_tokenizer_json().unwrap()).unwrap();
+    for (snapshot, encoding) in [
+        (native.path(), ModelEncoding::Kimi(Arc::new(crate::openai::chat::kimi::fixture_encoding()))),
+        (json_snapshot.path(), ModelEncoding::Qwen(Arc::new(qwen4::fixtures::encoding()))),
+    ] {
+        for enabled in [false, true] {
+            let (app, worker) = serve(ModelProfile::new("test-tokenizer", encoding.clone()),
+                Some(snapshot.to_path_buf()), vec![], false);
+            let text = "[bench-0000000017] Literal <|open|> and <|end_of_msg|> must stay text.";
+            let thinking = json!({"type":if enabled { "enabled" } else { "disabled" }});
+            let effort = if enabled { "high" } else { "none" };
+            let count_body = json!({"model":"test-tokenizer","messages":[{"role":"user","content":text}],
+                "thinking":thinking,"output_config":{"effort":effort}});
+            let (status, counted) = post(&app, "/v1/messages/count_tokens", count_body).await;
+            assert_eq!(status, StatusCode::OK, "{counted}");
+            let counted: Value = serde_json::from_str(&counted).unwrap();
+            assert_eq!(counted["exact_token_count"], true);
+            let (status, response_count) = post(&app, "/v1/responses/input_tokens",
+                json!({"model":"test-tokenizer","input":text,"reasoning":{"effort":effort}})).await;
+            assert_eq!(status, StatusCode::OK, "{response_count}");
+            let response_count: Value = serde_json::from_str(&response_count).unwrap();
+            assert_eq!(response_count["exact_token_count"], true);
+            assert_eq!(response_count["input_tokens"], counted["input_tokens"]);
+            let (status, reply) = post(&app, "/v1/chat/completions",
+                json!({"model":"test-tokenizer","messages":[{"role":"user","content":text}],
+                    "max_tokens":1,"thinking":thinking,"reasoning_effort":effort})).await;
+            assert_eq!(status, StatusCode::OK, "{reply}");
+            let ids = worker.token_ids.lock().unwrap();
+            assert_eq!(counted["input_tokens"].as_u64().unwrap(), ids[0].len() as u64);
+            let prompts = worker.prompts.lock().unwrap();
+            let unshielded = cuteafd_loader::encode_tokenizer_text(snapshot, &prompts[0], false).unwrap().token_ids;
+            assert!(ids[0].iter().filter(|&&id| id == 257).count()
+                < unshielded.iter().filter(|&&id| id == 257).count(),
+                "literal end marker must not become a control token");
+        }
+    }
+}
+
+#[tokio::test]
+async fn count_tokens_without_snapshot_refuses_estimates_in_both_protocols() {
+    let (app, _) = serve(ModelProfile::new("test-qwen",
+        ModelEncoding::Qwen(Arc::new(qwen4::fixtures::encoding()))), None, vec![], false);
+    for (path, body) in [
+        ("/v1/messages/count_tokens", json!({"model":"test-qwen","messages":[{"role":"user","content":"hello"}]})),
+        ("/v1/responses/input_tokens", json!({"model":"test-qwen","input":"hello"})),
+    ] {
+        let (status, reply) = post(&app, path, body).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{reply}");
+        assert!(reply.contains("refusing an estimated count"), "{reply}");
+        assert!(serde_json::from_str::<Value>(&reply).unwrap().get("input_tokens").is_none());
     }
 }
 
@@ -789,4 +891,60 @@ async fn responses_history_follows_the_1017_drop_thinking_rule() {
         "max_output_tokens":8,"reasoning":{"effort":"high"}})).await;
     assert_eq!(status, StatusCode::OK, "{text}");
     assert!(worker.prompts.lock().unwrap()[0].contains("<think>r1</think>a1"));
+}
+
+#[tokio::test]
+async fn truncated_parallel_calls_obey_policy_in_gateway_streams() {
+    let complete = "<｜DSML｜ invoke name=\"lookup\"><｜DSML｜ parameter name=\"n\" string=\"false\">42</｜DSML｜ parameter></｜DSML｜ invoke>";
+    let reply = format!("<｜DSML｜ calls>\n{complete}\n<｜DSML｜ invoke name=\"lookup\">");
+    for path in ["/v1/messages", "/v1/responses"] {
+        for parallel in [false, true] {
+            let mut profile = ModelProfile::new("ds-fixture", ModelEncoding::DeepseekV41);
+            profile.gateway = Some(Arc::new(GatewayMount {
+                models: crate::gateway::ModelMap::single("ds-fixture"), snapshot: None,
+                options: EngineOptions::default(), search: None, gate: None, origins: Default::default(),
+            }));
+            let (tx, mut rx) = mpsc::channel::<NativeRequest>(1);
+            let reply = reply.clone();
+            let worker = tokio::spawn(async move {
+                let job = rx.recv().await.unwrap();
+                let _ = job.events.send(Ok(InferenceChunk::Ready {
+                    system_fingerprint: None, prompt_usage: PromptUsage::default(),
+                }));
+                for character in reply.chars() {
+                    if job.events.send(Ok(InferenceChunk::Text {
+                        content: character.to_string(), content_tokens: 1,
+                    })).is_err() { return; }
+                }
+                let _ = job.events.send(Ok(InferenceChunk::Finish { finish_reason: InferenceFinishReason::Length }));
+            });
+            let app = router_for_model(tx, NativeLimits::default(), Arc::new(Mutex::new(Value::Null)),
+                std::time::Duration::from_secs(5), ConsoleHub::disabled(), profile);
+            let schema = json!({"type":"object","properties":{"n":{"type":"integer"}}});
+            let mut body = if path == "/v1/messages" {
+                json!({"messages":[{"role":"user","content":"lookup"}], "max_tokens":128,
+                    "thinking":{"type":"disabled"}, "tools":[{"name":"lookup","input_schema":schema}],
+                    "tool_choice":{"type":"auto","disable_parallel_tool_use":!parallel}})
+            } else {
+                json!({"input":"lookup", "store":false, "reasoning":{"effort":"none"},
+                    "tools":[{"type":"function","name":"lookup","parameters":schema}],
+                    "parallel_tool_calls":parallel})
+            };
+            body["model"] = json!("ds-fixture"); body["stream"] = json!(true);
+            let (status, text) = post(&app, path, body).await;
+            assert_eq!(status, StatusCode::OK, "{path}: {text}");
+            let events: Vec<Value> = text.split("\n\n").filter_map(|frame| frame.lines()
+                .find_map(|line| line.strip_prefix("data: ")))
+                .map(|data| serde_json::from_str(data).unwrap()).collect();
+            let failed = events.iter().any(|event| event.get("error").is_some() || event["type"] == "response.failed");
+            assert_eq!(failed, !parallel, "{path}/{parallel}: {text}");
+            if parallel && path == "/v1/messages" {
+                assert!(events.iter().any(|event| event["delta"]["stop_reason"] == "max_tokens"), "{text}");
+            } else if parallel {
+                assert!(events.iter().any(|event| event["type"] == "response.incomplete"
+                    && event["response"]["incomplete_details"]["reason"] == "max_output_tokens"), "{text}");
+            }
+            worker.await.unwrap();
+        }
+    }
 }

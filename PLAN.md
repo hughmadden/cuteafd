@@ -58,7 +58,7 @@ Extend (new families; kernels largely exist in b12x already):
 
 | Model | Family | New pieces |
 | --- | --- | --- |
-| zai-org/GLM-5.3-Flash, brandonmusic/GLM-5.3-Flash-tr3-4bpw | glm5_flash | hybrid KDA linear attention (34) + DSA MLA (11), mHC, EXL3 tr3 |
+| zai-org/GLM-5.3-Flash, wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K4-MC | glm5_flash | hybrid KDA linear attention (34) + DSA MLA (11), mHC, EXL3 tr3 |
 | XiaomiMiMo/MiMo-V2-Flash | mimo_v2 | GQA full + SWA with sink, no shared expert, FP8 |
 | XiaomiMiMo/MiMo-V2.6-Pro-MOPD | mimo_v2 | 70 layers, 128 heads, mxfp4 store dtype, dflash dir |
 | Qwen/Qwen3.8-Flash-Next (+ EXL3 K4.25 PLE variants) | qwen4 | GDN linear attention, n-gram memory tables, PLE, MTP; `../qflashrt` has a single-device port |
@@ -67,7 +67,8 @@ Speculation: one best speculator per family (native MTP/nextn, dSpark,
 DFlash2). Adaptive width with calibrated confidence and cost model, as in
 ds41rt `dspark_policy` and glmrt `dflash2_confidence`.
 Qwen's launcher defaults to MTP3 for qualified local EXL3 and NVFP4
-(`ranks == 0`); explicit overrides win. Spark-backed layouts leave the
+(admitted Spark expert world 0, independent of inventory); explicit overrides
+win. Spark-backed expert layouts leave the
 speculator off unless selected explicitly. Native MTP with coordinator-local
 draft experts is an explicit Spark option, not a requirement of vision or
 decode-bucket qualification.
@@ -75,6 +76,43 @@ Qwen TP4's former 32,768-token KV pool admitted only seven fresh requests
 at the qualified C16 output budget; scheduler and EXL3 slots were not the
 limit. Full-width distinct-prompt qualification and default auto admission
 are recorded under Qwen TP4 admission below.
+
+## Live V4 placement inputs
+
+The full CPU gate requires both V4 checkpoints and compiler-produced placement
+metadata; absent or stale inputs fail rather than silently passing. The default
+CPU tier explicitly lists these four live tests among its exclusions. Direct
+Cargo invocations run them and require the inputs. `--skip-live-planners` is an
+explicit, recorded opt-out, not a full gate result for V4 coverage.
+
+Regenerate on root NVMe from a committed checkout with pinned submodules,
+without a GPU or hardware lock:
+
+```sh
+sha=$(git rev-parse HEAD)
+root="$HOME/.cache/cuteafd/builds/v4-placement-inputs"
+python3 scripts/build/assert-build-filesystem.py "$root"
+mkdir -p "$root"
+CUTEAFD_DEV_TARGET_DIR="$root" CUTEAFD_DEV_MEMORY=32g \
+  timeout 14400 scripts/build/cuteafd-dev.sh cpu -- nice -n 19 \
+  scripts/build/build-slot.sh python3 scripts/build/compare-sm-exports.py \
+  --v4-placement-inputs "/opt/cuteafd-target/$sha" \
+  --output-dir "/opt/cuteafd-target/staging-$sha" --workers 1 --timeout 7200
+ln -sfn "$sha" "$root/current"
+rm -rf "$root/staging-$sha"
+```
+
+The exporter compiles Flash/Pro and their split-head programs at both 131072
+and 1048576 context, plus native EXL3 K2/K3 coordinator capacity metadata.
+Each of the eight views contains unmodified exported manifests. `INPUTS.json`
+records engine commit, fork revision/tree hash, compiler environment, engine
+export-source fingerprints and file checksums. Sources are checked before/after
+compilation and every worker must attest the captured fork pin. Consumers reject
+changed, added or removed engine export sources even when the fork pin is unchanged. Both daemon equality tests and loader TP2-cost tests use
+`CUTEAFD_V4_PLACEMENT_INPUTS`, defaulting to `$root/current`; they refuse a
+fork-pin/tree-hash mismatch or missing/modified manifests. Keep the published
+commit directory and `current` symlink during build cleanup; delete only export
+staging and task Cargo targets. No weights or generated inputs belong in Git.
 
 ## Architecture
 
@@ -84,7 +122,7 @@ rust/crates/
   cuteafd-ffi        libloading C ABI; one module per kernel family, family-namespaced symbols
   cuteafd-loader     checkpoint catalog, family readers (HF config -> ModelSpec), LoadPlan,
                  capability check, fast sliced readers, mapped tables, sparknest placement
-  cuteafd-transport  ExpertProtocolV2, verbs RoCE, TP x EP topology (unchanged from ds41rt)
+  cuteafd-transport  ExpertProtocolV2, verbs RoCE, Spark TP topology
   cuteafd-hostcache  pinned host RAM prefix snapshots (unchanged)
   cuteafd-engine     model-agnostic serve runtime: scheduler, lanes, prefix cache, memory,
                  speculative transaction framework, console state
@@ -121,7 +159,7 @@ pin bumps ever bypass those tests; the current AOT manifest does not carry them.
 - `Attention` per layer kind: CED compressed MLA (V4.1), alternating
   compressed MLA (V4), MLA + DSA indexer (GLM), GQA full / SWA + sink (MiMo),
   KDA / GDN linear (GLM Flash, Qwen). Each owns its KV layout and formats.
-- `ExpertBackend`: Spark TP×EP over RoCE, local RTX TP1/TP2, dSpark-style
+- `ExpertBackend`: Spark TP over RoCE, local RTX TP1/TP2, dSpark-style
   drafter experts. Format-specific pack/unpack lives with the AOT shim.
 - `Speculator`: propose, verify, commit/rollback inside the existing
   speculative transaction protocol.
@@ -414,10 +452,9 @@ memory budget — and 1–6 Sparks, KV target, objective) → a hashed
 `placement.json` that the loader, workers, engines and launchers all
 consume. It generalizes V4.1's startup handoff (`v41_native_serve/placement.rs`),
 live memory planner and 20/20 backbone split. Per MoE layer the experts are
-resident on GPU0/GPU1 (full width, or TP2 where measured) or on a Spark group
-with TP×EP and uneven whole-block slices; EP means expert subsets per group
-(new: today groups are replicated). Cost model counts the busiest rank
-(E[max] routed experts per group), fabric intake as a shared prefill
+resident on GPU0/GPU1 (full width, or TP2 where measured) or on the Sparks
+as TP slices with uneven whole-block widths. Cost model counts the busiest rank,
+fabric intake as a shared prefill
 resource, and per-family coordinator step tables; search is exhaustive.
 Cold components get dispositions: official vision/audio towers run whole on
 a Spark when they fit (`ENCODERS=rtx0` pins them) with a hash-keyed
@@ -1021,8 +1058,8 @@ Work, in priority order:
    state, prefix, graph and headroom reserves. A fresh identical-config A/B
    uses 73,728 tokens in both arms so all sixteen requests fit. The distinct
    three-pair full-width medians pass the 0.98 floor for plain and Copy;
-   startup graphs now default on for serving, with `QWEN_STARTUP_GRAPHS=off`
-   restoring lazy capture. Golden/diagnostic engines keep exact-shape behavior.
+   startup graphs now default on for serving behind the bounded graph cache,
+   with a zero `GPU_GRAPH_RESERVE` running eagerly. Golden/diagnostic engines keep exact-shape behavior.
    Before KV allocation, admission solves the candidate pool's enumerated
    graph count (actual context, layers, sequence count and speculative modes)
    times the 2026-10-07 measured 149,712 bytes/graph, plus a margin of the
@@ -1635,9 +1672,7 @@ item-4 bugs and started items 7 and 10; commit messages carry its evidence.
    deterministic) cuts the GPU-only 8K prefill 2.89 -> 2.57 s, but 8K with
    Sparks stays 2.95 s (GPU wait 2.11 -> 1.45 s, Spark wait up): the GB10
    wave is the bound. Lanes 2 or 4 lose to 3.
-   Verify layouts (busiest-rank expert reads, uniform routes): TP6 beats
-   TP2xEP3 up to 16 rows (1.50 vs 2.02 expert-equivalents at 1 row, 10.8 vs
-   11.2 at 8) and loses by 1-8% only at 32-64 rows; keep TP6. DFlash2 at max
+   DFlash2 at max
    (TP6 + split, code C1): adaptive 66-68 tok/s vs fixed 7/5/3 at 65/62/61;
    offline trace scoring with the measured TP6 table: adaptive 72.9 vs best
    fixed 62.7 (oracle 83.3) — the policy is not the limit.
@@ -2376,7 +2411,7 @@ sketches; typed errors inside crates.
       - role/manifest proof (`V41_EXPERT_TP_AOT.json`, `symbols_verified`,
         native-library hash, the `io.cuteafd.spark_tp_roles` label);
       - artifact identity and the resolved-config fingerprint;
-      - the topology (`SPARK_TP`/`SPARK_EP`) and the placement handoff;
+      - the Spark TP (the expert rank count) and the placement handoff;
       - `KV_POOL_SIZE` and `MEMORY_RESERVATION` as `AdmissionArgs`.
     - **CLI.** V4.1's arguments are composed from shared clap groups
       (`RuntimeServeArgs`, `AdmissionArgs`, `TopologyArgs`, `PrefixArgs`,
@@ -6291,114 +6326,15 @@ new+skipped import counts, retaining strict success, zero-copy, complete
 inventory and managed checksum checks. Launcher retries are two minutes
 apart for brief coordinator outages; numerical producer source is sealed.
 
-## Mistral Large 4 K4 experts / Core K6 (2026-11-01)
+## Mistral Large 4 K4 experts / original core (2026-11-12)
 
-TJ authorized the complete quant, a short pilot, autonomous numerical-failure
-cache assessment, ordinary-OOM resume, and direct publication without another
-approval stop. This supersedes QUANT_BRIEF.md's pilot and publication pauses.
-Work stays on `quant/mistral-large4-k4-core-k6` in the existing `mistral-quant`
-worktree; no engine changes or integration/release pushes are authorized.
-Only raptor GPU1 (`GPU-95f8f212-9131-df99-fd53-7535965197d7`) is exposed to
-its bounded container, under the existing fair queue. GPU0 and other jobs
-remain untouched. Host RSS admission is 74 GiB; the container caps memory
-and swap together at 78 GiB. Work/output are on the Developer NVMe; builds
-and temporary test/compiler files use the task's root-NVMe build directory.
-
-Pinned source is `mistralai/Mistral-Large-4-1T-A52B` at
-`f12dabdc0c1e99e7f7924461a6f308859b05af4d`. No official BF16 sibling was
-found; execute original block-128 FP8 times its positive power-of-two qscale,
-then BF16. All original payloads are audited against Hub LFS/Git hashes.
-SparkNest downloaded the complete model across physical local raptor disks
-including D2/D3; their union is local readiness, with no loading replicas.
-The native Tekken v15 renderer uses reasoning_effort high and preserves
-special-like user strings as text. Full public-panel calibration is 1,426
-whole prompts and 1,126,268 tokens, without packing, truncation or padding.
-
-Implementation is `quantization/mistral_large4/core_k6/`. Recipe: 424 K6
-core/head and 27,264 K4 routed projections, standard MCG 0xCBAC1FED,
-seed 787, sigma 0.025, automatic scales. Preserve 1,251 original tensors
-byte-for-byte: BF16 kv_b, FP8 indexer including its original qscales,
-routers/norms, embeddings, vision and bundled native dSpark. Self-owned
-NoPE kv_a retains the name wkv_a_with_mqa with width512; RoPE width576 uses
-stored640 padding and crops only after full reconstruction. Nine reused
-layers have no kv_a. Expected export: 73 shards, 112,003 tensors,
-540,617,010,400 payload bytes (503.49 GiB). Routed bytes require about
-79.98 GiB per Spark at TP6; TP4 needs119.97 GiB before runtime overhead.
-
-Calibrate each causal stage against reconstructed quantized predecessors,
-finish K4 experts and replay the whole block before its successor. Every
-frontier carries exact shared DSA selections and layer35's compressed NoPE
-KV through later reuse. Raw dense XTX contains actual corpus rows only;
-cold routed experts use native router ranks5-8 in rank-major/corpus order,
-then missing-count identity rows to reach1024. Phase manifests, projection
-receipts, audited shards and successor frontier are ordered retirement
-barriers. Resume checks numerical identity and hashes; launcher/publisher
-changes do not masquerade as changes to numerical producers. Numerical
-failures require dependency-aware review; never delete valid predecessors
-merely because an uncommitted current phase failed.
-
-The launcher runs a durable user systemd unit. Its guard stops this task's
-container before releasing GPU1, then authorized upload runs CPU-only.
-Independent completed-export validation must pass before publication; remote
-object hashes, anonymous revision and weight HEAD are checked. Publication
-target is `wrldsuksgo2mars/Mistral-Large-4-EXL3-K4-Core-K6`. Keep the source
-Mistral Ecosystem Open-Weight License intact. Serving, full-model quality and
-engine-format qualification are separate from projection/native math checks.
-Local run/evidence/export: `~/Developer/cute-worktrees/mistral-quant-work/`.
-
-Tracking: issue #937, draft PR #938. Initial implementation is sealed at
-`e7bb052f9`; 141 focused CPU cases pass and the affected native/pilot26
-pass again after removing a false-positive class-name secret-scanner trigger.
-All68 source files (1,060,613,131,585 bytes including assets) match their
-published Hub hashes. The bounded GPU pilot runs under user unit
-`mistral-core-k6-1793465295342526983`; final pilot/production results are
-not yet claimed.
-
-The CPU finalizer publishes once, then delegates storage to native SparkNest:
-`nest hf import --offline` permits copying, followed by a native placement
-plan at factor1/6 across ostrich,dodo,emu,kiwi,rhea,moa. TJ superseded the
-original no-copy constraint and custom SSH/rsync checks on2026-11-02.
-Trust native import/placement job results and sealed-copy metadata; do not
-add another weight hash pass or remote file checks. Durable job IDs support
-storage retries without replaying the validated publisher. Retire only this
-task's local standalone weights after native completion, retaining evidence.
-
-The short GPU pilot passed in563.50 seconds (2026-10-31T16:57:47UTC), exit0:
-all72 frozen-source layers,24 native byte-exact block proofs,7 separate
-2,205-token sparse/KV proofs and16 serialized candidates. Worst tested K6
-heldout NMSE is3.15245e-4 (<1e-3); routed K4 witness is3.15434e-4 (<0.05).
-No OOM or numerical crash occurred. Keep the proposed K6/core, K4/routed and
-native exclusions. Full production started2026-10-31T17:02:39UTC under unit
-`mistral-core-k6-1793466152658395709`, with authorized CPU upload and
-distributed import enabled (the native copy-permitted path above supersedes it). Producer files/fork/calibration are
-frozen; recover this run explicitly with its existing launcher and --resume.
-
-Production completed2026-11-02T01:20:47UTC:72/72 layers and27,688/27,688
-projections,73 shards,112,003 tensors,540,617,010,400 payload bytes. The
-independent export audit passed and all1,251 retained native tensors matched
-byte-for-byte. No numerical/OOM failures or numerical restarts occurred.
-Published2026-11-02T02:44:39UTC at
-https://huggingface.co/wrldsuksgo2mars/Mistral-Large-4-EXL3-K4-Core-K6
-revision `03c80aebaa483d55760703ae5bc0c9734c9d67d6`, with remote and anonymous
-checks complete. Native import job3263500808 finished in27.249s; native
-placement job3263500849 moved the remaining89,445,357,508B to moa in22.284s
-and removed redundant managed copies. Numerical producers remain frozen.
-The CPU supervisor was deliberately stopped to replace the custom storage
-path with this user-requested native path; this was not a quant failure.
-Focused finalizer/archive/launcher checks:55 passed. Full-model quality and
-serving qualification remain separate. Production layer15 attention.wo has
-a0.006871 regularized-Hessian relative error; the report preserves this
-outlier separately from the short pilot's unregularized heldout NMSE.
-
-Native storage completion and local weight retirement are durable at
-2026-11-02T03:22:04UTC. All73 sealed shards have exactly one managed Spark
-copy (ostrich/dodo/emu/kiwi/rhea/moa:12/12/12/12/13/12). Final CPU supervisor
-`mistral-core-k6-1793589723765453717` exited0. The30-minute progress timer is
-stopped. A preceding CPU-only retry rejected native refs/main grouping;
-its corrected retry reused the same native jobs without another transfer,
-quantization or publisher pass.56 focused storage/finalizer/launcher cases
-pass. The task's standalone local weight hardlinks are retired; scalar
-proofs, reports, metadata and the managed published revision remain.
+Published checkpoint: `wrldsuksgo2mars/Mistral-Large-4-EXL3-K4` at
+`9c354cee78cd6feddb057549b8edde6e3b319822`. It restores the original
+mixed FP8/BF16 core and BF16 head with EXL3 K4 routed experts;
+`CORE_VIEW=original` is the only accepted view. Live min/max examples use
+1 RTX + 5 Sparks and 2 RTX + 6 Sparks with bundled dSpark.
+Release smoke cards for this checkpoint are pending.
+Core-K6 was retired on 2026-11-12; its quant tools and benchmark reports remain historical evidence.
 
 
 ## Muse Spark Open K4 experts / Core K6 (2026-11-01)

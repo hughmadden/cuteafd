@@ -22,28 +22,113 @@ def v41_source() -> str:
 
 
 class NativeReleaseLauncherTest(unittest.TestCase):
+    def test_generic_package_preflight_refuses_before_dry_run_and_startup(self) -> None:
+        text = FAMILY.read_text()
+        start = text.index('# Recipe registration is not proof')
+        end = text.index('if ((dry_run)); then', start)
+        block = text[start:end]
+        self.assertLess(end, text.index('# --restart removes only this coordinator', end))
+        script = r'''set -euo pipefail
+repo_root="$1"; checkpoint_family=mistral_large4; spark_image=image:fixture
+wip_slot=all; WIP_ROOT=/fixture/seal; WIP_INSTANCE=fixture
+spark_expert_ranks=(0 1 2 3 4)
+deployment_json='{"artifact_requirements":{"spark_packages":{"exl3/exl3-ml4-k45":["tp5-compact-rank4/m1"]}}}'
+get() { echo "worker-${1}"; }
+release_die() { echo "$*" >&2; exit 2; }
+timeout() { shift; "$@"; }
+ssh() { cat >/dev/null; echo "missing Spark package exl3/exl3-ml4-k45/tp5-compact-rank4/m1" >&2; return 2; }
+'''
+        result = subprocess.run(['bash', '-c', script + block + '\necho SERVING_STARTED', 'test', str(ROOT)],
+                                cwd=ROOT, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn('missing Spark package exl3/exl3-ml4-k45/tp5-compact-rank4/m1', result.stderr)
+        self.assertIn('before startup', result.stderr)
+        self.assertNotIn('SERVING_STARTED', result.stdout)
+
+    def test_expert_usage_serve_flag_defaults_on_and_preserves_explicit_off(self) -> None:
+        text = FAMILY.read_text()
+        start = text.index('if [[ $family == deepseek_v4 || $family == mimo_v2 || $family == glm5 || $family == kimi_k3 ]]; then')
+        block = text[start:text.index('\nfi', start) + 3]
+        for family in ['deepseek_v4', 'mimo_v2', 'glm5', 'kimi_k3']:
+            for setting, expected in [('', '--expert-usage'), ('off', '--expert-usage=false'), ('on', '--expert-usage'), ('invalid', None)]:
+                with self.subTest(family=family, setting=setting):
+                    script = '''set -euo pipefail
+family="$1"; setting="$2"; family_args=()
+get() { printf '%s' "${setting:-$2}"; }
+release_die() { echo "$*" >&2; exit 2; }
+'''
+                    result = subprocess.run(['bash', '-c', script + block +
+                        '\nprintf \'%s\' "${family_args[*]}"', 'test', family, setting],
+                        cwd=ROOT, capture_output=True, text=True)
+                    if expected is None:
+                        self.assertNotEqual(result.returncode, 0)
+                        self.assertIn('EXPERT_USAGE must be on or off', result.stderr)
+                    else:
+                        self.assertEqual(result.returncode, 0, result.stderr)
+                        self.assertEqual(result.stdout, expected)
+
+    def test_unadapted_families_accept_policy_without_enabling_native_telemetry(self) -> None:
+        text = FAMILY.read_text()
+        start = text.index('case "$(get EXPERT_USAGE on)" in', text.index('family_args=(--embedding-placement'))
+        block = text[start:text.index('\nfi', start) + 3]
+        for family in ['glm5_flash', 'muse_spark', 'step5', 'qwen4', 'qwen3_5']:
+            for setting in ['', 'on', 'off', 'invalid']:
+                with self.subTest(family=family, setting=setting):
+                    script = '''set -euo pipefail
+family="$1"; setting="$2"; family_args=()
+get() { printf '%s' "${setting:-$2}"; }
+release_die() { echo "$*" >&2; exit 2; }
+'''
+                    result = subprocess.run(['bash', '-c', script + block +
+                        '\nprintf \'%s\' "${family_args[*]}"', 'test', family, setting],
+                        cwd=ROOT, capture_output=True, text=True)
+                    self.assertEqual(result.returncode, 2 if setting == 'invalid' else 0, result.stderr)
+                    self.assertEqual(result.stdout, '')
+
+    def test_v41_expert_usage_serve_flag_defaults_on_and_preserves_explicit_off(self) -> None:
+        source = v41_source()
+        start = source.index('case "$(get EXPERT_USAGE on)" in')
+        block = source[start:source.index('\nesac', start) + len('\nesac')]
+        for setting, expected in [('', '--expert-usage'), ('off', '--expert-usage=false'), ('on', '--expert-usage'), ('invalid', None)]:
+            with self.subTest(setting=setting):
+                script = '''set -euo pipefail
+setting="$1"; args=()
+get() { printf '%s' "${setting:-$2}"; }
+release_die() { echo "$*" >&2; exit 2; }
+'''
+                result = subprocess.run(['bash', '-c', script + block +
+                    '\nprintf \'%s\' "${args[*]}"', 'test', setting],
+                    cwd=ROOT, capture_output=True, text=True)
+                if expected is None:
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn('EXPERT_USAGE must be on or off', result.stderr)
+                else:
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(result.stdout, expected)
+
     def test_v41_planner_receives_normalized_effective_config(self) -> None:
         source = v41_source()
         block = source[source.index('count_args='):source.index('if [[ -n "$wip_layout" ]]; then', source.index('count_args='))]
-        for requested, expected in [(None, 'on'), ('off', 'off')]:
-            with self.subTest(requested=requested), tempfile.TemporaryDirectory() as temporary:
+        for requested, expected, usage in [(None, 'on', None), (None, 'on', 'off'), ('off', 'off', 'on')]:
+            with self.subTest(requested=requested, usage=usage), tempfile.TemporaryDirectory() as temporary:
                 root = Path(temporary)
                 config = root / 'sparse.config'
-                config.write_text('  SPECULATOR = "dspark" # draft mode\nDSPARK_DRAFT_LIMIT=\'7\' # width\n'
+                config.write_text('  SPECULATOR = "dspark" # draft mode\nDRAFT_LENGTH=\'7\' # width\n'
                                   'SPARK_0_HOST="ostrich" # first\nSPARK_1_HOST=\'dodo\'\n'
                                   'SPARK_0_LANE_A=10.55.0.1\nSPARK_1_LANE_A=10.55.0.2\n'
+                                  + (f'EXPERT_USAGE="{usage}" # telemetry policy\n' if usage else '')
                                   + (f'TP2_DSPARK_EXPERTS="{requested}" # explicit override\n' if requested else ''))
                 script = '''set -euo pipefail
 source scripts/lib/release-common.sh
 release_load_config "$1"
 release_resolve_tp2_dspark_experts deepseek_v41 2
-dspark_draft_limit="$DSPARK_DRAFT_LIMIT"
-get() { printf '%s' "${2:-}"; }
+draft_length="$DRAFT_LENGTH"
+get() { if [[ "$1" == EXPERT_USAGE ]]; then printf '%s' "${EXPERT_USAGE:-${2:-}}"; else printf '%s' "${2:-}"; fi; }
 container_hf_home=/hf
 namespace_mount_args=()
 '''
                 result = subprocess.run(['bash', '-c', script + block + '''
-printf '%s\\n' "$TP2_DSPARK_EXPERTS" "$SPECULATOR" "$dspark_draft_limit" "$RELEASE_AVAILABLE_SPARKS"
+printf '%s\\n' "$TP2_DSPARK_EXPERTS" "$SPECULATOR" "$draft_length" "$RELEASE_AVAILABLE_SPARKS"
 cat "$count_config"
 printf 'arg=%s\\n' "${count_args[@]}"
 printf 'mount=%s\\n' "${count_mounts[@]}"
@@ -52,11 +137,27 @@ printf 'mount=%s\\n' "${count_mounts[@]}"
                 lines = result.stdout.splitlines()
                 self.assertEqual(lines[:4], [expected, 'dspark', '7', '2'])
                 normalized = dict(line.split('=', 1) for line in lines[4:] if not line.startswith(('arg=', 'mount=')))
-                self.assertEqual(normalized, dict(TP2_DSPARK_EXPERTS=expected, SPECULATOR='dspark', DSPARK_DRAFT_LIMIT='7',
+                self.assertEqual(normalized, dict(TP2_DSPARK_EXPERTS=expected, SPECULATOR='dspark', DRAFT_LENGTH='7', EXPERT_USAGE=usage or 'on',
                     **{f'SPARK_{rank}_HOST': host for rank, host in enumerate(['ostrich', 'dodo'])}))
                 self.assertIn('arg=--config', lines)
                 self.assertIn('arg=/run/cuteafd-plan.config', lines)
                 self.assertTrue(any(line.startswith('mount=') and line.endswith(':/run/cuteafd-plan.config:ro') for line in lines))
+
+    def test_generic_planner_preserves_explicit_off(self) -> None:
+        text = FAMILY.read_text()
+        start = text.index('  case "$(get EXPERT_USAGE on)" in', text.index('plan_draft_args+=(--host-cache-bytes'))
+        block = text[start:text.index('\n  esac', start) + len('\n  esac')]
+        for setting, expected in [('', '--expert-usage'), ('on', '--expert-usage'), ('off', '--expert-usage=false')]:
+            with self.subTest(setting=setting):
+                script = '''set -euo pipefail
+setting="$1"; plan_draft_args=()
+get() { printf '%s' "${setting:-$2}"; }
+'''
+                result = subprocess.run(['bash', '-c', script + block +
+                    '\nprintf \'%s\' "${plan_draft_args[*]}"', 'test', setting],
+                    cwd=ROOT, capture_output=True, text=True)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout, expected)
 
     def test_cuda_capacity_matches_uuid_not_cuda_ordinal_and_creates_no_context(self) -> None:
         import contextlib
@@ -95,16 +196,21 @@ printf 'mount=%s\\n' "${count_mounts[@]}"
                 with self.assertRaisesRegex(SystemExit, message): exec(source, {})
 
     def test_coordinator_capacity_registry_boundary_and_invalid_inputs(self) -> None:
-        for total, budget, expected in [('98304', '', 16), ('32768', '', 8), ('98304', '32', 8),
-                                        ('98304', '32.001', 16), ('32768', '96', 8)]:
+        # GPU_MEMORY_CAP is a size; the profile is the smaller of the card and the cap, in bytes.
+        for total, cap, expected, logical in [
+                ('98304', '', 16, 98304 << 20), ('32768', '', 8, 32768 << 20),
+                ('98304', '32GiB', 8, 32 << 30), ('98304', '32.001GiB', 16, int(32.001 * 2**30)),
+                ('32768', '96GiB', 8, 32768 << 20), ('98304', '34400000000', 16, 34_400_000_000),
+                ('98304', '1024MiB', 8, 1 << 30)]:
             result = subprocess.run(['bash', '-c',
                 'source scripts/lib/release-common.sh; repo_root=$PWD; release_coordinator_profile "$1" "$2"',
-                'test', str(int(total) * 2**20) if total.isdigit() else total, budget], cwd=ROOT, text=True, capture_output=True)
+                'test', str(int(total) * 2**20) if total.isdigit() else total, cap], cwd=ROOT, text=True, capture_output=True)
             self.assertEqual(result.returncode, 0, result.stderr)
-            gib, concurrency = result.stdout.split()
-            self.assertEqual(float(gib), min(float(total) / 1024, float(budget) if budget else float('inf')))
+            cap_bytes, concurrency = result.stdout.split()
+            self.assertEqual(int(cap_bytes), logical)
             self.assertEqual(int(concurrency), expected)
-        for total, budget in [('0', ''), ('NaN', ''), ('98304', 'inf'), ('98304', '0'), ('bad', '')]:
+        for total, budget in [('0', ''), ('NaN', ''), ('98304', 'inf'), ('98304', '0'), ('bad', ''),
+                              ('98304', '90%'), ('98304', '32TiB')]:
             result = subprocess.run(['bash', '-c',
                 'source scripts/lib/release-common.sh; repo_root=$PWD; release_coordinator_profile "$1" "$2"',
                 'test', str(int(total) * 2**20) if total.isdigit() else total, budget], cwd=ROOT, text=True, capture_output=True)
@@ -261,7 +367,8 @@ printf '%s\0' "${RELEASE_SERVING_ARGS[@]}"
         self.assertEqual(FAMILY.read_text().count('-v "$USAGE_DIR:/run/cuteafd/usage"'), 1)
         self.assertIn('shared_api_state', v41_source())
         v41 = v41_source().split("<<'REMOTE' &", 1)[1].split('\nREMOTE', 1)[0]
-        self.assertIn('release_serving_docker_args\ncuteafd_cdi_gpu_args all || exit 2\ndocker run -d "${RELEASE_SERVING_ARGS[@]}"', v41)
+        self.assertLess(v41.index('release_serving_docker_args\ncuteafd_cdi_gpu_args all || exit 2'),
+                        v41.index('docker run -d "${RELEASE_SERVING_ARGS[@]}"'))
 
     def test_v41_worker_capacity_covers_every_coordinator_chunk_and_replay(self) -> None:
         chunks = list(range(80, 4097))
@@ -279,12 +386,13 @@ printf '%s\0' "${RELEASE_SERVING_ARGS[@]}"
         self.assertIn('encoder_plan="$count_plan"', source)
         self.assertNotIn('--prefill-rows "$expert_capacity"', source)
 
-    def test_count_fallback_precedes_bf16_package_preflight(self) -> None:
+    def test_role_selection_precedes_bf16_package_preflight(self) -> None:
         source = (ROOT / 'scripts/launch/run-family.sh').read_text()
         selection = source.index('selected_ranks="')
-        reexec = source.index('exec bash "$repo_root/scripts/launch/run-family.sh"', selection)
+        roles = source.index('release_deployment_spark_roles "$deployment_json"', selection)
         package = source.index('printf -v preflight_command')
-        self.assertLess(reexec, package)
+        self.assertLess(roles, package)
+        self.assertNotIn('exec bash "$repo_root/scripts/launch/run-family.sh"', source)
         self.assertLess(package, source.index('if [[ "$restart" == 1 ]];'))
 
     def test_v41_capacity_registry_rejects_invalid_chunks_and_syntax_drift(self) -> None:
@@ -312,14 +420,14 @@ printf '%s\0' "${RELEASE_SERVING_ARGS[@]}"
         source = (ROOT / 'scripts/launch/run-family.sh').read_text()
         generic = source[source.index('# Validate the name before it is used to identify allocations'):]
         block = generic.split('attention_placement="$(get ATTENTION_PLACEMENT auto)"', 1)[1].split('\ncase "$family" in', 1)[0]
-        self.assertLess(generic.index('case "$attention_placement:$family" in'), generic.index('docker run'))
         self.assertIn('--attention-placement "$attention_placement"', source)
         self.assertIn('CUTEAFD_ATTENTION_PLACEMENT=$attention_placement', source)
         for family in ['glm5', 'glm5_flash', 'deepseek_v4', 'mimo_v2', 'qwen4']:
             for mode in ['auto', 'heads', 'context', 'layers', 'bad']:
                 for wip_slot in ['', 'slot-test']:
                     result = subprocess.run(['bash', '-c',
-                        'source scripts/lib/release-common.sh; release_known_key ATTENTION_PLACEMENT; '
+                        'source scripts/lib/release-common.sh; source scripts/lib/attention-placement.sh; '
+                        'release_known_key ATTENTION_PLACEMENT; '
                         'family="$1"; attention_placement="$2"; wip_slot="$3"; ' + block,
                         'test', family, mode, wip_slot], cwd=ROOT, text=True, capture_output=True)
                     # GLM and V4 run context; Qwen layers requires a Spark-free pair (checked later).
@@ -337,10 +445,10 @@ printf '%s\0' "${RELEASE_SERVING_ARGS[@]}"
         source = v41_source()
         block = source.split('attention_placement="${ATTENTION_PLACEMENT:-auto}"', 1)[1].split(
             'case "$EMBEDDING" in', 1)[0]
-        self.assertLess(source.index('case "$attention_placement" in'), source.index('docker run'))
         for mode in ['auto', 'heads', 'context', 'layers', 'bad']:
             result = subprocess.run(['bash', '-c',
-                'source scripts/lib/release-common.sh; attention_placement="$1"; ' + block,
+                'source scripts/lib/release-common.sh; source scripts/lib/attention-placement.sh; '
+                'attention_placement="$1"; ' + block,
                 'test', mode], cwd=ROOT, text=True, capture_output=True)
             self.assertEqual(result.returncode == 0, mode in ['auto', 'heads'], result.stderr)
             if mode in ['context', 'layers']:
@@ -452,8 +560,8 @@ printf '%s\0' "${RELEASE_SERVING_ARGS[@]}"
             self.assertIn('shared_graph_census_args', v41_source())
             for launcher in ['scripts/launch/run-family.sh']:
                 source = (ROOT / launcher).read_text()
-                suffix = source.split('graph_census_args=()\n', 1)[1]
-                block = 'graph_census_args=()\n' + suffix.split('\nfi', 1)[0] + '\nfi\n'
+                suffix = source.split('shared_graph_census_args() {\n', 1)[1]
+                block = 'shared_graph_census_args() {\n' + suffix.split('\n}\n', 1)[0] + '\n}\nshared_graph_census_args\n'
                 self.assertIn('"${graph_census_args[@]}"', source)
                 for value, wip, path, valid in [
                     (None, '', str(control), True), ('0', '', str(control), True),
@@ -468,7 +576,7 @@ printf '%s\0' "${RELEASE_SERVING_ARGS[@]}"
                         if value is not None:
                             env['CUTEAFD_GRAPH_CENSUS'] = value
                         env['CUTEAFD_GRAPH_CENSUS_CONTROL'] = path
-                        harness = 'set -euo pipefail\nrelease_die() { exit 2; }\nwip_layout=$1\n'
+                        harness = 'set -euo pipefail\nrelease_die() { exit 2; }\nget() { :; }\nfamily=glm5\nwip_layout=$1\n'
                         result = subprocess.run(['bash', '-c', harness + block +
                             'printf "%s\\0" before "${graph_census_args[@]}" after', 'test', wip],
                             env=env, capture_output=True)
@@ -520,19 +628,36 @@ printf '%s\0' "${RELEASE_SERVING_ARGS[@]}"
         native = v41_source()
         generic = (ROOT / 'scripts/launch/run-family.sh').read_text()
         self.assertIn('--embedding-placement "$EMBEDDING"', native)
-        self.assertIn('family_args=(--embedding-placement "$embedding" "${exlr8_plan_args[@]}")', generic)
+        from test_run_family_dispatch import _family_launch_result
+        for extra_args, expected in [((), 'gpu'), (('--embedding-placement', 'host'), 'host')]:
+            with self.subTest(embedding=expected), tempfile.TemporaryDirectory() as temporary:
+                launched = _family_launch_result(
+                    Path(temporary),
+                    {'model_type': 'glm_moe_dsa', 'num_hidden_layers': 4,
+                     'first_k_dense_replace': 3},
+                    'test/embedding',
+                    'EXLR8_MANIFEST=up1\nSPARK_COUNT=4\nRTX_GPUS=1\n'
+                    'SPECULATOR=off\nVISION=off\nAUDIO=off\n',
+                    extra_args=extra_args)
+                self.assertEqual(launched.returncode, 0, launched.stderr)
+                commands = [shlex.split(line) for line in launched.stderr.splitlines()
+                            if 'cuteafd serve-glm --snapshot' in line]
+                self.assertTrue(commands, launched.stderr)
+                for argv in commands:
+                    self.assertEqual(argv[argv.index('--embedding-placement') + 1], expected)
         self.assertIn('cfg_overrides[EMBEDDING]="$embedding_override"', generic)
 
     def test_small_card_embedding_default_and_explicit_overrides(self) -> None:
         source = v41_source()
-        block = source.split('if python3 -c', 1)[1].split('\nsnapshot_rel=', 1)[0]
-        block = 'if python3 -c' + block
-        for gib, config_value, override, expected in (
-            ('31.8', '', '', 'host'), ('32', '', '', 'host'),
-            ('96', '', '', 'gpu'), ('31.8', 'gpu', '', 'gpu'),
-            ('31.8', '', 'gpu', 'gpu'), ('96', 'host', '', 'host'),
+        block = source.split('if ((profile_cap <= 32 << 30)); then\n  if [[ -z "${cfg_overrides[EMBEDDING]', 1)[1].split('\nsnapshot_rel=', 1)[0]
+        block = 'if ((profile_cap <= 32 << 30)); then\n  if [[ -z "${cfg_overrides[EMBEDDING]' + block
+        gib = lambda value: str(int(float(value) * 2**30))
+        for cap, config_value, override, expected in (
+            (gib('31.8'), '', '', 'host'), (gib('32'), '', '', 'host'),
+            (gib('96'), '', '', 'gpu'), (gib('31.8'), 'gpu', '', 'gpu'),
+            (gib('31.8'), '', 'gpu', 'gpu'), (gib('96'), 'host', '', 'host'),
         ):
-            with self.subTest(gib=gib, config=config_value, override=override):
+            with self.subTest(cap=cap, config=config_value, override=override):
                 with tempfile.NamedTemporaryFile(mode='w') as config:
                     if config_value:
                         config.write(f'EMBEDDING={config_value}\n')
@@ -541,17 +666,16 @@ printf '%s\0' "${RELEASE_SERVING_ARGS[@]}"
 release_spark_compact_active() { return 1; }
 release_die() { exit 1; }
 declare -A cfg_overrides
-profile_gib=$1
+profile_cap=$1
 config=$2
 EMBEDDING=${3:-gpu}
 cfg_overrides[EMBEDDING]=$4
 [[ -z "$4" ]] || EMBEDDING=$4
 PREFILL_BATCH_TOKENS=2048
-MEMORY_RESERVATION=
 RTX_EXPERT_LAYERS=auto
 '''
                     result = subprocess.run(['bash', '-c', harness + block + '\nprintf "%s" "$EMBEDDING"',
-                        'test', gib, config.name, config_value, override], cwd=ROOT, text=True, capture_output=True)
+                        'test', cap, config.name, config_value, override], cwd=ROOT, text=True, capture_output=True)
                     self.assertEqual(result.returncode, 0, result.stderr)
                     self.assertEqual(result.stdout, expected)
 
@@ -717,9 +841,9 @@ spark_tp_roles=
         # The V4.1 controls are configuration keys, settable per launch with --set.
         for option in ("--set KEY=VALUE", "--dry-run", "--wip", "--restart", "--embedding-placement"):
             self.assertIn(option, help_text)
-        for key in ("RTX_GPUS", "CONCURRENCY", "KV_POOL_SIZE", "MEMORY_RESERVATION", "PREFIX_CACHE_ENTRIES",
+        for key in ("RTX_GPUS", "CONCURRENCY", "KV_POOL_SIZE", "GPU_MEMORY_CAP", "PREFIX_CACHE_ENTRIES",
                     "MAX_CONTEXT_TOKENS", "MAX_OUTPUT_TOKENS", "PREFILL_BATCH_TOKENS", "SPECULATOR",
-                    "DSPARK_DRAFT_LIMIT", "TP2_ATTENTION"):
+                    "DRAFT_LENGTH", "TP2_ATTENTION"):
             self.assertIn(key, help_text)
 
     def test_standard_release_defaults_are_native(self) -> None:
@@ -746,7 +870,7 @@ printf '%s\n' "$MODEL_ID" "$MODEL_REVISION" "$EXPERT_FORMAT" "$SPARKINFER_EXL3" 
                 "disable",
                 "16",
                 "20",
-                "1048576",
+                "auto",
                 "131072",
                 "0.0.0.0:8000",
                 "19441",
@@ -786,14 +910,14 @@ printf '%s\n' "$MODEL_ID" "$MODEL_REVISION" "$EXPERT_FORMAT" "$SPARKINFER_EXL3" 
             for args, message in (
                 (["--set", "CONCURRENCY=65"], "CONCURRENCY must be in 1..64"),
                 (["--set", "PREFIX_CACHE_ENTRIES=-1"], "PREFIX_CACHE_ENTRIES must be auto or non-negative"),
-                (["--set", "MAX_CONTEXT_TOKENS=1048577"], "MAX_CONTEXT_TOKENS must be in 1..1048576"),
+                (["--set", "MAX_CONTEXT_TOKENS=1048577"], "MAX_CONTEXT_TOKENS must be auto or in 1..1048576"),
                 (["--set", "MAX_OUTPUT_TOKENS=12k"], "MAX_OUTPUT_TOKENS must be an integer"),
                 (["--set", "RTX_GPUS=3"], "RTX_GPUS must be auto, 1, or 2"),
-                (["--set", "DSPARK_DRAFT_LIMIT=8"], "DSPARK_DRAFT_LIMIT must be in 1..7"),
+                (["--set", "DRAFT_LENGTH=0"], "DRAFT_LENGTH must be a positive integer"),
                 (["--set", "NOT_A_KEY=1"], "unknown configuration key: NOT_A_KEY"),
                 # The former options name the key that replaced them.
                 (["--concurrency", "4"], "--set CONCURRENCY=VALUE"),
-                (["--dspark-draft-limit", "7"], "--set DSPARK_DRAFT_LIMIT=VALUE"),
+                (["--draft-length", "7"], "--set DRAFT_LENGTH=VALUE"),
                 (["--tp2-attention"], "--set TP2_<OPTION>=on|off"),
             ):
                 with self.subTest(args=args):
@@ -802,10 +926,27 @@ printf '%s\n' "$MODEL_ID" "$MODEL_REVISION" "$EXPERT_FORMAT" "$SPARKINFER_EXL3" 
                     result = subprocess.run(["./run.sh", *args], cwd=ROOT, capture_output=True, text=True, env=env)
                     self.assertEqual(result.returncode, 2, result.stderr)
                     self.assertIn(message, result.stderr)
+            # A valid override must reach model resolution, which comes after the
+            # launcher's tool and image checks. Stub those two so the answer does
+            # not depend on the host (WSL2 keeps nvidia-smi outside /usr/bin, and
+            # a build host need not hold the release images), and point the
+            # namespace and HF_HOME at empty directories so the missing snapshot
+            # is the same everywhere.
+            stub_bin = Path(home) / "bin"
+            stub_bin.mkdir()
+            for tool in ("docker", "nvidia-smi"):
+                stub = stub_bin / tool
+                stub.write_text("#!/bin/sh\nexit 0\n")
+                stub.chmod(0o755)
+            empty_namespace, empty_hf = Path(home) / "namespace", Path(home) / "hf"
+            empty_namespace.mkdir()
+            empty_hf.mkdir()
+            resolved_env = {**env, "PATH": f"{stub_bin}:/usr/bin:/bin", "HF_HOME": str(empty_hf),
+                            "CUTEAFD_NAMESPACE_ROOT": str(empty_namespace)}
             for override in ["CONCURRENCY=17", "CONCURRENCY=64", "PREFIX_CACHE_ENTRIES=129"]:
                 with self.subTest(override=override):
                     result = subprocess.run(["./run.sh", "--set", override], cwd=ROOT,
-                                            capture_output=True, text=True, env=env)
+                                            capture_output=True, text=True, env=resolved_env)
                     self.assertNotIn("CONCURRENCY must", result.stderr)
                     self.assertNotIn("PREFIX_CACHE_ENTRIES must", result.stderr)
                     self.assertIn("model snapshot is missing", result.stderr)

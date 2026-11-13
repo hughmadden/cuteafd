@@ -130,10 +130,13 @@ echo "export-remote: admitted cap ${cap} MiB, ${jobs} jobs, device ${baseline} M
 # WSL reports only total device use. Watch the bounded aggregate budget,
 # not an individual cap that would count a sibling export as ours.
 status=0
+# This host's export cache (scripts/build/export-cache.py), as raptor's builds keep theirs.
+mkdir -p "$HOME/.cache/cuteafd/export-cache/x86_64"
 python3 "$placement" watch --smi "$smi" --gpu 0 --cap-mib "$cap" --ledger "$ledger" --reservation "$reservation" -- \
   docker run --rm --init --memory "${ram}m" --memory-swap "${ram}m" --device nvidia.com/gpu=all --user "$(id -u):$(id -g)" --name "$container" \
     -e HOME=/wip/home -e "USER=$(id -un)" -e "LOGNAME=$(id -un)" -e "CMAKE_BUILD_PARALLEL_LEVEL=$ninja_jobs" -e "CUTEAFD_EXPORT_JOBS=$variant_jobs" -e CUTEAFD_EXPORT_WORKER_RAM_MIB=4096 -e CUTEAFD_EXPORT_HOST_CLASS=remote -e CUTEAFD_EXPORT_HOST_SLOT_DIR=/export-slots -e "CUTEAFD_EXPORT_HOST_WORKERS=$cores" \
     --env-file "$area/scope.env" -e "CMAKE_BUILD_PARALLEL_LEVEL=$ninja_jobs" -e "CUTEAFD_EXPORT_JOBS=$variant_jobs" -e CUTEAFD_WIP_NATIVE_STORE=/wip/build/native-store \
+    -v "$HOME/.cache/cuteafd/export-cache/x86_64:/opt/cuteafd-export-cache" -e CUTEAFD_EXPORT_CACHE=/opt/cuteafd-export-cache \
     -v "$HOME/.cache/cuteafd/export-workers:/export-slots" -v "$root/src:/wip/source" -v "$root/build:/wip/build" -v "$root/output:/wip/output" -v "$root/home:/wip/home" \
     "$image" /wip/source/scripts/build/build-wip-artifacts.sh \
     /wip/source coordinator "$arch" /wip/build/coordinator /wip/output/coordinator export || status=$?

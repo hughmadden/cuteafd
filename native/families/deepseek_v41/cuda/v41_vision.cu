@@ -1,3 +1,5 @@
+#include "memory_failure.h"
+#include "blas_owner.h"
 #include "cuteafd_v41_vision.h"
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
@@ -10,7 +12,7 @@ namespace {
 using B = __nv_bfloat16;
 constexpr uint64_t workspace_bytes=4*1024*1024;
 constexpr int max_rows=9216, heads=16, channels=1024, tile=128;
-struct Handle { cublasHandle_t blas; void* workspace; int device; };
+struct Handle { std::shared_ptr<cuteafd::BlasOwner> owner; cublasHandle_t blas; void* workspace; int device; };
 int status(cublasStatus_t s) { return s==CUBLAS_STATUS_SUCCESS?0:-int(s); }
 bool valid(const void* p,uint64_t bytes,int alignment) {
   auto address=reinterpret_cast<uintptr_t>(p);
@@ -23,8 +25,8 @@ bool apart(const void* a,uint64_t na,const void* b,uint64_t nb) {
 int bind(Handle* h,void* stream) {
   int device;auto result=cudaGetDevice(&device);if(result)return result;
   if(device!=h->device)return cudaErrorInvalidDevice;
-  auto s=cublasSetStream(h->blas,reinterpret_cast<cudaStream_t>(stream));if(s)return status(s);
-  return status(cublasSetWorkspace(h->blas,h->workspace,workspace_bytes));
+  return status(cuteafd::bind_blas(h->owner,reinterpret_cast<cudaStream_t>(stream),
+      h->workspace,workspace_bytes,CUBLAS_MATH_DISALLOW_REDUCED_PRECISION_REDUCTION));
 }
 __device__ float sum(float x) {
   for(int d=16;d;d>>=1)x=__fadd_rn(x,__shfl_down_sync(0xffffffff,x,d));return x;
@@ -127,14 +129,13 @@ extern "C" int32_t cuteafd_v41_vision_create(void* workspace,uint64_t bytes,void
   if(bytes<workspace_bytes || !valid(workspace,workspace_bytes,256))return cudaErrorInvalidValue;
   auto* h=new(std::nothrow)Handle{};if(!h)return cudaErrorMemoryAllocation;
   auto result=cudaGetDevice(&h->device);if(result){delete h;return result;}
-  auto s=cublasCreate(&h->blas);if(s){delete h;return status(s);}
-  s=cublasSetMathMode(h->blas,CUBLAS_MATH_DISALLOW_REDUCED_PRECISION_REDUCTION);
-  if(s){cublasDestroy(h->blas);delete h;return status(s);}
+  auto s=cuteafd::borrow_blas(false,h->owner,"v41/blas/media");if(s){delete h;return status(s);}
+  h->blas=h->owner->gemm;
   h->workspace=workspace;*output=h;return 0;
 }
 extern "C" int32_t cuteafd_v41_vision_destroy(void* opaque) {
   if(!opaque)return cudaErrorInvalidValue;auto* h=static_cast<Handle*>(opaque);
-  auto s=cublasDestroy(h->blas);delete h;return status(s);
+  delete h;return 0;
 }
 extern "C" int32_t cuteafd_v41_vision_linear(void* opaque,const uint16_t* x,const uint16_t* w,
     const uint16_t* bias,float* scratch,uint16_t* y,int rows,int in,int out,void* stream) {

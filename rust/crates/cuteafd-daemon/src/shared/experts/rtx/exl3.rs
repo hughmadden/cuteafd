@@ -20,6 +20,7 @@ use std::{
     path::{Path, PathBuf},
     rc::Rc,
 };
+use crate::shared::memory::Tag;
 
 /// Exclusive to one rank's serialized stream; all capacities share one scratch arena.
 pub(crate) struct Exl3Tp2<'a> {
@@ -183,6 +184,7 @@ fn validate_shard_package(package: &Path, rows: usize, policy: Exl3RowPolicy,
             cuteafd_core::FfnActivation::SiluBf16Product { .. } => "silu",
             cuteafd_core::FfnActivation::SiluPostClampFp32Product { .. } => "silu_post_clamp",
             cuteafd_core::FfnActivation::Situ { .. } => "situ",
+            cuteafd_core::FfnActivation::SwigluOai { .. } => "swigluoai",
         };
         // The exporter omits the activation key only for its ordinary SiLU default.
         let exported_activation = match meta.get("activation") {
@@ -258,8 +260,8 @@ impl<'a> Exl3Tp2<'a> {
             Exl3ReductionPlan::new(&paths)?;
         }
         Ok([Exl3Workspace::plan(&paths, Self::INPUT_FORMAT, Exl3Epilogue::Sum)?,
-            max_rows.checked_mul(hidden).and_then(|n| n.checked_mul(4))
-                .context("EXL3 TP2 output overflow")?])
+            usize::try_from(cuteafd_loader::serving_capacity::exl3_rtx_output_bytes(
+                max_rows as u64, hidden as u64)?)?])
     }
 
     /// Loads each layer's two slices concurrently before advancing to the next
@@ -399,19 +401,15 @@ impl<'a> Exl3Tp2<'a> {
             remaining[rank] = budgets[rank]
                 .checked_sub(workspace_bytes[rank])
                 .context("EXL3 TP2 workspace exceeds budget")?;
-            let mut used = workspace_bytes[rank];
-            for &layer in &layers {
-                let plan = Exl3Weights::plan(catalog, ExpertLayer::BackboneTp2 { layer, rank })?;
-                used = used
-                    .checked_add(plan.resident_bytes)
-                    .context("EXL3 TP2 resident overflow")?;
-                ensure!(
-                    used.checked_add(plan.device_staging_bytes)
-                        .context("EXL3 TP2 peak overflow")?
-                        <= budgets[rank],
-                    "EXL3 TP2 rank {rank} weights + workspace + staging exceed budget"
-                );
-            }
+            let plans = layers.iter().map(|&layer|
+                Exl3Weights::plan(catalog, ExpertLayer::BackboneTp2 { layer, rank }))
+                .collect::<Result<Vec<_>>>()?;
+            let layout = crate::shared::experts::weight_layout::layout(devices[rank].id, "exl3",
+                crate::shared::experts::exl3::regions(catalog,
+                    layers.iter().map(|&layer| ExpertLayer::BackboneTp2 { layer, rank }))?)?;
+            crate::shared::experts::weight_layout::admit(&layout,
+                plans.iter().map(|p| p.device_staging_bytes).max().unwrap_or(0),
+                workspace_bytes[rank], budgets[rank])?;
         }
         let unloaded = [
             devices[0].own(|| Ok(Rc::new(Vec::with_capacity(layers.len()))))?,
@@ -449,42 +447,33 @@ impl<'a> Exl3Tp2<'a> {
             }
             ranks
         } else if std::env::var("CUTEAFD_TP2_SHARED_READ").as_deref() == Ok("0") {
-            let remaining = std::cell::RefCell::new(remaining);
-            load_layer_pairs(
-                ranks,
-                layers.clone(),
-                |layer| {
-                    let available = *remaining.borrow();
-                    // SAFETY: fresh GPU owners only; load drains all uploads and
-                    // DeviceOwner drops on the owning GPU, including partial errors.
-                    unsafe {
-                        cuteafd_ffi::synchronized_load::load_pair(|rank| {
-                            devices[rank].own(|| {
-                                let _memory_scope = cuteafd_ffi::memory_ledger::scope_owned(&label);
-                                Ok(vec![Exl3Weights::load(
-                                    devices[rank].library,
-                                    catalog,
-                                    ExpertLayer::BackboneTp2 { layer, rank },
-                                    available[rank],
-                                )?])
-                            })
-                        })
+            // SAFETY: each thread creates and drains its own fresh rank backing. No
+            // pre-existing Rc arena crosses synchronized_load's boundary.
+            let pair = unsafe {
+                cuteafd_ffi::synchronized_load::load_pair(|rank| devices[rank].own(|| {
+                    let _memory_scope = cuteafd_ffi::memory_ledger::scope_owned(&label);
+                    let arena = crate::shared::experts::exl3::arena(devices[rank], catalog,
+                        layers.iter().map(|&layer| ExpertLayer::BackboneTp2 { layer, rank }))?;
+                    let mut remaining = remaining[rank];
+                    let mut loaded = Vec::with_capacity(layers.len());
+                    for &layer in &layers {
+                        let weight = Exl3Weights::load_into(devices[rank].library, catalog,
+                            ExpertLayer::BackboneTp2 { layer, rank }, remaining, &arena)?;
+                        remaining -= weight.budget.resident_bytes;
+                        loaded.push(weight);
                     }
-                },
-                |owner, mut loaded, rank| {
-                    remaining.borrow_mut()[rank] -= loaded[0].budget.resident_bytes;
-                    devices[rank].run(|| {
-                        Rc::get_mut(
-                            Rc::get_mut(&mut owner.weights)
-                                .expect("unpublished device owner")
-                                .get_mut(),
-                        )
-                        .expect("unpublished EXL3 rank")
-                        .append(loaded.get_mut());
-                        Ok(())
-                    })
-                },
-            )?
+                    Ok(loaded)
+                }))
+            }?;
+            let mut ranks = ranks;
+            for (rank, mut loaded) in pair.into_iter().enumerate() {
+                devices[rank].run(|| {
+                    Rc::get_mut(Rc::get_mut(&mut ranks[rank].weights).expect("unpublished device owner").get_mut())
+                        .expect("unpublished EXL3 rank").append(loaded.get_mut());
+                    Ok(())
+                })?;
+            }
+            ranks
         } else {
             let pair = Exl3Weights::load_tp2_pair(devices, catalog, &layers, remaining)?;
             let mut ranks = ranks;
@@ -587,12 +576,11 @@ impl<'a> Exl3Tp2<'a> {
         validate_whole_package(package, max_rows, row_policy, selection, geometry)?;
         let plans = layers.iter().map(|&layer| Exl3Weights::plan(catalog,
             ExpertLayer::BackboneFull { layer })).collect::<Result<Vec<_>>>()?;
-        let mut used = workspace_bytes;
-        for plan in &plans {
-            used = used.checked_add(plan.resident_bytes).context("EXL3 whole resident overflow")?;
-            ensure!(used.checked_add(plan.device_staging_bytes).context("EXL3 whole peak overflow")?
-                <= budget, "EXL3 whole weights + workspace + staging exceed admitted budget");
-        }
+        let layout = crate::shared::experts::weight_layout::layout(device.id, "exl3",
+            crate::shared::experts::exl3::regions(catalog,
+                layers.iter().map(|&layer| ExpertLayer::BackboneFull { layer }))?)?;
+        crate::shared::experts::weight_layout::admit(&layout,
+            plans.iter().map(|p| p.device_staging_bytes).max().unwrap_or(0), workspace_bytes, budget)?;
         let label = format!("experts/whole expert layers {layers:?}");
         let weights = device.own(|| {
             let _scope = cuteafd_ffi::memory_ledger::scope_owned(&label);
@@ -607,11 +595,13 @@ impl<'a> Exl3Tp2<'a> {
                     weights
                 }
                 None => {
+                    let arena = crate::shared::experts::exl3::arena(device, catalog,
+                        layers.iter().map(|&layer| ExpertLayer::BackboneFull { layer }))?;
                     let mut weights = Vec::with_capacity(layers.len());
                     let mut remaining = budget.checked_sub(workspace_bytes).context("EXL3 whole workspace exceeds budget")?;
                     for &layer in &layers {
-                        let weight = Exl3Weights::load(device.library, catalog,
-                            ExpertLayer::BackboneFull { layer }, remaining)?;
+                        let weight = Exl3Weights::load_into(device.library, catalog,
+                            ExpertLayer::BackboneFull { layer }, remaining, &arena)?;
                         remaining -= weight.budget.resident_bytes;
                         weights.push(weight);
                     }
@@ -663,6 +653,7 @@ impl<'a> Exl3Tp2<'a> {
                         self.device.library,
                         &[self.device.id],
                         &format!("exl3-package-m{capacity}"),
+                        Default::default(),
                     )?;
                     ensure!(
                         execution.capacity() == capacity as usize
@@ -675,7 +666,7 @@ impl<'a> Exl3Tp2<'a> {
         })?);
         self.output = Some(Allocation::new(
             self.device,
-            output_bytes(self.geometry, self.max_rows)?,
+            output_bytes(self.geometry, self.max_rows)?, Tag::workspace("experts/rtx-exl3-output")
         )?);
         Ok(())
     }
@@ -785,6 +776,20 @@ impl Exl3Tp2<'_> {
 }
 
 impl RtxExpertLayer for Exl3Tp2<'_> {
+    fn allocation_receipts(&self, inventory: &mut crate::shared::memory::receipts::Inventory<'_>,
+        name: &str) -> Result<()> {
+        for (index, weight) in self.weights.iter().enumerate() {
+            weight.allocation_receipts(inventory, &format!("{name}.weight.{}", self.layers[index]))?;
+        }
+        if let Some(executions) = &self.executions {
+            for (index, execution) in executions.iter().enumerate() {
+                execution.allocation_receipts(inventory, &format!("{name}.execution.{index}"))?;
+            }
+        }
+        if let Some(output) = &self.output { inventory.device(&format!("{name}.output"), output.buffer)?; }
+        Ok(())
+    }
+
     fn shard(&self) -> RtxShard {
         self.shard
     }

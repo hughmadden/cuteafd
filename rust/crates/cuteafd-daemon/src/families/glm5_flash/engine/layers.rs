@@ -74,6 +74,8 @@ struct Bindings<'e, 'a, 'c> {
     owners: Vec<Owners>,
     lane: usize,
     rows: usize,
+    logit_rows: usize,
+    head: bool,
     graphed: bool,
     tap: (usize, usize, usize),
     on_layer: Option<&'c mut dyn FnMut(usize, &[u8]) -> Result<()>>,
@@ -159,20 +161,15 @@ impl<'a> GlmfEngine<'a> {
         on_layer: Option<&mut dyn FnMut(usize, &[u8]) -> Result<()>>)
         -> Result<Option<DeviceLogits>> {
         ensure!(!graphed || on_layer.is_none(), "layer callbacks must run outside capture");
-        if graphed {
-            self.release_retired_graphs()?;
-            if self.embedding.device_gather() { self.gather_streams(w, rows)?; }
-        }
+        if graphed && self.embedding.device_gather() { self.gather_streams(w, rows)?; }
         let mut bindings = [Bindings { unit: None, engine: self, work: [w, w1], tables: [tables, tables1],
             owners: self.layer_owners(), lane: 0, rows, graphed, on_layer, prepared: Cell::new(None),
+            logit_rows, head: graphed && self.weights.layers.len() == self.cfg.layers && logit_rows == rows,
             tap: (rows.saturating_sub(crate::shared::speculation::dflash::TAP_ROWS),
                 rows.min(crate::shared::speculation::dflash::TAP_ROWS), 0) }];
         self.layer_pipeline(scope, &mut bindings)?;
         if self.weights.layers.len() < self.cfg.layers { self.synchronize()?; return Ok(None); }
-        self.run("head", &[("streams", w.streams[0].buffer.ptr), ("weight", self.weights.norm.buffer.ptr),
-            ("out", w.x.buffer.ptr)], &[Scalar::I32(rows as i32)])?;
-        self.logits(w, rows, logit_rows, tables.decode)?;
-        Ok(Some(self.device_logits(w, logit_rows, false)))
+        Ok(Some(self.device_logits(w, logit_rows, bindings[0].head)))
     }
 
     fn unit_binding<'s>(&'s self, work: [&'s Workspace<'a>; 2],
@@ -181,7 +178,7 @@ impl<'a> GlmfEngine<'a> {
         let window = total.saturating_sub(crate::shared::speculation::dflash::TAP_ROWS);
         let from = unit.rows.start.max(window).min(unit.rows.end);
         Bindings { unit: Some(unit), engine: self, work, tables: [&tables[0], &tables[1]], owners: self.layer_owners(),
-            lane: unit.slot, rows: unit.rows.len(), graphed: false, on_layer: None,
+            lane: unit.slot, rows: unit.rows.len(), logit_rows: 0, head: false, graphed: false, on_layer: None,
             prepared: Cell::new(prepared), tap: (from - unit.rows.start, unit.rows.end - from,
                 from.saturating_sub(window)) }
     }
@@ -266,7 +263,7 @@ impl Bindings<'_, '_, '_> {
             let attended = if layer.attention_share.split() { self.meet(rank, index)? } else { w.delta.buffer.ptr };
             e.post_pre_on(rank, w, attended, 0, layer, "ffn", "post_norm", rows, self.cap())
         };
-        if self.graphed { e.replay_on(rank, GraphKey::new(index, self.rows, self.tables[rank]), body) } else { body() }
+        if self.graphed && active { e.replay_on(rank, GraphKey::new(index, self.rows, self.tables[rank]).normalized(Some(layer.attention)), body) } else { body() }
     }
 
     fn meet(&self, rank: usize, layer: usize) -> Result<*mut c_void> {
@@ -317,11 +314,22 @@ impl Bindings<'_, '_, '_> {
         let body = || {
             let out = e.meet_ffn(w, last, self.lane, last + 1, self.rows)?;
             e.mhc_post_at(w, out, 1, &Span { first: 0, rows: self.rows })?;
-            self.tap(last)
+            self.tap(last)?;
+            if self.head {
+                e.normalize_head(w, self.rows)?;
+                e.logits(w, self.rows, self.rows, self.tables[0].decode)?;
+                e.select_greedy(w, self.rows)?;
+            }
+            Ok(())
         };
-        if self.graphed { e.replay(GraphKey::new(last + 1, self.rows, self.tables[0]), body)?; } else { body()?; }
+        if self.head { e.replay(GraphKey::new(last + 1, self.rows, self.tables[0]).normalized(None), body)?; } else { body()?; }
         e.replicate_terminal(w, self.work[1], 0, self.rows)?;
-        self.completed_layer(last)
+        self.completed_layer(last)?;
+        if !self.head && last + 1 == e.cfg.layers {
+            e.normalize_head(w, self.rows)?;
+            e.logits(w, self.rows, self.logit_rows, self.tables[0].decode)?;
+        }
+        Ok(())
     }
 }
 
@@ -375,7 +383,8 @@ impl PipelineKernels for Bindings<'_, '_, '_> {
         let [w, w1] = self.work;
         let layer = self.layer(0, index);
         let peer = self.layer(1, index);
-        let real = if self.tables[0].decode && e.startup_graphs { self.tables[0].real_rows } else { self.rows };
+        let real = if self.tables[0].decode && e.use_graphs && !e.warming_graphs.get() {
+            self.tables[0].real_rows } else { self.rows };
         let rows = Scalar::I32((if layer.dense { self.rows } else { real }) as i32);
         let masked = self.graphed && e.warming_graphs.get() && !layer.dense;
         ensure!(masked || layer.dense || real > 0, "per-layer MoE needs positive real rows");
@@ -419,7 +428,8 @@ impl PipelineKernels for Bindings<'_, '_, '_> {
     fn finish_ffn(&mut self, index: usize, ticket: Ticket) -> Result<()> {
         ensure!(ticket.layer == index && ticket.lane == self.lane, "per-layer FFN ticket identity");
         let e = self.engine;
-        let real = if self.tables[0].decode && e.startup_graphs { self.tables[0].real_rows } else { self.rows };
+        let real = if self.tables[0].decode && e.use_graphs && !e.warming_graphs.get() {
+            self.tables[0].real_rows } else { self.rows };
         if ticket.spark {
             let Some(Experts::Spark { transport }) = e.routed_experts(index) else { anyhow::bail!("Spark ticket backend changed"); };
             let wave = e.layer_waves.borrow_mut()[self.lane].take().context("retained Spark wave")?;
@@ -496,7 +506,7 @@ mod tests {
             row_bytes: 32, rows: 8, lanes: lanes as u64, entry_gpu: 0,
             head_gpu: 0, terminal: TerminalHome::Replicated };
         let placement = Placement { expert_tier: None, pool_tokens: 0, pool_limits: cuteafd_loader::placement::PoolLimits(vec![]), attention_placement: AttentionPlacement::Layers,
-            attention_by_kind: vec![], peer_row_bytes: 0, onboard_layers: 0, max_pool_tokens_no_onboard: 0,
+            attention_by_kind: vec![], peer_row_bytes: 0, onboard_layers: 0, max_pool_tokens_no_onboard: None,
             layers: modes.iter().map(|&mode| LayerAssignment { mode, experts: ExpertHome::Dense }).collect(),
             movables: vec![], expert_ranges: vec![], residual: residual_homes(modes, &spec).unwrap(),
             tp2: None, items: vec![], hops: plan_hops(modes, &spec).unwrap() };
@@ -517,6 +527,24 @@ mod tests {
                 assert!(validate_attention_shares(&execution, shares[..2].iter().copied(), rank, 2).is_err());
             }
         }
+    }
+
+    #[test]
+    fn small_segments_stay_eager_and_full_head_is_inside_the_tail() {
+        let source = include_str!("layers.rs");
+        let segment = source.split("fn segment(&self").nth(1).unwrap().split("fn meet(").next().unwrap();
+        assert!(segment.contains("self.graphed && active"));
+        assert!(segment.find("e.meet_ffn(").unwrap() < segment.find("if !active").unwrap());
+        let finish = source.split("fn finish(&mut self) -> Result<()>").nth(1).unwrap()
+            .split("impl LayerKernels").next().unwrap();
+        for launch in ["e.normalize_head(w, self.rows)", "e.logits(w, self.rows, self.rows",
+            "e.select_greedy(w, self.rows)"] {
+            assert!(finish.find(launch).unwrap() < finish.find("e.replay(").unwrap());
+        }
+        assert!(finish.contains("if self.head { e.replay("));
+        assert!(finish.find("e.replicate_terminal(").unwrap() < finish.find("self.completed_layer(").unwrap());
+        let engine = include_str!("../engine.rs");
+        assert!(engine.contains("if index == layers.len() && !head { segment()?; }"));
     }
 
     #[test]

@@ -1,6 +1,7 @@
 """CPU contracts for GLM's ABI2 tower qualification; no CUDA imports."""
 import ctypes
 import importlib.util
+import re
 from pathlib import Path
 
 import numpy as np
@@ -131,16 +132,56 @@ def test_glm_memory_diagnostics_do_not_change_cuda_state():
 
 
 def test_blas_handle_diagnostics_log_only_after_successful_creation():
-    source = (ROOT / "native/shared/cuda/linear.cu").read_text()
-    logging = source.split("void log_blas_handle_created(", 1)[1].split("cuteafd_status_t cublas_handle", 1)[0]
-    assert "pthread_getname_np" in logging
-    assert "configured_workspace=runtime-default configured_workspace_bytes=unknown" in logging
-    assert "cuda" not in logging and "cublas" not in logging
-    blas = source.split("cuteafd_status_t cublas_handle(", 1)[1].split("\n}", 1)[0]
-    assert blas.index("cublasCreate(&handle)") < blas.index("return status_from_cublas(status)") < blas.index('log_blas_handle_created("cublas")')
-    assert "static thread_local" in blas
-    assert "cublasSetWorkspace" not in blas
+    owner = (ROOT / "native/shared/include/blas_owner.h").read_text()
+    assert "pthread_getname_np" in owner and "SYS_gettid" in owner
+    assert "thread_id=%ld thread_name=%s owner=%p" in owner
+    assert 'if (status == CUBLAS_STATUS_SUCCESS) owner->log("create", tensor ? "lt" : "gemm")' in owner
+    assert 'cuteafd_tag_check(CUTEAFD_MEMORY_KIND_WORKSPACE, allocation_owner)' in owner
+    assert 'kind=workspace allocation_owner=%s' in owner
+    assert "static thread_local" in owner
+    bind = owner.split("inline cublasStatus_t bind_blas(", 1)[1]
+    assert bind.index("cublasSetStream") < bind.index("cublasSetWorkspace")
+    assert "cublasSetMathMode" in bind and "cublasSetAtomicsMode" in bind
+    linear = (ROOT / "native/shared/cuda/linear.cu").read_text()
+    assert "blas_workspace device=%d thread_id=%ld stream=%p bytes=%zu ptr=%p" in linear
+    assert "constexpr size_t kLinearBlasWorkspace = 4 << 20" in linear
+    assert "CUTEAFD_TRACK_ALLOC" in linear and "CUTEAFD_TRACK_FREE" in linear
 
+
+def test_blas_borrowers_include_the_pool_header_directly():
+    borrowers = [path for path in (ROOT / "native").rglob("*.cu")
+                 if "cuteafd::borrow_blas(" in path.read_text()]
+    assert borrowers
+    for path in borrowers:
+        assert '#include "blas_owner.h"' in path.read_text(), str(path.relative_to(ROOT))
+
+
+def test_generic_linear_blas_remains_outside_serving():
+    # A serving caller needs pre-Ready preparation and named pool/scratch owners.
+    forbidden = (".linear_bf16(", "cuteafd_cuda_linear_bf16", "cuteafd_cuda_mla_scalar_qa_batched_norm_candidate_async",
+                 "cuteafd_cuda_dspark_terminal_greedy_bf16_async")
+    for path in (ROOT / "rust/crates/cuteafd-daemon/src").rglob("*.rs"):
+        source = path.read_text()
+        assert not any(symbol in source for symbol in forbidden), str(path.relative_to(ROOT))
+
+
+def test_glmf_blas_owners_follow_resolved_head_not_checkpoint_dtype():
+    module = (ROOT / "rust/crates/cuteafd-daemon/src/families/glm5_flash/mod.rs").read_text()
+    runtime = module.split("blas_head: args.resolved_target_head().blas_head(", 1)[1].split("representation, resident", 1)[0]
+    assert '!self.native && (core.get_weight("lm_head").is_none() && !core.native.contains_key("lm_head"))' in runtime
+    assert "representation.head == head::GlmfHeadFormat::Bf16" in runtime
+    layout = (ROOT / "rust/crates/cuteafd-loader/src/plan/layout/glm5_flash.rs").read_text()
+    assert layout.index("representation.head.resolve(") < layout.index("blas_head:")
+    selection = layout.split("blas_head:", 1)[1].split("resident, workspace", 1)[0]
+    assert 'exlr8.is_some() || core.get_weight("lm_head").is_some()' in selection
+    assert "representation.head != resident::GlmfHeadFormat::Bf16" in selection
+    engine = (ROOT / "rust/crates/cuteafd-daemon/src/families/glm5_flash/engine.rs").read_text()
+    assert "native_head: head.bf16().is_none()" in engine
+    assert "head: if shape.lead && !self.native_head" in engine
+    draft = engine.split("pub fn draft_head(", 1)[1].split("/// Launches", 1)[0]
+    packed = draft.split("packed @ GlmfHead::Packed", 1)[1]
+    assert "TargetHead::Launch" in packed and "launch_packed(" in packed
+    assert "rows, true, None, stream" in packed
 
 
 def test_glm_text_cold_replay_uses_serving_decode_not_eager_scoring():
@@ -163,11 +204,11 @@ def test_glm_serving_admits_and_precreates_all_reachable_workspaces():
     # Every workspace buffer comes from the loader's arithmetic, which the reserve charges: a lane's
     # own buffers over its GPU's shared temporaries.
     temporaries = source.split("fn temporaries(", 1)[1].split("fn lane(", 1)[0]
-    assert "glmf_temporary_bytes(" in temporaries and "self.alloc(bytes.scratch)" in temporaries
+    assert "glmf_temporary_bytes(" in temporaries and "self.alloc(bytes.scratch, tag)" in temporaries
+    assert 'let tag = Tag::workspace("glmf/temporaries")' in temporaries
     lane = source.split("fn lane(", 1)[1].split("/// ModelOpt NVFP4 dense MLPs", 1)[0]
     assert "glmf_lane_bytes(" in lane and "streams: [alloc(bytes.streams)?" in lane
-    reserve = source.split("pub(crate) fn workspace_reserve(", 1)[1].split("/// The prefill lanes a serving engine", 1)[0]
-    assert "plan.workspace_bytes(" in reserve and "workspace_reserve_bytes(" in reserve
+    assert "fn workspace_reserve(" not in source
     prepare = source.split("pub fn prepare_serving_workspaces(", 1)[1].split("/// Capture the complete", 1)[0]
     for required in ("self.decode_workspace_of(rank)", "self.pipelined()", "self.prefill_waves",
                      "self.prefill_slots_of(rank, lanes)", "drafter.prepare_workspace()", "self.synchronize()"):
@@ -175,25 +216,30 @@ def test_glm_serving_admits_and_precreates_all_reachable_workspaces():
     # Scoring (`--full-prefill-logits`) precreates the same lanes: a serial prefill runs in lane 0.
     scoring = source.split("pub fn prepare_scoring_prefill(", 1)[1].split("fn step_plan(", 1)[0]
     assert "self.prefill_slots_of(rank, lanes)" in scoring and "self.workspace(" not in scoring
-    # The per-workspace runtime allowance is the loader's shared definition; where the measured
-    # loaded code covers it (`placement::inventory::LOADED_CODE`) the reserve charges that instead.
+    # Retained handles are named owners, not a mixed per-workspace residual.
     graphs = (ROOT / "rust/crates/cuteafd-loader/src/serving_capacity/glmf_graphs.rs").read_text()
-    assert "WORKSPACE_RUNTIME_OVERHEAD_BYTES: u64 = 72 << 20" in graphs
-    assert "measured/calibrated allowance is not exact cuBLAS allocator ownership" in source
+    assert "WORKSPACE_RUNTIME_OVERHEAD_BYTES" not in graphs
+    admission = (ROOT / "rust/crates/cuteafd-loader/src/placement/families/glm5_flash/admission.rs").read_text()
+    assert 'p::serving::blas_components("sm_120"' in admission
+    search = (ROOT / "rust/crates/cuteafd-loader/src/placement/planner/search.rs").read_text()
+    solve = search.split("pub fn solve(", 1)[1]
+    assert solve.index("recipe.prepare(&request)?") < solve.index("contract.add_driver_page_tables()")
+    assert solve.index("contract.add_driver_page_tables()") < solve.index("apply_reserve_override(")
     assert "kda.in[24896|12576,4096]" in source
     module = (root / "glm5_flash/mod.rs").read_text()
-    gathering = module.split("fn admit(", 1)[1].split("pub fn with_engine", 1)[0]
-    admission = gathering.index("admission::solve_attention_working_set_with_graphs(")
-    for required in ("RuntimeInventory::measure(", "pending_code(", "resident_weights(",
-                     "admission::step_workspace_demands(", "admission::startup_graphs("):
-        assert gathering.index(required) < admission
-    assert "representation, resident, workspace, local_workspace, graphs" in gathering
-    assert "alternate_resident.as_deref()" in gathering
-    assert '"attention_first_owner": attention.first_owner' in gathering
-    assert "placed_attention(attention, &placement)" in gathering
     opening = module.split("pub fn with_engine", 1)[1]
-    assert opening.index("self.admit(") < opening.index("TokenEmbedding::load(")
-    assert "admitted_graphs.lifetime" in opening
+    inventory = opening.index("self.admission_inventory(")
+    allocation = opening.index("TokenEmbedding::load_with(")
+    assert opening.count("self.admission_inventory(") == 1
+    assert inventory < opening.index("self.admit_candidate(")
+    assert all(inventory < start < allocation for start in (
+        match.start() for match in re.finditer(r"self\.admit_candidate\(", opening)))
+    # The charged per-device reserve configures the shared cache and the startup set warms it;
+    # each rank carries its own traced base and the fixed allocation tail behind its charge.
+    flat = " ".join(opening.split())
+    assert ("engine.configure_graph_cache(&admitted_graphs.charged, &admitted_graphs.reserves, "
+            "&admitted_graphs.bootstraps, admitted_graphs.extra)?") in flat
+    assert "engine.warm_decode_graphs(sequences.min(args.decode_rows), speculation)?" in opening
     assert 'full_prefill_logits_bytes(' not in opening
     startup = opening.index("let result = with_startup_graphs(")
     assert opening.index("engine.prepare_serving_workspaces()") < startup
@@ -210,7 +256,9 @@ def test_glm_serving_admits_and_precreates_all_reachable_workspaces():
     assert "self.reset_context(0, 0)?" in prime
     assert "self.reset_context(slot, TAP_ROWS)?" in prime
     assert "self.discard_context(slot)?" in prime
-    assert prime.index("self.prime_metadata()?") < prime.index("self.update(") < prime.index("self.draft_device_with(")
+    assert prime.index("self.prime_metadata()?") < prime.index("self.update(") < prime.index("self.draft_from_rank(")
+    assert prime.index("self.prime_rank(false)?") < prime.index("split.peer.prime_remote()")
+    assert prime.index("split.peer.prime_remote()") < prime.index("split.exchange.add(")
     assert prime.index("self.discard_context(slot)?") < prime.index("self.startup_primed.set(true)")
     assert "prepare_workspace()" not in existing
     assert "prepare_workspace()" not in drafter.split("pub(crate) fn prepare_workspace(", 1)[0]

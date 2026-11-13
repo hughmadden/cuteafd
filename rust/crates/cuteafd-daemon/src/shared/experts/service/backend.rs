@@ -118,8 +118,33 @@ impl<'a> Weights<'a> {
                 }
             }
         }
+        // Payload views omit alignment gaps. Report the retained physical roots
+        // once, for both mount arenas and unchanged ReadyArena push owners.
+        let physical = [library.cuda_get_device()?];
+        let mut inventory = crate::shared::memory::receipts::Inventory::new(
+            cuteafd_loader::placement::planner::CoordinatorDevices::new(&physical)?, "spark",
+            cuteafd_loader::placement::planner::Lifetime::RESIDENT,
+            cuteafd_core::memory_layout::Category::Experts, "expert weights");
+        match self {
+            Self::Full(weights) => for (index, weight) in weights.iter().enumerate() {
+                weight.allocation_receipts(&mut inventory, &format!("layer.{index}"))?;
+            },
+            Self::Exl3(weights) => for (index, weight) in weights.iter().enumerate() {
+                weight.allocation_receipts(&mut inventory, &format!("layer.{index}"))?;
+            },
+            Self::Exlr8(weights) => for (index, weight) in weights.iter().enumerate() {
+                weight.allocation_receipts(&mut inventory, &format!("layer.{index}"))?;
+            },
+            Self::Fp8(groups) => for group in groups {
+                for weight in &group.layers {
+                    weight.allocation_receipts(&mut inventory, &format!("layer.{}", weight.layer))?;
+                }
+            },
+        }
+        let physical = super::super::weight_layout::backing_bytes(&inventory.receipts)?;
+        ensure!(physical >= resident, "Spark physical roots undercount expert payload");
         slices.sort_unstable_by_key(|slice| slice.layer);
-        Ok((resident, slices))
+        Ok((physical, slices))
     }
 
     pub(super) fn validate_ingress(&self, library: &NativeLibrary,
@@ -186,7 +211,6 @@ impl<'a> Weights<'a> {
                 modules.exlr8()?, weights, config, remaining)?),
             Self::Full(weights) => {
                 let mut execution = ExpertWeights::execution_layers(weights, compiled, config.capacity, remaining)?;
-                execution.install_native_group(config.native_group()?)?;
                 execution.install_worker_timing(config.rank)?;
                 Execution::Full(execution)
             }
@@ -215,8 +239,8 @@ impl<'a> Weights<'a> {
                         + Fp8Worker::segment_io_bytes(&group.module, extent, group.bf16_module.is_some())?)
                         .context("expert group workspace overflow"))?;
                 ensure!(workspace <= remaining, "expert worker workspace exceeds the device budget");
-                let scratch = Rc::new(crate::shared::memory::DeviceAllocation::named(library,
-                    scratch_bytes, "experts/workspace/native_scratch")?);
+                let scratch = Rc::new(crate::shared::memory::DeviceAllocation::new(library,
+                    scratch_bytes, crate::shared::memory::tag(crate::shared::memory::MemoryKind::Workspace, "experts/workspace/native_scratch"))?);
                 let mut workers = Vec::with_capacity(experts.len());
                 let mut bindings = Vec::new();
                 for (group, experts) in experts.iter().enumerate() {
@@ -582,9 +606,9 @@ mod admission_tests {
             host: 469_860_352, pinned: 369_098_752 });
         bytes.load(Fp8LayerLoad { resident: 2_214_592_512,
             host: 738_197_504, pinned: 738_197_504 });
-        let headroom = cuteafd_core::memory_layout::SPARK_RUNTIME_RESIDUAL_BYTES as usize;
+        let headroom = cuteafd_core::memory_layout::spark_arena_driver_overhead_bytes(permanent as u64) as usize;
         let peak = permanent + bytes.host + bytes.pinned + headroom;
-        assert_eq!(peak, 104_987_576_320);
+        assert_eq!(peak, permanent + 2 * 738_197_504 + headroom);
         assert!(peak < 100 << 30);
         // The pinned owner from the larger group must survive even if a later
         // group has smaller host buffers.
@@ -618,6 +642,9 @@ pub(super) fn load_fp8<'a>(
     push: Option<&mut std::net::TcpStream>,
 ) -> Result<(Weights<'a>, usize)> {
     ensure!(!groups.is_empty(), "native expert worker has no resident groups");
+    for group in &groups {
+        super::super::fp8::validate_reply_formats(group.tensors.format(), cuteafd_core::spark_reply::requested())?;
+    }
     let mut totals = ExpertGroupBytes::default();
     let mut budgets = Vec::with_capacity(groups.len());
     for group in &groups {
@@ -653,7 +680,7 @@ pub(super) fn load_fp8<'a>(
     ensure!(peak.load_peak <= config.device_budget && peak.serve_peak <= config.device_budget,
         "native expert groups exceed budget: load {} serve {} budget {}",
         peak.load_peak, peak.serve_peak, config.device_budget);
-    admit_worker_peak(library, peak.load_peak, peak.serve_peak)?;
+
     tracing::info!(groups = groups.len(), resident = totals.resident, scratch = totals.scratch,
         host = totals.host, pinned = totals.pinned, workspace, "native expert groups admitted before allocation");
     let mut owners = Vec::with_capacity(groups.len());
@@ -665,6 +692,7 @@ pub(super) fn load_fp8<'a>(
     }
     let pushed = push.map(|stream| super::push_fp8::load(library, catalog, config, &groups,
         totals.resident, stream)).transpose()?.flatten();
+    let mut resident = totals.resident;
     if let Some(layers) = pushed {
         // Match the prepared package groups without ever allocating mount weights.
         for layer in layers {
@@ -675,11 +703,22 @@ pub(super) fn load_fp8<'a>(
     } else {
         // Failed candidates have crossed the all-rank drain barrier. Reuse the
         // original modules; no second package preparation on fallback.
+        let regions = groups.iter().map(|group| super::super::fp8::regions(
+            &group.tensors, &group.layers, config.world, config.rank, group.slicing))
+            .collect::<Result<Vec<_>>>()?.into_iter().flatten().collect::<Vec<_>>();
+        let device = crate::shared::memory::device::Device { library, id: library.cuda_get_device()? };
+        let layout = super::super::weight_layout::layout(device.id, "fp8", regions)?;
+        let peak = spark_admission_budget(config, layout.bytes(), 0, totals.pinned, totals.host, workspace)?;
+        ensure!(peak.load_peak <= config.device_budget && peak.serve_peak <= config.device_budget,
+            "physical expert arena startup peak exceeds configured device budget");
+        admit_worker_peak(library, config.rank, peak.load_peak, peak.serve_peak)?;
+        resident = layout.bytes();
+        let arena = crate::shared::memory::weight_arena::DeviceWeightArena::new(device, layout, cuteafd_core::memory_layout::ArenaTag::experts("experts/spark-mount"))?;
         for (owner, group) in owners.iter_mut().zip(&groups) {
-            owner.load_mount(library, &group.tensors, &group.layers, group.slicing)?;
+            owner.load_mount_into(library, &group.tensors, &group.layers, group.slicing, &arena)?;
         }
     }
-    Ok((Weights::Fp8(owners.into_iter().map(Rc::new).collect()), config.device_budget - totals.resident))
+    Ok((Weights::Fp8(owners.into_iter().map(Rc::new).collect()), config.device_budget - resident))
 }
 
 pub(super) fn load_exl3<'a>(
@@ -733,25 +772,35 @@ pub(super) fn load_exl3<'a>(
     tracing::info!(rank=config.rank, resident_bytes=resident, device_staging_bytes=staging,
         pinned_host_bytes=pinned, read_scratch_bytes=scratch, load_peak_bytes=peak.load_peak,
         serve_peak_bytes=peak.serve_peak, "EXL3 Spark admitted loader peak");
-    admit_worker_peak(library, peak.load_peak, peak.serve_peak)?;
+    ensure!(peak.load_peak <= config.device_budget && peak.serve_peak <= config.device_budget,
+        "physical expert arena startup peak exceeds configured device budget");
+
     if let Some(stream) = push {
         if let Some(weights) = super::push::load(library, catalog, config, &layers, &plans, resident, stream)? {
             return Ok((Weights::Exl3(Rc::new(weights)), config.device_budget - resident));
         }
     }
-    let mut remaining = config.device_budget;
+    let device = crate::shared::memory::device::Device { library, id: library.cuda_get_device()? };
+    let layout = super::super::weight_layout::layout(device.id, "exl3",
+        super::super::exl3::regions(catalog,
+            layers.iter().map(|&layer| config.exl3_selection(layer)).collect::<Result<Vec<_>>>()?)?)?;
+    let peak = spark_admission_budget(config, layout.bytes(), staging, pinned, scratch, workspace)?;
+    ensure!(peak.load_peak <= config.device_budget && peak.serve_peak <= config.device_budget,
+        "physical expert arena startup peak exceeds configured device budget");
+    admit_worker_peak(library, config.rank, peak.load_peak, peak.serve_peak)?;
+    let remaining = config.device_budget.checked_sub(layout.bytes()).context("EXL3 mount arena exceeds budget")?;
+    let arena = crate::shared::memory::weight_arena::DeviceWeightArena::new(device, layout, cuteafd_core::memory_layout::ArenaTag::experts("experts/spark-exl3"))?;
     let weights = crate::shared::experts::load_in_rank_order(&layers, config.rank, |index, layer| {
         let plan = &plans[index];
         let started = std::time::Instant::now();
-        let weight = Exl3Weights::load(
+        let weight = Exl3Weights::load_into(
             library,
             catalog,
             config.exl3_selection(layer)?,
-            remaining,
+            config.device_budget,
+            &arena,
         )?;
-        remaining = remaining
-            .checked_sub(plan.resident_bytes)
-            .context("EXL3 resident budget exhausted")?;
+
         tracing::info!(
             rank = config.rank,
             layer,

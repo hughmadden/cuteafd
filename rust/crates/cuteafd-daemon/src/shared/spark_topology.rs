@@ -1,89 +1,36 @@
-//! CLI-resolved replicated Spark `TP×EP` topology shared by both daemons.
+//! The launched Spark world shared by both daemons, and its checkpoint
+//! qualification.
 //!
 //! The only source of rank identity is
 //! [`cuteafd_transport::expert::SparkTopology`]: this module never
-//! re-derives executor ids, group indices or physical rank maps, so transport,
-//! worker shard selection and coordinator assembly cannot drift apart.
+//! re-derives executor ids or rank maps, so transport, worker shard selection
+//! and coordinator assembly cannot drift apart.
 use anyhow::{ensure, Result};
 use cuteafd_loader::OfficialV41Catalog;
-use cuteafd_transport::expert::{SparkTopology, SparkWorld};
+use cuteafd_transport::expert::SparkWorld;
 
-/// Resolve the opt-in `--spark-tp N --spark-ep M` pair for a command that knows
-/// how many physical Spark ranks were launched.
-///
-/// Both keys are all-or-none: absent selects canonical wire for the pure-TP rank
-/// count, present selects the ownership-aware replicated-group contract. `world` is the
-/// physical rank count (coordinator peers / worker `--world`), and it must equal
-/// `TP * EP` exactly.
-pub(crate) fn resolve(
-    tp: Option<u8>,
-    ep: Option<u8>,
-    world: usize,
-    component: &str,
-) -> Result<Option<SparkTopology>> {
-    let topology = match (tp, ep) {
-        (None, None) => return Ok(None),
-        (Some(tp), Some(ep)) => SparkTopology::new(tp, ep)?,
-        _ => anyhow::bail!(
-            "{component} --spark-tp and --spark-ep must be given together or not at all"
-        ),
-    };
-    ensure!(
-        topology.world_size() == world,
-        "{component} Spark topology {}x{} needs {} physical ranks but {world} were given",
-        topology.tp(),
-        topology.ep(),
-        topology.world_size()
-    );
-    Ok(Some(topology))
+/// The canonical world for the launched physical rank count (coordinator
+/// peers / worker `--world`).
+pub(crate) fn world(ranks: usize) -> Result<SparkWorld> {
+    SparkWorld::canonical(ranks)
 }
 
-/// Resolve the declared wire independently from the physical TP/EP layout.
-/// Omitted CLI keys choose canonical pure TP. No transport derives rank
-/// identities from a fallback.
-pub(crate) fn world(topology: Option<SparkTopology>, ranks: usize) -> Result<SparkWorld> {
-    let world = match topology {
-        Some(topology) => SparkWorld::owned(topology)?,
-        None => SparkWorld::canonical(ranks)?,
-    };
-    ensure!(world.topology().world_size() == ranks,
-        "declared Spark topology {}x{} needs {} physical ranks but {ranks} were given",
-        world.topology().tp(), world.topology().ep(), world.topology().world_size());
-    Ok(world)
-}
-
-/// Check package qualification before admitting any retained world. The native
-/// ownership wire requires native experts; generic programs keep canonical routes.
-pub(crate) fn require_supported(
-    topology: Option<SparkTopology>,
-    catalog: &OfficialV41Catalog,
-) -> Result<()> {
-    if let Some(topology) = topology {
-        ensure!(catalog.fp8().is_none(),
-            "generic expert programs require canonical Spark wire");
-        let nvfp4 = catalog.nvfp4().is_some();
-        ensure!(catalog.exl3().is_none() && (!nvfp4
-                || (topology.ep() == 1 && matches!(topology.tp(), 3 | 4 | 6))),
-            "unsupported Spark ownership wire {}x{} for this checkpoint; NVFP4 on TP3EP1, TP4EP1, TP6EP1 only; EXL3 requires canonical wire",
-            topology.tp(), topology.ep());
-        let geometry = catalog.routed_experts().geometry()?;
-        let family = geometry.family().unwrap_or("v41");
-        ensure!(cuteafd_core::tp_units::spark_package_worlds(family,
-                if nvfp4 { "nvfp4" } else { "mxfp4" }).contains(&(topology.tp() as usize)),
-            "checkpoint has no native Spark width-class recipe for TP{}", topology.tp());
-        SparkWorld::owned(topology)?;
+/// Check the checkpoint's reply formats before admitting any world.
+pub(crate) fn require_supported(catalog: &OfficialV41Catalog) -> Result<()> {
+    if let Some(tensors) = catalog.fp8() {
+        super::experts::fp8::validate_reply_formats(tensors.format(), cuteafd_core::spark_reply::requested())?;
     }
     Ok(())
 }
 
+/// Every rank count in the checkpoint's Spark package range is served on the
+/// canonical wire; the registry, not a per-family list, gates native worlds.
 pub(crate) fn require_wire(world: SparkWorld, catalog: &OfficialV41Catalog) -> Result<()> {
     if catalog.format() == cuteafd_loader::plan::checkpoint::CheckpointFormat::Exlr8 {
-        ensure!(world.ownership_topology().is_none(),
-            "EXLR8 unit ownership requires canonical Spark wire");
         ensure!((1..=8).contains(&world.topology().world_size()), "EXLR8 requires 1..=8 ranks");
         return Ok(());
     }
-    require_supported(world.ownership_topology(), catalog)?;
+    require_supported(catalog)?;
     if catalog.exl3().is_none() && catalog.fp8().is_none() {
         let geometry = catalog.routed_experts().geometry()?;
         let family = geometry.family().unwrap_or("v41");
@@ -111,17 +58,15 @@ pub(crate) fn require_world(world: SparkWorld, catalog: &OfficialV41Catalog, lay
     Ok(())
 }
 
-/// Roles published by the native Spark shard families, for callers that need
-/// the expected role without loading the library. `TP6` is the pure
-/// unreplicated six-rank layout (one disjoint intermediate slice of every
-/// expert per rank); `TP2`/`TP3` are the replicated-group shards. Three-, four-
-/// and six-rank layouts reduce through the native generic N-plane entry point;
-/// admission uses `V41CompactReducer::require_rank_count` on the loaded library
-/// before any allocation or readiness publication, so a missing artifact fails
-/// startup rather than the first request.
+/// Roles published by the native Spark TP shard families, for callers that
+/// need the expected role without loading the library: each rank holds one
+/// disjoint intermediate slice of every expert. Multi-rank layouts reduce
+/// through the native generic N-plane entry point; admission uses
+/// `V41CompactReducer::require_rank_count` on the loaded library before any
+/// allocation or readiness publication, so a missing artifact fails startup
+/// rather than the first request.
 pub(crate) const SPARK_TP2_ROLE: u32 = 5;
 pub(crate) const SPARK_TP3_ROLE: u32 = 6;
-/// Native role id of the pure `TP6EP1` Spark shard family.
 pub(crate) const SPARK_TP6_ROLE: u32 = 7;
 
 #[cfg(test)]
@@ -165,6 +110,7 @@ mod tests {
                 ("dsv4p", "mxfp4") => testing::write_v4_pro_mxfp4_snapshot(&snapshot),
                 ("dsv4p", "exl3") => testing::write_v4_pro_exl3_snapshot(&snapshot),
                 ("kimik3", _) => testing::write_kimi_snapshot(&snapshot, true),
+                ("minimax", "nvfp4") => write_minimax_release_text_snapshot(&snapshot, &source)?,
                 ("muse", _) => testing::write_muse_spark_snapshot(&snapshot, &(0..62).collect::<Vec<_>>()),
                 ("mimo", _) => testing::write_snapshot(&snapshot, &testing::mimo_flash_config(), &testing::mimo_flash_tensors(), None),
                 ("mimof", _) => testing::write_snapshot(&snapshot, &testing::mimo_flash_mopd_config(), &testing::mimo_flash_mopd_tensors(), Some(4)),
@@ -195,7 +141,7 @@ mod tests {
                 ("ml4", _) => testing::write_mistral_large4_snapshot(&snapshot, None, true),
                 _ => anyhow::bail!("missing full launch fixture for covered {key}"),
             }
-            if !matches!(family, "v41" | "kimik3" | "muse" | "ml4") {
+            if !matches!(family, "v41" | "kimik3" | "muse" | "ml4" | "minimax") {
                 expand_eight_rank_fixture(&snapshot)?;
             }
             let catalog = cuteafd_loader::read_expert_catalog(&snapshot)?;
@@ -213,6 +159,8 @@ mod tests {
                 }
                 else { None };
             let options = PlanOptions {
+                // This topology fixture publishes owned-MLA programs, not Context kernels.
+                attention_placement: (family == "kimik3").then_some(cuteafd_loader::placement::AttentionPlacement::Layers),
                 placement: ExpertPlacement::from_spark_ranks(8),
                 draft_ownership: Some(cuteafd_loader::plan::spec::DraftOwnership::None),
                 vision: cuteafd_loader::plan::MediaMode::Off, audio: cuteafd_loader::plan::MediaMode::Off,
@@ -224,6 +172,15 @@ mod tests {
                     ..Default::default() }), ..Default::default()
             };
             let report = testing::BudgetedPlanInput::open(&snapshot)?.plan(&options)?;
+            if key == "minimax:nvfp4" {
+                // When MiniMax becomes servable, replace this refusal witness with the
+                // complete N8 launch/count-cap chain below rather than silently accepting it.
+                assert_eq!(report.runtime, Some(cuteafd_loader::plan::RuntimeStatus::Planned), "{key}: qualify the real launch chain");
+                assert!(!report.wip_launchable(), "{key}: qualify the real launch chain");
+                assert!(report.hints.iter().any(|hint| hint.what
+                    == "planned family has no executable serving admission in this build"),
+                    "{key}: wrong refusal: {:?}", report.hints);
+            }
             // Coverage follows each family's own runtime status: a Planned family must
             // be refused at deployment until it serves; flipping it to Serving puts it
             // through the whole chain below (and requires its launch dispatch).
@@ -231,8 +188,16 @@ mod tests {
                 let refused = DeploymentOptions { rtx_gpus: gpus,
                     peers: (0..8).map(|rank| format!("192.0.2.{}:9100", rank + 1)).collect(),
                     speculator: "off".into(), ..Default::default() };
-                let deployment = DeploymentSpec::from_report(&report, &refused)?;
-                assert!(!report.executable() && !deployment.executable, "{key}: a planned family must be refused at deployment");
+                if key == "minimax:nvfp4" {
+                    // Planned inventory has no admitted expert package to deploy. The
+                    // exact runtime refusal above distinguishes this from a broken plan.
+                    let error = DeploymentSpec::from_report(&report, &refused).unwrap_err();
+                    assert_eq!(error.to_string(), "Spark deployment requires an expert package", "{key}");
+                    assert!(!report.executable(), "{key}: a planned family must be refused at deployment");
+                } else {
+                    let deployment = DeploymentSpec::from_report(&report, &refused)?;
+                    assert!(!report.executable() && !deployment.executable, "{key}: a planned family must be refused at deployment");
+                }
                 eprintln!("N8 launch-chain: {key} planned; refused at deployment");
                 tested.push(key.clone());
                 continue;
@@ -247,7 +212,7 @@ mod tests {
                 .filter(|device| device.kind == cuteafd_core::memory_layout::DeviceKind::Spark).collect::<Vec<_>>();
             assert_eq!(spark_devices.len(), 8, "{key}");
             for device in spark_devices {
-                assert_eq!(device.worker_budget_bytes, 108 << 30, "{key}");
+                assert_eq!(device.worker_budget_bytes, (if family == "muse" { 100 } else { 108 }) << 30, "{key}");
                 assert!(device.worker_budget_bytes <= device.capacity_bytes && device.worker_budget_bytes <= 121 << 30,
                     "{key}: worker ceiling exceeds device capacity");
             }
@@ -267,24 +232,24 @@ print(json.dumps(capture_real_eight_rank_launch(*map(Path, sys.argv[2:]))))
             let argv = captured["argv"].as_array().unwrap().iter().map(|v| v.as_str().unwrap()).collect::<Vec<_>>();
             let cli = crate::cli::Cli::try_parse_from(&argv)?;
             use crate::cli::Commands;
-            let (peers, tp, ep) = match cli.command {
-                Commands::ServeNative(a) => (a.peers.len(), a.spark_tp, a.spark_ep),
-                Commands::ServeDsv4(a) => (a.engine.peers.split(',').count(), None, None),
-                Commands::ServeGlm(a) => (a.engine.peers.as_deref().unwrap().split(',').count(), None, None),
-                Commands::ServeGlmf(a) => (a.engine.peers.as_deref().unwrap().split(',').count(), None, None),
-                Commands::ServeMimo(a) => (a.engine.peers.as_deref().unwrap().split(',').count(), None, None),
-                Commands::ServeKimi(a) => (a.peers.len(), None, None),
+            let peers = match cli.command {
+                Commands::ServeNative(a) => a.peers.len(),
+                Commands::ServeDsv4(a) => a.engine.peers.split(',').count(),
+                Commands::ServeGlm(a) => a.engine.peers.as_deref().unwrap().split(',').count(),
+                Commands::ServeGlmf(a) => a.engine.peers.as_deref().unwrap().split(',').count(),
+                Commands::ServeMimo(a) => a.engine.peers.as_deref().unwrap().split(',').count(),
+                Commands::ServeKimi(a) => a.peers.len(),
                 Commands::ServeMuse(a) => {
                     assert_eq!(family, "muse", "{key}: wrong Muse dispatch");
                     assert_eq!(a.prefill_waves, Some(deployment.prefill_waves as _),
                         "{key}: launch must preserve the admitted prefill wave count");
                     assert_eq!(a.prefill_waves, Some(1), "{key}: fixture requests one prefill lane");
-                    (a.peers.len(), None, None)
+                    a.peers.len()
                 }
                 other => anyhow::bail!("{key}: wrong dispatch {other:?}"),
             };
             assert_eq!(peers, 8, "{key}: lost peers in launch/parse");
-            require_world(world(resolve(tp, ep, peers, "launch-chain")?, peers)?, &catalog)?;
+            require_world(world(peers)?, &catalog)?;
             if family == "v41" {
                 // TP8 retains logical/stored S288: payloads plus coded K32 scales.
                 let (hidden, width, experts) = (5120u64, 288u64, 384u64);
@@ -305,7 +270,45 @@ print(json.dumps(capture_real_eight_rank_launch(*map(Path, sys.argv[2:]))))
                     + 2 * 64 * 5120 * 2) + rows * waves * 5120 * 2
                     + 8 * cuteafd_core::serving_capacity::spark_intake_allocation_bytes(rows * waves * 5120 * 2)?);
             }
-            if family != "kimik3" {
+            if family == "v41" {
+                // Intake is an explicitly estimated PINNED allocation in the
+                // joint contract, not an exact item in the old host ledger.
+                let ledger = report.phase_ledger.as_ref().expect("joint V4.1 physical ledger");
+                let host = ledger.budgets.iter().find(|budget|
+                    budget.locations.contains(&cuteafd_loader::placement::planner::Location::HOST))
+                    .expect("shared host budget");
+                let intake = rows * waves * hidden * 4 * peers as u64 * 3;
+                let router = (rows + 64) * (hidden * 2 + 8 * 8);
+                let staging = (rows + 64) * hidden * 8 + (2 << 20);
+                let ready = ledger.phases.iter().find(|phase| phase.budget == host.id
+                    && phase.phase == cuteafd_loader::placement::planner::Phase::Ready)
+                    .expect("ready host phase");
+                assert_eq!(ready.opaque, intake + router + staging,
+                    "{key}: shared PINNED intake estimate omits a rank or wave");
+                assert!(ledger.phases.iter().all(|phase| phase.owned + phase.opaque <= phase.available));
+            } else if matches!(family, "glm" | "ml4" | "glmf") {
+                // GLM's unified physical ledger admits GPU return reserves;
+                // the deleted ordinary-host ledger is not an allocation owner.
+                // Candidate-invariant coordinator-device intake planes are
+                // named Transport owners; only probe-selected pinned/host
+                // storage stays an allowance envelope.
+                let placement = report.solver_placement.as_ref().expect("shared GLM placement");
+                let planes: Vec<_> = placement.items[0].iter().filter(|item|
+                    item.group == "Spark intake"
+                        && item.category == cuteafd_core::memory_layout::Category::Transport).collect();
+                assert_eq!(planes.len(), 1, "{key}: one admitted prefill endpoint");
+                assert!(planes[0].bytes >= intake, "{key}: device intake omits ranks");
+                let ledger = report.phase_ledger.as_ref().expect("joint physical ledger");
+                assert!(ledger.phases.iter().all(|phase| phase.owned + phase.opaque <= phase.available));
+            } else if matches!(family, "dsv4f" | "dsv4p") {
+                // V4's contract owns its host tier: the eight ranks' pinned link
+                // storage is a host-budget owner in the one solved ledger.
+                let ledger = report.phase_ledger.as_ref().expect("V4 joint physical ledger");
+                assert!(report.host_ledger.is_none(), "{key}: no generic host ledger beside the contract");
+                assert!(ledger.budgets.iter().any(|budget| budget.id == "coordinator host RAM"), "{key}");
+                assert!(ledger.phases.iter().any(|row| row.budget == "coordinator host RAM" && row.owned > 0), "{key}");
+                assert!(ledger.phases.iter().all(|phase| phase.owned + phase.opaque <= phase.available));
+            } else if family != "kimik3" {
                 let host = report.host_ledger.as_ref().expect("full host intake ledger");
                 let (group, expected) = if matches!(family, "mimo" | "mimof" | "mimop") {
                     ("mimo/spark-intake-upper-bound", (rows * waves + 64) * hidden * 2 * 8)
@@ -317,9 +320,9 @@ print(json.dumps(capture_real_eight_rank_launch(*map(Path, sys.argv[2:]))))
                     let prefill = cuteafd_loader::serving_capacity::prefill_waves::PrefillPlan {
                         unit_rows: rows, waves, span_rows: rows * waves,
                     };
-                    let cutoff = Cutoff::with_wide(layout.muse_partial_bf16_max_rows,
+                    let cutoff = Cutoff::with_formats(layout.muse_partial_bf16_max_rows,
                         cuteafd_loader::families::muse_spark::replies::DEFAULT_BF16_MAX_ROWS,
-                        layout.resolved_spark_reply_format(true).into())?;
+                        layout.spark_reply_formats)?;
                     let transport = cuteafd_loader::placement::families::muse_spark::host_transport(
                         &cfg, prefill, cutoff, layout.resolved_state_slots("muse_spark") as usize, peers)?;
                     ("spark-intake", transport.intake)
@@ -344,6 +347,58 @@ print(json.dumps(capture_real_eight_rank_launch(*map(Path, sys.argv[2:]))))
         }
         assert!(!tested.is_empty());
         eprintln!("N8 real config -> launch -> clap -> topology -> intake: {}", tested.join(", "));
+        Ok(())
+    }
+
+    fn write_minimax_release_text_snapshot(snapshot: &std::path::Path, source: &std::path::Path) -> Result<()> {
+        use cuteafd_loader::plan::testing::{t, write_snapshot};
+        let mut config: serde_json::Value = serde_json::from_slice(&std::fs::read(source.join(
+            "rust/crates/cuteafd-loader/src/families/minimax_m3/fixtures/config.json"))?)?;
+        config.as_object_mut().unwrap().remove("vision_config");
+        let mut tensors = vec![
+            t("language_model.model.embed_tokens.weight", "BF16", &[200064, 6144]),
+            t("language_model.lm_head.weight", "BF16", &[200064, 6144]),
+            t("language_model.model.norm.weight", "BF16", &[6144]),
+        ];
+        // Independent release-header recipe: full text depth and all 128 native experts.
+        for layer in 0..60 {
+            let p = format!("language_model.model.layers.{layer}.");
+            for norm in ["input_layernorm", "post_attention_layernorm"] {
+                tensors.push(t(format!("{p}{norm}.weight"), "BF16", &[6144]));
+            }
+            for (name, n, k) in [("q_proj", 8192, 6144), ("k_proj", 512, 6144),
+                ("v_proj", 512, 6144), ("o_proj", 6144, 8192),
+                ("index_q_proj", 512, 6144), ("index_k_proj", 128, 6144)] {
+                let stem = format!("{p}self_attn.{name}");
+                tensors.push(t(format!("{stem}.weight"), "F8_E4M3", &[n, k]));
+                tensors.push(t(format!("{stem}.weight_scale_inv"), "U8", &[n, k / 32]));
+            }
+            for norm in ["q_norm", "k_norm", "index_q_norm", "index_k_norm"] {
+                tensors.push(t(format!("{p}self_attn.{norm}.weight"), "BF16", &[128]));
+            }
+            let (stem, intermediate) = if layer < 3 { ("mlp", 12288) }
+                else { ("block_sparse_moe.shared_experts", 3072) };
+            for (proj, n, k) in [("gate", intermediate, 6144), ("up", intermediate, 6144),
+                ("down", 6144, intermediate)] {
+                let stem = format!("{p}{stem}.{proj}_proj");
+                tensors.push(t(format!("{stem}.weight"), "F8_E4M3", &[n, k]));
+                tensors.push(t(format!("{stem}.weight_scale_inv"), "U8", &[n, k / 32]));
+            }
+            if layer < 3 { continue; }
+            tensors.push(t(format!("{p}block_sparse_moe.gate.weight"), "F32", &[128, 6144]));
+            tensors.push(t(format!("{p}block_sparse_moe.e_score_correction_bias"), "F32", &[128]));
+            for expert in 0..128 {
+                for (proj, n, k) in [("w1", 3072, 6144), ("w3", 3072, 6144), ("w2", 6144, 3072)] {
+                    let stem = format!("{p}block_sparse_moe.experts.{expert}.{proj}");
+                    tensors.push(t(format!("{stem}.weight_packed"), "U8", &[n, k / 2]));
+                    tensors.push(t(format!("{stem}.weight_scale"), "F8_E4M3", &[n, k / 16]));
+                    for scale in ["weight_global_scale", "input_global_scale"] {
+                        tensors.push(t(format!("{stem}.{scale}"), "F32", &[]));
+                    }
+                }
+            }
+        }
+        write_snapshot(snapshot, &config, &tensors, None);
         Ok(())
     }
 
@@ -434,26 +489,30 @@ print(json.dumps(capture_real_eight_rank_launch(*map(Path, sys.argv[2:]))))
             for ranks in 1..=cuteafd_core::MAX_SPARK_WORLD {
                 let canonical = require_world(SparkWorld::canonical(ranks)?, &catalog);
                 assert_eq!(canonical.is_ok(), supported.contains(&ranks), "{family} TP{ranks}: {canonical:?}");
-                if supported.contains(&ranks) {
-                    require_world(SparkWorld::owned(SparkTopology::new(ranks as u8, 1)?)?, &catalog)?;
-                }
-                launch_check(ranks, supported.contains(&ranks), true)?;
+                launch_check(ranks)?;
             }
+        }
+        // V4.1 serves every rank count its MXFP4 package range names on the
+        // canonical wire, the frozen NVFP4 range only its admitted worlds.
+        assert_eq!(cuteafd_core::tp_units::spark_package_worlds("v41", "mxfp4"), [2, 3, 4, 5, 6, 7, 8]);
+        let root = tempfile::tempdir()?;
+        testing::write_v41_nvfp4_snapshot(root.path());
+        let catalog = cuteafd_loader::read_expert_catalog(root.path())?;
+        for ranks in 1..=cuteafd_core::MAX_SPARK_WORLD {
+            let served = require_world(SparkWorld::canonical(ranks)?, &catalog);
+            assert_eq!(served.is_ok(), matches!(ranks, 2 | 3 | 4 | 6), "NVFP4 TP{ranks}: {served:?}");
         }
         Ok(())
     }
 
-    fn launch_check(ranks: usize, supported: bool, owned: bool) -> Result<()> {
+    /// The launcher carries no Spark topology keys: every count passes its
+    /// shell validation and checkpoint recipes are checked by serve.
+    fn launch_check(ranks: usize) -> Result<()> {
         let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
         let output = std::process::Command::new("bash")
-            .args(["-c", "source \"$1/scripts/lib/release-common.sh\"; SPARK_COUNT=$2; SPARK_TP=$3; SPARK_EP=$4; EXPERT_FORMAT=native; SPARKINFER_EXL3=disable; release_validate_spark_topology", "launch-test"])
-            .arg(source).arg(ranks.to_string())
-            .arg(if owned { ranks.to_string() } else { String::new() })
-            .arg(if owned { "1" } else { "" }).output()?;
-        // Launch checks only wire qualification; checkpoint recipes are checked
-        // by serve, so another native family's valid width may pass the shell.
-        let expected = if owned { cuteafd_core::tp_units::spark_ownership_topology(ranks, 1) } else { true };
-        assert_eq!(output.status.success(), expected, "TP{ranks} supported={supported}: {}", String::from_utf8_lossy(&output.stderr));
+            .args(["-c", "source \"$1/scripts/lib/release-common.sh\"; SPARK_COUNT=$2; EXPERT_FORMAT=native; SPARKINFER_EXL3=disable; release_validate_spark_count", "launch-test"])
+            .arg(source).arg(ranks.to_string()).output()?;
+        assert!(output.status.success(), "TP{ranks}: {}", String::from_utf8_lossy(&output.stderr));
         Ok(())
     }
 
@@ -478,38 +537,8 @@ print(json.dumps(capture_real_eight_rank_launch(*map(Path, sys.argv[2:]))))
                 let expected = cuteafd_loader::plan::experts::spark_recipe(&format!("{family}:{format}"), intermediate, ranks).is_ok();
                 let served = require_world(SparkWorld::canonical(ranks)?, &catalog);
                 assert_eq!(served.is_ok(), expected, "{family} TP{ranks}: {served:?}");
-                launch_check(ranks, expected, false)?;
+                launch_check(ranks)?;
             }
-        }
-        Ok(())
-    }
-
-    #[test]
-    fn generic_programs_refuse_ownership_wire() -> Result<()> {
-        use cuteafd_loader::plan::testing::{mimo_flash_config, mimo_flash_tensors, write_snapshot};
-        let root = tempfile::tempdir()?;
-        write_snapshot(root.path(), &mimo_flash_config(), &mimo_flash_tensors(), None);
-        let catalog = cuteafd_loader::read_expert_catalog(root.path())?;
-        let error = require_world(SparkWorld::owned(SparkTopology::NATIVE_TP4_EP1)?, &catalog)
-            .unwrap_err();
-        assert_eq!(error.to_string(), "generic expert programs require canonical Spark wire");
-        Ok(())
-    }
-
-    #[test]
-    fn ownership_refusal_names_requested_and_supported_layouts() -> Result<()> {
-        for exl3 in [false, true] {
-            let root = tempfile::tempdir()?;
-            if exl3 {
-                cuteafd_loader::plan::testing::write_v4_pro_exl3_snapshot(root.path());
-            } else {
-                cuteafd_loader::plan::testing::write_v41_nvfp4_snapshot(root.path());
-            }
-            let catalog = cuteafd_loader::read_expert_catalog(root.path())?;
-            let error = require_supported(Some(SparkTopology::NATIVE_TP2_EP1), &catalog)
-                .unwrap_err().to_string();
-            assert!(error.contains("ownership wire 2x1"), "{error}");
-            assert!(error.contains("NVFP4 on TP3EP1, TP4EP1, TP6EP1"), "{error}");
         }
         Ok(())
     }
@@ -529,80 +558,14 @@ print(json.dumps(capture_real_eight_rank_launch(*map(Path, sys.argv[2:]))))
         Ok(())
     }
 
-    fn topology(tp: u8, ep: u8) -> SparkTopology {
-        SparkTopology::new(tp, ep).unwrap()
-    }
-
     #[test]
-    fn absent_keys_select_canonical_wire() {
-        assert_eq!(resolve(None, None, 4, "serve-native").unwrap(), None);
-        // Physical topology is declared when the wire selection becomes a world.
-        assert_eq!(resolve(None, None, 2, "expertd-native").unwrap(), None);
-    }
-
-    #[test]
-    fn world_resolution_binds_count_and_retains_canonical_device_tp4() {
-        let canonical = world(None, 4).unwrap();
-        assert!(canonical.supports_device_exchange());
-        assert_eq!(canonical.topology(), SparkTopology::NATIVE_TP4_EP1);
-        assert!(!world(Some(SparkTopology::NATIVE_TP4_EP1), 4).unwrap().supports_device_exchange());
-        let error = world(Some(SparkTopology::NATIVE_TP3_EP1), 4).unwrap_err().to_string();
-        assert!(error.contains("topology 3x1"), "{error}");
-        assert!(error.contains("needs 3 physical ranks but 4 were given"), "{error}");
-        for count in [0, cuteafd_core::MAX_SPARK_WORLD + 1] { assert!(world(None, count).is_err()); }
-        for count in [7, 8] {
-            let resolved = world(None, count).unwrap();
+    fn world_binds_count_and_device_exchange_is_tp4_and_tp6() {
+        for count in 1..=cuteafd_core::MAX_SPARK_WORLD {
+            let resolved = world(count).unwrap();
             assert_eq!(resolved.topology().world_size(), count);
-            assert!(!resolved.supports_device_exchange());
+            assert_eq!(resolved.supports_device_exchange(), matches!(count, 4 | 6));
         }
+        for count in [0, cuteafd_core::MAX_SPARK_WORLD + 1] { assert!(world(count).is_err()); }
+        assert_eq!(world(6).unwrap().topology().executor_ids(), [27, 28, 29, 30, 31, 32]);
     }
-
-    #[test]
-    fn keys_are_all_or_none() {
-        assert!(resolve(Some(2), None, 4, "serve-native").is_err());
-        assert!(resolve(None, Some(2), 4, "serve-native").is_err());
-    }
-
-    #[test]
-    fn approved_layouts_require_their_exact_rank_count() {
-        for (tp, ep) in [(1u8, 1u8), (2, 1), (3, 1), (4, 1), (5, 1), (6, 1), (7, 1), (8, 1), (2, 2), (3, 2), (2, 3)] {
-            let expected = topology(tp, ep);
-            let resolved = resolve(Some(tp), Some(ep), expected.world_size(), "serve-native")
-                .unwrap()
-                .expect("explicit topology");
-            assert_eq!(resolved, expected);
-            assert_eq!(resolved.world_size(), tp as usize * ep as usize);
-            assert!(resolve(Some(tp), Some(ep), expected.world_size() + 1, "serve-native").is_err());
-        }
-    }
-
-    #[test]
-    fn unapproved_layouts_and_ranges_are_rejected() {
-        for (tp, ep) in [(9u8, 1u8), (2, 4), (4, 2), (3, 3), (0, 1), (6, 2), (6, 3)] {
-            let world = tp as usize * ep as usize;
-            assert!(resolve(Some(tp), Some(ep), world, "serve-native").is_err(), "{tp}x{ep}");
-        }
-    }
-
-    #[test]
-    fn pure_tp6_is_one_unreplicated_group_of_six_disjoint_shards() {
-        let resolved = resolve(Some(6), Some(1), 6, "expertd-native")
-            .unwrap()
-            .expect("explicit TP6EP1 topology");
-        assert_eq!(resolved.tp(), 6);
-        assert_eq!(resolved.ep(), 1);
-        assert_eq!(resolved.group_count(), 1);
-        for rank in 0..6 {
-            assert_eq!(resolved.group(rank).unwrap(), 0);
-            assert_eq!(resolved.tp_rank(rank).unwrap(), rank as u8);
-            assert_eq!(resolved.executor_id(rank).unwrap(), 27 + rank as u64);
-        }
-        assert!(resolved.group(6).is_err());
-        // The canonical six-rank group shares the TP6EP1 namespace.
-        for rank in 0..6 {
-            assert_eq!(cuteafd_transport::expert::SparkWorld::canonical(6).unwrap().topology().executor_id(rank).unwrap(),
-                resolved.executor_id(rank).unwrap());
-        }
-    }
-
 }

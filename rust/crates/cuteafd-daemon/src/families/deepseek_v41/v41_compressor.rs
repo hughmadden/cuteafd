@@ -1,7 +1,7 @@
 //! CSA2 source weights, immutable proposal execution and accepted-prefix state.
 use crate::shared::memory::{DeviceAllocation, HostAllocation, LoadStream};
 use crate::shared::memory::row_window::RowWindow;
-use crate::shared::decode_graph::{GraphBank, GraphOwner};
+use crate::shared::decode_graph::{GraphBank, GraphOwner, GraphPolicy};
 use crate::families::deepseek_v41::v41_tensors::NativeRtxTensors;
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::{CuteafdDeviceBuffer, NativeLibrary, V41AttentionOps, V41Compressor, V41Kv};
@@ -10,6 +10,7 @@ use std::{
     ffi::c_void,
     sync::atomic::{AtomicU64, Ordering},
 };
+use crate::shared::memory::Tag;
 mod source_cache;
 mod commit;
 use commit::PendingCommit;
@@ -112,8 +113,8 @@ impl<'a> CompressorState<'a> {
             index: SourceCache::new(library, index_pages, slots)?,
             pending: if ratio(layer)? == 2 {
                 Some([
-                    DeviceAllocation::new(library, slots * 2048)?,
-                    DeviceAllocation::new(library, slots * 2048)?,
+                    DeviceAllocation::new(library, slots * 2048, Tag::kv("v41/compressor-carry"))?,
+                    DeviceAllocation::new(library, slots * 2048, Tag::kv("v41/compressor-carry"))?,
                 ])
             } else {
                 None
@@ -289,7 +290,10 @@ pub(crate) struct CompressorWeights<'a> {
     names: Vec<String>,
 }
 impl<'a> CompressorWeights<'a> {
-    fn names(layer: usize) -> Result<Vec<String>> {
+    pub(crate) fn inventory(&self, inventory: &mut crate::shared::memory::receipts::Inventory<'_>) -> Result<()> {
+        self.tensors.inventory(inventory)
+    }
+    pub(super) fn names(layer: usize) -> Result<Vec<String>> {
         let suffixes = if ratio(layer)? == 2 {
             vec!["wkv", "norm", "wgate"]
         } else {
@@ -308,6 +312,7 @@ impl<'a> CompressorWeights<'a> {
     pub fn device_bytes(catalog: &OfficialV41Catalog, layer: usize) -> Result<usize> {
         NativeRtxTensors::plan(catalog, &Self::names(layer)?)
     }
+    #[cfg(test)]
     pub fn load(
         library: &'a NativeLibrary,
         catalog: &OfficialV41Catalog,
@@ -315,8 +320,12 @@ impl<'a> CompressorWeights<'a> {
         budget: usize,
         staging_bytes: usize,
     ) -> Result<Self> {
+        Self::load_in(library, catalog, layer, budget, staging_bytes, None)
+    }
+    pub fn load_in(library: &'a NativeLibrary, catalog: &OfficialV41Catalog, layer: usize,
+        budget: usize, staging_bytes: usize, arena: Option<&crate::shared::memory::weight_arena::DeviceWeightArena<'a>>) -> Result<Self> {
         let names = Self::names(layer)?;
-        let tensors = NativeRtxTensors::load(library, catalog, &names, budget, staging_bytes)?;
+        let tensors = NativeRtxTensors::load_in(library, catalog, &names, budget, staging_bytes, arena)?;
         Ok(Self {
             library,
             tensors,
@@ -351,17 +360,17 @@ impl<'a> CompressorWeights<'a> {
             kv: self.library.v41_compressed_kv()?,
             norm: self.library.v41_attention_ops()?,
             weights: self,
-            staging: HostAllocation::new(self.library, unit * if self.ratio == 2 { 16 } else { 8 })?,
+            staging: HostAllocation::new(self.library, unit * if self.ratio == 2 { 16 } else { 8 }, Tag::staging("v41/compressor"))?,
             capacity: unit,
             graph: None,
-            retained_graphs: GraphBank::new(None),
+            retained_graphs: GraphBank::with_family(GraphPolicy::Budgeted { bytes: None }, "deepseek_v41"),
             ready: None,
             pending_query: None,
             pending_commit: None,
             unsettled: Vec::new(),
             replica: None,
-            commit_staging: HostAllocation::new(self.library, source_cache::commit_staging_bytes(unit))?,
-            commit_destinations: HostAllocation::new(self.library, unit * 8)?,
+            commit_staging: HostAllocation::new(self.library, source_cache::commit_staging_bytes(unit), Tag::staging("v41/compressor"))?,
+            commit_destinations: HostAllocation::new(self.library, unit * 8, Tag::staging("v41/compressor"))?,
         })
     }
 }
@@ -446,31 +455,31 @@ impl<'a> CompressorStorage<'a> {
         ensure!(rows <= crate::shared::memory::row_window::MAX_RESERVE_ROWS.max(4096),
             "compressor storage of {rows} rows exceeds the reserve");
         let paired = layers.iter().any(|&l| ratio(l).is_ok_and(|r| r == 2));
-        let workspace = DeviceAllocation::new(library, V41Compressor::WORKSPACE_BYTES)?;
+        let workspace = DeviceAllocation::new(library, V41Compressor::WORKSPACE_BYTES, Tag::workspace("v41/compressor"))?;
         let kernel = unsafe { library.v41_compressor(workspace.buffer)? };
         Ok(std::rc::Rc::new(Self {
             stream: LoadStream { library, raw: library.cuda_stream_create()? },
             kernel,
             _workspace: workspace,
-            input: DeviceAllocation::new(library, unit * 10240)?,
-            descriptors: paired.then(|| DeviceAllocation::new(library, unit * 8)).transpose()?,
-            positions: DeviceAllocation::new(library, unit * 8)?,
-            frequencies: DeviceAllocation::new(library, unit * 256)?,
-            index_projected: DeviceAllocation::new(library, unit * 256)?,
-            index_key: DeviceAllocation::new(library, unit * 256)?,
-            output: DeviceAllocation::new(library, unit * 1024)?,
+            input: DeviceAllocation::new(library, unit * 10240, Tag::workspace("v41/compressor"))?,
+            descriptors: paired.then(|| DeviceAllocation::new(library, unit * 8, Tag::workspace("v41/compressor"))).transpose()?,
+            positions: DeviceAllocation::new(library, unit * 8, Tag::workspace("v41/compressor"))?,
+            frequencies: DeviceAllocation::new(library, unit * 256, Tag::workspace("v41/compressor"))?,
+            index_projected: DeviceAllocation::new(library, unit * 256, Tag::workspace("v41/compressor"))?,
+            index_key: DeviceAllocation::new(library, unit * 256, Tag::workspace("v41/compressor"))?,
+            output: DeviceAllocation::new(library, unit * 1024, Tag::workspace("v41/compressor"))?,
             planes: layers.iter().map(|&layer| {
                 let ratio = ratio(layer)?;
                 Ok(CompressorPlanes {
                     layer,
                     ratio,
-                    kv_values: DeviceAllocation::attention_plane(library, rows, V41Kv::COMPRESSED_VALUE_BYTES, "compressed proposal values")?,
-                    kv_scales: DeviceAllocation::attention_plane(library, rows, V41Kv::COMPRESSED_SCALE_BYTES, "compressed proposal scales")?,
-                    index_packed: DeviceAllocation::new(library, rows * 64)?,
-                    index_scales: DeviceAllocation::new(library, rows * 4)?,
-                    cache_destinations: DeviceAllocation::new(library, rows * 8)?,
-                    projected: DeviceAllocation::new(library, unit * 512 * if ratio == 2 { 4 } else { 2 })?,
-                    scores: (ratio == 2).then(|| DeviceAllocation::new(library, unit * 2048)).transpose()?,
+                    kv_values: DeviceAllocation::attention_plane(library, rows, V41Kv::COMPRESSED_VALUE_BYTES, "compressed proposal values", Tag::workspace("v41/compressor-proposal"))?,
+                    kv_scales: DeviceAllocation::attention_plane(library, rows, V41Kv::COMPRESSED_SCALE_BYTES, "compressed proposal scales", Tag::workspace("v41/compressor-proposal"))?,
+                    index_packed: DeviceAllocation::new(library, rows * 64, Tag::workspace("v41/compressor"))?,
+                    index_scales: DeviceAllocation::new(library, rows * 4, Tag::workspace("v41/compressor"))?,
+                    cache_destinations: DeviceAllocation::new(library, rows * 8, Tag::workspace("v41/compressor"))?,
+                    projected: DeviceAllocation::new(library, unit * 512 * if ratio == 2 { 4 } else { 2 }, Tag::workspace("v41/compressor"))?,
+                    scores: (ratio == 2).then(|| DeviceAllocation::new(library, unit * 2048, Tag::workspace("v41/compressor"))).transpose()?,
                     epoch: std::cell::Cell::new(0),
                 })
             }).collect::<Result<Vec<_>>>()?,
@@ -525,6 +534,25 @@ impl IndexBinding {
         self.lease.owner == other.lease.owner
     }
 }
+/// Stable score-launch allocation geometry, independent of request snapshots.
+#[derive(Clone, Copy)]
+pub(crate) struct IndexScoreGeometry {
+    pub packed: CuteafdDeviceBuffer,
+    pub scales: CuteafdDeviceBuffer,
+    pub pool_pages: CuteafdDeviceBuffer,
+    pub pool_rows: CuteafdDeviceBuffer,
+    pub proposal_packed: CuteafdDeviceBuffer,
+    pub proposal_scales: CuteafdDeviceBuffer,
+    pub capacity: usize,
+}
+impl IndexScoreGeometry {
+    pub(crate) fn binding(self) -> [usize; 10] {
+        [self.packed.ptr as usize, self.scales.ptr as usize, self.pool_pages.ptr as usize,
+            self.pool_rows.ptr as usize, self.pool_pages.bytes, self.pool_rows.bytes,
+            self.packed.bytes, self.proposal_packed.ptr as usize, self.proposal_scales.ptr as usize,
+            self.capacity]
+    }
+}
 /// Borrowed accepted-history and current-wave index view. Consumers must drain
 /// before releasing these borrows. No proposed rows are published to the cache.
 pub(crate) struct IndexProposal<'a> {
@@ -548,6 +576,11 @@ pub(crate) struct IndexProposal<'a> {
     _wave: std::marker::PhantomData<&'a ()>,
 }
 impl IndexProposal<'_> {
+    pub(crate) fn score_geometry(&self) -> IndexScoreGeometry {
+        IndexScoreGeometry { packed: self.cache.packed, scales: self.cache.scales,
+            pool_pages: self.cache.pool_pages, pool_rows: self.cache.pool_rows,
+            proposal_packed: self.packed, proposal_scales: self.scales, capacity: self.capacity }
+    }
     /// # Safety
     /// Producer writes are complete or ordered before the replica's stream.
     /// Retain both plane owners until all peer consumers drain.
@@ -639,7 +672,7 @@ pub(crate) struct CompressorWave<'w, 'a> {
     /// Per slot: descriptors and positions rewritten on the host per unit.
     staging: HostAllocation<'a>,
     capacity: usize,
-    graph: Option<(*mut c_void, usize, u64)>,
+    graph: Option<(usize, u64)>,
     // Lane-local decode shapes; large prefill retains only the current graph.
     retained_graphs: GraphBank<(usize, u64), GraphOwner<'a, &'w CompressorWeights<'a>>>,
     ready: Option<Prepared>,
@@ -663,6 +696,19 @@ impl<'a> CompressorWave<'_, 'a> {
     fn planes(&self) -> &CompressorPlanes<'a> { &self.storage.planes[self.plane] }
     fn kv_values(&self) -> CuteafdDeviceBuffer { self.window.apply(self.planes().kv_values.buffer, V41Kv::COMPRESSED_VALUE_BYTES) }
     fn kv_scales(&self) -> CuteafdDeviceBuffer { self.window.apply(self.planes().kv_scales.buffer, V41Kv::COMPRESSED_SCALE_BYTES) }
+    pub(crate) fn startup_index_geometry(&self, state: &CompressorState<'_>, rows: usize) -> Result<IndexScoreGeometry> {
+        ensure!(self.ready.is_none() && self.pending_query.is_none() && self.pending_commit.is_none()
+            && !self.window.is_windowed() && rows > 0 && rows <= self.capacity
+            && state.layer == self.weights.layer, "startup index source geometry requires idle matching owner");
+        let cache = state.source_cache().view(0, 0);
+        let mut proposal_packed = self.index_packed();
+        let mut proposal_scales = self.index_scales();
+        proposal_packed.bytes = rows * 64;
+        proposal_scales.bytes = rows * 4;
+        Ok(IndexScoreGeometry { packed: cache.packed, scales: cache.scales,
+            pool_pages: cache.pool_pages, pool_rows: cache.pool_rows,
+            proposal_packed, proposal_scales, capacity: rows })
+    }
     fn index_packed(&self) -> CuteafdDeviceBuffer { self.window.apply(self.planes().index_packed.buffer, 64) }
     fn index_scales(&self) -> CuteafdDeviceBuffer { self.window.apply(self.planes().index_scales.buffer, 4) }
     fn cache_destinations(&self) -> CuteafdDeviceBuffer { self.window.apply(self.planes().cache_destinations.buffer, 8) }
@@ -941,6 +987,39 @@ impl<'w, 'a> CompressorWave<'w, 'a> {
         }
         Ok(())
     }
+    pub(crate) fn capture_startup(&mut self, state: &CompressorState<'_>, rows: &[usize]) -> Result<()> {
+        ensure!(self.ready.is_none() && self.pending_query.is_none() && self.pending_commit.is_none()
+            && !self.window.is_windowed() && state.layer == self.weights.layer,
+            "compressor startup requires an idle matching owner");
+        self.stream().require_complete()?;
+        let keys: Vec<_> = rows.iter().map(|&row| (row, state.owner)).collect();
+        let _ = keys;
+        for &row in rows {
+            ensure!(row > 0 && row <= self.capacity, "compressor startup row exceeds capacity");
+            let library = self.stream().library;
+            let stream = self.stream().raw;
+            // SAFETY: the real admitted state pins ratio-two pending buffers.
+            // Capture records proposal kernels only, without execution/commit.
+            let Some(mut ticket) = self.retained_graphs.cache_ticket(&(row, state.owner),
+                super::graph_policy::pinned_shape(self.storage.input.buffer.device_id, row as u32), None) else { continue };
+            unsafe { ticket.capture_result(library.cuda_graph_begin_capture(stream))?; }
+            let queued = unsafe { self.enqueue(state, row) };
+            let captured = unsafe { ticket.capture_result(library.cuda_graph_end_capture_topology(stream)) };
+            match (queued, captured) {
+                (Ok(()), Ok((graph, nodes, width, spans, _))) => self.insert_graph(graph, row, state.owner, ticket, nodes as u64, width, spans)?,
+                (Err(error), Ok((graph, ..))) => {
+                    unsafe { library.cuda_graph_exec_destroy(graph)?; }
+                    return Err(error);
+                }
+                (Ok(()), Err(error)) if cuteafd_ffi::is_small_graph(&error) => {},
+                (Err(error), Err(_)) | (Ok(()), Err(error)) => return Err(error),
+            }
+            crate::shared::decode_graph::device::observe_device(library, self.storage.input.buffer.device_id)?;
+        }
+
+        self.graph = None;
+        Ok(())
+    }
     /// # Safety
     /// Query and admitted state slots stay alive and immutable until poll_query
     /// completes or abort_query drains. Peer work may use only disjoint slots.
@@ -964,7 +1043,7 @@ impl<'w, 'a> CompressorWave<'w, 'a> {
             self.upload_queued(&prepared)?;
             unsafe {
                 crate::shared::decode_graph::census::dispatch(self.stream().library, self.stream().raw, c"layer_row",
-                    prepared.rows, if capture || forced_eager { None } else { self.graph.map(|(raw,_,_)|raw) },
+                    prepared.rows, if capture || forced_eager { None } else { self.selected_graph().map(|(raw, _, _)| raw) },
                     || self.enqueue(state, prepared.rows))
             }
         })();
@@ -980,19 +1059,23 @@ impl<'w, 'a> CompressorWave<'w, 'a> {
             ensure!(prepared.owner == state.owner, "queued cache owner differs");
             let chained = crate::shared::memory::chain::active();
             if !chained && !unsafe { self.stream().library.cuda_stream_query(self.stream().raw)? } { return Ok(false); }
-            if *capture {
-                unsafe { self.stream().library.cuda_graph_begin_capture(self.stream().raw)?; }
+            let ticket = if *capture { self.retained_graphs.cache_ticket(&(prepared.rows, state.owner),
+                super::graph_policy::pinned_shape(self.storage.input.buffer.device_id, prepared.rows as u32), None) } else { None };
+            if let Some(mut ticket) = ticket {
+                unsafe { ticket.capture_result(self.stream().library.cuda_graph_begin_capture(self.stream().raw))?; }
                 let queued = unsafe { self.enqueue(state, prepared.rows) };
-                let captured = unsafe { self.stream().library.cuda_graph_end_capture(self.stream().raw) };
-                let graph = match (queued, captured) {
-                    (Ok(()), Ok(graph)) => graph,
-                    (Err(error), Ok(graph)) => {
+                let captured = unsafe { ticket.capture_result(self.stream().library.cuda_graph_end_capture_topology(self.stream().raw)) };
+                match (queued, captured) {
+                    (Ok(()), Ok((graph, nodes, width, spans, _))) => {
+                        self.insert_graph(graph, prepared.rows, state.owner, ticket, nodes as u64, width, spans)?;
+                    }
+                    (Err(error), Ok((graph, ..))) => {
                         unsafe { self.stream().library.cuda_graph_exec_destroy(graph)?; }
                         return Err(error);
                     }
+                    (Ok(()), Err(error)) if cuteafd_ffi::is_small_graph(&error) => {},
                     (Err(error), Err(_)) | (Ok(()), Err(error)) => return Err(error),
-                };
-                self.insert_graph(graph, prepared.rows, state.owner)?;
+                }
                 // Eager proposal is complete. Capture records future work without
                 // committing cache state; publish the existing result below.
             }
@@ -1033,11 +1116,14 @@ impl<'w, 'a> CompressorWave<'w, 'a> {
         // Windowed units run eagerly: graphs bake row-0 plane pointers.
         let uncaptured = !super::graph_policy::captures_shape(prepared.rows as u32) || self.window.is_windowed();
         if crate::shared::memory::chain::active() && self.pending_query.is_none()
-            && (uncaptured || self.graph.is_some_and(|(_, n, o)| n == prepared.rows && o == state.owner)) {
+            && (uncaptured || self.selected_graph().is_some_and(|(_, n, o)| n == prepared.rows && o == state.owner)) {
             // Order the producer on the chain (forked from the query's
             // normalized input) instead of draining it on the host: a captured
             // shape replays, an uncaptured prefill width launches eagerly.
-            let graph = if uncaptured { None } else { Some(self.graph.unwrap().0) };
+            let graph = if uncaptured { None } else {
+                // The guard only checks liveness; count this actual chain replay once.
+                self.retained_graphs.cached_launch(&(prepared.rows, state.owner)).map(|graph| graph.raw)
+            };
             let queued = (|| -> Result<()> { unsafe {
                 crate::shared::memory::chain::join_fork(self.stream().library, self.stream().raw)?;
                 self.stream().library.copy_d2d_async(self.storage.input.buffer, query.hidden,
@@ -1061,6 +1147,7 @@ impl<'w, 'a> CompressorWave<'w, 'a> {
         self.select_graph(prepared.rows, state.owner, true)?;
         if self.graph.is_none() {
             unsafe { self.capture(state, chunks)?; }
+            return self.output(state);
         }
         unsafe { self.replay(state, chunks) }
     }
@@ -1081,7 +1168,7 @@ impl<'w, 'a> CompressorWave<'w, 'a> {
         self.output(state)
     }
     /// # Safety
-    /// Same input contract as execute. Warmup is unpublished and never commits.
+    /// Same input contract as execute. The drained eager proposal stays published and never commits.
     pub unsafe fn capture(
         &mut self,
         state: &CompressorState<'_>,
@@ -1092,25 +1179,34 @@ impl<'w, 'a> CompressorWave<'w, 'a> {
         unsafe {
             self.execute(state, chunks)?;
         }
-        let prepared = self.prepare(state, chunks)?;
+        // Preserve the completed proposal identity; preparing again would
+        // invalidate the eager result without running any replacement work.
+        let prepared = self.ready.take().context("compressor capture eager output missing")?;
+        let Some(mut ticket) = self.retained_graphs.cache_ticket(&(prepared.rows, state.owner),
+            super::graph_policy::pinned_shape(self.storage.input.buffer.device_id, prepared.rows as u32), None) else {
+                self.ready = Some(prepared);
+                return Ok(());
+            };
         unsafe {
-            self.stream()
+            ticket.capture_result(self.stream()
                 .library
-                .cuda_graph_begin_capture(self.stream().raw)?;
+                .cuda_graph_begin_capture(self.stream().raw))?;
         }
         let launched = unsafe { self.enqueue(state, prepared.rows) };
-        let captured = unsafe { self.stream().library.cuda_graph_end_capture(self.stream().raw) };
+        let captured = unsafe { ticket.capture_result(self.stream().library.cuda_graph_end_capture_topology(self.stream().raw)) };
         match (launched, captured) {
-            (Ok(()), Ok(graph)) => {
-                self.insert_graph(graph, prepared.rows, state.owner)?;
+            (Ok(()), Ok((graph, nodes, width, spans, _))) => {
+                self.insert_graph(graph, prepared.rows, state.owner, ticket, nodes as u64, width, spans)?;
+                self.ready = Some(prepared);
                 Ok(())
             }
-            (Err(error), Ok(graph)) => {
+            (Err(error), Ok((graph, ..))) => {
                 unsafe {
                     self.stream().library.cuda_graph_exec_destroy(graph)?;
                 }
                 Err(error)
             }
+            (Ok(()), Err(error)) if cuteafd_ffi::is_small_graph(&error) => Ok(()),
             (Err(error), Err(_)) | (Ok(()), Err(error)) => Err(error),
         }
     }
@@ -1123,7 +1219,7 @@ impl<'w, 'a> CompressorWave<'w, 'a> {
     ) -> Result<CompressorOutput<'s>> {
         let prepared = self.prepare(state, chunks)?;
         ensure!(!self.window.is_windowed(), "windowed compressor production is eager");
-        let (graph, rows, owner) = self.graph.context("compressor graph is not captured")?;
+        let (graph, rows, owner) = self.selected_graph().context("compressor graph is not captured")?;
         ensure!(
             rows == prepared.rows && owner == state.owner,
             "compressor capture binding differs"
@@ -1252,37 +1348,37 @@ impl<'w, 'a> CompressorWave<'w, 'a> {
     }
     /// Switch only after prior launches finish. Graphs bind the cache owner and
     /// lane workspace, while current request descriptors are uploaded on replay.
-    fn select_graph(&mut self, rows: usize, owner: u64, drain: bool) -> Result<()> {
-        if self.graph.is_some_and(|(_, n, o)| n == rows && o == owner) { return Ok(()); }
+    fn select_graph(&mut self, rows: usize, owner: u64, _drain: bool) -> Result<()> {
         ensure!(self.pending_query.is_none() && self.pending_commit.is_none(),
             "cannot switch a pending cache producer graph");
-        if self.retained_graphs.count(|(_, o)| *o != owner) > 0 {
-            return self.clear_graph_inner(drain);
-        }
         self.ready = None;
-        if drain { self.synchronize()?; } else { self.stream().require_complete()?; }
-        self.graph = None;
-        if rows > 64 && self.retained_graphs.count(|&(r, _)| r > 64 && r != rows)
-            >= crate::shared::decode_graph::LARGE_SHAPES {
-            // Keep the full prefill chunk and decoder replay across decode rounds.
-            self.retained_graphs.retire_oldest(|&(r, _)| r > 64 && r != rows);
-        }
-        drop(self.retained_graphs.drain_retired(|| Ok(()))?);
-        self.graph = self.retained_graphs.launch(&(rows, owner)).map(|exec| (exec.raw, rows, owner));
+        self.graph = self.retained_graphs.cached_launch(&(rows, owner)).map(|_| (rows, owner));
         Ok(())
     }
-    fn insert_graph(&mut self, graph: *mut c_void, rows: usize, owner: u64) -> Result<()> {
+    fn selected_graph(&self) -> Option<(*mut c_void, usize, u64)> {
+        let (rows, owner) = self.graph?;
+        Some((self.retained_graphs.get(&(rows, owner))?.raw, rows, owner))
+    }
+    fn insert_graph(&mut self, graph: *mut c_void, rows: usize, owner: u64,
+        ticket: crate::shared::decode_graph::CaptureTicket, nodes: u64, width: usize, spans: bool) -> Result<()> {
         let library = self.stream().library;
         let device = library.cuda_get_device()?;
         // SAFETY: weights are borrowed and the containing wave retains workspace
         // and buffers; the cache owner is unchanged until a drained bank clear.
         let exec = unsafe { GraphOwner::new(library, device, graph, self.weights)? };
-        self.retained_graphs.insert((rows, owner), exec, None);
-        self.graph = Some((graph, rows, owner));
+        crate::shared::decode_graph::census::capture_device_key("deepseek_v41", "compressor",
+            &self.retained_graphs as *const _ as usize, device, None, &(rows, owner), graph);
+        self.retained_graphs.cache_commit((rows, owner), exec, ticket, nodes, width, spans);
+        self.graph = Some((rows, owner));
         tracing::debug!(target: "cuteafd::graph_capture", site = "compressor", rows,
             layer = self.weights.layer, device, binding = owner,
             bank = ?(&self.retained_graphs as *const _), "captured graph binding");
         Ok(())
+    }
+    pub(crate) fn visit_graph_banks(&mut self,
+        f: &mut dyn FnMut(i32, &'static str, bool, &mut dyn crate::shared::decode_graph::CacheAttached) -> Result<()>,
+    ) -> Result<()> {
+        f(self.storage.input.buffer.device_id, "compressor", false, &mut self.retained_graphs)
     }
     pub fn clear_graph(&mut self) -> Result<()> {
         self.clear_graph_inner(true)
@@ -1293,8 +1389,7 @@ impl<'w, 'a> CompressorWave<'w, 'a> {
         self.ready = None;
         if drain { self.synchronize()?; } else { self.stream().require_complete()?; }
         self.graph = None;
-        self.retained_graphs.retire_all();
-        drop(self.retained_graphs.drain_retired(|| Ok(()))?);
+        self.retained_graphs.cache_clear_drained();
         Ok(())
     }
 }
@@ -1320,5 +1415,76 @@ impl<'a> CompressorState<'a> {
 impl CompressorWeights<'_> {
     pub(crate) fn visit(&self, prefix: &str, f: &mut dyn FnMut(String, cuteafd_ffi::CuteafdDeviceBuffer)) {
         self.tensors.visit(prefix, f);
+    }
+}
+
+#[cfg(test)]
+mod cold_capture_tests {
+    use super::*;
+    use crate::shared::decode_graph::CacheAttached;
+    use crate::families::deepseek_v41::v41_attention_query::AttentionQueryWeights;
+    use crate::shared::decode_graph::device::{Basis, Cycle, Preference, Site};
+
+    #[test]
+    #[ignore = "requires V4.1 checkpoint, AOT native library and CUDA GPU"]
+    fn first_query_publishes_eager_result_with_admitted_or_denied_capture() -> Result<()> {
+        // SAFETY: checkpoint, library, inputs and request state outlive every wave.
+        let library = unsafe { NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?)? };
+        library.cuda_set_device(0)?;
+        let catalog = cuteafd_loader::read_official_v41_catalog(std::path::Path::new(
+            &std::env::var("CUTEAFD_SNAPSHOT")?))?;
+        let query_weights = AttentionQueryWeights::load(&library, &catalog, 2, usize::MAX, 1 << 20)?;
+        let weights = CompressorWeights::load(&library, &catalog, 2, usize::MAX, 1 << 20)?;
+        let mut query = query_weights.wave(2, usize::MAX)?;
+        let input: Vec<_> = (0..2 * 5120).flat_map(|i| {
+            let value = ((i * 37 % 61) as f32 - 30.) / 32.;
+            ((value.to_bits() >> 16) as u16).to_ne_bytes()
+        }).collect();
+        for admitted in [true, false] {
+            let mut state = CompressorState::new(&library, 2, 1, 1, usize::MAX)?;
+            let lease = state.begin_request(0, 1)?;
+            let chunks = [CompressorChunk { lease, position: 0, tokens: 2 }];
+            let mut wave = weights.wave(2, usize::MAX)?;
+            wave.retained_graphs.attach(&library, 0, 256 << 20, Site {
+                name: if admitted { "Compressor.cold.admitted" } else { "Compressor.cold.denied" },
+                cycle: Cycle::Prefill, preference: Preference::Capture,
+                bootstrap: if admitted { 2 << 20 } else { 1 << 30 },
+                basis: Basis::Bytes, spans_devices: false,
+            })?;
+            // Startup recording must not publish or consume a request proposal.
+            wave.capture_startup(&state, &[1])?;
+            assert!(wave.ready.is_none());
+            // SAFETY: preparation stages finite matching hidden rows and positions.
+            let produced = unsafe { query.execute_tokens_prepared(&[0, 1], |stream, buffer| {
+                library.copy_h2d(buffer, &input)?;
+                unsafe { library.cuda_stream_synchronize(stream) }
+            })? };
+            // Obtain an eager reference from the identical normalized query input.
+            library.copy_d2d(wave.input(), produced.hidden, produced.hidden.bytes)?;
+            let expected = unsafe {
+                let output = wave.execute(&state, &chunks)?;
+                let mut bytes = vec![0; output.buffer.bytes];
+                library.copy_d2h(&mut bytes, output.buffer)?;
+                bytes
+            };
+            let eager_snapshot = wave.ready.as_ref().context("eager proposal missing")?.snapshot;
+            // First real query misses the startup row-1 key. Capture records,
+            // but must return the completed eager row-2 proposal without replay.
+            unsafe { wave.execute_query(&state, &chunks, &produced)?; }
+            let prepared = wave.ready.as_ref().context("first query output unpublished")?;
+            assert_eq!(prepared.snapshot, eager_snapshot + 2, "cold capture prepared more than its query and eager execution");
+            assert_eq!(prepared.rows, 2);
+            assert_eq!(wave.selected_graph().is_some(), admitted);
+            let output = wave.output(&state)?;
+            let mut actual = vec![0; output.buffer.bytes];
+            library.copy_d2h(&mut actual, output.buffer)?;
+            assert_eq!(actual, expected, "cold result differs, admitted={admitted}");
+            // A subsequent real query exercises replay or repeated eager denial.
+            unsafe { wave.execute_query(&state, &chunks, &produced)?; }
+            let output = wave.output(&state)?;
+            library.copy_d2h(&mut actual, output.buffer)?;
+            assert_eq!(actual, expected, "next query differs, admitted={admitted}");
+        }
+        Ok(())
     }
 }

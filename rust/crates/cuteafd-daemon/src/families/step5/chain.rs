@@ -86,7 +86,8 @@ impl<'a> TargetChain<'a> {
         let mut bytes = weights
             .checked_add(contract.rope_tables.allocation_bytes)
             .context("chain rope overflow")?;
-        let catalog = (count > 3).then(|| cuteafd_loader::read_expert_catalog(&checkpoint.snapshot)).transpose()?;
+        let catalog = (count > 3).then(|| cuteafd_loader::read_expert_catalog_view(
+            checkpoint.view.as_ref().context("Step-5 target chain requires its selected checkpoint view")?)).transpose()?;
         let mut routed = Vec::new();
         for layer in &contract.layers[..count] {
             let workspace = if layer.sliding.is_some() {
@@ -575,7 +576,7 @@ mod tests {
             "sealed Step-5 expert geometry"
         );
         let exports = crate::families::step5::serve::package_exports(&serde_json::json!({"layouts": {"tp": tp4.clone()}}))?;
-        SparkAdmission::plan(
+        SparkAdmission::plan_original_for_test(
             snapshot,
             ExpertGeometry::STEP5,
             Some(&catalog),
@@ -586,7 +587,6 @@ mod tests {
                 prefill_lanes: 1,
             },
             peers.len(),
-            None,
             crate::families::step5::serve::spark_model(&exports,
                 SparkEndpoint { ring_depth: None, capacity: 64, ingress: SparkIngress::Native, partial_reply_bytes: None },
                 1, 1, config.max_frame_bytes)?,
@@ -607,7 +607,7 @@ mod tests {
         )?;
         // The widest wave sizes every rank's rings and the exchange staging.
         let mut link = SparkLink::new(device.library, world, &peers, 64, config, H * 2)?;
-        link.bootstrap(&warm)?;
+        link.bootstrap(&cuteafd_transport::SparkSessionShape::from_request(&warm)?)?;
         Ok(RefCell::new(link))
     }
 
@@ -636,6 +636,7 @@ mod tests {
         let library =
             unsafe { cuteafd_ffi::NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?)? };
         let device = crate::shared::memory::device::cache_test_device(&library)?;
+        device.run(|| crate::shared::inventory::preload_native_modules(&library))?;
         let programs = library
             .programs()?
             .with_manifest(Path::new(&std::env::var("CUTEAFD_PROGRAM_MANIFEST")?))?;
@@ -737,7 +738,7 @@ mod tests {
                 cache.borrow().bytes() as u64,
                 staging.allocation_bytes() as u64,
             ], cuteafd_loader::families::qwen4::Qwen4KvCache::Bf16)?;
-        let input = Allocation::new(device, 64 * H * 4)?;
+        let input = Allocation::new(device, 64 * H * 4, crate::shared::memory::TEST)?;
         let read = |buffer, bytes| {
             let mut result = vec![0; bytes];
             device.run(|| library.copy_d2h(&mut result, buffer))?;
@@ -889,6 +890,7 @@ mod tests {
         // SAFETY: the supported runner verifies the native artifact and source seal.
         let library = unsafe { cuteafd_ffi::NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?)? };
         let device = crate::shared::memory::device::cache_test_device(&library)?;
+        device.run(|| crate::shared::inventory::preload_native_modules(&library))?;
         let programs = library.programs()?.with_manifest(Path::new(&std::env::var("CUTEAFD_PROGRAM_MANIFEST")?))?;
         let checkpoint = Checkpoint::coordinator(&snapshot, false, false)?;
         let link = device.run(|| link(device, &snapshot, &[88, 89, 90]))?;

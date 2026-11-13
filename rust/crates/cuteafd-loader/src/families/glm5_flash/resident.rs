@@ -6,11 +6,84 @@ use cuteafd_core::DType;
 #[derive(Debug, Clone, Copy)]
 pub struct GlmfRepresentation {
     pub kda_fp8: bool,
-    pub fp8_head: bool,
+    pub head: GlmfHeadFormat,
     pub output_shard: bool,
 }
 impl Default for GlmfRepresentation {
-    fn default() -> Self { Self { kda_fp8: true, fp8_head: true, output_shard: true } }
+    fn default() -> Self { Self { kda_fp8: false, head: GlmfHeadFormat::Auto, output_shard: false } }
+}
+
+/// The one resident form of the vocabulary head `lm_head.weight` [vocab, hidden] that target
+/// logits and the drafter share (`--fp8-head`, launcher `GLM5_FLASH_FP8_HEAD`): the checkpoint's
+/// BF16 (`false`, also `bf16`/`off`), an E4M3 copy with FP32 scales per row and 128-wide K block
+/// (`true`, also `fp8`/`on`), or `packed`: the exact 12-bit copy of the BF16 values
+/// (`cuteafd_core::packed_head`), packed and verified at load from the landed BF16, which it
+/// then releases. Target logits read it exactly (both planes and the exception table, FP32
+/// sums); the drafter reads its coarse plane. A packed head serves one coordinator GPU.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum GlmfHeadFormat {
+    /// Resolve after reading checkpoint headers and selecting the coordinator topology.
+    #[default]
+    Auto,
+    Bf16,
+    Fp8,
+    Packed,
+}
+
+impl std::str::FromStr for GlmfHeadFormat {
+    type Err = String;
+    fn from_str(value: &str) -> Result<Self, String> {
+        match value {
+            "auto" => Ok(Self::Auto),
+            "false" | "bf16" | "off" => Ok(Self::Bf16),
+            "true" | "fp8" | "on" => Ok(Self::Fp8),
+            "packed" => Ok(Self::Packed),
+            _ => Err(format!("{value:?}: expected auto, false (bf16), true (fp8) or packed")),
+        }
+    }
+}
+
+impl GlmfHeadFormat {
+    /// Auto preserves the checkpoint head; conversions require an explicit choice.
+    pub fn resolve(self, native_head: bool, _ranks: usize) -> Self {
+        if native_head { Self::Bf16 }
+        else if self == Self::Auto {
+            Self::Bf16
+        } else { self }
+    }
+
+    /// The resolved `fp8-head` setting: the boolean spellings for BF16 and FP8, `packed`.
+    pub fn setting(self) -> &'static str {
+        match self { Self::Auto => "auto", Self::Bf16 => "false", Self::Fp8 => "true", Self::Packed => "packed" }
+    }
+
+    /// The head's name in plans and logs.
+    pub fn name(self) -> &'static str {
+        match self { Self::Auto => "auto", Self::Bf16 => "BF16", Self::Fp8 => "FP8", Self::Packed => "exact 12-bit" }
+    }
+
+    /// Resident bytes of a `[vocab, hidden]` BF16 head in this form, as the loader allocates them.
+    pub fn resident_bytes(self, vocab: u64, hidden: u64) -> u64 {
+        match self {
+            Self::Auto => panic!("resolve GLM Flash head before sizing"),
+            Self::Bf16 => (vocab * hidden * 2).max(256),
+            Self::Fp8 => (vocab * hidden).max(256) + (vocab * hidden.div_ceil(128) * 4).max(256),
+            Self::Packed => cuteafd_core::packed_head::PackedHeadLayout::bytes(vocab, hidden),
+        }
+    }
+
+    /// Bytes beside the resident form while loading: the landed BF16 source a packed head
+    /// packs from (released once the pack verifies). The FP8 copy quantizes from pinned host
+    /// rows and keeps no device source.
+    pub fn load_source_bytes(self, vocab: u64, hidden: u64) -> u64 {
+        if self == Self::Packed { Self::Bf16.resident_bytes(vocab, hidden) } else { 0 }
+    }
+
+    /// GEMV scratch of one projection site of up to `rows` rows on an `sms`-SM device: only
+    /// the packed head's (`cuteafd_packed_head_workspace`); the FP8 program has none.
+    pub fn scratch_bytes(self, rows: u64, vocab: u64, hidden: u64, sms: u64) -> u64 {
+        if self == Self::Packed { cuteafd_core::packed_head::workspace_bytes(rows, hidden, vocab, sms) } else { 0 }
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -85,13 +158,33 @@ pub fn resident_weights_placed(checkpoint: &Checkpoint, cfg: &GlmNextConfig, lay
     out[0].weights = tensor("model.language_model.norm.weight")?.meta.byte_length.max(256)
         + if let Some(head) = core.get_weight("lm_head") {
             head.resident_bytes(1).map_err(|e| e.to_string())?
-        } else if repr.fp8_head { fp8(&["lm_head.weight".into()], false, true)? }
-            else { tensor("lm_head.weight")?.meta.byte_length.max(256) };
+        } else if core.native.get("lm_head").is_some_and(|head| head.fp8) {
+            fp8(&["lm_head.weight".into()], false, false)?
+        } else {
+            match repr.head.resolve(core.get_weight("lm_head").is_some(), ranks) {
+                GlmfHeadFormat::Auto => unreachable!("head resolved"),
+                GlmfHeadFormat::Fp8 => fp8(&["lm_head.weight".into()], false, true)?,
+                GlmfHeadFormat::Bf16 => tensor("lm_head.weight")?.meta.byte_length.max(256),
+                GlmfHeadFormat::Packed => {
+                    let head = tensor("lm_head.weight")?;
+                    if ranks != 1 { return Err("the exact 12-bit GLM Flash head serves one coordinator GPU".into()); }
+                    match (&head.meta.dtype, head.meta.shape.as_slice()) {
+                        (DType::Bf16, &[vocab, hidden]) => {
+                            cuteafd_core::packed_head::PackedHeadLayout::new(vocab, hidden).map_err(|e| e.to_string())?;
+                            GlmfHeadFormat::Packed.resident_bytes(vocab as u64, hidden as u64)
+                        }
+                        _ => return Err("the exact 12-bit GLM Flash head packs a BF16 [vocab, hidden] lm_head".into()),
+                    }
+                }
+            }
+        };
     let mut mla_owner = first_owner;
     for layer in 0..layers.min(cfg.layers) {
         let owner = mla_owner;
         if cfg.attention[layer] == GlmNextAttention::Mla { mla_owner ^= 1; }
         let native = core.layer_weights(cfg, layer, ranks, owned.then_some(owner as u8)
+            .filter(|_| cfg.attention[layer] == GlmNextAttention::Mla)).map_err(|e| e.to_string())?;
+        let native_attention = core.layer_native(cfg, layer, ranks, owned.then_some(owner as u8)
             .filter(|_| cfg.attention[layer] == GlmNextAttention::Mla)).map_err(|e| e.to_string())?;
         let p = format!("model.language_model.layers.{layer}");
         let a = |s: &str| format!("{p}.self_attn.{s}");
@@ -101,14 +194,15 @@ pub fn resident_weights_placed(checkpoint: &Checkpoint, cfg: &GlmNextConfig, lay
             Ok((n * 4 / if split { ranks as u64 } else { 1 }).max(256))
         };
         for rank in 0..ranks {
-            let mut bytes = 0;
+            let mut bytes = native_attention[rank].values().try_fold(0u64, |bytes, layout|
+                layout.bytes().map(|n| bytes + n)).map_err(|e| e.to_string())?;
             for site in ["attn", "ffn"] {
                 for suffix in ["fn", "scale", "base"] { bytes += f32(&[format!("{p}.hc_{site}_{suffix}")], false)?; }
             }
             bytes += one(&format!("{p}.input_layernorm.weight"))? + one(&format!("{p}.post_attention_layernorm.weight"))?;
             match cfg.attention[layer] {
                 GlmNextAttention::Kda => {
-                    if core.get_weight(&a("q_proj")).is_some() {
+                    if core.get_weight(&a("q_proj")).is_some() || core.native.contains_key(&a("q_proj")) {
                         bytes += native[rank].iter().filter(|(name, _)| name.starts_with("self_attn."))
                             .map(|(_, layout)| layout.bytes as u64).sum::<u64>();
                         let aux = elements(&a("f_a_proj.weight"))? + elements(&a("g_a_proj.weight"))?
@@ -138,7 +232,7 @@ pub fn resident_weights_placed(checkpoint: &Checkpoint, cfg: &GlmNextConfig, lay
                         bytes += one(&a("q_a_layernorm.weight"))? + one(&a("kv_a_layernorm.weight"))?;
                         bytes += (cfg.heads * cfg.qk_nope_dim * cfg.kv_lora_rank * 2 / parts) as u64;
                         bytes += (cfg.heads * cfg.v_head_dim * cfg.kv_lora_rank * 2 / parts) as u64;
-                        if core.get_weight(&a("q_a_proj")).is_some() {
+                        if core.get_weight(&a("q_a_proj")).is_some() || core.native.contains_key(&a("q_a_proj")) {
                             bytes += native[rank].iter().filter(|(name, _)| name.starts_with("self_attn."))
                                 .map(|(_, layout)| layout.bytes as u64).sum::<u64>();
                         } else {
@@ -155,7 +249,7 @@ pub fn resident_weights_placed(checkpoint: &Checkpoint, cfg: &GlmNextConfig, lay
             }
             let mlp = if cfg.dense[layer] { format!("{p}.mlp") } else { format!("{p}.mlp.shared_experts") };
             let gate = format!("{mlp}.gate_proj.weight");
-            if core.get_weight(&gate).is_some() {
+            if core.staged(gate.strip_suffix(".weight").unwrap()) {
                 bytes += native[rank].iter().filter(|(name, _)| name.starts_with("mlp."))
                     .map(|(_, layout)| layout.bytes as u64).sum::<u64>();
             } else if cfg.dense[layer] && tensor(&gate)?.meta.dtype == DType::U8 {
@@ -211,16 +305,57 @@ mod tests {
             .into_iter().map(|(name, shape)| CheckpointTensor { shard: "fixture".into(),
                 meta: crate::SafetensorsTensorMetadata { name: name.into(), dtype: DType::Bf16,
                     byte_length: shape.iter().product::<usize>() as u64 * 2, shape, byte_offset: 0 } }).collect();
-        let checkpoint = Checkpoint { snapshot: "fixture".into(), config, quantize_config: None,
+        let checkpoint = Checkpoint { view: None, snapshot: "fixture".into(), config, quantize_config: None,
             weight_map: Default::default(), tensors, missing_shards: vec![], shard_bytes: 0 };
         // Zero target layers isolates the head representation and ownership contract.
         let single = resident_weights(&checkpoint, &cfg, 0, 1, Default::default()).unwrap();
         let split = resident_weights(&checkpoint, &cfg, 0, 2, Default::default()).unwrap();
         assert_eq!(single[0].embedding, 524_288);
-        assert_eq!(single[0].weights, 278_528); // norm BF16 + head FP8 values and row128 FP32 scales.
-        assert_eq!(split[0].weights, single[0].weights);
+        assert_eq!(single[0].weights, 532_480); // BF16 norm and source head.
+        assert_eq!(split[0].weights, 532_480); // Same source precision on TP2.
         assert_eq!((split[1].embedding, split[1].weights), (0, 0));
         assert!(resident_weights(&checkpoint, &cfg, 2, 1, Default::default()).unwrap_err().contains("resident operand missing"));
+        // Each head form charges its own allocation and nothing else; the exact 12-bit one is
+        // PackedHeadLayout's single allocation and serves one GPU.
+        for (head, bytes) in [(GlmfHeadFormat::Bf16, 524_288), (GlmfHeadFormat::Fp8, 270_336),
+            (GlmfHeadFormat::Packed, 395_776)] {
+            let repr = GlmfRepresentation { head, ..Default::default() };
+            let single = resident_weights(&checkpoint, &cfg, 0, 1, repr).unwrap();
+            assert_eq!(single[0].weights, 8192 + bytes, "{head:?}");
+            assert_eq!(head.resident_bytes(64, 4096), bytes);
+        }
+        assert_eq!(GlmfHeadFormat::Packed.resident_bytes(64, 4096),
+            cuteafd_core::packed_head::PackedHeadLayout::new(64, 4096).unwrap().total_bytes() as u64);
+        let packed = GlmfRepresentation { head: GlmfHeadFormat::Packed, ..Default::default() };
+        assert!(resident_weights(&checkpoint, &cfg, 0, 2, packed).unwrap_err().contains("one coordinator GPU"));
+    }
+
+    /// `--fp8-head` keeps its boolean spellings and adds `packed`; GLM 5.3 Flash's
+    /// [154880, 4096] head is 1.27 GB BF16, 654 MB FP8 and 956 MB exact 12-bit, plus the
+    /// landed BF16 while packing and the GEMV's 512 KiB of scratch below 606 SMs.
+    #[test]
+    fn head_formats_parse_report_and_charge_the_flash_head() {
+        use GlmfHeadFormat::{Bf16, Fp8, Packed};
+        for (spellings, head) in [(["false", "bf16", "off"], Bf16), (["true", "fp8", "on"], Fp8)] {
+            for spelling in spellings { assert_eq!(spelling.parse::<GlmfHeadFormat>(), Ok(head)); }
+        }
+        assert_eq!("packed".parse::<GlmfHeadFormat>(), Ok(Packed));
+        assert!("maybe".parse::<GlmfHeadFormat>().unwrap_err().contains("packed"));
+        assert_eq!([Bf16, Fp8, Packed].map(GlmfHeadFormat::setting), ["false", "true", "packed"]);
+        assert_eq!([Bf16, Fp8, Packed].map(GlmfHeadFormat::name), ["BF16", "FP8", "exact 12-bit"]);
+        assert_eq!("auto".parse::<GlmfHeadFormat>(), Ok(GlmfHeadFormat::Auto));
+        assert_eq!(GlmfHeadFormat::default(), GlmfHeadFormat::Auto);
+        assert_eq!(GlmfRepresentation::default().head, GlmfHeadFormat::Auto);
+        for (native, ranks, resolved) in [(false, 1, Bf16), (false, 2, Bf16), (true, 1, Bf16), (true, 2, Bf16)] {
+            assert_eq!(GlmfHeadFormat::Auto.resolve(native, ranks), resolved);
+        }
+        let (vocab, hidden) = (154_880, 4096);
+        assert_eq!([Bf16, Fp8, Packed].map(|head| head.resident_bytes(vocab, hidden)),
+            [1_268_776_960, 654_213_120, 956_074_752]);
+        assert_eq!([Bf16, Fp8, Packed].map(|head| head.load_source_bytes(vocab, hidden)), [0, 0, 1_268_776_960]);
+        for sms in [48, 170, 188] {
+            assert_eq!([Bf16, Fp8, Packed].map(|head| head.scratch_bytes(256, vocab, hidden, sms)), [0, 0, 524_288]);
+        }
     }
 
     #[test]
@@ -240,7 +375,9 @@ mod tests {
         let owned1 = resident_weights_placed(&checkpoint, &cfg, 6, 2, Default::default(), Layers, 1).unwrap();
         let mut previous = [0; 2];
         for layers in 0..=6 {
-            let single = resident_weights(&checkpoint, &cfg, layers, 1, Default::default()).unwrap();
+            // Hold head precision fixed while checking only attention ownership.
+            let single = resident_weights(&checkpoint, &cfg, layers, 1,
+                GlmfRepresentation { head: GlmfHeadFormat::Fp8, ..Default::default() }).unwrap();
             let split = resident_weights(&checkpoint, &cfg, layers, 2, Default::default()).unwrap();
             for first in [0, 1] {
                 let owned = resident_weights_placed(&checkpoint, &cfg, layers, 2, Default::default(), Layers, first).unwrap();
@@ -329,11 +466,16 @@ mod tests {
             let Some(path) = resolved.snapshot_path else { continue };
             let checkpoint = Checkpoint::open(&path).unwrap();
             let cfg = GlmNextConfig::from_hf(&checkpoint.config).unwrap();
+            // Original retains all BF16 KDA projections and the BF16 shared head.
             let single = resident_weights(&checkpoint, &cfg, cfg.layers, 1, Default::default()).unwrap();
-            assert_eq!((single[0].embedding, single[0].weights), (1_268_776_960, 8_956_184_320), "{model}");
+            assert_eq!((single[0].embedding, single[0].weights),
+                (1_268_776_960, 14_034_716_416), "{model}");
+            let packed = GlmfRepresentation { head: GlmfHeadFormat::Packed, ..Default::default() };
+            let packed = resident_weights(&checkpoint, &cfg, cfg.layers, 1, packed).unwrap();
+            assert_eq!(packed[0].weights, 14_034_716_416 - 1_268_776_960 + 956_074_752, "{model}");
             let split = resident_weights(&checkpoint, &cfg, cfg.layers, 2, Default::default()).unwrap();
             assert_eq!((split[0].weights, split[1].weights),
-                (5_660_947_200, 4_907_587_072 + router_replica_bytes(&checkpoint, &cfg, cfg.layers).unwrap()), "{model}");
+                (7_936_512_768, 6_568_588_800 + router_replica_bytes(&checkpoint, &cfg, cfg.layers).unwrap()), "{model}");
             assert_eq!(split[1].embedding, 0);
         }
     }

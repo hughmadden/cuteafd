@@ -14,6 +14,7 @@ mod families {
 #[path = "../src/shared"]
 mod shared {
     pub(crate) mod decode_graph;
+    pub(crate) mod speculation_trace;
     pub(crate) mod fp8_linear;
     pub(crate) mod fp8_load_quant;
     pub(crate) mod memory;
@@ -21,11 +22,14 @@ mod shared {
     pub(crate) mod target_head;
     pub(crate) mod experts {
         pub(crate) mod layer;
+        pub(crate) mod weight_layout;
         pub(crate) mod paired_load;
         pub(crate) mod rtx {
             pub(crate) mod dense;
             // The query fixture has no push receiver, only dense plan records.
             pub(crate) mod push {
+                pub(crate) mod policy;
+                pub(crate) use policy::PushPolicy;
                 pub(crate) struct DensePlan {
                     pub base: u64,
                     pub host_bytes: u64,

@@ -10,7 +10,7 @@ use std::{cell::RefCell, path::Path};
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum Drafts {
     None,
-    Neural { depth: usize, fixed: bool },
+    Neural { depth: usize },
 }
 
 /// Ungraphed rows can replay prompt tokens or advance a live decode.
@@ -145,6 +145,12 @@ pub(crate) trait Backend<'a> {
     fn prefill_device(&self, placement: &mut Self::Placement, tokens: &[u32], logit_rows: usize,
         pool: &cuteafd_engine::prefix::RefPagePool)
         -> Result<Option<DeviceLogits>>;
+    fn streamed_prefill_scoring(&self) -> bool { false }
+    fn prefill_scoring(&self, placement: &mut Self::Placement, tokens: &[u32], logit_rows: usize,
+        _position: usize, _probe: &probe::ProbeRef, pool: &cuteafd_engine::prefix::RefPagePool)
+        -> Result<Option<probe::ScoreLogits>> {
+        Ok(self.prefill_device(placement, tokens, logit_rows, pool)?.map(probe::ScoreLogits::Device))
+    }
     fn packed_limits(&self) -> Option<crate::shared::prefill_packing::Limits> { None }
     fn coordinator_packed_cap(&self) -> Result<Option<usize>> { Ok(None) }
     fn checked_packed_limits(&self) -> Result<Option<crate::shared::prefill_packing::Limits>> {
@@ -169,12 +175,12 @@ pub(crate) trait Backend<'a> {
         kind: UngraphedKind, pool: &cuteafd_engine::prefix::RefPagePool)
         -> Result<Option<DeviceLogits>>;
     fn verify_bucket_rows(&self, rows: usize, speculative: bool, diagnostic: bool) -> usize;
-    fn verify_attention_trace(&self, contexts: &[Vec<usize>], rows: usize) -> serde_json::Value;
+    fn verify_attention_trace(&self, contexts: &[Vec<usize>], rows: usize) -> crate::shared::speculation_trace::Deferred;
     fn draft_geometry(&self, snapshot: &Path, width: usize) -> Result<cuteafd_core::PolicyGeometry>;
     fn arm_draft_probe(&self) -> Result<()>;
     fn prefill_draft(&self, placement: &Self::Placement, start: usize, chunk: &[u32], next: Option<u32>,
         draft: &mut Self::Draft) -> Result<()>;
-    fn draft(&self, sequences: &mut [DraftSeq<'_, Self::Placement, Self::Draft>], timing: &mut DraftTiming)
+    fn draft(&self, sequences: &mut [DraftSeq<'_, Self::Placement, Self::Draft>], timing: &mut DraftTiming, selector: &mut crate::shared::token_io::TokenSelector<'_>)
         -> Result<Vec<Vec<u32>>>;
     fn accept(&self, verified: &mut [Verified<'_, Self::Placement, Self::Draft, Self::History>],
         speculative: bool) -> Result<()>;
@@ -380,8 +386,8 @@ impl Trace {
         Ok(crate::shared::speculation_trace::Trace::open()?.map(Self))
     }
 
-    fn cycle(&mut self, line: serde_json::Value) {
-        if let Err(error) = self.0.write(&line) {
+    fn cycle(&mut self, line: impl serde::Serialize + Send + 'static) {
+        if let Err(error) = self.0.write(line) {
             tracing::warn!("trace: {error:#}");
         }
     }
@@ -526,11 +532,19 @@ mod verify_tests {
 fn publish<E: Encoder, M: Clone + Default>(stats: &Mutex<serde_json::Value>, requests: u64, generated: u64, active: usize, prefilling: usize,
     cache: &PrefixCache<CudaCopyEngine<'_>, M>, media: &MediaAdmission<Prompt, E>,
     preparer: Option<&cuteafd_api::openai::media::MediaPreparer>, verify: &VerifyStats, reserve: &Reserve, stalled: usize) {
+    if active == 0 && prefilling == 0 { cache.refresh_serving_stats(); }
+    let prefix_stats = cache.serving_stats();
     if let Ok(mut stats) = stats.lock() {
         *stats = serde_json::json!({ "draft_policy": resource::snapshot(),"requests": requests, "generated_tokens": generated, "active": active,
-            "prefilling": prefilling, "prefix_cache": cache.stats(), "verify": verify.snapshot(), "kv_reserve": reserve.snapshot(stalled),
-            "media": media.stats(cache.stats().media_key_collisions, preparer.map_or(0, |p| p.memo_hits()))});
-        probe::graph_capture_stats(&mut stats);
+            "prefilling": prefilling, "prefix_cache": prefix_stats, "verify": verify.snapshot(), "kv_reserve": reserve.snapshot(stalled),
+            "media": media.stats(prefix_stats.media_key_collisions, preparer.map_or(0, |p| p.memo_hits()))});
+    }
+    // Sampled once, outside the stats lock, after the first request retires so a
+    // settled device is measured rather than a partial decode step. Silent when
+    // the family publishes no reconciliation provenance.
+    if requests > 0 {
+        static FIRST: std::sync::Once = std::sync::Once::new();
+        crate::shared::probe::first_request(&FIRST, requests, || crate::shared::memory_report::reconcile::capture("first_request"));
     }
 }
 
@@ -657,6 +671,15 @@ mod readiness_tests {
     }
 
     #[test]
+    fn streamed_scoring_capability_is_published_before_scheduler_readiness() {
+        let source = include_str!("scheduler.rs").split_once("\npub(crate) fn schedule").unwrap().1;
+        let init = source.split_once("= initialize(|| {").unwrap().1.split_once("}, initialized)?;").unwrap().0;
+        let capability = init.split_once("if streamed_scoring {").unwrap().1
+            .split_once('}').unwrap().0;
+        assert!(capability.contains("set_resolved(\"prefill-scoring\", \"streamed\")"));
+    }
+
+    #[test]
     fn scheduler_init_failure_never_publishes_ready() {
         let published = Cell::new(false);
         let result = initialize(|| -> Result<()> { anyhow::bail!("scheduler init failed") }, || {
@@ -753,19 +776,27 @@ fn prefill_group<'a, B: Backend<'a>>(engine: &B, family: &B::Prefix,
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn schedule<'a, B: Backend<'a>>(engine: &B, snapshot: &std::path::Path,
     receive: &mut mpsc::Receiver<NativeRequest>, stats: &Mutex<serde_json::Value>, max_sequences: usize,
-    drafts: Drafts, eos: Vec<u32>, decode_share: DecodeShareArgs, prefix: &PrefixArgs,
+    drafts: Drafts, length: crate::shared::draft::length::DraftLength, eos: Vec<u32>, decode_share: DecodeShareArgs, prefix: &PrefixArgs,
     loop_abort: LoopAbortConfig, select: SelectPlacement,
     media: &mut MediaAdmission<Prompt, B::Encoder>,
     preparer: Option<&cuteafd_api::openai::media::MediaPreparer>,
     initialized: impl FnOnce() -> Result<()>)
     -> Result<()> {
     let geometry = engine.geometry();
+    let streamed_scoring = probe::streamed_prefill_scoring(geometry.family) && engine.streamed_prefill_scoring();
     anyhow::ensure!(geometry.decode_rows > 0 && max_sequences <= geometry.decode_rows
         && max_sequences <= geometry.slots, "scheduler lanes exceed target decode/state capacity");
     let width = match drafts { Drafts::Neural { depth, .. } => depth, Drafts::None => 0 };
+    let drafts = match drafts {
+        Drafts::Neural { depth } => Drafts::Neural { depth: length.effective(depth) },
+        Drafts::None => Drafts::None,
+    };
     // Publish readiness only after all fallible scheduler-owned startup work.
     let (family, mut cache, markers, mut grammars, tokenizer, mut selector, mut shared, mut trace, mut prefills) = initialize(|| {
         let (family, cache) = engine.prefix_cache(prefix, max_sequences)?;
+        if streamed_scoring {
+            cuteafd_bench::context::set_resolved("prefill-scoring", "streamed");
+        }
         let markers = crate::shared::prefix::marker_ids(snapshot, engine.message_starts())?;
         let grammars = crate::shared::constraints::Compiler::with_vocab(
             engine.library(), snapshot.join("tokenizer.json"), geometry.vocab_size, eos);
@@ -775,8 +806,7 @@ pub(crate) fn schedule<'a, B: Backend<'a>>(engine: &B, snapshot: &std::path::Pat
         let shared = if width > 0 {
             let geometry = engine.draft_geometry(snapshot, width)?;
             engine.arm_draft_probe()?;
-            let mut policy = cuteafd_core::DraftPolicy::seeded(geometry, cuteafd_core::PolicySeed::weak(width))?;
-            crate::shared::draft::apply_length_rule(&mut policy);
+            let policy = length.policy(geometry, cuteafd_core::PolicySeed::weak(width), width)?;
             Some(policy)
         } else { None };
         let trace = Trace::open()?;
@@ -826,7 +856,8 @@ pub(crate) fn schedule<'a, B: Backend<'a>>(engine: &B, snapshot: &std::path::Pat
                                 Err(_) => break,
                             }
                         };
-                        if let Err(error) = probe::validate_scoring(&job.probe, geometry.full_prefill_logits) {
+                        if let Err(error) = probe::validate_scoring(&job.probe,
+                            geometry.full_prefill_logits || streamed_scoring) {
                             let _ = job.events.send(Err(NativeFailure::BadRequest(format!("scoring: {error:#}"))));
                             continue;
                         }
@@ -965,9 +996,15 @@ pub(crate) fn schedule<'a, B: Backend<'a>>(engine: &B, snapshot: &std::path::Pat
             if let Some(from) = probe::scoring(&job.probe) {
                 // Teacher-forced scoring: every row's logits, no generation, nothing retained.
                 let scored = probe::score(engine.library(), &job.probe, &tokens, from, geometry.prefill_rows,
-                    geometry.decode_rows, probe::verify_rows(&job.probe), geometry.full_prefill_logits, &mut placement,
-                    |placement, chunk, rows| Ok(engine.prefill_device(placement, chunk, rows, cache.pool())?
-                        .map(probe::ScoreLogits::Device)),
+                    geometry.decode_rows, probe::verify_rows(&job.probe),
+                    geometry.full_prefill_logits || streamed_scoring, &mut placement,
+                    |placement, chunk, rows, position| {
+                        if streamed_scoring {
+                            engine.prefill_scoring(placement, chunk, rows, position, &job.probe, cache.pool())
+                        } else {
+                            Ok(engine.prefill_device(placement, chunk, rows, cache.pool())?.map(probe::ScoreLogits::Device))
+                        }
+                    },
                     |placement, chunk| engine.verify_device_ungraphed(&mut [(placement, chunk)], false,
                         UngraphedKind::Scoring, cache.pool())?
                         .context("scoring needs every layer"));
@@ -1306,7 +1343,7 @@ async fn decode_round<'a, B: Backend<'a>>(lease: LaneLease<'_>, engine: &B, geom
             .min(reserved_drafts(a.placement.len(), a.placement.units().len(), cache.pool().page_rows())) }).collect();
     let mut proposals: Vec<Vec<u32>> = match drafts {
         Drafts::None => vec![Vec::new(); active.len()],
-        Drafts::Neural { depth, fixed } => {
+        Drafts::Neural { depth } => {
             let limits: Vec<usize> = limits.iter().map(|&l| l.min(depth)).collect();
             let histories: Vec<&DraftHistory> = active.iter().map(|a| &a.outcomes).collect();
             neural_confidence = DraftHistory::acceptance(&histories, &limits);
@@ -1319,7 +1356,7 @@ async fn decode_round<'a, B: Backend<'a>>(lease: LaneLease<'_>, engine: &B, geom
             let selection = resource::select_drafted(shared, &candidates, depth, geometry.decode_rows,
                 neural_confidence.iter().filter(|p| !p.is_empty()).count());
             predicted = selection.predicted;
-            let mut depths = if fixed { neural_confidence.iter().map(Vec::len).collect() } else { selection.lengths };
+            let mut depths = selection.lengths;
             for (a, d) in active.iter().zip(depths.iter_mut()) {
                 // A whole-prompt prefix hit has no draft continuation yet: it drafts after its first step.
                 if a.draft.pending_rows() == 0 {
@@ -1334,7 +1371,7 @@ async fn decode_round<'a, B: Backend<'a>>(lease: LaneLease<'_>, engine: &B, geom
                     placement: &a.placement, seq: &mut a.draft, depth }).collect();
                 drafted_requests = depths.iter().filter(|&&n| n > 0).count();
                 drafted_width = depths.iter().copied().max().unwrap_or(0);
-                let proposals = round_clock.draft(|| engine.draft(&mut seqs, &mut lane.timing))?;
+                let proposals = round_clock.draft(|| engine.draft(&mut seqs, &mut lane.timing, selector))?;
                 proposals
             } else {
                 vec![Vec::new(); active.len()]
@@ -1349,11 +1386,11 @@ async fn decode_round<'a, B: Backend<'a>>(lease: LaneLease<'_>, engine: &B, geom
     let copies: Vec<_> = active.iter().zip(&proposals).zip(&limits).zip(&mut neural_confidence)
         .map(|(((a, proposal), &limit), prior)| {
             prior.truncate(proposal.len());
-            shared.as_ref().filter(|_| !matches!(drafts, Drafts::Neural { fixed: true, .. }))
+            shared.as_ref().filter(|policy| !policy.fixed())
                 .and_then(|shared| resource::copy_continuation(shared, active.len(), a.ticket.id(), &a.history,
                     proposal, prior, limit, a.job.sampling.is_greedy()))
         }).collect();
-    if let Some(shared) = shared.as_mut().filter(|_| drafted_width > 0 && !matches!(drafts, Drafts::Neural { fixed: true, .. })) {
+    if let Some(shared) = shared.as_mut().filter(|policy| drafted_width > 0 && !policy.fixed()) {
         let candidates: Vec<_> = active.iter().zip(&neural_confidence).zip(&limits).map(|((a, prior), &limit)|
             resource::Candidate { id: a.ticket.id(), prior, limit, selector: false, cold: false }).collect();
         let selection = resource::select_drafted(shared, &candidates, drafted_width, geometry.decode_rows, drafted_requests);
@@ -1537,21 +1574,21 @@ async fn decode_round<'a, B: Backend<'a>>(lease: LaneLease<'_>, engine: &B, geom
     if let Some(trace) = trace.as_mut() {
         let contexts: Vec<Vec<usize>> = starts.iter().zip(&sequences)
             .map(|(&start, rows)| (1..=rows.len()).map(|offset| start + offset).collect()).collect();
-        trace.cycle(serde_json::json!({"rows": tokens.len(), "seqs": sequences.len(),
-            "attention": engine.verify_attention_trace(&contexts,
+        trace.cycle(crate::shared::speculation_trace::record! {rows: tokens.len(), seqs: sequences.len(),
+            attention: engine.verify_attention_trace(&contexts,
                 engine.verify_bucket_rows(tokens.len(), spec, diagnostic)),
-            "contexts": contexts,
-            "ids": active.iter().map(|a| a.id).collect::<Vec<_>>(),
-            "depths": sequences.iter().map(|s| s.len() - 1).collect::<Vec<_>>(),
-            "kept": kept.iter().map(|k| k.map_or(0, |(n, _)| n)).collect::<Vec<_>>(),
-            "verify_ms": 1e3 * elapsed, "draft_steps": lane.timing.steps - steps_before,
-            "draft_ms": 1e3 * (lane.timing.seconds - draft_s_before), "cycle_ms": 1e3 * cycle.elapsed().as_secs_f64(),
-            "neural_tokens": trace_neural,
-            "copy_windows": trace_copy.as_ref().map(|windows| windows.iter().map(|(start, suffix, tokens)|
-                serde_json::json!({"start": start, "matched_suffix": suffix, "tokens": tokens})).collect::<Vec<_>>()),
-            "committed_tokens": active.iter().zip(&before).map(|(a, &n)| &a.history[n..]).collect::<Vec<_>>(),
-            "predicted_us": predicted, "rates": neural_confidence,
-            "draft_policy": resource::snapshot()}));
+            contexts: contexts,
+            ids: active.iter().map(|a| a.id).collect::<Vec<_>>(),
+            depths: sequences.iter().map(|s| s.len() - 1).collect::<Vec<_>>(),
+            kept: kept.iter().map(|k| k.map_or(0, |(n, _)| n)).collect::<Vec<_>>(),
+            verify_ms: 1e3 * elapsed, draft_steps: lane.timing.steps - steps_before,
+            draft_ms: 1e3 * (lane.timing.seconds - draft_s_before), cycle_ms: 1e3 * cycle.elapsed().as_secs_f64(),
+            neural_tokens: trace_neural,
+            copy_windows: trace_copy.as_ref().map(|windows| windows.iter().map(|(start, suffix, tokens)|
+                crate::shared::speculation_trace::record! {start: *start, matched_suffix: *suffix, tokens: tokens.clone()}).collect::<Vec<_>>()),
+            committed_tokens: active.iter().zip(&before).map(|(a, &n)| a.history[n..].to_vec()).collect::<Vec<_>>(),
+            predicted_us: predicted, rates: neural_confidence,
+            draft_policy: resource::trace_snapshot()});
     }
     Ok(Some(finished))
 }

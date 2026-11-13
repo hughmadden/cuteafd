@@ -29,12 +29,14 @@ def test_split_catalog_covers_whole_and_head_split(monkeypatch):
     exec(compile(ast.Module(body=[n for n in tree.body if isinstance(n, ast.FunctionDef)],
                            type_ignores=[]), str(path), "exec"), namespace)
     entries = namespace["programs"]()
-    assert len(entries) == 32
-    assert len({name for name, _, _ in entries}) == 32
+    assert len(entries) == 56
+    assert len({name for name, _, _ in entries}) == 56
+    assert all(not name.startswith("kimik31_") for name, _, _ in entries[:32])
+    assert all(name.startswith("kimik31_") for name, _, _ in entries[32:])
     for heads in (48, 96):
         for rows in (64, 4096):
             selected = {name: thunk for name, thunk, capacity in entries
-                        if f"h{heads}_" in name and capacity == rows}
+                        if f"h{heads}_" in name and capacity == rows and not name.startswith("kimik31_")}
             assert len(selected) == (8 if heads == 96 else 7)
             if heads == 96:
                 args, kw = selected[f"kda_fused_h96_m{rows}"]()
@@ -48,6 +50,13 @@ def test_split_catalog_covers_whole_and_head_split(monkeypatch):
                     assert kw["kv_stride"] == stride and args[0] == {"heads": heads, "kv_cache": cache}
 
     catalogue = {name: thunk for name, thunk, _ in entries}
+    for name, thunk, capacity in entries[32:]:
+        args, kw = thunk()
+        assert args[0]["norm_eps"] == 1e-5
+        assert kw["max_rows"] == capacity
+        if "rank_norm" in name:
+            assert args[0]["kv_cache"] in ("bf16", "fp8")
+            assert kw["kv_stride"] in (576, 640)
     args, kw = catalogue["kda_commit_h96"]()
     assert args[0][1] == {"hidden": 7168, "kda_heads": 96} and not kw
     assert catalogue["kda_output_h96"]() == ((), {"width": 12288, "outputs": 7168})

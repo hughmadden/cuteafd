@@ -1,8 +1,18 @@
 //! Native device/pinned allocation and stream owners shared by model components.
 use anyhow::Result;
 use cuteafd_ffi::{CuteafdDeviceBuffer, CuteafdHostBuffer, NativeLibrary};
+pub(crate) use cuteafd_ffi::memory_ledger::{tag, MemoryKind, Tag};
+/// Scratch allocated by this crate's tests; absent from every non-test build.
+#[cfg(test)]
+pub(crate) const TEST: Tag = Tag::workspace("test/scratch");
+/// An immutable arena tag for this crate's tests; absent from every non-test build.
+#[cfg(test)]
+pub(crate) const TEST_ARENA: cuteafd_core::memory_layout::ArenaTag<cuteafd_core::memory_layout::arena_class::Immutable> =
+    cuteafd_core::memory_layout::ArenaTag::weights("test/arena");
 use std::ffi::c_void;
 
+#[path = "memory/receipts.rs"]
+pub(crate) mod receipts;
 #[path = "memory/snapshot.rs"]
 mod snapshot;
 pub(crate) use snapshot::{SnapshotCopies, SnapshotPool, SnapshotStorage};
@@ -52,33 +62,49 @@ pub(crate) mod push_native;
 pub(crate) struct DeviceAllocation<'a> {
     pub(crate) library: &'a NativeLibrary,
     pub(crate) buffer: CuteafdDeviceBuffer,
+    pub(crate) backing: Option<device::Allocation<'a>>,
 }
 impl<'a> DeviceAllocation<'a> {
-    pub(crate) fn named(library: &'a NativeLibrary, bytes: usize, scope: &'static str) -> Result<Self> {
-        let _scope = cuteafd_ffi::memory_ledger::scope(scope);
-        Self::new(library, bytes)
+    pub(crate) fn from_allocation(allocation: device::Allocation<'a>) -> Self {
+        Self { library: allocation.device.library, buffer: allocation.buffer, backing: Some(allocation) }
+    }
+
+    pub(crate) fn inventory(&self, inventory: &mut receipts::Inventory<'_>, name: &str) -> Result<()> {
+        match &self.backing {
+            Some(allocation) => allocation.inventory(inventory, name),
+            None => inventory.device(name, self.buffer),
+        }
     }
 
     /// Attention value/scale planes retain 16-byte alignment under every row slice.
     pub(crate) fn attention_plane(library: &'a NativeLibrary, rows: usize, stride: usize,
-        name: &str) -> Result<Self> {
+        name: &str, tag: Tag) -> Result<Self> {
         let bytes = rows.checked_mul(stride).ok_or_else(|| anyhow::anyhow!("attention plane size overflow"))?;
-        let allocation = Self::new(library, bytes)?;
+        let allocation = Self::new(library, bytes, tag)?;
         anyhow::ensure!(allocation.buffer.ptr as usize % 16 == 0 && stride % 16 == 0,
             "V4.1 BF16 AOT attention load: {name} shape=[{rows},{stride}] on GPU {} requires 16-byte aligned base and row stride",
             allocation.buffer.device_id);
         Ok(allocation)
     }
 
-    pub(crate) fn new(library: &'a NativeLibrary, bytes: usize) -> Result<Self> {
-        Ok(Self {
-            library,
-            buffer: library.alloc_device_buffer(bytes)?,
-        })
+    /// Device memory on the current device holding `tag`.
+    #[track_caller]
+    pub(crate) fn new(library: &'a NativeLibrary, bytes: usize, tag: Tag) -> Result<Self> {
+        Ok(Self { library, buffer: library.alloc_device_buffer(bytes, tag)?, backing: None })
+    }
+
+    /// Kind and owner as the ledger recorded them (`None` for empty backing).
+    pub(crate) fn tag(&self) -> Option<Tag> {
+        match &self.backing { Some(allocation) => allocation.tag(), None => self.tag_of_buffer() }
+    }
+
+    fn tag_of_buffer(&self) -> Option<Tag> {
+        cuteafd_ffi::memory_ledger::tag_of(self.buffer.ptr as usize)
     }
 }
 impl Drop for DeviceAllocation<'_> {
     fn drop(&mut self) {
+        if self.backing.is_some() { return; }
         if self.library.is_quarantined_after_failed_drain() {
             // cudaFree may synchronize with unproved work on another stream.
             // Retain this allocation until process teardown on that path.
@@ -89,21 +115,41 @@ impl Drop for DeviceAllocation<'_> {
         }
     }
 }
+/// Borrowed descriptor of an already admitted pinned owner, retained until load commit.
+#[derive(Clone)]
+pub(crate) struct HostLanding { address: usize, bytes: usize, pub(crate) ready: std::sync::Arc<std::sync::atomic::AtomicBool> }
+impl HostLanding {
+    pub(crate) fn new(storage: &mut HostAllocation<'_>) -> Self {
+        Self { address: storage.buffer.ptr as usize, bytes: storage.buffer.bytes, ready: Default::default() }
+    }
+    pub(crate) fn bytes(&self) -> usize { self.bytes }
+    pub(crate) fn fill(&self, body: impl FnOnce(&mut [u8]) -> Result<()>) -> Result<()> {
+        // SAFETY: the load owns this pinned allocation exclusively through commit.
+        body(unsafe { std::slice::from_raw_parts_mut(self.address as *mut u8, self.bytes) })
+    }
+
+    pub(crate) fn copy(&self, at: usize, source: &[u8]) -> Result<()> {
+        anyhow::ensure!(at.checked_add(source.len()).is_some_and(|end| end <= self.bytes),
+            "host landing outside admitted owner");
+        // SAFETY: the recording loader retains this pinned owner until every rank
+        // joins; checked fragments are disjoint and no reader runs before commit.
+        unsafe { std::ptr::copy_nonoverlapping(source.as_ptr(), (self.address as *mut u8).add(at), source.len()); }
+        Ok(())
+    }
+}
 pub(crate) struct HostAllocation<'a> {
     pub(crate) library: &'a NativeLibrary,
     pub(crate) buffer: CuteafdHostBuffer,
 }
 impl<'a> HostAllocation<'a> {
-    pub(crate) fn named(library: &'a NativeLibrary, bytes: usize, scope: &'static str) -> Result<Self> {
-        let _scope = cuteafd_ffi::memory_ledger::scope(scope);
-        Self::new(library, bytes)
+    /// Zeroed pinned, device-mapped host memory holding `tag`.
+    #[track_caller]
+    pub(crate) fn new(library: &'a NativeLibrary, bytes: usize, tag: Tag) -> Result<Self> {
+        Self::zeroed(library, library.alloc_host_buffer(bytes, tag)?, bytes)
     }
 
-    pub(crate) fn new(library: &'a NativeLibrary, bytes: usize) -> Result<Self> {
-        let value = Self {
-            library,
-            buffer: library.alloc_host_buffer(bytes)?,
-        };
+    fn zeroed(library: &'a NativeLibrary, buffer: CuteafdHostBuffer, bytes: usize) -> Result<Self> {
+        let value = Self { library, buffer };
         // Padding must also be initialized before copying the contiguous arena.
         unsafe {
             std::ptr::write_bytes(value.buffer.ptr.cast::<u8>(), 0, bytes);
@@ -147,13 +193,15 @@ pub(crate) enum ResidentWeight<'a> {
     Host { storage: HostAllocation<'a>, alias: CuteafdDeviceBuffer },
 }
 impl<'a> ResidentWeight<'a> {
-    pub(crate) fn new(library: &'a NativeLibrary, bytes: usize, host: bool) -> Result<Self> {
+    /// `tag` must be an immutable kind: the same bytes serve from either placement.
+    pub(crate) fn new(library: &'a NativeLibrary, bytes: usize, host: bool,
+        tag: cuteafd_core::memory_layout::ArenaTag<cuteafd_core::memory_layout::arena_class::Immutable>) -> Result<Self> {
         if host {
-            let storage = HostAllocation::new(library, bytes)?;
+            let storage = HostAllocation::new(library, bytes, tag.tag())?;
             let alias = library.cuda_host_buffer_device_alias(storage.buffer)?;
             Ok(Self::Host { storage, alias })
         } else {
-            Ok(Self::Device(DeviceAllocation::new(library, bytes)?))
+            Ok(Self::Device(DeviceAllocation::new(library, bytes, tag.tag())?))
         }
     }
     pub(crate) fn buffer(&self) -> CuteafdDeviceBuffer {
@@ -174,9 +222,10 @@ pub(crate) struct LayerStaging<'a> {
     regions: usize,
 }
 impl<'a> LayerStaging<'a> {
-    pub(crate) fn new(library: &'a NativeLibrary, region: usize, layers: usize) -> Result<Self> {
+    pub(crate) fn new(library: &'a NativeLibrary, region: usize, layers: usize, owner: &'static str) -> Result<Self> {
         let regions = layers.max(1);
-        Ok(Self { allocation: HostAllocation::new(library, region.max(1) * regions)?, region: region.max(1), regions })
+        let tag = Tag::new(MemoryKind::Staging, owner);
+        Ok(Self { allocation: HostAllocation::new(library, region.max(1) * regions, tag)?, region: region.max(1), regions })
     }
     /// Layer `layer`'s region: its host buffer and bytes.
     pub(crate) fn region(&mut self, layer: usize) -> (CuteafdHostBuffer, &mut [u8]) {
@@ -252,6 +301,34 @@ impl Drop for BlockingWait<'_> {
     }
 }
 
+/// Standalone component qualification shares one lazily created stream per owner.
+/// Device metadata and teardown never initialize it; serving uses explicit streams.
+pub(crate) struct StandaloneStream<'a> {
+    pub(crate) device: device::Device<'a>,
+    stream: std::cell::OnceCell<device::Stream<'a>>,
+}
+impl<'a> StandaloneStream<'a> {
+    pub(crate) fn new(device: device::Device<'a>) -> Self {
+        Self { device, stream: std::cell::OnceCell::new() }
+    }
+    pub(crate) fn get(&self) -> Result<&device::Stream<'a>> {
+        if self.stream.get().is_none() {
+            let stream = device::Stream::new(self.device)?;
+            let _ = self.stream.set(stream);
+        }
+        Ok(self.stream.get().expect("initialized standalone stream"))
+    }
+    pub(crate) fn drain(&self) -> Result<()> {
+        self.stream.get().map_or(Ok(()), device::Stream::drain)
+    }
+    pub(crate) fn require_complete(&self) -> Result<()> {
+        if let Some(stream) = self.stream.get() {
+            anyhow::ensure!(stream.ready()?, "standalone component stream is unfinished");
+        }
+        Ok(())
+    }
+}
+
 pub(crate) struct LoadStream<'a> {
     pub(crate) library: &'a NativeLibrary,
     pub(crate) raw: *mut c_void,
@@ -310,10 +387,45 @@ impl Drop for LoadStream<'_> {
 }
 
 #[cfg(test)]
+pub(crate) fn cpu_stream_fixture() -> Result<(tempfile::TempDir, cuteafd_ffi::native_library_lifetime_fixture::Fixture)> {
+    use anyhow::Context;
+    let root = std::path::PathBuf::from(std::env::var_os("HOME").context("HOME is unset")?)
+        .join(".cache/cuteafd/builds");
+    let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
+    let status = std::process::Command::new("python3")
+        .arg(repo.join("scripts/build/assert-build-filesystem.py"))
+        .arg(&root)
+        .status()?;
+    anyhow::ensure!(status.success(), "CPU stream fixture filesystem check failed");
+    std::fs::create_dir_all(&root)?;
+    let directory = tempfile::Builder::new().prefix("cpu-stream-fixture-").tempdir_in(root)?;
+    let fixture = cuteafd_ffi::native_library_lifetime_fixture::Fixture::build_in(directory.path())?;
+    Ok((directory, fixture))
+}
+
+#[cfg(test)]
 mod load_stream_lifetime_tests {
     use super::*;
     use cuteafd_ffi::native_library_lifetime_fixture::Fixture;
     use std::{future::Future, task::{Context, Poll, Waker}};
+
+    #[test]
+    fn standalone_stream_is_lazy_shared_and_drains_without_initializing() -> Result<()> {
+        let (_directory, fixture) = cpu_stream_fixture()?;
+        let library = fixture.load()?;
+        let device = device::Device { library: &library, id: 0 };
+        let owner = std::rc::Rc::new(StandaloneStream::new(device));
+        let component = owner.clone();
+        owner.drain()?;
+        component.require_complete()?;
+        assert!(!fixture.events()?.contains('V'), "metadata/drain must not create a stream");
+        assert_eq!(owner.get()?.raw, component.get()?.raw);
+        assert_eq!(fixture.events()?.matches('V').count(), 1);
+        drop(component);
+        drop(owner);
+        assert_eq!(fixture.events()?.matches('V').count(), 1);
+        Ok(())
+    }
 
     #[test]
     #[ignore = "requires an allocated CPU build slot and explicit NVMe fixture directory"]
@@ -325,8 +437,8 @@ mod load_stream_lifetime_tests {
             std::fs::write(std::env::var("CUTEAFD_FATAL_LOAD_STREAM_EVIDENCE")?,
                 fixture.directory().join("events").to_str().unwrap())?;
             let library = fixture.load()?;
-            let weights = [DeviceAllocation::new(&library, 256)?, DeviceAllocation::new(&library, 256)?];
-            let staging = [HostAllocation::new(&library, 256)?, HostAllocation::new(&library, 256)?];
+            let weights = [DeviceAllocation::new(&library, 256, crate::shared::memory::TEST)?, DeviceAllocation::new(&library, 256, crate::shared::memory::TEST)?];
+            let staging = [HostAllocation::new(&library, 256, crate::shared::memory::TEST)?, HostAllocation::new(&library, 256, crate::shared::memory::TEST)?];
             fixture.configure_pack(&library, 0, 1)?;
             match path.as_str() {
                 "drop" => drop(LoadStream { library: &library, raw: std::ptr::null_mut() }),
@@ -373,6 +485,22 @@ mod load_stream_lifetime_tests {
 /// Test support for fake SparkNest push sources.
 #[cfg(test)]
 pub(crate) mod push_testing {
+    pub(crate) fn bind(socket: &str) -> std::io::Result<cuteafd_loader::push_load::Listener> {
+        cuteafd_loader::push_load::validate_socket_endpoint(socket)?;
+        cuteafd_loader::push_load::Listener::bind(socket)
+    }
+
+    #[test]
+    fn overlong_fixture_socket_is_rejected_before_bind() {
+        let error = match bind(&"x".repeat(108)) {
+            Ok(_) => panic!("overlong fixture socket accepted"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(error.get_ref().unwrap().is::<cuteafd_loader::push_load::SocketEndpointError>());
+        assert!(error.to_string().contains("socket path is 108 bytes > 107 bytes"));
+    }
+
     /// A fake SparkNest's `accept`, bounded: a rank that never connects fails the
     /// test after `timeout` with a clear error instead of hanging (Listener has no
     /// accept timeout; a waker connects at the deadline).

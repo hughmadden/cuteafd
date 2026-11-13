@@ -123,6 +123,7 @@ pub(super) enum DenseFamily { Glm(GlmDsaConfig), Flash(GlmNextConfig) }
 pub struct DenseSelection {
     prefix: &'static str,
     layers: usize,
+    glm: Option<GlmDsaConfig>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -157,8 +158,8 @@ impl DenseSelection {
 
     pub fn from_hf(config: &serde_json::Value) -> anyhow::Result<Self> {
         Ok(match DenseFamily::from_hf(config)? {
-            DenseFamily::Glm(cfg) => Self { prefix: "model.", layers: cfg.layers },
-            DenseFamily::Flash(cfg) => Self { prefix: "model.language_model.", layers: cfg.layers },
+            DenseFamily::Glm(cfg) => Self { prefix: "model.", layers: cfg.layers, glm: Some(cfg) },
+            DenseFamily::Flash(cfg) => Self { prefix: "model.language_model.", layers: cfg.layers, glm: None },
         })
     }
 
@@ -171,6 +172,21 @@ impl DenseSelection {
     pub fn layer_prefix(&self, layer: usize) -> anyhow::Result<String> {
         ensure!(layer < self.layers, "native dense layer outside config");
         Ok(format!("{}layers.{layer}", self.prefix))
+    }
+
+    /// The same plain-role names used by GLM's native reader, not a second table.
+    pub fn plain_owner(&self, layer: usize, tensor: &str) -> Option<&'static str> {
+        self.glm.as_ref()?.plain_owners(layer).into_iter()
+            .find_map(|(key, name)| (name == tensor).then_some(key))
+    }
+
+    /// Decode a layer tensor relative to this checkpoint's own backbone root.
+    pub fn layer_tensor<'a>(&self, tensor: &'a str) -> anyhow::Result<Option<(usize, &'a str)>> {
+        let Some(rest) = tensor.strip_prefix(&format!("{}layers.", self.prefix)) else { return Ok(None); };
+        let (layer, leaf) = rest.split_once('.').context("native dense layer tensor")?;
+        let layer = layer.parse::<usize>()?;
+        ensure!(layer < self.layers, "native dense layer outside config");
+        Ok(Some((layer, leaf)))
     }
 
     /// The same bounded selection feeds allocation admission and the dense reader.
@@ -289,7 +305,7 @@ impl DenseFamily {
             DenseTransform::WidenBf16
         } else { DenseTransform::Identity };
         Ok(DenseOwnership { execution, transform,
-            whole_mla: (flash && mla && leaf.starts_with("self_attn.")).then_some(layer) })
+            whole_mla: (mla && leaf.starts_with("self_attn.")).then_some(layer) })
     }
 }
 

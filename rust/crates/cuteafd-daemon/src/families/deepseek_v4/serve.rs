@@ -40,14 +40,16 @@ use tokio::sync::mpsc;
 #[derive(Debug, clap::Args)]
 pub(crate) struct ServeArgs {
     #[command(flatten)]
+    pub draft_length: crate::shared::draft::length::DraftLength,
+    #[command(flatten)]
     pub engine: EngineArgs,
     #[arg(long, default_value = "0.0.0.0:8000")]
     pub listen: String,
     /// Packed short-prompt arithmetic: unrestricted by default, exact keeps loaded routes.
     #[arg(long, value_enum)]
     pub prefill_packing: Option<crate::shared::prefill_packing::PackingMode>,
-    /// Longest sequence; 0 selects checkpoint full, bounded by compiled support and the admitted pool.
-    #[arg(long, default_value_t = 0)]
+    /// Served context: auto fits the admitted pool; a positive count pins it.
+    #[arg(long = "max-context-tokens", default_value = "auto", value_parser = crate::shared::context::parse_tokens::<u32>)]
     pub max_context: u32,
     /// Public model id; defaults to the snapshot's Hugging Face id.
     #[arg(long)]
@@ -83,10 +85,14 @@ fn prefix_score_path(position: usize, input_rows: usize) -> probe::ScorePath {
 }
 
 pub(crate) async fn run_serve(mut args: ServeArgs) -> Result<()> {
+    if probe::streamed_prefill_scoring("deepseek_v4") {
+        cuteafd_bench::context::set_resolved("prefill-scoring", "streamed");
+    }
+    args.draft_length.report_inactive(args.engine.dspark);
     cuteafd_core::concurrency::validate("deepseek_v4", args.engine.max_sequences as u64)?;
     args.prefix.resolve_entries(args.engine.max_sequences);
     let api = args.api.load()?;
-    let profile = ModelProfile::new(
+    let mut profile = ModelProfile::new(
         args.model_id.clone().or_else(|| model_id(&args.engine.snapshot)).context("model id")?,
         ModelEncoding::DeepseekV4,
     );
@@ -95,6 +101,7 @@ pub(crate) async fn run_serve(mut args: ServeArgs) -> Result<()> {
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
     let mut engine_args = args.engine.clone();
     engine_args.max_context = args.max_context as usize;
+    profile.expert_usage = engine_args.expert_usage_reader.clone();
     let worker_stats = stats.clone();
     let (max_context, decode_share, prefix) =
         (args.max_context as usize, args.decode_share, args.prefix.clone());
@@ -102,7 +109,7 @@ pub(crate) async fn run_serve(mut args: ServeArgs) -> Result<()> {
     let packing = args.prefill_packing.unwrap_or_default();
     let worker = tokio::task::spawn_blocking(move ||
         serve_loop(engine_args, args.loop_abort.config(), receive, ready_tx, worker_stats, max_context,
-            decode_share, prefix, packing));
+            decode_share, prefix, packing, args.draft_length));
     let max_context = ready_rx.await.context("engine failed before it was ready")??;
     let limits = args.prefix.reserve.limits(max_context)?;
     cuteafd_bench::context::phase("engine loaded");
@@ -114,11 +121,12 @@ pub(crate) async fn run_serve(mut args: ServeArgs) -> Result<()> {
     // lazy graphs or loads more code.
     crate::shared::memory_report::log("ready");
     tracing::info!(listen = %args.listen, model = %profile.id, "DeepSeek V4 API is ready");
+    let mut worker = Some(worker);
     tokio::select! {
-        served = axum::serve(listener, api.app(router, hub)
-            .into_make_service_with_connect_info::<std::net::SocketAddr>()) => served?,
-        _ = crate::shared::api::watch_scheduler(worker) => unreachable!(),
+        served = crate::shared::api::serve_http(listener, api.app(router, hub), "deepseek_v4") => served?,
+        _ = crate::shared::api::watch_scheduler(&mut worker) => unreachable!(),
     }
+    crate::shared::api::finish_scheduler(&mut worker, "deepseek_v4").await?;
     Ok(())
 }
 
@@ -174,6 +182,7 @@ fn serve_loop(
     decode_share: DecodeShareArgs,
     prefix: PrefixArgs,
     packing: crate::shared::prefill_packing::PackingMode,
+    length: crate::shared::draft::length::DraftLength,
 ) -> Result<()> {
     let loaded = match super::load(&args) {
         Ok(loaded) => loaded,
@@ -197,10 +206,10 @@ fn serve_loop(
         }
         if max_context > engine.max_context {
             tracing::warn!(requested = max_context, supported = engine.max_context,
-                "--max-context exceeds the exported programs; requests are limited to the programs' context");
+                "--max-context-tokens exceeds the exported programs; requests are limited to the programs' context");
         }
         engine.configure_packing(packing, transports)?;
-        let shared = super::draft_binding::new(engine, &loaded, transports)?;
+        let shared = super::draft_binding::new(engine, &loaded, transports, length)?;
         let local = engine.local_layers();
         console::layer_classes((0..engine.weights.layers.len()).map(|l| console::layer_class(false, l >= local)).collect());
         let mut selector = TokenSelector::new(&loaded.library, args.token_io.token_select, engine.cfg.vocab_size,
@@ -212,10 +221,9 @@ fn serve_loop(
                 }
             })
     });
-    if let Some(ready) = ready.take() {
-        let _ = ready.send(result.as_ref().map(|_| args.max_context).map_err(|e| anyhow::anyhow!("{e:#}")));
-    }
-    result
+    crate::shared::serve::forward_initialization(result, ready.is_some(), "V4 initialization failed", |error| {
+        ready.take().expect("pending readiness").send(Err(error)).map_err(|result| match result { Err(error) => error, Ok(_) => unreachable!("sent an error") })
+    })
 }
 
 /// An admitted prompt waiting for its remaining prefill chunks (from the
@@ -622,7 +630,7 @@ fn prefix_cache<'e, 'a>(engine: &'e super::engine::Engine<'a>, args: &PrefixArgs
     tracing::info!(entries, mark_slots = family.slots(), mark_bytes = family.mark_bytes(), page_bytes = layout.page_bytes,
         pages = layout.pages, page_rows = layout.page_rows, host_bytes, points = ?args.points(),
         "DeepSeek V4 prefix cache");
-    cuteafd_bench::context::set_kv((layout.pages * layout.page_rows) as u64, engine.max_pool_tokens_no_onboard, layout.pages as u64,
+    cuteafd_bench::context::set_kv((layout.pages * layout.page_rows) as u64, None, layout.pages as u64,
         &"compressed C4/C128 + index".to_string(), host_bytes);
     Ok((family, cache))
 }
@@ -638,12 +646,19 @@ fn release(family: &Dsv4Prefix<'_, '_>, cache: &mut PrefixCache<CudaCopyEngine<'
 
 /// Serving statistics for `/v1/stats`.
 #[allow(clippy::too_many_arguments)]
-fn publish(stats: &Mutex<serde_json::Value>, requests: u64, generated: u64, active: usize, prefilling: usize,
+fn publish(engine: &super::engine::Engine<'_>, stats: &Mutex<serde_json::Value>, requests: u64, generated: u64, active: usize, prefilling: usize,
     cache: &PrefixCache<CudaCopyEngine<'_>>, reserve: &Reserve, stalled: usize) {
+    if active == 0 && prefilling == 0 { cache.refresh_serving_stats(); }
+    let prefix_stats = cache.serving_stats();
+    if requests > 0 {
+        static FIRST: std::sync::Once = std::sync::Once::new();
+        FIRST.call_once(|| crate::shared::memory_report::reconcile::capture("first_request"));
+    }
     if let Ok(mut stats) = stats.lock() {
         *stats = serde_json::json!({"requests": requests, "generated_tokens": generated, "active": active,
-            "prefilling": prefilling, "prefix_cache": cache.stats(), "draft_policy": resource::snapshot(),
+            "prefilling": prefilling, "prefix_cache": prefix_stats, "draft_policy": resource::snapshot(),
             "kv_reserve": reserve.snapshot(stalled)});
+        stats["v4_runtime"] = engine.runtime_stats();
     }
 }
 
@@ -749,6 +764,10 @@ fn schedule(
     let mut prefills = decode_share.queue::<Prefill<'_>>()?;
     let mut kv_waiter = cuteafd_engine::prefix::DeferredAdmission::<NativeRequest>::default();
     // Prefix capacity and all fallible scheduler initialization precede readiness.
+    for rank in 0..engine.ranks() {
+        engine.on(rank, || crate::shared::inventory::startup_probe(&loaded.library,
+            &[loaded.library.cuda_get_device()?], "v4/ready", Default::default()))?;
+    }
     ready();
     crate::shared::api::run_scheduler(|| {
     loop {
@@ -766,7 +785,7 @@ fn schedule(
                     if !busy {
                         // Idle: publish the state the server waits in (captures and releases done).
                         cache.tick();
-                        publish(stats, requests, generated_total, 0, 0, &cache, &reserve, 0);
+                        publish(engine, stats, requests, generated_total, 0, 0, &cache, &reserve, 0);
                         console::gauges_now(|| console::Gauges::prefix_cache(&cache, 0, 0, 0));
                         match receive.blocking_recv() {
                             Some(job) => job,
@@ -783,7 +802,7 @@ fn schedule(
             let reject = |job: &NativeRequest, message: String| {
                 let _ = job.events.send(Err(NativeFailure::BadRequest(message)));
             };
-            if let Err(error) = probe::validate_scoring(&job.probe, engine.full_prefill_logits) {
+            if let Err(error) = probe::validate_scoring(&job.probe, probe::prefill_scoring_admitted("deepseek_v4", engine.full_prefill_logits)) {
                 reject(&job, format!("scoring: {error:#}"));
                 continue;
             }
@@ -844,12 +863,15 @@ fn schedule(
             if let Some(from) = probe::scoring(&job.probe) {
                 // Teacher-forced scoring: every row's logits, no generation, nothing retained.
                 let mut placement = admitted.placement;
-                let scored = probe::score(&loaded.library, &job.probe, &tokens, from, chunk_limit, engine.decode_rows, probe::verify_rows(&job.probe), engine.full_prefill_logits,
+                let scored = probe::score(&loaded.library, &job.probe, &tokens, from, chunk_limit, engine.decode_rows, probe::verify_rows(&job.probe), probe::prefill_scoring_admitted("deepseek_v4", engine.full_prefill_logits),
                     &mut (&mut placement, &mut *transports),
-                    |(placement, transports), chunk, rows| {
+                    |(placement, transports), chunk, rows, position| {
                         if prefix_score_path(placement.len, chunk.len()) == probe::ScorePath::Decode {
                             Ok(Some(probe::ScoreLogits::Device(engine.verify_device(
                                 &mut [(&mut **placement, chunk)], transports, runtime)?)))
+                        } else if rows > 1 && !engine.full_prefill_logits && probe::streamed_prefill_scoring("deepseek_v4") {
+                            Ok(Some(engine.prefill_streamed_scoring(placement, chunk, transports,
+                                probe::ScoringRows { probe: &job.probe, position })?))
                         } else if rows > 1 {
                             Ok(Some(probe::ScoreLogits::Host {
                                 values: engine.prefill(placement, chunk, transports, runtime, rows, None)?,
@@ -1058,7 +1080,7 @@ fn schedule(
         if active.is_empty() {
             if !stalled.is_empty() {
                 // Only stalled requests: wait for a capture or prefill to return pages.
-                publish(stats, requests, generated_total, 0, prefills.len(), &cache, &reserve, stalled.len());
+                publish(engine, stats, requests, generated_total, 0, prefills.len(), &cache, &reserve, stalled.len());
                 std::thread::park_timeout(Duration::from_millis(1));
             }
             continue;
@@ -1092,7 +1114,7 @@ fn schedule(
             release(&family, &mut cache, &mut states, &request.placement);
         }
         cache.tick();
-        publish(stats, requests, generated_total, active.len(), prefills.len(), &cache, &reserve, stalled.len());
+        publish(engine, stats, requests, generated_total, active.len(), prefills.len(), &cache, &reserve, stalled.len());
         console::gauges(|| console::Gauges::prefix_cache(&cache, active.len() + stalled.len(), prefills.len(),
             receive.len() + kv_waiter.len()));
         prefills.stepped(cycle.elapsed().as_secs_f64());
@@ -1224,7 +1246,7 @@ mod tests {
         let scoring = source.split_once("let scored = probe::score(").unwrap().1
             .split_once("match scored {").unwrap().0;
         let decode = scoring.split_once("if prefix_score_path(placement.len, chunk.len())").unwrap().1
-            .split_once("} else if rows > 1 {").unwrap().0;
+            .split_once("} else if rows > 1 && !engine.full_prefill_logits && probe::streamed_prefill_scoring(\"deepseek_v4\") {").unwrap().0;
         assert!(decode.contains("engine.verify_device("));
         assert!(!decode.contains("engine.prefill_device("));
     }
@@ -1270,6 +1292,24 @@ mod tests {
         assert_eq!(round_censor(true, true, 2, &rows, None, 99), Some(Censor::Cancelled));
         assert_eq!(round_censor(true, true, 2, &rows, Some(99), 99), None);
         assert_eq!(round_censor(true, true, 4, &rows, Some(99), 99), Some(Censor::Cancelled));
+    }
+
+    #[test]
+    fn publish_leaves_graph_stats_to_request_time_and_keeps_reconciliation() {
+        let source = include_str!("serve.rs");
+        let publish = source.split_once("\nfn publish(").unwrap().1
+            .split_once("\n/// Message starts").unwrap().0;
+        let replace = publish.find("*stats = serde_json::json!").unwrap();
+        assert!(!publish.contains("graph_capture_stats"),
+            "graph inventory diagnostics belong to the shared request-time stats hook");
+        let api = include_str!("../../shared/api.rs");
+        assert!(api.contains("probe::graph_capture_stats"),
+            "the shared stats endpoint retains graph inventory diagnostics");
+        let guard = publish.find("if requests > 0 {").unwrap();
+        let once = publish.find("static FIRST: std::sync::Once").unwrap();
+        let first = publish.find("reconcile::capture(\"first_request\")").unwrap();
+        assert!(guard < once && once < first && first < replace,
+            "the once-guarded first request capture precedes the stats replacement");
     }
 
     #[test]

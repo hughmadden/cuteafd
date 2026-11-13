@@ -6,6 +6,7 @@ use crate::shared::experts::rtx::{
     native::NativeTp2,
     pair::{OwnerInputs, OwnerPair, OwnerPolicy, OwnerWeights},
 };
+use crate::shared::memory::Tag;
 use crate::shared::memory::device::{Allocation, Device, Stream};
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::{CuteafdDeviceBuffer, Bf16Add};
@@ -61,10 +62,11 @@ pub(crate) fn pushed_routed_weights<'a>(
     budgets: [usize; 2],
     pushed: [Vec<crate::shared::experts::layer::ExpertWeights<'a>>; 2],
 ) -> Result<[OwnerWeights<'a>; 2]> {
-    ensure!(catalog.exl3().is_none() && catalog.nvfp4().is_none(), "pushed coordinator halves are native MXFP4");
+    ensure!(catalog.exl3().is_none(), "pushed coordinator halves require native experts");
+    let nvfp4 = catalog.nvfp4().is_some();
     let OwnerPolicy::Native { selection, output, .. } =
-        devices[0].run(|| OwnerPolicy::native(devices[0].library, false))? else { unreachable!() };
-    let workspace = NativeTp2::workspace_bytes_for_format(devices[0].library, capacity as usize, selection, output, false)?;
+        devices[0].run(|| OwnerPolicy::native(devices[0].library, nvfp4))? else { unreachable!() };
+    let workspace = NativeTp2::workspace_bytes_for_format(devices[0].library, capacity as usize, selection, output, nvfp4)?;
     let budgets = [budgets[0].checked_add(workspace).context("TP2 native budget overflow")?,
         budgets[1].checked_add(workspace).context("TP2 native budget overflow")?];
     Ok(NativeTp2::pushed_pair_weights(devices, catalog, (0..layers).collect(), capacity as usize, budgets,
@@ -82,10 +84,10 @@ impl<'a> PeerInputs<'a> {
     fn new(device: Device<'a>, capacity: u32) -> Result<Self> {
         let [values, wire, ids, routing] = Self::allocation_sizes(capacity);
         Ok(Self {
-            values: Allocation::new(device, values)?,
-            wire: Allocation::new(device, wire)?,
-            ids: Allocation::new(device, ids)?,
-            routing: Allocation::new(device, routing)?,
+            values: Allocation::new(device, values, Tag::workspace("v41/tp2-experts"))?,
+            wire: Allocation::new(device, wire, Tag::workspace("v41/tp2-experts"))?,
+            ids: Allocation::new(device, ids, Tag::workspace("v41/tp2-experts"))?,
+            routing: Allocation::new(device, routing, Tag::workspace("v41/tp2-experts"))?,
         })
     }
     fn buffers(&self) -> [CuteafdDeviceBuffer; 4] {
@@ -436,8 +438,8 @@ impl<'a> Execution<'a> {
                 modules,
             )?,
             output: [
-                Allocation::new(devices[0], reserve as usize * 10240)?,
-                Allocation::new(devices[1], reserve as usize * 10240)?,
+                Allocation::new(devices[0], reserve as usize * 10240, Tag::workspace("v41/tp2-experts"))?,
+                Allocation::new(devices[1], reserve as usize * 10240, Tag::workspace("v41/tp2-experts"))?,
             ],
             add: devices[0].library.bf16_add()?,
             sm: [Some(devices[0].run(|| devices[0].library.v41_peer_copy())?),
@@ -1329,7 +1331,7 @@ mod shared_storage_tests {
             let b=inputs[i].buffers();runtime.block_on(unsafe {slot.execute(0,16,b[0],b[1],b[2],b[3])})?;
         }
         let rank=storage.execution.try_lock().unwrap().routed.rank_output(0);
-        let reader=Stream::new(devices[1])?;let saved=Allocation::new(devices[1],want.len())?;
+        let reader=Stream::new(devices[1])?;let saved=Allocation::new(devices[1],want.len(), crate::shared::memory::TEST)?;
         let reader_copy=devices[1].run(||lib.v41_peer_copy())?;
         devices[1].run(||unsafe {reader_copy.launch(saved.buffer,rank,want.len(),reader.raw)})?;reader.drain()?;
         let chains=[StageChain::on_devices(&lib,&[0,1])?,StageChain::on_devices(&lib,&[0,1])?];
@@ -1421,9 +1423,9 @@ mod shared_storage_tests {
         let runtime = tokio::runtime::Builder::new_current_thread().build()?;
         for local in [0usize, 1] {
             let remote = 1 - local;
-            let sources = widths.map(|width| Allocation::new(devices[local], CAPACITY * width));
+            let sources = widths.map(|width| Allocation::new(devices[local], CAPACITY * width, crate::shared::memory::TEST));
             let sources: Vec<_> = sources.into_iter().collect::<Result<_>>()?;
-            let peers: Vec<_> = widths.iter().map(|&width| Allocation::new(devices[remote], CAPACITY * width)).collect::<Result<_>>()?;
+            let peers: Vec<_> = widths.iter().map(|&width| Allocation::new(devices[remote], CAPACITY * width, crate::shared::memory::TEST)).collect::<Result<_>>()?;
             for rows in [1usize, 6, 17, 48, 64] {
                 for (plane, (source, &width)) in sources.iter().zip(&widths).enumerate() {
                     let data: Vec<u8> = (0..CAPACITY * width).map(|i| ((i * 31 + plane * 7 + rows) % 253) as u8).collect();
@@ -1482,8 +1484,8 @@ mod shared_storage_tests {
         let flags = crate::shared::peer_split::PeerExchange::new_flags(&lib, [0, 1], FLAGS,
             crate::families::deepseek_v41::v41_peer_push::lane_bytes_with(64, 15568, None)?)?;
         let sm = devices[0].run(|| lib.v41_peer_copy())?;
-        let source = Allocation::new(devices[1], 64 * 10240)?;
-        let output = Allocation::new(devices[0], 64 * 10240)?;
+        let source = Allocation::new(devices[1], 64 * 10240, crate::shared::memory::TEST)?;
+        let output = Allocation::new(devices[0], 64 * 10240, crate::shared::memory::TEST)?;
         let chain = StageChain::on_devices(&lib, &[0, 1])?;
         chain.set_device_order(true);
         let runtime = tokio::runtime::Builder::new_current_thread().build()?;

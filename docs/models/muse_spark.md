@@ -11,7 +11,20 @@ serve instead.
 Status: under qualification. The plan, the coordinator engine on one RTX or a
 head-split pair, the Spark expert path, RTX onboarding, the prefix cache, the
 chat encoding with constrained tool calls and both DFlash2 drafters are in
-place; serving is text only until the bundled towers are bound (#936).
+place. The starting configs also serve the checkpoint's bundled vision and
+PCM audio towers by default; qualification and caveats are recorded below
+and on #923.
+
+## Core views
+
+`wrldsuksgo2mars/Muse-Spark-Open-EXL3-K4-MC` provides the original BF16 core
+and complete `k8-compact` / `k6-compact` cores. Select with `CORE_VIEW` (default
+`original`) or `--core-view`; see the [MC contract](../mc-checkpoints.md).
+The original path retains native attention, MoE frontend/backend and vocabulary
+head weights. Compact widths have distinct dispatch and exact memory charges.
+`fp8-compact` retains the existing attention conversion scope, using row-major
+E4M3 weights with F32 block-128 scales and BF16 activations (W8A16).
+Towers and routed experts are shared, not converted with the core.
 
 ## Architecture
 
@@ -50,11 +63,12 @@ every routed (row, slot), and the coordinator's combine
 The combine reads every rank's reply in place through an `i64` table of
 region addresses (`rank_regions`).
 
-Replies are BF16 for a step's narrow segments (up to
-`--expert-partial-bf16-max-rows`, 64 by default: decode and verify stay
-lossless) and NVFP4 by default (or FP8/BF16 via the shared `--spark-reply-format`) for wider
-prefill segments. Each endpoint's frame is sized from the admitted worst
-reply (NVFP4 91.5 MiB, FP8 117.8 MiB per frame).
+With the phase keys omitted, replies are BF16 for narrow prefill segments
+(up to `--expert-partial-bf16-max-rows`, 64 by default) and NVFP4 for wider
+prefill segments; decode and verify stay BF16. The independent shared
+`--spark-prefill-reply-format` and `--spark-decode-reply-format` selections
+accept BF16, FP8 or NVFP4 and apply explicitly at every row count. Each
+endpoint's frame is sized from the admitted worst reply across both phases.
 
 **RTX onboarding** is on by default: an onboarded layer runs its experts on
 the coordinator from the image's EXL3 package (`exl3-muse-k<tiers>/rtx-tp2`
@@ -76,7 +90,9 @@ peer access); the head runs on the last rank.
 
 The prefix cache restores exact frontiers (full-layer KV records and the
 sliding rings), with the shared host tier; prefill runs as row units on the
-shared prefill pipeline. Packed prefill is not supported yet (#923).
+shared prefill pipeline. Packed prefill is enabled by default (`unrestricted`);
+`exact` falls back to singleton units for EXL3 when row invariance is not
+available.
 
 ## Chat encoding
 
@@ -85,25 +101,23 @@ transformers on the goldens). The model replies in recipient-addressed
 messages: `to=self` is private reasoning, `to=commentary` and `to=user` are
 visible content, any other recipient is a tool call in an
 `<atem:function_calls>` block. `reasoning_effort` maps onto the template's
-`low`/`medium`/`high`/`xhigh` (`minimal` to low, `max` to xhigh); turning
-thinking off is refused, as the template always reasons. Strict or required
-tool calls, tool-decoding assistance and structured `response_format` run
-under a native grammar (`muse_tool_schema`): reasoning first, then the calls
-or a `to=user` answer in the requested format.
+`low`/`medium`/`high`/`xhigh` (`minimal` to low, `max` to xhigh). Thinking
+off pre-fills the final `to=user` recipient, skips private reasoning and
+ignores reasoning effort; requests with tools are refused in this mode.
+With thinking on, strict or required tool calls, tool-decoding assistance
+and structured `response_format` run under a native grammar
+(`muse_tool_schema`): reasoning first, then the calls or a `to=user` answer
+in the requested format. Thinking-off structured output uses the ordinary
+response grammar directly on the final answer.
 
 ## Layouts
 
-`cuteafd plan --layout` on the header-only EXL3 K4 + Core-K6 fixture
-(RTX PRO 6000, default Spark budget, no host prefix tier):
-
-| Layout | KV pool | RTX expert layers |
-|---|---|---|
-| 2 RTX + 4..8 Sparks | 2.10M (the 2M target) | automatic (1 here; 3 with the host tier) |
-| 2 RTX + 3 Sparks | refused | |
-| 1 RTX + 4 Sparks | 814K | automatic (0) |
-| 1 RTX + 6 Sparks | 805K | automatic (0) |
-| 1 RTX + 8 Sparks | 796K | automatic (0) |
-| any + 2 Sparks | refused | |
+Use `cuteafd plan --layout` with the actual checkpoint, bundled towers,
+NVIDIA drafter and image's program manifest to resolve the KV pool and RTX
+onboarding. The qualified cards are 1 RTX + 4 Sparks and 2 RTX + 6 Sparks;
+the max card reaches the 2M pool target, while the min card's pool is
+memory-limited. Header-only fixture estimates omit runtime reservations and
+are not served-card capacities.
 
 One RTX admits the pool below the 1M compiled context, so an automatic
 context is clamped to it. KV is 4 KiB per token per full layer (BF16),
@@ -115,7 +129,8 @@ per-sequence ring of the window plus one rollback step.
 The launcher and planner default to NVIDIA DFlash2, pinned to
 `22e2669e4c60689f9bff0749a34d9d8e59ce7cd6`. It is chosen on C4 emitted
 throughput; baseline C1 ties RadixArk. Both pass the lossless set and exact
-prefix-cache checks on the qualified 1 RTX + 4 Spark layout. Set
+prefix-cache checks; NVIDIA is qualified on both the 1 RTX + 4 Spark and
+2 RTX + 6 Spark cards. Set
 `SPECULATOR=off` to disable drafting; an explicit model/revision overrides
 the default.
 
@@ -137,8 +152,10 @@ context.
 
 The starting configs serve the checkpoint's bundled vision and PCM audio
 towers (`VISION=auto`, `AUDIO=auto`); set either to `off` to drop it. Both
-place on Sparks by default (min: vision on rank 0, 4,860,356,960 B; audio on
-rank 1, 246,586,368 B), never on the RTX. Qualification is on #923:
+prefer Sparks in Auto mode (min: vision on rank 0, 4,860,356,960 B; audio on
+rank 1, 246,586,368 B). If no Spark admits a tower and its scratch plus
+headroom, Auto falls back to an RTX with enough memory. Explicit `--vision rtx`
+or `--audio rtx` requests coordinator placement directly. Qualification is on #923:
 
 - **Vision:** byte-exact metadata and the FP32 yardstick (public RMS ratio
   0.990); prompt and turn prefix-cache restores exact.
@@ -162,5 +179,6 @@ rank 1, 246,586,368 B), never on the RTX. Qualification is on #923:
 
 ## Changelog
 
-| Date | Release | Change | Quality / performance |
-|---|---|---|---|
+| Version | Date | Change | Basic eval |
+| --- | --- | --- | --- |
+| v5 | 2026-11-10 | Published benchmarks | <a href="../../benchmarks/muse_spark/2026-11-10-smoke-muse-spark-open-exl3-k4-core-k6-1rtx-4spark-muse-spark-exl3-min/report.svg"><img src="../../benchmarks/muse_spark/2026-11-10-smoke-muse-spark-open-exl3-k4-core-k6-1rtx-4spark-muse-spark-exl3-min/card.svg" width="360" alt="Muse-Spark-Open-EXL3-K4-Core-K6 (exl3-k4) (1× RTX)"></a> <a href="../../benchmarks/muse_spark/2026-11-10-smoke-muse-spark-open-exl3-k4-core-k6-2rtx-6spark-muse-spark-exl3-max/report.svg"><img src="../../benchmarks/muse_spark/2026-11-10-smoke-muse-spark-open-exl3-k4-core-k6-2rtx-6spark-muse-spark-exl3-max/card.svg" width="360" alt="Muse-Spark-Open-EXL3-K4-Core-K6 (exl3-k4) (2× RTX)"></a> |

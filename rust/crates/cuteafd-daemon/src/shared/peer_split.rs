@@ -11,6 +11,7 @@
 //! waits on either stream. Callers pick slots by layer parity (and lane), so a
 //! push never lands on rows the other GPU may still read. One extra flag
 //! (`DIRECT`) serves pushes into buffers outside the slots.
+use crate::shared::memory::Tag;
 use crate::shared::memory::DeviceAllocation;
 use anyhow::{ensure, Context, Result};
 
@@ -218,6 +219,33 @@ fn validate_decode_extent(bytes: usize) -> Result<()> {
 }
 
 impl<'a> PeerExchange<'a> {
+    /// Physical retained owners, never reconstructed from requested slot extents.
+    pub(crate) fn allocation_buffers(&self) -> Vec<(usize, String, cuteafd_ffi::CuteafdDeviceBuffer)> {
+        let mut out = Vec::new();
+        for (rank, end) in self.ends.iter().enumerate() {
+            for (slot, recv) in end.recv.iter().enumerate() {
+                out.push((rank, format!("peer.recv.{slot}"), recv.buffer));
+            }
+            out.push((rank, "peer.control".into(), end.control.buffer));
+            if let Some(progress) = &end.progress {
+                out.push((rank, "peer.progress".into(), progress.buffer));
+            }
+            if let Some(abort) = &self.abort {
+                out.push((rank, "peer.abort".into(), abort.sides[rank].word.buffer));
+            }
+        }
+        out
+    }
+
+    /// Ordinary host backing retained by opt-in progress diagnostics.
+    pub(crate) fn diagnostic_host_backing(&self) -> Result<Option<(u64, u64)>> {
+        let ordinals = self.host_ordinals.try_borrow()?;
+        if ordinals.capacity() == 0 { return Ok(None); }
+        let bytes = ordinals.capacity().checked_mul(std::mem::size_of::<[[u64; 2]; 2]>())
+            .context("peer diagnostic host backing overflow")?;
+        Ok(Some((ordinals.as_ptr() as u64, u64::try_from(bytes)?)))
+    }
+
     /// Enables peer access both ways and allocates `slots` zeroed receive
     /// buffers of `slot_bytes` and the control words on each rank; `ranks[0]`'s
     /// device must be current (and is again on return).
@@ -260,6 +288,7 @@ impl<'a> PeerExchange<'a> {
         validate_decode_extent(decode_lane_bytes)?;
         let slots = flags;
         let diagnostics = std::env::var("CUTEAFD_PEER_WAIT_DIAGNOSTICS").is_ok_and(|v| v == "1");
+        let storage = cuteafd_loader::serving_capacity::PeerStorageLayout::new(slots, sizes.iter().copied().max().unwrap_or(1), diagnostics)?;
         let end = |rank: usize| -> Result<End<'a>> {
             on_device(library, ranks[rank].device, || {
                 library.cuda_enable_peer(ranks[1 - rank].device)?;
@@ -273,7 +302,7 @@ impl<'a> PeerExchange<'a> {
                 library.peer_exchange_initialize()?;
                 if diagnostics { library.peer_diagnostic_initialize()?; }
                 let zeroed = |bytes: usize| -> Result<DeviceAllocation<'a>> {
-                    let allocation = DeviceAllocation::new(library, bytes.max(256))?;
+                    let allocation = DeviceAllocation::new(library, bytes.max(256), Tag::transport("shared/peer-split"))?;
                     library.cuda_zero_bytes(allocation.buffer, allocation.buffer.bytes)?;
                     Ok(allocation)
                 };
@@ -281,8 +310,8 @@ impl<'a> PeerExchange<'a> {
                     recv: sizes.iter()
                         .map(|&bytes| zeroed(bytes))
                         .collect::<Result<_>>()?,
-                    control: zeroed(Self::flag_bytes(slots))?,
-                    progress: if diagnostics { Some(zeroed((slots + 1) * std::mem::size_of::<PeerProgress>())?) } else { None },
+                    control: zeroed(storage.control_bytes)?,
+                    progress: if diagnostics { Some(zeroed(storage.progress_bytes)?) } else { None },
                 })
             })
         };
@@ -318,11 +347,11 @@ impl<'a> PeerExchange<'a> {
         let side = |rank: usize| {
             on_device(library, ranks[rank].device, || {
                 let probe = |stage| crate::shared::inventory::startup_probe(
-                    library, &[ranks[rank].device], stage);
+                    library, &[ranks[rank].device], stage, Default::default());
                 probe("peer-abort-before-preload")?;
                 library.peer_abort_initialize()?;
                 probe("peer-abort-after-preload")?;
-                let word = DeviceAllocation::new(library, 256)?;
+                let word = DeviceAllocation::new(library, 256, Tag::transport("shared/peer-abort-word"))?;
                 library.cuda_zero_bytes(word.buffer, word.buffer.bytes)?;
                 probe("peer-abort-after-word")?;
                 let stream = library.cuda_stream_create()?;
@@ -930,7 +959,7 @@ mod tests {
                 }
             }
         }
-        let source = DeviceAllocation::new(&library, 1024)?;
+        let source = DeviceAllocation::new(&library, 1024, crate::shared::memory::TEST)?;
         assert!(exchange.push(0, 0, source.buffer.ptr, 272).is_err());
         assert!(exchange.push(0, sizes.len(), source.buffer.ptr, 16).is_err());
         assert!(PeerExchange::new_sized(&library, ranks, &[0], 256).is_err());

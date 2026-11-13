@@ -107,6 +107,7 @@ impl RoutedExpertShape {
 
 #[derive(Debug)]
 pub struct OfficialV41Catalog {
+    source: CatalogSource,
     reader: crate::expert_reader::ExpertReader,
     format: crate::plan::checkpoint::CheckpointFormat,
     /// The strict V4.1 contract; `None` for other families, which only expose
@@ -119,6 +120,14 @@ pub struct OfficialV41Catalog {
     exl3_arena_bytes: std::sync::Mutex<BTreeMap<(usize, usize), Vec<u64>>>,
     nvfp4: Option<crate::V41Nvfp4Contract>,
     fp8: Option<crate::formats::fp8_experts::Fp8ExpertTensors>,
+}
+
+/// A selected catalog can never fall back to an unselected disk inventory.
+#[derive(Debug, Default)]
+enum CatalogSource {
+    #[default]
+    Legacy,
+    Selected(crate::plan::checkpoint::CheckpointView),
 }
 
 /// Bounded range reads for a validated, unsharded coordinator tensor.
@@ -155,7 +164,7 @@ impl OfficialV41Catalog {
     #[cfg(feature = "test-support")]
     #[doc(hidden)]
     pub fn exlr8_transport_fixture(snapshot: &Path, experts: RoutedExpertShape) -> Self {
-        Self { reader: Default::default(), exl3_arena_bytes: Default::default(), format: crate::plan::checkpoint::CheckpointFormat::Exlr8,
+        Self { source: CatalogSource::Legacy, reader: Default::default(), exl3_arena_bytes: Default::default(), format: crate::plan::checkpoint::CheckpointFormat::Exlr8,
             config: None, experts, snapshot: snapshot.into(), tensors: Vec::new(),
             exl3: None, nvfp4: None, fp8: None }
     }
@@ -171,14 +180,22 @@ impl OfficialV41Catalog {
         if let Some(fp8) = &self.fp8 { fp8.finish_reads(); }
     }
 
+    fn inventory(&self) -> Result<crate::plan::Checkpoint> {
+        match &self.source {
+            CatalogSource::Selected(view) => crate::plan::Checkpoint::inventory_view(view),
+            CatalogSource::Legacy => crate::plan::Checkpoint::inventory(&self.snapshot),
+        }
+    }
+
     /// Resolve bundled dSpark from the checkpoint's own spec and catalog, not its family name.
     pub fn bundled_dspark_ownership(&self, requested: bool) -> Result<crate::plan::spec::DraftOwnership> {
         use crate::plan::{spec::{DraftOwnership, SpeculatorSpec}, Component};
         if !requested { return Ok(DraftOwnership::None); }
-        let checkpoint = crate::plan::Checkpoint::inventory(&self.snapshot)?;
+        let checkpoint = self.inventory()?;
         let family = crate::plan::family::detect(&checkpoint).context("catalog family")?;
         let model = family.open(&checkpoint)?;
-        let bundled = matches!(model.spec().speculator, Some(SpeculatorSpec::BundledDspark { .. }))
+        let bundled = matches!(model.spec().speculator,
+            Some(SpeculatorSpec::BundledDspark { .. } | SpeculatorSpec::Dspark { .. }))
             && self.tensors.iter().any(|tensor| family.classify(model.spec(), &tensor.metadata.name)
                 .is_some_and(|role| role.component == Component::Speculator));
         if !bundled { return Err(MissingBundledDspark.into()); }
@@ -196,7 +213,7 @@ impl OfficialV41Catalog {
             return Ok(());
         }
         if ownership.uses_checkpoint() { return Ok(()); }
-        let checkpoint = crate::plan::Checkpoint::inventory(&self.snapshot)?;
+        let checkpoint = self.inventory()?;
         let family = crate::plan::family::detect(&checkpoint).context("catalog family")?;
         let model = family.open(&checkpoint)?;
         let keep = |name: &str| family.classify(model.spec(), name)
@@ -265,6 +282,10 @@ impl OfficialV41Catalog {
     pub fn routed_experts(&self) -> &RoutedExpertShape {
         &self.experts
     }
+    pub fn selected_view(&self) -> Option<&crate::plan::checkpoint::CheckpointView> {
+        match &self.source { CatalogSource::Selected(view) => Some(view), CatalogSource::Legacy => None }
+    }
+
     pub fn snapshot(&self) -> &Path {
         &self.snapshot
     }
@@ -309,8 +330,10 @@ impl OfficialV41Catalog {
     pub fn backbone_tp2_slice(&self, name: &str, rank: usize) -> Result<crate::V41Exl3TensorSlice> {
         let tensor = self.tensor(name)?;
         ensure!(rank < 2, "invalid TP2 rank");
-        let V41TensorPlacement::BackboneExpertTp4 { axis, .. } = tensor.placement else {
-            anyhow::bail!("TP2 slice requires a native backbone projection");
+        let axis = match tensor.placement {
+            V41TensorPlacement::BackboneExpertTp4 { axis, .. } => axis,
+            V41TensorPlacement::CoordinatorRtx if name.starts_with("mtp.") && name.contains(".ffn.experts.") => usize::from(name.contains(".w2.")),
+            _ => anyhow::bail!("TP2 slice requires a native routed projection"),
         };
         let bytes = usize::try_from(tensor.metadata.byte_length)?;
         ensure!(bytes % 2 == 0, "uneven TP2 projection bytes");
@@ -393,6 +416,9 @@ impl OfficialV41Catalog {
         &self, name: &str, rank: usize, dst: &mut [u8], scratch: &mut [u8],
     ) -> Result<usize> {
         let tensor = self.tensor(name)?;
+        if name.starts_with("mtp.") && name.contains(".ffn.experts.") {
+            return self.read_coordinator_tp2_into(name, usize::from(name.contains(".w2.")), rank, dst, scratch);
+        }
         ensure!(rank < 2 && matches!(tensor.placement, V41TensorPlacement::BackboneExpertTp4 { .. }),
             "TP2 read requires a backbone expert and rank in 0..2");
         let bytes = usize::try_from(tensor.metadata.byte_length / 2)?;
@@ -855,7 +881,7 @@ pub fn read_official_v41_role_catalog(snapshot: &Path, role: &str, needed: impl 
         );
     }
     tensors.sort_by(|a, b| a.metadata.name.cmp(&b.metadata.name));
-    Ok(OfficialV41Catalog { reader: Default::default(), exl3_arena_bytes: Default::default(), format: crate::plan::checkpoint::CheckpointFormat::HfIndexed,
+    Ok(OfficialV41Catalog { source: CatalogSource::Legacy, reader: Default::default(), exl3_arena_bytes: Default::default(), format: crate::plan::checkpoint::CheckpointFormat::HfIndexed,
         experts: RoutedExpertShape::of_v41(&config),
         config: Some(config),
         snapshot: snapshot.to_path_buf(),
@@ -869,6 +895,11 @@ pub fn read_official_v41_role_catalog(snapshot: &Path, role: &str, needed: impl 
 /// Opens the routed experts of any supported checkpoint: the strict V4.1
 /// contract, or a DeepSeek V4 (Flash/Pro) checkpoint whose experts share the
 /// V4.1 storage (packed FP4 in I8, E8M0 scales per 32 values).
+pub fn read_expert_catalog_view(view: &crate::plan::checkpoint::CheckpointView) -> Result<OfficialV41Catalog> {
+    let (checkpoint, validation) = crate::plan::Checkpoint::open_view_with_header_validation(view)?;
+    expert_catalog_from_checkpoint(&checkpoint, &validation)
+}
+
 pub fn read_expert_catalog(snapshot: &Path) -> Result<OfficialV41Catalog> {
     let config: serde_json::Value =
         crate::families::deepseek_v41::v41_exl3::read_json(&snapshot.join("config.json"), 1024 * 1024)?;
@@ -881,11 +912,22 @@ pub(crate) fn expert_catalog_from_checkpoint(checkpoint: &crate::plan::Checkpoin
         validation.as_ref().map_err(|error| anyhow::anyhow!("{error}"))?;
         ensure!(checkpoint.missing_shards.is_empty(), "expert catalog needs readable shards: {:?}", checkpoint.missing_shards);
     }
-    read_expert_catalog_with_checkpoint(&checkpoint.snapshot, &checkpoint.config, Some(checkpoint))
+    let mut catalog = read_expert_catalog_with_checkpoint(&checkpoint.snapshot, &checkpoint.config, Some(checkpoint))?;
+    if let Some(view) = &checkpoint.view { catalog.source = CatalogSource::Selected(view.clone()); }
+    Ok(catalog)
 }
 
 fn read_expert_catalog_with_checkpoint(snapshot: &Path, config: &serde_json::Value,
     checkpoint: Option<&crate::plan::Checkpoint>) -> Result<OfficialV41Catalog> {
+    if config["model_type"] == "minimax_m3_vl" {
+        let cfg = crate::families::minimax_m3::config::MiniMaxM3Config::from_hf(config)?;
+        let first_layer = cfg.moe.iter().position(|&moe| moe).context("MiniMax M3 has no routed layers")?;
+        let end = cfg.moe.iter().rposition(|&moe| moe).unwrap() + 1;
+        ensure!(cfg.moe[first_layer..end].iter().all(|&moe| moe), "MiniMax M3 routed layer set is not contiguous");
+        return fp8_catalog(snapshot, RoutedExpertShape { layers: end, first_layer,
+            experts: cfg.experts, topk: cfg.topk, hidden: cfg.hidden,
+            intermediate: cfg.moe_intermediate, draft_stages: 0, draft_experts: 0 });
+    }
     if kimi_catalog_config(config) {
         return read_kimi_expert_catalog(snapshot, config, checkpoint);
     }
@@ -903,21 +945,28 @@ fn read_expert_catalog_with_checkpoint(snapshot: &Path, config: &serde_json::Val
     }
     if matches!(config["model_type"].as_str(), Some("step5" | "step5_vl")) {
         let checkpoint_arg = checkpoint;
-        let checkpoint = crate::plan::Checkpoint::inventory(snapshot)?;
-        let cfg = crate::plan::families::step5::Config::parse(&checkpoint)?;
+        let inventory;
+        let checkpoint = match checkpoint {
+            Some(checkpoint) => checkpoint,
+            None => {
+                inventory = crate::plan::Checkpoint::inventory(snapshot)?;
+                &inventory
+            }
+        };
+        let cfg = crate::plan::families::step5::Config::parse(checkpoint)?;
         // The final target layer is dense; bundled MTP stages are separately owned.
         let first_layer = cfg.moe[..cfg.layers].iter().position(|&moe| moe).context("Step-5 has no routed layers")?;
         let end = cfg.moe[..cfg.layers].iter().rposition(|&moe| moe).unwrap() + 1;
         ensure!(cfg.moe[first_layer..end].iter().all(|&moe| moe), "Step-5 routed layer set is not contiguous");
         let shape = RoutedExpertShape { layers: end, first_layer, experts: cfg.experts,
             topk: cfg.topk, hidden: cfg.hidden, intermediate: cfg.intermediate, draft_stages: 0, draft_experts: 0 };
-        if crate::plan::families::step5::exl3::is_exl3(&checkpoint) {
+        if crate::plan::families::step5::exl3::is_exl3(checkpoint) {
             // K4 experts with K6 tails: the shared two-tier package exl3-step5-k46.
             return exl3_catalog_or_read(snapshot, shape, &[4, 6], checkpoint_arg);
         }
         let fp8 = crate::formats::fp8_experts::Fp8ExpertTensors::read_layers(snapshot, shape,
             &(first_layer..end).collect())?;
-        return Ok(OfficialV41Catalog { reader: Default::default(), exl3_arena_bytes: Default::default(), format: crate::plan::checkpoint::CheckpointFormat::HfIndexed, config: None, experts: shape, snapshot: snapshot.to_path_buf(),
+        return Ok(OfficialV41Catalog { source: CatalogSource::Legacy, reader: Default::default(), exl3_arena_bytes: Default::default(), format: crate::plan::checkpoint::CheckpointFormat::HfIndexed, config: None, experts: shape, snapshot: snapshot.to_path_buf(),
             tensors: Vec::new(), exl3: None, nvfp4: None, fp8: Some(fp8) });
     }
     if config.get("text_config").is_some() {
@@ -1021,7 +1070,11 @@ fn read_glm_dsa_expert_catalog(snapshot: &Path, config: &serde_json::Value,
         draft_stages: 0,
         draft_experts: 0,
     };
-    if crate::plan::checkpoint::CheckpointFormat::detect(snapshot)? == crate::plan::checkpoint::CheckpointFormat::Exlr8 {
+    let format = match checkpoint.and_then(|checkpoint| checkpoint.view.as_ref()) {
+        Some(view) => crate::plan::checkpoint::CheckpointFormat::detect_view(view)?,
+        None => crate::plan::checkpoint::CheckpointFormat::detect(snapshot)?,
+    };
+    if format == crate::plan::checkpoint::CheckpointFormat::Exlr8 {
         let (_, _, family) = crate::plan::exlr8::native::family_geometry(config)?;
         crate::plan::Checkpoint::inventory(snapshot)?;
         let draft_layers = crate::plan::exlr8::draft_layers(snapshot, config)?;
@@ -1029,7 +1082,7 @@ fn read_glm_dsa_expert_catalog(snapshot: &Path, config: &serde_json::Value,
         // Flash uses an external drafter; its published MTP is not a worker owner.
         shape.draft_stages = if family == cuteafd_ffi::exlr8::KernelFamily::GlmFlash { 0 } else { draft_layers.len() };
         shape.draft_experts = if shape.draft_stages == 0 { 0 } else { shape.experts };
-        return Ok(OfficialV41Catalog { reader: Default::default(), exl3_arena_bytes: Default::default(), format: crate::plan::checkpoint::CheckpointFormat::Exlr8,
+        return Ok(OfficialV41Catalog { source: CatalogSource::Legacy, reader: Default::default(), exl3_arena_bytes: Default::default(), format: crate::plan::checkpoint::CheckpointFormat::Exlr8,
             config: None, experts: shape, snapshot: snapshot.into(), tensors: Vec::new(),
             exl3: None, nvfp4: None, fp8: None });
     }
@@ -1076,7 +1129,7 @@ pub fn read_qwen4_mtp_expert_catalog(snapshot: &Path, stages: usize) -> Result<O
     let layers = (cfg.layers..cfg.layers + stages).collect();
     let fp8 = crate::formats::fp8_experts::Fp8ExpertTensors::read_layers(snapshot, shape, &layers)?;
     for layer in layers { fp8.for_layer(layer)?; }
-    Ok(OfficialV41Catalog { reader: Default::default(), exl3_arena_bytes: Default::default(), format: crate::plan::checkpoint::CheckpointFormat::HfIndexed, config: None, experts: shape, snapshot: snapshot.to_path_buf(), tensors: Vec::new(),
+    Ok(OfficialV41Catalog { source: CatalogSource::Legacy, reader: Default::default(), exl3_arena_bytes: Default::default(), format: crate::plan::checkpoint::CheckpointFormat::HfIndexed, config: None, experts: shape, snapshot: snapshot.to_path_buf(), tensors: Vec::new(),
         exl3: None, nvfp4: None, fp8: Some(fp8) })
 }
 
@@ -1134,8 +1187,8 @@ fn read_mistral_large4_expert_catalog(snapshot: &Path, config: &serde_json::Valu
     };
     match config["quantization_config"]["quant_method"].as_str() {
         Some("exl3") => exl3_catalog_or_read(snapshot, shape, &[4, 5], checkpoint),
-        Some("fp8") => anyhow::bail!("Mistral Large 4 serves from the EXL3 K4 + Core-K6 publication \
-            (wrldsuksgo2mars/Mistral-Large-4-EXL3-K4-Core-K6); the official FP8 release is the \
+        Some("fp8") => anyhow::bail!("Mistral Large 4 serves from the EXL3 K4 + original FP8/BF16 core publication \
+            (wrldsuksgo2mars/Mistral-Large-4-EXL3-K4); the official FP8 release is the \
             quantization source and fidelity root, with no Spark expert package"),
         other => anyhow::bail!("Mistral Large 4 routed experts stored as {other:?} have no expert package"),
     }
@@ -1196,12 +1249,13 @@ fn fp8_catalog(snapshot: &Path, shape: RoutedExpertShape) -> Result<OfficialV41C
     let index: Index = crate::families::deepseek_v41::v41_exl3::read_json(&crate::plan::checkpoint::index_path(snapshot)?,
         64 * 1024 * 1024).and_then(|value| Ok(serde_json::from_value(value)?))?;
     let mut coordinator: Vec<V41Tensor> = read_index_headers(snapshot, &index.weight_map)?.into_iter()
-        .filter(|(_, tensor)| !(tensor.name.contains(".mlp.experts.")
-            && hf_layer(&tensor.name).is_some_and(|layer| layer < shape.layers)))
+        .filter(|(_, tensor)| !((tensor.name.contains(".mlp.experts.")
+            || tensor.name.contains(".block_sparse_moe.experts."))
+            && hf_layer(&tensor.name).is_some_and(|layer| (shape.first_layer..shape.layers).contains(&layer))))
         .map(|(shard, metadata)| V41Tensor { shard, metadata, placement: V41TensorPlacement::CoordinatorRtx })
         .collect();
     coordinator.sort_by(|a, b| a.metadata.name.cmp(&b.metadata.name));
-    Ok(OfficialV41Catalog { reader: Default::default(), exl3_arena_bytes: Default::default(), format: crate::plan::checkpoint::CheckpointFormat::HfIndexed,
+    Ok(OfficialV41Catalog { source: CatalogSource::Legacy, reader: Default::default(), exl3_arena_bytes: Default::default(), format: crate::plan::checkpoint::CheckpointFormat::HfIndexed,
         config: None,
         experts: shape,
         snapshot: snapshot.to_path_buf(),
@@ -1274,7 +1328,7 @@ fn read_deepseek_v4_expert_catalog(snapshot: &Path,
         let metadata = read_safetensors_metadata(&snapshot.join(shard))
             .with_context(|| format!("reading {shard}"))?;
         crate::plan::checkpoint::validate_index_headers(shard, &names, &metadata)?;
-        for tensor in metadata {
+        for tensor in metadata.into_iter().filter(|tensor| names.contains(tensor.name.as_str())) {
             let placement = match expect(&tensor.name) {
                 Some((dtype, shape)) => {
                     ensure!(
@@ -1297,7 +1351,7 @@ fn read_deepseek_v4_expert_catalog(snapshot: &Path,
         v4.n_routed_experts
     );
     tensors.sort_by(|a, b| a.metadata.name.cmp(&b.metadata.name));
-    Ok(OfficialV41Catalog { reader: Default::default(), exl3_arena_bytes: Default::default(), format: crate::plan::checkpoint::CheckpointFormat::HfIndexed,
+    Ok(OfficialV41Catalog { source: CatalogSource::Legacy, reader: Default::default(), exl3_arena_bytes: Default::default(), format: crate::plan::checkpoint::CheckpointFormat::HfIndexed,
         config: None,
         experts: RoutedExpertShape {
             layers: v4.n_layers,
@@ -1342,7 +1396,7 @@ fn read_index_headers(
         let metadata = read_safetensors_metadata(&snapshot.join(shard))
             .with_context(|| format!("reading {shard}"))?;
         crate::plan::checkpoint::validate_index_headers(shard, &names, &metadata)?;
-        for tensor in metadata {
+        for tensor in metadata.into_iter().filter(|tensor| names.contains(tensor.name.as_str())) {
             headers.push((shard.to_string(), tensor));
         }
     }
@@ -1370,12 +1424,17 @@ fn deepseek_v4_exl3_catalog_input(snapshot: &Path, weight_map: &BTreeMap<String,
         Some(checkpoint) => checkpoint.tensors.iter().map(|tensor| (tensor.shard.clone(), tensor.meta.clone())).collect(),
         None => read_index_headers(snapshot, weight_map)?,
     };
-    let manifest = crate::families::deepseek_v41::v41_exl3::read_deepseek_v4_exl3_manifest(
-        snapshot,
-        backbone,
-        headers.iter().map(|(_, tensor)| tensor),
-        tiers,
-    )?;
+    let default_view;
+    let view = match checkpoint.and_then(|checkpoint| checkpoint.view.as_ref()) {
+        Some(view) => view,
+        None => {
+            default_view = crate::plan::checkpoint::CheckpointView::select(snapshot,
+                crate::plan::checkpoint::CoreView::Original)?;
+            &default_view
+        }
+    };
+    let manifest = crate::families::deepseek_v41::v41_exl3::read_deepseek_v4_exl3_manifest_view(
+        view, backbone, headers.iter().map(|(_, tensor)| tensor), tiers)?;
     let mut tensors = Vec::with_capacity(headers.len());
     let mut routed = 0usize;
     for (shard, tensor) in headers {
@@ -1417,7 +1476,7 @@ fn deepseek_v4_exl3_catalog_input(snapshot: &Path, weight_map: &BTreeMap<String,
         manifest.projections.len()
     );
     tensors.sort_by(|a, b| a.metadata.name.cmp(&b.metadata.name));
-    Ok(OfficialV41Catalog { reader: Default::default(), exl3_arena_bytes: Default::default(), format: crate::plan::checkpoint::CheckpointFormat::HfIndexed,
+    Ok(OfficialV41Catalog { source: CatalogSource::Legacy, reader: Default::default(), exl3_arena_bytes: Default::default(), format: crate::plan::checkpoint::CheckpointFormat::HfIndexed,
         config: None,
         experts: manifest.experts,
         snapshot: snapshot.to_path_buf(),
@@ -1546,7 +1605,7 @@ mod tests {
             }
         }
         tensors.sort_by(|a, b| a.metadata.name.cmp(&b.metadata.name));
-        let mut catalog = OfficialV41Catalog { reader: Default::default(), exl3_arena_bytes: Default::default(),
+        let mut catalog = OfficialV41Catalog { source: CatalogSource::Legacy, reader: Default::default(), exl3_arena_bytes: Default::default(),
             format: crate::plan::checkpoint::CheckpointFormat::HfIndexed,
             config: Some(config), experts: shape, snapshot: PathBuf::new(), tensors,
             exl3: None, nvfp4: None, fp8: None };
@@ -1612,7 +1671,7 @@ mod tests {
                     placement: V41TensorPlacement::BackboneExpertTp4 { layer, expert, axis } });
             }}}
             tensors.sort_by(|a, b| a.metadata.name.cmp(&b.metadata.name));
-            let catalog = OfficialV41Catalog { reader: Default::default(), exl3_arena_bytes: Default::default(),
+            let catalog = OfficialV41Catalog { source: CatalogSource::Legacy, reader: Default::default(), exl3_arena_bytes: Default::default(),
                 format: crate::plan::checkpoint::CheckpointFormat::HfIndexed,
                 config: None, experts: RoutedExpertShape { layers: 8, first_layer: 0, experts: 2,
                     topk: 1, hidden, intermediate, draft_stages: 0, draft_experts: 0 },
@@ -1673,6 +1732,47 @@ mod tests {
                     intermediate, hidden, world, 0).is_err());
             }
         }
+        Ok(())
+    }
+
+    #[test]
+    fn minimax_dispatch_uses_native_experts_before_v41_text_config() -> Result<()> {
+        use crate::plan::testing::{t, write_snapshot};
+        let dir = tempfile::tempdir()?;
+        let mut config = crate::families::minimax_m3::config::tests::release_config();
+        config["text_config"]["num_hidden_layers"] = 4.into();
+        config["text_config"]["num_local_experts"] = 4.into();
+        config["text_config"]["moe_layer_freq"] = serde_json::json!([0, 0, 0, 1]);
+        for key in ["sparse_attention_freq", "sparse_disable_index_value"] {
+            config["text_config"]["sparse_attention_config"][key].as_array_mut().unwrap().truncate(4);
+        }
+        let norm = "language_model.model.layers.3.post_attention_layernorm.weight";
+        let shared = "language_model.model.layers.3.block_sparse_moe.shared_experts.gate_proj.weight";
+        let mut headers = vec![t(norm, "BF16", &[6144]), t(shared, "F8_E4M3", &[3072, 6144])];
+        for expert in 0..4 {
+            for (stem, n, k) in [("w1", 3072, 6144), ("w3", 3072, 6144), ("w2", 6144, 3072)] {
+                let name = format!("language_model.model.layers.3.block_sparse_moe.experts.{expert}.{stem}");
+                headers.extend([t(format!("{name}.weight_packed"), "U8", &[n, k / 2]),
+                    t(format!("{name}.weight_scale"), "F8_E4M3", &[n, k / 16]),
+                    t(format!("{name}.weight_global_scale"), "F32", &[]),
+                    t(format!("{name}.input_global_scale"), "F32", &[])]);
+            }
+        }
+        write_snapshot(dir.path(), &config, &headers, None);
+        let catalog = read_expert_catalog(dir.path())?;
+        assert_eq!((catalog.experts.first_layer, catalog.experts.layers), (3, 4));
+        assert_eq!((catalog.experts.hidden, catalog.experts.intermediate), (6144, 3072));
+        let fp8 = catalog.fp8().context("MiniMax did not select the native worker")?;
+        assert_eq!(fp8.format(), crate::formats::fp8_experts::ExpertFormat::Nvfp4);
+        fp8.validate_layer(3)?;
+        assert!(!fp8.has_layer(2));
+        assert_eq!(catalog.tensors.len(), 2);
+        assert!(catalog.tensor(norm).is_ok());
+        assert!(catalog.tensor(shared).is_ok());
+        assert!(catalog.tensor("language_model.model.layers.3.block_sparse_moe.experts.0.w1.weight_packed").is_err());
+        config["text_config"]["moe_layer_freq"] = serde_json::json!([0, 1, 0, 1]);
+        std::fs::write(dir.path().join("config.json"), serde_json::to_vec(&config)?)?;
+        assert!(format!("{:#}", read_expert_catalog(dir.path()).unwrap_err()).contains("not contiguous"));
         Ok(())
     }
 
@@ -1908,7 +2008,7 @@ mod tests {
             "weight_map": names.iter().map(|name| (*name, "fixture.safetensors")).collect::<BTreeMap<_, _>>()
         }).to_string()).unwrap();
         let shape = RoutedExpertShape::of_v41(&cfg);
-        let mut catalog = OfficialV41Catalog { reader: Default::default(), exl3_arena_bytes: Default::default(), format: crate::plan::checkpoint::CheckpointFormat::HfIndexed,
+        let mut catalog = OfficialV41Catalog { source: CatalogSource::Legacy, reader: Default::default(), exl3_arena_bytes: Default::default(), format: crate::plan::checkpoint::CheckpointFormat::HfIndexed,
             config: Some(cfg), experts: shape, snapshot: dir.path().to_path_buf(),
             tensors: names.iter().map(|name| V41Tensor {
                 shard: "fixture.safetensors".into(), placement: placement(name),
@@ -1925,6 +2025,15 @@ mod tests {
                 resident_bytes: Default::default(),
             }), nvfp4: None, fp8: None,
         };
+        // Keep the frozen selection after its on-disk metadata is removed.
+        let view = crate::plan::checkpoint::CheckpointView::select(dir.path(),
+            crate::plan::checkpoint::CoreView::Original).unwrap();
+        let fingerprint = view.fingerprint().to_owned();
+        catalog.source = CatalogSource::Selected(view);
+        std::fs::remove_file(dir.path().join("config.json")).unwrap();
+        std::fs::remove_file(dir.path().join("model.safetensors.index.json")).unwrap();
+        assert_eq!(catalog.inventory().unwrap().view.unwrap().fingerprint(), fingerprint);
+        assert_eq!(catalog.bundled_dspark_ownership(true).unwrap(), DraftOwnership::BundledDspark);
         catalog.select_draft(DraftOwnership::selected("deepseek_v41", "dspark")).unwrap();
         assert_eq!(catalog.tensors.len(), 3);
         assert_eq!(catalog.exl3().unwrap().projections.len(), 2);
@@ -2079,7 +2188,7 @@ mod tests {
     #[test]
     fn immutable_catalog_arena_cache_matches_native_ranks_and_draft_selection_clears_it() -> Result<()> {
         let manifest = super::super::v41_exl3_residency::tests::fixture_geometry(&[2, 3], 5120, 2304, 16);
-        let mut catalog = OfficialV41Catalog { reader: Default::default(), exl3_arena_bytes: Default::default(),
+        let mut catalog = OfficialV41Catalog { source: CatalogSource::Legacy, reader: Default::default(), exl3_arena_bytes: Default::default(),
             format: crate::plan::checkpoint::CheckpointFormat::HfIndexed,
             config: None, experts: manifest.experts, snapshot: PathBuf::new(), tensors: Vec::new(),
             exl3: Some(manifest), nvfp4: None, fp8: None };
@@ -2135,7 +2244,7 @@ mod tests {
         file.write_all_at(&(0u8..32).collect::<Vec<_>>(), offset)
             .unwrap();
         let name = "layers.0.ffn.experts.0.w2.weight";
-        let mut catalog = OfficialV41Catalog { reader: Default::default(), exl3_arena_bytes: Default::default(), format: crate::plan::checkpoint::CheckpointFormat::HfIndexed,
+        let mut catalog = OfficialV41Catalog { source: CatalogSource::Legacy, reader: Default::default(), exl3_arena_bytes: Default::default(), format: crate::plan::checkpoint::CheckpointFormat::HfIndexed,
             config: Some(official_config()),
             experts: RoutedExpertShape::of_v41(&official_config()),
             exl3: None,
@@ -2216,6 +2325,24 @@ mod tests {
                 assert_eq!(&out[16..], &[255; 4]);
             }
         }
+        // V4 stage experts retain coordinator placement but use backbone TP2
+        // projection slicing in both paired mount and coordinator-push loads.
+        for (projection, axis) in [("w1", 0), ("w3", 0), ("w2", 1)] {
+            let name = format!("mtp.0.ffn.experts.0.{projection}.weight");
+            catalog.tensors[0].metadata.name = name.clone();
+            let pair = [catalog.backbone_tp2_slice(&name, 0).unwrap(), catalog.backbone_tp2_slice(&name, 1).unwrap()];
+            crate::V41Exl3TensorSlice::validate_pair(pair, 32).unwrap();
+            for rank in 0..2 {
+                let mut actual = [0; 16];
+                let mut expected = [0; 16];
+                catalog.read_backbone_tp2_into(&name, rank, &mut actual, &mut [0; 16]).unwrap();
+                catalog.read_coordinator_tp2_into(&name, axis, rank, &mut expected, &mut [0; 16]).unwrap();
+                assert_eq!(actual, expected);
+            }
+        }
+        catalog.tensors[0].metadata.name = "mtp.0.main_proj.weight".into();
+        assert!(catalog.backbone_tp2_slice("mtp.0.main_proj.weight", 0).is_err());
+        catalog.tensors[0].metadata.name = name.into();
         assert!(catalog.read_coordinator_tp2_into(name, 1, 0, &mut [0; 16], &mut [0; 7]).is_err());
         assert!(catalog.read_coordinator_tp2_into(name, 0, 2, &mut [0; 16], &mut []).is_err());
         assert!(catalog.read_coordinator_tp2_into(name, 2, 0, &mut [0; 16], &mut []).is_err());
@@ -2318,7 +2445,7 @@ mod expert_staging_tests {
             offset += spec.bytes;
         }
         tensors.sort_by(|a, b| a.metadata.name.cmp(&b.metadata.name));
-        let catalog = OfficialV41Catalog { reader: Default::default(), exl3_arena_bytes: Default::default(), format: crate::plan::checkpoint::CheckpointFormat::HfIndexed,
+        let catalog = OfficialV41Catalog { source: CatalogSource::Legacy, reader: Default::default(), exl3_arena_bytes: Default::default(), format: crate::plan::checkpoint::CheckpointFormat::HfIndexed,
             config: Some(official_config()),
             experts: RoutedExpertShape::of_v41(&official_config()),
             exl3: None,

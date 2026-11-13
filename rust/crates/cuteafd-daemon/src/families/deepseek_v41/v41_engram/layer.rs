@@ -4,7 +4,7 @@ use std::rc::Rc;
 use crate::shared::memory::{chain, row_window::{RowWindow, ScratchGuard, MAX_RESERVE_ROWS}};
 use crate::shared::memory::{DeviceAllocation, LoadStream};
 use crate::families::deepseek_v41::v41_tensors::NativeRtxTensors;
-use crate::shared::decode_graph::RowGraphs;
+use crate::shared::decode_graph::{CacheAttached, RowGraphs};
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::{CuteafdDeviceBuffer, NativeLibrary, V41Fp8Plan};
 use cuteafd_loader::OfficialV41Catalog;
@@ -21,18 +21,34 @@ pub(crate) struct EngramLayerWeights<'a> {
     names: [String; 4],
 }
 impl<'a> EngramLayerWeights<'a> {
+    pub(crate) fn inventory(&self, inventory: &mut crate::shared::memory::receipts::Inventory<'_>) -> Result<()> {
+        self.tensors.inventory(inventory)?;
+        self.packed_scales.inventory(inventory,
+            &crate::families::deepseek_v41::weight_layout::packed_scale_name(&self.names[0]))
+    }
     pub fn device_bytes(library:&NativeLibrary,catalog:&OfficialV41Catalog,layer_index:usize)->Result<usize> {
         let layer=*cuteafd_core::ENGRAM_LAYERS.get(layer_index).context("invalid engram layer index")?;
         let names=["wkv.weight","wkv.scale","q_weight","k_weight"].map(|suffix| format!("layers.{layer}.engram.{suffix}"));
         NativeRtxTensors::plan(catalog,&names)?.checked_add(library.v41_fp8_kernel(16)?.info().packed_weight_scale_bytes as usize)
             .context("engram resident budget overflow")
     }
+    #[cfg(test)]
     pub fn load(
         library: &'a NativeLibrary,
         catalog: &OfficialV41Catalog,
         layer_index: usize,
         device_budget: usize,
         staging_bytes: usize,
+    ) -> Result<Self> {
+        Self::load_in(library, catalog, layer_index, device_budget, staging_bytes, None)
+    }
+    pub fn load_in(
+        library: &'a NativeLibrary,
+        catalog: &OfficialV41Catalog,
+        layer_index: usize,
+        device_budget: usize,
+        staging_bytes: usize,
+        arena: Option<&crate::shared::memory::weight_arena::DeviceWeightArena<'a>>,
     ) -> Result<Self> {
         let layer = *cuteafd_core::ENGRAM_LAYERS
             .get(layer_index)
@@ -48,14 +64,14 @@ impl<'a> EngramLayerWeights<'a> {
             required <= device_budget,
             "engram weights and packed scales exceed device budget"
         );
-        let tensors = NativeRtxTensors::load(
-            library,
-            catalog,
-            &names,
-            device_budget - packed_bytes,
-            staging_bytes,
+        let tensors = NativeRtxTensors::load_in(
+            library, catalog, &names, device_budget - packed_bytes, staging_bytes, arena,
         )?;
-        let packed_scales = DeviceAllocation::new(library, packed_bytes)?;
+        let packed_scales = crate::families::deepseek_v41::weight_layout::allocation(
+            library, arena,
+            &crate::families::deepseek_v41::weight_layout::packed_scale_name(&names[0]),
+            packed_bytes,
+        )?;
         let stream = LoadStream {
             library,
             raw: library.cuda_stream_create()?,
@@ -112,6 +128,10 @@ pub(crate) struct EngramGate<'weights, 'library> {
     ready_rows: Option<usize>,
 }
 impl<'weights, 'library> EngramGate<'weights, 'library> {
+    pub(crate) fn visit_graph_banks(&mut self, f: &mut dyn FnMut(i32, &'static str, bool, &mut dyn CacheAttached) -> Result<()>) -> Result<()> {
+        f(self.storage.output.buffer.device_id, "v41.engram.gate", false, &mut self.graphs)
+    }
+
     pub fn layer(&self) -> usize {
         cuteafd_core::ENGRAM_LAYERS[self.weights.layer_index] as usize
     }
@@ -135,8 +155,7 @@ impl<'weights, 'library> EngramGate<'weights, 'library> {
     pub fn device_bytes(library:&NativeLibrary,capacity:usize)->Result<usize> {
         ensure!(capacity>0 && capacity<=4096,"invalid engram gate capacity");
         let scratch=library.v41_fp8_matrix_plan(capacity as u32,6144,25600)?.info().scratch_bytes as usize;
-        (capacity*(40960*2+51200+24*512+1)).checked_add(scratch).and_then(|b| b.checked_add(4))
-            .context("engram execution budget overflow")
+        Ok(cuteafd_loader::serving_capacity::v41_workspace::engram(capacity, scratch)?.bytes())
     }
     pub fn new(
         weights: &'weights EngramLayerWeights<'library>,
@@ -153,16 +172,23 @@ impl<'weights, 'library> EngramGate<'weights, 'library> {
             && unit <= rows, "invalid Engram gate storage dimensions");
         let kernel = library.v41_fp8_matrix_plan(unit as u32, 6144, 25600)?;
         let scratch_bytes = kernel.info().scratch_bytes as usize;
+        let arena = crate::shared::memory::weight_arena::workspace_arena(library,
+            cuteafd_loader::serving_capacity::v41_workspace::engram(unit, scratch_bytes)?,
+            cuteafd_core::memory_layout::ArenaTag::workspace("v41/engram-layer"))?;
+        let plane = |name| -> Result<_> {
+            let bytes = arena.layout().view(name).context("Engram plane")?.bytes();
+            Ok(DeviceAllocation::from_allocation(arena.view(name, bytes)?))
+        };
         let storage = EngramGateStorage {
             stream: LoadStream { library, raw: library.cuda_stream_create()? },
             guard: ScratchGuard::new(library, &[library.cuda_get_device()?])?,
-            output: DeviceAllocation::new(library, unit * 40960)?,
-            residual: DeviceAllocation::new(library, unit * 40960)?,
-            embeddings: DeviceAllocation::new(library, unit * 24 * 512)?,
-            text_mask: DeviceAllocation::new(library, unit)?,
-            projected: DeviceAllocation::new(library, unit * 51200)?,
-            scratch: DeviceAllocation::new(library, scratch_bytes)?,
-            alpha: DeviceAllocation::new(library, 4)?, kernel, rows, unit,
+            output: plane("output")?,
+            residual: plane("residual")?,
+            embeddings: plane("embeddings")?,
+            text_mask: plane("text_mask")?,
+            projected: plane("projected")?,
+            scratch: plane("scratch")?,
+            alpha: plane("alpha")?, kernel, rows, unit,
         };
         // SAFETY: workspace is owned by storage and initialization drains here.
         unsafe { storage.kernel.initialize_scratch(storage.scratch.buffer,
@@ -175,7 +201,7 @@ impl<'weights, 'library> EngramGate<'weights, 'library> {
         ensure!(weights.tensors.get(&weights.names[0])?.device_id == storage.output.buffer.device_id,
             "Engram weights and storage devices differ");
         Ok(Self { capacity: storage.unit, storage, weights, window: RowWindow::NONE,
-            graphs: RowGraphs::new(weights.library, "engram", cuteafd_core::V41_VERIFY_ROWS), ready_rows: None })
+            graphs: RowGraphs::new(weights.library, "engram", cuteafd_core::V41_VERIFY_ROWS, "deepseek_v41"), ready_rows: None })
     }
     /// Slot reuse, including all cross-stream readers, is drained by the caller.
     pub(crate) fn select_window(&mut self, window: RowWindow) -> Result<()> {
@@ -344,35 +370,53 @@ impl<'weights, 'library> EngramGate<'weights, 'library> {
         self.synchronize()?;
         unsafe { self.capture_ready(gathered.rows) }
     }
+    pub(crate) fn capture_startup(&mut self, rows: &[usize]) -> Result<()> {
+        ensure!(self.ready_rows.is_none() && !self.window.is_windowed(), "Engram startup requires an idle owner");
+        self.storage.stream.require_complete()?;
+        for &row in rows {
+            ensure!(row <= self.capacity, "Engram startup row exceeds capacity");
+            // SAFETY: recording owned gate buffers does not execute kernels,
+            // gather table rows, or publish residuals or request state.
+            unsafe { self.capture_ready(row)?; }
+            crate::shared::decode_graph::device::observe_device(self.storage.stream.library,
+                self.storage.output.buffer.device_id)?;
+        }
+        Ok(())
+    }
     unsafe fn capture_ready(&mut self, rows: usize) -> Result<()> {
+        let Some(mut ticket) = self.graphs.cache_ticket(&rows, crate::families::deepseek_v41::graph_policy::pinned_shape(self.storage.output.buffer.device_id, rows as u32), None) else {
+            crate::families::deepseek_v41::graph_policy::note_miss(format!("engram_gate rows={rows} layer={}", self.layer()), || "graph cache selected eager".into());
+            return Ok(());
+        };
         self.ready_rows = None;
         ensure!(!self.window.is_windowed(), "windowed gate cannot capture");
         unsafe {
-            self.weights
+            ticket.capture_result(self.weights
                 .library
-                .cuda_graph_begin_capture(self.storage.stream.raw)?;
+                .cuda_graph_begin_capture(self.storage.stream.raw))?;
         }
         let launched = unsafe { self.enqueue(rows) };
         // End on both paths so a failed enqueue cannot leave the stream capturing.
-        let captured = unsafe { self.weights.library.cuda_graph_end_capture(self.storage.stream.raw) };
+        let captured = unsafe { ticket.capture_result(self.weights.library.cuda_graph_end_capture_topology(self.storage.stream.raw)) };
         match (launched, captured) {
-            (Ok(()), Ok(graph)) => {
-                // SAFETY: this capture has not launched; a graph the insert
-                // retires had its launches drained by the caller (`would_retire`).
-                if let Err(error) = unsafe { self.graphs.insert(rows, graph) } {
+            (Ok(()), Ok((graph, nodes, width, spans, _))) => {
+                // SAFETY: this executable has not launched; the containing gate
+                // retains its buffers until the completed-step consumer drain.
+                if let Err(error) = unsafe { self.graphs.cache_insert(rows, graph, ticket, nodes as u64, width, spans) } {
                     // SAFETY: the rejected graph has no queued launches.
                     unsafe { self.weights.library.cuda_graph_exec_destroy(graph)?; }
                     return Err(error);
                 }
                 Ok(())
             }
-            (Err(error), Ok(graph)) => {
+            (Err(error), Ok((graph, _, _, _, _))) => {
                 if let Err(cleanup) = unsafe { self.weights.library.cuda_graph_exec_destroy(graph) }
                 {
                     tracing::error!(%cleanup, "destroying failed engram capture");
                 }
                 Err(error)
             }
+            (Ok(()), Err(error)) if cuteafd_ffi::is_small_graph(&error) => Ok(()),
             (Err(error), Err(_)) | (Ok(()), Err(error)) => Err(error),
         }
     }
@@ -386,7 +430,9 @@ impl<'weights, 'library> EngramGate<'weights, 'library> {
         self.ready_rows = None;
         let rows = gathered.rows;
         ensure!(!self.window.is_windowed(), "windowed gate cannot replay");
-        let graph = self.graphs.get(rows).context("engram graph has not been captured for these rows")?;
+        let Some(graph) = self.graphs.cached_launch(rows) else {
+            return unsafe { self.execute(residual, gathered) };
+        };
         let launched = unsafe {
             self.stage_inputs(residual, gathered)?;
             self.weights
@@ -403,7 +449,7 @@ impl<'weights, 'library> EngramGate<'weights, 'library> {
     pub async unsafe fn execute_into_cooperative(&mut self, residual: CuteafdDeviceBuffer,
         gathered: &EngramDeviceView) -> Result<()> {
         self.ready_rows = None;
-        let graph = if self.window.is_windowed() { None } else { self.graphs.get(gathered.rows) };
+        let graph = if self.window.is_windowed() { None } else { self.graphs.cached_launch(gathered.rows) };
         let cold = graph.is_none();
         let launched = (|| unsafe {
             crate::shared::memory::chain::join(self.weights.library, self.storage.stream.raw)?;
@@ -416,10 +462,8 @@ impl<'weights, 'library> EngramGate<'weights, 'library> {
         if cold && !self.window.is_windowed() && crate::families::deepseek_v41::graph_policy::captures_shape(gathered.rows as u32)
             && !crate::shared::decode_graph::census::eager("layer_row") {
             // The cold shape already ran eagerly above: record the graph for
-            // later calls without a second launch (hunt C #3). Only when the
-            // insert retires another graph must its queued launches drain
-            // first (a rare new large shape), so the host waits only then.
-            if self.graphs.would_retire(gathered.rows) { self.storage.stream.wait().await?; }
+            // later calls without a second launch. Eviction is drained at the
+            // enclosing completed-step boundary, never inside this segment.
             if let Err(error) = unsafe { self.capture_ready(gathered.rows) } { self.synchronize()?; return Err(error); }
         }
         let copied = unsafe { self.weights.library.copy_d2d_async(residual, self.storage.output.buffer,

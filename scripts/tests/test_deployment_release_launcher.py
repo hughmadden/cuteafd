@@ -14,6 +14,8 @@ FIXTURES = Path(__file__).parent / "fixtures/deployment-launch"
 BASELINE_CAPTURES = {
     "glm53-exl3-k6core-min": "glm53-exl3-min",
     "glm53-exl3-k6core-max": "glm53-exl3-max",
+    "v41-flash-max-fp8-reply": "v41-flash-max",
+    "v41-flash-max-nvfp4-reply": "v41-flash-max",
 }
 
 
@@ -29,50 +31,97 @@ def release_entry(entry: dict) -> dict:
     return entry
 
 
-@pytest.mark.parametrize("entry,swa_kv", [
-    pytest.param(entry, swa_kv, id=entry["name"] + (f"-{swa_kv}" if swa_kv else ""))
+@pytest.mark.parametrize("entry,swa_kv,decode_graphs", [
+    pytest.param(entry, swa_kv, decode_graphs,
+                 id=entry["name"] + (f"-{swa_kv}" if swa_kv else "")
+                 + ("-graphs-off" if decode_graphs == "off" else ""))
     for entry in ENTRIES
     for swa_kv in ([None, "bf16", "int8", "fp8"] if entry["family"] == "mimo_v2" else [None])
+    for decode_graphs in ([None, "off"] if entry["family"] == "mimo_v2" else [None])
 ])
 @pytest.mark.parametrize("draft_kv", ["bf16", "fp8"])
-def test_deployment_preserves_release_container_commands(entry: dict, swa_kv: str | None, draft_kv: str) -> None:
+def test_deployment_preserves_release_container_commands(
+    entry: dict, swa_kv: str | None, draft_kv: str, decode_graphs: str | None,
+) -> None:
     golden_name = BASELINE_CAPTURES.get(entry['name'], entry['name'])
     golden_text = (FIXTURES / f"{golden_name}.json").read_text()
-    if entry['name'] in BASELINE_CAPTURES:
+    if entry['name'].startswith('glm53-exl3-k6core-'):
         # Core storage changes inside the loader, not the launch ABI. Compare
         # against K4-v1's full capture, changing only checkpoint and endpoints.
         golden_text = golden_text.replace('models--wrldsuksgo2mars--GLM-5.3-EXL3-K4-v1',
                                            'models--wrldsuksgo2mars--GLM-5.3-EXL3-K4-Core-K6')
         golden_text = golden_text.replace('47af23347db743b4666d952e2eb48f2b01c3fede',
                                            '5a4e83a09a11f3145332ed632d28a9894ea88225')
+    if entry['name'] in BASELINE_CAPTURES:
         baseline = next(e for e in ENTRIES if e['name'] == golden_name)
         for key in ('ADDR', 'EXPERT_PORT'):
             old = baseline['set'][key].rsplit(':', 1)[-1]
             new = entry['set'][key].rsplit(':', 1)[-1]
             golden_text = golden_text.replace(':' + old, ':' + new)
             if key == 'EXPERT_PORT':
+                golden_text = golden_text.replace(':' + str(int(old) + 100), ':' + str(int(new) + 100))
                 for rank in range(len(entry['sparks'])):
                     golden_text = golden_text.replace(
                         f'cuteafd-spark-expert-worker-{rank}-{old}',
                         f'cuteafd-spark-expert-worker-{rank}-{new}')
     golden = json.loads(golden_text)
+    if entry["name"] == "v4-flash-max":
+        # The RTX pair now owns all 43 expert layers; retain the historical
+        # coordinator contract, deliberately retiring its four Spark workers.
+        assert [run["host"] for run in golden] == ["coordinator", *[f"worker-{i}" for i in range(4)]]
+        golden = golden[:1]
     selected = release_entry(entry)
     compact_draft = entry["family"] in {"glm5", "glm5_flash", "mimo_v2"}
     if compact_draft:
         selected["set"]["DRAFT_KV_CACHE"] = draft_kv
     if swa_kv is not None:
         selected["set"]["SWA_KV_CACHE"] = swa_kv
+    if decode_graphs is not None:
+        selected["set"]["DECODE_GRAPHS"] = decode_graphs
     current = capture(ROOT, entry["name"], release_entry=selected)
     assert [run["host"] for run in current["containers"]] == [run["host"] for run in golden]
     for old, new in zip(golden, current["containers"]):
         before, after = namespace_launch_contract(parse_run(old["argv"])), parse_run(new["argv"])
+        if entry["name"].endswith(("-fp8-reply", "-nvfp4-reply")):
+            # The historical max capture used a WIP slot. These showcases use
+            # release images: remove only that slot's exact mounts/env/entrypoint.
+            before["options"].remove("--entrypoint /opt/cuteafd/share/release-entrypoint.sh")
+            for name, value in {
+                "PYTHONPATH": "/source/third_party/sparkinfer",
+                "PATH": "/opt/cuteafd/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+                "CUTEAFD_NATIVE_LIB": "/opt/cuteafd/lib/libcuteafd_native.so",
+            }.items():
+                assert before["env"].pop(name) == value
+            root = f"<root>/hosts/{old['host']}/.cache/cuteafd/wip-run/gate/serve-default"
+            for source, destination in (("bin", "/opt/cuteafd/bin"), ("lib", "/opt/cuteafd/lib"),
+                                        ("share", "/opt/cuteafd/share"), ("source", "/source")):
+                before["mounts"].remove(f"{root}/{source}:{destination}:ro")
+            role_key = ("COORDINATOR_DOCKER_INFERENCE" if old["host"] == "coordinator"
+                        else "SPARK_EXPERT_DOCKER_INFERENCE")
+            before["image"] = selected["set"][role_key]
+            if old["host"] == "coordinator":
+                before["env"]["CUTEAFD_IMAGE"] = before["image"]
+                for phase in ("PREFILL", "DECODE"):
+                    key = f"CUTEAFD_SPARK_{phase}_REPLY_FORMAT"
+                    before["env"][key] = entry["set"][f"SPARK_{phase}_REPLY_FORMAT"]
         # Serving containers now run under --init (tini forwards SIGTERM to the daemon).
         if "--init" not in before["options"]:
             before["options"] = sorted([*before["options"], "--init"])
         if old["host"] == "coordinator":
             # capture() bounds readiness to 30s; admission now shares that deadline.
             before["env"]["CUTEAFD_SPARK_ADMISSION_TIMEOUT_SECONDS"] = "30"
+            if entry["family"] in {"deepseek_v4", "mimo_v2", "kimi_k3", "glm5"}:
+                # Telemetry defaults on in adapted families; historical captures
+                # predate it. This is the first family-specific serve argument.
+                position = before["command"].index("--embedding-placement") + 2
+                before["command"][position:position] = ["--expert-usage"]
             if entry["family"] == "mimo_v2":
+                # MiMo defaults to the qualified TP2 drafter on split pairs.
+                tp2_dflash = ("true" if "--split-device" in before["command"]
+                              and "--draft" in before["command"] else "false")
+                # The launcher emits it after the telemetry switch.
+                position = before["command"].index("--embedding-placement") + 3
+                before["command"][position:position] = ["--tp2-dflash", tp2_dflash]
                 anchor = "--kv-cache" if "--kv-cache" in before["command"] else "--prefix-partial"
                 position = before["command"].index(anchor) + 2
                 before["command"][position:position] = ["--swa-kv-cache", swa_kv or "int8"]
@@ -93,11 +142,38 @@ def test_deployment_preserves_release_container_commands(entry: dict, swa_kv: st
                                     ("--prefill-span-rows", unit * waves)]:
                     before["command"][before["command"].index(flag) + 1] = str(value)
             if entry["family"] == "deepseek_v4":
+                if entry["name"] == "v4-flash-max":
+                    position = before["command"].index("--peers")
+                    assert before["command"][position + 1] == ",".join(
+                        f"192.0.2.{i + 1}:19905" for i in range(4))
+                    del before["command"][position:position + 2]
+                    assert "--peers" not in after["command"]
                 # V4 forwards the planner's resolved unit and wave defaults.
                 anchor = "--split-device" if "--split-device" in before["command"] else "--pool-tokens"
                 position = before["command"].index(anchor) + 2
                 before["command"][position:position] = ["--prefill-rows", str(unit), "--prefill-waves", str(waves)]
+                if "--split-device" in before["command"] and "--dspark" in before["command"]:
+                    before["command"].insert(before["command"].index("--dspark") + 1, "--tp2-dspark-experts")
             if entry["family"] == "glm5_flash":
+                # Plan and serve defer auto to the shared checkpoint/topology resolver.
+                # The server publishes the resolved head in report settings and its load log.
+                head = after["command"].index("--fp8-head")
+                assert after["command"].count("--fp8-head") == 1
+                assert after["command"][head + 1] == "auto"
+                before["command"][before["command"].index("--fp8-head") + 1] = "auto"
+                # Preserve historical whole-drafter commands with the now-explicit choice.
+                # On max pairs this is the mock planner's selection, not a fit assertion.
+                position = after["command"].index("--tp2-dflash")
+                assert after["command"].count("--tp2-dflash") == 1
+                assert after["command"][position + 1] == "false"
+                del after["command"][position:position + 2]
+                if "--vision-peers" in before["command"]:
+                    endpoints = before["command"][before["command"].index("--vision-peers") + 1].split(",")
+                    # Historical endpoint lanes encode the physical rank, not expert-world order.
+                    physical = ",".join(str(int(peer.split(":")[0].rsplit(".", 1)[1]) - 1)
+                                        for peer in endpoints)
+                    position = before["command"].index("--encoder-revision") + 2
+                    before["command"][position:position] = ["--vision-peer-ranks", physical]
                 # The span is exactly the live rows (no old 16384 span).
                 position = before["command"].index("--console-secret-file")
                 before["command"][position:position] = ["--prefill-rows", str(unit), "--prefill-waves", str(waves),
@@ -107,6 +183,12 @@ def test_deployment_preserves_release_container_commands(entry: dict, swa_kv: st
                           "mimo_v2": "--swa-kv-cache"}[entry["family"]]
                 position = before["command"].index(anchor) + 2
                 before["command"][position:position] = ["--draft-kv-cache", draft_kv]
+            if entry["family"] == "mimo_v2":
+                # Preserve the effective default-on command and explicit opt-out.
+                position = before["command"].index("--swa-kv-cache") + 2
+                before["command"][position:position] = [
+                    "--decode-graphs", "false" if decode_graphs == "off" else "true",
+                ]
         # Other families have no resolved-config fingerprint today; adding a
         # fabricated one is a failure. V4.1's fingerprint now also covers the
         # shared executor's prefill waves, which reach serve-native.
@@ -114,6 +196,17 @@ def test_deployment_preserves_release_container_commands(entry: dict, swa_kv: st
             position = before["command"].index("--max-output-tokens") + 2
             before["command"][position:position] = ["--mapped-scale-preload-gib", "0"]
             command = after["command"]
+            context_position = command.index("--max-context-tokens") + 1
+            context = command[context_position]
+            launch_config = dict(line.split("=", 1) for line in (ROOT / selected["config"]).read_text().splitlines()
+                                 if line and not line.startswith("#"))
+            launch_config.update(selected["set"])
+            pinned_context = launch_config.get("MAX_CONTEXT_TOKENS")
+            if pinned_context:
+                assert context == pinned_context
+            else:
+                # Automatic context stays automatic; either CLI encoding has the same meaning.
+                assert context in {"0", "auto"}, (entry["name"], context)
             waves = command[command.index("--prefill-waves") + 1]
             assert waves == ("3" if int(selected["set"]["SPARK_COUNT"]) else "1"), (entry["name"], waves)
             anchor = "--decode-lanes" if "--decode-lanes" in before["command"] else "--mapped-scale-preload-gib"
@@ -126,6 +219,8 @@ def test_deployment_preserves_release_container_commands(entry: dict, swa_kv: st
                 before["command"][before["command"].index("--prefill-batch-tokens") + 1] = "2752"
             if before["command"][before["command"].index("--rtx-gpus") + 1] == "2" and "--dspark" in before["command"]:
                 before["command"].insert(before["command"].index("--dspark") + 1, "--tp2-dspark-experts")
+            position = before["command"].index("--mapped-scale-preload-gib") + 2
+            before["command"][position:position] = ["--expert-usage"]
 
         if old["host"] == "coordinator" and entry["family"] != "deepseek_v41":
             # Every family's coordinator now takes its GPUs as V4.1's always did: CDI by
@@ -142,9 +237,40 @@ def test_deployment_preserves_release_container_commands(entry: dict, swa_kv: st
             config = dict(line.split("=", 1) for line in (ROOT / selected["config"]).read_text().splitlines()
                           if line and not line.startswith("#"))
             config.update(selected["set"])
-            expected = str(config.get("SPARK_DEVICE_BUDGET_BYTES", 108 << 30))
+            expected = str(config.get("SPARK_MEMORY_CAP", 108 << 30))
             assert after["command"][after["command"].index("--device-budget-bytes") + 1] == expected
             before["command"][before["command"].index("--device-budget-bytes") + 1] = expected
+        # The new default is an explicit checkpoint-native view, not an implicit
+        # target-weight conversion. Historical captures predate this selector.
+        if (entry["family"] in {"glm5", "glm5_flash", "kimi_k3", "step5", "muse_spark"}
+                and (old["host"] != "coordinator" or entry["family"] in {"glm5", "glm5_flash"})):
+            anchor = "--device-budget-bytes" if old["host"] != "coordinator" else "--embedding-placement"
+            position = before["command"].index(anchor) + 2
+            before["command"][position:position] = ["--core-view", "original"]
+        if old["host"] == "coordinator" and entry["family"] == "glm5":
+            before["env"]["CUTEAFD_GLM_BF16"] = "native"
+        if old["host"] == "coordinator" and entry["family"] == "glm5_flash":
+            position = before["command"].index("--kda-fp8") + 1
+            before["command"][position] = "off"
+            for flag in ("--kda-output-shard", "--kda-prefill-expanded"):
+                if flag in before["command"]:
+                    before["command"].remove(flag)
+        if old["host"] == "coordinator" and "--coordinator-weight-budget-gib" not in before["command"]:
+            # Serve admits resident weights against the planner's budget; historical
+            # captures predate passing it and fell back to the 80 GiB default.
+            planned = {plan[plan.index("--coordinator-weight-budget-gib") + 1]
+                       for plan in current["plans"] if "--coordinator-weight-budget-gib" in plan}
+            assert len(planned) == 1, (entry["name"], planned)
+            budget = planned.pop()
+            command = after["command"]
+            assert command.count("--coordinator-weight-budget-gib") == 1
+            assert command[command.index("--coordinator-weight-budget-gib") + 1] == budget
+            anchor_flag = "--snapshot" if entry["family"] != "deepseek_v41" else None
+            if anchor_flag:
+                position = before["command"].index(anchor_flag) + 2
+            else:
+                position = command.index("--coordinator-weight-budget-gib")
+            before["command"][position:position] = ["--coordinator-weight-budget-gib", budget]
         fingerprint = "CUTEAFD_RELEASE_CONFIG_SHA256"
         if entry["family"] == "deepseek_v41" and fingerprint in before["env"]:
             assert after["env"][fingerprint] != before["env"][fingerprint], (entry["name"], old["host"])
@@ -157,13 +283,13 @@ def test_deployment_preserves_release_container_commands(entry: dict, swa_kv: st
 def test_v41_worker_budget_comes_from_typed_deployment(explicit: int | None) -> None:
     entry = release_entry(next(e for e in ENTRIES if e["name"] == "v41-flash-min"))
     if explicit is not None:
-        entry["set"]["SPARK_DEVICE_BUDGET_BYTES"] = str(explicit)
+        entry["set"]["SPARK_MEMORY_CAP"] = str(explicit)
     result = capture(ROOT, entry["name"], release_entry=entry)
     for plan in result["plans"]:
         if explicit is None:
-            assert "--spark-budget-gib" not in plan
+            assert "--spark-memory-cap" not in plan
         else:
-            assert float(plan[plan.index("--spark-budget-gib") + 1]) == explicit / 2**30
+            assert plan[plan.index("--spark-memory-cap") + 1] == str(explicit)
     workers = [parse_run(run["argv"])["command"] for run in result["containers"] if run["host"] != "coordinator"]
     assert len(workers) == int(entry["set"]["SPARK_COUNT"])
     for worker in workers:
@@ -245,7 +371,7 @@ def test_exlr8_launcher_preserves_explicit_prefill_waves(waves: str) -> None:
     assert "CUTEAFD_GLM_PREFILL_LANES" not in coordinator["env"]
 
 
-@pytest.mark.parametrize("gpus,attention", [("1", "auto"), ("1", "heads"), ("2", "auto"), ("2", "context")])
+@pytest.mark.parametrize("gpus,attention", [("1", "auto"), ("1", "heads"), ("2", "auto"), ("2", "context"), ("2", "heads"), ("2", "layers")])
 @pytest.mark.parametrize("ranks", range(1, 7))
 def test_exlr8_launcher_accepts_canonical_spark_worlds(ranks: int, gpus: str, attention: str) -> None:
     entry = exlr8_entry()
@@ -264,11 +390,10 @@ def test_exlr8_launcher_accepts_canonical_spark_worlds(ranks: int, gpus: str, at
 @pytest.mark.parametrize("overrides,reason", [
     ({"RTX_GPUS": "0"}, "RTX GPUs"),
     ({"RTX_GPUS": "3"}, "RTX GPUs"),
-    ({"RTX_GPUS": "1"}, "heads attention"),
-    ({"RTX_GPUS": "1", "ATTENTION_PLACEMENT": "layers"}, "heads attention"),
-    ({"SPARK_COUNT": "9"}, "canonical Spark ranks"),
+    ({"RTX_GPUS": "1"}, "heads or two-GPU context/layers attention"),
+    ({"RTX_GPUS": "1", "ATTENTION_PLACEMENT": "layers"}, "heads or two-GPU context/layers attention"),
+    ({"SPARK_COUNT": "9"}, "0..8 Spark ranks"),
     ({"SPECULATOR": "mtp"}, "SPECULATOR=off or dflash2"),
-    ({"ATTENTION_PLACEMENT": "heads"}, "context attention"),
 ])
 def test_exlr8_launcher_refuses_unsupported_route(overrides: dict, reason: str) -> None:
     entry = exlr8_entry()

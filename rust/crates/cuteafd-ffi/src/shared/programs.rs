@@ -13,6 +13,65 @@ use std::ffi::c_void;
 use std::fmt;
 use std::path::Path;
 
+/// ABI records consumed by native/shared/cuda/fp8_load_quant.h. Admission and
+/// execution use these same layouts when sizing retained pinned job tables.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct Fp8LoadSegment { pub offset: u64, pub ptr: *const u8, pub bytes: u64 }
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct Fp8LoadJob {
+    pub segments: *const Fp8LoadSegment,
+    pub count: i32,
+    pub rows: i32,
+    pub cols: i32,
+    pub layout: i32,
+    pub rule: i32,
+    pub pad: i32,
+    pub col0: i64,
+    pub pitch: i64,
+    pub q: *mut u8,
+    pub q_stride: i64,
+    pub scales: *mut f32,
+    pub scale_stride: i64,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum Fp8LoadTableError {
+    #[error("FP8 load table requires nonzero rows and whole scale units")]
+    InvalidRows,
+    #[error("FP8 load table byte extent overflow")]
+    Overflow,
+}
+
+/// One segment and job per scale unit, with the executor's pinned minimum.
+/// Block quantization uses 128 rows per unit; row/channel layouts use one.
+pub fn fp8_load_table_bytes(rows: usize, unit_rows: usize) -> std::result::Result<usize, Fp8LoadTableError> {
+    if rows == 0 || !matches!(unit_rows, 1 | 128) || rows % unit_rows != 0 {
+        return Err(Fp8LoadTableError::InvalidRows);
+    }
+    let bytes = std::mem::size_of::<Fp8LoadSegment>().checked_add(std::mem::size_of::<Fp8LoadJob>())
+        .and_then(|stride| stride.checked_mul(rows / unit_rows)).ok_or(Fp8LoadTableError::Overflow)?;
+    Ok(bytes.max(1 << 20))
+}
+
+#[cfg(test)]
+mod fp8_load_table_tests {
+    use super::*;
+    #[test]
+    fn extent_uses_native_abi_and_checked_scale_units() {
+        assert_eq!(std::mem::size_of::<Fp8LoadSegment>(), 24);
+        assert_eq!(std::mem::size_of::<Fp8LoadJob>(), 80);
+        assert_eq!(fp8_load_table_bytes(128, 128).unwrap(), 1 << 20);
+        assert_eq!(fp8_load_table_bytes(32768, 1).unwrap(), 32768 * 104);
+        assert_eq!(fp8_load_table_bytes(128 * 32768, 128).unwrap(), 32768 * 104);
+        for (rows, units) in [(0, 1), (127, 128), (128, 0), (128, 2), (usize::MAX, 1)] {
+            assert!(fp8_load_table_bytes(rows, units).is_err());
+        }
+    }
+}
+
 /// Extents compiled into the coordinator programs. They describe one
 /// sequence's index, not the shared token pool or its physical GPU replicas.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -34,12 +93,32 @@ impl fmt::Display for ProgramCapacityError {
         match self {
             Self::Invalid { field } => write!(f, "program manifest capacities.{field} must be a positive integer that fits usize"),
             Self::MissingContext { family } => write!(f, "{family}: program manifest lacks capacities.max_context; export matching coordinator programs with an explicit --max-context before loading weights"),
-            Self::ContextExceeded { family, requested, compiled } => write!(f, "{family}: requested context {requested} exceeds compiled index extent {compiled}; export matching coordinator programs with CUTEAFD_DSV4_MAX_CONTEXT={requested} (--max-context {requested}), or lower --max-context to {compiled}"),
+            Self::ContextExceeded { family, requested, compiled } => write!(f, "{family}: requested context {requested} exceeds compiled index extent {compiled}; export matching coordinator programs with CUTEAFD_DSV4_MAX_CONTEXT={requested} (--max-context {requested}), or lower --max-context-tokens to {compiled}"),
         }
     }
 }
 
 impl std::error::Error for ProgramCapacityError {}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("missing compressed Spark reply export {export}; release builds include this export (development builds provide BF16 replies only)")]
+pub struct MissingReplyExport {
+    pub export: String,
+}
+
+/// Validate an explicitly requested codec before loading weights or allocating workspaces.
+pub fn require_reply_export(name: &str, present: bool) -> std::result::Result<(), MissingReplyExport> {
+    if present { Ok(()) } else { Err(MissingReplyExport { export: name.to_owned() }) }
+}
+
+pub fn admit_reply_export(formats: cuteafd_core::spark_reply::SparkReplyFormats,
+    format: cuteafd_core::SparkReplyFormat, name: &str, present: bool)
+    -> std::result::Result<(), MissingReplyExport> {
+    if formats.prefill == Some(format) || formats.decode == Some(format) {
+        require_reply_export(name, present)?;
+    }
+    Ok(())
+}
 
 impl ProgramCapacities {
     fn from_manifest(manifest: &serde_json::Value) -> std::result::Result<Self, ProgramCapacityError> {
@@ -147,7 +226,7 @@ impl NativeLibrary {
         for index in 0..unsafe { count() } {
             let mut raw = ProgramInfo::default();
             let status = unsafe { info(index, &mut raw) };
-            ensure!(status == 0, "DeepSeek V4 program {index} info failed with {status}");
+            if status != 0 { return Err(crate::memory_ledger::capture_failure(anyhow::anyhow!("DeepSeek V4 program {index} info failed with {status}"))); }
             let name = c_string(&raw.name);
             let kinds = c_string(&raw.scalar_kinds).into_bytes();
             ensure!(kinds.len() == raw.scalars as usize, "program {name} scalar table is inconsistent");
@@ -240,6 +319,11 @@ impl<'a> Programs<'a> {
                 }
             } else if name.starts_with("exlr8_") {
                 validate_exlr8_entry(spec, entry)?;
+            } else if name.starts_with("minimax_norm_rope_") || name == "minimax_index_producer"
+                || name.starts_with("minimax_oai_split_") {
+                crate::minimax_m3::producers::validate_producer_entry(spec, entry)?;
+            } else if name.starts_with("minimax_") {
+                crate::minimax_m3::validate_entry(spec, entry)?;
             }
         }
         Ok(self)
@@ -250,7 +334,7 @@ impl<'a> Programs<'a> {
     pub fn with_attention_plan(mut self, plan: cuteafd_core::coordinator_programs::AttentionReductionPlan,
         keep: impl Fn(&str) -> bool) -> Result<Self> {
         let select = |spec: &mut ProgramSpec| -> Result<()> {
-            cuteafd_core::coordinator_programs::select_attention_scratch(&spec.geometry, &mut spec.scratch, plan)?;
+            cuteafd_core::coordinator_programs::select_core_view_scratch(&spec.geometry, &mut spec.scratch, plan)?;
             Ok(())
         };
         for (_, spec) in self.programs.values_mut() {
@@ -283,10 +367,20 @@ impl<'a> Programs<'a> {
             let status = unsafe { (self.load)(*index) };
             ensure!(status != -12001,
                 "loading {name} refused: insufficient resident SMs for its fused diagnostic CTA barrier");
-            ensure!(status == 0, "loading {name} failed with CUDA status {status}");
+            if status != 0 { return Err(crate::memory_ledger::capture_failure(anyhow::anyhow!("loading {name} failed with CUDA status {status}"))); }
             loaded += 1;
         }
         Ok((loaded, skipped))
+    }
+
+    pub fn contains(&self, name: &str) -> bool {
+        self.programs.contains_key(name)
+    }
+
+    pub fn reply_bound(&self, name: &str, pointers: &[&str], format: cuteafd_core::SparkReplyFormat)
+        -> Result<Option<BoundProgram<'a>>> {
+        admit_reply_export(cuteafd_core::spark_reply::requested(), format, name, self.contains(name))?;
+        self.contains(name).then(|| self.bound(name, pointers)).transpose()
     }
 
     pub fn names(&self) -> impl Iterator<Item = &str> {
@@ -328,7 +422,7 @@ impl<'a> Programs<'a> {
         let status = unsafe { (self.load)(*index) };
         ensure!(status != -12001,
             "loading {name} refused: insufficient resident SMs for its fused diagnostic CTA barrier");
-        ensure!(status == 0, "loading {name} failed with CUDA status {status}");
+        if status != 0 { return Err(crate::memory_ledger::capture_failure(anyhow::anyhow!("loading {name} failed with CUDA status {status}"))); }
         let spec = self.spec(name)?;
         Ok(Program { programs: self, index: *index, spec })
     }
@@ -369,7 +463,7 @@ impl BoundProgram<'_> {
         let slots: Vec<u64> = scalars.iter().map(|s| s.slot()).collect();
         // SAFETY: ABI counts/kinds checked above, extents guaranteed by caller.
         let status = unsafe { (self.launch)(self.index, pointers.as_ptr(), slots.as_ptr(), stream) };
-        ensure!(status == 0, "{} launch failed with status {status}", self.spec.name);
+        if status != 0 { return Err(crate::memory_ledger::capture_failure(anyhow::anyhow!("{} launch failed with status {status}", self.spec.name))); }
         Ok(())
     }
 }
@@ -399,7 +493,7 @@ impl<'a> Program<'a> {
         // SAFETY: counts and kinds were checked against the native table; the
         // caller guarantees pointer validity (see the function contract).
         let status = unsafe { (self.programs.launch)(self.index, pointers.as_ptr(), slots.as_ptr(), stream) };
-        ensure!(status == 0, "{} launch failed with status {status}", self.spec.name);
+        if status != 0 { return Err(crate::memory_ledger::capture_failure(anyhow::anyhow!("{} launch failed with status {status}", self.spec.name))); }
         Ok(())
     }
 }
@@ -434,12 +528,13 @@ fn validate_exlr8_entry(spec: &ProgramSpec, entry: &serde_json::Value) -> Result
 
 fn validate_exlr8_scalars(kind: super::exlr8::KernelKind, entry: &serde_json::Value) -> Result<()> {
     use super::exlr8::KernelKind::*;
-    let expected: &[(&str, &str)] = match kind {
+    let expected: &[(&str, &str)] = match kind.arithmetic_kind() {
         GroupedA16 | GroupedA8 | GroupedDecode => &[
             ("rows", "int32"), ("cta_limit", "int32"), ("unit_limit", "int32"), ("l2_bytes", "int32"),
         ],
-        Routed | Shared | Group | SharedGroup | GroupedGroup => &[("rows", "int32"), ("cta_limit", "int32")],
+        Routed | Shared | Group | SharedGroup | GroupedGroup | ReplyFp8 | ReplyNvfp4 => &[("rows", "int32"), ("cta_limit", "int32")],
         Decode => &[("rows", "int32"), ("groups", "int32"), ("cta_limit", "int32")],
+        _ => unreachable!("reply arithmetic kinds normalize to their BF16 sibling"),
     };
     let scalars = entry["scalars"].as_array().context("EXLR8 scalar ABI missing")?;
     ensure!(scalars.len() == expected.len() && scalars.iter().zip(expected).all(
@@ -456,6 +551,33 @@ fn c_string(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn development_admits_bf16_but_refuses_either_explicit_compressed_phase() {
+        use cuteafd_core::{SparkReplyFormat as F, spark_reply::SparkReplyFormats};
+        for prefill in [None, Some(F::Bf16), Some(F::Fp8), Some(F::Nvfp4)] {
+            for decode in [None, Some(F::Bf16), Some(F::Fp8), Some(F::Nvfp4)] {
+                let formats = SparkReplyFormats { prefill, decode };
+                for codec in [F::Fp8, F::Nvfp4] {
+                    let requested = prefill == Some(codec) || decode == Some(codec);
+                    let error = admit_reply_export(formats, codec, "producer", false).err();
+                    assert_eq!(error.is_some(), requested);
+                    if let Some(error) = error { assert_eq!(error.export, "producer"); }
+                    assert!(admit_reply_export(formats, codec, "producer", true).is_ok());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn missing_reply_export_is_typed_and_names_release_support() {
+        let name = "expert_reply_native_h4096_1";
+        let error: anyhow::Error = require_reply_export(name, false).unwrap_err().into();
+        assert_eq!(error.downcast_ref::<MissingReplyExport>().unwrap().export, name);
+        let message = error.to_string();
+        assert!(message.contains(name) && message.contains("release builds include"));
+        assert!(require_reply_export(name, true).is_ok());
+    }
 
     #[test]
     fn exported_glm_stage_manifest_passes_runtime_dispatch() {
@@ -503,6 +625,127 @@ mod tests {
             assert!(validate_glm_stage_entry(&wrong_name, entry).is_err(), "{}: name", spec.name);
         }
         assert_eq!(swiglu, 4);
+    }
+
+    #[test]
+    fn manifest_loader_accepts_all_nine_reply_exports_for_both_exlr8_families() {
+        use super::super::exlr8::KernelFamily;
+        let original: serde_json::Value = serde_json::from_str(include_str!(
+            "../../tests/fixtures/exlr8_grouped_programs_sm121.json")).unwrap();
+        let mut entries = Vec::new();
+        for family in [KernelFamily::Glm, KernelFamily::GlmFlash] {
+            let prefix = if family == KernelFamily::Glm { "exlr8" } else { "exlr8_glmf" };
+            let hidden = family.geometry().hidden;
+            let mut base = original["programs"].as_array().unwrap().clone();
+            if family == KernelFamily::GlmFlash {
+                for entry in &mut base {
+                    entry["name"] = entry["name"].as_str().unwrap().replacen("exlr8_", "exlr8_glmf_", 1).into();
+                    entry["geometry"]["hidden"] = hidden.into();
+                    entry["geometry"]["fc1_splits"] = 4.into();
+                    entry["geometry"]["swiglu_limit"] = 10.0.into();
+                    for pointer in entry["pointers"].as_array_mut().unwrap() {
+                        pointer["shape"] = pointer["shape"].as_str().unwrap()
+                            .replace("6144", "4096").replace(",6,", ",4,").into();
+                    }
+                    for name in ["fc1", "fc2"] {
+                        entry["scratch_bytes_at_capacity"][name] =
+                            (entry["scratch_bytes_at_capacity"][name].as_u64().unwrap() / 3 * 2).into();
+                    }
+                }
+            }
+            let mut core = base.iter().find(|e| e["name"].as_str().unwrap().ends_with("_grouped64")).unwrap().clone();
+            core["name"] = format!("{prefix}_a16_serving_core").into();
+            for key in ["group_rows", "fc2_partials"] { core["geometry"].as_object_mut().unwrap().remove(key); }
+            core["geometry"]["core_only"] = true.into();
+            core["geometry"]["serving_variant"] = "k1_k23_coalesced".into();
+            core["pointers"].as_array_mut().unwrap().truncate(13);
+            core["scalars"].as_array_mut().unwrap().truncate(2);
+            entries.push(core);
+            for format in [1, 2] {
+                let stride = if format == 1 { hidden * 33 / 32 } else { hidden * 9 / 16 };
+                entries.push(serde_json::json!({"name":format!("{prefix}_reply_{format}"),
+                    "capacity_rows":64,"scratch_bytes_at_capacity":{},
+                    "geometry":{"hidden":hidden,"top_k":8,"format":format,"row_bytes":stride,
+                        "variant":"k1_k23_coalesced"},
+                    "pointers":[
+                        {"name":"route_group_lane","dtype":"int32","shape":"[rows,8]","role":"in"},
+                        {"name":"route_weights","dtype":"float32","shape":"[rows,8]","role":"in"},
+                        {"name":"fc2","dtype":"float32","shape":"[fc2_scratch]","role":"in"},
+                        {"name":"signs_out","dtype":"int8","shape":format!("[{hidden}]"),"role":"in"},
+                        {"name":"output","dtype":"uint8","shape":format!("[rows,{stride}]"),"role":"out"},
+                        {"name":"group_count","dtype":"int32","shape":"[1]","role":"in"}],
+                    "scalars":[{"name":"rows","type":"int32"},{"name":"cta_limit","type":"int32"}]}));
+                for entry in &base {
+                    let mut reply = entry.clone();
+                    reply["name"] = format!("{}_reply{format}", entry["name"].as_str().unwrap()).into();
+                    reply["geometry"]["reply_format"] = format.into();
+                    reply["pointers"][11]["dtype"] = "uint8".into();
+                    reply["pointers"][11]["shape"] = format!("[rows,{stride}]").into();
+                    entries.push(reply);
+                }
+            }
+        }
+        assert_eq!(entries.len(), 18);
+        let root = std::path::PathBuf::from(std::env::var_os("CUTEAFD_NATIVE_LIFETIME_FIXTURE_DIR")
+            .unwrap_or_else(|| std::path::PathBuf::from(std::env::var_os("HOME").unwrap())
+                .join(".cache/cuteafd/builds/manifest-loader").into_os_string()))
+            .join(format!("reply-manifest-{}", std::process::id()));
+        let repo = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../..");
+        assert!(std::process::Command::new("python3").arg(repo.join("scripts/build/assert-build-filesystem.py"))
+            .arg(&root).status().unwrap().success());
+        std::fs::create_dir_all(&root).unwrap();
+        let manifest = root.join("PROGRAMS.json");
+        let source = root.join("mock.c");
+        let shared = root.join("mock.so");
+        let names = entries.iter().map(|e| format!("\"{}\"", e["name"].as_str().unwrap())).collect::<Vec<_>>().join(",");
+        let pointers = entries.iter().map(|e| e["pointers"].as_array().unwrap().len().to_string()).collect::<Vec<_>>().join(",");
+        let scalars = entries.iter().map(|e| e["scalars"].as_array().unwrap().len().to_string()).collect::<Vec<_>>().join(",");
+        std::fs::write(&source, format!(r#"
+#include <stdint.h>
+#include <string.h>
+struct Info {{ char name[64]; uint32_t pointers, scalars; char kinds[16]; }};
+static const char *names[] = {{{names}}};
+static const unsigned pointers[] = {{{pointers}}}, scalars[] = {{{scalars}}};
+int cuteafd_rdma_rc_endpoint_try_poll(void) {{ return 0; }}
+int cuteafd_set_expert_hidden(unsigned hidden) {{ return 0; }}
+unsigned cuteafd_dsv4_program_count(void) {{ return 18; }}
+int cuteafd_dsv4_program_info(unsigned i, struct Info *p) {{
+  if (i >= 18) return 1;
+  memset(p, 0, sizeof(*p)); strcpy(p->name, names[i]);
+  p->pointers = pointers[i]; p->scalars = scalars[i]; memset(p->kinds, 'i', scalars[i]); return 0;
+}}
+int cuteafd_dsv4_program_load(unsigned i) {{ return 0; }}
+int cuteafd_dsv4_program_launch(unsigned i, void **p, uint64_t *s, void *stream) {{ return 0; }}
+"#)).unwrap();
+        let output = std::process::Command::new("cc").args(["-shared", "-fPIC"])
+            .arg(&source).arg("-o").arg(&shared).output().unwrap();
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        std::fs::write(&manifest, serde_json::to_vec(&serde_json::json!({"programs":entries})).unwrap()).unwrap();
+        // SAFETY: this test compiles the library above; its table functions only
+        // read static CPU data and no CUDA entry point is invoked.
+        let library = unsafe { NativeLibrary::load(&shared).unwrap() };
+        let loaded = library.programs().unwrap().with_manifest(&manifest).unwrap();
+        assert_eq!(loaded.names().count(), 18);
+        let missing = "expert_reply_native_h4096_1";
+        assert!(!loaded.contains(missing));
+        assert!(admit_reply_export(Default::default(), cuteafd_core::SparkReplyFormat::Fp8,
+            missing, loaded.contains(missing)).is_ok());
+        for formats in [
+            cuteafd_core::spark_reply::SparkReplyFormats { prefill: Some(cuteafd_core::SparkReplyFormat::Fp8), decode: None },
+            cuteafd_core::spark_reply::SparkReplyFormats { prefill: None, decode: Some(cuteafd_core::SparkReplyFormat::Fp8) },
+        ] {
+            let error = admit_reply_export(formats, cuteafd_core::SparkReplyFormat::Fp8,
+                missing, loaded.contains(missing)).unwrap_err();
+            assert_eq!(error.export, missing);
+            assert!(error.to_string().contains("release builds include"));
+        }
+
+        drop(loaded);
+        for entry in &mut entries { entry["geometry"]["reply_format"] = 99.into(); }
+        std::fs::write(&manifest, serde_json::to_vec(&serde_json::json!({"programs":entries})).unwrap()).unwrap();
+        assert!(library.programs().unwrap().with_manifest(&manifest).is_err());
+        drop(library);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -644,6 +887,14 @@ mod tests {
 
 type HeadLaunchFn = unsafe extern "C" fn(*mut c_void, *const u16, *const u16, *mut f32, i32, *mut c_void) -> i32;
 
+/// The only native library a vocabulary projection will launch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(i32)]
+pub enum HeadMode {
+    Gemm = 0,
+    TensorLt = 1,
+}
+
 /// cuBLAS vocabulary head at the model width with pedantic FP32 accumulation
 /// (the reference promotes the projection to FP32); logits that need not
 /// follow it may take the tensor-op launch ([`VocabularyHead::launch_tensor_op`]).
@@ -663,8 +914,9 @@ impl NativeLibrary {
     /// # Safety
     /// `workspace` must be live device memory of at least
     /// [`VOCABULARY_HEAD_WORKSPACE`] bytes that outlives the head.
-    pub unsafe fn vocabulary_head(&self, workspace: *mut c_void, width: u32, max_rows: u32) -> Result<VocabularyHead<'_>> {
-        type Create = unsafe extern "C" fn(*mut c_void, u64, i32, i32, *mut *mut c_void) -> i32;
+    pub unsafe fn vocabulary_head(&self, workspace: *mut c_void, width: u32, max_rows: u32, mode: HeadMode) -> Result<VocabularyHead<'_>> {
+        let _failure_boundary = crate::memory_ledger::fault::boundary();
+        type Create = unsafe extern "C" fn(*mut c_void, u64, i32, i32, i32, *mut *mut c_void) -> i32;
         let create = *unsafe { self.lib.get::<Create>(b"cuteafd_vocabulary_head_create") }?;
         let launch = *unsafe { self.lib.get(b"cuteafd_vocabulary_head_launch_width") }?;
         let launch_tensor_op = unsafe { self.lib.get(b"cuteafd_vocabulary_head_launch_tensor_op") }.ok().map(|f| *f);
@@ -673,9 +925,12 @@ impl NativeLibrary {
             .ok().map(|f| *f);
         let mut handle = std::ptr::null_mut();
         let status = unsafe {
-            create(workspace, VOCABULARY_HEAD_WORKSPACE as u64, i32::try_from(width)?, i32::try_from(max_rows)?, &mut handle)
+            create(workspace, VOCABULARY_HEAD_WORKSPACE as u64, i32::try_from(width)?, i32::try_from(max_rows)?, mode as i32, &mut handle)
         };
-        ensure!(status == 0, "vocabulary head creation failed with {status}");
+        if status != 0 {
+            return Err(crate::memory_ledger::capture_failure(
+                anyhow::anyhow!("vocabulary head creation failed with {status}")));
+        }
         Ok(VocabularyHead { library: self, handle, launch, launch_tensor_op, launch_tensor_invariant })
     }
 }
@@ -699,7 +954,7 @@ impl NativeLibrary {
             select(logits, bias, tid2eid, tokens, ids, routing, i32::try_from(rows)?, i32::try_from(experts)?,
                 i32::try_from(topk)?, route_scale, stream)
         };
-        ensure!(status == 0, "DeepSeek V4 router select failed with {status}");
+        if status != 0 { return Err(crate::memory_ledger::capture_failure(anyhow::anyhow!("DeepSeek V4 router select failed with {status}"))); }
         Ok(())
     }
 
@@ -719,7 +974,7 @@ impl NativeLibrary {
             select(logits, bias, tid2eid, tokens, ids, routing, i32::try_from(rows)?, i32::try_from(experts)?,
                 i32::try_from(topk)?, route_scale, i32::from(sigmoid), stream)
         };
-        ensure!(status == 0, "DeepSeek V4 router select failed with {status}");
+        if status != 0 { return Err(crate::memory_ledger::capture_failure(anyhow::anyhow!("DeepSeek V4 router select failed with {status}"))); }
         Ok(())
     }
 }
@@ -744,7 +999,7 @@ impl NativeLibrary {
             select(logits, ids, routing, i32::try_from(rows)?, i32::try_from(experts)?, i32::try_from(topk)?,
                 route_scale, i32::from(round_bf16), stream)
         };
-        ensure!(status == 0, "softmax router select failed with {status}");
+        if status != 0 { return Err(crate::memory_ledger::capture_failure(anyhow::anyhow!("softmax router select failed with {status}"))); }
         Ok(())
     }
 }
@@ -761,7 +1016,7 @@ impl NativeLibrary {
         type Dequant = unsafe extern "C" fn(*const c_void, *const c_void, *mut c_void, i32, i32, *mut c_void) -> i32;
         let f = *unsafe { self.lib.get::<Dequant>(b"cuteafd_fp8_block_dequant") }?;
         let status = unsafe { f(w, scale, out, i32::try_from(rows)?, i32::try_from(cols)?, stream) };
-        ensure!(status == 0, "FP8 block dequantization failed with {status}");
+        if status != 0 { return Err(crate::memory_ledger::capture_failure(anyhow::anyhow!("FP8 block dequantization failed with {status}"))); }
         Ok(())
     }
 
@@ -778,7 +1033,7 @@ impl NativeLibrary {
         type Quant = unsafe extern "C" fn(*const c_void, i32, *mut c_void) -> i32;
         let f = *unsafe { self.lib.get::<Quant>(b"cuteafd_fp8_load_quant") }?;
         let status = unsafe { f(jobs, i32::try_from(count)?, stream) };
-        ensure!(status == 0, "FP8 load quantization failed with {status}");
+        if status != 0 { return Err(crate::memory_ledger::capture_failure(anyhow::anyhow!("FP8 load quantization failed with {status}"))); }
         Ok(())
     }
 
@@ -791,7 +1046,7 @@ impl NativeLibrary {
         type Widen = unsafe extern "C" fn(*const c_void, *mut c_void, i64, *mut c_void) -> i32;
         let f = *unsafe { self.lib.get::<Widen>(b"cuteafd_load_widen_bf16_f32") }?;
         let status = unsafe { f(src, dst, i64::try_from(n)?, stream) };
-        ensure!(status == 0, "BF16 load widening failed with {status}");
+        if status != 0 { return Err(crate::memory_ledger::capture_failure(anyhow::anyhow!("BF16 load widening failed with {status}"))); }
         Ok(())
     }
 
@@ -807,6 +1062,23 @@ impl NativeLibrary {
         unsafe { narrow.launch(src, dst, n, stream) }
     }
 
+    /// Checked I64 -> I32 conversion; `invalid` is zero on entry and becomes
+    /// one when a source value is out of range. Inspect only after draining.
+    ///
+    /// # Safety
+    /// `src` holds `n` I64, `dst` holds `n` I32, and `invalid` is a device-visible
+    /// U32; all are aligned, disjoint, and live through completion on `stream`.
+    pub unsafe fn load_narrow_i64_i32(&self, src: *const c_void, dst: *mut c_void,
+        n: usize, invalid: *mut c_void, stream: *mut c_void) -> Result<()> {
+        type Narrow = unsafe extern "C" fn(*const c_void, *mut c_void, i64, *mut c_void, *mut c_void) -> i32;
+        // SAFETY: the symbol has this stable shared native ABI.
+        let narrow = *unsafe { self.lib.get::<Narrow>(b"cuteafd_load_narrow_i64_i32") }?;
+        // SAFETY: typed live storage is guaranteed by the caller.
+        let status = unsafe { narrow(src, dst, i64::try_from(n)?, invalid, stream) };
+        if status != 0 { return Err(crate::memory_ledger::capture_failure(anyhow::anyhow!("I64 load narrowing launch failed with {status}"))); }
+        Ok(())
+    }
+
     /// `n` BF16 pairs `a[i]`, `b[i]` (device-visible) promoted to F32 and
     /// multiplied once into `dst` (F32) on the current device.
     ///
@@ -817,7 +1089,7 @@ impl NativeLibrary {
         type Product = unsafe extern "C" fn(*const c_void, *const c_void, *mut c_void, i64, *mut c_void) -> i32;
         let f = *unsafe { self.lib.get::<Product>(b"cuteafd_load_bf16_product_f32") }?;
         let status = unsafe { f(a, b, dst, i64::try_from(n)?, stream) };
-        ensure!(status == 0, "BF16 load product failed with {status}");
+        if status != 0 { return Err(crate::memory_ledger::capture_failure(anyhow::anyhow!("BF16 load product failed with {status}"))); }
         Ok(())
     }
 
@@ -836,7 +1108,7 @@ impl NativeLibrary {
         let f = *unsafe { self.lib.get::<Tiles>(b"cuteafd_load_trellis_tiles") }?;
         let status = unsafe { f(src, dst, i64::try_from(rows)?, i64::try_from(k0)?, i64::try_from(tiles)?,
             i64::try_from(tile_bytes)?, side, i64::try_from(k16)?, stream) };
-        ensure!(status == 0, "EXL3 trellis tile reorder failed with {status}");
+        if status != 0 { return Err(crate::memory_ledger::capture_failure(anyhow::anyhow!("EXL3 trellis tile reorder failed with {status}"))); }
         Ok(())
     }
 
@@ -853,7 +1125,7 @@ impl NativeLibrary {
         let f = *unsafe { self.lib.get::<Absorb>(b"cuteafd_load_kvb_absorb") }?;
         let status = unsafe { f(kv_b, uk, uv, i64::try_from(h0)?, i64::try_from(heads)?, i64::try_from(nope)?,
             i64::try_from(v)?, i64::try_from(lat)?, stream) };
-        ensure!(status == 0, "kv_b load absorption failed with {status}");
+        if status != 0 { return Err(crate::memory_ledger::capture_failure(anyhow::anyhow!("kv_b load absorption failed with {status}"))); }
         Ok(())
     }
 
@@ -876,7 +1148,7 @@ impl NativeLibrary {
         let f = *unsafe { self.lib.get::<Split>(b"cuteafd_load_kvb_split_fp8") }?;
         let status = unsafe { f(kv_b, grid, uk, uk_scale, uv, uv_scale, i64::try_from(row0)?, i64::try_from(heads)?,
             i64::try_from(nope)?, i64::try_from(v)?, i64::try_from(lat)?, stream) };
-        ensure!(status == 0, "FP8 kv_b split failed with {status}");
+        if status != 0 { return Err(crate::memory_ledger::capture_failure(anyhow::anyhow!("FP8 kv_b split failed with {status}"))); }
         Ok(())
     }
 
@@ -887,7 +1159,7 @@ impl NativeLibrary {
         let (mut job, mut segment, mut cols) = (0, 0, 0);
         // SAFETY: three writable u64 outputs.
         let status = unsafe { f(&mut job, &mut segment, &mut cols) };
-        ensure!(status == 0, "FP8 load quantization ABI query failed with {status}");
+        if status != 0 { return Err(crate::memory_ledger::capture_failure(anyhow::anyhow!("FP8 load quantization ABI query failed with {status}"))); }
         Ok((job, segment, cols))
     }
 
@@ -901,7 +1173,7 @@ impl NativeLibrary {
         type Widen = unsafe extern "C" fn(*const c_void, *mut c_void, i64, i64, *mut c_void) -> i32;
         let f = *unsafe { self.lib.get::<Widen>(b"cuteafd_fp8_grid_kmajor") }?;
         let status = unsafe { f(grid, kmajor, i64::try_from(rows)?, i64::try_from(kb)?, stream) };
-        ensure!(status == 0, "FP8 K-major grid widening failed with {status}");
+        if status != 0 { return Err(crate::memory_ledger::capture_failure(anyhow::anyhow!("FP8 K-major grid widening failed with {status}"))); }
         Ok(())
     }
 
@@ -920,7 +1192,7 @@ impl NativeLibrary {
         let f = *unsafe { self.lib.get::<Gather>(b"cuteafd_load_scale_gather") }?;
         let status = unsafe { f(grid, index, row_major, k_major, i64::try_from(rows)?, i64::try_from(kb)?,
             i64::try_from(grid_cols)?, i64::try_from(col0)?, stream) };
-        ensure!(status == 0, "load-time scale gather failed with {status}");
+        if status != 0 { return Err(crate::memory_ledger::capture_failure(anyhow::anyhow!("load-time scale gather failed with {status}"))); }
         Ok(())
     }
 
@@ -935,7 +1207,7 @@ impl NativeLibrary {
         type Quant = unsafe extern "C" fn(*const c_void, *mut c_void, *mut c_void, i32, i32, *mut c_void) -> i32;
         let f = *unsafe { self.lib.get::<Quant>(b"cuteafd_fp8_block_quant") }?;
         let status = unsafe { f(w, q, scale, i32::try_from(rows)?, i32::try_from(cols)?, stream) };
-        ensure!(status == 0, "FP8 block quantization failed with {status}");
+        if status != 0 { return Err(crate::memory_ledger::capture_failure(anyhow::anyhow!("FP8 block quantization failed with {status}"))); }
         Ok(())
     }
 
@@ -950,7 +1222,7 @@ impl NativeLibrary {
         type Quant = unsafe extern "C" fn(*const c_void, *mut c_void, *mut c_void, i32, i32, *mut c_void) -> i32;
         let f = *unsafe { self.lib.get::<Quant>(b"cuteafd_fp8_row_quant") }?;
         let status = unsafe { f(w, q, scale, i32::try_from(rows)?, i32::try_from(cols)?, stream) };
-        ensure!(status == 0, "FP8 row quantization failed with {status}");
+        if status != 0 { return Err(crate::memory_ledger::capture_failure(anyhow::anyhow!("FP8 row quantization failed with {status}"))); }
         Ok(())
     }
 
@@ -968,7 +1240,7 @@ impl NativeLibrary {
         let name: &[u8] = if row { b"cuteafd_fp8_row_quant_rule" } else { b"cuteafd_fp8_block_quant_rule" };
         let f = *unsafe { self.lib.get::<Quant>(name) }?;
         let status = unsafe { f(w, q, scale, i32::try_from(rows)?, i32::try_from(cols)?, rule, stream) };
-        ensure!(status == 0, "FP8 quantization (rule {rule}) failed with {status}");
+        if status != 0 { return Err(crate::memory_ledger::capture_failure(anyhow::anyhow!("FP8 quantization (rule {rule}) failed with {status}"))); }
         Ok(())
     }
 
@@ -986,7 +1258,7 @@ impl NativeLibrary {
             f(stream, out, i32::try_from(rows)?, i32::try_from(hidden)?, i32::try_from(stride)?,
                 i32::try_from(offset)?, cuda_stream)
         };
-        ensure!(status == 0, "dSpark hc mean failed with {status}");
+        if status != 0 { return Err(crate::memory_ledger::capture_failure(anyhow::anyhow!("dSpark hc mean failed with {status}"))); }
         Ok(())
     }
 
@@ -1005,7 +1277,7 @@ impl NativeLibrary {
         let status = unsafe {
             f(x, w, scale, norm, out, work, i32::try_from(rows)?, i32::try_from(n)?, i32::try_from(k)?, eps, cuda_stream)
         };
-        ensure!(status == 0, "dSpark main projection failed with {status}");
+        if status != 0 { return Err(crate::memory_ledger::capture_failure(anyhow::anyhow!("dSpark main projection failed with {status}"))); }
         Ok(())
     }
 
@@ -1033,7 +1305,7 @@ impl NativeLibrary {
             f(logits, w1, w2, first, drafts, workspace, i32::try_from(sequences)?, i32::try_from(block)?,
                 i32::try_from(vocab)?, i32::try_from(rank)?, cuda_stream)
         };
-        ensure!(status == 0, "dSpark Markov drafts failed with {status}");
+        if status != 0 { return Err(crate::memory_ledger::capture_failure(anyhow::anyhow!("dSpark Markov drafts failed with {status}"))); }
         Ok(())
     }
 }
@@ -1043,9 +1315,10 @@ impl NativeLibrary {
     ///
     /// # Safety
     /// As [`Self::vocabulary_head`].
-    pub unsafe fn vocabulary_head_rows(&self, workspace: *mut c_void, width: u32, max_rows: u32, vocab: u32)
+    pub unsafe fn vocabulary_head_rows(&self, workspace: *mut c_void, width: u32, max_rows: u32, vocab: u32, mode: HeadMode)
         -> Result<VocabularyHead<'_>> {
-        type Create = unsafe extern "C" fn(*mut c_void, u64, i32, i32, i32, *mut *mut c_void) -> i32;
+        let _failure_boundary = crate::memory_ledger::fault::boundary();
+        type Create = unsafe extern "C" fn(*mut c_void, u64, i32, i32, i32, i32, *mut *mut c_void) -> i32;
         let create = *unsafe { self.lib.get::<Create>(b"cuteafd_vocabulary_head_create_vocab") }?;
         let launch = *unsafe { self.lib.get(b"cuteafd_vocabulary_head_launch_width") }?;
         let launch_tensor_op = unsafe { self.lib.get(b"cuteafd_vocabulary_head_launch_tensor_op") }.ok().map(|f| *f);
@@ -1055,9 +1328,12 @@ impl NativeLibrary {
         let mut handle = std::ptr::null_mut();
         let status = unsafe {
             create(workspace, VOCABULARY_HEAD_WORKSPACE as u64, i32::try_from(width)?, i32::try_from(max_rows)?,
-                i32::try_from(vocab)?, &mut handle)
+                i32::try_from(vocab)?, mode as i32, &mut handle)
         };
-        ensure!(status == 0, "vocabulary head creation failed with {status}");
+        if status != 0 {
+            return Err(crate::memory_ledger::capture_failure(
+                anyhow::anyhow!("vocabulary head creation failed with {status}")));
+        }
         Ok(VocabularyHead { library: self, handle, launch, launch_tensor_op, launch_tensor_invariant })
     }
 }
@@ -1075,7 +1351,7 @@ impl VocabularyHead<'_> {
             "this native library has no fixed tensor vocabulary head (rebuild it with this checkout)")?;
         // SAFETY: the caller guarantees buffer, device and stream lifetimes.
         let status = unsafe { launch(self.handle, input, weight, logits, i32::try_from(rows)?, stream) };
-        ensure!(status == 0, "fixed tensor vocabulary head launch of {rows} rows failed with {status}");
+        if status != 0 { return Err(crate::memory_ledger::capture_failure(anyhow::anyhow!("fixed tensor vocabulary head launch of {rows} rows failed with {status}"))); }
         Ok(())
     }
 
@@ -1085,7 +1361,7 @@ impl VocabularyHead<'_> {
     pub unsafe fn launch(&self, input: *const u16, weight: *const u16, logits: *mut f32, rows: u32,
         stream: *mut c_void) -> Result<()> {
         let status = unsafe { (self.launch)(self.handle, input, weight, logits, i32::try_from(rows)?, stream) };
-        ensure!(status == 0, "vocabulary head launch failed with {status}");
+        if status != 0 { return Err(crate::memory_ledger::capture_failure(anyhow::anyhow!("vocabulary head launch failed with {status}"))); }
         Ok(())
     }
 
@@ -1101,7 +1377,7 @@ impl VocabularyHead<'_> {
         let launch = self.launch_tensor_op.context(
             "this native library has no cuteafd_vocabulary_head_launch_tensor_op (rebuild it with this checkout)")?;
         let status = unsafe { launch(self.handle, input, weight, logits, i32::try_from(rows)?, stream) };
-        ensure!(status == 0, "tensor-op vocabulary head launch of {rows} rows failed with {status}");
+        if status != 0 { return Err(crate::memory_ledger::capture_failure(anyhow::anyhow!("tensor-op vocabulary head launch of {rows} rows failed with {status}"))); }
         Ok(())
     }
 }

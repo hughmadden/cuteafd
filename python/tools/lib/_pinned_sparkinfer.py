@@ -75,10 +75,22 @@ def _use_offline_target(name: str) -> str | None:
           file=sys.stderr, flush=True)
     return name
 
+def _export_cache_paused():
+    # The export cache records what an export reads (python/tools/lib/_export_cache.py).
+    # Verification hashes the whole tree against the lock: that proves the tree
+    # is the locked one, it does not consume it, so only the lock is an input.
+    recorder = sys.modules.get("_export_cache")
+    if recorder is None:
+        from contextlib import nullcontext
+        return nullcontext()
+    recorder.note_read(LOCK)
+    return recorder.paused()
+
 
 try:
     _verifier = _load_verifier()
-    LOCK_DATA = _verifier.verify(SOURCE, LOCK)
+    with _export_cache_paused():
+        LOCK_DATA = _verifier.verify(SOURCE, LOCK)
     _prepend_source()
     IMPORTED_MODULE = _verifier.verify_import_source(SOURCE)
 except Exception as exc:
@@ -104,7 +116,7 @@ VERSION = str(
 # exporter imports this module before compiling, so the default HostTarget is
 # pinned here once. Coordinator stubs (launch wrappers, not hot code) use
 # x86-64-v3 (AVX2). Every Spark is a GB10 (Cortex-X925 + Cortex-A725, one
-# feature set), so Spark exports are tuned for its fast core: CuTe DSL 4.6.2's
+# feature set), so Spark exports are tuned for its fast core: CuTe DSL 4.8.1's
 # LLVM accepts cortex-x925, and on a GB10 "native" already resolved to it
 # (identical objects), so the pin keeps today's code and makes it reproducible.
 # An explicit per-call --host-target still wins; CUTEAFD_CUTE_HOST_TARGET
@@ -145,7 +157,7 @@ def _pin_cute_host_target() -> None:
     # and the string parser assigns "" for an absent --host-target. The object
     # export reads only .triple/.cpu/.features, so an empty spec resolves to the
     # pinned target there; a non-empty explicit spec is used as given.
-    pinned = compiler._parse_host_target(target)
+    pinned = cls._parse_target(target)
 
     def resolved(self) -> tuple[str, str, str]:
         return (self._triple, self._cpu, self._features) if self._triple else pinned

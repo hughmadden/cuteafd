@@ -22,7 +22,7 @@ const DECODE_TOKENS: u64 = 320;
 /// Short waves keep the mandatory scaling sweep within the smoke budget.
 const SWEEP_TOKENS: u64 = 160;
 /// The prefill case's prompt length.
-const PREFILL_TOKENS: u64 = 8192;
+const PREFILL_TOKENS: u64 = crate::prefill::CARD_TOKENS;
 
 pub const CONTENT: [(&str, &str); 3] = [
     ("code", "Write a complete Python module that implements a thread-safe LRU cache with per-entry TTL expiry, \
@@ -47,7 +47,7 @@ pub fn estimate_s(rates: &Rates, info: &ServerInfo) -> f64 {
     let decode = 3.0 * rates.seconds(60.0, DECODE_TOKENS as f64);
     let prefill = rates.seconds(PREFILL_TOKENS as f64 + 1600.0, 4.0);
     let fidelity = 4096.0 / rates.decode_tok_s + 24000.0 / rates.prefill_tok_s + 8.0 * 0.15;
-    let cache = rates.seconds(6.0 * CACHE_PROMPT_TOKENS as f64, 30.0);
+    let cache = rates.seconds(6.0 * cache_prompt_tokens(cache_minimum_tokens(info)) as f64, 30.0);
     let spec = rates.seconds(200.0, 2.0 * 128.0 * 1.6);
     let template = rates.seconds(400.0, 400.0);
     let c4 = rates.seconds(500.0, 2.0 * 64.0);
@@ -134,6 +134,29 @@ fn unsupported(check: &mut Check) {
     check.summary = "this engine does not run benchmark probes yet".into();
 }
 
+fn decode_content(run: &mut Run<'_>) -> Result<()> {
+    let client = run.client;
+    for (i, (content, prompt)) in CONTENT.iter().enumerate() {
+        run.step(0.04 + 0.08 * i as f64, &format!("C1 decode · {content}"));
+        let fabric_mark = client.fabric_mark();
+        let before = common::draft_counters(client);
+        let chat = client.chat(plain(client, &format!("[{}] {prompt}", nonce()), DECODE_TOKENS), None)
+            .with_context(|| format!("{content} decode"))?;
+        let after = common::draft_counters(client);
+        if let Some(phase) = client.fabric_since(fabric_mark, &format!("decode/{content}/c1"), true) {
+            run.baseline.fabric.push(phase);
+        }
+        if *content == "code" {
+            run.baseline.card.concurrency.push(concurrent_rate(vec![common::Timed { sent: 0.0, chat: chat.clone() }],
+                run.baseline.card.warmup_s.unwrap_or_default(), "code"));
+        }
+        run.baseline.card.decode.push(ContentRate { content: content.to_string(), tok_s: chat.timing.decode_tok_s(),
+            runs: vec![chat.timing], acceptance: common::acceptance(before, after) });
+        run.publish();
+    }
+    Ok(())
+}
+
 pub fn run(client: &Client, info: &ServerInfo, progress: &Progress, run_id: &str, fingerprint: &str,
     max_context: u64, max_output: u64) -> Result<Baseline> {
     let started = Instant::now();
@@ -159,23 +182,7 @@ pub fn run(client: &Client, info: &ServerInfo, progress: &Progress, run_id: &str
     }
     client.chat(plain(client, &format!("[{}] {}", nonce(), CONTENT[0].1), 32), None).context("warm-up decode")?;
     run.baseline.card.warmup_s = Some(warmup.elapsed().as_secs_f64());
-    // C1 decode per content type.
-    for (i, (content, prompt)) in CONTENT.iter().enumerate() {
-        run.step(0.04 + 0.08 * i as f64, &format!("C1 decode · {content}"));
-        let fabric_mark = client.fabric_mark();
-        let chat = client.chat(plain(client, &format!("[{}] {prompt}", nonce()), DECODE_TOKENS), None)
-            .with_context(|| format!("{content} decode"))?;
-        if let Some(phase) = client.fabric_since(fabric_mark, &format!("decode/{content}/c1"), true) {
-            run.baseline.fabric.push(phase);
-        }
-        if *content == "code" {
-            run.baseline.card.concurrency.push(concurrent_rate(vec![common::Timed { sent: 0.0, chat: chat.clone() }],
-                run.baseline.card.warmup_s.unwrap_or_default(), "code"));
-        }
-        run.baseline.card.decode.push(ContentRate { content: content.to_string(), tok_s: chat.timing.decode_tok_s(),
-            runs: vec![chat.timing], acceptance: None });
-        run.publish();
-    }
+    decode_content(&mut run)?;
     // One untimed warm wave per width primes graphs, tables and first-use workspaces.
     let levels = concurrent_levels(info);
     anyhow::ensure!(!levels.is_empty(), "server admits no concurrent sequences");
@@ -195,36 +202,43 @@ pub fn run(client: &Client, info: &ServerInfo, progress: &Progress, run_id: &str
         run.baseline.card.concurrency.push(concurrent_rate(batch, warmup_s, speed::DISTINCT_PROMPTS));
         run.publish();
     }
-    // 8K prefill: a cold prompt sized from the fit.
-    run.step(0.40, "8K prefill");
+    // The fit is only an initial estimate; the served tokenizer determines length.
     let (slope, intercept) = match fit.as_slice() {
         [(w0, t0), (w1, t1)] if w1 > w0 && t1 > t0 => ((t1 - t0) / (w1 - w0), t0 - (t1 - t0) / (w1 - w0) * w0),
         _ => (1.0, 20.0),
     };
     run.baseline.card.prompt_token_ratio = Some(slope);
-    let target = PREFILL_TOKENS.min(max_context.saturating_sub(64)) as f64;
-    let words = ((target - intercept) / slope).max(64.0) as usize;
-    // Warm beyond the full 8K chunk when context permits. Near-equal corpus
-    // lengths can move a lane boundary and leave part of the measured lane
-    // cold. Keep normal prefix-cache retention work in both requests.
-    let warm_target = (target + 512.0).min(max_context.saturating_sub(64) as f64);
-    let warm_words = ((warm_target - intercept) / slope).max(64.0) as usize;
-    let text = format!("[{}] Reply with the single word OK.\n\n{}", nonce(), corpus(98, warm_words));
-    client.chat(plain(client, &text, 1), None).context("8K prefill warm-up")?;
-    let text = format!("[{}] Reply with the single word OK.\n\n{}", nonce(), corpus(99, words));
-    // Prime this exact lane shape and its routed expert accesses too. A cold
-    // probe neither reads nor retains a prefix, so the timed ordinary request
-    // still performs its full prefill and normal snapshot work.
-    client.chat(plain(client, &text, 1), Some(ProbeSpec { cold: true, ..ProbeSpec::default() }))
-        .context("8K prefill route warm-up")?;
-    let fabric_mark = client.fabric_mark();
-    let chat = client.chat(plain(client, &text, 1), None).context("8K prefill")?;
-    if let Some(phase) = client.fabric_since(fabric_mark, "prefill/8k", true) { run.baseline.fabric.push(phase); }
-    let t = chat.timing.clone();
-    anyhow::ensure!(t.cached_tokens == 0, "8K cold prefill reused {} cached tokens", t.cached_tokens);
-    run.baseline.card.prefill = Some(PrefillRate { prompt_tokens: t.prompt_tokens, tok_s: t.prefill_tok_s(),
-        ttft_s: t.ttft_s, runs: vec![t] });
-    run.publish();
+    let unit = crate::prefill::unit_rows(&info.configuration.settings)?;
+    for (label, target, tail) in [("8K prefill", PREFILL_TOKENS, false),
+        ("8K w/tail", crate::prefill::tail_tokens(unit)?, true)] {
+        run.step(if tail { 0.45 } else { 0.40 }, label);
+        let estimate = ((target as f64 - intercept) / slope).max(64.0) as usize;
+        let instruction = "Reply with the single word OK.";
+        let sized = crate::prefill::prompts(client, (98, 99), estimate, target, max_context, instruction, tail);
+        let Some((warm, text)) = card_prefill_prompts(&mut run.baseline.card, target, tail, sized)? else {
+            run.publish();
+            continue;
+        };
+        let chat = client.chat(plain(client, &warm.text, 1), None).with_context(|| format!("{label} warm-up"))?;
+        crate::prefill::validate(warm.tokens, chat.timing.prompt_tokens)?;
+        // A cold probe primes this exact route without retaining the prefix.
+        let probe = client.chat(plain(client, &text.text, 1), Some(ProbeSpec { cold: true, ..ProbeSpec::default() }))
+            .with_context(|| format!("{label} route warm-up"))?;
+        crate::prefill::validate(text.tokens, probe.timing.prompt_tokens)?;
+        let fabric_mark = client.fabric_mark();
+        let chat = client.chat(plain(client, &text.text, 1), None).with_context(|| label.to_string())?;
+        if let Some(phase) = client.fabric_since(fabric_mark, if tail { "prefill/8k-tail" } else { "prefill/8k" }, true) {
+            run.baseline.fabric.push(phase);
+        }
+        let t = chat.timing;
+        crate::prefill::validate(text.tokens, t.prompt_tokens)?;
+        anyhow::ensure!(t.cached_tokens == 0, "{label} cold prefill reused {} cached tokens", t.cached_tokens);
+        let rate = PrefillRate { requested_tokens: target, prompt_tokens: t.prompt_tokens,
+            shape: Some(crate::prefill::shape(t.prompt_tokens, unit)), tok_s: t.prefill_tok_s(), ttft_s: t.ttft_s, runs: vec![t] };
+        if tail { run.baseline.card.prefill_tail = Some(rate); }
+        else { run.baseline.card.prefill = Some(rate); }
+        run.publish();
+    }
     // Quick quality.
     run.step(0.50, "logit fidelity");
     run.check("fidelity", "Logit fidelity", fidelity);
@@ -242,6 +256,21 @@ pub fn run(client: &Client, info: &ServerInfo, progress: &Progress, run_id: &str
     run.step(1.0, "baseline done");
     run.publish();
     Ok(run.baseline)
+}
+
+fn card_prefill_prompts(card: &mut crate::report::BasicCard, target: u64, diagnostic: bool,
+    sized: Result<(crate::prefill::SizedPrompt, crate::prefill::SizedPrompt)>)
+    -> Result<Option<(crate::prefill::SizedPrompt, crate::prefill::SizedPrompt)>> {
+    match sized {
+        Ok(prompts) => Ok(Some(prompts)),
+        Err(error) if diagnostic => {
+            card.skipped_prefill.push(crate::report::SkippedPrefill {
+                label: "8K w/tail".into(), requested_tokens: target, reason: format!("{error:#}"),
+            });
+            Ok(None)
+        }
+        Err(error) => Err(error),
+    }
 }
 
 fn fidelity(run: &mut Run<'_>, check: &mut Check) -> Result<()> {
@@ -361,7 +390,8 @@ fn cache_exact_with(client: &Client, info: &ServerInfo, check: &mut Check, fixtu
     let body = |text: &str, n| cache_body(client, text, n, fixture);
     let rows = |n: usize| ProbeSpec { no_speculation: true, record_rows: n, top_k: 1, ..ProbeSpec::default() };
     // Prompt end: the first request computes and retains, the second restores it whole.
-    let (text, turn_text) = cache_prompts();
+    let minimum = cache_minimum_tokens(info);
+    let (text, turn_text) = cache_prompts(minimum);
     let first = request(body(&text, 2), rows(2))?;
     if !honoured(&first) {
         unsupported(check);
@@ -369,8 +399,7 @@ fn cache_exact_with(client: &Client, info: &ServerInfo, check: &mut Check, fixtu
     }
     if let Some(fixture) = fixture { cache_bound(&first, fixture)?; }
     let restored = request(body(&text, 2), rows(2))?;
-    let minimum = cache_minimum_tokens(info);
-    check.set("prompt_reference_tokens", CACHE_PROMPT_TOKENS as u64);
+    check.set("prompt_reference_tokens", cache_prompt_tokens(minimum) as u64);
     check.set("minimum_prompt_tokens", minimum as u64);
     check.set("prompt_tokens", restored.prompt_ids.len() as u64);
     if !cache_coverage(check, "prompt", restored.prompt_ids.len(), minimum) { return Ok(()); }
@@ -439,7 +468,7 @@ fn cache_bound(record: &ProbeRecord, fixture: &Value) -> Result<()> {
 /// hits above only decode and cannot catch a leaked prefill staging-reuse flag.
 fn cache_continuation(run: &mut Run<'_>, check: &mut Check, minimum: usize) -> Result<()> {
     let client = run.client;
-    let text = format!("[{}] Read these notes.\n\n{}", nonce(), corpus(73, CACHE_PROMPT_TOKENS));
+    let text = format!("[{}] Read these notes.\n\n{}", nonce(), corpus(73, cache_prompt_tokens(minimum)));
     let discovery = probed(client, plain(client, &text, 1), ProbeSpec {
         no_speculation: true, record_rows: 1, ..ProbeSpec::default() })?;
     if !cache_coverage(check, "continuation seed", discovery.prompt_ids.len(), minimum) { return Ok(()); }
@@ -520,12 +549,19 @@ fn continuation_rows(warm: &ProbeRecord, cold: &ProbeRecord) -> Result<Value> {
 
 // Leave room for model/reference tokenizer differences above three 2752-row units.
 const CACHE_PROMPT_TOKENS: usize = 10240;
+/// Three units of the default 2752-row prefill.
+const CACHE_DEFAULT_MINIMUM: usize = 3 * 2752;
+
+/// Reference tokens that clear `minimum` model tokens by the same margin as the default.
+fn cache_prompt_tokens(minimum: usize) -> usize {
+    CACHE_PROMPT_TOKENS + minimum.saturating_sub(CACHE_DEFAULT_MINIMUM)
+}
 
 fn cache_minimum_tokens(info: &ServerInfo) -> usize {
     let positive = |name| info.setting(name).and_then(|s| s.parse::<usize>().ok()).filter(|n| *n > 0);
     // Qwen's explicit unit override takes precedence over its span-sized prefill-rows.
     positive("prefill-units").or_else(|| positive("prefill-rows"))
-        .map_or(8256, |rows| rows.saturating_mul(3))
+        .map_or(CACHE_DEFAULT_MINIMUM, |rows| rows.saturating_mul(3))
 }
 
 fn cache_coverage(check: &mut Check, name: &str, actual: usize, minimum: usize) -> bool {
@@ -535,10 +571,11 @@ fn cache_coverage(check: &mut Check, name: &str, actual: usize, minimum: usize) 
     false
 }
 
-fn cache_prompts() -> (String, String) {
-    (format!("[{}] Read the notes and answer in one word.\n\n{}", nonce(), corpus(31, CACHE_PROMPT_TOKENS)),
+fn cache_prompts(minimum: usize) -> (String, String) {
+    let tokens = cache_prompt_tokens(minimum);
+    (format!("[{}] Read the notes and answer in one word.\n\n{}", nonce(), corpus(31, tokens)),
         format!("[{}] Here are some notes.\n\n{}\n\nCount from one to forty in words, separated by commas.",
-            nonce(), corpus(57, CACHE_PROMPT_TOKENS)))
+            nonce(), corpus(57, tokens)))
 }
 
 /// Generated tokens of the turn-end case's turn.
@@ -1014,8 +1051,85 @@ pub fn describe(timing: &StreamTiming) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn prefill_tail_sizing_failure_is_recorded_but_card_8k_stays_strict() {
+        let mut card = crate::report::BasicCard::default();
+        let error = || Err(anyhow::anyhow!("no exact 8296-token prefill after 16 variants"));
+        assert!(super::card_prefill_prompts(&mut card, 8296, true, error()).unwrap().is_none());
+        assert!(card.prefill_tail.is_none());
+        let json = serde_json::to_value(&card).unwrap();
+        assert_eq!(json["skipped_prefill"][0]["requested_tokens"], 8296);
+        assert_eq!(json["skipped_prefill"][0]["label"], "8K w/tail");
+        assert!(json["skipped_prefill"][0]["reason"].as_str().unwrap().contains("16 variants"));
+        assert!(super::card_prefill_prompts(&mut card, 8192, false, error()).is_err());
+        assert_eq!(card.skipped_prefill.len(), 1);
+    }
+
     use super::*;
     use crate::report::Check;
+
+    fn content_acceptance_fixture(counters: bool) -> Vec<ContentRate> {
+        use std::io::{Read, Write};
+        use std::sync::{Arc, atomic::AtomicBool};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            for step in 0..9 {
+                let (mut socket, _) = listener.accept().unwrap();
+                socket.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+                let mut request = Vec::new();
+                while !request.ends_with(b"\r\n\r\n") {
+                    let mut byte = [0];
+                    socket.read_exact(&mut byte).unwrap();
+                    request.push(byte[0]);
+                }
+                let headers = String::from_utf8(request).unwrap();
+                let chat = step % 3 == 1;
+                assert!(headers.starts_with(if chat { "POST /v1/chat/completions " } else { "GET /v1/stats " }));
+                let length = headers.lines().find_map(|line| line.split_once(':')
+                    .filter(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+                    .map(|(_, value)| value.trim().parse::<usize>().unwrap())).unwrap_or(0);
+                let mut body = vec![0; length];
+                socket.read_exact(&mut body).unwrap();
+                let response = if chat {
+                    let body: Value = serde_json::from_slice(&body).unwrap();
+                    assert_eq!(body["max_tokens"], DECODE_TOKENS);
+                    assert!(body["messages"][0]["content"].as_str().unwrap().contains(CONTENT[step / 3].1));
+                    "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"length\"}],\"usage\":{\"prompt_tokens\":20,\"completion_tokens\":2}}\n\ndata: [DONE]\n\n".to_string()
+                } else if counters {
+                    let completed = step / 3 + usize::from(step % 3 == 2);
+                    json!({"totals": {"drafted_tokens": 100 + 8 * completed,
+                        "accepted_drafts": 20 + 6 * completed}}).to_string()
+                } else { "{}".into() };
+                write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    if chat { "text/event-stream" } else { "application/json" }, response.len(), response).unwrap();
+            }
+        });
+        let client = Client::new(&base, None, Arc::new(AtomicBool::new(false)));
+        let mut run = Run { client: &client, info: &ServerInfo::default(), progress: &Progress::default(),
+            max_context: 32768, baseline: Baseline { fingerprint: String::new(), run_id: String::new(),
+                created: now_rfc3339(), card: BasicCard::default(), quality: Quality::default(),
+                seconds: 0.0, thermal: None, fabric: vec![] } };
+        decode_content(&mut run).unwrap();
+        server.join().unwrap();
+        assert_eq!(run.baseline.card.decode.len(), CONTENT.len());
+        run.baseline.card.decode
+    }
+
+    #[test]
+    fn content_acceptance_records_each_timed_request_counter_delta() {
+        for rate in content_acceptance_fixture(true) {
+            assert_eq!(rate.acceptance, Some(0.75));
+            assert_eq!(serde_json::to_value(&rate).unwrap()["acceptance"], 0.75);
+        }
+    }
+
+    #[test]
+    fn content_acceptance_is_absent_without_server_counters() {
+        for rate in content_acceptance_fixture(false) {
+            assert_eq!(rate.acceptance, None);
+        }
+    }
 
     #[test]
     fn media_cache_fixture_rejects_ambiguous_or_missing_inputs() {
@@ -1149,12 +1263,17 @@ mod tests {
 
     #[test]
     fn cache_prompts_cover_three_largest_prefill_units() {
-        assert!(CACHE_PROMPT_TOKENS >= 3 * 2752);
-        let (prompt, turn) = cache_prompts();
-        for (text, seed) in [(prompt, 31), (turn, 57)] {
-            let body = corpus(seed, CACHE_PROMPT_TOKENS);
-            assert!(text.contains(&body));
-            assert!(body.len() > corpus(seed, 3 * 2752).len());
+        assert_eq!(cache_prompt_tokens(CACHE_DEFAULT_MINIMUM), CACHE_PROMPT_TOKENS);
+        // 4096-row units (V4, Qwen) need 12288 model tokens; 10240 reference tokens gave 10173.
+        for minimum in [CACHE_DEFAULT_MINIMUM, 3 * 4096] {
+            let tokens = cache_prompt_tokens(minimum);
+            assert_eq!(tokens - minimum, CACHE_PROMPT_TOKENS - CACHE_DEFAULT_MINIMUM);
+            let (prompt, turn) = cache_prompts(minimum);
+            for (text, seed) in [(prompt, 31), (turn, 57)] {
+                let body = corpus(seed, tokens);
+                assert!(text.contains(&body));
+                assert!(body.len() > corpus(seed, minimum).len());
+            }
         }
     }
 

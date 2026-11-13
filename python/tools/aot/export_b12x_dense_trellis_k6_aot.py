@@ -125,7 +125,8 @@ ML4_SHAPES = (
 # Step-5 (head_dim 192, 64 Q / 4 KV heads): K6 target core with the current
 # two-GPU head split (q/k/v rows, o_proj columns) and whole FFNs and heads; its
 # three MTP stages are K4 throughout, each with its own vocabulary head. A fifth
-# element names a width other than K6 and suffixes its program names with _k<bits>.
+# element names a width other than K6. Shipping K4 names stay unchanged;
+# explicit K8 screens get a _k8 suffix.
 STEP5_SHAPES = (
     ("step5_q", 4096, 12288, 1),
     ("step5_q_tp2", 4096, 6144, 1),
@@ -160,7 +161,7 @@ def _bits(item):
 
 
 def _suffix(item):
-    return "" if _bits(item) == 6 else f"_k{_bits(item)}"
+    return "_k8" if _bits(item) == 8 else ""
 
 
 def _key(item):
@@ -168,11 +169,17 @@ def _key(item):
     return item[1:4] + (() if _bits(item) == 6 else (_bits(item),))
 
 
+def kimi_k8_screen_shapes():
+    """Explicit opt-in only; shipping K4/K6 inventories are unchanged."""
+    return tuple((*shape[:4], 8) for shape in KIMI_SHAPES)
+
+
 def shapes_for(families):
     """Canonicalize equal geometries so runtime lookup is never ambiguous."""
     result, seen = [], set()
     for family in families:
-        for item in FAMILY_SHAPES[family]:
+        for item in (*FAMILY_SHAPES[family], *(tuple((*shape[:4], 8) for shape in FAMILY_SHAPES[family])
+                                                if family in ("glmf", "muse") else ())):
             if _key(item) not in seen:
                 result.append(item)
                 seen.add(_key(item))
@@ -192,17 +199,17 @@ def row_policies(families=("kimik3",)):
             result.append(dict(shape=name, input_features=k, output_features=n,
                 sharded_side=side, codebook=book,
                 **({} if _bits(item) == 6 else {"bits": _bits(item)}),
-                native_program=f"trellis_{name}_{book}",
+                native_program=f"trellis_{name}_{book}{_suffix(item)}",
                 native_input=f"trellis_input_k{k}_bf16",
                 output_program=f"trellis_output_n{n}_{output_dtype(k, n, side)}",
-                **({"grouped": grouped_policy(name, k, n, book)} if name in GROUPED_SHAPES else {})))
+                **({"grouped": grouped_policy(name, k, n, book, _bits(item))} if name in GROUPED_SHAPES else {})))
     return result
 
 
-def grouped_policy(name, k, n, book):
+def grouped_policy(name, k, n, book, bits=6):
     groups = GROUPED_SHAPES[name]
     return dict(groups=groups, max_rows=GROUPED_MAX_ROWS,
-                native_program=f"trellis_{name}_{book}_g{groups}",
+                native_program=f"trellis_{name}_{book}{'_k8' if bits == 8 else ''}_g{groups}",
                 native_input=f"trellis_input_k{k}_bf16_g{groups}",
                 output_program=f"trellis_output_n{n}_bf16_g{groups}")
 
@@ -238,7 +245,7 @@ def programs_for_shapes(shapes, *, max_rows=4096, f32_outputs=F32_OUTPUTS, input
             params = dict(input_features=k, output_features=n, bits=_bits(item),
                           codebook=codebook, sharded_side=side,
                           rotation_count=1, max_rows=max_rows, **core_dtype)
-            result.append((f"trellis_{name}_{codebook}", "trellis_linear", params,
+            result.append((f"trellis_{name}_{codebook}{_suffix(item)}", "trellis_linear", params,
                            partial(compile_trellis_linear_aot, **params)))
     for k in sorted({item[1] for item in shapes}):
         params = dict(features=k, input_dtype="bf16", max_rows=max_rows, **ingress_dtype)
@@ -256,9 +263,9 @@ def programs_for_shapes(shapes, *, max_rows=4096, f32_outputs=F32_OUTPUTS, input
             continue
         rows = min(max_rows, GROUPED_MAX_ROWS)
         for codebook in ("mcg", "mul1"):
-            params = dict(input_features=k, output_features=n, bits=6, codebook=codebook,
+            params = dict(input_features=k, output_features=n, bits=_bits(item), codebook=codebook,
                           sharded_side=side, rotation_count=groups, max_rows=rows, groups=groups, **core_dtype)
-            result.append((f"trellis_{name}_{codebook}_g{groups}", "trellis_linear", params,
+            result.append((f"trellis_{name}_{codebook}{_suffix(item)}_g{groups}", "trellis_linear", params,
                            partial(compile_trellis_linear_aot, **params)))
         params = dict(features=k, input_dtype="bf16", max_rows=rows, groups=groups, **ingress_dtype)
         result.append((f"trellis_input_k{k}_bf16_g{groups}", "trellis_input", params,
@@ -266,7 +273,12 @@ def programs_for_shapes(shapes, *, max_rows=4096, f32_outputs=F32_OUTPUTS, input
         params = dict(features=n, output_dtype="bf16", max_rows=rows, groups=groups)
         result.append((f"trellis_output_n{n}_bf16_g{groups}", "trellis_output", params,
                        partial(compile_trellis_output_aot, **params)))
-    return result
+    unique = {}
+    for entry in result:
+        if entry[0] in unique and entry[:3] != unique[entry[0]][:3]:
+            raise ValueError(f"conflicting trellis export {entry[0]}")
+        unique.setdefault(entry[0], entry)
+    return list(unique.values())
 
 
 def main():

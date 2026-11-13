@@ -58,7 +58,7 @@ exit 0
 """
 
 
-def write_config(path, hosts, *, spark_count=None, topology=None, extra=""):
+def write_config(path, hosts, *, spark_count=None, extra=""):
     lines = [
         "MODEL_ID=deepseek-ai/DeepSeek-V4.1-Flash",
         "MODEL_VARIANT=flash",
@@ -66,10 +66,6 @@ def write_config(path, hosts, *, spark_count=None, topology=None, extra=""):
     ]
     if spark_count is not None:
         lines.append(f"SPARK_COUNT={spark_count}")
-    if topology is not None:
-        tp, ep = topology
-        lines.append(f"SPARK_TP={tp}")
-        lines.append(f"SPARK_EP={ep}")
     for index, host in enumerate(hosts):
         lines.append(f"SPARK_{index}_HOST={host}")
         lines.append(f"SPARK_{index}_LANE_A=10.55.0.{index + 1}")
@@ -168,13 +164,6 @@ class StopHostScopeTest(StopHarness):
         config = write_config(self.root / "six-hosts-count4.config",
                               SIX_HOSTS, spark_count=4)
         result, lines, _ = self.run_stop("--config", str(config))
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(sorted(set(self.hosts(lines))), sorted(SIX_HOSTS))
-
-    def test_explicit_example_six_host_config_stops_all_six(self):
-        """The reported --config example configuration must clean every rank."""
-        result, lines, _ = self.run_stop(
-            "--config", str(EXAMPLES / "tp3ep2-native.config"))
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(sorted(set(self.hosts(lines))), sorted(SIX_HOSTS))
 
@@ -400,7 +389,7 @@ class StopConfigModeTest(StopHarness):
         """Rails are launch-only; cleanup must not need LANE_A/B."""
         config = self.raw_config(
             "no-rails.config",
-            "SPARK_COUNT=6\nSPARK_TP=3\nSPARK_EP=2\n" + self.host_lines(SIX_HOSTS, lanes=False),
+            "SPARK_COUNT=6\n" + self.host_lines(SIX_HOSTS, lanes=False),
         )
         strict = self.load(config)
         self.assertEqual(strict.returncode, 2, strict.stdout)
@@ -432,7 +421,6 @@ class StopConfigModeTest(StopHarness):
             ("port.config", "SPARK_0_HOST=ostrich\nEXPERT_PORT=99999\n"),
             ("gpus.config", "SPARK_0_HOST=ostrich\nRTX_GPUS=3\n"),
             ("count-type.config", "SPARK_0_HOST=ostrich\nSPARK_COUNT=abc\n"),
-            ("tp-type.config", "SPARK_0_HOST=ostrich\nSPARK_TP=abc\n"),
         ):
             with self.subTest(name=name):
                 config = self.raw_config(name, body)

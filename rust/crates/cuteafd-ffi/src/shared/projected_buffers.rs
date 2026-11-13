@@ -1,6 +1,6 @@
 use crate::CuteafdDeviceBuffer as Buffer;
 
-pub(super) fn validate_buffers<const N: usize>(
+pub(crate) fn validate_buffers<const N: usize>(
     items: &[(Buffer, usize); N],
     alignments: &[usize; N],
     writable: &[usize],

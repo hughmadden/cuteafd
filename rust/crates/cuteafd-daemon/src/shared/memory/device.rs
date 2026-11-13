@@ -126,24 +126,81 @@ impl<F: Future> Drop for DeviceFuture<'_, F> {
 pub(crate) struct Allocation<'a> {
     pub device: Device<'a>,
     pub buffer: CuteafdDeviceBuffer,
+    backing: Option<std::rc::Rc<Allocation<'a>>>,
+    weight_id: Option<(String, super::MemoryKind)>,
+    arena_registration: Option<cuteafd_ffi::memory_ledger::fault::ArenaRegistration>,
 }
+
+pub(crate) struct WeightArenaBacking<'b> {
+    pub id: &'b str,
+    pub buffer: CuteafdDeviceBuffer,
+    /// The arena's kind, as its backing receipt reports it.
+    pub kind: super::MemoryKind,
+}
+
 impl<'a> Allocation<'a> {
-    pub fn attention_plane(device: Device<'a>, rows: usize, stride: usize, name: &str) -> Result<Self> {
+    pub fn attention_plane(device: Device<'a>, rows: usize, stride: usize, name: &str, tag: super::Tag) -> Result<Self> {
         let bytes = rows.checked_mul(stride).ok_or_else(|| anyhow::anyhow!("attention plane size overflow"))?;
-        let allocation = Self::new(device, bytes)?;
+        let allocation = Self::new(device, bytes, tag)?;
         anyhow::ensure!(allocation.buffer.ptr as usize % 16 == 0 && stride % 16 == 0,
             "V4.1 BF16 AOT attention load: {name} shape=[{rows},{stride}] on GPU {} requires 16-byte aligned base and row stride",
             device.id);
         Ok(allocation)
     }
 
-    pub fn new(device: Device<'a>, bytes: usize) -> Result<Self> {
-        let buffer = device.run(|| device.library.alloc_device_buffer(bytes))?;
-        Ok(Self { device, buffer })
+    /// Device memory on `device` holding `tag`.
+    #[track_caller]
+    pub fn new(device: Device<'a>, bytes: usize, tag: super::Tag) -> Result<Self> {
+        let _site = cuteafd_ffi::memory_ledger::allocation_site(std::panic::Location::caller());
+        let buffer = device.run(|| device.library.alloc_device_buffer(bytes, tag))?;
+        Ok(Self { device, buffer, backing: None, weight_id: None, arena_registration: None })
+    }
+
+    /// Kind and owner of the physical backing (a view reports its arena's).
+    pub fn tag(&self) -> Option<super::Tag> {
+        match &self.backing {
+            Some(backing) => backing.tag(),
+            None => cuteafd_ffi::memory_ledger::tag_of(self.buffer.ptr as usize),
+        }
+    }
+
+    #[track_caller]
+    pub(super) fn weight_arena(device: Device<'a>, bytes: usize, id: &str, tag: super::Tag) -> Result<Self> {
+        let mut allocation = Self::new(device, bytes, tag)?;
+        allocation.weight_id = Some((id.into(), tag.kind));
+        Ok(allocation)
+    }
+
+    pub(super) fn register_weight_arena(&mut self, registration: cuteafd_ffi::memory_ledger::fault::ArenaRegistration) {
+        self.arena_registration = Some(registration);
+    }
+
+    pub(crate) fn weight_backing(&self) -> Option<WeightArenaBacking<'_>> {
+        if let Some(backing) = &self.backing { return backing.weight_backing(); }
+        self.weight_id.as_ref().map(|(id, kind)| WeightArenaBacking { id, buffer: self.buffer, kind: *kind })
+    }
+
+    pub(crate) fn inventory(&self, inventory: &mut super::receipts::Inventory<'_>, name: &str) -> Result<()> {
+        match self.weight_backing() {
+            Some(backing) => inventory.weight_view(name, self.buffer, backing),
+            None => inventory.device(name, self.buffer),
+        }
+    }
+
+    /// A view retains the physical owner, including on partial-load failures.
+    pub fn view(owner: &std::rc::Rc<Self>, offset: usize, bytes: usize) -> Result<Self> {
+        ensure!(bytes > 0 && offset.checked_add(bytes).is_some_and(|end| end <= owner.buffer.bytes),
+            "device allocation view outside backing");
+        let address = (owner.buffer.ptr as usize).checked_add(offset)
+            .ok_or_else(|| anyhow::anyhow!("device allocation view address overflow"))?;
+        ensure!(address % 256 == 0, "weight arena view requires 256-byte alignment");
+        Ok(Self { device: owner.device, buffer: CuteafdDeviceBuffer {
+            ptr: address as *mut std::ffi::c_void, bytes, ..owner.buffer }, backing: Some(owner.clone()), weight_id: None, arena_registration: None })
     }
 }
 impl Drop for Allocation<'_> {
     fn drop(&mut self) {
+        if self.backing.is_some() { return; }
         if self.device.library.is_quarantined_after_failed_drain() {
             // Match legacy allocations: cudaFree may wait on unproved work.
             return;
@@ -179,7 +236,7 @@ mod allocation_lifetime_tests {
             std::fs::write(std::env::var("CUTEAFD_FATAL_SYNC_EVIDENCE")?, fixture.directory().join("events").to_str().unwrap())?;
             let library = fixture.load()?;
             let device = Device { library: &library, id: 0 };
-            let allocation = Allocation::new(device, 256)?;
+            let allocation = Allocation::new(device, 256, crate::shared::memory::TEST)?;
             let stream = Stream { device, raw: std::ptr::null_mut() };
             fixture.configure_pack(&library, 0, 1)?;
             match path {
@@ -244,7 +301,7 @@ mod allocation_lifetime_tests {
         let fixture = Fixture::build()?;
         let library = fixture.load()?;
         let device = Device { library: &library, id: 0 };
-        let allocation = Allocation::new(device, 256)?;
+        let allocation = Allocation::new(device, 256, crate::shared::memory::TEST)?;
         let stream = Stream { device, raw: std::ptr::null_mut() };
         fixture.configure_pack(&library, 0, 1)?;
         assert!(stream.drain().is_err());
@@ -263,7 +320,7 @@ mod allocation_lifetime_tests {
         for quarantined in [false, true] {
             let fixture = Fixture::build()?;
             let library = fixture.load()?;
-            let allocation = Allocation::new(Device { library: &library, id: 1 }, 256)?;
+            let allocation = Allocation::new(Device { library: &library, id: 1 }, 256, crate::shared::memory::TEST)?;
             assert_eq!(library.cuda_get_device()?, 0, "allocation must restore the current device");
             if quarantined { library.quarantine_module_after_failed_drain(); }
             drop(allocation);
@@ -285,7 +342,7 @@ impl<'a> Stream<'a> {
     pub fn new(device: Device<'a>) -> Result<Self> {
         Ok(Self { device, raw: device.run(|| device.library.cuda_stream_create())? })
     }
-    fn ready(&self) -> Result<bool> {
+    pub(super) fn ready(&self) -> Result<bool> {
         self.device.run(|| unsafe { self.device.library.cuda_stream_query(self.raw) })
     }
     pub(crate) fn drain(&self) -> Result<()> {
@@ -341,7 +398,12 @@ impl Drop for Stream<'_> {
 
 pub(crate) struct Event<'a> { pub device: Device<'a>, pub raw: *mut c_void }
 impl<'a> Event<'a> {
+    /// An ordering edge without timestamp collection.
     pub fn new(device: Device<'a>) -> Result<Self> {
+        Ok(Self { device, raw: device.run(|| device.library.cuda_event_create_ordering())? })
+    }
+    /// A timestamp for an explicitly measured elapsed-time pair.
+    pub fn timing(device: Device<'a>) -> Result<Self> {
         Ok(Self { device, raw: device.run(|| device.library.cuda_event_create())? })
     }
     pub fn record(&mut self, producer: &Stream<'a>) -> Result<()> {
@@ -455,8 +517,7 @@ impl<'a> PeerTransfer<'a> {
             "peer transfer requires distinct devices from one library");
         destination.run(|| destination.library.cuda_enable_peer(source.id))?;
         let stream = Stream::new(destination)?;
-        let ready = Event { device: source,
-            raw: source.run(|| source.library.cuda_event_create())? };
+        let ready = Event::new(source)?;
         let sm = Some(destination.run(|| destination.library.v41_peer_copy())?);
         Ok(Self { destination: stream, ready, sm, push: None })
     }
@@ -594,6 +655,33 @@ impl<'a> PeerTransfer<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "requires CUTEAFD_NATIVE_LIB and one CUDA GPU"]
+    fn ordering_events_wait_without_timestamps_and_timing_events_measure() -> Result<()> {
+        // SAFETY: the opt-in path names the matching built native library.
+        let lib = unsafe { NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?)? };
+        lib.cuda_set_device(0)?;
+        let device = Device { library: &lib, id: 0 };
+        let producer = Stream::new(device)?;
+        let consumer = Stream::new(device)?;
+        let mut ordered = Event::new(device)?;
+        let mut start = Event::timing(device)?;
+        let mut end = Event::timing(device)?;
+        start.record(&producer)?;
+        ordered.record(&producer)?;
+        // SAFETY: the recorded event and both streams survive consumer drainage.
+        unsafe { lib.cuda_stream_wait_event(consumer.raw, ordered.raw)?; }
+        end.record(&consumer)?;
+        consumer.drain()?;
+        // SAFETY: both timestamps completed through the consumer's ordering wait.
+        let elapsed = unsafe { lib.cuda_event_elapsed_ms(start.raw, end.raw)? };
+        assert!(elapsed.is_finite() && elapsed >= 0.0);
+        // SAFETY: both events completed, but the default event has no timestamp.
+        assert!(unsafe { lib.cuda_event_elapsed_ms(ordered.raw, end.raw) }.is_err());
+        assert_eq!(lib.cuda_get_device()?, 0);
+        Ok(())
+    }
     #[test]
     #[ignore = "requires CUTEAFD_NATIVE_LIB and two CUDA GPUs"]
     fn device_scoped_futures_restore_poll_and_cancellation_context() -> Result<()> {
@@ -668,9 +756,9 @@ mod tests {
         lib.cuda_set_device(0)?;
         let d0 = Device { library: &lib, id: 0 };
         let d1 = Device { library: &lib, id: 1 };
-        let source = Allocation::new(d0, 4096)?;
-        let mut destination = Allocation::new(d1, 4096)?;
-        let output = Allocation::new(d1, 4096)?;
+        let source = Allocation::new(d0, 4096, crate::shared::memory::TEST)?;
+        let mut destination = Allocation::new(d1, 4096, crate::shared::memory::TEST)?;
+        let output = Allocation::new(d1, 4096, crate::shared::memory::TEST)?;
         let producer = Stream::new(d0)?;
         let independent = Stream::new(d1)?;
         let mut transfer = PeerTransfer::new(d0, d1)?;
@@ -721,10 +809,10 @@ mod tests {
         assert!(failed.is_err());
         assert_eq!(lib.cuda_get_device()?, 0);
         const BYTES: usize = 1024 * 1024;
-        let source_a = Allocation::new(a, BYTES)?;
-        let source_b = Allocation::new(b, BYTES)?;
-        let mut target_a = Allocation::new(a, BYTES)?;
-        let mut target_b = Allocation::new(b, BYTES)?;
+        let source_a = Allocation::new(a, BYTES, crate::shared::memory::TEST)?;
+        let source_b = Allocation::new(b, BYTES, crate::shared::memory::TEST)?;
+        let mut target_a = Allocation::new(a, BYTES, crate::shared::memory::TEST)?;
+        let mut target_b = Allocation::new(b, BYTES, crate::shared::memory::TEST)?;
         let producer_a = Stream::new(a)?;
         let producer_b = Stream::new(b)?;
         let mut ab = PeerTransfer::new(a, b)?;
@@ -764,10 +852,10 @@ mod tests {
         let lib = unsafe { NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?)? };
         lib.cuda_set_device(0)?;
         let (d0, d1) = (Device { library: &lib, id: 0 }, Device { library: &lib, id: 1 });
-        let source = Allocation::new(d0, 4096)?;
-        let mut staging = Allocation::new(d1, 4096)?;
-        let out = Allocation::new(d1, 4096)?;
-        let check = Allocation::new(d1, 4096)?;
+        let source = Allocation::new(d0, 4096, crate::shared::memory::TEST)?;
+        let mut staging = Allocation::new(d1, 4096, crate::shared::memory::TEST)?;
+        let out = Allocation::new(d1, 4096, crate::shared::memory::TEST)?;
+        let check = Allocation::new(d1, 4096, crate::shared::memory::TEST)?;
         let (producer, reader) = (Stream::new(d0)?, Stream::new(d1)?);
         let mut transfer = PeerTransfer::new(d0, d1)?;
         let guard = ScratchGuard::new(&lib, &[0, 1])?;

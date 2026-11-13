@@ -4,11 +4,13 @@ use crate::{catalog::MAX_JSON_BYTES, read_safetensors_metadata, SafetensorsTenso
 use anyhow::{ensure, Context, Result};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::File;
-use std::io::Read;
 use std::path::{Path, PathBuf};
 
 pub mod identity;
+pub mod mc;
+pub mod view;
+pub use mc::CoreView;
+pub use view::CheckpointView;
 
 /// Storage discovery is shared by inventories, catalogs and bootstrap identity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -25,6 +27,10 @@ pub fn index_name(snapshot: &Path) -> Result<String> {
     let path = snapshot.join("config.json");
     if !path.is_file() { return Ok(HF_INDEX.into()); }
     let config = read_json(&path)?;
+    index_name_from_config(&config)
+}
+
+fn index_name_from_config(config: &Value) -> Result<String> {
     match config.get("transformers_weights") {
         None | Some(Value::Null) => Ok(HF_INDEX.into()),
         Some(Value::String(name)) => {
@@ -42,6 +48,16 @@ pub fn index_path(snapshot: &Path) -> Result<PathBuf> {
 }
 
 impl CheckpointFormat {
+    pub fn detect_view(view: &CheckpointView) -> Result<Self> {
+        if !view.mode().compact() && super::exlr8::recognizes(view.snapshot())? {
+            return Ok(Self::Exlr8);
+        }
+        if view.weight_map().is_some() { return Ok(Self::HfIndexed); }
+        ensure!(view.snapshot().join("model.safetensors").is_file(),
+            "checkpoint has no recognized tensor inventory");
+        Ok(Self::HfSingle)
+    }
+
     pub fn detect(snapshot: &Path) -> Result<Self> {
         if super::exlr8::recognizes(snapshot)? { return Ok(Self::Exlr8); }
         if index_path(snapshot)?.is_file() { return Ok(Self::HfIndexed); }
@@ -55,6 +71,10 @@ impl CheckpointFormat {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ModuleNumerics { CheckpointPrecision, W4A4, W8A8, W8CheckpointActivations }
+
+fn projection_stem(module: &str) -> &str {
+    module.strip_suffix(".weight_packed").or_else(|| module.strip_suffix(".weight")).unwrap_or(module)
+}
 
 fn module_match(pattern: &str, module: &str) -> bool {
     if !pattern.contains('*') {
@@ -80,6 +100,8 @@ pub struct CheckpointTensor {
 
 #[derive(Debug)]
 pub struct Checkpoint {
+    /// Immutable selection propagated to catalogs, push records and identities.
+    pub view: Option<CheckpointView>,
     pub snapshot: PathBuf,
     /// `config.json`, verbatim.
     pub config: Value,
@@ -87,7 +109,7 @@ pub struct Checkpoint {
     pub quantize_config: Option<Value>,
     /// Authoritative inventory, including tensors whose shards are not local.
     pub weight_map: BTreeMap<String, String>,
-    /// Headers read for this role, sorted by name.
+    /// Headers selected for this role's payload, sorted by name.
     pub tensors: Vec<CheckpointTensor>,
     /// Shards named by the index that are not readable (absent or incomplete).
     pub missing_shards: Vec<String>,
@@ -96,10 +118,9 @@ pub struct Checkpoint {
 
 pub(crate) fn validate_index_headers(shard: &str, names: &BTreeSet<&str>,
     headers: &[SafetensorsTensorMetadata]) -> Result<()> {
-    ensure!(headers.len() == names.len(), "index/header tensor count mismatch in {shard}");
-    for tensor in headers {
-        ensure!(names.contains(tensor.name.as_str()),
-            "tensor {} appears in unexpected shard {shard}", tensor.name);
+    let present: BTreeSet<_> = headers.iter().map(|tensor| tensor.name.as_str()).collect();
+    for name in names {
+        ensure!(present.contains(name), "indexed tensor {name} missing from shard {shard} header");
     }
     Ok(())
 }
@@ -108,12 +129,118 @@ pub fn read_json(path: &Path) -> Result<Value> {
     Ok(crate::read_json_file(path)?)
 }
 
+/// Storage of one projection in the selected index, before optional conversion.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProjectionStorage {
+    Native { dtype: cuteafd_core::DType, shape: Vec<usize> },
+    /// Compressed-tensors packed E2M1; shape is logical, not the packed U8 extent.
+    CompressedNvfp4 { shape: Vec<usize> },
+    Exl3,
+}
+
+#[derive(Debug, Clone)]
+pub struct SelectedProjection {
+    pub storage: ProjectionStorage,
+    /// Only active indexed tensors; includes native scales or EXL3 buffers.
+    pub tensors: Vec<CheckpointTensor>,
+    pub source_bytes: u64,
+}
+
 impl Checkpoint {
+    pub fn core_view(&self) -> CoreView {
+        self.view.as_ref().map_or(CoreView::Original, CheckpointView::mode)
+    }
+
+    pub fn converts_to_fp8(&self, name: &str) -> bool {
+        self.view.as_ref().is_some_and(|view| view.converts_to_fp8(name))
+    }
+
+    /// Push conversion is selected per tensor, not by a family's global view mode.
+    pub fn projection_view(&self, stem: &str) -> CoreView {
+        if self.converts_to_fp8(&format!("{stem}.weight")) { CoreView::Fp8Compact }
+        else { CoreView::Original }
+    }
+
+    /// Families declare executable roles, never a second conversion selection.
+    pub fn validate_fp8_roles(&self, family: &str,
+        role: impl Fn(&str) -> (&'static str, bool)) -> Result<()> {
+        for name in self.view.iter().flat_map(|view| view.fp8_tensors()) {
+            let (role, supported) = role(name);
+            ensure!(supported, "{name}: role {role} cannot execute block FP8 in family {family}");
+            let header = self.header(name).with_context(|| format!("{name}: role {role} in family {family}: selected BF16 header missing"))?;
+            ensure!(header.dtype == cuteafd_core::DType::Bf16 && header.shape.len() == 2
+                && header.shape.iter().all(|dim| *dim > 0 && dim % 128 == 0),
+                "{name}: role {role} in family {family}: fp8-compact requires a BF16 matrix with whole 128x128 blocks, found {:?} {:?}",
+                header.dtype, header.shape);
+        }
+        Ok(())
+    }
+
+    /// Whether a payload or classification header is available, independent of index membership.
+    pub fn has_header(&self, name: &str) -> bool {
+        self.header(name).is_some()
+    }
+
+    /// Validated metadata for classification, including native operands not owned by this role.
+    pub fn header(&self, name: &str) -> Option<&SafetensorsTensorMetadata> {
+        [self.tensors.as_slice(), self.classification_headers()].into_iter().find_map(|headers|
+            headers.binary_search_by(|tensor| tensor.meta.name.as_str().cmp(name))
+                .ok().map(|at| &headers[at].meta))
+    }
+
+    fn classification_headers(&self) -> &[CheckpointTensor] {
+        self.view.as_ref().map_or(&[], |view| view.classification_headers.as_slice())
+    }
+
+    /// Per-projection classification shared by runtime and push planning.
+    /// Call on a role-opened checkpoint so all selected projection headers exist.
+    pub fn projection(&self, stem: &str) -> Result<SelectedProjection> {
+        let prefix = format!("{stem}.");
+        let mut tensors = Vec::new();
+        for headers in [self.tensors.as_slice(), self.classification_headers()] {
+            let start = headers.partition_point(|tensor| tensor.meta.name.as_str() < prefix.as_str());
+            tensors.extend(headers[start..].iter()
+                .take_while(|tensor| tensor.meta.name.starts_with(&prefix))
+                .filter(|tensor| !tensor.meta.name[prefix.len()..].contains('.')
+                    && self.contains_tensor(&tensor.meta.name)).cloned());
+        }
+        let weight = tensors.iter().find(|tensor| tensor.meta.name == format!("{stem}.weight"));
+        let packed = tensors.iter().any(|tensor| tensor.meta.name == format!("{stem}.weight_packed"));
+        let trellis = tensors.iter().any(|tensor| tensor.meta.name == format!("{stem}.trellis"));
+        ensure!(usize::from(weight.is_some()) + usize::from(packed) + usize::from(trellis) <= 1,
+            "{stem}: checkpoint contains conflicting native, packed or EXL3 storage");
+        let storage = if packed {
+            let members = tensors.iter().map(|tensor|
+                (tensor.meta.name[prefix.len()..].to_owned(), tensor)).collect();
+            let operand = super::format::detect(&members)
+                .map_err(|error| anyhow::anyhow!("{}: {}", error.tensor, error.reason))?;
+            ensure!(operand.is_compressed_nvfp4(), "{stem}: invalid compressed NVFP4 storage");
+            ProjectionStorage::CompressedNvfp4 { shape: operand.logical }
+        } else if trellis { ProjectionStorage::Exl3 } else {
+            let weight = weight.with_context(|| format!("{stem}: selected projection headers missing"))?;
+            ProjectionStorage::Native { dtype: weight.meta.dtype.clone(), shape: weight.meta.shape.clone() }
+        };
+        let source_bytes = tensors.iter().try_fold(0u64, |sum, tensor| sum.checked_add(tensor.meta.byte_length)
+            .context("projection source bytes overflow"))?;
+        Ok(SelectedProjection { storage, tensors, source_bytes })
+    }
+
     /// Reads the configuration, the index (or a single `model.safetensors`) and
     /// every shard header. Missing shards are recorded rather than fatal so a
     /// partially downloaded checkpoint can still be planned.
     pub fn open(snapshot: &Path) -> Result<Self> {
         Self::open_filtered(snapshot, None, |_| true)
+    }
+
+    pub fn open_view(view: &CheckpointView) -> Result<Self> {
+        Self::open_view_filtered(view, None, |_| true, None)
+    }
+
+    pub fn coordinator_view(view: &CheckpointView, local_experts: bool, speculator: bool) -> Result<Self> {
+        let inventory = Self::inventory_view(view)?;
+        let role = super::files::ReadRole::Coordinator { local_experts, speculator };
+        let names = super::files::required_tensors(&inventory, role)?;
+        Self::open_view_filtered(view, Some(&role.label()), |name| names.contains(name), None)
     }
 
     /// Coordinator ownership uses the planner's family classification, not
@@ -122,41 +249,65 @@ impl Checkpoint {
         super::files::open_role(snapshot, super::files::ReadRole::Coordinator { local_experts, speculator })
     }
 
-    /// Reads the index/configuration plus scale-free declared-A4 weight headers
-    /// to distinguish unquantized modules from incomplete packed storage.
+    /// Reads the index/configuration plus declared native-attention and scale-free
+    /// declared-A4 headers needed to classify storage before opening a role.
     pub fn inventory(snapshot: &Path) -> Result<Self> {
-        let mut checkpoint = Self::open_filtered(snapshot, None, |_| false)?;
-        let mut unscaled = BTreeMap::<String, BTreeSet<String>>::new();
+        Self::inventory_view(&CheckpointView::select(snapshot, CoreView::Original)?)
+    }
+
+    pub fn inventory_view(view: &CheckpointView) -> Result<Self> {
+        let snapshot = view.snapshot();
+        let mut checkpoint = Self::open_view_filtered(view, None, |_| false, None)?;
+        let native = view.native_core_names().collect::<BTreeSet<_>>();
+        let mut required = BTreeMap::<String, BTreeSet<String>>::new();
+        for name in &native {
+            let shard = checkpoint.weight_map.get(*name).context("declared native attention is not indexed")?;
+            required.entry(shard.clone()).or_default().insert((*name).to_owned());
+        }
         for (name, shard) in &checkpoint.weight_map {
             let Some(module) = name.strip_suffix(".weight") else { continue };
             if checkpoint.declared_numerics(module)? == ModuleNumerics::W4A4
                 && ["weight_scale", "weight_scale_2", "input_scale"].iter()
                     .all(|suffix| !checkpoint.contains_tensor(&format!("{module}.{suffix}"))) {
-                unscaled.entry(shard.clone()).or_default().insert(name.clone());
+                required.entry(shard.clone()).or_default().insert(name.clone());
             }
         }
-        // Only anomalous unscaled declarations need headers; group by shard so
-        // the many BF16 nextn experts do not reopen the same header per module.
-        for (shard, names) in unscaled {
-            for meta in read_safetensors_metadata(&snapshot.join(&shard))? {
+        let mut classification = Vec::new();
+        for (shard, names) in required {
+            let headers = read_safetensors_metadata(&snapshot.join(&shard))?;
+            validate_index_headers(&shard, &names.iter().map(String::as_str).collect(), &headers)?;
+            for meta in headers {
                 if names.contains(&meta.name) {
-                    checkpoint.tensors.push(CheckpointTensor { shard:shard.clone(), meta });
+                    let tensor = CheckpointTensor { shard: shard.clone(), meta };
+                    if native.contains(tensor.meta.name.as_str()) { classification.push(tensor); }
+                    else { checkpoint.tensors.push(tensor); }
                 }
             }
         }
         checkpoint.tensors.sort_by(|a, b| a.meta.name.cmp(&b.meta.name));
+        classification.sort_by(|a, b| a.meta.name.cmp(&b.meta.name));
+        checkpoint.view.as_mut().unwrap().classification_headers = std::sync::Arc::new(classification);
         Ok(checkpoint)
     }
 
-    /// A runtime role declares the tensors it reads before any shard is opened.
-    /// Every selected index entry must have a readable, matching header.
+    /// A runtime role declares its payload reads before any shard is opened.
+    /// Declared native-attention headers remain available for classification only,
+    /// outside `tensors` and role payload bytes. Every selected header must be readable.
+    pub fn open_view_for_role(view: &CheckpointView, role: &str, needed: impl Fn(&str) -> bool) -> Result<Self> {
+        Self::open_view_filtered(view, Some(role), needed, None)
+    }
+
     pub fn open_for_role(snapshot: &Path, role: &str, needed: impl Fn(&str) -> bool) -> Result<Self> {
         Self::open_filtered(snapshot, Some(role), needed)
     }
 
     pub(crate) fn open_with_header_validation(snapshot: &Path) -> Result<(Self, Result<(), String>)> {
+        Self::open_view_with_header_validation(&CheckpointView::select(snapshot, CoreView::Original)?)
+    }
+
+    pub(crate) fn open_view_with_header_validation(view: &CheckpointView) -> Result<(Self, Result<(), String>)> {
         let mut validation = Ok(());
-        let checkpoint = Self::open_filtered_validated(snapshot, None, |_| true, Some(&mut validation))?;
+        let checkpoint = Self::open_view_filtered(view, None, |_| true, Some(&mut validation))?;
         Ok((checkpoint, validation))
     }
 
@@ -165,30 +316,25 @@ impl Checkpoint {
     }
 
     fn open_filtered_validated(snapshot: &Path, role: Option<&str>, needed: impl Fn(&str) -> bool,
+        validation: Option<&mut Result<(), String>>) -> Result<Self> {
+        let view = CheckpointView::select(snapshot, CoreView::Original)?;
+        Self::open_view_filtered(&view, role, needed, validation)
+    }
+
+    fn open_view_filtered(view: &CheckpointView, role: Option<&str>, needed: impl Fn(&str) -> bool,
         mut validation: Option<&mut Result<(), String>>) -> Result<Self> {
-        let config = read_json(&snapshot.join("config.json"))?;
-        if CheckpointFormat::detect(snapshot)? == CheckpointFormat::Exlr8 {
-            return super::exlr8::inventory(snapshot, config, needed);
+        let snapshot = view.snapshot();
+        let config = view.config()?;
+        if CheckpointFormat::detect_view(view)? == CheckpointFormat::Exlr8 {
+            let mut checkpoint = super::exlr8::inventory(snapshot, config, needed)?;
+            checkpoint.view = Some(view.clone());
+            debug_assert!(checkpoint.tensors.windows(2).all(|pair| pair[0].meta.name <= pair[1].meta.name));
+            return Ok(checkpoint);
         }
-        let quantize_config = ["quantize_config.json", "quantization_config.json", "hf_quant_config.json"]
-            .iter()
-            .map(|name| snapshot.join(name))
-            .find(|path| path.is_file())
-            .map(|path| crate::formats::exl3_storage::read_storage_metadata(&path, MAX_JSON_BYTES, None))
-            .transpose()?;
-        let index_path = index_path(snapshot)?;
-        let weight_map: BTreeMap<String, String> = if index_path.is_file() {
-            #[derive(serde::Deserialize)]
-            struct Index { weight_map: BTreeMap<String, String> }
-            let file = File::open(&index_path)?;
-            let size = file.metadata()?.len();
-            ensure!(size <= MAX_JSON_BYTES, "index exceeds metadata size limit");
-            // Slice parsing avoids serde_json's per-byte Read adapter on large indexes.
-            let mut bytes = Vec::with_capacity(usize::try_from(size)?);
-            file.take(MAX_JSON_BYTES + 1).read_to_end(&mut bytes)?;
-            ensure!(bytes.len() as u64 <= MAX_JSON_BYTES, "index exceeds metadata size limit");
-            let index: Index = serde_json::from_slice(&bytes).context("decoding weight_map")?;
-            index.weight_map
+        let quantize_config = view.quantize_config();
+        let index_path = view.index_path();
+        let weight_map: BTreeMap<String, String> = if let Some(index) = view.weight_map() {
+            index.clone()
         } else {
             let single = snapshot.join("model.safetensors");
             ensure!(
@@ -201,12 +347,20 @@ impl Checkpoint {
                 .map(|meta| (meta.name, "model.safetensors".to_owned()))
                 .collect()
         };
+        // Native headers classify eager family cores even when this role never
+        // reads their payloads. Share the role's once-per-shard header pass.
+        let native = if role.is_some() { view.native_core_names().collect::<BTreeSet<_>>() }
+            else { BTreeSet::new() };
         // Group once instead of scanning the complete index for every shard.
         let mut shards = BTreeMap::<&String, BTreeSet<&str>>::new();
         for (name, shard) in &weight_map {
-            if needed(name) { shards.entry(shard).or_default().insert(name); }
+            ensure!(!shard.is_empty() && Path::new(shard).components().all(|component|
+                matches!(component, std::path::Component::Normal(_))),
+                "invalid checkpoint shard path {shard:?}");
+            if needed(name) || native.contains(name.as_str()) { shards.entry(shard).or_default().insert(name); }
         }
         let mut tensors = Vec::with_capacity(weight_map.len());
+        let mut classification_headers = Vec::new();
         let mut missing_shards = Vec::new();
         let mut shard_bytes = 0u64;
         for (shard, names) in shards {
@@ -233,6 +387,9 @@ impl Checkpoint {
             if let Some(result) = validation.as_deref_mut().filter(|result| result.is_ok()) {
                 *result = validate_index_headers(shard, &names, &headers).map_err(|error| error.to_string());
             }
+            if validation.is_none() && role.is_none() {
+                validate_index_headers(shard, &names, &headers)?;
+            }
             if let Some(role) = role {
                 let header_names: BTreeSet<_> = headers.iter().map(|meta| meta.name.as_str()).collect();
                 for name in &names {
@@ -241,18 +398,23 @@ impl Checkpoint {
                         snapshot.display());
                 }
             }
-            shard_bytes += metadata.len();
+            if names.iter().any(|name| needed(name)) { shard_bytes += metadata.len(); }
             for meta in headers {
                 if names.contains(meta.name.as_str()) {
-                    tensors.push(CheckpointTensor {
-                        shard: shard.clone(),
-                        meta,
-                    });
+                    let selected = needed(&meta.name);
+                    let tensor = CheckpointTensor { shard: shard.clone(), meta };
+                    if selected { tensors.push(tensor); }
+                    else { classification_headers.push(tensor); }
                 }
             }
         }
         tensors.sort_by(|a, b| a.meta.name.cmp(&b.meta.name));
+        classification_headers.sort_by(|a, b| a.meta.name.cmp(&b.meta.name));
+        let mut view = view.clone();
+        view.classification_headers = std::sync::Arc::new(classification_headers);
+        debug_assert!(tensors.windows(2).all(|pair| pair[0].meta.name <= pair[1].meta.name));
         Ok(Self {
+            view: Some(view),
             snapshot: snapshot.to_path_buf(),
             config,
             quantize_config,
@@ -272,16 +434,23 @@ impl Checkpoint {
 
     pub fn contains_tensor(&self, name: &str) -> bool {
         if !self.weight_map.is_empty() { return self.weight_map.contains_key(name); }
-        self.tensors.binary_search_by(|tensor| tensor.meta.name.as_str().cmp(name)).is_ok()
+        self.has_header(name)
     }
 
     /// Select each module's declared arithmetic. Ignore rules take precedence;
     /// class-wide Linear rules apply only to linear weights, not arbitrary tensors.
     pub fn module_numerics(&self, module: &str) -> Result<ModuleNumerics> {
-        let stem = module.strip_suffix(".weight").unwrap_or(module);
-        let weight = format!("{stem}.weight");
-        let dtype = self.tensors.binary_search_by(|tensor| tensor.meta.name.cmp(&weight))
-            .ok().map(|at| self.tensors[at].meta.dtype.clone());
+        let stem = projection_stem(module);
+        ensure!(!(self.contains_tensor(&format!("{stem}.weight")) && self.contains_tensor(&format!("{stem}.weight_packed"))),
+            "{stem}: checkpoint contains both native and packed storage");
+        let dtype = ["weight", "weight_packed"].iter()
+            .find_map(|suffix| self.header(&format!("{stem}.{suffix}"))).map(|header| header.dtype.clone());
+        if ["weight_packed", "weight_global_scale", "input_global_scale"].iter()
+            .any(|suffix| self.contains_tensor(&format!("{stem}.{suffix}")))
+            && self.declared_numerics(stem)? == ModuleNumerics::W4A4 {
+            self.validate_native_members(stem,
+                &["weight_packed", "weight_scale", "weight_global_scale", "input_global_scale"], true)?;
+        }
         match dtype {
             Some(dtype) => self.module_numerics_with_header(stem, dtype),
             None => self.declared_numerics(stem),
@@ -291,8 +460,22 @@ impl Checkpoint {
     /// Complete unquantized BF16 headers override an overbroad ModelOpt declaration;
     /// partial quantization is never treated as an unquantized checkpoint module.
     pub fn module_numerics_with_header(&self, module: &str, dtype: cuteafd_core::DType) -> Result<ModuleNumerics> {
-        let module = module.strip_suffix(".weight").unwrap_or(module);
+        let module = projection_stem(module);
         let declared = self.declared_numerics(module)?;
+        let compressed = self.contains_tensor(&format!("{module}.weight_packed"));
+        let mxfp8 = self.quantization().is_some_and(|q| q.get("quant_method").and_then(Value::as_str) == Some("mxfp8"));
+        if compressed && declared == ModuleNumerics::W4A4 {
+            ensure!(!self.contains_tensor(&format!("{module}.weight")), "{module}: checkpoint contains both native and packed storage");
+            ensure!(dtype == cuteafd_core::DType::U8, "{module}.weight_packed: compressed NVFP4 requires U8 storage");
+            self.validate_native_members(module,
+                &["weight_packed", "weight_scale", "weight_global_scale", "input_global_scale"], true)?;
+            return Ok(declared);
+        }
+        if mxfp8 && declared == ModuleNumerics::W8A8 {
+            ensure!(dtype == cuteafd_core::DType::F8E4M3, "{module}.weight: declared MXFP8 requires E4M3 storage");
+            self.validate_native_members(module, &["weight", "weight_scale_inv"], false)?;
+            return Ok(declared);
+        }
         if declared != ModuleNumerics::W4A4 { return Ok(declared); }
         let scales = ["weight_scale", "weight_scale_2", "input_scale"]
             .map(|suffix| self.contains_tensor(&format!("{module}.{suffix}")));
@@ -313,8 +496,30 @@ impl Checkpoint {
         Ok(declared)
     }
 
+    fn validate_native_members(&self, module: &str, suffixes: &[&str], compressed: bool) -> Result<()> {
+        let mut members = BTreeMap::new();
+        for suffix in suffixes {
+            let name = format!("{module}.{suffix}");
+            ensure!(self.contains_tensor(&name), "{name}: declared native arithmetic is missing tensor");
+            if let Some(meta) = self.header(&name) {
+                members.insert((*suffix).to_owned(), CheckpointTensor { shard: String::new(), meta: meta.clone() });
+            }
+        }
+        // Inventory-only views may not have read the payload shard yet.
+        if members.len() != suffixes.len() { return Ok(()); }
+        let refs = members.iter().map(|(suffix, tensor)| (suffix.clone(), tensor)).collect();
+        let operand = super::format::detect(&refs)
+            .map_err(|error| anyhow::anyhow!("{}: {}", error.tensor, error.reason))?;
+        ensure!(if compressed { operand.is_compressed_nvfp4() } else {
+            operand.is_fp8_row_groups(32, &[super::format::ScaleEncoding::Ue8m0])
+                && operand.logical.len() == 2 && operand.logical.iter().all(|dim| *dim > 0)
+                && operand.logical[1] % 32 == 0
+        }, "{module}: native storage does not match declared arithmetic");
+        Ok(())
+    }
+
     fn declared_numerics(&self, module: &str) -> Result<ModuleNumerics> {
-        let module = module.strip_suffix(".weight").unwrap_or(module);
+        let module = projection_stem(module);
         // Stacked MoE projections are parameters of the MoE, not child Linear
         // modules. In particular, a router-module wildcard must not accidentally
         // match the lexical gate_proj parameter stem. Keep the original stem for
@@ -329,6 +534,28 @@ impl Checkpoint {
     fn declared_numerics_for_owner(&self, module: &str, owner: &str) -> Result<ModuleNumerics> {
         let Some(root) = self.quantization() else { return Ok(ModuleNumerics::CheckpointPrecision) };
         let q = root.get("quantization").unwrap_or(root);
+        if root.get("quant_method").and_then(Value::as_str) == Some("mxfp8") {
+            if q.get("ignored_layers").and_then(Value::as_array).is_some_and(|rules|
+                rules.iter().filter_map(Value::as_str).any(|rule| module_match(rule, owner))) {
+                return Ok(ModuleNumerics::CheckpointPrecision);
+            }
+            if module.contains(".experts.") && q.get("moe_quant_algo").is_some() {
+                ensure!(q.get("moe_quant_algo").and_then(Value::as_str) == Some("NVFP4")
+                    && q.get("moe_quant_format").and_then(Value::as_str) == Some("nvfp4-pack-quantized")
+                    && q.get("group_size").and_then(Value::as_u64) == Some(16),
+                    "{module}: unsupported packed expert arithmetic");
+                return Ok(ModuleNumerics::W4A4);
+            }
+            // Norms, embeddings and other non-linear parameters are not MXFP8.
+            if !(module.ends_with("_proj") || module.ends_with(".w1") || module.ends_with(".w2")
+                || module.ends_with(".w3") || self.contains_tensor(&format!("{module}.weight_scale_inv"))) {
+                return Ok(ModuleNumerics::CheckpointPrecision);
+            }
+            ensure!(q.get("activation_scheme").and_then(Value::as_str) == Some("dynamic")
+                && q.get("weight_block_size") == Some(&serde_json::json!([1, 32])),
+                "{module}: native MXFP8 requires dynamic activations and [1,32] weight blocks");
+            return Ok(ModuleNumerics::W8A8);
+        }
         if root.get("quant_method").and_then(Value::as_str) != Some("modelopt")
             && root.pointer("/producer/name").and_then(Value::as_str) != Some("modelopt") {
             return Ok(ModuleNumerics::CheckpointPrecision);
@@ -384,7 +611,8 @@ impl Checkpoint {
     }
 
     pub fn declared_module_numerics(&self) -> Result<BTreeMap<String, ModuleNumerics>> {
-        self.tensor_names().filter_map(|name| name.strip_suffix(".weight"))
+        self.tensor_names().filter(|name| name.ends_with(".weight") || name.ends_with(".weight_packed"))
+            .map(projection_stem)
             .map(|module| Ok((module.to_owned(), self.module_numerics(module)?))).collect()
     }
 
@@ -393,8 +621,16 @@ impl Checkpoint {
     pub fn spark_input_is_bf16(&self) -> bool {
         let layers = opt_usize_field(self.text_config(), "num_hidden_layers");
         self.tensor_names().any(|name| {
-            let Some(stem) = name.strip_suffix(".input_scale") else { return false };
-            if !stem.contains(".experts.") || !self.contains_tensor(&format!("{stem}.weight_scale_2")) {
+            let stem = if let Some(stem) = name.strip_suffix(".input_global_scale") {
+                if !["weight_packed", "weight_scale", "weight_global_scale"].iter()
+                    .all(|suffix| self.contains_tensor(&format!("{stem}.{suffix}"))) { return false; }
+                if self.module_numerics(stem).ok() != Some(ModuleNumerics::W4A4) { return false; }
+                stem
+            } else if let Some(stem) = name.strip_suffix(".input_scale") {
+                if !self.contains_tensor(&format!("{stem}.weight_scale_2")) { return false; }
+                stem
+            } else { return false; };
+            if !stem.contains(".experts.") {
                 return false;
             }
             // Legacy fixtures/undeclared checkpoints retain header detection.
@@ -407,7 +643,7 @@ impl Checkpoint {
                 return false;
             }
             let parts: Vec<_> = stem.split('.').collect();
-            if parts.iter().any(|part| matches!(*part, "mtp" | "nextn")) { return false; }
+            if parts.iter().any(|part| matches!(*part, "mtp" | "nextn" | "dspark")) { return false; }
             let layer = parts.iter().position(|part| *part == "layers")
                 .and_then(|at| parts.get(at + 1)).and_then(|value| value.parse::<usize>().ok());
             layer.is_some_and(|layer| layers.is_none_or(|count| layer < count))
@@ -517,6 +753,84 @@ mod sliced_tests {
     use serde_json::json;
 
     #[test]
+    fn header_presence_is_distinct_from_index_membership() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("config.json"), "{}").unwrap();
+        write_safetensors(&dir.path().join("model.safetensors"), &[
+            t("a.weight", "BF16", &[8, 8]), t("z.weight", "BF16", &[8, 8]),
+        ]);
+        let mut checkpoint = Checkpoint::open(dir.path()).unwrap();
+        checkpoint.weight_map.remove("a.weight");
+        checkpoint.weight_map.insert("missing.weight".into(), "absent.safetensors".into());
+        for name in ["", "a", "a.weight", "a.weight.child", "missing.weight", "z.weight", "zz"] {
+            assert_eq!(checkpoint.has_header(name),
+                checkpoint.tensors.iter().any(|tensor| tensor.meta.name == name), "{name}");
+        }
+        assert!(checkpoint.has_header("a.weight"));
+        assert!(!checkpoint.contains_tensor("a.weight"));
+        assert!(!checkpoint.has_header("missing.weight"));
+        assert!(checkpoint.contains_tensor("missing.weight"));
+        checkpoint.weight_map.clear();
+        assert!(checkpoint.contains_tensor("a.weight"));
+        checkpoint.tensors.clear();
+        assert!(!checkpoint.has_header("a.weight"));
+    }
+
+    #[test]
+    fn projection_prefix_lookup_matches_full_scan() {
+        for mixed in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join("config.json"), "{}").unwrap();
+            let mut tensors = crate::plan::testing::exl3("a", 128, 128, 6);
+            tensors.extend(crate::plan::testing::exl3("a_sibling", 128, 128, 6));
+            tensors.extend([t("a.child.weight", "BF16", &[8, 8]), t("a.weight", "BF16", &[8, 8])]);
+            if mixed {
+                tensors.extend([t("native.weight", "F8_E4M3", &[128, 128]),
+                    t("native.weight_scale_inv", "F32", &[1, 1]),
+                    t("native.child.weight", "BF16", &[8, 8]),
+                    t("collision.weight", "BF16", &[8, 8]),
+                    t("collision.trellis", "I16", &[8])]);
+            }
+            write_safetensors(&dir.path().join("model.safetensors"), &tensors);
+            let mut checkpoint = Checkpoint::open(dir.path()).unwrap();
+            // Retain an unindexed header to exercise the authoritative index filter.
+            checkpoint.weight_map = checkpoint.tensors.iter().filter(|tensor|
+                tensor.meta.name != "a.weight" && !tensor.meta.name.ends_with(".child.weight"))
+                .map(|tensor| (tensor.meta.name.clone(), tensor.shard.clone())).collect();
+            for stem in ["a", "a_sibling", "native", "collision", "missing"] {
+                let prefix = format!("{stem}.");
+                let scan: Vec<_> = checkpoint.tensors.iter().filter(|tensor|
+                    tensor.meta.name.starts_with(&prefix)
+                        && !tensor.meta.name[prefix.len()..].contains('.')
+                        && checkpoint.contains_tensor(&tensor.meta.name)).collect();
+                let weight = scan.iter().find(|tensor| tensor.meta.name == format!("{stem}.weight"));
+                let trellis = scan.iter().any(|tensor| tensor.meta.name == format!("{stem}.trellis"));
+                let actual = checkpoint.projection(stem);
+                if (weight.is_some() && trellis) || (weight.is_none() && !trellis) {
+                    assert!(actual.is_err(), "{mixed}/{stem}");
+                    continue;
+                }
+                let actual = actual.unwrap();
+                let expected = if trellis { ProjectionStorage::Exl3 } else {
+                    let weight = weight.unwrap();
+                    ProjectionStorage::Native { dtype: weight.meta.dtype.clone(), shape: weight.meta.shape.clone() }
+                };
+                assert_eq!(actual.storage, expected, "{mixed}/{stem}");
+                assert_eq!(actual.source_bytes, scan.iter().map(|tensor| tensor.meta.byte_length).sum::<u64>());
+                assert_eq!(actual.tensors.len(), scan.len());
+                for (actual, expected) in actual.tensors.iter().zip(scan) {
+                    assert_eq!(actual.shard, expected.shard);
+                    assert_eq!(actual.meta.name, expected.meta.name);
+                    assert_eq!(actual.meta.dtype, expected.meta.dtype);
+                    assert_eq!(actual.meta.shape, expected.meta.shape);
+                    assert_eq!(actual.meta.byte_offset, expected.meta.byte_offset);
+                    assert_eq!(actual.meta.byte_length, expected.meta.byte_length);
+                }
+            }
+        }
+    }
+
+    #[test]
     fn spark_input_agrees_between_coordinator_and_worker_for_every_family_and_format() {
         for prefix in ["layers.0.ffn", "model.layers.0.mlp", "model.language_model.layers.0.mlp"] {
             for family in ["deepseek_v41", "deepseek_v4", "glm5", "glm5_flash", "qwen4", "mimo_v2"] {
@@ -590,7 +904,7 @@ mod sliced_tests {
         // NVIDIA GLM-5.3-Flash-NVFP4 layer 45 is BF16 [2048,4096],
         // absent from both ignore lists despite the class-wide Linear declaration.
         let stem = "model.language_model.layers.45.mlp.experts.65.gate_proj";
-        let mut checkpoint = Checkpoint { snapshot:PathBuf::new(), config:Value::Null,
+        let mut checkpoint = Checkpoint { view: None, snapshot:PathBuf::new(), config:Value::Null,
             quantize_config:None, weight_map:BTreeMap::new(), tensors:Vec::new(),
             missing_shards:Vec::new(), shard_bytes:0 };
         checkpoint.config = json!({"text_config":{"num_hidden_layers":45,"num_nextn_predict_layers":1},
@@ -636,6 +950,106 @@ mod sliced_tests {
                 }}
             })).unwrap()).unwrap();
             assert_eq!(Checkpoint::inventory(dir.path()).unwrap().spark_input_is_bf16(), bf16);
+        }
+    }
+
+    fn mixed_mxfp8_config() -> Value {
+        json!({"num_hidden_layers":1, "quantization_config":{
+            "quant_method":"mxfp8", "activation_scheme":"dynamic", "weight_block_size":[1,32],
+            "group_size":16, "moe_quant_algo":"NVFP4", "moe_quant_format":"nvfp4-pack-quantized",
+            "ignored_layers":["lm_head", "vision_tower", "*.block_sparse_moe.gate"]}})
+    }
+
+    fn compressed_expert(stem: &str) -> Vec<crate::plan::testing::Tensor> {
+        vec![t(format!("{stem}.weight_packed"), "U8", &[16,32]),
+            t(format!("{stem}.weight_scale"), "F8_E4M3", &[16,4]),
+            t(format!("{stem}.weight_global_scale"), "F32", &[]),
+            t(format!("{stem}.input_global_scale"), "F32", &[])]
+    }
+
+    #[test]
+    fn mxfp8_mixed_native_numerics_are_role_independent() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("config.json"), mixed_mxfp8_config().to_string()).unwrap();
+        let routed = "language_model.model.layers.0.block_sparse_moe.experts.0.w1";
+        let dense = "language_model.model.layers.0.self_attn.index_q_proj";
+        let mut tensors = compressed_expert(routed);
+        tensors.extend([t(format!("{dense}.weight"), "F8_E4M3", &[16,64]),
+            t(format!("{dense}.weight_scale_inv"), "U8", &[16,2]),
+            t("language_model.model.layers.0.block_sparse_moe.gate.weight", "F32", &[16,64]),
+            t("language_model.model.layers.0.self_attn.q_norm.weight", "BF16", &[64]),
+            t("lm_head.weight", "BF16", &[16,64]),
+            t("vision_tower.q_proj.weight", "BF16", &[16,64])]);
+        write_safetensors(&dir.path().join("model.safetensors"), &tensors);
+        for checkpoint in [Checkpoint::open(dir.path()).unwrap(), Checkpoint::inventory(dir.path()).unwrap(),
+            Checkpoint::open_for_role(dir.path(), "coordinator", |name| name == "lm_head.weight").unwrap()] {
+            for suffix in ["", ".weight_packed"] {
+                assert_eq!(checkpoint.module_numerics(&format!("{routed}{suffix}")).unwrap(), ModuleNumerics::W4A4);
+            }
+            assert_eq!(checkpoint.module_numerics(dense).unwrap(), ModuleNumerics::W8A8);
+            for module in ["lm_head", "vision_tower.q_proj", "language_model.model.layers.0.block_sparse_moe.gate",
+                "language_model.model.layers.0.self_attn.q_norm"] {
+                assert_eq!(checkpoint.module_numerics(module).unwrap(), ModuleNumerics::CheckpointPrecision, "{module}");
+            }
+            let map = checkpoint.declared_module_numerics().unwrap();
+            assert_eq!(map[routed], ModuleNumerics::W4A4);
+            assert_eq!(map[dense], ModuleNumerics::W8A8);
+            assert!(checkpoint.spark_input_is_bf16());
+        }
+        let projection = Checkpoint::open(dir.path()).unwrap().projection(routed).unwrap();
+        assert_eq!(projection.storage, ProjectionStorage::CompressedNvfp4 { shape:vec![16,64] });
+        assert_eq!(projection.source_bytes, 16*32 + 16*4 + 2*4);
+        assert_eq!(projection.tensors.len(), 4);
+    }
+
+    #[test]
+    fn mxfp8_native_contracts_fail_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let routed = "model.layers.0.mlp.experts.0.w1";
+        let dense = "model.layers.0.self_attn.q_proj";
+        for (key, value) in [("activation_scheme", json!("static")), ("weight_block_size", json!([1,16])),
+            ("group_size", json!(32)), ("moe_quant_algo", json!("FP8")), ("moe_quant_format", json!("modelopt"))] {
+            let mut config = mixed_mxfp8_config();
+            config["quantization_config"][key] = value;
+            std::fs::write(dir.path().join("config.json"), config.to_string()).unwrap();
+            write_safetensors(&dir.path().join("model.safetensors"), &compressed_expert(routed));
+            let checkpoint = Checkpoint::open(dir.path()).unwrap();
+            let module = if matches!(key, "activation_scheme" | "weight_block_size") { dense } else { routed };
+            assert!(checkpoint.module_numerics(module).is_err(), "{key}");
+        }
+        std::fs::write(dir.path().join("config.json"), mixed_mxfp8_config().to_string()).unwrap();
+        let native = [t(format!("{dense}.weight"), "F8_E4M3", &[16,64]),
+            t(format!("{dense}.weight_scale_inv"), "U8", &[16,2])];
+        for removed in 0..4 {
+            let mut tensors = compressed_expert(routed);
+            tensors.remove(removed);
+            tensors.extend(native.clone());
+            write_safetensors(&dir.path().join("model.safetensors"), &tensors);
+            let checkpoint = Checkpoint::open(dir.path()).unwrap();
+            assert!(checkpoint.projection(routed).is_err(), "missing member {removed}");
+            assert!(checkpoint.module_numerics(routed).is_err(), "missing member {removed}");
+        }
+        for bad in [t(format!("{dense}.weight_scale_inv"), "F32", &[16,2]),
+            t(format!("{dense}.weight_scale_inv"), "U8", &[16,4])] {
+            write_safetensors(&dir.path().join("model.safetensors"), &[native[0].clone(), bad]);
+            assert!(Checkpoint::open(dir.path()).unwrap().module_numerics(dense).is_err());
+        }
+        let mut tensors = compressed_expert(routed);
+        tensors.push(t(format!("{routed}.weight"), "BF16", &[16,64]));
+        write_safetensors(&dir.path().join("model.safetensors"), &tensors);
+        let checkpoint = Checkpoint::open(dir.path()).unwrap();
+        assert!(checkpoint.projection(routed).is_err());
+        assert!(checkpoint.module_numerics(routed).is_err());
+    }
+
+    #[test]
+    fn compressed_nvfp4_wire_ignores_draft_and_out_of_range_experts() {
+        for stem in ["model.layers.1.mlp.experts.0.w1", "model.mtp.layers.0.mlp.experts.0.w1",
+            "nextn.layers.0.mlp.experts.0.w1", "dspark.layers.0.mlp.experts.0.w1"] {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join("config.json"), mixed_mxfp8_config().to_string()).unwrap();
+            write_safetensors(&dir.path().join("model.safetensors"), &compressed_expert(stem));
+            assert!(!Checkpoint::inventory(dir.path()).unwrap().spark_input_is_bf16(), "{stem}");
         }
     }
 
@@ -720,6 +1134,20 @@ mod sliced_tests {
     }
 
     #[test]
+    fn shard_paths_stay_inside_snapshot_even_for_unselected_roles() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("config.json"), "{}").unwrap();
+        for shard in ["/outside.safetensors", "../outside.safetensors", "dense/../../outside.safetensors", ""] {
+            std::fs::write(dir.path().join("model.safetensors.index.json"),
+                serde_json::to_vec(&json!({"weight_map": {"model.visual.weight": shard}})).unwrap()).unwrap();
+            for selected in [false, true] {
+                let error = Checkpoint::open_for_role(dir.path(), "vision", |_| selected).unwrap_err().to_string();
+                assert!(error.contains("invalid checkpoint shard path"), "{shard:?}: {error}");
+            }
+        }
+    }
+
+    #[test]
     fn grouped_shards_ignore_unindexed_and_wrong_shard_headers() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("config.json"), "{}").unwrap();
@@ -729,7 +1157,7 @@ mod sliced_tests {
             t("a.weight", "BF16", &[2]), t("z.weight", "BF16", &[2]), t("extra.weight", "BF16", &[2])]);
         write_safetensors(&dir.path().join("z.safetensors"), &[t("z.weight", "BF16", &[2])]);
         let (_, validation) = Checkpoint::open_with_header_validation(dir.path()).unwrap();
-        assert!(validation.unwrap_err().contains("index/header tensor count mismatch"));
+        assert!(validation.is_ok());
         let checkpoint = Checkpoint::open_for_role(dir.path(), "coordinator", |_| true).unwrap();
         assert_eq!(checkpoint.tensors.iter().map(|tensor| (tensor.meta.name.as_str(), tensor.shard.as_str()))
             .collect::<Vec<_>>(), [("a.weight", "a.safetensors"), ("z.weight", "z.safetensors")]);
@@ -762,7 +1190,7 @@ mod embedding_tests {
         let t = |name: &str, offset| CheckpointTensor { shard: "model.safetensors".into(),
             meta: SafetensorsTensorMetadata { name: name.into(), dtype: DType::Bf16,
                 shape: vec![64, 128], byte_offset: offset, byte_length: 16384 } };
-        Checkpoint { snapshot: Default::default(), config: super::super::testing::glm5_config(),
+        Checkpoint { view: None, snapshot: Default::default(), config: super::super::testing::glm5_config(),
             quantize_config: None, weight_map: Default::default(), missing_shards: vec![], shard_bytes: 0,
             tensors: vec![t("model.embed_tokens.weight", 0), t("lm_head.weight", 16384)] }
     }

@@ -360,3 +360,253 @@ fn stop_ids_are_loaded_and_the_xtml_contract_is_required() {
     std::fs::write(dir.path().join("tokenizer_config.json"), "{}").unwrap();
     assert!(KimiEncoding::from_snapshot(dir.path()).is_err());
 }
+
+// ------------------------------------------------------- streamed args
+
+mod streamed_args {
+    use super::*;
+
+    /// The assembled arguments of a parse: the `ToolCall` opener's bytes plus
+    /// every `ToolArgumentsDelta`, exactly as a client concatenates them.
+    fn assembled(chunks: &[OutputChunk]) -> String {
+        let mut text = String::new();
+        for chunk in chunks {
+            match chunk {
+                OutputChunk::ToolCall { arguments, .. } => text.push_str(arguments),
+                OutputChunk::ToolArgumentsDelta { content } => text.push_str(content),
+                _ => {}
+            }
+        }
+        text
+    }
+
+    fn lookup() -> deepseek_recipe_core::tools::ToolDefinition {
+        deepseek_recipe_core::tools::ToolDefinition { name: "lookup".into(), description: None,
+            parameters: serde_json::json!({"type": "object"}), strict: None }
+    }
+
+    fn parse_streaming(wire: &str, streaming: bool) -> (Vec<OutputChunk>, usize) {
+        let mut parser = KimiOutputParser::with_stream_args(KimiParserOptions {
+            thinking: false, tools: Some(vec![lookup()]), stop_sequences: Vec::new() }, streaming);
+        let mut chunks = Vec::new();
+        for character in wire.chars() {
+            chunks.extend(parser.push(&character.to_string()));
+        }
+        chunks.extend(parser.finish());
+        (chunks, parser.tool_calls())
+    }
+
+    fn assert_streamed_matches_hold(shape: &str, wire: &str) {
+        let (hold, hold_calls) = parse_streaming(wire, false);
+        let (streamed, streamed_calls) = parse_streaming(wire, true);
+        assert_eq!((hold_calls, streamed_calls), (1, 1), "{shape}");
+        assert_eq!(assembled(&streamed), assembled(&hold), "{shape}: streamed == held, byte for byte");
+        for split in wire.char_indices().map(|(index, _)| index).chain([wire.len()]) {
+            let mut parser = KimiOutputParser::with_stream_args(KimiParserOptions {
+                thinking: false, tools: Some(vec![lookup()]), stop_sequences: Vec::new() }, true);
+            let mut chunks = parser.push(&wire[..split]);
+            chunks.extend(parser.push(&wire[split..]));
+            chunks.extend(parser.finish());
+            assert_eq!(assembled(&chunks), assembled(&hold), "{shape}: split at {split}");
+        }
+        // A buffering constructor would pass every check above; prove a delta
+        // actually arrives before the call closes.
+        let close = wire.find(&close("call")).expect("the call closes");
+        let mut parser = KimiOutputParser::with_stream_args(KimiParserOptions {
+            thinking: false, tools: Some(vec![lookup()]), stop_sequences: Vec::new() }, true);
+        let mut saw_delta_before_close = false;
+        for (index, character) in wire.char_indices() {
+            let chunks = parser.push(&character.to_string());
+            if index < close
+                && chunks.iter().any(|chunk| matches!(chunk, OutputChunk::ToolArgumentsDelta { .. }))
+            {
+                saw_delta_before_close = true;
+            }
+        }
+        parser.finish();
+        assert!(saw_delta_before_close, "{shape}: a delta must arrive before the call closes");
+    }
+
+    fn call(body: &str) -> String {
+        format!("{}{}{}{}{}{}{}", close("response"), open("tools", &[]),
+            open("call", &[("tool", "lookup".into()), ("index", "1".into())]), body,
+            close("call"), close("tools"), close("message"))
+    }
+
+    fn argument(key: &str, kind: &str, value: &str) -> String {
+        format!("{}{}{}{}", open("argument", &[("key", key.into()), ("type", kind.into())]),
+            value, close("argument"), "")
+    }
+
+    #[test]
+    fn multiple_string_parameters_stream_byte_for_byte() {
+        let wire = call(&format!("{}{}", argument("q", "string", "A & B"), argument("n", "string", "hello")));
+        assert_streamed_matches_hold("two strings", &wire);
+    }
+
+    #[test]
+    fn a_chunk_boundary_inside_the_close_tag_does_not_leak() {
+        let wire = call(&argument("q", "string", "cats"));
+        assert_streamed_matches_hold("split close tag", &wire);
+    }
+
+    #[test]
+    fn object_arguments_stream_byte_for_byte() {
+        let wire = call(&format!("{}{}{}", open("json", &[("type", "object".into())]),
+            "{\"q\": \"A & B\", \"n\": 1}", close("json")));
+        assert_streamed_matches_hold("object", &wire);
+    }
+
+    /// A repeated key is the one case the two paths cannot agree on: the hold
+    /// path keeps the last value (standard JSON), the streaming path keeps the
+    /// first because a streamed value cannot be retracted. Both stay a valid
+    /// JSON object with no duplicate keys.
+    #[test]
+    fn repeated_keys_keep_the_last_value_in_hold_and_the_first_when_streamed() {
+        let wire = call(&format!("{}{}{}{}", argument("q", "string", "A"), argument("n", "string", "1"),
+            argument("q", "string", "B"), argument("n", "string", "2")));
+        let (hold, hold_calls) = parse_streaming(&wire, false);
+        let (streamed, streamed_calls) = parse_streaming(&wire, true);
+        assert_eq!((hold_calls, streamed_calls), (1, 1));
+        assert_eq!(assembled(&hold), r#"{"q":"B","n":"2"}"#);
+        assert_eq!(assembled(&streamed), r#"{"q":"A","n":"1"}"#);
+        for split in wire.char_indices().map(|(index, _)| index).chain([wire.len()]) {
+            let mut parser = KimiOutputParser::with_stream_args(KimiParserOptions {
+                thinking: false, tools: Some(vec![lookup()]), stop_sequences: Vec::new() }, true);
+            let mut chunks = parser.push(&wire[..split]);
+            chunks.extend(parser.push(&wire[split..]));
+            chunks.extend(parser.finish());
+            assert_eq!(assembled(&chunks), r#"{"q":"A","n":"1"}"#, "split at {split}");
+        }
+    }
+
+    /// A malformed call that is lost before any argument byte is streamed (a
+    /// call head without an index) comes back as content in both modes, so the
+    /// streamed deltas are empty exactly as the hold path's are.
+    #[test]
+    fn a_malformed_envelope_streams_no_arguments() {
+        let wire = format!("{}{}{}{}{}{}", close("response"), open("tools", &[]),
+            open("call", &[("tool", "lookup".into())]), argument("q", "string", "cats"),
+            close("call"), close("tools"));
+        let (hold, hold_calls) = parse_streaming(&wire, false);
+        let (streamed, streamed_calls) = parse_streaming(&wire, true);
+        assert_eq!((hold_calls, streamed_calls), (0, 0));
+        assert_eq!(assembled(&streamed), assembled(&hold));
+        assert_eq!(assembled(&streamed), "");
+    }
+}
+
+/// A lost call's `</call>` close is matched even when a chunk boundary falls
+/// inside it, so the call after it still parses instead of being swallowed.
+#[test]
+fn a_lost_call_does_not_swallow_the_next_call_when_its_close_is_split() {
+    let malformed = format!("{}{}{}{}",
+        open("call", &[("tool", "lookup".into()), ("index", "1".into())]),
+        open("json", &[("type", "array".into())]), "{}", close("json"));
+    let valid = format!("{}{}{}",
+        open("call", &[("tool", "lookup".into()), ("index", "2".into())]),
+        format!("{}cats{}", open("argument", &[("key", "q".into()), ("type", "string".into())]),
+            close("argument")),
+        close("call"));
+    let wire = format!("{}{}{}{}{}{}", close("response"), open("tools", &[]), malformed,
+        close("call"), valid, close("tools"));
+    let close_at = wire.find(&close("call")).expect("the lost call closes");
+    for split in close_at..close_at + close("call").len() {
+        let (parsed, count) = parse(&[&wire[..split], &wire[split..]], false);
+        assert_eq!(count, 1, "split at {split}");
+        assert_eq!(parsed.calls, vec![json!({"name": "lookup", "arguments": {"q": "cats"}})], "split at {split}");
+    }
+}
+
+/// A malformed call head (an unquoted attribute) is returned as content, never
+/// dropped.
+#[test]
+fn a_malformed_head_is_returned_as_content() {
+    let wire = format!("{}{}{}{}", close("response"), open("tools", &[]),
+        "<|open|>call tool=lookup<|sep|>", close("tools"));
+    let (parsed, count) = parse(&[&wire], false);
+    assert_eq!(count, 0);
+    assert!(parsed.content.contains("call tool=lookup"), "{:?}", parsed.content);
+}
+
+
+#[tokio::test]
+async fn malformed_object_envelopes_fail_chat_and_gateway_streams() {
+    use crate::openai::*;
+    use axum::{body::{to_bytes, Body}, http::{Request, StatusCode}};
+    use std::sync::{Arc, Mutex};
+    use tower::ServiceExt;
+
+    let head = open("call", &[("tool", "lookup".into()), ("index", "1".into())]);
+    let object = format!("{}{{\"q\":{{\"s\":\"brace }}\"}}}} \n{}",
+        open("json", &[("type", "object".into())]), close("json"));
+    for suffix in [String::new(), close("argument"),
+        format!("{}cats{}{}", open("argument", &[("key", "q".into()), ("type", "string".into())]),
+            close("argument"), close("call")), close("call")] {
+        let valid = suffix == close("call");
+        let wire = format!("{}{}{head}{object}{suffix}{}{}", close("response"), open("tools", &[]),
+            close("tools"), close("message"));
+        for path in ["/v1/chat/completions", "/v1/messages", "/v1/responses"] {
+            // Both a whole body and character-wise delivery must retain the
+            // object's final brace until the outer call envelope is verified.
+            for characterwise in [false, true] {
+                let mut profile = ModelProfile::new("kimi-fixture",
+                    ModelEncoding::Kimi(Arc::new(KimiEncoding { eos: vec![163586] })));
+                profile.gateway = Some(Arc::new(GatewayMount {
+                    models: crate::gateway::ModelMap::single("kimi-fixture"), snapshot: None,
+                    options: engine::EngineOptions::default(), search: None, gate: None, origins: Default::default(),
+                }));
+                let (tx, mut rx) = tokio::sync::mpsc::channel::<NativeRequest>(1);
+                let wire = wire.clone();
+                let worker = tokio::spawn(async move {
+                    let job = rx.recv().await.unwrap();
+                    let _ = job.events.send(Ok(InferenceChunk::Ready {
+                        system_fingerprint: None, prompt_usage: PromptUsage::default(),
+                    }));
+                    let parts = if characterwise { wire.chars().map(|ch| ch.to_string()).collect() } else { vec![wire] };
+                    for content in parts {
+                        if job.events.send(Ok(InferenceChunk::Text { content, content_tokens: 1 })).is_err() { return; }
+                    }
+                    let _ = job.events.send(Ok(InferenceChunk::Finish { finish_reason: InferenceFinishReason::Stop }));
+                });
+                let app = router_for_model(tx, NativeLimits::default(), Arc::new(Mutex::new(Value::Null)),
+                    std::time::Duration::from_secs(5), ConsoleHub::disabled(), profile);
+                let schema = json!({"type":"object"});
+                let mut body = match path {
+                    "/v1/messages" => json!({"messages":[{"role":"user","content":"lookup"}], "max_tokens":128,
+                        "thinking":{"type":"disabled"}, "tools":[{"name":"lookup","input_schema":schema}]}),
+                    "/v1/responses" => json!({"input":"lookup", "store":false, "reasoning":{"effort":"none"},
+                        "tools":[{"type":"function","name":"lookup","parameters":schema}]}),
+                    _ => json!({"messages":[{"role":"user","content":"lookup"}], "thinking":{"type":"disabled"},
+                        "tools":[{"type":"function","function":{"name":"lookup","parameters":schema}}]}),
+                };
+                body["model"] = json!("kimi-fixture");
+                body["stream"] = json!(true);
+                let response = app.oneshot(Request::post(path).header("content-type", "application/json")
+                    .body(Body::from(body.to_string())).unwrap()).await.unwrap();
+                assert_eq!(response.status(), StatusCode::OK, "{path}");
+                let bytes = to_bytes(response.into_body(), 1 << 20).await.unwrap();
+                let text = std::str::from_utf8(&bytes).unwrap();
+                let events: Vec<Value> = text.split("\n\n").filter_map(|frame| frame.lines()
+                    .find_map(|line| line.strip_prefix("data: ")))
+                    .filter(|data| *data != "[DONE]").map(|data| serde_json::from_str(data).unwrap()).collect();
+                let failed = events.iter().any(|event| event.get("error").is_some()
+                    || event["type"] == "response.failed");
+                assert_eq!(failed, !valid, "{path}/{characterwise}/{suffix}: {text}");
+                if !valid && path == "/v1/chat/completions" {
+                    crate::openai::tests::terminal_sse_error(&bytes);
+                }
+                if valid {
+                    let arguments: String = events.iter().filter_map(|event| match path {
+                        "/v1/messages" => event["delta"]["partial_json"].as_str(),
+                        "/v1/responses" if event["type"] == "response.function_call_arguments.delta" => event["delta"].as_str(),
+                        "/v1/chat/completions" => event["choices"][0]["delta"]["tool_calls"][0]["function"]["arguments"].as_str(),
+                        _ => None,
+                    }).collect();
+                    assert_eq!(arguments, "{\"q\":{\"s\":\"brace }\"}} \n", "{path}: {text}");
+                }
+                worker.await.unwrap();
+            }
+        }
+    }
+}

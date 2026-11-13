@@ -88,7 +88,7 @@ pub fn spec_from(cfg: &MimoV2Config, checkpoint: &Checkpoint) -> ModelSpec {
                 memory.max_load_staging, memory.max_load_staging as f64 / GIB));
         }
     } else {
-        notes.push("default resident formats follow checkpoint tensors; explicit single-copy head/O/drafter conversions remain configurable".into());
+        notes.push("default target weights preserve checkpoint precision; head/O FP8 conversions are opt-in; drafter defaults are unchanged (exempt)".into());
     }
     notes.push("component bytes, owner totals and weight-only placement budgets below describe checkpoint source storage; they are not complete resident-memory admission. Runtime admission counts selected representations, loading phases, optional DFlash, caches and workspaces separately".into());
     ModelSpec {
@@ -222,12 +222,11 @@ impl Family for MiMo {
                         packages fp8-mimop tp1 coordinator, tp6/tp2 Spark, \
                         python/tools/aot/package_fp8_moe_aot.py --geometry mimop [--cross-sm121]). Spark layout TP6 \
                         over six ranks: whole 32-blocks per rank ({widest}/{} rows), widest stored width {stored}, \
-                        {:.1} GiB per rank (TP2xEP3: {:.1} GiB, but a decode step reads all of a row's experts \
-                        that land on one EP group). The SM121 Spark package streams MXFP8 x MXFP4 gate/up \
+                        {:.1} GiB per rank. The SM121 Spark package streams MXFP8 x MXFP4 gate/up \
                         above 640 live rows, and its down projection quantizes the BF16 SwiGLU rows per K32 to \
                         MXFP8 for block-scaled MXFP8 x MXFP4 MMAs (FP8_EXPERT_PREFILL=w8a16 keeps BF16 down); \
                         smaller row counts use the grouped route.",
-                        widest - 32, per_rank(stored), per_rank(i / 2) / 3.0),
+                        widest - 32, per_rank(stored)),
                 })
             }
             Component::RoutedExpert => Some(Hint {
@@ -424,6 +423,8 @@ impl FamilyModel for MimoModel {
     fn spec(&self) -> &ModelSpec {
         &self.spec
     }
+
+    fn contract_admission(&self) -> bool { true }
 
     fn placement(&self, input: &crate::plan::PlanInput, report: &mut crate::plan::PlanReport,
         options: &mut crate::plan::layout::LayoutOptions, _requested: crate::plan::ExpertPlacement)

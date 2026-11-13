@@ -133,7 +133,7 @@
       "--prefix-cache-entries",
       "20",
       "--max-context-tokens",
-      "1048576",
+      "auto",
       "--max-output-tokens",
       "131072",
       "--console-secret-file",
@@ -151,11 +151,7 @@
       "auto",
       "--pool-tokens",
       "0",
-      "--dspark",
-      "--spark-tp",
-      "6",
-      "--spark-ep",
-      "1"
+      "--dspark"
     ]
   },
   {
@@ -243,10 +239,6 @@
       "107374182400",
       "--listen",
       "0.0.0.0:19901",
-      "--spark-tp",
-      "6",
-      "--spark-ep",
-      "1",
       "--encoder",
       "--encoder-listen",
       "0.0.0.0:20001",
@@ -342,11 +334,7 @@
       "--device-budget-bytes",
       "107374182400",
       "--listen",
-      "0.0.0.0:19901",
-      "--spark-tp",
-      "6",
-      "--spark-ep",
-      "1"
+      "0.0.0.0:19901"
     ]
   },
   {
@@ -433,11 +421,7 @@
       "--device-budget-bytes",
       "107374182400",
       "--listen",
-      "0.0.0.0:19901",
-      "--spark-tp",
-      "6",
-      "--spark-ep",
-      "1"
+      "0.0.0.0:19901"
     ]
   },
   {
@@ -524,11 +508,7 @@
       "--device-budget-bytes",
       "107374182400",
       "--listen",
-      "0.0.0.0:19901",
-      "--spark-tp",
-      "6",
-      "--spark-ep",
-      "1"
+      "0.0.0.0:19901"
     ]
   },
   {
@@ -615,11 +595,7 @@
       "--device-budget-bytes",
       "107374182400",
       "--listen",
-      "0.0.0.0:19901",
-      "--spark-tp",
-      "6",
-      "--spark-ep",
-      "1"
+      "0.0.0.0:19901"
     ]
   },
   {
@@ -706,11 +682,7 @@
       "--device-budget-bytes",
       "107374182400",
       "--listen",
-      "0.0.0.0:19901",
-      "--spark-tp",
-      "6",
-      "--spark-ep",
-      "1"
+      "0.0.0.0:19901"
     ]
   }
 ]

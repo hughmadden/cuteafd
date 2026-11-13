@@ -44,7 +44,7 @@ pub struct PcmLedger {
     pub encodes: u64,
 }
 type Required = unsafe extern "C" fn(*const PcmSpec, *mut PcmLedger) -> i32;
-type Create = unsafe extern "C" fn(*const PcmSpec, i32, u64, *mut *mut c_void) -> i32;
+type Create = unsafe extern "C" fn(*const PcmSpec, i32, u64, *const super::media_backings::RawTags, *mut *mut c_void) -> i32;
 type Upload = unsafe extern "C" fn(*mut c_void, u64, *const u8, u64) -> i32;
 type Observer = unsafe extern "C" fn(*mut c_void, i32, u32, *const c_void, u32, u32) -> i32;
 type Encode = unsafe extern "C" fn(
@@ -57,12 +57,14 @@ type Encode = unsafe extern "C" fn(
     *mut c_void,
 ) -> i32;
 type Ledger = unsafe extern "C" fn(*mut c_void, *mut PcmLedger) -> i32;
-type Destroy = unsafe extern "C" fn(*mut c_void) -> i32;
+#[cfg(feature = "test-support")]
+pub fn check_for_test(code: i32) -> Result<(), AudioError> { check(code) }
 fn check(code: i32) -> Result<(), AudioError> {
     if code == 0 {
+        crate::memory_ledger::fault::clear_failure();
         Ok(())
     } else {
-        Err(AudioError::Native(code))
+        Err(AudioError::Failure(crate::memory_ledger::capture_failure(anyhow::Error::new(AudioError::Native(code)))))
     }
 }
 pub struct NativePcmAudio {
@@ -70,35 +72,72 @@ pub struct NativePcmAudio {
     owner: *mut c_void,
     encode: Encode,
     ledger: Ledger,
-    destroy: Destroy,
+    backings: super::media_backings::MediaBackings,
     max_samples: usize,
     width: usize,
     _thread: PhantomData<Rc<()>>,
 }
 impl NativePcmAudio {
+    /// Query the native ledger without allocating an owner or touching CUDA.
+    pub fn required(path: &Path, spec: &PcmSpec) -> Result<PcmLedger, AudioError> {
+        // SAFETY: the library stays live through the versioned ABI call and the
+        // output ledger is writable for its exact C layout.
+        unsafe {
+            let library = Library::new(path)?;
+            crate::memory_ledger::fault::install(&library);
+            let required: Required = *library.get(b"cuteafd_pcm_required\0")?;
+            let mut ledger = PcmLedger::default();
+            check(required(spec, &mut ledger))?;
+            Ok(ledger)
+        }
+    }
     pub fn load(
         path: &Path,
         spec: &PcmSpec,
         device: i32,
         admitted: u64,
         weights: &[u8],
+        tags: crate::memory_ledger::MediaTags,
     ) -> Result<Self, AudioError> {
+        Self::load_inner(path, spec, device, admitted, Some(weights), tags)
+    }
+    /// `tags` name the tower's weight arena and scratch arena in the ledger.
+    pub fn prepare(path: &Path, spec: &PcmSpec, device: i32, admitted: u64, tags: crate::memory_ledger::MediaTags)
+        -> Result<Self, AudioError> {
+        Self::load_inner(path, spec, device, admitted, None, tags)
+    }
+    pub fn weight_arena(&self) -> Result<usize, AudioError> {
+        // SAFETY: exact header ABI, live owner; caller retains it through external writes.
+        unsafe {
+            let get = self._library.get::<unsafe extern "C" fn(*mut c_void, *mut *mut c_void) -> i32>(b"cuteafd_pcm_weight_arena")?;
+            let mut arena = std::ptr::null_mut();
+            check(get(self.owner, &mut arena))?;
+            Ok(arena as usize)
+        }
+    }
+    /// Call only after the existing push group drains all external writes.
+    pub fn commit_weights(&mut self) -> Result<(), AudioError> {
+        // SAFETY: exact header ABI and live thread-confined owner.
+        unsafe { check(self._library.get::<unsafe extern "C" fn(*mut c_void) -> i32>(b"cuteafd_pcm_commit_weights")?(self.owner)) }
+    }
+    fn load_inner(path: &Path, spec: &PcmSpec, device: i32, admitted: u64, weights: Option<&[u8]>,
+        tags: crate::memory_ledger::MediaTags) -> Result<Self, AudioError> {
         if spec.abi_version != 2 || !spec.feature_norm_eps.is_finite() || spec.feature_norm_eps <= 0.0 {
             return Err(AudioError::InvalidInput("PCM ABI 2 and positive finite feature epsilon required"));
         }
-        if weights.len() as u64 != spec.weight_bytes {
+        if weights.is_some_and(|w| w.len() as u64 != spec.weight_bytes) {
             return Err(AudioError::InvalidInput("PCM weight arena length"));
         }
         // SAFETY: symbols have the versioned C header ABI, and Library is held
         // until the owner has drained and destroyed all of its CUDA work.
         unsafe {
             let library = Library::new(path)?;
+            crate::memory_ledger::fault::install(&library);
             let required: Required = *library.get(b"cuteafd_pcm_required\0")?;
             let create: Create = *library.get(b"cuteafd_pcm_create\0")?;
             let upload: Upload = *library.get(b"cuteafd_pcm_upload\0")?;
             let encode: Encode = *library.get(b"cuteafd_pcm_encode\0")?;
             let ledger: Ledger = *library.get(b"cuteafd_pcm_get_ledger\0")?;
-            let destroy: Destroy = *library.get(b"cuteafd_pcm_destroy\0")?;
             let mut charge = PcmLedger::default();
             check(required(spec, &mut charge))?;
             if charge
@@ -111,21 +150,29 @@ impl NativePcmAudio {
                 ));
             }
             let mut owner = std::ptr::null_mut();
-            check(create(spec, device, admitted, &mut owner))?;
-            if let Err(error) = check(upload(owner, 0, weights.as_ptr(), weights.len() as u64)) {
-                destroy(owner);
-                return Err(error);
-            }
-            Ok(Self {
+            let native = super::media_backings::NativeTags::new(tags).map_err(AudioError::Native)?;
+            let status = create(spec, device, admitted, &native.raw(), &mut owner);
+            // From here Drop destroys a non-null owner and retires what native frees.
+            let mut result = Self {
                 _library: library,
                 owner,
                 encode,
                 ledger,
-                destroy,
+                backings: Default::default(),
                 max_samples: spec.max_samples as usize,
                 width: spec.output_width as usize,
                 _thread: PhantomData,
-            })
+            };
+            // Each backing native still holds is recorded, success or not.
+            match super::media_backings::MediaBackings::created(&result._library, "cuteafd_pcm", status,
+                result.owner, device, tags) {
+                Ok(backings) => result.backings = backings,
+                Err((status, backings)) => { result.backings = backings; return Err(AudioError::Native(status)); }
+            }
+            if let Some(weights) = weights {
+                check(upload(result.owner, 0, weights.as_ptr(), weights.len() as u64))?;
+            }
+            Ok(result)
         }
     }
     pub fn ledger(&self) -> Result<PcmLedger, AudioError> {
@@ -170,8 +217,10 @@ impl Drop for NativePcmAudio {
     fn drop(&mut self) {
         // SAFETY: owner is uniquely held on its creation thread; native drains
         // before releasing modules/storage, then Library drops after this body.
-        unsafe {
-            (self.destroy)(self.owner);
+        // Only backings native reports as freed leave the ledger.
+        if !self.owner.is_null() {
+            let status = unsafe { self.backings.destroy(&self._library, "cuteafd_pcm", self.owner) };
+            if status != 0 { tracing::warn!(status, "PCM owner destruction reported an error"); }
         }
     }
 }
@@ -183,10 +232,39 @@ mod tests {
         for (version, epsilon) in [(1, 1e-5), (3, 1e-5), (2, 0.0),
             (2, f32::NAN), (2, f32::INFINITY), (2, -1.0)] {
             let spec = PcmSpec { abi_version: version, feature_norm_eps: epsilon, ..Default::default() };
-            assert!(matches!(NativePcmAudio::load(Path::new("missing-library"), &spec, 0, 0, &[]),
+            assert!(matches!(NativePcmAudio::load(Path::new("missing-library"), &spec, 0, 0, &[], crate::memory_ledger::MediaTags::new("test/tower")),
                 Err(AudioError::InvalidInput("PCM ABI 2 and positive finite feature epsilon required"))));
         }
     }
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn required_queries_the_library_without_creating_a_cuda_owner() {
+        let root = std::path::PathBuf::from(std::env::var_os("TMPDIR").unwrap_or_else(||
+            std::path::PathBuf::from(std::env::var_os("HOME").unwrap())
+                .join(".cache/cuteafd/builds/pcm-required/tmp").into_os_string()))
+            .join(format!("pcm-required-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let source = root.join("mock.c");
+        let library = root.join("mock.so");
+        // Only the query symbol is provided: owner creation cannot be invoked.
+        std::fs::write(&source, r#"
+#include <stdint.h>
+struct Ledger { uint64_t weights, scratch, device_allocations, encodes; };
+int cuteafd_pcm_required(const void *spec, struct Ledger *out) {
+    if (!spec) return 1;
+    *out = (struct Ledger){4096, 8192, 2, 0};
+    return 0;
+}
+"#).unwrap();
+        let output = std::process::Command::new("cc").args(["-shared", "-fPIC"])
+            .arg(&source).arg("-o").arg(&library).output().unwrap();
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        let ledger = NativePcmAudio::required(&library, &PcmSpec::default()).unwrap();
+        assert_eq!(ledger, PcmLedger { weights:4096, scratch:8192, device_allocations:2, encodes:0 });
+        assert!(NativePcmAudio::required(&root.join("missing.so"), &PcmSpec::default()).is_err());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn c_abi_sizes() {
         assert_eq!(std::mem::size_of::<PcmBlock>(), 56);

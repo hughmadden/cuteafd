@@ -42,8 +42,8 @@ fn shared_capacity_scratch_matches_private_and_graph_replay() -> Result<()> {
         let old = directories.iter().map(|p| Exl3Execution::plan(p, format, Exl3Epilogue::Sum)).collect::<Result<Vec<_>>>()?
             .into_iter().sum::<usize>();
         ensure!(planned < old, "workspace sharing did not reduce storage");
-        let inputs = [DeviceAllocation::new(&library, 4096*pitch)?,
-            DeviceAllocation::new(&library, 4096*k*4)?, DeviceAllocation::new(&library, 4096*k*4)?];
+        let inputs = [DeviceAllocation::new(&library, 4096*pitch, crate::shared::memory::TEST)?,
+            DeviceAllocation::new(&library, 4096*k*4, crate::shared::memory::TEST)?, DeviceAllocation::new(&library, 4096*k*4, crate::shared::memory::TEST)?];
         let mut wire = vec![0;4096*pitch];
         for (row, bytes) in wire.chunks_exact_mut(pitch).enumerate() {
             for (col, value) in bytes[..h].iter_mut().enumerate() { *value = 0x30 + ((row+col)%16) as u8; }
@@ -71,7 +71,7 @@ fn shared_capacity_scratch_matches_private_and_graph_replay() -> Result<()> {
             unsafe { library.cuda_graph_begin_capture(stream.raw)?; }
             let captured = unsafe { states[i].launch(input_buffers(), capacity, stream.raw) };
             let graph = Graph { library: &library,
-                exec: unsafe { library.cuda_graph_end_capture(stream.raw)? }, stream: stream.raw };
+                exec: unsafe { library.cuda_graph_end_capture_for_test(stream.raw)? }, stream: stream.raw };
             graphs.push((graph, captured?, expected));
         }
         // Replay every capacity after larger and smaller kernels have overwritten
@@ -152,7 +152,7 @@ fn retained_modules_are_measured_once_and_consumed_without_reload() -> Result<()
         V41Exl3ResidentBuffer { bytes: if descriptor {3*6*2*4} else {16},
             initial_words: if descriptor { vec![0; 3*6*2] } else { vec![] }, name }
     }).collect();
-    let arena = DeviceAllocation::new(&library, 1024)?;
+    let arena = DeviceAllocation::new(&library, 1024, crate::shared::memory::TEST)?;
     let weights = Rc::new(vec![Exl3Weights {
         buffers: specs.iter().map(|s| WeightBuffer { buffer: CuteafdDeviceBuffer { bytes:s.bytes, ..arena.buffer } }).collect(),
         _arena: crate::shared::experts::exl3::ArenaOwner::Mount(arena),

@@ -92,6 +92,24 @@ impl LocalTp4Client {
     pub(crate) fn timeout(&self) -> Duration { self.config.timeout }
     pub(crate) fn open_waves(&self) -> usize { self.waves.len() }
 
+    pub(crate) fn allocation_census(&self) -> TransportAllocationCensus {
+        if !self.waves.is_empty() || self.pending.iter().any(|pending| !pending.is_empty()) {
+            return TransportAllocationCensus::unavailable("sessions", "transport has waves in flight");
+        }
+        let mut census = TransportAllocationCensus::default();
+        for (rank, session) in self.sessions.iter().enumerate() {
+            let owner = format!("rank.{rank}");
+            match session {
+                Some(session) => census.extend(session.allocation_census(&owner)),
+                None => census.extend(TransportAllocationCensus::unavailable(owner, "session is not bootstrapped")),
+            }
+        }
+        if let Some(egress) = &self.egress {
+            census.host_buffer("egress".into(), egress.host());
+        }
+        census
+    }
+
     pub(crate) fn installed_grouping(&self) -> Result<Vec<crate::worker_selection::InstalledExpertGrouping>> {
         let reports = self.expert_grouping.iter().enumerate().map(|(rank, report)|
             report.clone().with_context(|| match self.sessions[rank].is_some() {
@@ -114,11 +132,11 @@ impl LocalTp4Client {
     /// dispatched and no worker sees the request's rows. A planner can read
     /// [`Self::installed_grouping`] afterwards without a wave having to open a
     /// session first, and the waves that follow reuse these sessions.
-    pub(crate) fn bootstrap(&mut self, request: &ExpertProtocolV2Request) -> Result<()> {
+    pub(crate) fn bootstrap(&mut self, shape: &crate::SparkSessionShape) -> Result<()> {
         for rank in 0..self.peers.len() {
             if self.sessions[rank].is_none() {
                 self.drain_retired()?;
-                self.open_session(rank, request, self.landing[rank], true)?;
+                self.open_session(rank, shape, self.landing[rank], true)?;
             }
         }
         self.installed_grouping()?;
@@ -127,16 +145,16 @@ impl LocalTp4Client {
 
     /// Opens `rank`'s session with `request` (which sizes the registered rings)
     /// and retains the grouping its bootstrap reported.
-    fn open_session(&mut self, rank: usize, request: &ExpertProtocolV2Request, landing: Option<DeviceLanding>,
+    fn open_session(&mut self, rank: usize, shape: &crate::SparkSessionShape, landing: Option<DeviceLanding>,
         egress: bool) -> Result<()> {
         landing_phase_admits_open(landing, self.max_waves, self.egress_slot)?;
         let flow_label = self.flows.label(rank, self.peers[rank])?;
         // Only the compact-BF16 wire caps a session's rings by capacity; every
         // other family's rings are the request's own wire extents.
         let capacity = self.capacity.filter(|_| cuteafd_core::expert_geometry().family() == Some("v41")
-            && request.header.flags & crate::protocol_v2::EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16 != 0);
+            && shape.flags & crate::protocol_v2::EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16 != 0);
         self.sessions[rank] = Some(VerbsHostProtocolV2PersistentClientSession::connect_local(
-            self.peers[rank], &self.config, request, self.execution_lane(), landing,
+            self.peers[rank], &self.config, shape, self.execution_lane(), landing,
             if egress { self.egress.as_ref() } else { None },
             self.terminal_owner.clone(), flow_label, capacity, self.model_endpoint)
             .with_context(|| format!("opening Spark rank {rank} session"))?);
@@ -303,7 +321,7 @@ impl LocalTp4Client {
             }
             if self.sessions[rank].is_none() {
                 self.drain_retired()?;
-                self.open_session(rank, request, self.landing[rank], true)?;
+                self.open_session(rank, &crate::SparkSessionShape::from_request(request)?, self.landing[rank], true)?;
             }
         }
         if self.expert_grouping.iter().any(Option::is_some) { self.installed_grouping()?; }
@@ -551,6 +569,8 @@ mod terminal_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// Scratch allocated by these tests; absent from every non-test build.
+    const TEST: cuteafd_ffi::memory_ledger::Tag = cuteafd_ffi::memory_ledger::Tag::workspace("test/scratch");
 
     #[test]
     fn independent_local_transports_do_not_collide_on_one_decode_owner() -> Result<()> {
@@ -616,7 +636,7 @@ mod tests {
                     if gpu { client.set_landing(vec![Some(landing)])?; }
                     // As after `slot` dispatches on live sessions that then dropped.
                     client.egress_slot = slot;
-                    let error = format!("{:#}", client.open_session(0, &request, client.landing[0], true).unwrap_err());
+                    let error = format!("{:#}", client.open_session(0, &crate::SparkSessionShape::from_request(&request)?, client.landing[0], true).unwrap_err());
                     let refused = error.contains("cannot (re)connect at wave slot");
                     assert_eq!(refused, gpu && slot != 0, "{waves} waves, slot {slot}, gpu {gpu}: {error}");
                     assert!(client.sessions[0].is_none());
@@ -920,7 +940,7 @@ mod tests {
                     if registered { client.enable_egress(plane_bytes)?; }
                     let mut plane = None;
                     if landing {
-                        let buffer = library.alloc_device_buffer(plane_bytes * waves)?;
+                        let buffer = library.alloc_device_buffer(plane_bytes * waves, TEST)?;
                         client.set_landing(vec![Some(match placed {
                             true => DeviceLanding::placed(buffer)?,
                             false => DeviceLanding::with_slots(buffer, waves)?,
@@ -1038,7 +1058,7 @@ mod tests {
                 timing: false, timeout: Duration::from_secs(30), max_frame_bytes: 64 << 20 }, 0);
             if registered { client.enable_egress(plane_bytes)?; }
             let plane = if gpu {
-                let buffer = library.alloc_device_buffer(plane_bytes)?;
+                let buffer = library.alloc_device_buffer(plane_bytes, TEST)?;
                 client.set_landing(vec![Some(DeviceLanding::new(buffer))])?;
                 Some(buffer)
             } else { None };
