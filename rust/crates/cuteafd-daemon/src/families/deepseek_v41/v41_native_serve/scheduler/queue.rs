@@ -50,7 +50,10 @@ pub(in crate::families::deepseek_v41::v41_native_serve) fn chunk<T, C, H: Host<T
     super::stall::tick();
     if matches!(outcome, Ok(None)) { return Ok(Chunk::More); }
     let request = entry.request.take().expect("checked above");
-    entry.cursor = host.rest();
+    let previous = std::mem::replace(&mut entry.cursor, host.rest());
+    if outcome.as_ref().err().is_some_and(super::super::prefix::capture_undrained) {
+        std::mem::forget(previous);
+    } else { drop(previous); }
     match outcome {
         Ok(Some(output)) => host.admit(entry.slot, request, output)?,
         Err(error) => host.fail(request, error)?,
@@ -114,10 +117,16 @@ mod tests {
     /// A prompt of `tokens`; `closed` once its client left.
     struct Prompt { id: usize, tokens: usize, closed: Rc<RefCell<BTreeSet<usize>>> }
     struct FakeHost { whole: bool, rows: usize, waves: usize, log: Rc<RefCell<Vec<(usize, Range<usize>)>>>,
-        leases: BTreeSet<usize>, admitted: Vec<(usize, usize)>, failed: Vec<usize>, sleep: Duration }
+        leases: BTreeSet<usize>, fatal_on: Option<usize>, admitted: Vec<(usize, usize)>, failed: Vec<usize>, sleep: Duration }
     impl Host<Prompt, Cursor> for FakeHost {
         type Output = usize;
         fn run(&mut self, request: &mut Prompt, cursor: &mut Cursor) -> Result<Option<usize>> {
+            if self.fatal_on == Some(request.id) {
+                return Err(cuteafd_engine::prefix::PrefixError::CaptureUndrained {
+                    ticket: None,
+                    capture: "injected capture failure".into(), source: "capture lane pending".into(),
+                }.into());
+            }
             anyhow::ensure!(!request.closed.borrow().contains(&request.id), "client disconnected");
             let mut driver = Driver { tokens: request.tokens, rows: self.rows, waves: self.waves, id: request.id,
                 log: self.log.clone(), sleep: self.sleep };
@@ -128,7 +137,11 @@ mod tests {
             self.admitted.push((slot, request.id));
             Ok(())
         }
-        fn fail(&mut self, request: Prompt, _: anyhow::Error) -> Result<()> {
+        fn fail(&mut self, request: Prompt, error: anyhow::Error) -> Result<()> {
+            if super::super::super::prefix::capture_undrained(&error) {
+                self.failed.push(request.id);
+                return Err(error);
+            }
             assert!(self.leases.remove(&request.id), "released twice");
             self.failed.push(request.id);
             Ok(())
@@ -137,7 +150,7 @@ mod tests {
     }
 
     fn host(share: f64, rows: usize, waves: usize) -> FakeHost {
-        FakeHost { whole: share == 0.0, rows, waves, log: Rc::default(), leases: BTreeSet::new(), admitted: Vec::new(),
+        FakeHost { whole: share == 0.0, rows, waves, log: Rc::default(), leases: BTreeSet::new(), fatal_on: None, admitted: Vec::new(),
             failed: Vec::new(), sleep: Duration::ZERO }
     }
     fn queue(host: &mut FakeHost, share: f64, prompts: &[usize], closed: &Rc<RefCell<BTreeSet<usize>>>)
@@ -249,4 +262,183 @@ mod tests {
         assert_eq!(host.admitted, [(11, 1)]);
         assert!(host.log.borrow().iter().filter(|(id, _)| *id == 0).count() == 1, "no call after the cancel");
     }
+    struct StagedPrompt {
+        stages: super::super::super::prefix::points::Stages,
+        end: usize,
+        closed: bool,
+    }
+    struct StagedHost {
+        whole: bool,
+        capture_ok: bool,
+        target_drain_ok: bool,
+        draft_drain_ok: bool,
+        failures: usize,
+        log: Vec<(&'static str, usize)>,
+        active: bool,
+        releases: usize,
+        samples: usize,
+    }
+    impl Host<StagedPrompt, ()> for StagedHost {
+        type Output = usize;
+        fn run(&mut self, request: &mut StagedPrompt, _: &mut ()) -> Result<Option<usize>> {
+            loop {
+                anyhow::ensure!(!request.closed, "client disconnected");
+                let end = request.stages.end(request.end);
+                self.log.push(("complete_and_drain", end));
+                if !request.stages.has_points() { return Ok(Some(end)); }
+                self.log.push(("capture_and_drain", end));
+                if !self.capture_ok {
+                    let drained = super::super::super::prefix::drain_capture_streams(
+                        || if self.target_drain_ok { Ok(()) } else { Err("target pending".into()) },
+                        || if self.draft_drain_ok { Ok(()) } else { Err("draft pending".into()) },
+                    );
+                    if let Err(source) = drained {
+                        return Err(cuteafd_engine::prefix::PrefixError::CaptureUndrained {
+                            ticket: None,
+                            capture: "injected queued copy failure".into(), source }.into());
+                    }
+                }
+                request.stages.completed(self.capture_ok);
+                self.log.push((if self.capture_ok { "restore" } else { "cold" },
+                    if self.capture_ok { end } else { 0 }));
+                if !self.whole { return Ok(None); }
+            }
+        }
+        fn admit(&mut self, _: usize, request: StagedPrompt, output: usize) -> Result<()> {
+            assert!(!request.stages.has_points());
+            assert_eq!(request.end, output);
+            self.samples += 1;
+            self.active = true;
+            Ok(())
+        }
+        fn fail(&mut self, _: StagedPrompt, error: anyhow::Error) -> Result<()> {
+            self.failures += 1;
+            if super::super::super::prefix::capture_undrained(&error) { return Err(error); }
+            self.releases += 1;
+            Ok(())
+        }
+        fn rest(&self) {}
+    }
+    fn staged(whole: bool, capture_ok: bool) -> (StagedHost, Queued<StagedPrompt, ()>) {
+        let mut tokens = vec![1; 1024]; tokens[900] = 7;
+        let stages = super::super::super::prefix::points::Stages::plan(&tokens, &[7], &[], 0, 256, 64,
+            cuteafd_engine::prefix::PointPolicy { gap: 0, boundaries: 1, per_request: 4 });
+        (StagedHost { whole, capture_ok, target_drain_ok: true, draft_drain_ok: true, failures: 0, log: Vec::new(), active: false, releases: 0, samples: 0 },
+            Queued { slot: 0, request: Some(StagedPrompt { stages, end: tokens.len(), closed: false }), cursor: () })
+    }
+    #[test]
+    fn staged_queue_emits_and_samples_only_after_the_final_frontier() {
+        for whole in [false, true] {
+            let (mut host, mut entry) = staged(whole, true);
+            let first = chunk(&mut host, &mut entry).unwrap();
+            if !whole {
+                assert!(matches!(first, Chunk::More));
+                assert!(!host.active && host.samples == 0);
+                assert!(matches!(chunk(&mut host, &mut entry).unwrap(), Chunk::Done));
+            } else { assert!(matches!(first, Chunk::Done)); }
+            assert!(host.active && host.samples == 1 && host.releases == 0);
+            assert_eq!(host.log, [("complete_and_drain", 900), ("capture_and_drain", 900),
+                ("restore", 900), ("complete_and_drain", 1024)]);
+        }
+    }
+    #[test]
+    fn stage_capture_failure_serves_uncached_and_between_stage_cancellation_releases_once() {
+        let (mut host, mut entry) = staged(false, false);
+        assert!(matches!(chunk(&mut host, &mut entry).unwrap(), Chunk::More));
+        assert_eq!(host.log.last(), Some(&("cold", 0)));
+        assert!(matches!(chunk(&mut host, &mut entry).unwrap(), Chunk::Done));
+        assert!(host.active && host.samples == 1 && host.releases == 0);
+        let (mut host, mut entry) = staged(false, true);
+        assert!(matches!(chunk(&mut host, &mut entry).unwrap(), Chunk::More));
+        entry.request.as_mut().unwrap().closed = true;
+        assert!(matches!(chunk(&mut host, &mut entry).unwrap(), Chunk::Done));
+        assert_eq!(host.releases, 1);
+        assert!(!host.active && host.samples == 0 && entry.request.is_none());
+        assert_eq!(host.log.len(), 3, "no stage-two work after cancellation");
+    }
+
+    #[test]
+    fn undrained_target_or_draft_capture_is_fatal_without_recycling() {
+        for (target, draft) in [(false, true), (true, false), (false, false)] {
+            let (mut host, mut entry) = staged(false, false);
+            host.target_drain_ok = target;
+            host.draft_drain_ok = draft;
+            let error = match chunk(&mut host, &mut entry) { Err(error) => error, Ok(_) => panic!("undrained capture recycled") };
+            assert!(super::super::super::prefix::capture_undrained(&error));
+            assert_eq!((host.failures, host.releases, host.samples), (1, 0, 0));
+            assert!(!host.active && entry.request.is_none());
+            assert_eq!(host.log, [("complete_and_drain", 900), ("capture_and_drain", 900)],
+                "no cold admission or further work after either failed drain");
+        }
+    }
+
+    #[test]
+    fn round_with_stops_on_fatal_capture_and_preserves_unprocessed_owners() {
+        for fatal in [false, true] {
+            let (mut host, first) = staged(true, false);
+            host.target_drain_ok = !fatal;
+            let (_, second) = staged(true, true);
+            let mut queue = PrefillQueue::new(0.0);
+            queue.push(first);
+            queue.push(second);
+            let finished = queue.round_with(&mut host, |_, _| Ok(()),
+                |host, entry| chunk(host, entry), |_| true).unwrap();
+            if fatal {
+                assert_eq!(finished.len(), 1);
+                assert!(super::super::super::prefix::capture_undrained(finished[0].1.as_ref().unwrap_err()));
+                assert_eq!((host.failures, host.releases, host.samples), (1, 0, 0));
+                assert_eq!(queue.len(), 1);
+                let unprocessed = queue.iter().next().unwrap().request.as_ref().unwrap();
+                assert!(unprocessed.stages.has_points(), "second prompt was never run or restarted");
+                assert_eq!(host.log.len(), 2, "no device work for second prompt");
+                // Shutdown still owns the unprocessed request exactly once.
+                assert_eq!(queue.drain().filter(|entry| entry.request.is_some()).count(), 1);
+                assert!(queue.is_empty());
+            } else {
+                assert!(finished.iter().all(|(_, result)| result.is_ok()));
+                assert_eq!(finished.len(), 2);
+                assert!(queue.is_empty());
+                assert_eq!(host.samples, 2, "safely cleaned errors retain the continue path");
+            }
+        }
+    }
+
+    #[test]
+    fn fatal_round_keeps_later_cursor_suffix_and_leases_for_shutdown() {
+        for fatal in [false, true] {
+            let mut host = host(0.0, 2752, 3);
+            let closed = Rc::default();
+            let mut queue = queue(&mut host, 0.0, &[900, 900], &closed);
+            let suffix = Rc::new(());
+            queue.iter_mut().nth(1).unwrap().cursor.suffix = Some(suffix.clone());
+            if fatal { host.fatal_on = Some(0); }
+            else { closed.borrow_mut().insert(0); }
+            let finished = queue.round_with(&mut host, |_, _| Ok(()),
+                |host, entry| chunk(host, entry), |_| true).unwrap();
+            if fatal {
+                assert_eq!(finished.len(), 1);
+                assert!(super::super::super::prefix::capture_undrained(finished[0].1.as_ref().unwrap_err()));
+                assert_eq!(host.failed, [0]);
+                assert!(host.admitted.is_empty() && host.log.borrow().is_empty());
+                assert_eq!(host.leases, BTreeSet::from([0, 1]));
+                assert_eq!(Rc::strong_count(&suffix), 2);
+                let later = queue.iter().next().unwrap();
+                assert_eq!(later.slot, 11);
+                assert_eq!(later.request.as_ref().unwrap().id, 1);
+                assert_eq!(later.cursor.next, 0);
+                assert!(Rc::ptr_eq(later.cursor.suffix.as_ref().unwrap(), &suffix));
+                // Shutdown receives the same opaque cursor/lease owner, once.
+                drop(queue.drain().next().unwrap());
+                assert!(queue.is_empty());
+                assert_eq!(Rc::strong_count(&suffix), 1);
+            } else {
+                assert!(finished.iter().all(|(_, result)| result.is_ok()));
+                assert!(queue.is_empty());
+                assert_eq!(host.failed, [0]);
+                assert_eq!(host.admitted, [(11, 1)]);
+                assert_eq!(host.leases, BTreeSet::from([1]));
+            }
+        }
+    }
+
 }

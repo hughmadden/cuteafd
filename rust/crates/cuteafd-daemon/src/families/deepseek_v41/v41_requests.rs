@@ -20,6 +20,7 @@ fn lease_slot(slots: &[Option<Request>], lease: CacheLease) -> Result<usize> {
     slots.iter().position(|r| r.as_ref().is_some_and(|r| r.lease == lease)).context("request history missing")
 }
 struct Request {
+    capture_quarantined: bool,
     lease: CacheLease,
     history: EngramHistory,
     prefill: Option<EngramPrefillCursor>,
@@ -214,7 +215,7 @@ impl<'a> Requests<'a> {
         );
         let history = self.pipeline.new_history()?;
         let lease = self.cache.begin_request(slot, id)?;
-        self.slots[slot] = Some(Request { lease, history, prefill: None, images: RequestImages::default(),
+        self.slots[slot] = Some(Request { capture_quarantined: false, lease, history, prefill: None, images: RequestImages::default(),
             lookahead: None });
         Ok(lease)
     }
@@ -283,7 +284,14 @@ impl<'a> Requests<'a> {
     pub fn cancel_foreign_prefetch(&mut self, lease: CacheLease) -> usize {
         self.prefetched.cancel_others(&lease)
     }
+    /// Failed capture completion retains the lease and all its source owners until shutdown.
+    pub fn quarantine_capture(&mut self, lease: CacheLease) {
+        if let Some(request) = self.slots.iter_mut().flatten().find(|r| r.lease == lease) {
+            request.capture_quarantined = true;
+        }
+    }
     pub fn release(&mut self, lease: CacheLease) -> Result<()> {
+        ensure!(!self.request_identity(lease)?.capture_quarantined, "undrained capture owns request storage");
         self.prefetched.cancel_owner(&lease);
         if self.cache.request_id(lease).is_ok() { self.cache.ensure_releasable(lease)?; }
         let slot = self
@@ -308,6 +316,24 @@ impl<'a> Requests<'a> {
         }
         if !units.is_empty() { self.released_units.push(units); }
         Ok(())
+    }
+    /// Re-admit a drained complete frontier for an ordinary prefix restore. Image
+    /// features move with the request; source-unit references retire through the
+    /// prefix engine exactly as on normal release. No mark guard is relaxed.
+    pub fn restart(&mut self, lease: CacheLease) -> Result<CacheLease> {
+        self.cache.mark_meta(lease)?;
+        self.cache.ensure_releasable(lease)?;
+        let slot = lease_slot(&self.slots, lease)?;
+        let id = self.cache.request_id(lease)?;
+        let images = std::mem::take(&mut self.slots[slot].as_mut().unwrap().images);
+        self.image_requests -= usize::from(!images.is_empty());
+        self.release(lease)?;
+        let fresh = self.admit(slot, id)?;
+        if let Err(error) = self.attach_images(fresh, images) {
+            let _ = self.release(fresh);
+            return Err(error);
+        }
+        Ok(fresh)
     }
     /// Moves whenever a request is released.
     pub fn release_epoch(&self) -> u64 { self.releases }
@@ -399,8 +425,8 @@ impl<'a> Requests<'a> {
         let request = self.request(lease)?;
         ensure!(request.prefill.is_none() && request.history.position() == self.cache.committed_end(lease)?,
             "request prefix has pending or inconsistent history");
+        crate::shared::memory::reserve_snapshot(&mut self.prefix_leases[lane], lease)?;
         let backbone = self.cache.queue_mark(lane, lease, mark)?;
-        self.prefix_leases[lane] = Some(lease);
         Ok(self.mark_of(self.request_identity(lease)?, backbone))
     }
     pub fn mark_ready(&mut self, lane: usize) -> Result<bool> {
@@ -410,9 +436,9 @@ impl<'a> Requests<'a> {
         Ok(ready)
     }
     pub fn abort_mark(&mut self, lane: usize) -> Result<()> {
-        let drained = self.cache.abort_mark(lane);
+        self.cache.abort_mark(lane)?;
         if let Some(lease) = self.prefix_leases.get_mut(lane) { *lease = None; }
-        drained
+        Ok(())
     }
     /// Restore an exact snapshot (`saved`, its bytes in `mark`) into a fresh request whose
     /// sources hold its rows. With `prompt_end`, the restored frontier continues the encoder

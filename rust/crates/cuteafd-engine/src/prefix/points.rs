@@ -42,6 +42,26 @@ pub struct PointPlan {
     pub points: Vec<(usize, usize)>,
 }
 
+/// Decisions made by the same planning pass that produces executable points.
+/// Floor filters precede the boundary count and point cap; media rounding of
+/// periodic points follows the cap. Capped candidates contribute no diagnostics.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct PointDiagnostics {
+    pub skipped_below_minimum: u64,
+    pub skipped_at_or_before_resume: u64,
+    pub skipped_inside_media_span: u64,
+    pub media_rounded: u64,
+}
+impl PointDiagnostics {
+    fn floor_skip(&mut self, original: usize, point: usize, resume: usize, minimum: usize) {
+        if original != point {
+            self.media_rounded += 1;
+            self.skipped_inside_media_span += 1;
+        } else if point <= resume { self.skipped_at_or_before_resume += 1; }
+        else if point < minimum { self.skipped_below_minimum += 1; }
+    }
+}
+
 /// Positions of `marker` (message starts) in `tokens`: a snapshot of `tokens[..p]` ends right
 /// before a message.
 pub fn message_boundaries(tokens: &[u32], marker: u32) -> Vec<usize> {
@@ -54,17 +74,36 @@ pub fn message_boundaries(tokens: &[u32], marker: u32) -> Vec<usize> {
 /// skipped (they are, or cannot beat, what was restored).
 pub fn plan(resume: usize, len: usize, chunk: usize, boundaries: &[usize], reach: usize, min_tokens: usize,
     policy: PointPolicy) -> PointPlan {
+    plan_media_diagnostics(resume, len, chunk, boundaries, reach, min_tokens, policy, &[]).0
+}
+
+/// Media-aware planning with diagnostics from its ordered candidate decisions.
+/// Schedule semantics match `plan_media`; no diagnostic re-plan changes resume.
+pub fn plan_media_diagnostics(resume: usize, len: usize, chunk: usize, boundaries: &[usize], reach: usize,
+    min_tokens: usize, policy: PointPolicy, media: &[cuteafd_core::MediaSpan]) -> (PointPlan, PointDiagnostics) {
     assert!(chunk > 0 && resume <= len);
+    let resume = crate::media::round_frontier(resume, media);
     let floor = resume.max(min_tokens.saturating_sub(1));
-    let mut wanted: Vec<usize> = boundaries
-        .iter()
-        .copied()
-        .filter(|&b| b > floor && b < len)
-        .collect();
+    let mut diagnostics = PointDiagnostics::default();
+    let enabled = policy.per_request > 0;
+    let mut rounded_boundaries = std::collections::BTreeSet::new();
+    let mut wanted: Vec<usize> = boundaries.iter().copied().filter_map(|original| {
+        let point = crate::media::round_frontier(original, media);
+        if point > floor && point < len {
+            if original != point { rounded_boundaries.insert(point); }
+            Some(point)
+        } else {
+            if enabled && policy.boundaries > 0 && point < len {
+                diagnostics.floor_skip(original, point, resume, min_tokens);
+            }
+            None
+        }
+    }).collect();
     wanted.sort_unstable();
     wanted.dedup();
     let keep_boundaries = wanted.len().saturating_sub(policy.boundaries);
     wanted.drain(..keep_boundaries);
+    rounded_boundaries.retain(|point| wanted.contains(point));
     // Regular chunk ends, then split chunks for boundaries a chunk end cannot reach.
     let regular = |from: usize| (1..).map(move |i| (from + i * chunk).min(len)).take_while(move |&e| e < len);
     let mut ends: Vec<usize> = regular(resume).collect();
@@ -84,6 +123,8 @@ pub fn plan(resume: usize, len: usize, chunk: usize, boundaries: &[usize], reach
             if e - last >= policy.gap {
                 if e > floor {
                     wanted.push(e);
+                } else if enabled {
+                    diagnostics.floor_skip(e, e, resume, min_tokens);
                 }
                 last = e;
             }
@@ -93,11 +134,27 @@ pub fn plan(resume: usize, len: usize, chunk: usize, boundaries: &[usize], reach
     wanted.dedup();
     let excess = wanted.len().saturating_sub(policy.per_request);
     wanted.drain(..excess);
-    let points = wanted
-        .into_iter()
-        .map(|p| (ends.iter().position(|&e| e >= p).expect("the last end is len"), p))
-        .collect();
-    PointPlan { chunks: ends, points }
+    // Boundary rounding happened before floor filtering, periodic rounding after
+    // the cap, exactly as in the ordinary media schedule.
+    let mut points: Vec<_> = wanted.into_iter().filter_map(|original| {
+        let point = crate::media::round_frontier(original, media);
+        if point <= resume || point < min_tokens || point >= len {
+            diagnostics.floor_skip(original, point, resume, min_tokens);
+            None
+        } else {
+            diagnostics.media_rounded += u64::from(original != point || rounded_boundaries.contains(&point));
+            Some(point)
+        }
+    }).collect();
+    points.sort_unstable();
+    points.dedup();
+    for &point in &points {
+        let end = *ends.iter().find(|&&end| end >= point).expect("last chunk ends at len");
+        if end - point > reach { ends.push(point); ends.sort_unstable(); }
+    }
+    ends.dedup();
+    let points = points.into_iter().map(|p| (ends.iter().position(|&end| end >= p).unwrap(), p)).collect();
+    (PointPlan { chunks: ends, points }, diagnostics)
 }
 
 /// Media-aware schedule. Ordinary prefill chunks may cross image rows, but every snapshot
@@ -105,21 +162,7 @@ pub fn plan(resume: usize, len: usize, chunk: usize, boundaries: &[usize], reach
 /// An empty span list is exactly the text-only schedule.
 pub fn plan_media(resume: usize, len: usize, chunk: usize, boundaries: &[usize], reach: usize,
     min_tokens: usize, policy: PointPolicy, media: &[cuteafd_core::MediaSpan]) -> PointPlan {
-    if media.is_empty() { return plan(resume, len, chunk, boundaries, reach, min_tokens, policy); }
-    let resume = crate::media::round_frontier(resume, media);
-    let boundaries: Vec<_> = boundaries.iter().map(|&p| crate::media::round_frontier(p, media)).collect();
-    let mut schedule = plan(resume, len, chunk, &boundaries, reach, min_tokens, policy);
-    let mut points: Vec<_> = schedule.points.iter().map(|&(_, p)| crate::media::round_frontier(p, media))
-        .filter(|&p| p > resume && p >= min_tokens && p < len).collect();
-    points.sort_unstable();
-    points.dedup();
-    for &point in &points {
-        let end = *schedule.chunks.iter().find(|&&end| end >= point).expect("last chunk ends at len");
-        if end - point > reach { schedule.chunks.push(point); schedule.chunks.sort_unstable(); }
-    }
-    schedule.chunks.dedup();
-    schedule.points = points.into_iter().map(|p| (schedule.chunks.iter().position(|&end| end >= p).unwrap(), p)).collect();
-    schedule
+    plan_media_diagnostics(resume, len, chunk, boundaries, reach, min_tokens, policy, media).0
 }
 
 #[cfg(test)]

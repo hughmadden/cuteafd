@@ -11,6 +11,9 @@ fn slice(mut buffer: CuteafdDeviceBuffer, offset: usize, bytes: usize) -> Cuteaf
 }
 
 impl<'a> DsparkWindow<'a> {
+    /// Drain the stream used by synchronous snapshot copies, including failed captures.
+    pub fn drain_capture(&self) -> Result<()> { self.synchronize() }
+
     /// Bytes a retained ring of a window ending at `end` holds.
     pub fn ring_bytes(end: u64) -> usize {
         end.min(128) as usize * V41DsparkCache::ROW_BYTES
@@ -30,9 +33,9 @@ impl<'a> DsparkWindow<'a> {
         let slot = self.validate(lease)?;
         let mut used = [false; cuteafd_core::V41_MAX_REQUESTS]; used[slot] = true;
         let reservation = self.access.reserve(used)?;
-        let end = self.copy_ring(lease, destination, stream)?;
-        self.prefix_copies[lane].pending = Some((lease, reservation));
-        Ok(end)
+        crate::shared::memory::reserve_snapshot(
+            &mut self.prefix_copies[lane].pending, (lease, reservation))?;
+        self.copy_ring(lease, destination, stream)
     }
     /// Whether lane `lane`'s queued ring copy landed; the lane and its reservation free once
     /// it has.

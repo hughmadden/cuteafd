@@ -87,61 +87,67 @@ There is no separate scale-only preload. `ENGRAM_WARM` warms the whole mapped ta
 | --- | --- | --- |
 | `TP2_DSPARK_EXPERTS` | `on` with two RTX GPUs and dSpark; otherwise `off` | Splits dSpark routed experts across the RTX pair. `off` keeps them on the draft GPU. Explicit `on` requires V4.1, two RTX GPUs and dSpark. |
 
-### Exact message-boundary checkpoints: design, not enabled
+### Exact message-boundary checkpoints
 
-V4.1 currently retains complete prompt-end and turn-end marks. Its shared
-intermediate-point arguments are not wired into prefill. Keep boundary points
-off until the following implementation and native-state checks are complete;
-the intended qualified default is one boundary, with explicit zero disabling it.
-The partial-reuse default stays exact-only.
+V4.1 retains one exact message frontier by default, in addition to prompt-end
+and turn-end snapshots. `PREFIX_POINT_BOUNDARIES=0` (or
+`--prefix-point-boundaries 0`) disables boundary points. The shared
+`--prefix-points-per-request` cap defaults to four and `--prefix-point-gap`
+defaults to zero. Message boundaries come from the checkpoint's native
+`<｜System｜>`, `<｜User｜>` and `<｜Assistant｜>` added tokens; position `B`
+means the exclusive prefix `tokens[..B]`. The shared media-aware planner
+rounds points inside images to their start and applies the minimum and resume
+floor. No point is captured inside an image.
 
-Resolve the checkpoint's `<｜System｜>`, `<｜User｜>` and `<｜Assistant｜>` added tokens
-with the shared marker helpers. The [encoding fixtures](../../rust/crates/cuteafd-api/tests/fixtures/v41-encoding/)
-show these markers in rendered prompts;
-the last assistant marker starts the generation prompt. Use the shared
-media-aware point planner with reach zero, the requested last N boundaries and
-`prefix_points_per_request`. Points inside media round to its start or are
-skipped by the planner. A point must be an actual prefill call end.
+Each point ends a complete prefill stage: encoder units and their lookahead
+stop at B, then the normal final decoder replay commits the complete frontier.
+Synchronous retention captures an ordinary full target/dSpark mark. The drained
+request and draft slots are then re-admitted through normal prefix restoration
+of that concrete captured entry for the next stage; a same-end peer snapshot
+cannot replace it. External selection and Prompt/Turn tie rules are unchanged. The same exact restore rule applies: fewer than 128 suffix
+tokens use full-state continuation, while 128 or more use encoder continuation
+and a final decoder replay. There is no encoder-phase capture or new mark kind.
+The prompt-end snapshot remains unchanged.
 
-Split both `V41PrefillTimes::encoder_unit` and the `prompt_units` Engram lookahead
-plan at the same points, including under whole-prompt budgets. No unit may cross
-a point. Drain every slot's device chain and check transport health there before
-capturing. `encoder_units::commit_unit` advances host bookkeeping without a host
-drain; later units can already overwrite window rings, so inserting a capture
-in that hook does not establish an exact checkpoint. Preserve the existing
-complete-mark guard in `BackboneCache::copy_mark`.
+Staged prompts run individually through the shared prefill queue, including
+with decode sharing. Sampling and output occur only at the final prompt end;
+intermediate logits do not consume RNG or advance a grammar. Cold/scoring probes,
+disabled caches and launches without mark slots skip staging. A skipped boundary
+capture, or a failed capture whose target and all draft capture streams drained
+successfully, abandons the remaining points and restarts the full prompt uncached.
+If completion cannot be established on either side, the request fails fatally:
+its lease, source storage, draft slots and capture storage remain quarantined
+for shutdown, with no cold restart or recycling. Queued captures reserve their
+source owners before enqueue and drain their own target and draft capture lanes
+on failure; ordinary-stream completion alone cannot release them. A failed wait
+for a peer's queued capture under mark pressure makes that owning ticket fatal
+and quarantines its source identity, rather than the waiting request's. Fatal
+capture errors stop the current prefill round and further admission. Independent
+lanes finish work already in flight, then check the shared stop flag between
+retirements and before selecting another decode round; they start no further
+retirement captures or decode rounds after observing that stop. Image prompts
+prepare all missing image features before staging,
+including cached images needed by that fallback, and move them across re-admission.
+Cancellation between stages releases the request through the ordinary queue path
+after the synchronous copies have drained. A failed drain follows the fatal
+quarantine path even if the client has disconnected.
 
-Add a separate encoder-only mark capability and serialized kind: 20 encoder
-window rings, all four source carries/frontiers (including the source at layer
-20), and the Engram lookback. Share source pages using the existing prefix
-engine. Require the encoder phase, empty publication, matching source/window
-frontiers and no pending request history. Finish or safely abort the mark's
-copies before resuming writers or releasing storage. An encoder-only mark must
-never be accepted by the full-mark restore entry point or supply prompt logits.
-
-Admit encoder-only marks solely through encoder continuation with at least 128
-new tokens. Use the shared compatible-metadata lookup for both tiers and peeks;
-shorter suffixes and exact-end matches fall back to an older complete mark or
-cold prefill. Rank valid candidates by tokens saved, preserving existing bank
-tie rules; a deeper valid exact candidate wins. Approximate replay is absent in
-the current V4.1 implementation.
-
-The encoder payload is `20 * 67,592 + 4 * 4,096 = 1,368,224` bytes, before host
-metadata. Initially reuse full mark slots: 2,720,064 target bytes, plus 202,752
-drafter bytes when configured (2,922,816 total). Arena reservation is unchanged;
-a separate smaller class would require per-entry mark geometry.
-Source units remain shared, with at most the existing 455,680-byte private tail
-unit per capture. Bound points with the existing per-request cap.
-
-Qualification is blocked in a CPU-only run: the existing `committed_bytes` and
-`qualify_encoder_continuation` helpers use real CUDA. The cache/request integration
-tests return early without their native-library environment variables; they do
-not provide a CPU fake of V4.1 production or publication ordering. Before enabling
-this path, reuse those helpers on native hardware to compare initialized encoder,
-source and Engram bytes with cold prefill at the same point, then continued final
-state. Cover even/odd carry, 127/128/129 suffixes, older-full-mark fallback in both
-tiers, media rounding, multiple waves, two devices and cancellation/copy failures
-with no queued work surviving publication or storage release.
+`/v1/stats.prefix_points` reports planned/captured points, skipped minimum,
+media, resume, eligibility and storage cases, rounded media points, capture
+failures and stage/cold restarts. Planning counters come from the executable
+planner pass: floor filtering precedes the boundary count and cap, while periodic
+media rounding follows the cap. Capped candidates do not count as media skips
+or rounded points. Existing `prefix` fidelity counters also include
+internal stage restores; `prefix_points.restarts` identifies that extra activity.
+Request cached-token usage still reports only the original admission's hit.
+The extra work per retained point includes a final replay, full mark capture,
+slot recycling and normal restore; with a short suffix the suffix also runs
+through all layers. Native initialized-state equality, cancellation and failure
+ordering, fidelity and replay throughput require GPU qualification. This includes
+initialized draft-ring bytes and ends at B and after restore (the target/Engram
+state hashes do not cover draft rings), same-end Prompt/Turn identity, and queued
+copy failures with successful and failed target/draft drains, including mark-pressure
+waits and a peer suspended in retirement when the fatal stop is raised.
 
 ## Known limits
 

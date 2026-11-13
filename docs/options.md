@@ -275,7 +275,7 @@ Each key is also a global `cuteafd` flag (`--gpu-memory-cap`, `--kv-max-tokens`,
 | `PREFIX_CACHE_ENTRIES` | `auto` | `auto`, non-negative | Snapshot entries; auto derives from context × concurrency. |
 | `PREFIX_CACHE_MARK_MIB` | unset | MiB | Device budget for recurrent/ring marks, with or without the host tier; includes capture/restore headroom. `on-evict` stores only under device entry/mark pressure. |
 | `PREFIX_PARTIAL` | `off` | `on`, `off` | MiMo approximate partial reuse; off keeps exact restores only. Every other family, V4.1 included, restores exact snapshot frontiers only and refuses `on`. |
-| `PREFIX_POINT_BOUNDARIES` | `1` | `0`, `1` | Dense Qwen: retain the exact frontier before the generation message. |
+| `PREFIX_POINT_BOUNDARIES` | `1` | non-negative integer (`0` disables) | Dense Qwen and V4.1: retain exact message frontiers before the generation message. V4.1 stages complete prefill and restores the boundary mark; `--prefix-points-per-request` caps points (default 4), and `--prefix-point-gap` adds periodic points (default 0). |
 | `GLM5_FLASH_PREFIX_MARKS` | unset | `arena`, `pool` | GLM Flash KDA state marks. |
 | `GLM5_FLASH_KDA_STATE` | `f32` | `f32`, `bf16` | GLM Flash KDA recurrent state. |
 | `GLM5_FLASH_INDEX_CACHE` | `auto` | `keys`, `compact` | GLM Flash index cache; auto picks compact on one GPU. |
@@ -611,7 +611,7 @@ original core is already FP8, not an MC publication.
 | `PREFIX_CACHE_ENTRIES` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | `PREFIX_CACHE_MARK_MIB` | ✗ | ✗ | ✗ | ✓ | ✓ | ✗ | ✓ | ✗ | ✗ | ✗ |
 | `PREFIX_PARTIAL` | ✓ | ✗ | ✗ | ✗ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ |
-| `PREFIX_POINT_BOUNDARIES` | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✓ | ✗ | ✗ | ✗ |
+| `PREFIX_POINT_BOUNDARIES` | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✓ | ✗ | ✗ | ✗ |
 | `GLM5_FLASH_PREFIX_MARKS` | ✗ | ✗ | ✗ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
 | `GLM5_FLASH_KDA_STATE` | ✗ | ✗ | ✗ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
 | `GLM5_FLASH_INDEX_CACHE` | ✗ | ✗ | ✗ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |

@@ -101,6 +101,7 @@ pub(crate) struct DraftRuntime<'w, 'a, C = DsparkChain<'w, 'a>> {
     lanes: Vec<LaneRound>,
 }
 struct DraftRequest {
+    capture_quarantined: bool,
     leases: [WindowLease; 3],
     rng: cuteafd_core::DsparkRng,
     slot: usize,
@@ -173,6 +174,7 @@ impl<'w, 'a, C: DraftChain<'a>> DraftRuntime<'w, 'a, C> {
             }
         }
         self.requests.insert(id, DraftRequest {
+            capture_quarantined: false,
             leases: leases.try_into().ok().context("draft admission incomplete")?,
             rng: cuteafd_core::DsparkRng::new(id),
             slot,
@@ -311,7 +313,11 @@ impl<'w, 'a, C: DraftChain<'a>> DraftRuntime<'w, 'a, C> {
         self.lanes[lane].drafted_requests = requests.iter().filter(|r| r.1 > 0).count();
         Ok(width)
     }
+    pub fn quarantine_capture(&mut self, id: u64) {
+        if let Some(request) = self.requests.get_mut(&id) { request.capture_quarantined = true; }
+    }
     pub fn release(&mut self, id: u64) -> Result<()> {
+        ensure!(!self.requests.get(&id).is_some_and(|r| r.capture_quarantined), "undrained capture owns draft storage");
         let _device = self.chains[0].execution_device().map(|device| device.enter()).transpose()?;
         ensure!(!self.pending_prefix_ids.contains(&Some(id)), "cannot release a request with pending snapshot copies");
         ensure!(!pending_draft_blocks(&self.pending, id),
@@ -362,6 +368,17 @@ impl<'w, 'a, C: DraftChain<'a>> DraftRuntime<'w, 'a, C> {
             Ok(())
         })
     }
+    /// Attempt every window even if an earlier synchronization failed.
+    pub fn drain_capture(&self) -> Result<()> {
+        let device = self.windows[0].device();
+        device.run(|| {
+            let mut failure = None;
+            for window in &self.windows {
+                if let Err(error) = window.drain_capture() { failure.get_or_insert(error); }
+            }
+            failure.map_or(Ok(()), Err)
+        })
+    }
     /// [`DraftRuntime::capture_mark`] queued on capture lane `lane`.
     pub fn queue_mark(&mut self, lane: usize, id: u64, end: u64, mark: CuteafdDeviceBuffer) -> Result<()> {
         let _device = self.chains[0].execution_device().map(|device| device.enter()).transpose()?;
@@ -370,7 +387,7 @@ impl<'w, 'a, C: DraftChain<'a>> DraftRuntime<'w, 'a, C> {
         ensure!(!self.pending_prefix_ids.contains(&Some(id)), "draft snapshot already pending");
         ensure!(mark.bytes == DRAFT_MARK_BYTES, "draft mark storage size differs");
         let leases = self.check_frontier(id, end)?;
-        self.pending_prefix_ids[lane] = Some(id);
+        crate::shared::memory::reserve_snapshot(&mut self.pending_prefix_ids[lane], id)?;
         let device = self.windows[0].device();
         let queued = device.run(|| {
             for (stage, (window, lease)) in self.windows.iter_mut().zip(leases).enumerate() {
@@ -378,13 +395,9 @@ impl<'w, 'a, C: DraftChain<'a>> DraftRuntime<'w, 'a, C> {
             }
             Ok(())
         });
-        if let Err(error) = queued {
-            if let Err(cleanup) = self.abort_mark(lane) {
-                tracing::error!(%cleanup, "draining failed draft snapshot enqueue");
-            }
-            return Err(error);
-        }
-        Ok(())
+        // The prefix engine owns failure cleanup, including every target/draft lane.
+        // Keep reservations even when a window only partially enqueued its copies.
+        queued
     }
     /// Whether a ring copy is queued on capture lane `lane`.
     pub fn mark_pending(&self, lane: usize) -> bool {
@@ -420,8 +433,9 @@ impl<'w, 'a, C: DraftChain<'a>> DraftRuntime<'w, 'a, C> {
         for window in &mut self.windows {
             if let Err(error) = window.abort_ring(lane) { failure.get_or_insert(error); }
         }
+        failure.map_or(Ok(()), Err)?;
         self.pending_prefix_ids[lane] = None;
-        failure.map_or(Ok(()), Err)
+        Ok(())
     }
     /// Restore request `id`'s rings at frontier `end` from `mark`. A failure releases the draft
     /// request.

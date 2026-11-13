@@ -28,6 +28,8 @@
 //! until the restore drains, and the engine drains before it releases or stores anything
 //! (`tests::prefix_stream_reads_only_committed_private_state` checks the argument's source;
 //! moving onto the shared copy stream is #1882).
+pub(crate) mod points;
+
 use super::*;
 use super::scores::RetainedScores;
 use crate::families::deepseek_v41::v41_backbone_cache::{BackboneMark, CacheLease, UNIT_BYTES, UNIT_TOKENS};
@@ -36,7 +38,7 @@ use crate::shared::memory::Tag;
 use crate::shared::memory::device::{Allocation, Device};
 use crate::shared::prefix::{cuda_copy::range, CudaCopyEngine};
 use cuteafd_engine::prefix::{
-    After, BoxError, CaptureTicket, Captured, Eviction, FamilyLayout, Mark, MarkSlot, MarkStore,
+    After, BoxError, EntryId, CaptureTicket, Captured, Eviction, FamilyLayout, Mark, MarkSlot, MarkStore,
     PrefixCache, PrefixConfig, PrefixFamily, RestoreCandidate, RestoreContext, RestoreFidelity, RestorePlan, ReuseRule, TailCopy,
 };
 use cuteafd_hostcache::copy::DeviceRange;
@@ -75,6 +77,7 @@ pub(crate) struct V41Prefix<'r, 'a, 'w, C: DraftChain<'a>> {
     units: usize,
     /// Capture lane of the next queued capture (`queue_capture`'s ticket is the lane).
     lane: Cell<usize>,
+    failed_lane: Cell<Option<usize>>,
 }
 
 /// The mark arenas, allocated before serving: target marks on the backbone's prefix-copy
@@ -83,6 +86,7 @@ pub(crate) struct Arenas<'a> {
     target: Option<std::rc::Rc<Allocation<'a>>>,
     draft: Option<std::rc::Rc<Allocation<'a>>>,
     slots: usize,
+    quarantined: Cell<bool>,
 }
 
 impl<'a> Arenas<'a> {
@@ -94,7 +98,7 @@ impl<'a> Arenas<'a> {
             Some(device) if slots > 0 => Some(std::rc::Rc::new(Allocation::new(device, slots * super::speculative::DRAFT_MARK_BYTES, Tag::prefix("v41/prefix-snapshots"))?)),
             _ => None,
         };
-        Ok(Self { target, draft, slots })
+        Ok(Self { target, draft, slots, quarantined: Cell::new(false) })
     }
     /// Draft marks allocated after admission placed the drafter (two-RTX
     /// dSpark loads after the solve, so its marks are admitted, not sampled).
@@ -144,6 +148,22 @@ fn boxed(error: anyhow::Error) -> BoxError {
     format!("{error:#}").into()
 }
 
+/// Both calls run even if the target failed: a target error says nothing about
+/// outstanding draft copies. CPU tests inject outcomes here, not CUDA completion.
+pub(crate) fn drain_capture_streams(
+    target: impl FnOnce() -> Result<(), BoxError>,
+    draft: impl FnOnce() -> Result<(), BoxError>,
+) -> Result<(), BoxError> {
+    let target = target();
+    let draft = draft();
+    target.and(draft)
+}
+
+pub(crate) fn capture_undrained(error: &anyhow::Error) -> bool {
+    matches!(error.downcast_ref::<cuteafd_engine::prefix::PrefixError>(),
+        Some(cuteafd_engine::prefix::PrefixError::CaptureUndrained { .. }))
+}
+
 /// One snapshot's mark bytes: the backbone mark plus, with dSpark, the drafter rings.
 pub(crate) fn mark_bytes(draft: bool) -> usize {
     BackboneMark::BYTES + if draft { super::speculative::DRAFT_MARK_BYTES } else { 0 }
@@ -176,12 +196,38 @@ impl<'r, 'a, 'w, C: DraftChain<'a>> V41Prefix<'r, 'a, 'w, C> {
     pub fn new(requests: &'r mut Requests<'a>, draft: Option<&'r mut DraftRuntime<'w, 'a, C>>, arena: &'r Arenas<'a>)
         -> Self {
         let units = requests.cache().unit_capacity();
-        Self { requests: RefCell::new(requests), draft: RefCell::new(draft), arena, units, lane: Cell::new(0) }
+        Self { requests: RefCell::new(requests), draft: RefCell::new(draft), arena, units, lane: Cell::new(0), failed_lane: Cell::new(None) }
     }
     /// Capture lane for the next queued capture.
     pub fn on_lane(&self, lane: usize) -> &Self {
         self.lane.set(lane);
         self
+    }
+    fn capture_result<T>(&self, result: std::result::Result<T, cuteafd_engine::prefix::PrefixError>,
+        lease: CacheLease, draft_id: Option<u64>, pending: &mut [Option<PendingRetain>; 2]) -> Result<T> {
+        use cuteafd_engine::prefix::PrefixError;
+        let result = match result {
+            Err(error @ PrefixError::CaptureUndrained { .. }) => Err(error),
+            Err(error) => match self.drain_failed_capture() {
+                Ok(()) => Err(error),
+                Err(source) => Err(PrefixError::CaptureUndrained { ticket: None, capture: error.to_string(), source }),
+            },
+            done => done,
+        };
+        if let Some((lease, draft_id)) = result.as_ref().err()
+            .and_then(|error| undrained_owner(error, pending, lease, draft_id)) {
+            self.requests.borrow_mut().quarantine_capture(lease);
+            if let (Some(id), Some(draft)) = (draft_id, self.draft.borrow_mut().as_deref_mut()) {
+                draft.quarantine_capture(id);
+            }
+        }
+        if matches!(&result, Err(PrefixError::CaptureUndrained { .. })) {
+            // Failed native completion cannot authorize allocator reuse during shutdown.
+            if !self.arena.quarantined.replace(true) {
+                for owner in self.arena.owners() { std::mem::forget(owner); }
+            }
+        }
+        result.map_err(anyhow::Error::new)
     }
     fn bind_units(&self, placement: &V41Placement, rows: usize) -> Result<()> {
         let mut requests = self.requests.borrow_mut();
@@ -291,23 +337,28 @@ impl<'a, C: DraftChain<'a>> PrefixFamily<V41Meta> for V41Prefix<'_, 'a, '_, C> {
     fn queue_capture(&self, slot: MarkSlot, placement: &V41Placement, len: usize, tail: Option<TailCopy>)
         -> Result<Option<CaptureTicket>, BoxError> {
         let lane = self.lane.get();
+        self.failed_lane.set(Some(lane));
         // The tail copy runs on the prefix stream; `queue_mark` orders the lane's copies after
         // it on the device.
         if let Some(tail) = tail { self.copy_rows(tail)?; }
         let target = self.arena.target(slot).map_err(boxed)?;
         let saved = self.requests.borrow_mut().queue_mark(lane, placement.lease, target).map_err(boxed)?;
         if saved.backbone.end as usize != len {
-            let _ = self.requests.borrow_mut().abort_mark(lane);
             return Err("V4.1 captures its committed frontier only".into());
         }
         if let (Some(id), Some(draft), Some(ring)) = (placement.draft, self.draft.borrow_mut().as_deref_mut(),
             self.arena.draft(slot).map_err(boxed)?) {
-            if let Err(error) = draft.queue_mark(lane, id, len as u64, ring) {
-                let _ = self.requests.borrow_mut().abort_mark(lane);
-                return Err(boxed(error));
-            }
+            draft.queue_mark(lane, id, len as u64, ring).map_err(boxed)?;
         }
         Ok(Some(CaptureTicket(lane as u32)))
+    }
+    fn drain_failed_capture(&self) -> Result<(), BoxError> {
+        // Tail copies use ordinary streams, marks use the separate capture lane.
+        // Attempt every required drain even if one has already failed.
+        drain_capture_streams(
+            || self.drain(),
+            || self.failed_lane.get().map_or(Ok(()), |lane| self.abort_capture(CaptureTicket(lane as u32))),
+        )
     }
     fn capture_ready(&self, ticket: CaptureTicket) -> Result<bool, BoxError> {
         let lane = ticket.0 as usize;
@@ -341,7 +392,10 @@ impl<'a, C: DraftChain<'a>> PrefixFamily<V41Meta> for V41Prefix<'_, 'a, '_, C> {
         requests.cache().publish_units(&[copy.to]).map_err(boxed)
     }
     fn drain(&self) -> Result<(), BoxError> {
-        self.requests.borrow().cache().prefix_drain().map_err(boxed)
+        drain_capture_streams(
+            || self.requests.borrow().cache().prefix_drain().map_err(boxed),
+            || self.draft.borrow().as_ref().map_or(Ok(()), |draft| draft.drain_capture().map_err(boxed)),
+        )
     }
     fn page_segments(&self, page: u32) -> Vec<DeviceRange> {
         self.requests.borrow().cache().unit_segments(page).into_iter().map(range).collect()
@@ -359,8 +413,44 @@ impl<'a, C: DraftChain<'a>> PrefixFamily<V41Meta> for V41Prefix<'_, 'a, '_, C> {
 pub(crate) struct V41Cache<'a> {
     cache: PrefixCache<CudaCopyEngine<'a>, V41Meta>,
     arenas: Arenas<'a>,
-    pending: [Option<CaptureTicket>; 2],
+    pending: [Option<PendingRetain>; 2],
     capture_session: Option<String>,
+    pub points: points::Stats,
+}
+
+#[derive(Clone, Copy)]
+struct PendingRetain {
+    ticket: CaptureTicket,
+    lease: CacheLease,
+    draft_id: Option<u64>,
+    undrained: bool,
+}
+impl PendingRetain {
+    fn check(&self) -> Result<()> {
+        if self.undrained {
+            return Err(cuteafd_engine::prefix::PrefixError::CaptureUndrained {
+                ticket: Some(self.ticket),
+                capture: "queued retention remains quarantined".into(),
+                source: "capture lane completion was not established".into(),
+            }.into());
+        }
+        Ok(())
+    }
+}
+
+/// Resolve fatal queued ownership before quarantining native sources. A pressure
+/// waiter has not started its own capture and must never stand in for this owner.
+fn undrained_owner(error: &cuteafd_engine::prefix::PrefixError, pending: &mut [Option<PendingRetain>; 2],
+    lease: CacheLease, draft_id: Option<u64>) -> Option<(CacheLease, Option<u64>)> {
+    match error {
+        cuteafd_engine::prefix::PrefixError::CaptureUndrained { ticket: Some(ticket), .. } => {
+            let owner = pending.iter_mut().flatten().find(|owner| owner.ticket == *ticket)?;
+            owner.undrained = true;
+            Some((owner.lease, owner.draft_id))
+        }
+        cuteafd_engine::prefix::PrefixError::CaptureUndrained { ticket: None, .. } => Some((lease, draft_id)),
+        _ => None,
+    }
 }
 
 /// What a V4.1 admission restored: the resume point and, for an exact full-prompt hit, the
@@ -377,7 +467,7 @@ impl<'a> V41Cache<'a> {
         host: Option<(cuteafd_hostcache::config::Config, CudaCopyEngine<'a>)>, layout: FamilyLayout) -> Result<Self> {
         ensure!(layout.rule == ReuseRule::EXACT, "V4.1 restores exact snapshot frontiers only");
         let cache = PrefixCache::new(layout, config, host).map_err(|e| anyhow::anyhow!("{e}"))?;
-        Ok(Self { cache, arenas, pending: [None, None], capture_session: None })
+        Ok(Self { cache, arenas, pending: [None, None], capture_session: None, points: Default::default() })
     }
     pub fn arenas(&self) -> &Arenas<'a> { &self.arenas }
     /// A cache that retains nothing (component fixtures).
@@ -390,7 +480,7 @@ impl<'a> V41Cache<'a> {
     #[cfg(test)]
     pub fn configured(entries: usize) -> Self {
         let config = PrefixConfig { entries, mark_slots: 0, keep_logits: true, min_tokens: 1 };
-        Self::new(Arenas { target: None, draft: None, slots: 0 }, config, None, layout(1, false))
+        Self::new(Arenas { target: None, draft: None, slots: 0, quarantined: Cell::new(false) }, config, None, layout(1, false))
             .expect("a fixture prefix cache")
     }
     pub fn engine(&self) -> &PrefixCache<CudaCopyEngine<'a>, V41Meta> { &self.cache }
@@ -432,16 +522,19 @@ impl<'a> V41Cache<'a> {
     /// Admit a request leased at `lease` (fresh, its draft request admitted as `draft_id`):
     /// look `keys` up (media-keyed copy of `native`), allocate units for `capacity` tokens
     /// (its reservation: prompt plus a decode chunk), restore. Pool pressure is
-    /// `SourcePoolExhausted`; a restore that fails is a miss.
+    /// `SourcePoolExhausted`; a restore that fails is a miss. Internal staging
+    /// may require a concrete captured entry; external admission leaves selection unchanged.
     #[allow(clippy::too_many_arguments)]
     pub fn admit<C: DraftChain<'a>>(&mut self, requests: &mut Requests<'a>, mut draft: Option<&mut DraftRuntime<'_, 'a, C>>,
         lease: CacheLease, draft_id: Option<u64>, keys: &[u32], native: &[u32], media: &[MediaSpan], capacity: usize,
-        cold: bool) -> Result<Restored> {
+        cold: bool, captured: Option<EntryId>) -> Result<Restored> {
         self.reclaim(requests, draft.as_deref_mut())?;
         let family = V41Prefix::new(requests, draft, &self.arenas);
         let build = |units: Vec<u32>| V41Placement { units, lease, draft: draft_id, len: 0, plan: None };
         let admitted = if cold || !self.cache.enabled() {
             self.cache.admit_cold(&family, keys.len(), capacity, build)
+        } else if let Some(entry) = captured {
+            self.cache.admit_native_entry(&family, keys, native, media, capacity, true, entry, build)
         } else {
             self.cache.admit_native(&family, keys, native, media, capacity, true, build)
         };
@@ -489,15 +582,24 @@ impl<'a> V41Cache<'a> {
     pub fn retain<C: DraftChain<'a>>(&mut self, requests: &mut Requests<'a>, draft: Option<&mut DraftRuntime<'_, 'a, C>>,
         kind: SnapshotKind, keys: &[u32], media: &[MediaSpan], next: &RetainedScores, lease: CacheLease, draft_id: Option<u64>)
         -> Result<()> {
-        if !self.cache.enabled() { return Ok(()); }
+        self.retain_frontier(requests, draft, kind, keys, media, next, lease, draft_id).map(drop)
+    }
+
+    /// The synchronous capture result, used by staged prefill to fall back cold
+    /// when no ordinary complete snapshot could be retained.
+    #[allow(clippy::too_many_arguments)]
+    pub fn retain_frontier<C: DraftChain<'a>>(&mut self, requests: &mut Requests<'a>, draft: Option<&mut DraftRuntime<'_, 'a, C>>,
+        kind: SnapshotKind, keys: &[u32], media: &[MediaSpan], next: &RetainedScores, lease: CacheLease, draft_id: Option<u64>)
+        -> Result<Option<EntryId>> {
+        if !self.cache.enabled() { return Ok(None); }
         let end = requests.cache().committed_end(lease)? as usize;
         ensure!(end > 0 && end <= keys.len(), "retained token frontier differs");
         let units = requests.units(lease)?.to_vec();
         let placement = V41Placement { units, lease, draft: draft_id, len: end, plan: None };
         let after = After::from_logits(&next.logits()?, true);
         let family = V41Prefix::new(requests, draft, &self.arenas);
-        self.cache.capture_media(&family, kind, &keys[..end], media, &placement, after)
-            .map(drop).map_err(|e| anyhow::anyhow!("{e}"))
+        let result = self.cache.capture_media_entry(&family, kind, &keys[..end], media, &placement, after);
+        family.capture_result(result, lease, draft_id, &mut self.pending)
     }
     /// [`V41Cache::retain`] with its copies queued on capture lane `lane`; poll it with
     /// [`V41Cache::poll_retain`]. `Ok(false)` when nothing was queued.
@@ -514,10 +616,10 @@ impl<'a> V41Cache<'a> {
         let after = After::from_logits(&next.logits()?, true);
         let family = V41Prefix::new(requests, draft, &self.arenas);
         family.on_lane(lane);
-        match self.cache.queue_capture(&family, kind, &keys[..end], media, &placement, after)
-            .map_err(|e| anyhow::anyhow!("{e}"))? {
+        let result = self.cache.queue_capture(&family, kind, &keys[..end], media, &placement, after);
+        match family.capture_result(result, lease, draft_id, &mut self.pending)? {
             Captured::Queued(ticket) => {
-                self.pending[lane] = Some(ticket);
+                self.pending[lane] = Some(PendingRetain { ticket, lease, draft_id, undrained: false });
                 Ok(true)
             }
             Captured::Done | Captured::Skipped => Ok(false),
@@ -525,17 +627,29 @@ impl<'a> V41Cache<'a> {
     }
     pub fn poll_retain<C: DraftChain<'a>>(&mut self, lane: usize, requests: &mut Requests<'a>,
         draft: Option<&mut DraftRuntime<'_, 'a, C>>) -> Result<bool> {
-        let ticket = self.pending.get(lane).copied().flatten().context("retention is not pending")?;
+        let pending = self.pending.get(lane).copied().flatten().context("retention is not pending")?;
+        pending.check()?;
         let family = V41Prefix::new(requests, draft, &self.arenas);
-        let done = self.cache.poll_capture(&family, ticket).map_err(|e| anyhow::anyhow!("{e}"))?;
-        if done { self.pending[lane] = None; }
-        Ok(done)
+        let result = self.cache.poll_capture(&family, pending.ticket);
+        let result = family.capture_result(result, pending.lease, pending.draft_id, &mut self.pending);
+        if result.as_ref().err().is_some_and(capture_undrained) {
+            self.pending[lane].as_mut().unwrap().undrained = true;
+        }
+        if matches!(result, Ok(true)) { self.pending[lane] = None; }
+        result
     }
     pub fn abort_retain<C: DraftChain<'a>>(&mut self, lane: usize, requests: &mut Requests<'a>,
         draft: Option<&mut DraftRuntime<'_, 'a, C>>) -> Result<()> {
-        let Some(ticket) = self.pending.get_mut(lane).and_then(Option::take) else { return Ok(()) };
+        let Some(pending) = self.pending.get(lane).copied().flatten() else { return Ok(()) };
+        pending.check()?;
         let family = V41Prefix::new(requests, draft, &self.arenas);
-        self.cache.abort_capture(&family, ticket).map_err(|e| anyhow::anyhow!("{e}"))
+        let result = self.cache.abort_capture(&family, pending.ticket);
+        let result = family.capture_result(result, pending.lease, pending.draft_id, &mut self.pending);
+        if result.as_ref().err().is_some_and(capture_undrained) {
+            self.pending[lane].as_mut().unwrap().undrained = true;
+        }
+        if result.is_ok() { self.pending[lane] = None; }
+        result
     }
 }
 
@@ -577,6 +691,80 @@ mod tests {
 
     use cuteafd_engine::prefix::{RestoreCandidate, RestoreFidelity};
 
+    #[test]
+    fn pressure_wait_fatal_marks_the_owning_retention_instead_of_the_waiter() {
+        let owner = CacheLease::unbound_for_test(0);
+        let waiter = CacheLease::unbound_for_test(1);
+        let ticket = CaptureTicket(0);
+        let mut pending = [Some(PendingRetain { ticket, lease: owner, draft_id: Some(41), undrained: false }), None];
+        let error = cuteafd_engine::prefix::PrefixError::CaptureUndrained {
+            ticket: Some(ticket), capture: "queued capture wait".into(), source: "target or draft lane pending".into(),
+        };
+        let quarantined = undrained_owner(&error, &mut pending, waiter, Some(42)).unwrap();
+        assert_eq!(quarantined, (owner, Some(41)), "native quarantine receives A, never waiting B");
+        assert!(capture_undrained(&anyhow::Error::new(error)));
+        let sticky = pending[0].unwrap().check().unwrap_err();
+        assert!(capture_undrained(&sticky));
+        assert!(matches!(sticky.downcast_ref::<cuteafd_engine::prefix::PrefixError>(),
+            Some(cuteafd_engine::prefix::PrefixError::CaptureUndrained { ticket: Some(t), .. }) if *t == ticket));
+        assert!(pending[1].is_none());
+        let ordinary = cuteafd_engine::prefix::PrefixError::Family { what: "capture", source: "safely drained".into() };
+        assert!(undrained_owner(&ordinary, &mut pending, waiter, Some(42)).is_none());
+        // Even an unknown queued ticket must never be reassigned to the waiter.
+        let unknown = cuteafd_engine::prefix::PrefixError::CaptureUndrained {
+            ticket: Some(CaptureTicket(9)), capture: "unknown owner".into(), source: "pending".into(),
+        };
+        assert!(undrained_owner(&unknown, &mut pending, waiter, Some(42)).is_none());
+    }
+
+    #[test]
+    fn capture_cleanup_attempts_both_streams_and_requires_both_completions() {
+        for (target_ok, draft_ok) in [(true, true), (false, true), (true, false), (false, false)] {
+            let calls = RefCell::new(Vec::new());
+            let result = drain_capture_streams(
+                || { calls.borrow_mut().push("target"); if target_ok { Ok(()) } else { Err("target pending".into()) } },
+                || { calls.borrow_mut().push("draft"); if draft_ok { Ok(()) } else { Err("draft pending".into()) } },
+            );
+            assert_eq!(*calls.borrow(), ["target", "draft"]);
+            assert_eq!(result.is_ok(), target_ok && draft_ok);
+        }
+    }
+
+    #[test]
+    fn queued_capture_cleanup_checks_lanes_even_when_ordinary_streams_complete() {
+        for (target_ok, draft_ok) in [(true, true), (false, true), (true, false), (false, false)] {
+            let calls = RefCell::new(Vec::new());
+            let result = drain_capture_streams(
+                || { calls.borrow_mut().push("ordinary"); Ok(()) },
+                || drain_capture_streams(
+                    || { calls.borrow_mut().push("target lane"); if target_ok { Ok(()) } else { Err("pending".into()) } },
+                    || { calls.borrow_mut().push("draft lanes"); if draft_ok { Ok(()) } else { Err("pending".into()) } },
+                ),
+            );
+            assert_eq!(*calls.borrow(), ["ordinary", "target lane", "draft lanes"]);
+            assert_eq!(result.is_ok(), target_ok && draft_ok);
+        }
+        let pending = PendingRetain { ticket: CaptureTicket(0), lease: CacheLease::unbound_for_test(0),
+            draft_id: Some(1), undrained: true };
+        assert!(capture_undrained(&pending.check().unwrap_err()));
+    }
+
+    #[test]
+    fn queued_capture_sources_are_reserved_before_native_enqueue() {
+        let target = include_str!("../v41_backbone_cache/prefix.rs");
+        let copy = &target[target.find("    fn copy_mark(").unwrap()..];
+        assert!(copy.find("self.committed_end(lease)?").unwrap()
+            < copy.find("reserve_snapshot(").unwrap(), "keep complete-frontier validation");
+        assert!(copy.find("reserve_snapshot(").unwrap() < copy.find("cuda_event_record(").unwrap());
+        assert!(copy.find("reserve_snapshot(").unwrap() < copy.find("state.retain_prefix(").unwrap());
+        let draft = include_str!("../v41_dspark_cache/prefix.rs");
+        let queue = &draft[draft.find("    pub fn queue_ring(").unwrap()..];
+        assert!(queue.find("reserve_snapshot(").unwrap() < queue.find("self.copy_ring(").unwrap());
+        let requests = include_str!("../v41_requests.rs");
+        let queue = &requests[requests.find("    pub fn queue_mark(").unwrap()..];
+        assert!(queue.find("reserve_snapshot(").unwrap() < queue.find("self.cache.queue_mark(").unwrap());
+    }
+
     /// Every hit the radix can select under V4.1's rule, planned the way the engine plans it.
     fn selected(frontiers: &[&[u32]], prompt: &[u32]) -> Option<RestorePlan> {
         let rule = layout(8, true).rule;
@@ -603,6 +791,22 @@ mod tests {
             assert_eq!(ReuseRule::EXACT.skipped(common, frontier), 0, "{common}/{frontier}");
         }
         assert_eq!(ReuseRule::EXACT.skipped(777, 777), 777);
+    }
+
+    #[test]
+    fn each_stage_applies_the_existing_128_token_restore_rule() {
+        let tokens: Vec<u32> = (0..4096).collect();
+        for boundary in [512, 513, 1024, 1025] {
+            for suffix in [1, 37, 127, 128, 129] {
+                let route = selected(&[&tokens[..boundary]], &tokens[..boundary + suffix]).unwrap();
+                assert_eq!(route.snapshot_end, boundary);
+                assert_eq!(route.fidelity, if suffix < 128 { RestoreFidelity::Exact }
+                    else { RestoreFidelity::ExactEncoderContinuation });
+                // The same snapshot can be a short first stage even if P is far away.
+                let first = selected(&[&tokens[..boundary]], &tokens[..boundary + 37]).unwrap();
+                assert_eq!(first.fidelity, RestoreFidelity::Exact);
+            }
+        }
     }
 
     #[test]
@@ -635,8 +839,8 @@ mod tests {
         let config = PrefixConfig { entries: 4, mark_slots: 0, keep_logits: true, min_tokens: 64 };
         let mut partial = layout(1, false);
         partial.rule = ReuseRule { align: 2, replay: Some(128) };
-        assert!(V41Cache::new(Arenas { target: None, draft: None, slots: 0 }, config, None, partial).is_err());
-        assert!(V41Cache::new(Arenas { target: None, draft: None, slots: 0 }, config, None, layout(1, false)).is_ok());
+        assert!(V41Cache::new(Arenas { target: None, draft: None, slots: 0, quarantined: Cell::new(false) }, config, None, partial).is_err());
+        assert!(V41Cache::new(Arenas { target: None, draft: None, slots: 0, quarantined: Cell::new(false) }, config, None, layout(1, false)).is_ok());
     }
 
     #[test]
@@ -697,8 +901,10 @@ mod tests {
             ("diagnostic_state", &["self.capture_mark(lease"]),
             // Captures: a committed frontier with nothing unpublished (immutable rows).
             ("capture_mark", &["self.copy_mark(lease"]),
-            ("queue_mark", &["self.copy_mark(lease", "cuda_stream_wait_event(stream, self.prefix_queued.0)"]),
-            ("copy_mark", &["request.phase == CachePhase::Full && request.publication.is_empty()"]),
+            ("queue_mark", &["self.copy_mark(lease", "Some(lane)"]),
+            ("copy_mark", &["request.phase == CachePhase::Full && request.publication.is_empty()",
+                "reserve_snapshot(&mut self.prefix_copies[lane].pending, lease)",
+                "cuda_stream_wait_event(stream, self.prefix_queued.0)"]),
             // Restores: only a fresh admission, drained before it is observable.
             ("restore_retained_phase", &["request.end == 0", "request.version == 0", "cuda_stream_synchronize(self.prefix_stream.raw)"]),
             ("prefix_drain", &["cuda_stream_synchronize(self.prefix_stream.raw)"]),

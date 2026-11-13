@@ -5,8 +5,8 @@ use crate::families::deepseek_v41::v41_target_head::{SampledTargetRows, TargetSa
 use crate::shared::memory::device::DeviceOwner;
 use std::cell::RefCell;
 
-/// Futures remain concrete: selecting a layout does not box lane work or add a
-/// common stream. Each implementation retains its own device/transport owners.
+/// Futures remain concrete; the scheduler heap-pins each lane before wrapping
+/// it. Each implementation retains its own streams and device/transport owners.
 pub(crate) trait VerificationTarget<'a>: TargetCache<'a> {
     type Transport;
     fn set_route_capture(&mut self, enabled: bool) -> Result<()>;

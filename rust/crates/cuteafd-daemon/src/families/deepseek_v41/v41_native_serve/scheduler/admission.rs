@@ -8,6 +8,7 @@ pub(super) struct Prepared {
     pub job: NativeRequest,
     pub prompt: Vec<u32>,
     pub images: Vec<cuteafd_loader::V41ImageSpan>,
+    pub stages: super::super::prefix::points::Stages,
 }
 impl Prepared {
     pub fn new(
@@ -36,6 +37,7 @@ impl Prepared {
             job,
             prompt,
             images,
+            stages: Default::default(),
         })
     }
 }
@@ -50,7 +52,8 @@ pub(super) struct Leased {
     pub image_keys: ImageKeys,
     pub hit: Option<(usize, Option<RetainedScores>)>,
     pub restore: (Instant, Instant),
-    /// The frontier the restored prefix reached; images from here on are encoded.
+    /// Image preparation floor: restored frontier normally, zero for staged
+    /// prompts whose capture-failure fallback must also work cold.
     pub resume: usize,
     pub started: Instant,
 }

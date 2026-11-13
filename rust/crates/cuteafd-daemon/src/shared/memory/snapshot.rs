@@ -4,6 +4,21 @@ use anyhow::{ensure, Context};
 use std::{cell::RefCell, rc::Rc};
 use crate::shared::memory::Tag;
 
+/// Reserve before enqueue: a failed partial enqueue must still own its source.
+pub(crate) fn reserve_snapshot<T>(pending: &mut Option<T>, owner: T) -> Result<()> {
+    ensure!(pending.is_none(), "snapshot lane is occupied");
+    *pending = Some(owner);
+    Ok(())
+}
+
+/// Failed synchronization leaves ownership intact; only proven completion frees it.
+pub(crate) fn drain_snapshot<T>(pending: &mut Option<T>, drain: impl FnOnce() -> Result<()>) -> Result<()> {
+    if pending.is_none() { return Ok(()); }
+    drain()?;
+    *pending = None;
+    Ok(())
+}
+
 /// Stream destruction drains before the queued source/storage owners are dropped.
 pub(crate) struct SnapshotCopies<'a, T> {
     pub stream: LoadStream<'a>,
@@ -19,10 +34,9 @@ impl<'a, T> SnapshotCopies<'a, T> {
         unsafe { self.stream.library.cuda_stream_query(self.stream.raw) }
     }
     pub fn abort(&mut self) -> Result<()> {
-        if self.pending.is_none() { return Ok(()); }
-        let drained = unsafe { self.stream.library.cuda_stream_synchronize(self.stream.raw) };
-        self.pending = None;
-        drained
+        drain_snapshot(&mut self.pending, || unsafe {
+            self.stream.library.cuda_stream_synchronize(self.stream.raw)
+        })
     }
 }
 
@@ -92,6 +106,43 @@ impl Drop for SnapshotStorage<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn partial_enqueue_keeps_reservations_until_its_own_lane_drains() {
+        use std::cell::Cell;
+        struct Owner(Rc<Cell<usize>>);
+        impl Drop for Owner { fn drop(&mut self) { self.0.set(self.0.get() + 1); } }
+        for (target_ok, draft_ok) in [(true, true), (false, true), (true, false), (false, false)] {
+            let drops = Rc::new(Cell::new(0));
+            let mut target = None;
+            let mut draft = None;
+            reserve_snapshot(&mut target, Owner(drops.clone())).unwrap();
+            reserve_snapshot(&mut draft, Owner(drops.clone())).unwrap();
+            // Inject a partial enqueue error before any successful enqueue result.
+            // The ordinary stream is independently healthy and owns neither lane.
+            let ordinary: Result<()> = Ok(());
+            assert!(ordinary.is_ok() && target.is_some() && draft.is_some());
+            assert!(reserve_snapshot(&mut target, Owner(Rc::new(Cell::new(0)))).is_err());
+            let target_result = drain_snapshot(&mut target, || {
+                ensure!(target_ok, "target lane pending"); Ok(())
+            });
+            let draft_result = drain_snapshot(&mut draft, || {
+                ensure!(draft_ok, "draft lane pending"); Ok(())
+            });
+            assert_eq!(target_result.is_ok(), target_ok);
+            assert_eq!(draft_result.is_ok(), draft_ok);
+            assert_eq!(target.is_some(), !target_ok);
+            assert_eq!(draft.is_some(), !draft_ok);
+            assert_eq!(drops.get(), usize::from(target_ok) + usize::from(draft_ok));
+            // A shutdown owner settles each reservation once; repeated safe aborts
+            // never run the drain callback again or release an owner twice.
+            drain_snapshot(&mut target, || Ok(())).unwrap();
+            drain_snapshot(&mut draft, || Ok(())).unwrap();
+            drain_snapshot(&mut target, || panic!("already settled")).unwrap();
+            drain_snapshot(&mut draft, || panic!("already settled")).unwrap();
+            assert_eq!(drops.get(), 2);
+        }
+    }
+
     #[test]
     fn snapshot_census_charges_shared_backing_once_without_native_work() -> Result<()> {
         use cuteafd_core::memory_layout::Category;

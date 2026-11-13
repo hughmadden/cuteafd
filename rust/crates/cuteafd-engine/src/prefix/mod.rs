@@ -32,4 +32,4 @@ pub use family::{BoxError, CaptureTicket, Eviction, FamilyLayout, LaggedState, M
     RestoreContext, RestoreFidelity, RestorePlan};
 pub use marks::{ArenaExhausted, MarkArena, MarkSlot};
 pub use pages::{Fork, FreedPage, Need, PoolExhausted, RefPagePool, TailCopy};
-pub use points::{message_boundaries, plan as plan_points, plan_media as plan_media_points, PointPlan, PointPolicy};
+pub use points::{message_boundaries, plan as plan_points, plan_media as plan_media_points, plan_media_diagnostics, PointDiagnostics, PointPlan, PointPolicy};
