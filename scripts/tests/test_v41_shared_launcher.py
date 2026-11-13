@@ -746,20 +746,37 @@ def test_fork_staging_keys_reach_the_coordinator(tmp_root, monkeypatch, key, val
     assert all(env_key not in parse_run(worker['argv'])['env'] for worker in result['containers'][1:])
 
 
-@pytest.mark.parametrize('override', ['', 'SPARK_DECODE_REPLY_FORMAT=bf16\n', 'GPU_EXPERT_TIER=24\n'])
-def test_fork_reply_format_maps_to_both_phases_and_tier_refuses_compression(tmp_root, monkeypatch, override):
+@pytest.mark.parametrize('override,prefill,decode', [
+    ('', 'fp8', 'fp8'),
+    ('SPARK_DECODE_REPLY_FORMAT=bf16\n', 'fp8', 'bf16'),
+    ('GPU_EXPERT_TIER=24\n', 'fp8', 'fp8'),
+    ('GPU_EXPERT_TIER=24\nSPARK_PREFILL_REPLY_FORMAT=nvfp4\n'
+     'SPARK_DECODE_REPLY_FORMAT=bf16\n', 'nvfp4', 'bf16'),
+    ('GPU_EXPERT_TIER=24\nSPARK_PREFILL_REPLY_FORMAT=bf16\n'
+     'SPARK_DECODE_REPLY_FORMAT=nvfp4\n', 'bf16', 'nvfp4'),
+])
+def test_fork_reply_formats_reach_manifest_aware_tier_admission(tmp_root, monkeypatch, override, prefill, decode):
+    """The launcher forwards resolved phases; loader capability tests own refusal."""
     import v41_launch_capture as capture_module
     original = capture_module.example_config
     monkeypatch.setattr(capture_module, 'example_config', lambda name, directory:
         capture_module.append_config(original(name, directory), 'SPARK_REPLY_FORMAT=fp8\n' + override))
-    if 'GPU_EXPERT_TIER' in override:
-        with pytest.raises(RuntimeError, match='GPU_EXPERT_TIER requires BF16 Spark replies'):
-            capture_module.capture(ROOT, 'deepseek-v41-mxfp4-max')
-        return
     result = capture_module.capture(ROOT, 'deepseek-v41-mxfp4-max')
     env = parse_run(result['containers'][0]['argv'])['env']
-    for phase in ('prefill', 'decode'):
-        expected = 'bf16' if phase == 'decode' and override else 'fp8'
+    for phase, expected in [('prefill', prefill), ('decode', decode)]:
         assert env[f'CUTEAFD_SPARK_{phase.upper()}_REPLY_FORMAT'] == expected
         for plan in result['plans']:
             assert plan[plan.index(f'--spark-{phase}-reply-format') + 1] == expected
+
+
+def test_fork_tier_keeps_default_bf16_replies(tmp_root, monkeypatch):
+    import v41_launch_capture as capture_module
+    original = capture_module.example_config
+    monkeypatch.setattr(capture_module, 'example_config', lambda name, directory:
+        capture_module.append_config(original(name, directory), 'GPU_EXPERT_TIER=24\n'))
+    result = capture_module.capture(ROOT, 'deepseek-v41-mxfp4-max')
+    env = parse_run(result['containers'][0]['argv'])['env']
+    for phase in ('prefill', 'decode'):
+        assert f'CUTEAFD_SPARK_{phase.upper()}_REPLY_FORMAT' not in env
+        for plan in result['plans']:
+            assert f'--spark-{phase}-reply-format' not in plan

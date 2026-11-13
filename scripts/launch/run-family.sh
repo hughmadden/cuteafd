@@ -267,11 +267,6 @@ for phase in prefill decode; do
   key="spark_${phase}_reply_format"
   case "${!key}" in ""|bf16|fp8|nvfp4) ;; *) release_die "SPARK_${phase^^}_REPLY_FORMAT must be bf16, fp8 or nvfp4" ;; esac
 done
-if [[ "${v41_gpu_expert_tier:-off}" != off ]]; then
-  for format in "$spark_prefill_reply_format" "$spark_decode_reply_format"; do
-    [[ -z "$format" || "$format" == bf16 ]] || release_die "GPU_EXPERT_TIER requires BF16 Spark replies"
-  done
-fi
 landing="$(get SPARK_LANDING "")"
 case "$landing" in ""|auto|sm|copy-engine) ;; *) release_die "SPARK_LANDING must be auto, sm or copy-engine" ;; esac
 fp8_prefill="$(get FP8_EXPERT_PREFILL auto)"

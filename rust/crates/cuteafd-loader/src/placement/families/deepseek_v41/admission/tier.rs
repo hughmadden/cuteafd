@@ -419,6 +419,29 @@ mod tests {
                 }
             }
         }
+        // Both launcher-resolved phases are admitted against the selected
+        // program inventory, including explicit phase overrides of an alias.
+        for programs in [serde_json::json!({"programs": []}),
+            serde_json::json!({"programs": [{"name": "expert_reply_reduce_tier"}]})] {
+            let capable = TierChoice::expert_reply_reduce_tier_available(&programs);
+            for formats in [Default::default(),
+                SparkReplyFormats { prefill: Some(SparkReplyFormat::Fp8), decode: Some(SparkReplyFormat::Fp8) },
+                SparkReplyFormats { prefill: Some(SparkReplyFormat::Nvfp4), decode: Some(SparkReplyFormat::Bf16) },
+                SparkReplyFormats { prefill: Some(SparkReplyFormat::Bf16), decode: Some(SparkReplyFormat::Nvfp4) }] {
+                let mut request = request(Some(8192), Onboard::Auto);
+                request.spark_reply_formats = formats;
+                let compressed = [formats.prefill, formats.decode].into_iter().flatten()
+                    .any(|format| format != SparkReplyFormat::Bf16);
+                let result = prepared(&config, false).admit_with_tier(request,
+                    &TierChoice { setting: ExpertTierSetting::PerLayer(8),
+                        expert_reply_reduce_tier: capable, ..Default::default() });
+                if compressed && !capable {
+                    assert!(result.err().unwrap().to_string().contains("without expert_reply_reduce_tier"));
+                } else {
+                    assert_eq!(result.unwrap().placement.expert_tier.unwrap().experts, 40 * 8);
+                }
+            }
+        }
         assert!(TierChoice::expert_reply_reduce_tier_available(&serde_json::json!({"programs":[
             {"name":"expert_reply_reduce_tier"}]})));
         assert!(!TierChoice::expert_reply_reduce_tier_available(&serde_json::json!({"programs":[
