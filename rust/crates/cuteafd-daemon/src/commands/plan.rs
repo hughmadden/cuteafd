@@ -2328,16 +2328,17 @@ mod tests {
             let argv: Vec<&str> = argv.iter().map(String::as_str).collect();
             assert_eq!(planned(&argv), served(sequences, entries, mib.unwrap_or(2048)), "{argv:?}");
         }
-        // Host-on reserves a fixed staging working set even when mark lanes change.
-        let staging = cuteafd_core::prefix::HOST_MARK_STAGING_SLOTS;
+        // Host-on and host-off reserve the same budgeted device mark arena.
         assert_eq!(planned(&launcher(1, 0, None).iter().map(String::as_str).collect::<Vec<_>>()), (0, state(1)));
         assert_eq!(planned(&["--concurrency", "1", "--prefix-cache-entries", "0"]), (0, state(1)));
         for concurrency in [16, 64] {
             let args = launcher(concurrency, 20, None);
             assert_eq!(planned(&args.iter().map(String::as_str).collect::<Vec<_>>()),
-                (staging * mark, state(cuteafd_core::concurrency::state_slots(concurrency))));
+                (cuteafd_core::prefix::mark_slots_for(concurrency, 20, mark, 2048 << 20) * mark,
+                    state(cuteafd_core::concurrency::state_slots(concurrency))));
             assert_eq!(planned(&["--concurrency", &concurrency.to_string()]),
-                (staging * mark, state(cuteafd_core::concurrency::state_slots(concurrency))));
+                (cuteafd_core::prefix::mark_slots_for(concurrency, 20, mark, 2048 << 20) * mark,
+                    state(cuteafd_core::concurrency::state_slots(concurrency))));
         }
         let default_sequences = cuteafd_core::serving_capacity::LARGE_CARD_DEFAULT_CONCURRENCY;
         assert_eq!(planned(&[]), served(default_sequences, 20, 2048));

@@ -2206,7 +2206,8 @@ pub(super) mod tests {
                 budget_bytes: 512 << 20, host: host_cache_bytes != Some(0) };
             let mark_bytes = cfg.kda_layers() as u64 * (cfg.kda_state_bytes() + cfg.kda_conv_bytes());
             let marks = prefix_slots.unwrap_or_else(|| rule.slots(usize::try_from(mark_bytes).unwrap()) as u64);
-            assert_eq!(marks, if entries == 0 { 0 } else if rule.host { 2 } else { 1 });
+            assert_eq!(marks, prefix_slots.unwrap_or_else(|| cuteafd_core::prefix::mark_slots_for(
+                slots, entries as u64, mark_bytes, rule.budget_bytes)));
             let options = PlanOptions { attention_placement: Some(AttentionPlacement::Layers), placement: ExpertPlacement::Sparks { ranks: 6 },
                 layout: Some(LayoutOptions { host_memory: Some((128 << 30, 128 << 30)), rtx_bytes: vec![capacity; 2], prefill_rows: unit as u64, prefill_lanes: waves as u64,
                     concurrency: slots, state_slots: Some(slots), prefix_slots,
