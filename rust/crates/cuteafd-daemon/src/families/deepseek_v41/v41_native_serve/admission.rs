@@ -1403,8 +1403,18 @@ mod admission_tests {
             let weights = exact.solved.facts.resident_weights.iter()
                 .find(|owner| owner.id == format!("v41.tier.{gpu}.0")).context("tier weight claim")?;
             assert_eq!(weights.weights.0, tier.resident_bytes[gpu]);
+            // Items are physical capacity: retain the exact logical checks
+            // above, and require precisely one aggregate arena backing tail.
+            let root_id = format!("v41.tier.{gpu}.0");
+            let tails = exact.solved.facts.allocation_granularity.iter()
+                .filter(|tail| tail.id == format!("{root_id}.tail")).collect::<Vec<_>>();
+            assert_eq!(tails.len(), 1);
+            assert_eq!(tails[0].backings, vec![cuteafd_loader::placement::planner::GranularityBacking {
+                backing: root_id, requests: vec![tier.resident_bytes[gpu]] }]);
+            let physical = cuteafd_loader::placement::planner::sm120_request_backing(tier.resident_bytes[gpu])?;
+            assert_eq!(tails[0].bytes()?, physical - tier.resident_bytes[gpu]);
             assert_eq!(exact.placement.items[gpu].iter().filter(|item| item.category == Category::Experts)
-                .map(|item| item.bytes).sum::<u64>(), tier.resident_bytes[gpu], "GPU {gpu} charges resident experts once");
+                .map(|item| item.bytes).sum::<u64>(), physical, "GPU {gpu} charges the resident arena and its tail once");
         }
         // Automatic tiers are prefixes of one ranked order.
         let auto = serve("auto", "auto", &memory, experts.clone(), 0)?.placement.expert_tier.context("auto tier")?;

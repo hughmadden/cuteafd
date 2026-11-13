@@ -57,9 +57,16 @@ impl TierCosts {
         for rank in 0..self.gpus {
             // Retained weights and scratch are disjoint owners. Loading
             // staging retires after Load and never competes with KV at Ready.
+            // Native subset planes are 256-byte aligned: their aggregate is
+            // both the logical payload and exact arena extent. The shared
+            // arena owner adds one physical backing tail, outside the weight cap.
+            let bytes = usize::try_from(self.resident[count][rank])
+                .map_err(|_| Refusal::Overflow("GPU expert tier arena extent"))?;
+            let arena = crate::serving_capacity::WeightArenaLayout::new(
+                format!("v41.tier.{rank}.0"), [("resident weights".into(), bytes)])
+                .map_err(|error| invalid(&error.to_string()))?;
             let owners = [
-                Owner::weights(rank as u8, Category::Experts,
-                    "GPU expert tier (resident weights)", self.resident[count][rank]),
+                Owner::arena(rank as u8, arena, MemoryKind::Experts),
                 Owner::charged(rank as u8, Category::Workspace,
                     "GPU expert tier (workspace)", self.workspace),
                 Owner::charged(rank as u8, Category::Staging,
@@ -234,6 +241,68 @@ mod tests {
         let staging = admitted.solved.facts.allocations.iter().filter(|a| a.group == "GPU expert tier (load staging)");
         assert!(staging.clone().count() == 2);
         assert!(staging.into_iter().all(|a| a.lifetime == Lifetime { first: Phase::Load, last: Phase::Load }));
+    }
+
+    #[test]
+    fn tier_arena_charges_one_physical_tail_without_inflating_residency() {
+        let config = config();
+        // Coded MXFP4 TP2 planes for hidden 5120, stored intermediate 1152.
+        // Two experts in each of 40 layers have a non-2-MiB-aligned extent.
+        let per_expert = 5_898_240 + 186_624 + 2_949_120 + 97_280;
+        let extent = 80 * per_expert;
+        let backing = 731_906_048;
+        let tail_bytes = backing - extent;
+        assert_eq!((extent, tail_bytes), (730_501_120, 1_404_928));
+        let fixture = || {
+            let mut prepared = prepared(&config, false);
+            for cost in &mut prepared.experts {
+                cost.whole.resident = 384 * per_expert * 2;
+                for half in &mut cost.half { half.resident = 384 * per_expert; }
+            }
+            prepared
+        };
+        let choice = TierChoice { setting: ExpertTierSetting::PerLayer(2), ..Default::default() };
+        let mut request = request(Some(8192), Onboard::Layers(0));
+        // Exactly the logical weights fit: a physical tail must not consume
+        // this separate cap, even though it must consume the device budget.
+        request.resident_weight_limit = Some(ResidentWeights((8 << 30) + extent));
+        let admitted = fixture().admit_with_tier(request.clone(), &choice).unwrap();
+        assert_eq!(admitted.placement.expert_tier.as_ref().unwrap().resident_bytes, vec![extent; 2]);
+        for rank in 0..2 {
+            let id = format!("v41.tier.{rank}.0");
+            let root = admitted.solved.facts.allocations.iter().find(|a| a.id == id).unwrap();
+            let tails = admitted.solved.facts.allocation_granularity.iter()
+                .filter(|a| a.id == format!("{id}.tail")).collect::<Vec<_>>();
+            assert_eq!(tails.len(), 1);
+            assert_eq!(tails[0].backings, vec![GranularityBacking { backing: id.clone(), requests: vec![extent] }]);
+            assert_eq!(tails[0].bytes().unwrap(), tail_bytes);
+            assert_eq!(root.bytes + tails[0].bytes().unwrap(), backing);
+            assert_eq!(root.lifetime, Lifetime::RESIDENT);
+            assert_eq!(tails[0].lifetime, root.lifetime);
+            let resident = admitted.solved.facts.resident_weights.iter().find(|w| w.id == id).unwrap();
+            assert_eq!(resident.weights.0, extent);
+        }
+        // Set each card's cap exactly at its tightest admitted phase. That
+        // boundary fits; one byte less must refuse the exact tier/pool pin.
+        let mut tight = fixture();
+        for budget in tight.budgets.iter_mut().filter(|b| b.id.starts_with("rtx")) {
+            let slack = admitted.solved.phases.iter().filter(|p| p.budget == budget.id)
+                .map(|p| p.available - p.owned - p.opaque).min().unwrap();
+            budget.logical_bytes -= slack;
+        }
+        let at_boundary = tight.admit_with_tier(request.clone(), &choice).unwrap();
+        let mut below = fixture();
+        below.budgets = at_boundary.solved.budgets.clone();
+        for budget in below.budgets.iter_mut().filter(|b| b.id.starts_with("rtx")) {
+            budget.logical_bytes -= 1;
+        }
+        let budgets = below.budgets.clone();
+        assert!(below.admit_with_tier(request, &choice).is_err());
+        // The old omission would admit the same pinned request at this cap.
+        let mut without_tail = at_boundary.solved.facts.clone();
+        without_tail.allocation_granularity.retain(|a| !a.id.starts_with("v41.tier."));
+        assert!(evaluate(&without_tail, &budgets).unwrap().iter()
+            .all(|p| p.owned + p.opaque <= p.available));
     }
 
     #[test]
