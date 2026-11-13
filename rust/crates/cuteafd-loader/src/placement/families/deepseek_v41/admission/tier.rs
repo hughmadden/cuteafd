@@ -145,6 +145,25 @@ impl PreparedV41<'_> {
         self.minimum = 0;
         self.recipe.counts = vec![0];
         request.onboard = Pin::Exact(0);
+        // SM89 TP2, CUDA 13.4 EAGER, 2026-11-13: pre-pool used minus
+        // tracked and named owners was 347,517,986 / 367,004,618 B. These
+        // are additional backing/runtime bytes, outside the sampled base,
+        // named arena tails, KV and the unchanged graph reserve. Price them
+        // before optional residency: an exact pool cannot pay them at adoption.
+        // Measurement replaces this forecast; it never subtracts it as an
+        // already-created owner. Other architectures keep their own inventory.
+        if self.coordinator_arch == cuteafd_core::GpuArch::Sm89 && self.recipe.gpus == 2
+            && !whole_gpu_reserve()
+        {
+            for (rank, bytes) in [347_517_986, 367_004_618].into_iter().enumerate() {
+                self.recipe.opaques.push(Opaque {
+                    location: Location::coordinator(rank as u8), bytes,
+                    basis: Basis::Calibrated,
+                    lifetime: Lifetime { first: Phase::Ready, last: Phase::Growth },
+                    source: format!("{PRE_POOL_FORECAST} SM89 TP2 GPU{rank}, CUDA 13.4 EAGER, 2026-11-13"),
+                });
+            }
+        }
         let contract = self.recipe.prepare(&request)?;
         let (solved, count) = solve_residency(request, self.budgets.clone(), range, |_, count| {
             let mut candidate = contract.clone();
@@ -172,7 +191,7 @@ mod tests {
         serde_json::from_str(include_str!("../../../../families/deepseek_v41/official-v41-config.json")).unwrap()
     }
 
-    fn prepared(config: &serde_json::Value, live: bool) -> PreparedV41<'_> {
+    fn input(config: &serde_json::Value, live: bool) -> ProductionInput<'_> {
         let gpus = 2;
         ProductionInput {
             coordinator_arch: cuteafd_core::GpuArch::Sm120,
@@ -196,7 +215,11 @@ mod tests {
             budgets: if live { live_budgets(&[(CARD, CARD, CARD); 2], &[64 << 30; 4]).unwrap() }
                 else { production_budgets(&[(CARD, CARD); 2],
                     crate::placement::reserve::gpu("deepseek_v41"), None, 0, &[64 << 30; 4]).unwrap() },
-        }.prepare().unwrap()
+        }
+    }
+
+    fn prepared(config: &serde_json::Value, live: bool) -> PreparedV41<'_> {
+        input(config, live).prepare().unwrap()
     }
 
     fn request(pool: Option<u64>, onboard: Onboard) -> Request {
@@ -392,6 +415,67 @@ mod tests {
             budget.logical_bytes = (8 << 30) + MIB;
         }
         assert!(tight.admit_with_tier(request(None, Onboard::Auto), &choice).is_err());
+    }
+
+    #[test]
+    fn explicit_pool_sizes_sm89_tier_before_measured_ready_adoption() {
+        use cuteafd_core::GpuArch;
+        let config = config();
+        let fixture = |arch| {
+            let mut input = input(&config, true);
+            input.coordinator_arch = arch;
+            input.context = 1_048_576;
+            input.maximum_pool_tokens = 2_121_728;
+            input.concurrency = 8;
+            input.retained_turns = 20;
+            input.resident_weight_limit = u64::MAX;
+            input.prepare().unwrap()
+        };
+        let request = production_request(1_048_576u64, Some(2_121_728), Onboard::Auto,
+            PrefillShape { rows: 128, waves: 2 }, Operation::Serving, u64::MAX,
+            Default::default());
+        let choice = TierChoice { setting: ExpertTierSetting::Auto, ..Default::default() };
+        // Freeze a tight physical boundary independently of the new forecast.
+        // The old plan left 5,346,002 B, then added 347,517,986 B on GPU0.
+        let old = fixture(GpuArch::Sm120).admit_with_tier(request.clone(), &choice).unwrap();
+        let mut budgets = old.solved.budgets.clone();
+        for budget in budgets.iter_mut().filter(|b| b.id.starts_with("rtx")) {
+            let slack = old.solved.phases.iter().filter(|p| p.budget == budget.id)
+                .map(|p| p.available - p.owned - p.opaque).min().unwrap();
+            budget.logical_bytes -= slack.saturating_sub(5_346_002);
+        }
+        let mut prepared = fixture(GpuArch::Sm89);
+        prepared.budgets = budgets.clone();
+        let mut admitted = prepared.admit_with_tier(request.clone(), &choice).unwrap();
+        let tier = admitted.placement.expert_tier.clone().unwrap();
+        let before = serde_json::to_value(&admitted.solved.facts.resident_weights).unwrap();
+        let measured = [
+            MeasuredOccupancy { gpu: 0, backing: 109_828_792, unattributed: 237_689_194 },
+            MeasuredOccupancy { gpu: 1, backing: 188_489_836, unattributed: 178_514_782 },
+        ];
+        let adopted = adopt_measured(&config, 2, 8, 20, false, 2_121_728,
+            &mut admitted.solved, &measured).expect("explicit pool must fit after loading the admitted tier");
+        assert_eq!(adopted.pages * 512, 2_121_728);
+        assert_eq!(admitted.solved.pool_tokens, 2_121_728);
+        assert_eq!(admitted.placement.expert_tier.as_ref().unwrap(), &tier);
+        assert_eq!(serde_json::to_value(&admitted.solved.facts.resident_weights).unwrap(), before);
+        assert!(tier.experts < old.placement.expert_tier.as_ref().unwrap().experts);
+        for gpu in 0..2 {
+            let charge = admitted.solved.facts.allocations.iter()
+                .filter(|a| a.id.starts_with(&format!("v41.measured.{gpu}.")))
+                .map(|a| a.bytes).sum::<u64>();
+            assert_eq!(charge, measured[gpu].backing + measured[gpu].unattributed);
+        }
+        // If the resident set is also pinned, refuse it in the pre-load solve.
+        let mut pinned = fixture(GpuArch::Sm89);
+        pinned.budgets = budgets;
+        assert!(pinned.admit_with_tier(request, &TierChoice {
+            setting: ExpertTierSetting::PerLayer(old.placement.expert_tier.as_ref().unwrap().experts / 40),
+            ..Default::default()
+        }).is_err());
+        eprintln!("explicit pool={} pages={} tier experts {} -> {}",
+            admitted.solved.pool_tokens, adopted.pages,
+            old.placement.expert_tier.unwrap().experts, tier.experts);
     }
 
     #[test]

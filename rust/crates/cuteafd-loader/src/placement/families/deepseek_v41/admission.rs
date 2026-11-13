@@ -539,6 +539,9 @@ pub struct AdoptedPool {
 pub const BACKING_OWNER: &str = "SM120 allocation backing";
 pub const UNATTRIBUTED_OWNER: &str = "unattributed runtime, measured";
 
+// A forecast is headroom, not occupancy to subtract from a device sample.
+const PRE_POOL_FORECAST: &str = "V4.1 pre-pool occupancy forecast:";
+
 /// Adopt the pre-pool device measurement into a solved plan (#1634).
 ///
 /// The solve sizes the KV pool from a sample taken before the family loads its
@@ -571,6 +574,11 @@ pub fn adopt_measured(
     // Zero is a measurement too: an owner with no bytes is not a charge.
     for occupant in measured {
         let location = Location::coordinator(occupant.gpu);
+        // Replace this GPU's pre-load forecast, including a zero measurement.
+        // Keeping both would charge the same residual twice and could break
+        // an explicit pool after the tier had already loaded.
+        plan.facts.allowances.retain(|owner| owner.location != location
+            || !owner.source.starts_with(PRE_POOL_FORECAST));
         for (index, (group, bytes)) in [(BACKING_OWNER, occupant.backing),
             (UNATTRIBUTED_OWNER, occupant.unattributed)].into_iter().enumerate() {
             if bytes == 0 { continue; }
@@ -1206,6 +1214,7 @@ pub struct ProductionInput<'a> {
 }
 
 pub struct PreparedV41<'a> {
+    coordinator_arch: cuteafd_core::GpuArch,
     experts: Vec<ExpertCost>,
     workspace: u64,
     pub recipe: V41Recipe<'a>,
@@ -1433,7 +1442,7 @@ impl<'a> ProductionInput<'a> {
             });
         }
         let minimum = self.onboard_minimum;
-        Ok(PreparedV41 { recipe, budgets: self.budgets, minimum, experts: self.experts, workspace: self.workspace })
+        Ok(PreparedV41 { coordinator_arch: self.coordinator_arch, recipe, budgets: self.budgets, minimum, experts: self.experts, workspace: self.workspace })
     }
 }
 
