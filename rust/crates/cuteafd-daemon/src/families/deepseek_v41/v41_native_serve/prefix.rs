@@ -630,11 +630,11 @@ mod tests {
             for suffix in [1, 37, 127, 128, 129] {
                 let route = selected(&[&tokens[..boundary]], &tokens[..boundary + suffix]).unwrap();
                 assert_eq!(route.snapshot_end, boundary);
-                assert_eq!(route.fidelity, if suffix < 128 { RestoreFidelity::ExactSnapshot }
+                assert_eq!(route.fidelity, if suffix < 128 { RestoreFidelity::Exact }
                     else { RestoreFidelity::ExactEncoderContinuation });
                 // The same snapshot can be a short first stage even if P is far away.
                 let first = selected(&[&tokens[..boundary]], &tokens[..boundary + 37]).unwrap();
-                assert_eq!(first.fidelity, RestoreFidelity::ExactSnapshot);
+                assert_eq!(first.fidelity, RestoreFidelity::Exact);
             }
         }
     }

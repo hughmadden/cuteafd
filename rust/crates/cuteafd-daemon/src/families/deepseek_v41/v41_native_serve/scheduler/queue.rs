@@ -303,10 +303,10 @@ mod tests {
             let (mut host, mut entry) = staged(whole, true);
             let first = chunk(&mut host, &mut entry).unwrap();
             if !whole {
-                assert_eq!(first, Chunk::More);
+                assert!(matches!(first, Chunk::More));
                 assert!(!host.active && host.samples == 0);
-                assert_eq!(chunk(&mut host, &mut entry).unwrap(), Chunk::Done);
-            } else { assert_eq!(first, Chunk::Done); }
+                assert!(matches!(chunk(&mut host, &mut entry).unwrap(), Chunk::Done));
+            } else { assert!(matches!(first, Chunk::Done)); }
             assert!(host.active && host.samples == 1 && host.releases == 0);
             assert_eq!(host.log, [("complete_and_drain", 900), ("capture_and_drain", 900),
                 ("restore", 900), ("complete_and_drain", 1024)]);
@@ -315,14 +315,14 @@ mod tests {
     #[test]
     fn stage_capture_failure_serves_uncached_and_between_stage_cancellation_releases_once() {
         let (mut host, mut entry) = staged(false, false);
-        assert_eq!(chunk(&mut host, &mut entry).unwrap(), Chunk::More);
+        assert!(matches!(chunk(&mut host, &mut entry).unwrap(), Chunk::More));
         assert_eq!(host.log.last(), Some(&("cold", 0)));
-        assert_eq!(chunk(&mut host, &mut entry).unwrap(), Chunk::Done);
+        assert!(matches!(chunk(&mut host, &mut entry).unwrap(), Chunk::Done));
         assert!(host.active && host.samples == 1 && host.releases == 0);
         let (mut host, mut entry) = staged(false, true);
-        assert_eq!(chunk(&mut host, &mut entry).unwrap(), Chunk::More);
+        assert!(matches!(chunk(&mut host, &mut entry).unwrap(), Chunk::More));
         entry.request.as_mut().unwrap().closed = true;
-        assert_eq!(chunk(&mut host, &mut entry).unwrap(), Chunk::Done);
+        assert!(matches!(chunk(&mut host, &mut entry).unwrap(), Chunk::Done));
         assert_eq!(host.releases, 1);
         assert!(!host.active && host.samples == 0 && entry.request.is_none());
         assert_eq!(host.log.len(), 3, "no stage-two work after cancellation");
