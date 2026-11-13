@@ -20,6 +20,7 @@ fn lease_slot(slots: &[Option<Request>], lease: CacheLease) -> Result<usize> {
     slots.iter().position(|r| r.as_ref().is_some_and(|r| r.lease == lease)).context("request history missing")
 }
 struct Request {
+    capture_quarantined: bool,
     lease: CacheLease,
     history: EngramHistory,
     prefill: Option<EngramPrefillCursor>,
@@ -214,7 +215,7 @@ impl<'a> Requests<'a> {
         );
         let history = self.pipeline.new_history()?;
         let lease = self.cache.begin_request(slot, id)?;
-        self.slots[slot] = Some(Request { lease, history, prefill: None, images: RequestImages::default(),
+        self.slots[slot] = Some(Request { capture_quarantined: false, lease, history, prefill: None, images: RequestImages::default(),
             lookahead: None });
         Ok(lease)
     }
@@ -283,7 +284,14 @@ impl<'a> Requests<'a> {
     pub fn cancel_foreign_prefetch(&mut self, lease: CacheLease) -> usize {
         self.prefetched.cancel_others(&lease)
     }
+    /// Failed capture completion retains the lease and all its source owners until shutdown.
+    pub fn quarantine_capture(&mut self, lease: CacheLease) {
+        if let Some(request) = self.slots.iter_mut().flatten().find(|r| r.lease == lease) {
+            request.capture_quarantined = true;
+        }
+    }
     pub fn release(&mut self, lease: CacheLease) -> Result<()> {
+        ensure!(!self.request_identity(lease)?.capture_quarantined, "undrained capture owns request storage");
         self.prefetched.cancel_owner(&lease);
         if self.cache.request_id(lease).is_ok() { self.cache.ensure_releasable(lease)?; }
         let slot = self

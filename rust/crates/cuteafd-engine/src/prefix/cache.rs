@@ -48,6 +48,13 @@ pub enum PrefixError {
         #[source]
         source: BoxError,
     },
+    /// Capture storage is quarantined; the caller must retain its source placement too.
+    #[error("capture failed ({capture}); completion could not be established: {source}")]
+    CaptureUndrained {
+        capture: String,
+        #[source]
+        source: BoxError,
+    },
     #[error("snapshot of {tokens} tokens, but the placement committed {committed} (reach {reach})")]
     Frontier { tokens: usize, committed: usize, reach: usize },
     #[error(transparent)]
@@ -379,7 +386,24 @@ impl<E: CopyEngine, M: Clone + Default> PrefixCache<E, M> {
     #[allow(clippy::too_many_arguments)]
     pub fn admit_native_compatible<F: PrefixFamily<M, Placement = P>, P>(&mut self, family: &F,
         tokens: &[u32], native: &[u32], media: &[MediaSpan], capacity: usize, sampled: bool,
-        compatible: Option<&dyn Fn(&M, usize) -> bool>, mut build: impl FnMut(Vec<u32>) -> P)
+        compatible: Option<&dyn Fn(&M, usize) -> bool>, build: impl FnMut(Vec<u32>) -> P)
+        -> Result<Admitted<P>, PrefixError> {
+        self.admit_native_selected(family, tokens, native, media, capacity, sampled, compatible, None, build)
+    }
+
+    /// Restore only this device entry, or fall back cold if it is unavailable.
+    /// External longest-prefix and Prompt/Turn tie rules are untouched.
+    #[allow(clippy::too_many_arguments)]
+    pub fn admit_native_entry<F: PrefixFamily<M, Placement = P>, P>(&mut self, family: &F,
+        tokens: &[u32], native: &[u32], media: &[MediaSpan], capacity: usize, sampled: bool,
+        entry: EntryId, build: impl FnMut(Vec<u32>) -> P) -> Result<Admitted<P>, PrefixError> {
+        self.admit_native_selected(family, tokens, native, media, capacity, sampled, None, Some(entry), build)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn admit_native_selected<F: PrefixFamily<M, Placement = P>, P>(&mut self, family: &F,
+        tokens: &[u32], native: &[u32], media: &[MediaSpan], capacity: usize, sampled: bool,
+        compatible: Option<&dyn Fn(&M, usize) -> bool>, selected: Option<EntryId>, mut build: impl FnMut(Vec<u32>) -> P)
         -> Result<Admitted<P>, PrefixError> {
         crate::media::keys::validate_spans(media)?;
         if media.last().is_some_and(|s| s.checked_end().unwrap() > tokens.len()) || native.len() != tokens.len() {
@@ -393,12 +417,18 @@ impl<E: CopyEngine, M: Clone + Default> PrefixCache<E, M> {
         if self.enabled() && !tokens.is_empty() {
             self.stats.lookups += 1;
             let mut promoted = false;
-            let mut hit = if let Some(compatible) = compatible {
+            let mut hit = if let Some(id) = selected {
+                self.entries.get(&id).and_then(|entry| {
+                    let (resume, common, _) = media_resume(self.layout.rule, tokens, media, &entry.tokens,
+                        &entry.media, &entry.after, sampled);
+                    (resume > 0).then_some(Hit { id, kind: entry.kind, resume, common, frontier: entry.len() })
+                })
+            } else if let Some(compatible) = compatible {
                 self.device_compatible_hit(tokens, media, sampled, compatible)
             } else { self.lookup_media(tokens, media, sampled) };
             let host_deeper = compatible.is_some_and(|compatible| self.host_compatible_hit(tokens, media,
                 sampled, compatible).is_some_and(|(_, resume)| resume > hit.as_ref().map_or(0, |h| h.resume)));
-            if hit.is_none() || host_deeper {
+            if selected.is_none() && (hit.is_none() || host_deeper) {
                 let restored = self.promote(family, tokens, media, sampled, compatible)?;
                 promoted = restored.is_some();
                 // Promotion can evict the previous device candidate before
@@ -408,7 +438,7 @@ impl<E: CopyEngine, M: Clone + Default> PrefixCache<E, M> {
                 } else { restored };
             }
             if let Some(hit) = hit {
-                if compatible.is_some() {
+                if compatible.is_some() || selected.is_some() {
                     self.clock += 1;
                     if let Some(entry) = self.entries.get_mut(&hit.id) { entry.last_use = self.clock; }
                 }
@@ -740,8 +770,14 @@ impl<E: CopyEngine, M: Clone + Default> PrefixCache<E, M> {
     /// If the family's mark can no longer reach that row, skip instead of capturing wrong state.
     pub fn capture_media<F: PrefixFamily<M>>(&mut self, family: &F, kind: SnapshotKind, tokens: &[u32],
         media: &[MediaSpan], placement: &F::Placement, after: After) -> Result<bool, PrefixError> {
+        self.capture_media_entry(family, kind, tokens, media, placement, after).map(|id| id.is_some())
+    }
+
+    /// Synchronous capture returning the concrete published entry for an internal restore.
+    pub fn capture_media_entry<F: PrefixFamily<M>>(&mut self, family: &F, kind: SnapshotKind, tokens: &[u32],
+        media: &[MediaSpan], placement: &F::Placement, after: After) -> Result<Option<EntryId>, PrefixError> {
         let Some(prepared) = self.prepare_capture(family, kind, tokens, media, placement, after)? else {
-            return Ok(false);
+            return Ok(None);
         };
         let Prepared { entry, copies } = prepared;
         let len = entry.len();
@@ -752,13 +788,9 @@ impl<E: CopyEngine, M: Clone + Default> PrefixCache<E, M> {
             None => Ok(()),
         });
         if let Err(source) = captured {
-            self.release(family, &entry.pages)?;
-            self.release_draft(family, entry.draft.as_ref())?;
-            self.give_back(family, entry.mark)?;
-            return Err(PrefixError::Family { what: "capture", source });
+            return Err(self.failed_capture(family, entry, source));
         }
-        self.publish(family, kind, entry)?;
-        Ok(true)
+        self.publish(family, kind, entry).map(Some)
     }
 
     /// [`PrefixCache::capture_media`] for a family that copies its snapshots on a stream of its
@@ -792,30 +824,31 @@ impl<E: CopyEngine, M: Clone + Default> PrefixCache<E, M> {
                 let len = entry.len();
                 let captured = copies.into_iter().try_for_each(|copy| family.copy_rows(copy)).and_then(|()| family.capture(slot, placement, len));
                 if let Err(source) = captured {
-                    self.release(family, &entry.pages)?;
-                    self.release_draft(family, entry.draft.as_ref())?;
-                    self.give_back(family, entry.mark)?;
-                    return Err(PrefixError::Family { what: "capture", source });
+                    return Err(self.failed_capture(family, entry, source));
                 }
                 self.publish(family, kind, entry)?;
                 Ok(Captured::Done)
             }
-            Err(source) => {
-                // A partial enqueue may still write the storage: drain it through the family,
-                // or keep it forever.
-                match family.drain() {
-                    Ok(()) => {
-                        self.release(family, &entry.pages)?;
-                        self.release_draft(family, entry.draft.as_ref())?;
-                        self.give_back(family, entry.mark)?;
-                    }
-                    Err(error) => {
-                        tracing::error!(target: "cuteafd::prefix", %error, "capture enqueue failed and did not drain; quarantining");
-                        self.quarantine.push(Quarantined { _pages: entry.pages, _mark: entry.mark, _draft: entry.draft });
-                        self.stats.quarantined += 1;
-                    }
-                }
-                Err(PrefixError::Family { what: "capture", source })
+            Err(source) => Err(self.failed_capture(family, entry, source)),
+        }
+    }
+
+    /// A failed copy may already be queued. Retain every destination reference until
+    /// the family proves all of its capture streams complete, including draft copies.
+    fn failed_capture<F: PrefixFamily<M>>(&mut self, family: &F, entry: Entry<M>, source: BoxError) -> PrefixError {
+        let cleanup = family.drain().map_err(|source| PrefixError::Family { what: "capture drain", source })
+            .and_then(|()| {
+                self.dirty = false;
+                self.release(family, &entry.pages)?;
+                self.release_draft(family, entry.draft.as_ref())?;
+                self.give_back(family, entry.mark.clone())
+            });
+        match cleanup {
+            Ok(()) => PrefixError::Family { what: "capture", source },
+            Err(cleanup) => {
+                self.quarantine.push(Quarantined { _pages: entry.pages, _mark: entry.mark, _draft: entry.draft });
+                self.stats.quarantined += 1;
+                PrefixError::CaptureUndrained { capture: source.to_string(), source: Box::new(cleanup) }
             }
         }
     }
@@ -967,7 +1000,7 @@ impl<E: CopyEngine, M: Clone + Default> PrefixCache<E, M> {
 
     /// Retain a captured snapshot whose copies were enqueued (synchronous families) or landed.
     fn publish<F: PrefixFamily<M>>(&mut self, family: &F, kind: SnapshotKind, mut entry: Entry<M>)
-        -> Result<(), PrefixError> {
+        -> Result<EntryId, PrefixError> {
         // Target and draft copies become lookup-visible as one retired transaction.
         if entry.draft.is_some() {
             if let Err(error) = self.drain(family) {
@@ -990,7 +1023,8 @@ impl<E: CopyEngine, M: Clone + Default> PrefixCache<E, M> {
             SnapshotKind::Turn => self.stats.captures_turn += 1,
         }
         self.host_store(family, id)?;
-        self.reconcile_draft(family)
+        self.reconcile_draft(family)?;
+        Ok(id)
     }
 
     /// A prefill cancelled at a chunk boundary: keep what it computed as a prompt snapshot

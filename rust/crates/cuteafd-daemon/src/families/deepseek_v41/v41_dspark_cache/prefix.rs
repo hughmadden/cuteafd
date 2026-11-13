@@ -11,6 +11,9 @@ fn slice(mut buffer: CuteafdDeviceBuffer, offset: usize, bytes: usize) -> Cuteaf
 }
 
 impl<'a> DsparkWindow<'a> {
+    /// Drain the stream used by synchronous snapshot copies, including failed captures.
+    pub fn drain_capture(&self) -> Result<()> { self.synchronize() }
+
     /// Bytes a retained ring of a window ending at `end` holds.
     pub fn ring_bytes(end: u64) -> usize {
         end.min(128) as usize * V41DsparkCache::ROW_BYTES

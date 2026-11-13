@@ -50,7 +50,10 @@ pub(in crate::families::deepseek_v41::v41_native_serve) fn chunk<T, C, H: Host<T
     super::stall::tick();
     if matches!(outcome, Ok(None)) { return Ok(Chunk::More); }
     let request = entry.request.take().expect("checked above");
-    entry.cursor = host.rest();
+    let previous = std::mem::replace(&mut entry.cursor, host.rest());
+    if outcome.as_ref().err().is_some_and(super::super::prefix::capture_undrained) {
+        std::mem::forget(previous);
+    } else { drop(previous); }
     match outcome {
         Ok(Some(output)) => host.admit(entry.slot, request, output)?,
         Err(error) => host.fail(request, error)?,
@@ -257,6 +260,9 @@ mod tests {
     struct StagedHost {
         whole: bool,
         capture_ok: bool,
+        target_drain_ok: bool,
+        draft_drain_ok: bool,
+        failures: usize,
         log: Vec<(&'static str, usize)>,
         active: bool,
         releases: usize,
@@ -271,6 +277,16 @@ mod tests {
                 self.log.push(("complete_and_drain", end));
                 if !request.stages.has_points() { return Ok(Some(end)); }
                 self.log.push(("capture_and_drain", end));
+                if !self.capture_ok {
+                    let drained = super::super::super::prefix::drain_capture_streams(
+                        || if self.target_drain_ok { Ok(()) } else { Err("target pending".into()) },
+                        || if self.draft_drain_ok { Ok(()) } else { Err("draft pending".into()) },
+                    );
+                    if let Err(source) = drained {
+                        return Err(cuteafd_engine::prefix::PrefixError::CaptureUndrained {
+                            capture: "injected queued copy failure".into(), source }.into());
+                    }
+                }
                 request.stages.completed(self.capture_ok);
                 self.log.push((if self.capture_ok { "restore" } else { "cold" },
                     if self.capture_ok { end } else { 0 }));
@@ -284,7 +300,9 @@ mod tests {
             self.active = true;
             Ok(())
         }
-        fn fail(&mut self, _: StagedPrompt, _: anyhow::Error) -> Result<()> {
+        fn fail(&mut self, _: StagedPrompt, error: anyhow::Error) -> Result<()> {
+            self.failures += 1;
+            if super::super::super::prefix::capture_undrained(&error) { return Err(error); }
             self.releases += 1;
             Ok(())
         }
@@ -294,7 +312,7 @@ mod tests {
         let mut tokens = vec![1; 1024]; tokens[900] = 7;
         let stages = super::super::super::prefix::points::Stages::plan(&tokens, &[7], &[], 0, 256, 64,
             cuteafd_engine::prefix::PointPolicy { gap: 0, boundaries: 1, per_request: 4 });
-        (StagedHost { whole, capture_ok, log: Vec::new(), active: false, releases: 0, samples: 0 },
+        (StagedHost { whole, capture_ok, target_drain_ok: true, draft_drain_ok: true, failures: 0, log: Vec::new(), active: false, releases: 0, samples: 0 },
             Queued { slot: 0, request: Some(StagedPrompt { stages, end: tokens.len(), closed: false }), cursor: () })
     }
     #[test]
@@ -326,6 +344,21 @@ mod tests {
         assert_eq!(host.releases, 1);
         assert!(!host.active && host.samples == 0 && entry.request.is_none());
         assert_eq!(host.log.len(), 3, "no stage-two work after cancellation");
+    }
+
+    #[test]
+    fn undrained_target_or_draft_capture_is_fatal_without_recycling() {
+        for (target, draft) in [(false, true), (true, false), (false, false)] {
+            let (mut host, mut entry) = staged(false, false);
+            host.target_drain_ok = target;
+            host.draft_drain_ok = draft;
+            let error = match chunk(&mut host, &mut entry) { Err(error) => error, Ok(_) => panic!("undrained capture recycled") };
+            assert!(super::super::super::prefix::capture_undrained(&error));
+            assert_eq!((host.failures, host.releases, host.samples), (1, 0, 0));
+            assert!(!host.active && entry.request.is_none());
+            assert_eq!(host.log, [("complete_and_drain", 900), ("capture_and_drain", 900)],
+                "no cold admission or further work after either failed drain");
+        }
     }
 
 }

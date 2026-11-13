@@ -101,6 +101,7 @@ pub(crate) struct DraftRuntime<'w, 'a, C = DsparkChain<'w, 'a>> {
     lanes: Vec<LaneRound>,
 }
 struct DraftRequest {
+    capture_quarantined: bool,
     leases: [WindowLease; 3],
     rng: cuteafd_core::DsparkRng,
     slot: usize,
@@ -173,6 +174,7 @@ impl<'w, 'a, C: DraftChain<'a>> DraftRuntime<'w, 'a, C> {
             }
         }
         self.requests.insert(id, DraftRequest {
+            capture_quarantined: false,
             leases: leases.try_into().ok().context("draft admission incomplete")?,
             rng: cuteafd_core::DsparkRng::new(id),
             slot,
@@ -311,7 +313,11 @@ impl<'w, 'a, C: DraftChain<'a>> DraftRuntime<'w, 'a, C> {
         self.lanes[lane].drafted_requests = requests.iter().filter(|r| r.1 > 0).count();
         Ok(width)
     }
+    pub fn quarantine_capture(&mut self, id: u64) {
+        if let Some(request) = self.requests.get_mut(&id) { request.capture_quarantined = true; }
+    }
     pub fn release(&mut self, id: u64) -> Result<()> {
+        ensure!(!self.requests.get(&id).is_some_and(|r| r.capture_quarantined), "undrained capture owns draft storage");
         let _device = self.chains[0].execution_device().map(|device| device.enter()).transpose()?;
         ensure!(!self.pending_prefix_ids.contains(&Some(id)), "cannot release a request with pending snapshot copies");
         ensure!(!pending_draft_blocks(&self.pending, id),
@@ -360,6 +366,17 @@ impl<'w, 'a, C: DraftChain<'a>> DraftRuntime<'w, 'a, C> {
                 window.capture_ring(lease, Self::ring_at(mark, stage))?;
             }
             Ok(())
+        })
+    }
+    /// Attempt every window even if an earlier synchronization failed.
+    pub fn drain_capture(&self) -> Result<()> {
+        let device = self.windows[0].device();
+        device.run(|| {
+            let mut failure = None;
+            for window in &self.windows {
+                if let Err(error) = window.drain_capture() { failure.get_or_insert(error); }
+            }
+            failure.map_or(Ok(()), Err)
         })
     }
     /// [`DraftRuntime::capture_mark`] queued on capture lane `lane`.

@@ -111,6 +111,7 @@ struct Fake {
     writable_lag: usize,
     fail_restore: Cell<bool>,
     fail_copy: Cell<bool>,
+    fail_capture_queued: Cell<bool>,
     fail_drain: Cell<bool>,
     record_format: Cell<&'static str>,
     drains: Cell<usize>,
@@ -138,7 +139,7 @@ impl Fake {
     fn new(pages: usize, rings: usize, slots: usize) -> Self {
         let bytes = (pages * ROWS + rings * RING + slots * WINDOW) * ROW;
         let mem = Rc::new(RefCell::new(StubCopyEngine::new(CopyModel::default(), bytes, 1 << 26)));
-        Self { mem, pages, rings, slots, writable_lag: 0, queue: RefCell::new(Vec::new()), fail_restore: Cell::new(false), fail_copy: Cell::new(false), fail_drain: Cell::new(false), record_format: Cell::new("opaque_v1"), drains: Cell::new(0),
+        Self { mem, pages, rings, slots, writable_lag: 0, queue: RefCell::new(Vec::new()), fail_restore: Cell::new(false), fail_copy: Cell::new(false), fail_capture_queued: Cell::new(false), fail_drain: Cell::new(false), record_format: Cell::new("opaque_v1"), drains: Cell::new(0),
             rule: ReuseRule::EXACT, refused_partial_rule: None, encoder_window: None,
             markless: false, pooled: false, reserved: 0, draft: RefCell::new(None) }
     }
@@ -341,6 +342,7 @@ impl PrefixFamily for Fake {
         for (i, r) in Fake::mark_window(p, len)?.enumerate() {
             self.queue.borrow_mut().push(Op::Copy(self.ring_row(p.ring, r), self.slot_row(slot, i)));
         }
+        if self.fail_capture_queued.get() { return Err("injected failure after capture enqueue".into()); }
         Ok(())
     }
     fn capture_pages(&self, pages: &[u32], p: &Placement, len: usize) -> Result<(), BoxError> {
@@ -1937,4 +1939,86 @@ fn predictor_inclusive_host_pages_do_not_deduplicate_by_target_tokens() {
     assert_eq!(fake.mem.borrow().read_device(row(&restored.placement)), value(4, &[901]));
     cache.release(&fake, &restored.placement.pages).unwrap();
     cache.clear(&fake).unwrap();
+}
+
+#[test]
+fn synchronous_capture_failure_drains_or_quarantines_queued_storage() {
+    for failed_drain in [false, true] {
+        let fake = Fake::new(32, 4, 2);
+        let mut cache = cache(&fake, 4, 0);
+        let tokens = seq(100, 13);
+        let mut p = cache.admit_cold(&fake, tokens.len(), 20,
+            |pages| Placement { pages, ring: 0, len: 0, ring_from: 0 }).unwrap().placement;
+        fake.forward(&mut p, &tokens).unwrap();
+        let (free, marks) = (cache.pool().free(), cache.arena().free());
+        fake.fail_capture_queued.set(true);
+        fake.fail_drain.set(failed_drain);
+        let error = cache.capture(&fake, SnapshotKind::Prompt, &tokens, &p, After::default()).unwrap_err();
+        assert_eq!(matches!(error, PrefixError::CaptureUndrained { .. }), failed_drain);
+        assert_eq!(cache.stats().quarantined, u64::from(failed_drain));
+        assert_eq!(cache.arena().free(), marks - usize::from(failed_drain));
+        assert_eq!(cache.pool().free(), free - usize::from(failed_drain));
+        assert_eq!(fake.queue.borrow().is_empty(), !failed_drain);
+        assert_eq!(cache.peek(&tokens, false), 0, "failed capture must not be published");
+        if failed_drain {
+            assert_eq!(cache.pool().refs(p.pages[0]), 2, "quarantine keeps shared source references");
+            assert!(cache.release(&fake, &p.pages).is_err());
+            assert_eq!(cache.pool().free(), free - 1, "failed drain cannot return storage");
+        } else {
+            fake.fail_capture_queued.set(false);
+            cache.release(&fake, &p.pages).unwrap();
+            let cold = cache.admit_cold(&fake, tokens.len(), 20,
+                |pages| Placement { pages, ring: 1, len: 0, ring_from: 0 }).unwrap();
+            let mut p = cold.placement;
+            fake.forward(&mut p, &tokens).unwrap();
+            cache.release(&fake, &p.pages).unwrap();
+            assert_eq!(cache.pool().free(), cache.pool().capacity());
+        }
+    }
+}
+
+#[test]
+fn internal_capture_identity_beats_same_end_turn_and_deeper_peer() {
+    let fake = Fake::new(96, 6, 8);
+    let mut cache = cache(&fake, 8, 0);
+    let tokens = seq(100, 26);
+    let boundary = 13;
+    let mut own = None;
+    // The peer Turn is older, but wins the public same-end tie even though
+    // our Prompt is newer. Distinct ring bytes expose selection by end alone.
+    for (ring, end, kind, byte) in [(0, boundary, SnapshotKind::Turn, 0x11),
+        (1, boundary, SnapshotKind::Prompt, 0x22), (2, 21, SnapshotKind::Turn, 0x33)] {
+        let mut p = cache.admit_cold(&fake, end, end,
+            |pages| Placement { pages, ring, len: 0, ring_from: 0 }).unwrap().placement;
+        fake.forward(&mut p, &tokens[..end]).unwrap();
+        for row in end.saturating_sub(WINDOW)..end {
+            fake.mem.borrow_mut().write_device(fake.ring_row(ring, row), &[byte; ROW]);
+        }
+        let id = cache.capture_media_entry(&fake, kind, &tokens[..end], &[], &p,
+            After::from_logits(&[1.0, byte as f32], true)).unwrap().unwrap();
+        if byte == 0x22 { own = Some(id); }
+        cache.release(&fake, &p.pages).unwrap();
+    }
+    let own = own.unwrap();
+    let internal = cache.admit_native_entry(&fake, &tokens, &tokens, &[], 30, true, own,
+        |pages| Placement { pages, ring: 3, len: 0, ring_from: 0 }).unwrap();
+    assert_eq!(internal.resume, boundary);
+    assert_eq!(internal.source.unwrap().kind, SnapshotKind::Prompt);
+    fake.drain().unwrap();
+    assert_eq!(fake.mem.borrow().read_device(fake.ring_row(3, boundary - 1)), vec![0x22; ROW]);
+    cache.release(&fake, &internal.placement.pages).unwrap();
+    for (end, resume, byte) in [(boundary + 1, boundary, 0x11), (26, 21, 0x33)] {
+        let external = cache.admit(&fake, &tokens[..end], 30, true,
+            |pages| Placement { pages, ring: 4, len: 0, ring_from: 0 }).unwrap();
+        assert_eq!(external.resume, resume);
+        assert_eq!(external.source.unwrap().kind, SnapshotKind::Turn);
+        fake.drain().unwrap();
+        assert_eq!(fake.mem.borrow().read_device(fake.ring_row(4, resume - 1)), vec![byte; ROW]);
+        cache.release(&fake, &external.placement.pages).unwrap();
+    }
+    cache.clear(&fake).unwrap();
+    let missing = cache.admit_native_entry(&fake, &tokens, &tokens, &[], 30, true, own,
+        |pages| Placement { pages, ring: 5, len: 0, ring_from: 0 }).unwrap();
+    assert_eq!(missing.resume, 0, "an unavailable identity must fall back cold");
+    cache.release(&fake, &missing.placement.pages).unwrap();
 }

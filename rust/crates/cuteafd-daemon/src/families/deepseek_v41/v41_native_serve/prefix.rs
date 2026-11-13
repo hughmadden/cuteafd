@@ -38,7 +38,7 @@ use crate::shared::memory::Tag;
 use crate::shared::memory::device::{Allocation, Device};
 use crate::shared::prefix::{cuda_copy::range, CudaCopyEngine};
 use cuteafd_engine::prefix::{
-    After, BoxError, CaptureTicket, Captured, Eviction, FamilyLayout, Mark, MarkSlot, MarkStore,
+    After, BoxError, EntryId, CaptureTicket, Captured, Eviction, FamilyLayout, Mark, MarkSlot, MarkStore,
     PrefixCache, PrefixConfig, PrefixFamily, RestoreCandidate, RestoreContext, RestoreFidelity, RestorePlan, ReuseRule, TailCopy,
 };
 use cuteafd_hostcache::copy::DeviceRange;
@@ -144,6 +144,22 @@ fn view(buffer: cuteafd_ffi::CuteafdDeviceBuffer, offset: usize, bytes: usize) -
 
 fn boxed(error: anyhow::Error) -> BoxError {
     format!("{error:#}").into()
+}
+
+/// Both calls run even if the target failed: a target error says nothing about
+/// outstanding draft copies. CPU tests inject outcomes here, not CUDA completion.
+pub(crate) fn drain_capture_streams(
+    target: impl FnOnce() -> Result<(), BoxError>,
+    draft: impl FnOnce() -> Result<(), BoxError>,
+) -> Result<(), BoxError> {
+    let target = target();
+    let draft = draft();
+    target.and(draft)
+}
+
+pub(crate) fn capture_undrained(error: &anyhow::Error) -> bool {
+    matches!(error.downcast_ref::<cuteafd_engine::prefix::PrefixError>(),
+        Some(cuteafd_engine::prefix::PrefixError::CaptureUndrained { .. }))
 }
 
 /// One snapshot's mark bytes: the backbone mark plus, with dSpark, the drafter rings.
@@ -343,7 +359,10 @@ impl<'a, C: DraftChain<'a>> PrefixFamily<V41Meta> for V41Prefix<'_, 'a, '_, C> {
         requests.cache().publish_units(&[copy.to]).map_err(boxed)
     }
     fn drain(&self) -> Result<(), BoxError> {
-        self.requests.borrow().cache().prefix_drain().map_err(boxed)
+        drain_capture_streams(
+            || self.requests.borrow().cache().prefix_drain().map_err(boxed),
+            || self.draft.borrow().as_ref().map_or(Ok(()), |draft| draft.drain_capture().map_err(boxed)),
+        )
     }
     fn page_segments(&self, page: u32) -> Vec<DeviceRange> {
         self.requests.borrow().cache().unit_segments(page).into_iter().map(range).collect()
@@ -436,21 +455,18 @@ impl<'a> V41Cache<'a> {
     /// look `keys` up (media-keyed copy of `native`), allocate units for `capacity` tokens
     /// (its reservation: prompt plus a decode chunk), restore. Pool pressure is
     /// `SourcePoolExhausted`; a restore that fails is a miss. Internal staging
-    /// may require exactly `boundary`; external admission leaves selection unchanged.
+    /// may require a concrete captured entry; external admission leaves selection unchanged.
     #[allow(clippy::too_many_arguments)]
     pub fn admit<C: DraftChain<'a>>(&mut self, requests: &mut Requests<'a>, mut draft: Option<&mut DraftRuntime<'_, 'a, C>>,
         lease: CacheLease, draft_id: Option<u64>, keys: &[u32], native: &[u32], media: &[MediaSpan], capacity: usize,
-        cold: bool, boundary: Option<usize>) -> Result<Restored> {
+        cold: bool, captured: Option<EntryId>) -> Result<Restored> {
         self.reclaim(requests, draft.as_deref_mut())?;
         let family = V41Prefix::new(requests, draft, &self.arenas);
         let build = |units: Vec<u32>| V41Placement { units, lease, draft: draft_id, len: 0, plan: None };
         let admitted = if cold || !self.cache.enabled() {
             self.cache.admit_cold(&family, keys.len(), capacity, build)
-        } else if let Some(boundary) = boundary {
-            // Internal staging restores precisely the frontier just captured,
-            // even if a peer retained a deeper ancestor while this stage ran.
-            let compatible = |meta: &V41Meta, _: usize| meta.request.backbone.end as usize == boundary;
-            self.cache.admit_native_compatible(&family, keys, native, media, capacity, true, Some(&compatible), build)
+        } else if let Some(entry) = captured {
+            self.cache.admit_native_entry(&family, keys, native, media, capacity, true, entry, build)
         } else {
             self.cache.admit_native(&family, keys, native, media, capacity, true, build)
         };
@@ -506,16 +522,36 @@ impl<'a> V41Cache<'a> {
     #[allow(clippy::too_many_arguments)]
     pub fn retain_frontier<C: DraftChain<'a>>(&mut self, requests: &mut Requests<'a>, draft: Option<&mut DraftRuntime<'_, 'a, C>>,
         kind: SnapshotKind, keys: &[u32], media: &[MediaSpan], next: &RetainedScores, lease: CacheLease, draft_id: Option<u64>)
-        -> Result<bool> {
-        if !self.cache.enabled() { return Ok(false); }
+        -> Result<Option<EntryId>> {
+        if !self.cache.enabled() { return Ok(None); }
         let end = requests.cache().committed_end(lease)? as usize;
         ensure!(end > 0 && end <= keys.len(), "retained token frontier differs");
         let units = requests.units(lease)?.to_vec();
         let placement = V41Placement { units, lease, draft: draft_id, len: end, plan: None };
         let after = After::from_logits(&next.logits()?, true);
         let family = V41Prefix::new(requests, draft, &self.arenas);
-        self.cache.capture_media(&family, kind, &keys[..end], media, &placement, after)
-            .map_err(|e| anyhow::anyhow!("{e}"))
+        let result = self.cache.capture_media_entry(&family, kind, &keys[..end], media, &placement, after);
+        // Preserve the typed fatal class. Errors before capture allocation must
+        // also prove completion before the scheduler may attempt cold fallback.
+        let result = match result {
+            Err(error @ cuteafd_engine::prefix::PrefixError::CaptureUndrained { .. }) => Err(error),
+            Err(error) => match family.drain() {
+                Ok(()) => Err(error),
+                Err(source) => Err(cuteafd_engine::prefix::PrefixError::CaptureUndrained {
+                    capture: error.to_string(), source }),
+            },
+            done => done,
+        };
+        if matches!(&result, Err(cuteafd_engine::prefix::PrefixError::CaptureUndrained { .. })) {
+            family.requests.borrow_mut().quarantine_capture(lease);
+            if let (Some(id), Some(draft)) = (draft_id, family.draft.borrow_mut().as_deref_mut()) {
+                draft.quarantine_capture(id);
+            }
+            // The serve loop exits without recycling the source lease or draft
+            // slot. Keep destination arena backing alive through shutdown too.
+            for owner in self.arenas.owners() { std::mem::forget(owner); }
+        }
+        result.map_err(anyhow::Error::new)
     }
     /// [`V41Cache::retain`] with its copies queued on capture lane `lane`; poll it with
     /// [`V41Cache::poll_retain`]. `Ok(false)` when nothing was queued.
@@ -594,6 +630,19 @@ mod tests {
     use super::*;
 
     use cuteafd_engine::prefix::{RestoreCandidate, RestoreFidelity};
+
+    #[test]
+    fn capture_cleanup_attempts_both_streams_and_requires_both_completions() {
+        for (target_ok, draft_ok) in [(true, true), (false, true), (true, false), (false, false)] {
+            let calls = RefCell::new(Vec::new());
+            let result = drain_capture_streams(
+                || { calls.borrow_mut().push("target"); if target_ok { Ok(()) } else { Err("target pending".into()) } },
+                || { calls.borrow_mut().push("draft"); if draft_ok { Ok(()) } else { Err("draft pending".into()) } },
+            );
+            assert_eq!(*calls.borrow(), ["target", "draft"]);
+            assert_eq!(result.is_ok(), target_ok && draft_ok);
+        }
+    }
 
     /// Every hit the radix can select under V4.1's rule, planned the way the engine plans it.
     fn selected(frontiers: &[&[u32]], prompt: &[u32]) -> Option<RestorePlan> {

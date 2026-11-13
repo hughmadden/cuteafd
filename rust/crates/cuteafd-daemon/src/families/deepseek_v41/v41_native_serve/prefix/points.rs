@@ -33,11 +33,11 @@ impl Stats {
         if !has_marks { self.skipped_no_free_mark_slot += stages.points.len() as u64; return false; }
         true
     }
-    pub fn capture(&mut self, result: &anyhow::Result<bool>, has_free_mark: bool) {
+    pub fn capture(&mut self, result: &anyhow::Result<Option<cuteafd_engine::prefix::EntryId>>, has_free_mark: bool) {
         match result {
-            Ok(true) => self.captured += 1,
-            Ok(false) if !has_free_mark => self.skipped_no_free_mark_slot += 1,
-            Ok(false) => self.skipped_no_room += 1,
+            Ok(Some(_)) => self.captured += 1,
+            Ok(None) if !has_free_mark => self.skipped_no_free_mark_slot += 1,
+            Ok(None) => self.skipped_no_room += 1,
             Err(_) => self.capture_failures += 1,
         }
     }
@@ -153,9 +153,9 @@ mod tests {
         assert_eq!(stats.skipped_ineligible, 3);
         assert!(!stats.plan(&stages, true, false));
         assert_eq!(stats.skipped_no_free_mark_slot, 3);
-        stats.capture(&Ok(true), true);
-        stats.capture(&Ok(false), false);
-        stats.capture(&Ok(false), true);
+        stats.capture(&Ok(Some(7)), true);
+        stats.capture(&Ok(None), false);
+        stats.capture(&Ok(None), true);
         stats.capture(&Err(anyhow::anyhow!("injected copy failure")), true);
         assert_eq!((stats.captured, stats.skipped_no_free_mark_slot, stats.skipped_no_room, stats.capture_failures), (1, 4, 1, 1));
     }

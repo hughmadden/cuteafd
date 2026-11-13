@@ -723,10 +723,12 @@ impl<'w, 'a, P: ServingTarget<'w, 'a>> queue::Host<Waiting<'a>, super::prefill_t
                 &waiting.image_keys.tokens()[..end], waiting.image_keys.spans(), &scores, waiting.lease, draft_request);
             let has_free_mark = self.prefixes.engine().arena().free() > 0;
             self.prefixes.points.capture(&captured, has_free_mark);
-            let captured = match captured {
+            let snapshot = match captured {
                 Ok(done) => done,
-                Err(error) => { tracing::warn!(%error, "boundary capture failed; restarting prompt uncached"); false }
+                Err(error) if super::prefix::capture_undrained(&error) => return Err(error),
+                Err(error) => { tracing::warn!(%error, "boundary capture failed; restarting prompt uncached"); None }
             };
+            let captured = snapshot.is_some();
             if !captured {
                 self.prefixes.points.skipped_after_capture_failure += waiting.prepared.stages.len().saturating_sub(1) as u64;
             }
@@ -745,7 +747,7 @@ impl<'w, 'a, P: ServingTarget<'w, 'a>> queue::Host<Waiting<'a>, super::prefill_t
             let draft_request = draft_id(&self.draft, waiting.id);
             let restored = self.prefixes.admit(self.requests, self.draft.as_deref_mut(), waiting.lease,
                 draft_request, &waiting.image_keys.tokens()[..next],
-                &waiting.prepared.prompt[..next], &media, capacity, !captured, Some(end))?;
+                &waiting.prepared.prompt[..next], &media, capacity, !captured, snapshot)?;
             self.prefixes.points.restarts += 1;
             self.prefixes.points.cold_restarts += u64::from(!captured || restored.cached == 0);
             waiting.stage_cached = restored.cached;
@@ -772,6 +774,7 @@ impl<'w, 'a, P: ServingTarget<'w, 'a>> queue::Host<Waiting<'a>, super::prefill_t
                 let draft_request = draft_id(&self.draft, id);
                 if let Err(error) = self.prefixes.retain(self.requests, self.draft.as_deref_mut(), SnapshotKind::Prompt,
                     image_keys.tokens(), image_keys.spans(), &scores, lease, draft_request) {
+                    if super::prefix::capture_undrained(&error) { return Err(error); }
                     tracing::warn!(%error, "prompt prefix was not retained");
                 }
             }
@@ -817,6 +820,9 @@ impl<'w, 'a, P: ServingTarget<'w, 'a>> queue::Host<Waiting<'a>, super::prefill_t
         let _ = events.send(Err(failure));
         if events.is_closed() { ticket.cancel() } else { ticket.fail(0) }
         tracing::warn!(%error, "native request admission failed");
+        // Undrained capture copies still own the source lease, draft rings and
+        // connections. Stop serving; leave them held for shutdown, without reset.
+        if super::prefix::capture_undrained(&error) { return Err(error); }
         self.release(lease, id);
         P::reset_connections(self.first_transport)?; P::reset_connections(self.second_transport)?;
         for (_, transport) in self.prefill.slots.iter_mut() { P::reset_connections(transport)?; }
@@ -2962,7 +2968,7 @@ mod sampling_tests {
         assert!(run.contains("draft.release(waiting.id)?") && run.contains("draft.admit(waiting.id)?"));
         assert!(!run.contains(".sample("), "intermediate logits must not consume request RNG");
         assert!(run.contains("waiting.prepared.stages.completed(captured)"));
-        assert!(run.contains("capacity, !captured, Some(end))?"), "capture failure must restart uncached");
+        assert!(run.contains("capacity, !captured, snapshot)?"), "capture failure must restart uncached");
         let requests = include_str!("../v41_requests.rs");
         let restart = &requests[requests.find("    pub fn restart(&mut self, lease:").unwrap()..];
         let restart = &restart[..restart.find("\n    }\n").unwrap()];
