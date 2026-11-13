@@ -958,7 +958,9 @@ mod tests {
             assert!(count(&candidate) < count(&base),
                 "{format:?}: predictor pressure must move CSA off the head GPU: {} vs {}",
                 count(&base), count(&candidate));
-            assert_eq!(candidate.marks, 2);
+            let mark_bytes = candidate.cache.ranks.iter().map(|r| r.bytes).sum::<u64>();
+            assert_eq!(candidate.marks as u64, cuteafd_core::prefix::mark_slots_for(
+                inputs.marks.lanes as u64, inputs.marks.entries as u64, mark_bytes, inputs.marks.budget_bytes));
             assert_eq!(candidate.cache.ranks[0].mtp_lengths.len(), 3);
             assert!(candidate.cache.ranks[1].mtp_lengths.is_empty());
             let expected = Step5CacheLayout::for_execution(&cfg, &candidate.ownership,
@@ -975,6 +977,7 @@ mod tests {
 
     #[test]
     fn host_retention_reserves_budgeted_device_marks() -> Result<()> {
+        let (mut accepted, mut refused) = (0, 0);
         for ranks in [1, 2] {
             let mut inputs = inputs(ranks);
             inputs.context = EXTENT;
@@ -985,7 +988,24 @@ mod tests {
                 inputs.marks.entries = entries;
                 for budget in [0, 2 << 30, 32 << 30] {
                     inputs.marks.budget_bytes = budget;
-                    let admitted = run(&inputs)?;
+                    let admitted = match run(&inputs) {
+                        Ok(admitted) => { accepted += 1; admitted }
+                        Err(error) => {
+                            // A large retained arena may no longer leave room for the pinned
+                            // context. Host enablement must not hide that device allocation.
+                            assert_eq!(budget, 32 << 30, "ranks={ranks}, entries={entries}: {error:#}");
+                            assert!(entries > 0);
+                            inputs.marks.host = false;
+                            let device_error = run(&inputs).err().expect("the same device arena must also refuse");
+                            inputs.marks.host = true;
+                            for error in [error, device_error] {
+                                let message = format!("{error:#}");
+                                assert!(message.contains("selected context") && message.contains("cannot fit"), "{message}");
+                            }
+                            refused += 1;
+                            continue;
+                        }
+                    };
                     let mark_bytes = admitted.cache.ranks.iter().map(|r| r.bytes).sum::<u64>();
                     let slots = cuteafd_core::prefix::mark_slots_for(inputs.marks.lanes as u64,
                         entries as u64, mark_bytes, budget) as usize;
@@ -997,6 +1017,7 @@ mod tests {
                 }
             }
         }
+        assert!(accepted > 0 && refused > 0, "exercise both admitted and over-budget arenas");
         Ok(())
     }
 
