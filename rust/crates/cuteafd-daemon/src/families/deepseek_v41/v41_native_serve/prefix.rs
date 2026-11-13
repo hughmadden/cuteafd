@@ -363,6 +363,7 @@ pub(crate) struct V41Cache<'a> {
     arenas: Arenas<'a>,
     pending: [Option<CaptureTicket>; 2],
     capture_session: Option<String>,
+    pub points: points::Stats,
 }
 
 /// What a V4.1 admission restored: the resume point and, for an exact full-prompt hit, the
@@ -379,7 +380,7 @@ impl<'a> V41Cache<'a> {
         host: Option<(cuteafd_hostcache::config::Config, CudaCopyEngine<'a>)>, layout: FamilyLayout) -> Result<Self> {
         ensure!(layout.rule == ReuseRule::EXACT, "V4.1 restores exact snapshot frontiers only");
         let cache = PrefixCache::new(layout, config, host).map_err(|e| anyhow::anyhow!("{e}"))?;
-        Ok(Self { cache, arenas, pending: [None, None], capture_session: None })
+        Ok(Self { cache, arenas, pending: [None, None], capture_session: None, points: Default::default() })
     }
     pub fn arenas(&self) -> &Arenas<'a> { &self.arenas }
     /// A cache that retains nothing (component fixtures).

@@ -261,6 +261,7 @@ fn serving_stats<C: cuteafd_engine::media::EncoderClient>(prefixes: &PrefixCache
         // The engine's prefix counters: hits by kind, hit tokens, host promotions (host-tier
         // restores), captures, evictions and page/mark occupancy.
         "prefix": prefixes.serving_stats(),
+        "prefix_points": prefixes.points,
         "target_sampling": sampling_stats::snapshot(),
         "dspark_policy": super::speculative::policy_snapshot(),
         "admission": kv_waiter.stats(),
@@ -720,10 +721,15 @@ impl<'w, 'a, P: ServingTarget<'w, 'a>> queue::Host<Waiting<'a>, super::prefill_t
             let draft_request = draft_id(&self.draft, waiting.id);
             let captured = self.prefixes.retain_frontier(self.requests, self.draft.as_deref_mut(), SnapshotKind::Prompt,
                 &waiting.image_keys.tokens()[..end], waiting.image_keys.spans(), &scores, waiting.lease, draft_request);
+            let has_free_mark = self.prefixes.engine().arena().free() > 0;
+            self.prefixes.points.capture(&captured, has_free_mark);
             let captured = match captured {
                 Ok(done) => done,
                 Err(error) => { tracing::warn!(%error, "boundary capture failed; restarting prompt uncached"); false }
             };
+            if !captured {
+                self.prefixes.points.skipped_after_capture_failure += waiting.prepared.stages.len().saturating_sub(1) as u64;
+            }
             waiting.prepared.stages.completed(captured);
             // No new work or release races a completed mark; a disconnected
             // client leaves through the queue's ordinary release path.
@@ -740,6 +746,8 @@ impl<'w, 'a, P: ServingTarget<'w, 'a>> queue::Host<Waiting<'a>, super::prefill_t
             let restored = self.prefixes.admit(self.requests, self.draft.as_deref_mut(), waiting.lease,
                 draft_request, &waiting.image_keys.tokens()[..next],
                 &waiting.prepared.prompt[..next], &media, capacity, !captured, Some(end))?;
+            self.prefixes.points.restarts += 1;
+            self.prefixes.points.cold_restarts += u64::from(!captured || restored.cached == 0);
             waiting.stage_cached = restored.cached;
             waiting.hit_scores = restored.scores;
             if self.requests.cache().stage(waiting.lease)? == crate::families::deepseek_v41::v41_backbone_cache::CacheStage::Full {
@@ -1109,7 +1117,7 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
                     args.prefill_batch_tokens as usize, args.prefix.prefix_cache_min_tokens, args.prefix.points());
                 let eligible = prefixes.engine().enabled() && !cold && packing_probe_allowed(&job.probe);
                 let has_marks = prefixes.engine().arena().slots() > 0;
-                if eligible && has_marks {
+                if prefixes.points.plan(&planned, eligible, has_marks) {
                     *stages = planned;
                 }
                 let end = stages.end(prompt.len());
