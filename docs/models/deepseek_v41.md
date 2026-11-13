@@ -142,12 +142,29 @@ internal stage restores; `prefix_points.restarts` identifies that extra activity
 Request cached-token usage still reports only the original admission's hit.
 The extra work per retained point includes a final replay, full mark capture,
 slot recycling and normal restore; with a short suffix the suffix also runs
-through all layers. Native initialized-state equality, cancellation and failure
-ordering, fidelity and replay throughput require GPU qualification. This includes
-initialized draft-ring bytes and ends at B and after restore (the target/Engram
-state hashes do not cover draft rings), same-end Prompt/Turn identity, and queued
+through all layers. Beyond the state comparisons below, cancellation and failure
+ordering, replay throughput and the following native checks still require GPU
+qualification: initialized draft-ring bytes and ends at B and after restore
+(the target/Engram state hashes do not cover draft rings), same-end Prompt/Turn identity, and queued
 copy failures with successful and failed target/draft drains, including mark-pressure
 waits and a peer suspended in retirement when the fatal stop is raised.
+
+#### Staged-prefill numerics
+
+At the generation-message start (`<｜Assistant｜>`, token index B), the boundary snapshot is an ordinary complete frontier for `tokens[..B]`, with no new mark kind.
+Stage 2 uses ordinary exact restoration: full-mark replay for suffixes below 128 tokens (including the 1–2-token boundary), or encoder continuation for 128 or more.
+
+Qualification on 2× RTX 4090 D + Sparks, `17137589f`:
+
+| Check | Measured result |
+| --- | --- |
+| Captured B versus cold whole-prompt `tokens[..B]` | Byte-identical state (same extent, byte count and SHA) for suffix lengths 0/1/2/37/127/128/129/300. |
+| Restore B and continue versus staged prefill | Same frontier states and extents in same-launch comparisons across suffixes 1/2/37/127/128/129/300. |
+| Drafts on versus off | Identical frontier states at suffix lengths 127 and 128. |
+| Golden `--resume-at` | Text and image restore/continuation cases pass byte-exactly. |
+
+Smoke `cache_exact` cold recomputation compares staged prefill against unstaged cold prefill (cold probes skip staging); restored prompt-end/turn-end rows are byte-identical. Of 24 turn-prompt cold-recompute rows compared, at least one differs. A one-row full-vocabulary continuation comparison gives KL = 2.9514e-4 with the same arg-max, without byte identity; the cold-versus-cold reference gives KL = 0.0 and byte-identical rows.
+This is the accepted chunk-size/prefill-versus-decode floating-point reordering class, at the same order of magnitude as the tool-call check's ~0.000-nat top-token differences. The repository rule permits logit/greedy differences from reordering, not cache-induced state changes; these cold-recompute differences are not a restored-bytes mismatch.
 
 ## Known limits
 
