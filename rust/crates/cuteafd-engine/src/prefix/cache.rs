@@ -403,10 +403,10 @@ impl<E: CopyEngine, M: Clone + Default> PrefixCache<E, M> {
             loop {
                 let eligible = |meta: &M, len| compatible.is_none_or(|check| check(meta, len));
                 let hit = if rejected.is_empty() {
-                    if compatible.is_some() { self.device_compatible_hit(tokens, media, sampled, &eligible) }
+                    if compatible.is_some() { self.device_compatible_hit(tokens, media, sampled, &eligible, true) }
                     else { self.lookup_media(tokens, media, sampled) }
                 } else {
-                    self.device_hit_excluding(tokens, media, sampled, &eligible, &rejected)
+                    self.device_hit_excluding(tokens, media, sampled, &eligible, &rejected, true)
                 };
                 // Keep the normal device-first fast path. After a failed candidate, compare
                 // both tiers by saved work instead of giving up or retrying that candidate.
@@ -492,8 +492,8 @@ impl<E: CopyEngine, M: Clone + Default> PrefixCache<E, M> {
         loop {
             let (common, frontier, &id) = self.retained.lookup_reusable(query)?;
             let resume = self.layout.rule.skipped(common, frontier);
-            if !self.mark_available(self.entries.get(&id)?) {
-                let hit = self.device_media_hit(tokens, &[], sampled).0?;
+            if !self.candidate_available(self.entries.get(&id)?, common, true) {
+                let hit = self.device_media_hit(tokens, &[], sampled, true).0?;
                 self.clock += 1;
                 self.entries.get_mut(&hit.id)?.last_use = self.clock;
                 return Some(hit);
@@ -526,8 +526,8 @@ impl<E: CopyEngine, M: Clone + Default> PrefixCache<E, M> {
             loop {
                 let Some((common, frontier, &id)) = self.retained.peek_reusable(query) else { break 0 };
                 let Some(entry) = self.entries.get(&id) else { break 0 };
-                if !self.mark_available(entry) {
-                    break self.device_media_hit(tokens, media, sampled).0.map_or(0, |h| h.resume);
+                if !self.candidate_available(entry, common, false) {
+                    break self.device_media_hit(tokens, media, sampled, false).0.map_or(0, |h| h.resume);
                 }
                 let resume = self.layout.rule.skipped(common, frontier);
                 if !verify_media(resume, &entry.media, media) { break 0; }
@@ -537,7 +537,7 @@ impl<E: CopyEngine, M: Clone + Default> PrefixCache<E, M> {
                 } else { break resume; }
             }
         } else {
-            self.device_media_hit(tokens, media, sampled).0.map_or(0, |h| h.resume)
+            self.device_media_hit(tokens, media, sampled, false).0.map_or(0, |h| h.resume)
         };
         let host = self.host.as_ref().and_then(|host| {
             if media.is_empty() {
@@ -555,23 +555,24 @@ impl<E: CopyEngine, M: Clone + Default> PrefixCache<E, M> {
     pub fn peek_media_compatible(&self, tokens: &[u32], media: &[MediaSpan], sampled: bool,
         compatible: &dyn Fn(&M, usize) -> bool) -> usize {
         if !self.enabled() { return 0; }
-        let device = self.device_compatible_hit(tokens, media, sampled, compatible).map_or(0, |h| h.resume);
+        let device = self.device_compatible_hit(tokens, media, sampled, compatible, false).map_or(0, |h| h.resume);
         let host = self.host_compatible_hit(tokens, media, sampled, compatible).map_or(0, |h| h.1);
         device.max(host)
     }
 
     fn device_compatible_hit(&self, tokens: &[u32], media: &[MediaSpan], sampled: bool,
-        compatible: &dyn Fn(&M, usize) -> bool) -> Option<Hit> {
-        self.device_hit_excluding(tokens, media, sampled, compatible, &[])
+        compatible: &dyn Fn(&M, usize) -> bool, allow_missing_exact: bool) -> Option<Hit> {
+        self.device_hit_excluding(tokens, media, sampled, compatible, &[], allow_missing_exact)
     }
 
     fn device_hit_excluding(&self, tokens: &[u32], media: &[MediaSpan], sampled: bool,
-        compatible: &dyn Fn(&M, usize) -> bool, rejected: &[EntryId]) -> Option<Hit> {
-        self.entries.iter().filter(|(id, entry)| !rejected.contains(id) && self.mark_available(entry))
+        compatible: &dyn Fn(&M, usize) -> bool, rejected: &[EntryId], allow_missing_exact: bool) -> Option<Hit> {
+        self.entries.iter().filter(|(id, _)| !rejected.contains(id))
             .filter_map(|(&id, entry)| {
             let (resume, common, _) = media_resume(self.layout.rule, tokens, media, &entry.tokens,
                 &entry.media, &entry.after, sampled);
-            (resume > 0 && compatible(&entry.meta, entry.len())).then_some((
+            (resume > 0 && self.candidate_available(entry, common, allow_missing_exact)
+                && compatible(&entry.meta, entry.len())).then_some((
                 (resume, entry.kind == SnapshotKind::Turn, entry.last_use),
                 Hit { id, kind: entry.kind, resume, common, frontier: entry.len() }))
         }).max_by_key(|(rank, _)| *rank).map(|(_, hit)| hit)
@@ -596,15 +597,15 @@ impl<E: CopyEngine, M: Clone + Default> PrefixCache<E, M> {
         }).max_by_key(|(rank, _)| *rank).map(|(_, hit)| hit)
     }
 
-    fn device_media_hit(&self, tokens: &[u32], media: &[MediaSpan], sampled: bool) -> (Option<Hit>, u64) {
+    fn device_media_hit(&self, tokens: &[u32], media: &[MediaSpan], sampled: bool, allow_missing_exact: bool) -> (Option<Hit>, u64) {
         let mut best = None;
         let mut rank = (0, false, 0);
         let mut collisions = 0;
         for (&id, entry) in &self.entries {
-            if !self.mark_available(entry) { continue; }
             let (resume, common, collision) = media_resume(self.layout.rule, tokens, media, &entry.tokens,
                 &entry.media, &entry.after, sampled);
             collisions += u64::from(collision);
+            if !self.candidate_available(entry, common, allow_missing_exact) { continue; }
             let candidate = (resume, entry.kind == SnapshotKind::Turn, entry.last_use);
             if resume > 0 && candidate > rank {
                 rank = candidate;
@@ -616,7 +617,7 @@ impl<E: CopyEngine, M: Clone + Default> PrefixCache<E, M> {
 
     fn lookup_media(&mut self, tokens: &[u32], media: &[MediaSpan], sampled: bool) -> Option<Hit> {
         if media.is_empty() { return self.lookup(tokens, sampled); }
-        let (hit, collisions) = self.device_media_hit(tokens, media, sampled);
+        let (hit, collisions) = self.device_media_hit(tokens, media, sampled, true);
         self.stats.media_key_collisions += collisions;
         if let Some(hit) = hit {
             self.clock += 1;
@@ -1210,6 +1211,10 @@ impl<E: CopyEngine, M: Clone + Default> PrefixCache<E, M> {
             || entry.host_mark.is_some_and(|key| self.host.as_ref().is_some_and(|h| h.payload(key).is_some()))
     }
 
+    fn candidate_available(&self, entry: &Entry<M>, common: usize, allow_missing_exact: bool) -> bool {
+        self.mark_available(entry) || (self.layout.rule.partial() && (common < entry.len() || allow_missing_exact))
+    }
+
     fn sync_host_references(&mut self) {
         if let Some(host) = &mut self.host {
             host.set_device_references(self.entries.values().filter_map(|e| e.host_mark));
@@ -1217,11 +1222,14 @@ impl<E: CopyEngine, M: Clone + Default> PrefixCache<E, M> {
     }
 
     /// Residency is the host tier's ownership contract. Retire stale device entries before
-    /// selection, so their pages return once and lookup can find an exact ancestor.
+    /// exact-only selection. Partial families retain their independently reusable KV pages.
     fn retire_missing_marks<F: PrefixFamily<M>>(&mut self, family: &F) -> Result<bool, PrefixError> {
         let stale: Vec<_> = self.entries.iter().filter(|(_, entry)| !self.mark_available(entry))
             .map(|(&id, _)| id).collect();
         let retired = !stale.is_empty();
+        // Partial families can still replay from the entry's KV pages without its mark.
+        // An exact admission tries it once and reports MarkUnavailable instead.
+        if self.layout.rule.partial() { return Ok(retired); }
         for id in stale {
             self.stats.mark_restore_misses += 1;
             self.evict(family, id)?;

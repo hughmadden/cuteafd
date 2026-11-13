@@ -93,3 +93,46 @@ fn host_mark_segment_failure_retries_shallower_ancestor_after_clean_release() {
     cache.clear(&fake).unwrap();
     assert_eq!((cache.pool().free(), cache.arena().in_use()), (64, 0));
 }
+
+#[test]
+fn missing_host_mark_preserves_partial_pages_but_exact_restore_falls_back() {
+    let mut fake = Fake::new(64, 2, 8);
+    fake.rule = ReuseRule { align: 2, replay: Some(WINDOW) };
+    let host = HostConfig { bytes: 320, chunk_bytes: 64, min_tokens: 1, ..HostConfig::default() };
+    let mut cache = PrefixCache::new(fake.layout(), config(8, 8), Some((host, Shared(fake.mem.clone())))).unwrap();
+    let saved = seq(100, 24);
+    // Three chunks of pages plus the tail chunk fill the quota. The unrelated
+    // snapshot's next two page slabs must evict the only (device-referenced) key.
+    for tokens in [&saved, &seq(900, 24)] {
+        let mut p = cache.admit_cold(&fake, tokens.len(), tokens.len(),
+            |pages| Placement { pages, ring: 0, len: 0, ring_from: 0 }).unwrap().placement;
+        let logits = fake.forward(&mut p, tokens).unwrap();
+        cache.capture(&fake, SnapshotKind::Prompt, tokens, &p, After::from_logits(&logits, true)).unwrap();
+        fake.mem.borrow_mut().advance(10_000_000);
+        cache.tick();
+        cache.release(&fake, &p.pages).unwrap();
+    }
+    assert_eq!(cache.stats().host.unwrap().device_reference_evictions, 1);
+    let mut divergent = saved[..20].to_vec();
+    divergent.extend(seq(500, 4));
+    assert_eq!(cache.peek(&divergent, false), 12);
+    let admitted = cache.admit(&fake, &divergent, 24, false,
+        |pages| Placement { pages, ring: 1, len: 0, ring_from: 0 }).unwrap();
+    assert_eq!(admitted.resume, 12, "aligned common prefix minus replay");
+    assert!(admitted.source.unwrap().partial);
+    assert_eq!(admitted.placement.ring_from, 12, "mark=None restarts positional state");
+    assert_eq!(cache.stats().mark_restore_misses, 0);
+    assert_eq!(cache.stats().entries_prompt, 2, "missing mark must not retire valid pages");
+    let mut p = admitted.placement;
+    fake.forward(&mut p, &divergent).unwrap();
+    cache.release(&fake, &p.pages).unwrap();
+    assert_eq!(cache.peek(&saved, false), 0, "peek cannot promise a missing exact mark");
+    let admitted = cache.admit(&fake, &saved, 24, false,
+        |pages| Placement { pages, ring: 1, len: 0, ring_from: 0 }).unwrap();
+    assert_eq!(admitted.resume, 0);
+    assert_eq!((cache.stats().mark_restore_misses, cache.stats().fork_no_room), (1, 0));
+    assert_eq!(cache.stats().entries_prompt, 2);
+    cache.release(&fake, &admitted.placement.pages).unwrap();
+    cache.clear(&fake).unwrap();
+    assert_eq!((cache.pool().free(), cache.arena().in_use()), (64, 0));
+}
