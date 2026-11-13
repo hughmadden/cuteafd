@@ -58,6 +58,57 @@ fn fp8_plan(lib: &NativeLibrary, rows: u32, k: u32, n: u32) -> Result<u64> {
     Ok(plan.info().scratch_bytes)
 }
 
+fn check_fp8_head_scratch(
+    programs: &cuteafd_loader::placement::families::deepseek_v41::owners::NativePrograms<'_>,
+    rows: usize, vocabulary: usize, runtime: usize,
+) -> Result<()> {
+    // The sweep creates FP8 W8A16 scratch explicitly, even when serving is
+    // configured for the packed head, whose native workspace is smaller.
+    let plan = programs.head_scratch(super::super::v41_tensors::Fp8Head::All, rows as u64, vocabulary as u64)?;
+    ensure!(plan == runtime as u64, "planner charges {plan} B, the head allocates {runtime} B");
+    Ok(())
+}
+
+#[test]
+fn startup_sweep_fp8_head_scratch_matches_native_layout_without_gpu() -> Result<()> {
+    use cuteafd_loader::placement::families::deepseek_v41::{owners::NativePrograms, resident::Fp8Head};
+
+    // Mirror cuteafd_fp8_w8a16_workspace's regions, including the two
+    // activation scale planes and the kScaleCols=256 reduction maxima.
+    // These belong to FP8 GEMV, not the exact packed head's B fragments.
+    let pass_rows = cuteafd_core::packed_head::PASS_ROWS;
+    let k = 5120u64;
+    let align = |bytes: u64| bytes.div_ceil(256) * 256;
+    let scales = align(2 * pass_rows * std::mem::size_of::<f32>() as u64);
+    let maxima = align(k.div_ceil(256) * pass_rows * std::mem::size_of::<f32>() as u64);
+    let fragments = align(k * pass_rows * std::mem::size_of::<u16>() as u64);
+    let manifest = serde_json::json!({}); // Vocabulary sizing needs no AOT programs or checkpoint.
+    let mut failures = Vec::new();
+    for sms in [114, 128, 170, 188, 1024] {
+        let programs = NativePrograms::new(&manifest, sms)?;
+        // Start with the reported failure, then cover shorter and multi-pass projections.
+        for rows in [64u64, 1, 8, 32, 128] {
+            for vocabulary in [64640u64, 129280] {
+                let splits = cuteafd_core::packed_head::gemv_splits(vocabulary, k, u64::from(sms));
+                let partials = if splits > 1 {
+                    align(splits * rows.min(pass_rows) * vocabulary * std::mem::size_of::<f32>() as u64)
+                } else { 0 };
+                let runtime = scales + maxima + fragments + partials;
+                assert_eq!(programs.head_scratch(Fp8Head::Packed, rows, vocabulary)?, fragments + partials);
+                let checked = check_fp8_head_scratch(&programs, rows as usize, vocabulary as usize, runtime as usize);
+                eprintln!("FP8 scratch rows={rows} vocab={vocabulary} sms={sms} runtime={runtime}: {checked:?}");
+                if let Err(error) = checked {
+                    failures.push(format!("rows {rows} vocab {vocabulary} sms {sms}: {error}"));
+                }
+                assert!(check_fp8_head_scratch(&programs, rows as usize, vocabulary as usize,
+                    (runtime + 256) as usize).is_err(), "the sweep must reject unequal extents");
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+    Ok(())
+}
+
 /// A 4 MiB native workspace, as the compressor and vocabulary owners allocate.
 fn workspace(lib: &NativeLibrary) -> Result<DeviceAllocation<'_>> {
     DeviceAllocation::new(lib, cuteafd_ffi::V41Compressor::WORKSPACE_BYTES, crate::shared::memory::TEST)
@@ -495,11 +546,8 @@ fn cuda_v41_two_rtx_startup_handles_create_at_planned_sizes() -> Result<()> {
             }));
             if let Some(scratch) = sweep.record("FP8 head scratch", format!("head {head} GPU{} rows {head_rows}", device.id),
                 device.run(|| crate::shared::fp8_linear::scratch(&lib, head_rows, &[(5120, 64640)]).map(|s| s.buffer.bytes))) {
-                sweep.record("plan == runtime", format!("FP8 head scratch rows {head_rows}"), (|| {
-                    let plan = programs.head_scratch(super::super::v41_tensors::fp8_head(), head_rows as u64, 64640)?;
-                    ensure!(plan == scratch as u64, "planner charges {plan} B, the head allocates {scratch} B");
-                    Ok(())
-                })());
+                sweep.record("plan == runtime", format!("FP8 head scratch rows {head_rows}"),
+                    check_fp8_head_scratch(&programs, head_rows, 64640, scratch));
             }
         }
         sweep.record("head normalization", format!("head {head}"), devices[1].run(|| {
@@ -696,11 +744,8 @@ fn cuda_v41_single_gpu_handles_create_at_every_exported_capacity() -> Result<()>
         for vocabulary in [64640, 129280] {
             if let Some(scratch) = sweep.record("FP8 head scratch", format!("rows {rows} vocab {vocabulary}"),
                 crate::shared::fp8_linear::scratch(&lib, rows, &[(5120, vocabulary)]).map(|s| s.buffer.bytes)) {
-                sweep.record("plan == runtime", format!("FP8 head scratch rows {rows} vocab {vocabulary}"), (|| {
-                    let plan = programs.vocabulary_scratch(rows as u64, vocabulary as u64)?;
-                    ensure!(plan == scratch.max(256) as u64, "planner charges {plan} B, the head allocates {scratch} B");
-                    Ok(())
-                })());
+                sweep.record("plan == runtime", format!("FP8 head scratch rows {rows} vocab {vocabulary}"),
+                    check_fp8_head_scratch(&programs, rows, vocabulary, scratch));
             }
             sweep.record("packed head workspace", format!("rows {rows} vocab {vocabulary}"),
                 lib.packed_head_workspace(rows, 5120, vocabulary).map(drop));
