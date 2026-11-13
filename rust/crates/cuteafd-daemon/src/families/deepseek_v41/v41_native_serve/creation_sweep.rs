@@ -94,23 +94,46 @@ fn serve_args(snapshot: &std::path::Path, native_lib: &std::path::Path, unit: u6
     Ok(crate::cli::NativeServeArgs::from_arg_matches(&matches)?)
 }
 
-/// The deployment plan `cuteafd plan --layout --rtx 2 --coordinator-arch ARCH
-/// --spark-ranks 4 --workspace-manifest DIR/PROGRAMS.json` makes of the fixture
-/// with the bring-up's settings, and the serve arguments the launcher derives.
-fn deployment(arch: cuteafd_core::GpuArch, directory: &std::path::Path, snapshot: &std::path::Path,
-    native_lib: &std::path::Path) -> Result<(cuteafd_loader::plan::PlanReport, crate::cli::NativeServeArgs)> {
+/// Parse the exact sweep plan argv without opening a checkpoint or a library.
+fn plan_args(arch: cuteafd_core::GpuArch, directory: &std::path::Path, snapshot: &std::path::Path)
+    -> Result<crate::cli::PlanArgs> {
     use clap::Parser;
     let cli = crate::cli::Cli::try_parse_from(["cuteafd", "plan",
         &snapshot.display().to_string(), "--layout", "--rtx", "2", "--coordinator-arch", arch.as_str(),
         "--spark-ranks", "4", "--available-sparks", "4", "--workspace-manifest",
         &directory.join("PROGRAMS.json").display().to_string(), "--speculator", "dspark", "--concurrency", "8",
-        "--context-tokens", "1048576", "--prefix-cache-entries", "20", "--pool-tokens", "0",
+        "--max-context-tokens", "1048576", "--prefix-cache-entries", "20", "--pool-tokens", "0",
         "--embedding-placement", "host"])?;
     let crate::cli::Commands::Plan(mut plan_args) = cli.command else { anyhow::bail!("expected the plan command") };
     // The launcher's global VISION=off and AUDIO=off, as main hands them to the plan.
     plan_args.vision = cuteafd_loader::plan::MediaMode::Off;
     plan_args.audio = cuteafd_loader::plan::MediaMode::Off;
-    let report = crate::commands::plan::v41_report_for_test(plan_args)?;
+    Ok(plan_args)
+}
+
+#[test]
+fn startup_sweep_plan_and_serve_argv_parse_without_gpu() -> Result<()> {
+    let directory = std::path::Path::new("native-fixture");
+    let snapshot = std::path::Path::new("snapshot-fixture");
+    for arch in [cuteafd_core::GpuArch::Sm89, cuteafd_core::GpuArch::Sm120] {
+        let plan = plan_args(arch, directory, snapshot)?;
+        assert_eq!(plan.context_tokens, Some(1048576));
+        assert_eq!(plan.rtx, 2);
+        let serve = serve_args(snapshot, &directory.join("libcuteafd_native.so"), 2752, 3, 8192)?;
+        assert_eq!(serve.max_context_tokens, 1048576);
+        assert_eq!(serve.rtx_gpus, 2);
+        assert_eq!((serve.prefill_batch_tokens, serve.prefill_waves, serve.prefill_reserve_rows),
+            (2752, 3, 8192));
+    }
+    Ok(())
+}
+
+/// The deployment plan `cuteafd plan --layout --rtx 2 --coordinator-arch ARCH
+/// --spark-ranks 4 --workspace-manifest DIR/PROGRAMS.json` makes of the fixture
+/// with the bring-up's settings, and the serve arguments the launcher derives.
+fn deployment(arch: cuteafd_core::GpuArch, directory: &std::path::Path, snapshot: &std::path::Path,
+    native_lib: &std::path::Path) -> Result<(cuteafd_loader::plan::PlanReport, crate::cli::NativeServeArgs)> {
+    let report = crate::commands::plan::v41_report_for_test(plan_args(arch, directory, snapshot)?)?;
     ensure!(report.executable(), "the {arch} plan is not executable:\n{}", cuteafd_loader::plan::render(&report));
     let (unit, waves, reserve) = (report.prefill_unit_rows.context("plan unit")?,
         report.prefill_waves.context("plan waves")?, report.prefill_reserve_rows.context("plan reserve")?);
