@@ -136,3 +136,38 @@ fn missing_host_mark_preserves_partial_pages_but_exact_restore_falls_back() {
     cache.clear(&fake).unwrap();
     assert_eq!((cache.pool().free(), cache.arena().in_use()), (64, 0));
 }
+
+#[test]
+fn failed_host_promotion_compares_host_ancestor_after_pending_device_publication() {
+    use cuteafd_hostcache::copy::CopyFault;
+    let family = Lagged::new(96, 2, 1);
+    let mut cache = lag_cache(&family, 8, 1 << 20);
+    for len in [24, 32] {
+        let (_, p) = lag_serve(&mut cache, &family, 0, &seq(100, len), len);
+        cache.release(&family, &p.pages).unwrap();
+        family.fake.mem.borrow_mut().advance(10_000_000);
+        cache.tick();
+    }
+    cache.clear(&family).unwrap();
+    let tokens = seq(100, 16);
+    let mut writer = cache.admit_cold(&family, 16, 16,
+        |pages| Placement { pages, ring: 0, len: 0, ring_from: 0 }).unwrap().placement;
+    let logits = family.fake.forward(&mut writer, &tokens).unwrap();
+    let Captured::Queued(ticket) = cache.queue_capture(&family, SnapshotKind::Prompt, &tokens, &[],
+        &writer, After::from_logits(&logits, true)).unwrap() else { panic!("queued capture") };
+    assert_eq!(cache.stats().entries_prompt, 0);
+    assert_eq!(cache.arena().in_use(), 1);
+    family.fake.mem.borrow_mut().inject(CopyFault::IssueFails(Stream::Restore));
+    let admitted = cache.admit(&family, &seq(100, 33), 36, false,
+        |pages| Placement { pages, ring: 1, len: 0, ring_from: 0 }).unwrap();
+    assert_eq!(admitted.resume, 24, "host ancestor outranks newly published device frontier 16");
+    assert!(admitted.source.unwrap().host);
+    assert!(cache.poll_capture(&family, ticket).unwrap());
+    assert_eq!((cache.stats().mark_restore_misses, cache.stats().fork_no_room), (1, 0));
+    let mut p = admitted.placement;
+    family.fake.forward(&mut p, &seq(100, 33)).unwrap();
+    cache.release(&family, &p.pages).unwrap();
+    cache.release(&family, &writer.pages).unwrap();
+    cache.clear(&family).unwrap();
+    assert_eq!((cache.pool().free(), cache.arena().in_use()), (96, 0));
+}

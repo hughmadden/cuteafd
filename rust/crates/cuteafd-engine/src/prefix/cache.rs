@@ -410,7 +410,8 @@ impl<E: CopyEngine, M: Clone + Default> PrefixCache<E, M> {
                 };
                 // Keep the normal device-first fast path. After a failed candidate, compare
                 // both tiers by saved work instead of giving up or retrying that candidate.
-                let host = if missing_marks || hit.is_none() || compatible.is_some() || !rejected.is_empty() {
+                let host = if missing_marks || hit.is_none() || compatible.is_some()
+                    || !rejected.is_empty() || !rejected_host.is_empty() {
                     if compatible.is_none() && media.is_empty() && rejected_host.is_empty() {
                         // Preserve radix lookup for the first text candidate; only retries
                         // need to search around an excluded host key.
