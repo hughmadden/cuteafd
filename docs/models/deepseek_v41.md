@@ -119,9 +119,14 @@ If completion cannot be established on either side, the request fails fatally:
 its lease, source storage, draft slots and capture storage remain quarantined
 for shutdown, with no cold restart or recycling. Queued captures reserve their
 source owners before enqueue and drain their own target and draft capture lanes
-on failure; ordinary-stream completion alone cannot release them. Fatal capture
-errors stop the current prefill round and turn retirement before further serving
-or admission. Image prompts prepare all missing image features before staging,
+on failure; ordinary-stream completion alone cannot release them. A failed wait
+for a peer's queued capture under mark pressure makes that owning ticket fatal
+and quarantines its source identity, rather than the waiting request's. Fatal
+capture errors stop the current prefill round and further admission. Independent
+lanes finish work already in flight, then check the shared stop flag between
+retirements and before selecting another decode round; they start no further
+retirement captures or decode rounds after observing that stop. Image prompts
+prepare all missing image features before staging,
 including cached images needed by that fallback, and move them across re-admission.
 Cancellation between stages releases the request through the ordinary queue path
 after the synchronous copies have drained. A failed drain follows the fatal
@@ -141,7 +146,8 @@ through all layers. Native initialized-state equality, cancellation and failure
 ordering, fidelity and replay throughput require GPU qualification. This includes
 initialized draft-ring bytes and ends at B and after restore (the target/Engram
 state hashes do not cover draft rings), same-end Prompt/Turn identity, and queued
-copy failures with successful and failed target/draft drains.
+copy failures with successful and failed target/draft drains, including mark-pressure
+waits and a peer suspended in retirement when the fatal stop is raised.
 
 ## Known limits
 
