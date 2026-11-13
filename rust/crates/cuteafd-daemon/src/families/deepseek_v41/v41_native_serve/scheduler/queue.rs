@@ -80,6 +80,74 @@ mod tests {
     use std::rc::Rc;
     use std::time::Duration;
 
+    // Exact cached prompts already have their scores: their next chunk can
+    // complete immediately, without a checkpoint or native execution.
+    struct CachedLaneHost { active: Vec<Option<crate::shared::console::Ticket>> }
+    impl Host<crate::shared::console::Ticket, ()> for CachedLaneHost {
+        type Output = ();
+        fn run(&mut self, _: &mut crate::shared::console::Ticket, _: &mut ()) -> Result<Option<()>> {
+            Ok(Some(()))
+        }
+        fn admit(&mut self, slot: usize, ticket: crate::shared::console::Ticket, _: ()) -> Result<()> {
+            assert!(self.active[slot].is_none());
+            self.active[slot] = Some(ticket);
+            Ok(())
+        }
+        fn fail(&mut self, _: crate::shared::console::Ticket, error: anyhow::Error) -> Result<()> { Err(error) }
+        fn rest(&self) {}
+    }
+
+    #[test]
+    fn cached_c8_prefills_join_within_lane_capacity_after_survivor_rebalance() -> Result<()> {
+        use crate::shared::console::Ticket;
+        use crate::shared::serve::lanes::{rebalance, LaneSet};
+        use cuteafd_loader::plan::decode_lanes::assign;
+        let slots = 8usize;
+        for retired in 0..4 {
+            let mut host = CachedLaneHost { active: (0..slots).map(|_| None).collect() };
+            let mut prefills = PrefillQueue::new(0.2);
+            let mut loads = [0; 2];
+            // Staggered completions leave lane-zero requests decoding and
+            // lane-one requests queued, with a balanced combined population.
+            for slot in 0..slots {
+                let lane = assign(loads);
+                loads[lane] += 1;
+                let ticket = Ticket::new(slot as u64, lane as u8, None);
+                if lane == 0 { host.active[slot] = Some(ticket); }
+                else { prefills.push(Queued { slot, request: Some(ticket), cursor: () }); }
+            }
+            for slot in (0..slots).step_by(2).take(retired) { host.active[slot] = None; }
+            // The production admission boundary: pending tickets are counted
+            // by the same helper the scheduler calls and keep their identity.
+            loads = rebalance(&mut host.active,
+                prefills.iter().filter_map(Queued::request).map(Ticket::lane),
+                |entry| entry.as_ref().map(Ticket::lane),
+                |entry, lane| entry.as_mut().unwrap().set_lane(lane));
+            assert!(prefills.iter().filter_map(Queued::request).all(|ticket| ticket.lane() == 1));
+            for slot in (0..slots).step_by(2).take(retired) {
+                let lane = assign(loads);
+                loads[lane] += 1;
+                prefills.push(Queued { slot, request: Some(Ticket::new((slots + slot) as u64, lane as u8, None)), cursor: () });
+            }
+            // All short cache hits finish in the same real queue round.
+            for (_, result) in prefills.round(|entry| chunk(&mut host, entry)) { result?; }
+            assert!(prefills.is_empty());
+            assert_eq!(host.active.iter().flatten().count(), slots);
+            let set = LaneSet::default();
+            let check = |lane| {
+                let members = host.active.iter().flatten().filter(|ticket| ticket.lane() == lane).count();
+                async move {
+                    anyhow::ensure!(members <= slots.div_ceil(2),
+                        "independent lane exceeds request capacity: lane {lane}, members {members}, slots {slots}");
+                    Ok(())
+                }
+            };
+            tokio::runtime::Builder::new_current_thread().build()?.block_on(
+                set.run(|lease| check(lease.index()), |lease| check(lease.index())))?;
+        }
+        Ok(())
+    }
+
     /// A V4.1-shaped driver: the real `prompt_units` call plan, recording
     /// each executed call's rows, `(prompt, start..end)`.
     struct Driver { tokens: usize, rows: usize, waves: usize, id: usize, log: Rc<RefCell<Vec<(usize, Range<usize>)>>>,

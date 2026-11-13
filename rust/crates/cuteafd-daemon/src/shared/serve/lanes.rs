@@ -86,12 +86,17 @@ async fn paced<F: Future>(mut future: std::pin::Pin<&mut F>) -> F::Output {
     }).await
 }
 
-/// Balance a drained request cohort before admission. Preserve the first
-/// survivor migration and lane-zero tie break. Call only after both lanes
-/// release their outstanding device and transport work.
-pub(crate) fn rebalance<T>(entries: &mut [T], lane: impl Fn(&T) -> Option<usize>,
+/// Balance a drained cohort before admission, including pending prompts whose
+/// announced lanes stay fixed. Only active survivors may migrate; counting
+/// pending lanes first prevents their later promotion from overfilling a lane.
+/// Preserve the first survivor migration and lane-zero tie break. Call only
+/// after both lanes release their outstanding device and transport work.
+/// If the heavier lane has only fixed pending prompts, it cannot be balanced
+/// further; admission fills the lighter lane from the returned combined loads.
+pub(crate) fn rebalance<T>(entries: &mut [T], pending: impl Iterator<Item = usize>, lane: impl Fn(&T) -> Option<usize>,
     set_lane: impl Fn(&mut T, usize)) -> [usize; 2] {
     let mut loads = [0usize; 2];
+    for index in pending { loads[index] += 1; }
     for entry in entries.iter() {
         if let Some(index) = lane(entry) { loads[index] += 1; }
     }
@@ -235,13 +240,48 @@ mod tests {
                 loads[1 - heavy] += 1;
             }
             let mut actual = original;
-            assert_eq!(rebalance(&mut actual, |entry| *entry,
+            assert_eq!(rebalance(&mut actual, std::iter::empty(), |entry| *entry,
                 |entry, index| *entry = Some(index)), loads);
             assert_eq!(actual, expected);
             let unchanged = actual.clone();
-            assert_eq!(rebalance(&mut actual, |entry| *entry,
+            assert_eq!(rebalance(&mut actual, std::iter::empty(), |entry| *entry,
                 |entry, index| *entry = Some(index)), loads);
             assert_eq!(actual, unchanged);
+        }
+    }
+
+    #[test]
+    fn fixed_pending_lanes_preserve_capacity_for_every_supported_concurrency() {
+        use cuteafd_loader::plan::decode_lanes::assign;
+        for slots in 1usize..=64 {
+            let capacity = slots.div_ceil(2);
+            // Every legal fixed pending distribution and every full active
+            // distribution, even one that needs survivor migration to fit.
+            for pending in 0..=slots {
+                for pending_zero in pending.saturating_sub(capacity)..=pending.min(capacity) {
+                    let fixed = [pending_zero, pending - pending_zero];
+                    let remaining = slots - pending;
+                    for active_zero in 0..=remaining {
+                        let mut active: Vec<_> = (0..remaining).map(|i| Some(usize::from(i >= active_zero))).collect();
+                        let loads = rebalance(&mut active,
+                            std::iter::repeat_n(0, fixed[0]).chain(std::iter::repeat_n(1, fixed[1])),
+                            |entry| *entry, |entry, lane| *entry = Some(lane));
+                        let mut counted = fixed;
+                        for lane in active.iter().flatten() { counted[*lane] += 1; }
+                        assert_eq!(loads, counted);
+                        assert_eq!(loads.iter().sum::<usize>(), slots);
+                        assert!(loads.iter().all(|&load| load <= capacity), "slots={slots} fixed={fixed:?} loads={loads:?}");
+                        // Retire survivors, then refill their slots through the
+                        // real admission rule using the returned combined loads.
+                        let mut loads = loads;
+                        for lane in active.iter().flatten() { loads[*lane] -= 1; }
+                        for _ in 0..remaining {
+                            loads[assign(loads)] += 1;
+                            assert!(loads.iter().all(|&load| load <= capacity));
+                        }
+                    }
+                }
+            }
         }
     }
 

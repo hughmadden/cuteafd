@@ -986,10 +986,9 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
         // Their units are free for admission and the reservation round only once reclaimed.
         prefixes.reclaim(requests, draft.as_deref_mut())?;
         let mut loads = crate::shared::serve::lanes::rebalance(&mut active,
+            prefills.iter().filter_map(|queued| queued.request()).map(|waiting| waiting.ticket.lane()),
             |entry| entry.as_ref().map(Active::lane),
             |entry, lane| entry.as_mut().unwrap().ticket.set_lane(lane));
-        // Queued prompts keep the lane they were announced on and decode there.
-        for waiting in prefills.iter().filter_map(|queued| queued.request()) { loads[waiting.ticket.lane()] += 1; }
         // Admit available work at a completed boundary (both lanes drained):
         // admitted prompts join the decode-share queue holding their slots.
         let mut intake = receive.len().max(1);
@@ -2937,7 +2936,12 @@ mod sampling_tests {
         // A prompt deferred behind a pending snapshot wakes the lanes (#976 review A2).
         assert!(serve.contains("host_pending: (!media.full() && !media.backlog.is_empty()) || !prefix_waiters.is_empty(),"));
         // Queued prompts decode on the lane they were announced on (review A4).
-        assert!(serve.contains("for waiting in prefills.iter().filter_map(|queued| queued.request()) { loads[waiting.ticket.lane()] += 1; }"));
+        let rebalance = serve.find("crate::shared::serve::lanes::rebalance(&mut active,").unwrap();
+        let intake = serve.find("let mut intake =").unwrap();
+        assert!(rebalance < intake && intake < round);
+        assert!(serve[rebalance..intake].contains(
+            "prefills.iter().filter_map(|queued| queued.request()).map(|waiting| waiting.ticket.lane()),"),
+            "fixed queued lanes must count before survivor migration and admission");
         assert!(serve.contains("Ok((constraint, decoder, reserve)) => { loads[lane] += 1; prefills.push("));
         assert!(serve[round..decode].contains("prefills.settle("));
         let admit = &source[source.find("    fn admit(&mut self, slot: usize, waiting: Waiting<'a>").unwrap()..];
