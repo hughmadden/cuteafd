@@ -823,6 +823,26 @@ pub(crate) struct TransportCapabilitiesArgs {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn v41_defaults_to_one_boundary_and_keeps_shared_point_overrides() {
+        use clap::Parser;
+        let base = ["cuteafd", "serve-native", "--snapshot", "/model", "--native-lib", "/native.so"];
+        for (flags, boundaries, gap, cap) in [
+            (vec![], 1, 0, 4),
+            (vec!["--prefix-point-boundaries", "0"], 0, 0, 4),
+            (vec!["--prefix-point-boundaries", "2", "--prefix-point-gap", "8192", "--prefix-points-per-request", "3"], 2, 8192, 3),
+        ] {
+            let super::Commands::ServeNative(args) = super::Cli::try_parse_from(base.into_iter().chain(flags)).unwrap().command
+                else { unreachable!() };
+            assert_eq!((args.prefix.prefix_point_boundaries, args.prefix.prefix_point_gap, args.prefix.prefix_points_per_request),
+                (boundaries, gap, cap));
+        }
+        let super::Commands::ServeDsv4(args) = super::Cli::try_parse_from(
+            ["cuteafd", "serve-dsv4", "--snapshot", "/model", "--native-lib", "/native.so"]).unwrap().command
+            else { unreachable!() };
+        assert_eq!(args.prefix.prefix_point_boundaries, 0);
+    }
+
+    #[test]
     fn memory_policy_flags_parse_sizes_and_reject_percentages() {
         use clap::Parser;
         let cli = super::Cli::try_parse_from(["cuteafd", "--gpu-memory-cap", "32GiB", "--spark-memory-cap", "100GiB",
@@ -1489,6 +1509,7 @@ mod tests {
 }
 
 #[derive(Debug, Args)]
+#[command(mut_arg("prefix_point_boundaries", |arg| arg.default_value("1")))]
 pub(crate) struct NativeServeArgs {
     /// Count executed backbone expert routes by phase (disable with =false).
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set, num_args = 0..=1,

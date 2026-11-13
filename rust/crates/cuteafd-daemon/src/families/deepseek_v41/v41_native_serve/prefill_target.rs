@@ -770,6 +770,28 @@ mod prefill_tests {
     }
 
     #[test]
+    fn stages_cut_encoder_calls_and_lookahead_as_independent_whole_prompts() {
+        for resume in [0, 300] {
+            for boundary in [512, 513, 8191, 8192, 8193] {
+                let first = one_call_spans(boundary, resume, 2752, 2);
+                assert_eq!(first[0].start, resume);
+                assert_eq!(first.last().unwrap(), &(boundary..boundary));
+                assert!(first.iter().all(|call| call.end <= boundary));
+                let lookahead = prompt_units(resume, boundary, 2752, 2).unwrap();
+                assert_eq!(lookahead.ends.last(), Some(&(boundary as u64)));
+                assert!(lookahead.ends.iter().all(|&end| end <= boundary as u64));
+                // A >=128 suffix re-admitted from B follows the encoder route;
+                // its independent units start at B, then replay at P.
+                for suffix in [128, 129, 4096] {
+                    let second = one_call_spans(boundary + suffix, boundary, 2752, 2);
+                    assert_eq!(second[0].start, boundary);
+                    assert_eq!(second.last().unwrap(), &(boundary + suffix..boundary + suffix));
+                }
+            }
+        }
+    }
+
+    #[test]
     fn timing_ewma_is_per_kind_and_uses_elapsed_critical_path() {
         let mut times = V41PrefillTimes::default();
         times.observe(1, 512, Duration::from_micros(512));

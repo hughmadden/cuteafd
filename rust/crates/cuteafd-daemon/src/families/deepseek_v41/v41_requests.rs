@@ -309,6 +309,24 @@ impl<'a> Requests<'a> {
         if !units.is_empty() { self.released_units.push(units); }
         Ok(())
     }
+    /// Re-admit a drained complete frontier for an ordinary prefix restore. Image
+    /// features move with the request; source-unit references retire through the
+    /// prefix engine exactly as on normal release. No mark guard is relaxed.
+    pub fn restart(&mut self, lease: CacheLease) -> Result<CacheLease> {
+        self.cache.mark_meta(lease)?;
+        self.cache.ensure_releasable(lease)?;
+        let slot = lease_slot(&self.slots, lease)?;
+        let id = self.cache.request_id(lease)?;
+        let images = std::mem::take(&mut self.slots[slot].as_mut().unwrap().images);
+        self.image_requests -= usize::from(!images.is_empty());
+        self.release(lease)?;
+        let fresh = self.admit(slot, id)?;
+        if let Err(error) = self.attach_images(fresh, images) {
+            let _ = self.release(fresh);
+            return Err(error);
+        }
+        Ok(fresh)
+    }
     /// Moves whenever a request is released.
     pub fn release_epoch(&self) -> u64 { self.releases }
     pub fn release_if_present(&mut self, lease: CacheLease) -> Result<()> {

@@ -567,7 +567,7 @@ pub(crate) fn exercise_packed_prefill<'w, 'a: 'w>(
             max_tokens: 1, sampling: Default::default(), stop_token_ids: Vec::new(), events, usage: None, probe: None };
         let images = super::prefix::media_keys(tokens, &[])?;
         let now = Instant::now();
-        admitted.push((admission::Prepared { job, prompt: tokens.to_vec(), images: Vec::new() },
+        admitted.push((admission::Prepared { job, prompt: tokens.to_vec(), images: Vec::new(), stages: Default::default() },
             id, lease, slot, images, (now, now)));
     }
     let members: Vec<PackMember<'_>> = admitted.iter().map(|(prepared, _, lease, ..)| (prepared, *lease, false)).collect();
@@ -624,6 +624,8 @@ pub(super) struct Waiting<'a> {
     /// Prompt rows its restored prefix covered, and that prefix's retained
     /// logits (a whole-prompt hit selects from them without a call).
     cached: usize,
+    /// Resume within the current complete-frontier stage; usage keeps the initial hit.
+    stage_cached: usize,
     hit_scores: Option<RetainedScores>,
     /// It carried images (their spans drop once their features are installed).
     images: bool,
@@ -662,15 +664,12 @@ impl<'w, 'a, P: ServingTarget<'w, 'a>> Round<'_, 'w, 'a, P> {
     fn release(&mut self, lease: CacheLease, id: u64) {
         round_failure::release_admission(&mut *self.requests, self.draft.as_deref_mut(), lease, id);
     }
-}
 
-impl<'w, 'a, P: ServingTarget<'w, 'a>> queue::Host<Waiting<'a>, super::prefill_target::V41Prefill<P::Suffix>>
-    for Round<'_, 'w, 'a, P> {
-    type Output = RetainedScores;
-    fn run(&mut self, waiting: &mut Waiting<'a>, cursor: &mut super::prefill_target::V41Prefill<P::Suffix>)
+    fn run_stage(&mut self, waiting: &mut Waiting<'a>, cursor: &mut super::prefill_target::V41Prefill<P::Suffix>)
         -> Result<Option<RetainedScores>> {
-        let Waiting { prepared, lease, cached, hit_scores, packed, .. } = waiting;
-        let (job, prompt, lease) = (&prepared.job, prepared.prompt.as_slice(), *lease);
+        let Waiting { prepared, lease, stage_cached: cached, hit_scores, packed, .. } = waiting;
+        let end = prepared.stages.end(prepared.prompt.len());
+        let (job, prompt, lease) = (&prepared.job, &prepared.prompt[..end], *lease);
         ensure!(!job.events.is_closed(), "client disconnected");
         let first_call = cursor.at_start();
         // A scoring probe scores before anything else (it never packs) and
@@ -703,6 +702,53 @@ impl<'w, 'a, P: ServingTarget<'w, 'a>> queue::Host<Waiting<'a>, super::prefill_t
             times: &mut *self.times, interleaved: true };
         queue::advance(&mut step, cursor, false)
     }
+}
+
+impl<'w, 'a, P: ServingTarget<'w, 'a>> queue::Host<Waiting<'a>, super::prefill_target::V41Prefill<P::Suffix>>
+    for Round<'_, 'w, 'a, P> {
+    type Output = RetainedScores;
+    fn run(&mut self, waiting: &mut Waiting<'a>, cursor: &mut super::prefill_target::V41Prefill<P::Suffix>)
+        -> Result<Option<RetainedScores>> {
+        loop {
+            let Some(scores) = self.run_stage(waiting, cursor)? else { return Ok(None); };
+            if !waiting.prepared.stages.has_points() { return Ok(Some(scores)); }
+            let end = waiting.prepared.stages.end(waiting.prepared.prompt.len());
+            self.requests.record_state(waiting.lease, &waiting.prepared.job.probe, "boundary")?;
+            self.prefixes.capture_session(waiting.prepared.job.usage.as_ref().map(|u| u.session_id().to_owned()));
+            // The driver's final replay and target/draft commits drained before
+            // it returned scores. Synchronous retention drains its mark copies.
+            let draft_request = draft_id(&self.draft, waiting.id);
+            let captured = self.prefixes.retain_frontier(self.requests, self.draft.as_deref_mut(), SnapshotKind::Prompt,
+                &waiting.image_keys.tokens()[..end], waiting.image_keys.spans(), &scores, waiting.lease, draft_request);
+            let captured = match captured {
+                Ok(done) => done,
+                Err(error) => { tracing::warn!(%error, "boundary capture failed; restarting prompt uncached"); false }
+            };
+            waiting.prepared.stages.completed(captured);
+            // No new work or release races a completed mark; a disconnected
+            // client leaves through the queue's ordinary release path.
+            ensure!(!waiting.prepared.job.events.is_closed(), "client disconnected");
+            let capacity = self.requests.units(waiting.lease)?.len() * UNIT_TOKENS;
+            waiting.lease = self.requests.restart(waiting.lease)?;
+            if let Some(draft) = self.draft.as_deref_mut() {
+                draft.release(waiting.id)?;
+                draft.admit(waiting.id)?;
+            }
+            let next = waiting.prepared.stages.end(waiting.prepared.prompt.len());
+            let media = cuteafd_engine::media::snapshot_media(next, waiting.image_keys.spans());
+            let draft_request = draft_id(&self.draft, waiting.id);
+            let restored = self.prefixes.admit(self.requests, self.draft.as_deref_mut(), waiting.lease,
+                draft_request, &waiting.image_keys.tokens()[..next],
+                &waiting.prepared.prompt[..next], &media, capacity, !captured, Some(end))?;
+            waiting.stage_cached = restored.cached;
+            waiting.hit_scores = restored.scores;
+            if self.requests.cache().stage(waiting.lease)? == crate::families::deepseek_v41::v41_backbone_cache::CacheStage::Full {
+                self.requests.record_state(waiting.lease, &waiting.prepared.job.probe, "boundary_restore")?;
+            }
+            *cursor = super::prefill_target::V41Prefill::new();
+            if !self.whole { return Ok(None); }
+        }
+    }
 
     fn admit(&mut self, slot: usize, waiting: Waiting<'a>, scores: RetainedScores) -> Result<()> {
         let Waiting { prepared, id, lease, image_keys, cached, images, mut ticket, mut constraint, decoder, reserve, .. } = waiting;
@@ -729,8 +775,8 @@ impl<'w, 'a, P: ServingTarget<'w, 'a>> queue::Host<Waiting<'a>, super::prefill_t
         let (anchor, next_after_commit) = match result {
             Ok(value) => value,
             Err(error) => return queue::Host::<_, super::prefill_target::V41Prefill<P::Suffix>>::fail(self,
-                Waiting { prepared: admission::Prepared { job, prompt, images: Vec::new() }, id, lease, image_keys,
-                    cached, hit_scores: None, images, ticket, constraint, decoder, packed: None, reserve }, error),
+                Waiting { prepared: admission::Prepared { job, prompt, images: Vec::new(), stages: Default::default() }, id, lease, image_keys,
+                    cached, stage_cached: cached, hit_scores: None, images, ticket, constraint, decoder, packed: None, reserve }, error),
         };
         // The lane it was announced on at admission (queued prompts count in `loads`).
         let lane = ticket.lane();
@@ -787,7 +833,7 @@ fn pack_waiting<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, runtim
         && entry.request().is_some_and(|w| w.packed.is_none());
     let members: Vec<PackMember<'_>> = waiting.iter().filter(|entry| fresh(entry)).map(|entry| {
         let w = entry.request().expect("queued prompts hold their request");
-        (&w.prepared, w.lease, w.cached > 0 || w.images)
+        (&w.prepared, w.lease, w.cached > 0 || w.images || w.prepared.stages.has_points())
     }).collect();
     if members.len() < 2 { return Ok(()); }
     if !whole {
@@ -835,6 +881,7 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
         ensure!(native_coordinator_exact_cap(&manifest)? == NATIVE_COORDINATOR_EXACT_CAP,
             "native coordinator exact cap differs from validated inventory");
     }
+    let markers = crate::shared::prefix::marker_ids(&args.snapshot, &super::prefix::points::MESSAGE_STARTS)?;
     let _capture_session = crate::shared::decode_graph::CaptureWatch::session();
     let _stall_watch = stall::spawn();
     let mut active: Vec<Option<Active<'a>>> = (0..args.concurrency).map(|_| None).collect();
@@ -1044,7 +1091,7 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
             };
             let events = prepared.job.events.clone();
             let admitted = (|| -> Result<_> {
-                let admission::Prepared { job, prompt, images } = &mut prepared;
+                let admission::Prepared { job, prompt, images, stages } = &mut prepared;
                 if let Some(draft) = draft.as_deref_mut() { draft.admit(id)?; }
                 let image_keys = super::prefix::media_keys(prompt, images)?;
                 if !images.is_empty() {
@@ -1055,8 +1102,20 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
                 // allocated here and the best snapshot restored into them.
                 let cold = crate::shared::probe::cold(&job.probe);
                 let draft_id = draft_id(&draft, id);
-                let restored = prefixes.admit(requests, draft.as_deref_mut(), lease, draft_id, image_keys.tokens(),
-                    prompt, image_keys.spans(), rows, cold)?;
+                let resume = if cold { 0 } else {
+                    prefixes.engine().peek_media(image_keys.tokens(), image_keys.spans(), true)
+                };
+                let planned = super::prefix::points::Stages::plan(prompt, &markers, image_keys.spans(), resume,
+                    args.prefill_batch_tokens as usize, args.prefix.prefix_cache_min_tokens, args.prefix.points());
+                let eligible = prefixes.engine().enabled() && !cold && packing_probe_allowed(&job.probe);
+                let has_marks = prefixes.engine().arena().slots() > 0;
+                if eligible && has_marks {
+                    *stages = planned;
+                }
+                let end = stages.end(prompt.len());
+                let stage_media = cuteafd_engine::media::snapshot_media(end, image_keys.spans());
+                let restored = prefixes.admit(requests, draft.as_deref_mut(), lease, draft_id, &image_keys.tokens()[..end],
+                    &prompt[..end], &stage_media, rows, cold, None)?;
                 job.prefix_cache_source.set(restored.cached, restored.source.as_ref().is_some_and(|source| source.host));
                 if let Some(probe) = job.probe.as_ref().filter(|probe| probe.spec.record_state) {
                     if let Some(source) = &restored.source {
@@ -1069,8 +1128,9 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
                 let hit = (restored.cached > 0).then_some((restored.cached, restored.scores));
                 let restore = (restore_started, Instant::now());
                 let resume = if images.is_empty() { prompt.len() } else {
-                    let source_end = requests.cache().committed_end(lease)? as usize;
-                    // Encode only when a span from the restored frontier on lacks features.
+                    let source_end = stages.image_prepare_from(requests.cache().committed_end(lease)? as usize);
+                    // Staged prompts also prepare cached images for a possible cold
+                    // restart after capture failure. Ordinary hits encode only the suffix.
                     if requests.images(lease)?.needed(source_end, prompt.len())?.is_empty() { prompt.len() } else { source_end }
                 };
                 Ok((image_keys, hit, restore, resume))
@@ -1118,7 +1178,7 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
             held_slots.insert(slot);
             // Its rows depend only on its tokens and restored frontier, both known
             // now: fetch them while it waits behind earlier members, packed or not.
-            start_admission_lookahead(requests, lease, &prepared.prompt, args);
+            start_admission_lookahead(requests, lease, &prepared.prompt[..prepared.stages.end(prepared.prompt.len())], args);
             admitted.push_back((prepared, id, lease, slot, image_keys, hit, restore));
         }
         prefix_waiters.extend(next_wave);
@@ -1126,7 +1186,7 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
         while let Some((prepared, id, lease, slot, image_keys, hit, restore)) = admitted.pop_front() {
             let lane = cuteafd_loader::plan::decode_lanes::assign(loads);
             let events = prepared.job.events.clone();
-            let admission::Prepared { job, prompt, images } = prepared;
+            let admission::Prepared { job, prompt, images, stages } = prepared;
             let mut ticket = console::Ticket::new(id, lane as u8, job.usage.clone());
             let (cached, hit_scores) = hit.map_or((0, None), |(end, scores)| (end, scores));
             let image_count = images.len();
@@ -1149,8 +1209,8 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
             match ready {
                 Ok((constraint, decoder, reserve)) => { loads[lane] += 1; prefills.push(queue::Queued { slot,
                     cursor: super::prefill_target::V41Prefill::new(),
-                    request: Some(Waiting { prepared: admission::Prepared { job, prompt, images: Vec::new() }, id, lease,
-                        image_keys, cached, hit_scores, images: image_count > 0, ticket, constraint, decoder,
+                    request: Some(Waiting { prepared: admission::Prepared { job, prompt, images: Vec::new(), stages }, id, lease,
+                        image_keys, cached, stage_cached: cached, hit_scores, images: image_count > 0, ticket, constraint, decoder,
                         packed: None, reserve }) }) }
                 Err(error) => {
                     let failure = error.downcast_ref::<cuteafd_api::openai::NativeFailure>()
@@ -2864,7 +2924,7 @@ mod sampling_tests {
         assert!(serve.contains("if let Some(started) = cycle { prefills.stepped("));
         assert_eq!(serve.matches("prefills.stepped(").count(), 1);
         // The previous whole-prompt prefill is the share-0 chunk.
-        let host = &source[source.find("    fn run(&mut self, waiting: &mut Waiting<'a>").unwrap()..];
+        let host = &source[source.find("    fn run_stage(&mut self, waiting: &mut Waiting<'a>").unwrap()..];
         let host = &host[..host.find("\n    }\n").unwrap()];
         assert!(host.contains("if self.whole ||") && host.contains("super::prefill(self.lib"), "{host}");
         assert!(host.contains("queue::advance(&mut step, cursor, false)"));
@@ -2878,6 +2938,29 @@ mod sampling_tests {
         assert!(serve.contains("+ prefills.len();"));
         assert!(serve.contains("media_slots: media.len() + prefills.len(),"));
         assert!(serve.contains("&& prefills.is_empty() { break; }"));
+    }
+
+    #[test]
+    fn staged_frontiers_publish_after_replay_and_restart_through_normal_admission() {
+        let source = include_str!("scheduler.rs");
+        let run = &source[source.find("    fn run(&mut self, waiting: &mut Waiting<'a>").unwrap()..];
+        let run = &run[..run.find("\n    }\n").unwrap()];
+        let completed = run.find("self.run_stage(waiting, cursor)?").unwrap();
+        let capture = run.find("self.prefixes.retain_frontier(").unwrap();
+        let cancel = run.find("ensure!(!waiting.prepared.job.events.is_closed()").unwrap();
+        let restart = run.find("self.requests.restart(waiting.lease)?").unwrap();
+        let restore = run.find("self.prefixes.admit(").unwrap();
+        assert!(completed < capture && capture < cancel && cancel < restart && restart < restore);
+        assert!(run.contains("draft.release(waiting.id)?") && run.contains("draft.admit(waiting.id)?"));
+        assert!(!run.contains(".sample("), "intermediate logits must not consume request RNG");
+        assert!(run.contains("waiting.prepared.stages.completed(captured)"));
+        assert!(run.contains("capacity, !captured, Some(end))?"), "capture failure must restart uncached");
+        let requests = include_str!("../v41_requests.rs");
+        let restart = &requests[requests.find("    pub fn restart(&mut self, lease:").unwrap()..];
+        let restart = &restart[..restart.find("\n    }\n").unwrap()];
+        assert!(restart.find("self.cache.ensure_releasable(lease)?").unwrap() < restart.find("self.release(lease)?").unwrap());
+        assert!(restart.find("std::mem::take(").unwrap() < restart.find("self.release(lease)?").unwrap());
+        assert!(restart.contains("self.attach_images(fresh, images)"));
     }
 
     /// The lanes stop at their first completed boundary past the debt: an independent

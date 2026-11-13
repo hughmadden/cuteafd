@@ -434,16 +434,22 @@ impl<'a> V41Cache<'a> {
     /// Admit a request leased at `lease` (fresh, its draft request admitted as `draft_id`):
     /// look `keys` up (media-keyed copy of `native`), allocate units for `capacity` tokens
     /// (its reservation: prompt plus a decode chunk), restore. Pool pressure is
-    /// `SourcePoolExhausted`; a restore that fails is a miss.
+    /// `SourcePoolExhausted`; a restore that fails is a miss. Internal staging
+    /// may require exactly `boundary`; external admission leaves selection unchanged.
     #[allow(clippy::too_many_arguments)]
     pub fn admit<C: DraftChain<'a>>(&mut self, requests: &mut Requests<'a>, mut draft: Option<&mut DraftRuntime<'_, 'a, C>>,
         lease: CacheLease, draft_id: Option<u64>, keys: &[u32], native: &[u32], media: &[MediaSpan], capacity: usize,
-        cold: bool) -> Result<Restored> {
+        cold: bool, boundary: Option<usize>) -> Result<Restored> {
         self.reclaim(requests, draft.as_deref_mut())?;
         let family = V41Prefix::new(requests, draft, &self.arenas);
         let build = |units: Vec<u32>| V41Placement { units, lease, draft: draft_id, len: 0, plan: None };
         let admitted = if cold || !self.cache.enabled() {
             self.cache.admit_cold(&family, keys.len(), capacity, build)
+        } else if let Some(boundary) = boundary {
+            // Internal staging restores precisely the frontier just captured,
+            // even if a peer retained a deeper ancestor while this stage ran.
+            let compatible = |meta: &V41Meta, _: usize| meta.request.backbone.end as usize == boundary;
+            self.cache.admit_native_compatible(&family, keys, native, media, capacity, true, Some(&compatible), build)
         } else {
             self.cache.admit_native(&family, keys, native, media, capacity, true, build)
         };
@@ -491,7 +497,16 @@ impl<'a> V41Cache<'a> {
     pub fn retain<C: DraftChain<'a>>(&mut self, requests: &mut Requests<'a>, draft: Option<&mut DraftRuntime<'_, 'a, C>>,
         kind: SnapshotKind, keys: &[u32], media: &[MediaSpan], next: &RetainedScores, lease: CacheLease, draft_id: Option<u64>)
         -> Result<()> {
-        if !self.cache.enabled() { return Ok(()); }
+        self.retain_frontier(requests, draft, kind, keys, media, next, lease, draft_id).map(drop)
+    }
+
+    /// The synchronous capture result, used by staged prefill to fall back cold
+    /// when no ordinary complete snapshot could be retained.
+    #[allow(clippy::too_many_arguments)]
+    pub fn retain_frontier<C: DraftChain<'a>>(&mut self, requests: &mut Requests<'a>, draft: Option<&mut DraftRuntime<'_, 'a, C>>,
+        kind: SnapshotKind, keys: &[u32], media: &[MediaSpan], next: &RetainedScores, lease: CacheLease, draft_id: Option<u64>)
+        -> Result<bool> {
+        if !self.cache.enabled() { return Ok(false); }
         let end = requests.cache().committed_end(lease)? as usize;
         ensure!(end > 0 && end <= keys.len(), "retained token frontier differs");
         let units = requests.units(lease)?.to_vec();
@@ -499,7 +514,7 @@ impl<'a> V41Cache<'a> {
         let after = After::from_logits(&next.logits()?, true);
         let family = V41Prefix::new(requests, draft, &self.arenas);
         self.cache.capture_media(&family, kind, &keys[..end], media, &placement, after)
-            .map(drop).map_err(|e| anyhow::anyhow!("{e}"))
+            .map_err(|e| anyhow::anyhow!("{e}"))
     }
     /// [`V41Cache::retain`] with its copies queued on capture lane `lane`; poll it with
     /// [`V41Cache::poll_retain`]. `Ok(false)` when nothing was queued.
@@ -605,6 +620,22 @@ mod tests {
             assert_eq!(ReuseRule::EXACT.skipped(common, frontier), 0, "{common}/{frontier}");
         }
         assert_eq!(ReuseRule::EXACT.skipped(777, 777), 777);
+    }
+
+    #[test]
+    fn each_stage_applies_the_existing_128_token_restore_rule() {
+        let tokens: Vec<u32> = (0..4096).collect();
+        for boundary in [512, 513, 1024, 1025] {
+            for suffix in [1, 37, 127, 128, 129] {
+                let route = selected(&[&tokens[..boundary]], &tokens[..boundary + suffix]).unwrap();
+                assert_eq!(route.snapshot_end, boundary);
+                assert_eq!(route.fidelity, if suffix < 128 { RestoreFidelity::ExactSnapshot }
+                    else { RestoreFidelity::ExactEncoderContinuation });
+                // The same snapshot can be a short first stage even if P is far away.
+                let first = selected(&[&tokens[..boundary]], &tokens[..boundary + 37]).unwrap();
+                assert_eq!(first.fidelity, RestoreFidelity::ExactSnapshot);
+            }
+        }
     }
 
     #[test]

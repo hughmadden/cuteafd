@@ -249,4 +249,83 @@ mod tests {
         assert_eq!(host.admitted, [(11, 1)]);
         assert!(host.log.borrow().iter().filter(|(id, _)| *id == 0).count() == 1, "no call after the cancel");
     }
+    struct StagedPrompt {
+        stages: super::super::super::prefix::points::Stages,
+        end: usize,
+        closed: bool,
+    }
+    struct StagedHost {
+        whole: bool,
+        capture_ok: bool,
+        log: Vec<(&'static str, usize)>,
+        active: bool,
+        releases: usize,
+        samples: usize,
+    }
+    impl Host<StagedPrompt, ()> for StagedHost {
+        type Output = usize;
+        fn run(&mut self, request: &mut StagedPrompt, _: &mut ()) -> Result<Option<usize>> {
+            loop {
+                anyhow::ensure!(!request.closed, "client disconnected");
+                let end = request.stages.end(request.end);
+                self.log.push(("complete_and_drain", end));
+                if !request.stages.has_points() { return Ok(Some(end)); }
+                self.log.push(("capture_and_drain", end));
+                request.stages.completed(self.capture_ok);
+                self.log.push((if self.capture_ok { "restore" } else { "cold" },
+                    if self.capture_ok { end } else { 0 }));
+                if !self.whole { return Ok(None); }
+            }
+        }
+        fn admit(&mut self, _: usize, request: StagedPrompt, output: usize) -> Result<()> {
+            assert!(!request.stages.has_points());
+            assert_eq!(request.end, output);
+            self.samples += 1;
+            self.active = true;
+            Ok(())
+        }
+        fn fail(&mut self, _: StagedPrompt, _: anyhow::Error) -> Result<()> {
+            self.releases += 1;
+            Ok(())
+        }
+        fn rest(&self) {}
+    }
+    fn staged(whole: bool, capture_ok: bool) -> (StagedHost, Queued<StagedPrompt, ()>) {
+        let mut tokens = vec![1; 1024]; tokens[900] = 7;
+        let stages = super::super::super::prefix::points::Stages::plan(&tokens, &[7], &[], 0, 256, 64,
+            cuteafd_engine::prefix::PointPolicy { gap: 0, boundaries: 1, per_request: 4 });
+        (StagedHost { whole, capture_ok, log: Vec::new(), active: false, releases: 0, samples: 0 },
+            Queued { slot: 0, request: Some(StagedPrompt { stages, end: tokens.len(), closed: false }), cursor: () })
+    }
+    #[test]
+    fn staged_queue_emits_and_samples_only_after_the_final_frontier() {
+        for whole in [false, true] {
+            let (mut host, mut entry) = staged(whole, true);
+            let first = chunk(&mut host, &mut entry).unwrap();
+            if !whole {
+                assert_eq!(first, Chunk::More);
+                assert!(!host.active && host.samples == 0);
+                assert_eq!(chunk(&mut host, &mut entry).unwrap(), Chunk::Done);
+            } else { assert_eq!(first, Chunk::Done); }
+            assert!(host.active && host.samples == 1 && host.releases == 0);
+            assert_eq!(host.log, [("complete_and_drain", 900), ("capture_and_drain", 900),
+                ("restore", 900), ("complete_and_drain", 1024)]);
+        }
+    }
+    #[test]
+    fn stage_capture_failure_serves_uncached_and_between_stage_cancellation_releases_once() {
+        let (mut host, mut entry) = staged(false, false);
+        assert_eq!(chunk(&mut host, &mut entry).unwrap(), Chunk::More);
+        assert_eq!(host.log.last(), Some(&("cold", 0)));
+        assert_eq!(chunk(&mut host, &mut entry).unwrap(), Chunk::Done);
+        assert!(host.active && host.samples == 1 && host.releases == 0);
+        let (mut host, mut entry) = staged(false, true);
+        assert_eq!(chunk(&mut host, &mut entry).unwrap(), Chunk::More);
+        entry.request.as_mut().unwrap().closed = true;
+        assert_eq!(chunk(&mut host, &mut entry).unwrap(), Chunk::Done);
+        assert_eq!(host.releases, 1);
+        assert!(!host.active && host.samples == 0 && entry.request.is_none());
+        assert_eq!(host.log.len(), 3, "no stage-two work after cancellation");
+    }
+
 }
