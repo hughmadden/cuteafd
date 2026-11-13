@@ -1134,6 +1134,7 @@ start_coordinator() {
 echo "== starting native RTX coordinator =="
 local -a args=(--vision "$VISION" --audio "$AUDIO" serve-native "${vision_args[@]}" --snapshot "$(readlink -f "$hf_home/$snapshot_rel")" --native-lib /opt/cuteafd/lib/libcuteafd_native.so --peers "$peers" --rtx-gpus "$RELEASE_RTX_GPUS" --embedding-placement "$EMBEDDING" --listen "$ADDR" --prefill-batch-tokens "$PREFILL_BATCH_TOKENS" --concurrency "$CONCURRENCY" --prefix-cache-entries "$PREFIX_CACHE_ENTRIES" --max-context-tokens "$MAX_CONTEXT_TOKENS" --max-output-tokens "$MAX_OUTPUT_TOKENS" --mapped-scale-preload-gib "$(get MAPPED_SCALE_PRELOAD_GIB 0)")
 [[ -z "$(get PREFIX_PARTIAL)" ]] || args+=(--prefix-partial "$v41_prefix_partial")
+args+=(--prefix-point-boundaries "$(get PREFIX_POINT_BOUNDARIES 1)")
 case "$(get EXPERT_USAGE on)" in
   on) args+=(--expert-usage) ;;
   off) args+=(--expert-usage=false) ;;

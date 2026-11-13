@@ -464,7 +464,7 @@ release_spark_role_budget() {
 }
 # DeepSeek V4.1 reads shell variables after release_load_config, not get().
 _v41_allowed_keys() {
-  printf '%s\n' PREFIX_PARTIAL
+  printf '%s\n' PREFIX_PARTIAL PREFIX_POINT_BOUNDARIES
   cat <<'EOF'
 EXPERT_USAGE
 ADDR

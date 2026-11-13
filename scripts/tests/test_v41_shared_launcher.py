@@ -138,6 +138,8 @@ def test_shared_launcher_matches_the_private_v41_path(case: str, tmp_root) -> No
             "--prefill-reserve-rows", value("--prefill-reserve-rows")] if role == "coordinator" else [])
         if role == "coordinator":
             expected_command.append("--expert-usage")
+            # Exact complete frontier before the generation message.
+            expected_command += ["--prefix-point-boundaries", "1"]
             # Serve admits resident weights against the planner's budget (captures
             # predate passing it and fell back to the 80 GiB default).
             assert len(planned_budget) == 1, where
@@ -763,3 +765,25 @@ def test_fork_reply_format_maps_to_both_phases_and_tier_refuses_compression(tmp_
         assert env[f'CUTEAFD_SPARK_{phase.upper()}_REPLY_FORMAT'] == expected
         for plan in result['plans']:
             assert plan[plan.index(f'--spark-{phase}-reply-format') + 1] == expected
+
+
+@pytest.mark.parametrize("value", [None, "0", "1", "2"])
+def test_v41_prefix_point_boundaries_default_and_override(tmp_root, monkeypatch, value) -> None:
+    import v41_launch_capture as capture_module
+
+    original = capture_module.example_config
+
+    def with_key(name, directory):
+        config = original(name, directory)
+        if value is not None:
+            config.write_text(config.read_text() + f"PREFIX_POINT_BOUNDARIES={value}\n")
+        return config
+
+    monkeypatch.setattr(capture_module, "example_config", with_key)
+    result = capture_module.capture(ROOT, "deepseek-v41-mxfp4-max")
+    command = parse_run(result["containers"][0]["argv"])["command"]
+    assert command.count("--prefix-point-boundaries") == 1
+    assert command[command.index("--prefix-point-boundaries") + 1] == ("1" if value is None else value)
+    assert not any("prefix-point" in arg for plan in result["plans"] for arg in plan)
+    for worker in result["containers"][1:]:
+        assert not any("prefix-point" in arg or "PREFIX_POINT" in arg for arg in worker["argv"])
