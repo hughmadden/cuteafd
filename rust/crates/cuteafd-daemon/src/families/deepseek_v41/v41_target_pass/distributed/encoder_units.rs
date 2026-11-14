@@ -449,3 +449,55 @@ impl<'w, 'a> DistributedTargetPass<'w, 'a> {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod placement_tests {
+    use super::*;
+    use crate::shared::prefill_pipeline::{prefill_schedule, sequence_units, Step};
+    use cuteafd_loader::placement::families::deepseek_v41::EncoderPlacement;
+
+    /// Exercise the shared executor's causal/FIFO schedule with three physical
+    /// slots, their reuse and an odd tail. This checks enqueue dependencies;
+    /// GPU event completion and payload lifetime require the native fixture.
+    #[test]
+    fn tail14_three_unit_schedule_retains_one_crossing_and_source20_frontier() -> Result<()> {
+        let map = EncoderPlacement::Tail14.resolve(2)?;
+        let units = sequence_units(6 * 2752 + 129, 2752, 3, 20)?;
+        let schedule = prefill_schedule(&[FfnRoute::Spark; 20], &units, 3)?;
+        let mut publication = vec![[false; 20]; units.len()];
+        let mut finished = vec![[false; 20]; units.len()];
+        let mut fifo = std::collections::VecDeque::new();
+        let mut hops = Vec::new();
+        let mut ended = Vec::new();
+        for step in schedule {
+            match step {
+                Step::Attention { layer, unit } => {
+                    if unit > 0 { assert!(publication[unit - 1][layer]); }
+                    if layer > 0 { assert!(finished[unit][layer - 1]); }
+                    if layer > 0 && map.attention(layer - 1)? != map.attention(layer)? {
+                        assert_eq!(layer, 14);
+                        hops.push((unit, units[unit].slot, units[unit].rows.len() * 40976));
+                    }
+                    publication[unit][layer] = true;
+                }
+                Step::Send { layer, unit } => fifo.push_back((layer, unit)),
+                Step::Land { layer, unit } => {
+                    assert_eq!(fifo.pop_front(), Some((layer, unit)));
+                    finished[unit][layer] = true;
+                }
+                Step::End { unit } => {
+                    assert!(finished[unit][19]);
+                    assert_eq!(map.attention(19)?, map.attention(20)?);
+                    ended.push(unit); // source20 must be produced before commit
+                }
+                Step::Commit { unit } => assert_eq!(ended.last(), Some(&unit)),
+                _ => {}
+            }
+        }
+        assert_eq!(hops.len(), units.len());
+        assert_eq!(hops.last().unwrap().2, 129 * 40976);
+        assert!(fifo.is_empty());
+        assert_eq!(ended, (0..units.len()).collect::<Vec<_>>());
+        Ok(())
+    }
+}
