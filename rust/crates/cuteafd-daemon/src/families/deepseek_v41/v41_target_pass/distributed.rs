@@ -1163,6 +1163,9 @@ mod tests {
             .unwrap_or(if option == cuteafd_loader::placement::families::deepseek_v41::EncoderPlacement::Tail14 { 14 } else { 20 });
         ensure!([14, 20].contains(&boundary), "unsupported fixture attention boundary");
         let map = CachePlacement::new(std::array::from_fn(|l| usize::from(l >= boundary)))?;
+        crate::families::deepseek_v41::graph_policy::set_encoder_placement(
+            if boundary == 14 { cuteafd_loader::placement::families::deepseek_v41::EncoderPlacement::Tail14 }
+            else { cuteafd_loader::placement::families::deepseek_v41::EncoderPlacement::Ced })?;
         eprintln!("loading placed backbone and auxiliary weights");
         let weights = BackboneLaneWeights::load_distributed(
             &lib,

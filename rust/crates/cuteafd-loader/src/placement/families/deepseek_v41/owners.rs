@@ -750,13 +750,14 @@ mod tests {
     #[test]
     fn tail14_owner_deltas_match_the_memory_worksheet() -> Result<()> {
         let mut manifest = manifest();
-        // Gate scratch from the native allocation worksheet/census, rather
-        // than this module's otherwise synthetic GEMM plans.
+        // Aggregate retained scratch from the native worksheet/census. The
+        // synthetic m1/m16 plans contribute 256 B each; m64 and m4096
+        // below supply the remainder, not a second copy of that total.
         for variant in manifest["variants"].as_array_mut().unwrap() {
             if variant["input_dim"] == 6144 && variant["output_dim"] == 25600 {
                 match variant["capacity"].as_u64() {
-                    Some(4096) => variant["scratch_bytes"] = 27_326_464u64.into(),
-                    Some(64) => variant["scratch_bytes"] = 587_776u64.into(),
+                    Some(4096) => variant["scratch_bytes"] = (27_326_464u64 - 587_776).into(),
+                    Some(64) => variant["scratch_bytes"] = (587_776u64 - 512).into(),
                     _ => {}
                 }
             }

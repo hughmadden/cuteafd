@@ -232,6 +232,7 @@ fn cuda_v41_two_rtx_startup_handles_create_at_planned_sizes() -> Result<()> {
     cuteafd_loader::plan::testing::write_v41_snapshot(fixture.path());
     let catalog = cuteafd_loader::read_official_v41_catalog(fixture.path())?;
     let (report, args) = deployment(arch, &directory, fixture.path(), &native_lib)?;
+    super::super::graph_policy::set_encoder_placement(args.v41_encoder_placement)?;
     let onboard = report.solver_placement.as_ref().context("plan placement")?.onboard_layers;
 
     // Serve's shapes, through its own resolution of those arguments.

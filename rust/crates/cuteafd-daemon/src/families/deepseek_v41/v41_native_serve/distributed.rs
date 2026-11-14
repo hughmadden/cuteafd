@@ -68,6 +68,13 @@ pub(super) fn worker(mut args: crate::cli::NativeServeArgs, mut receive: mpsc::R
     memory_checkpoint("before native preload")?;
     let inventory = crate::shared::inventory::RuntimeInventory::measure(&lib,&[0,1], crate::shared::inventory::InventoryPhase::PreWeight, |gpu| {
         admission::preload(&lib,capacity,2,catalog.nvfp4().is_some())?;
+        // Tail14 adds native Engram code on GPU1. Bind every real gate's
+        // projection plans before the context/module sample, so their load
+        // cannot consume the solved tier or fixed KV pool later.
+        if args.v41_encoder_placement == cuteafd_loader::placement::families::deepseek_v41::EncoderPlacement::Tail14
+            && (map.attention(1)? == gpu as usize || map.attention(14)? == gpu as usize) {
+            lib.v41_fp8_matrix_plan(capacity, 6144, 25600)?;
+        }
         Ok(())
     })?;
     memory_checkpoint("after native preload")?;

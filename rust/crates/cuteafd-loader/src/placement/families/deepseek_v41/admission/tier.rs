@@ -239,14 +239,34 @@ mod tests {
         for variant in fp8["variants"].as_array_mut().unwrap() {
             if variant["input_dim"] == 6144 && variant["output_dim"] == 25600 {
                 match variant["capacity"].as_u64() {
-                    Some(4096) => variant["scratch_bytes"] = 27_326_464u64.into(),
-                    Some(64) => variant["scratch_bytes"] = 587_776u64.into(),
+                    Some(4096) => variant["scratch_bytes"] = (27_326_464u64 - 587_776).into(),
+                    Some(64) => variant["scratch_bytes"] = (587_776u64 - 512).into(),
                     _ => {}
                 }
             }
         }
         let catalog = crate::read_official_v41_catalog(root.path())?;
         let prefill = PrefillShape { rows: 2752, waves: 3 };
+        let fixed_for = |option: EncoderPlacement| -> anyhow::Result<_> {
+            let layout = TargetLayout::new_for_arch(&catalog, Some(option.resolve(2)?.layers()), true,
+                Fp8Head::All, false, false, cuteafd_core::GpuArch::Sm89)?;
+            let mut fixed = owners::target_arena_demands(&layout);
+            fixed.extend(owners::NativePrograms::new(&fp8, 128)?.with_encoder_placement(option)
+                .target(64, 8256, 2752, 2, 3, 16, Fp8Head::All, false)?);
+            Ok((layout, fixed))
+        };
+        // The real serving baseline includes terminal/draft/transport owners
+        // absent from this header-only target fixture. Hold an unchanged
+        // terminal owner in both arms so GPU1 is the tight baseline device,
+        // as in the design's C16 worksheet. This is a controlled admission
+        // fixture, not a prediction of the full deployment's absolute tier.
+        let (_, baseline) = fixed_for(EncoderPlacement::Ced)?;
+        let cache = crate::serving_capacity::deepseek_v41_cache_bytes_with_placement(
+            &config, 2, 16, 4368, false, EncoderPlacement::Ced)?;
+        let totals: [u64; 2] = std::array::from_fn(|gpu| cache[gpu] + baseline.iter()
+            .filter(|owner| owner.gpu as usize == gpu).map(|owner| owner.bytes).sum::<u64>());
+        let terminal = totals[0].saturating_sub(totals[1]) + 32 * MIB;
+        eprintln!("fixture unchanged terminal owner on GPU1={terminal}");
         let run = |option, setting| -> anyhow::Result<AdmittedV41> {
             let mut fixture = input(&config, false);
             fixture.encoder_placement = option;
@@ -261,11 +281,9 @@ mod tests {
                 expert.whole.resident = 384 * 9_131_264 * 2;
                 for half in &mut expert.half { half.resident = 384 * 9_131_264; }
             }
-            let layout = TargetLayout::new_for_arch(&catalog, Some(option.resolve(2)?.layers()), true,
-                Fp8Head::All, false, false, cuteafd_core::GpuArch::Sm89)?;
-            let mut fixed = owners::target_arena_demands(&layout);
-            fixed.extend(owners::NativePrograms::new(&fp8, 128)?.with_encoder_placement(option)
-                .target(64, 8256, 2752, 2, 3, 16, Fp8Head::All, false)?);
+            let (layout, mut fixed) = fixed_for(option)?;
+            fixed.push(crate::placement::Demand::new(1, Category::Workspace,
+                "fixture unchanged terminal owners", terminal, Basis::Formula));
             for gpu in 0..2 {
                 let workspace = fixed.iter().filter(|d| d.gpu == gpu && d.category == Category::Workspace).map(|d| d.bytes).sum::<u64>();
                 eprintln!("{option} GPU{gpu} fixture target weights payload={} arena={} workspaces={workspace}",
@@ -282,8 +300,9 @@ mod tests {
         let mut tail = run(EncoderPlacement::Tail14, ExpertTierSetting::Auto)?;
         let counts = [ced.placement.expert_tier.as_ref().unwrap().experts,
             tail.placement.expert_tier.as_ref().unwrap().experts];
-        eprintln!("tail14 C16 fixture paired experts: ced={} tail14={} loss={}", counts[0], counts[1], counts[0] - counts[1]);
-        assert!((220..=260).contains(&(counts[0] - counts[1])));
+        let loss = counts[0].checked_sub(counts[1]).expect("GPU1-bound fixture must lose paired residency");
+        eprintln!("tail14 C16 fixture paired experts: ced={} tail14={} loss={loss}", counts[0], counts[1]);
+        assert!((220..=260).contains(&loss));
         assert_eq!(ced.placement.pool_tokens, 2 << 20);
         assert_eq!(tail.placement.pool_tokens, 2 << 20);
         assert_eq!(tail.solved.decisions.attention, EncoderPlacement::Tail14.resolve(2)?.modes());
