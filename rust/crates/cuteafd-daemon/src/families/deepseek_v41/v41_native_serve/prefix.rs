@@ -794,6 +794,26 @@ mod tests {
     }
 
     #[test]
+    fn tail14_f1b_restore_keeps_complete_logical_frontiers() {
+        use cuteafd_loader::placement::families::deepseek_v41::EncoderPlacement;
+        let tokens: Vec<u32> = (0..4096).collect();
+        let map = EncoderPlacement::Tail14.resolve(2).unwrap();
+        assert_eq!((map.attention(19).unwrap(), map.attention(20).unwrap()), (1, 1));
+        // The mark geometry and restore rule are logical, with no physical
+        // cut in their identity. Odd B also preserves the C2 carry frontier.
+        assert_eq!(super::super::super::v41_backbone_cache::BackboneMark::BYTES, 2_720_064);
+        for boundary in [512, 513, 1025] {
+            for difference in [127, 128, 129] {
+                let route = selected(&[&tokens[..boundary]], &tokens[..boundary + difference]).unwrap();
+                assert_eq!((route.snapshot_end, route.resume(), route.lag.source_end), (boundary, boundary, boundary));
+                assert_eq!(route.fidelity, if difference < 128 { RestoreFidelity::Exact }
+                    else { RestoreFidelity::ExactEncoderContinuation });
+                assert!(route.exact());
+            }
+        }
+    }
+
+    #[test]
     fn each_stage_applies_the_existing_128_token_restore_rule() {
         let tokens: Vec<u32> = (0..4096).collect();
         for boundary in [512, 513, 1024, 1025] {

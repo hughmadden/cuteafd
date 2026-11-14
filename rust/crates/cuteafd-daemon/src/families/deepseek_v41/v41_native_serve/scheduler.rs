@@ -228,6 +228,10 @@ pub(super) fn prepare_prefix_cache<'a>(lib: &'a NativeLibrary, args: &crate::cli
             tracing::warn!(conversations_50k, desired = args.concurrency + 4,
                 "host prefix quota holds fewer 50K conversations than concurrency plus four");
         }
+        // Preserve every segment's real device_id (source 14 moves under
+        // tail14); the copy engine routes per registered extent and joins all
+        // device streams before publishing host restores. Never infer a GPU
+        // from the canonical source index or the mark arena's GPU.
         let engine = crate::shared::prefix::CudaCopyEngine::registered_with_owners(lib,
             &requests.cache().source_buffers(), arenas.owners())?;
         tracing::info!(target: "cuteafd::host_cache", config = ?config, "host snapshot cache enabled");
