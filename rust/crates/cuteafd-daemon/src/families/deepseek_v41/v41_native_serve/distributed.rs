@@ -26,6 +26,7 @@ pub(super) fn worker(mut args: crate::cli::NativeServeArgs, mut receive: mpsc::R
     ready: &mut Option<oneshot::Sender<std::result::Result<(Option<std::sync::Arc<std::sync::atomic::AtomicBool>>, u32), anyhow::Error>>>,
     stats: std::sync::Arc<std::sync::Mutex<serde_json::Value>>) -> Result<()> {
     validate_expert_layers(args.rtx_expert_layers, args.gpu_expert_tier)?;
+    super::super::graph_policy::set_encoder_placement(args.v41_encoder_placement)?;
     // AOT kernels keep their full scratch; row storage follows live capacity.
     let capacity = cuteafd_core::coordinator_programs::v41_live_rows(args.prefill_batch_tokens)
         .context("invalid V4.1 prefill batch")?;
@@ -51,7 +52,7 @@ pub(super) fn worker(mut args: crate::cli::NativeServeArgs, mut receive: mpsc::R
             "the GPU expert tier holds native MXFP4 expert halves");
     }
 
-    let map = CachePlacement::encoder_decoder();
+    let map = args.v41_encoder_placement.resolve(2)?;
     let started = Instant::now();
     // Sum resident storage plus the largest transient loading excess.
     let format = crate::families::deepseek_v41::v41_experts::ExpertFormat::of(&catalog);
@@ -347,7 +348,7 @@ pub(super) fn worker(mut args: crate::cli::NativeServeArgs, mut receive: mpsc::R
     // replace or add owners the planner does not model.
     if !(args.tp2_attention || args.tp2_query_projection || args.tp2_output_projection) {
         admission::verify_target_charges(&lib, &args.native_lib, &[0, 1], decode_rows, reserve as u64, capacity, slots,
-            args.concurrency)?;
+            args.concurrency, args.v41_encoder_placement)?;
     }
     pass.install_attention_plan(attention_plan)?;
     second.install_attention_plan(attention_plan)?;

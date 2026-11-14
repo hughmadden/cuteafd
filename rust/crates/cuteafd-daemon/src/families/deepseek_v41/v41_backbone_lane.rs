@@ -850,7 +850,7 @@ impl<'w, 'a> BackboneLane<'w, 'a> {
             && !self.weights.split_query_b && !self.weights.split_output_b,
             "startup prototype requires idle unsplit target lanes");
         let prewarm: Vec<_> = if decode {
-            cuteafd_loader::serving_capacity::v41_graphs::v41_prewarm_rows(crate::families::deepseek_v41::graph_policy::ranks(), self.block.inputs()[0].device_id as usize, cuteafd_core::V41_VERIFY_ROWS)
+            crate::families::deepseek_v41::graph_policy::prewarm_rows(self.block.inputs()[0].device_id as usize, cuteafd_core::V41_VERIFY_ROWS)
                 .into_iter().map(|entry| entry.rows).collect()
         } else { super::graph_policy::prefill_prewarm_rows(self.block.inputs()[0].device_id as usize, self.capacity) };
         ensure!(prewarm.iter().all(|&row| row <= self.capacity) && (!decode || (sinks.len() == 40 && selections.len() == 40)),

@@ -1543,6 +1543,10 @@ pub(crate) struct NativeServeArgs {
     /// Force one RTX or the distributed two-RTX layout (automatic launcher selection is pending).
     #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..=2))]
     pub rtx_gpus: u32,
+    /// Process-lifetime V4.1 native placement (tail14 requires two RTX GPUs).
+    #[arg(long, default_value = "ced")]
+    pub v41_encoder_placement: cuteafd_loader::placement::families::deepseek_v41::EncoderPlacement,
+
     // Per-switch promotion/deletion evidence: https://github.com/tpurtell/cuteafd/issues/404.
     /// Experimental TP2 attention with replicated KV; requires two RTX GPUs.
     #[arg(long)]
@@ -1672,6 +1676,7 @@ fn plan_decode_rows(value: &str) -> Result<u64, String> {
 }
 
 impl NativeServeArgs {
+        v41_encoder_placement: Default::default(),
     pub fn adaptive_dspark(&self) -> bool {
         self.dspark && self.draft_length.draft_length.is_none()
     }

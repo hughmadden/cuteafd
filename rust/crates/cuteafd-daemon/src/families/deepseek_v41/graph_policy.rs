@@ -1,5 +1,6 @@
 //! Captured shapes per backbone layer, sharing the containing lane's buffers.
 use anyhow::{ensure, Result};
+use cuteafd_loader::placement::families::deepseek_v41::EncoderPlacement;
 
 pub(super) const MAX_DECODE_ROWS: u32 = cuteafd_core::V41_VERIFY_ROWS as u32;
 
@@ -23,12 +24,37 @@ pub(super) fn set_prefill_rows(rows: u32) -> Result<()> {
 thread_local! {
     // Startup owns a dedicated CUDA worker thread. Avoid threading a layout
     // field through every primitive owner; attach refreshes it before capture.
+    static PLACEMENT: std::cell::Cell<Option<EncoderPlacement>> = const { std::cell::Cell::new(None) };
     static RANKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+/// Bind graph eligibility before any weights/state/banks are constructed.
+/// Tail14 has no trace-qualified target inventory. Its target banks run eager,
+/// preserving the full existing per-device reserve for qualification; admission
+/// cannot spend graph headroom on extra experts. Unchanged expert/draft banks
+/// retain their physical layout and existing reserve. No request changes this key.
+pub(crate) fn set_encoder_placement(placement: EncoderPlacement) -> Result<()> {
+    PLACEMENT.with(|key| {
+        ensure!(key.get().is_none_or(|old| old == placement), "V4.1 graph placement cannot change in a live engine");
+        key.set(Some(placement));
+        Ok(())
+    })
+}
+fn target_inventory_qualified() -> bool {
+    PLACEMENT.with(|key| key.get().unwrap_or_default() == EncoderPlacement::Ced)
+}
+pub(crate) fn prewarm_rows(rank: usize, rows: usize) -> Vec<cuteafd_loader::serving_capacity::v41_graphs::V41PrewarmEntry> {
+    if !target_inventory_qualified() { return Vec::new(); }
+    cuteafd_loader::serving_capacity::v41_graphs::v41_prewarm_rows(ranks(), rank, rows)
+}
+pub(crate) fn joint_prewarm_rows(rows: usize) -> Vec<usize> {
+    if !target_inventory_qualified() { return Vec::new(); }
+    cuteafd_loader::serving_capacity::v41_graphs::v41_joint_prewarm_rows(ranks(), rows)
 }
 pub(crate) fn ranks() -> usize { RANKS.with(std::cell::Cell::get) }
 fn set_layout(ranks: usize) { RANKS.with(|layout| layout.set(ranks)); }
 
 pub(crate) fn pinned_shape(device: i32, rows: u32) -> bool {
+    if !target_inventory_qualified() { return false; }
     let Ok(rank) = usize::try_from(device) else { return false };
     let Some(list) = cuteafd_loader::serving_capacity::v41_graphs::v41_prewarm(ranks(), rank) else { return false };
     list.entries.iter().chain(&list.prefill_entries)
@@ -36,7 +62,7 @@ pub(crate) fn pinned_shape(device: i32, rows: u32) -> bool {
 }
 
 pub(super) fn captures_shape(rows: u32) -> bool {
-    large_shape_captured(rows, PREFILL_ROWS.get().copied())
+    target_inventory_qualified() && large_shape_captured(rows, PREFILL_ROWS.get().copied())
 }
 
 /// Only slot zero serves non-unit prompt, replay and continuation work.
@@ -47,6 +73,7 @@ pub(crate) const PREFILL_HEAD_PREWARM_ROWS: [usize; 1] = [1];
 /// Nonwindowed prompt/replay paths reach these exact row counts. Streamed
 /// encoder units have offset bindings and deliberately remain eager (#1638).
 pub(crate) fn prefill_prewarm_rows(rank: usize, capacity: usize) -> Vec<usize> {
+    if !target_inventory_qualified() { return Vec::new(); }
     prefill_rows(rank, capacity, PREFILL_ROWS.get().copied())
 }
 
@@ -99,6 +126,9 @@ pub(crate) fn attach(library: &cuteafd_ffi::NativeLibrary, ranks: usize,
     use crate::shared::decode_graph::device::{Basis, Cycle, Preference, Site};
     tracing::warn!("V4.1 graph cache uses byte estimates: SM120 node rates are not calibrated");
     set_layout(ranks);
+    if !target_inventory_qualified() {
+        tracing::warn!("tail14 target graphs stay eager pending a placement-specific inventory; existing per-device graph reserves remain held");
+    }
     visit(&mut |device, name, spans, bank| {
         let (base, extra) = cuteafd_loader::placement::graph_reserve::v41_default(ranks, device as usize);
         let policy = cuteafd_loader::placement::graph_reserve::current(device as usize,
@@ -122,6 +152,22 @@ mod tests {
     use cuteafd_ffi::NativeLibrary;
     use std::collections::BTreeMap;
     use crate::shared::memory::{DeviceAllocation, LoadStream};
+
+    #[test]
+    fn tail14_graph_key_is_fixed_and_never_borrows_target_pins_or_captures() {
+        std::thread::spawn(|| {
+            set_layout(2);
+            set_encoder_placement(EncoderPlacement::Tail14).unwrap();
+            set_encoder_placement(EncoderPlacement::Tail14).unwrap();
+            assert!(set_encoder_placement(EncoderPlacement::Ced).is_err());
+            for rows in [1, 16, 64, 128, 2752] { assert!(!captures_shape(rows)); }
+            assert!(prewarm_rows(0, 64).is_empty());
+            assert!(prewarm_rows(1, 64).is_empty());
+            assert!(joint_prewarm_rows(64).is_empty());
+            assert!(prefill_prewarm_rows(1, 2752).is_empty());
+            assert!(!pinned_shape(0, 64));
+        }).join().unwrap();
+    }
 
     #[test]
     fn layout_state_is_local_to_the_engine_thread_and_refreshes_on_restart() {
