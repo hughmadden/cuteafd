@@ -567,6 +567,10 @@ pub(crate) struct PlanArgs {
     /// V4.1 native dSpark routed-expert TP2; requires --layout, --rtx 2 and dSpark.
     #[arg(long, requires = "layout")]
     pub(crate) tp2_dspark_experts: bool,
+    /// V4.1 encoder ownership for --layout; config key V41_ENCODER_PLACEMENT.
+    #[arg(long, requires = "layout")]
+    pub(crate) v41_encoder_placement: Option<cuteafd_loader::placement::families::deepseek_v41::EncoderPlacement>,
+
     /// Split MiMo/Kimi/GLM Flash DFlash over both target GPUs (explicit false wins over config).
     #[arg(long, action = clap::ArgAction::Set)]
     pub(crate) tp2_dflash: Option<bool>,

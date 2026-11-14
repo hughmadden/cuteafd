@@ -53,6 +53,8 @@ pub(super) fn worker(mut args: crate::cli::NativeServeArgs, mut receive: mpsc::R
     }
 
     let map = args.v41_encoder_placement.resolve(2)?;
+    cuteafd_bench::context::set_resolved("v41-encoder-placement", &args.v41_encoder_placement.to_string());
+    tracing::info!(placement = %args.v41_encoder_placement, layers = ?map.layers(), "admitted V4.1 encoder ownership");
     let started = Instant::now();
     // Sum resident storage plus the largest transient loading excess.
     let format = crate::families::deepseek_v41::v41_experts::ExpertFormat::of(&catalog);

@@ -574,6 +574,9 @@ pub fn adopt_measured(
 pub fn adopt_measured_with_placement(config: &serde_json::Value, gpus: usize, slots: u64, retained_turns: u64,
     replicated: bool, maximum_pool_tokens: u64, plan: &mut ResolvedPlan, measured: &[MeasuredOccupancy],
     placement: super::EncoderPlacement) -> Result<AdoptedPool, Refusal> {
+    if placement.resolve(gpus).map_err(|error| invalid(&error.to_string()))?.modes() != plan.decisions.attention {
+        return Err(invalid("measured adoption encoder placement differs from admitted execution"));
+    }
     let tails = slots
         .checked_add(retained_turns.checked_mul(2).ok_or(Refusal::Overflow("V4.1 retained turns"))?)
         .ok_or(Refusal::Overflow("V4.1 private tails"))?;
@@ -1606,6 +1609,9 @@ impl Domains<'_> {
 
 impl Recipe for V41Recipe<'_> {
     fn prepare(&self, request: &Request) -> Result<Contract, Refusal> {
+        if self.encoder_placement.resolve(self.gpus).map_err(|error| invalid(&error.to_string()))?.modes() != self.attention {
+            return Err(invalid("native owner placement differs from execution modes"));
+        }
         if !(1..=2).contains(&self.gpus)
             || self.context == 0
             || request.context.maximum != self.context

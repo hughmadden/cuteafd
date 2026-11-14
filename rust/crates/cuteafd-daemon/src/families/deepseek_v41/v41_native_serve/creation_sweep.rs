@@ -129,6 +129,12 @@ fn synthetic_experts<'a>(device: Device<'a>, layer: crate::families::deepseek_v4
         std::rc::Rc::new(arena), 0, layer, &planes, budget))
 }
 
+/// Only the ignored hardware sweep reads this test selector. Production
+/// consumes the typed CLI/admission contract, never an inference-only env key.
+fn qualification_placement() -> Result<cuteafd_loader::placement::families::deepseek_v41::EncoderPlacement> {
+    std::env::var("V41_ENCODER_PLACEMENT").unwrap_or_else(|_| "ced".into()).parse().map_err(anyhow::Error::msg)
+}
+
 /// Serve's arguments as the launcher derives them from the deployment plan.
 fn serve_args(snapshot: &std::path::Path, native_lib: &std::path::Path, unit: u64, waves: u64, reserve: u64)
     -> Result<crate::cli::NativeServeArgs> {
@@ -142,7 +148,9 @@ fn serve_args(snapshot: &std::path::Path, native_lib: &std::path::Path, unit: u6
             "--prefix-cache-entries", "20", "--max-context-tokens", "1048576", "--max-output-tokens", "262144",
             "--pool-tokens", "0", "--prefill-batch-tokens", &unit, "--prefill-waves", &waves,
             "--prefill-reserve-rows", &reserve])?;
-    Ok(crate::cli::NativeServeArgs::from_arg_matches(&matches)?)
+    let mut args = crate::cli::NativeServeArgs::from_arg_matches(&matches)?;
+    args.v41_encoder_placement = qualification_placement()?;
+    Ok(args)
 }
 
 /// Parse the exact sweep plan argv without opening a checkpoint or a library.
@@ -157,6 +165,7 @@ fn plan_args(arch: cuteafd_core::GpuArch, directory: &std::path::Path, snapshot:
         "--embedding-placement", "host"])?;
     let crate::cli::Commands::Plan(mut plan_args) = cli.command else { anyhow::bail!("expected the plan command") };
     // The launcher's global VISION=off and AUDIO=off, as main hands them to the plan.
+    plan_args.v41_encoder_placement = Some(qualification_placement()?);
     plan_args.vision = cuteafd_loader::plan::MediaMode::Off;
     plan_args.audio = cuteafd_loader::plan::MediaMode::Off;
     Ok(plan_args)
@@ -229,7 +238,7 @@ fn cuda_v41_two_rtx_startup_handles_create_at_planned_sizes() -> Result<()> {
     let decode = super::DECODE_LANE_ROWS;
     let width = if args.draft_length.draft_length.unwrap_or(5) > 5 { 7 } else { 5 };
     let requests = args.concurrency;
-    let map = CachePlacement::encoder_decoder();
+    let map = args.v41_encoder_placement.resolve(2)?;
     let spark_world = crate::shared::spark_topology::world(args.peers.len())?;
     let ranks = spark_world.topology().world_size();
     let snapshot_slots = cuteafd_core::prefix::mark_slots_with_host(0, u64::from(args.resolved_prefix_entries()), 1,

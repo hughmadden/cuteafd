@@ -229,6 +229,76 @@ mod tests {
     }
 
     #[test]
+    fn tail14_c16_native_owners_reduce_paired_tier_before_loading() -> anyhow::Result<()> {
+        use super::super::super::{EncoderPlacement, owners, weight_layout::TargetLayout, resident::Fp8Head};
+        let config = config();
+        let root = tempfile::tempdir()?;
+        crate::plan::testing::write_v41_snapshot(root.path());
+        let manifest = crate::plan::testing::write_v41_workspaces(root.path());
+        let fp8: serde_json::Value = serde_json::from_slice(&std::fs::read(manifest.parent().unwrap().join("V41_FP8_AOT.json"))?)?;
+        let catalog = crate::read_official_v41_catalog(root.path())?;
+        let prefill = PrefillShape { rows: 2752, waves: 3 };
+        let run = |option, setting| -> anyhow::Result<AdmittedV41> {
+            let mut fixture = input(&config, false);
+            fixture.encoder_placement = option;
+            fixture.prefill = prefill;
+            fixture.concurrency = 16;
+            fixture.retained_turns = 128;
+            fixture.resident_weight_limit = u64::MAX;
+            for expert in &mut fixture.experts {
+                expert.whole.resident = 384 * 9_131_264 * 2;
+                for half in &mut expert.half { half.resident = 384 * 9_131_264; }
+            }
+            let layout = TargetLayout::new_for_arch(&catalog, Some(option.resolve(2)?.layers()), true,
+                Fp8Head::All, false, false, cuteafd_core::GpuArch::Sm89)?;
+            let mut fixed = owners::target_arena_demands(&layout);
+            fixed.extend(owners::NativePrograms::new(&fp8, 128)?.with_encoder_placement(option)
+                .target(64, 8256, 2752, 2, 3, 16, Fp8Head::All, false)?);
+            fixture.owners = fixed.iter().map(Owner::from_demand).collect();
+            fixture.weight_arenas = layout.ranks;
+            let request = production_request(4096, Some(2 << 20), Onboard::Auto, prefill,
+                Operation::Serving, u64::MAX, Default::default());
+            Ok(fixture.prepare()?.admit_with_tier(request,
+                &TierChoice { setting, ..Default::default() })?)
+        };
+        let ced = run(EncoderPlacement::Ced, ExpertTierSetting::Auto)?;
+        let mut tail = run(EncoderPlacement::Tail14, ExpertTierSetting::Auto)?;
+        let counts = [ced.placement.expert_tier.as_ref().unwrap().experts,
+            tail.placement.expert_tier.as_ref().unwrap().experts];
+        eprintln!("tail14 C16 fixture paired experts: ced={} tail14={} loss={}", counts[0], counts[1], counts[0] - counts[1]);
+        assert!((220..=260).contains(&(counts[0] - counts[1])));
+        assert_eq!(ced.placement.pool_tokens, 2 << 20);
+        assert_eq!(tail.placement.pool_tokens, 2 << 20);
+        assert_eq!(tail.solved.decisions.attention, EncoderPlacement::Tail14.resolve(2)?.modes());
+        // A pin that fits CED cannot force tail14 to spend its pool or reserves.
+        assert!(run(EncoderPlacement::Ced, ExpertTierSetting::PerLayer(counts[0] / 40)).is_ok());
+        assert!(run(EncoderPlacement::Tail14, ExpertTierSetting::PerLayer(counts[0] / 40)).is_err());
+        for gpu in 0..2 {
+            for option in [EncoderPlacement::Ced, EncoderPlacement::Tail14] {
+                let plan = if option == EncoderPlacement::Ced { &ced } else { &tail };
+                let groups = 4096 + 16 + 256;
+                let exact = crate::serving_capacity::deepseek_v41_cache_bytes_with_placement(
+                    &config, 2, 16, groups, false, option)?;
+                let charged = plan.placement.items[gpu].iter().filter(|item| item.category == Category::Kv)
+                    .map(|item| item.bytes).sum::<u64>();
+                assert_eq!(charged, exact[gpu]);
+                eprintln!("{option} GPU{gpu} fixture KV={charged}");
+            }
+        }
+        let before = tail.solved.pool_tokens;
+        let measured = [MeasuredOccupancy { gpu: 0, backing: 0, unattributed: 0 },
+            MeasuredOccupancy { gpu: 1, backing: 0, unattributed: 0 }];
+        assert!(adopt_measured_with_placement(&config, 2, 16, 128, false, 2 << 20,
+            &mut tail.solved, &measured, EncoderPlacement::Ced).is_err());
+        let adopted = adopt_measured_with_placement(&config, 2, 16, 128, false, 2 << 20,
+            &mut tail.solved, &measured, EncoderPlacement::Tail14)?;
+        assert_eq!(tail.solved.pool_tokens, before);
+        assert_eq!(adopted.bytes, crate::serving_capacity::deepseek_v41_cache_bytes_with_placement(
+            &config, 2, 16, adopted.groups, false, EncoderPlacement::Tail14)?);
+        Ok(())
+    }
+
+    #[test]
     fn tier_off_equals_upstream_plan_byte_for_byte() {
         let config = config();
         for onboard in [Onboard::Auto, Onboard::Layers(2)] {

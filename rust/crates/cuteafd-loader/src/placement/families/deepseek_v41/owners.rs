@@ -772,7 +772,7 @@ mod tests {
             // Only unit scratch differs from the measured worksheet's native
             // GEMM scratch. All row-plane extents are independent of it.
             assert_eq!(get(&b, 1, "prefill slots engram rows"), 8256 * 18625);
-            let delta = |gpu, group| get(&b, gpu, group) as i64 - get(&a, gpu, group) as i64;
+            let delta = |gpu, group: &str| get(&b, gpu, group) as i64 - get(&a, gpu, group) as i64;
             let producer = 6 * 8256 * 536 + 8256 * 364 + 2752 * 4096;
             assert_eq!(delta(0, "prefill slots cache producers"), -(producer as i64));
             assert_eq!(delta(1, "prefill slots cache producers"), (producer + 2752 * 8) as i64);

@@ -96,6 +96,7 @@ fn options(args: &PlanArgs) -> Result<PlanOptions, PlanError> {
                 glmf_auto_replay: args.replay_records == crate::cli::PlanReplayRecords::Auto,
                 concurrency: args.concurrency,
                 v41_draft_width: args.draft_length.unwrap_or(5).min(7) as u8,
+                v41_encoder_placement: args.v41_encoder_placement.unwrap_or_default(),
                 tp2_dspark_experts: args.tp2_dspark_experts,
                 tp2_dflash: args.tp2_dflash.unwrap_or(false),
                 state_slots: args.state_slots,
@@ -169,6 +170,7 @@ pub(crate) fn v41_report_for_test(mut args: PlanArgs) -> Result<cuteafd_loader::
         v41_layout(layout, &args);
         layout.v41_draft_width = v41_draft_limit(&args, &cfg)?;
         layout.tp2_dspark_experts = tp2_dspark_experts(&args, family, &cfg)?;
+        layout.v41_encoder_placement = v41_encoder_placement(&args, family, &cfg)?;
     }
     options.vision = glm_flash_vision(&args, family, &snapshot);
     Ok(input.plan_spark_count(&options, args.available_sparks, args.spark_ranks)?)
@@ -205,6 +207,20 @@ fn v41_layout(layout: &mut cuteafd_loader::plan::layout::LayoutOptions, args: &P
         else if args.prefill_rows <= 256 { 256 }
         else if args.prefill_rows <= 1024 { 1024 }
         else { 4096 };
+}
+
+fn v41_encoder_placement(args: &PlanArgs, family: &str,
+    cfg: &std::collections::BTreeMap<String, String>) -> Result<cuteafd_loader::placement::families::deepseek_v41::EncoderPlacement> {
+    use cuteafd_loader::placement::families::deepseek_v41::EncoderPlacement;
+    let configured = cfg.get("V41_ENCODER_PLACEMENT");
+    anyhow::ensure!(family == "deepseek_v41" || (args.v41_encoder_placement.is_none() && configured.is_none()),
+        "V41_ENCODER_PLACEMENT is supported only for deepseek_v41");
+    let placement = match args.v41_encoder_placement {
+        Some(placement) => placement,
+        None => configured.map(|value| value.parse()).transpose().map_err(anyhow::Error::msg)?.unwrap_or(EncoderPlacement::Ced),
+    };
+    placement.resolve(args.rtx)?;
+    Ok(placement)
 }
 
 fn tp2_dspark_experts(args: &PlanArgs, family: &str,
@@ -393,11 +409,13 @@ pub(crate) fn run_plan(mut args: PlanArgs) -> Result<()> {
     let cfg = launch_config(args.config.as_deref())?;
     resolve_speculator(&mut args, &snapshot, family, &cfg)?;
     options.qwen_auto_mtp = family == "qwen4" && args.speculator == "auto";
+    let v41_encoder = v41_encoder_placement(&args, family, &cfg)?;
     let tp2_dspark_experts = tp2_dspark_experts(&args, family, &cfg)?;
     let tp2_dflash = tp2_dflash(&args, family, &cfg)?;
     options.draft_ownership = Some(cuteafd_loader::plan::spec::DraftOwnership::selected(family, &args.speculator));
     if let Some(layout) = &mut options.layout {
         layout.tp2_dspark_experts = tp2_dspark_experts;
+        layout.v41_encoder_placement = v41_encoder;
         layout.tp2_dflash = tp2_dflash;
         layout.glmf_tp2_dflash_auto = glmf_tp2_dflash_auto(&args, family, &cfg);
         if !options.qwen_auto_mtp && !options.draft_ownership.unwrap().uses_checkpoint() { layout.native_mtp_layers = 0; }
@@ -1341,6 +1359,33 @@ mod tests {
     }
 
     #[test]
+    fn deepseek_v41_encoder_placement_defaults_overrides_and_refusals() {
+        use cuteafd_loader::placement::families::deepseek_v41::EncoderPlacement::{Ced, Tail14};
+        let mut request = args(std::path::Path::new("/not-read"), 4, false);
+        request.rtx = 2;
+        assert_eq!(v41_encoder_placement(&request, "deepseek_v41", &Default::default()).unwrap(), Ced);
+        let config = [("V41_ENCODER_PLACEMENT".into(), "tail14".into())].into();
+        assert_eq!(v41_encoder_placement(&request, "deepseek_v41", &config).unwrap(), Tail14);
+        request.rtx = 1;
+        assert!(v41_encoder_placement(&request, "deepseek_v41", &config).is_err());
+        request.rtx = 2;
+        assert!(v41_encoder_placement(&request, "glm5", &config).is_err());
+        request.v41_encoder_placement = Some(Ced);
+        assert_eq!(v41_encoder_placement(&request, "deepseek_v41", &config).unwrap(), Ced);
+        request.v41_encoder_placement = None;
+        let invalid = [("V41_ENCODER_PLACEMENT".into(), "cut10".into())].into();
+        assert!(v41_encoder_placement(&request, "deepseek_v41", &invalid).is_err());
+        for value in ["ced", "tail14"] {
+            use clap::Parser;
+            let crate::cli::Commands::Plan(plan) = crate::cli::Cli::try_parse_from([
+                "cuteafd", "plan", "model", "--layout", "--rtx", "2", "--v41-encoder-placement", value]).unwrap().command else { panic!() };
+            let crate::cli::Commands::ServeNative(serve) = crate::cli::Cli::try_parse_from([
+                "cuteafd", "serve-native", "--snapshot", "model", "--native-lib", "native.so", "--rtx-gpus", "2", "--v41-encoder-placement", value]).unwrap().command else { panic!() };
+            assert_eq!(options(&plan).unwrap().layout.unwrap().v41_encoder_placement, serve.v41_encoder_placement);
+        }
+    }
+
+    #[test]
     fn v41_configured_draft_limit_matches_serving_width() {
         let mut request = args(std::path::Path::new("/not-read"), 3, false);
         for (configured, expected) in [(None, 5), (Some(""), 5), (Some("5"), 5), (Some("6"), 6), (Some("7"), 7)] {
@@ -1414,6 +1459,7 @@ mod tests {
             concurrency: 8,
             draft_length: None,
             tp2_dspark_experts: false,
+            v41_encoder_placement: None,
             tp2_dflash: None,
             state_slots: None,
             mark_lanes: None,

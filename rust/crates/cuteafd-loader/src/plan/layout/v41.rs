@@ -73,7 +73,7 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
         items: weights[rank].clone(), kv_tokens: 0,
     }).collect::<Vec<_>>();
     let mut waste = Vec::new();
-    let mut notes = vec![format!("resolved context {} tokens (checkpoint {})", shape.context_tokens, shape.checkpoint_context),
+    let mut notes = vec![format!("V4.1 encoder placement {}: {:?}", options.v41_encoder_placement, map.layers()), format!("resolved context {} tokens (checkpoint {})", shape.context_tokens, shape.checkpoint_context),
         "Native module residency: selected V41_FP8_AOT projection exports, estimated separately from physical BLAS pools. The existing lazy graph reserve remains; diagnostic startup capture is uncharged and outside this inventory.".into(),
         "Spark host, wave residual and native runtime: Estimated pending qualified worker inventory; explicit rank I/O remains formula-derived.".into(),
         "Lazy graph/runtime growth is a typed post-ready reserve, not part of the ready residency claim.".into()];
