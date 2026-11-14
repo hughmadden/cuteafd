@@ -1,5 +1,7 @@
 //! V4.1 CED ownership stays fixed; pool and local experts use shared admission.
 use super::super::*;
+pub mod encoder_placement;
+pub use encoder_placement::{CachePlacement, EncoderPlacement};
 pub mod admission;
 pub mod owners;
 pub mod resident;
@@ -555,6 +557,7 @@ mod tests {
         let total = 96 << 30;
         let budgets = admission::live_budgets(&vec![(total, total, free); ranks], &vec![64 << 30; 4])?;
         let input = ProductionInput {
+        encoder_placement: Default::default(),
             coordinator_arch: cuteafd_core::GpuArch::Sm120,
             blas: Vec::new(),
             expert_usage: false,
@@ -578,6 +581,7 @@ mod tests {
         for ranks in [1, 2] {
             for enabled in [false, true] {
                 let prepared = ProductionInput {
+        encoder_placement: Default::default(),
             coordinator_arch: cuteafd_core::GpuArch::Sm120,
                     blas: Vec::new(),
                     expert_usage: enabled, config: &config, gpus: ranks, context: 512,
@@ -641,6 +645,7 @@ mod tests {
         use crate::plan::encoder::{EncoderKind, EncoderPlacement};
         let config = config();
         let input = ProductionInput {
+        encoder_placement: Default::default(),
             coordinator_arch: cuteafd_core::GpuArch::Sm120,
             blas: Vec::new(),
             expert_usage: false, config: &config, gpus: 2, context: 32768, maximum_pool_tokens: 32768,
@@ -690,6 +695,7 @@ mod tests {
                     kind, weights: payload, scratch: 333, reason: "arena proof".into(), shortfall: 0,
                 }).collect();
                 let mut prepared = ProductionInput {
+        encoder_placement: Default::default(),
             coordinator_arch: cuteafd_core::GpuArch::Sm120,
                     blas: Vec::new(),
                     expert_usage: false, config: &config, gpus: ranks, context: 512, maximum_pool_tokens: 512,
@@ -848,6 +854,7 @@ mod tests {
         let cards = vec![(96u64 << 30, 96u64 << 30, (64 << 20) + padding); 2];
         let budgets = admission::live_budgets(&cards, &vec![1 << 30; 4])?;
         let input = ProductionInput {
+        encoder_placement: Default::default(),
             coordinator_arch: cuteafd_core::GpuArch::Sm120,
             blas: Vec::new(),
             expert_usage: false,

@@ -265,6 +265,34 @@ mod tests {
     }
 
     #[test]
+    fn tail14_native_weight_arenas_move_whole_operands_once() -> Result<()> {
+        use super::super::EncoderPlacement;
+        let headers = official_dense_headers();
+        let ced = TargetLayout::from_headers_for_arch(&headers, Some(EncoderPlacement::Ced.resolve(2)?.layers()),
+            true, Fp8Head::All, false, false, GpuArch::Sm89)?;
+        let tail = TargetLayout::from_headers_for_arch(&headers, Some(EncoderPlacement::Tail14.resolve(2)?.layers()),
+            true, Fp8Head::All, false, false, GpuArch::Sm89)?;
+        assert_eq!(ced.ranks[0].payload_bytes() - tail.ranks[0].payload_bytes(), 982_403_088);
+        assert_eq!(tail.ranks[1].payload_bytes() - ced.ranks[1].payload_bytes(), 982_403_088);
+        for (rank, arena) in tail.ranks.iter().enumerate() {
+            validate_packed_scales(arena, GpuArch::Sm89)?;
+            for (name, view) in arena.views() {
+                let old = ced.ranks.iter().filter_map(|a| a.view(name)).collect::<Vec<_>>();
+                assert!(!old.is_empty(), "new operand {name}");
+                assert!(old.iter().any(|old| old.bytes() == view.bytes()));
+                if name.starts_with("layers.14.") && !name.contains("shared_experts") {
+                    assert_eq!(rank, 1, "{name}");
+                    assert!(ced.ranks[0].view(name).is_some());
+                }
+                if name.contains("shared_experts") {
+                    assert_eq!(ced.ranks[rank].view(name).unwrap().bytes(), view.bytes());
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
     fn target_and_draft_scale_views_match_each_architecture() -> Result<()> {
         let headers = official_dense_headers();
         for arch in [GpuArch::Sm89, GpuArch::Sm120] {

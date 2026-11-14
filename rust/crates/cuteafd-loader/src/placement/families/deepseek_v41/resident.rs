@@ -122,7 +122,12 @@ pub fn resident_headers<'a>(config: &serde_json::Value,
 pub fn resident_headers_for_arch<'a>(config: &serde_json::Value,
     tensors: impl IntoIterator<Item = &'a crate::SafetensorsTensorMetadata>,
     ranks: usize, dspark: bool, arch: cuteafd_core::GpuArch) -> Option<Vec<Vec<Item>>> {
-    resident_inventory(config, tensors, ranks, dspark, true, arch)
+    resident_headers_with_placement(config, tensors, ranks, dspark, arch, super::EncoderPlacement::Ced)
+}
+pub fn resident_headers_with_placement<'a>(config: &serde_json::Value,
+    tensors: impl IntoIterator<Item = &'a crate::SafetensorsTensorMetadata>, ranks: usize, dspark: bool,
+    arch: cuteafd_core::GpuArch, placement: super::EncoderPlacement) -> Option<Vec<Vec<Item>>> {
+    resident_inventory(config, tensors, ranks, dspark, true, arch, placement)
 }
 
 /// Only the drafter's own checkpoint allocations; borrowed target owners are excluded.
@@ -132,12 +137,13 @@ pub fn drafter_weights(checkpoint: &Checkpoint, ranks: usize) -> Option<Vec<Vec<
 
 pub fn drafter_weights_for_arch(checkpoint: &Checkpoint, ranks: usize,
     arch: cuteafd_core::GpuArch) -> Option<Vec<Vec<Item>>> {
-    resident_inventory(&checkpoint.config, checkpoint.tensors.iter().map(|tensor| &tensor.meta), ranks, true, false, arch)
+    resident_inventory(&checkpoint.config, checkpoint.tensors.iter().map(|tensor| &tensor.meta), ranks, true, false, arch, super::EncoderPlacement::Ced)
 }
 
 fn resident_inventory<'a>(config: &serde_json::Value,
     tensors: impl IntoIterator<Item = &'a crate::SafetensorsTensorMetadata>,
-    ranks: usize, dspark: bool, target: bool, arch: cuteafd_core::GpuArch) -> Option<Vec<Vec<Item>>> {
+    ranks: usize, dspark: bool, target: bool, arch: cuteafd_core::GpuArch, placement: super::EncoderPlacement) -> Option<Vec<Vec<Item>>> {
+    let map = placement.resolve(ranks).ok()?;
     let config = config.get("text_config").unwrap_or(config);
     let tensors = tensors.into_iter().collect::<Vec<_>>();
     if ![1, 2].contains(&ranks) || config["num_hidden_layers"].as_u64() != Some(40)
@@ -217,7 +223,7 @@ fn resident_inventory<'a>(config: &serde_json::Value,
             // scale tensors are transient. Three FP8 matrices per rank.
             if name.ends_with(".scale") { continue; }
             for rank in 0..2 { add(rank, category, group, &format, bytes / 2); }
-        } else { add(if ranks == 2 && layer >= 20 { 1 } else { 0 }, category, group, &format, bytes); }
+        } else { add(map.attention(layer).ok()?, category, group, &format, bytes); }
     }
     if draft_experts {
         let experts = config["dspark_n_routed_experts"].as_u64()?;

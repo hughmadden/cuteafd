@@ -6,6 +6,7 @@ use cuteafd_core::memory_layout::{Basis, Category, ItemLifetime};
 use serde_json::Value;
 use crate::placement::{Demand, ProgramSet};
 use super::resident::Fp8Head;
+use super::EncoderPlacement;
 
 const BLAS: u64 = 4 << 20;
 const VOCAB: u64 = 129280;
@@ -48,10 +49,6 @@ pub fn encoder_suffix_bytes(unit: u64, concurrency: u64) -> u64 {
 /// decode/verify step (`V41_VERIFY_ROWS`).
 pub const DECODE_LANE_ROWS: u64 = cuteafd_core::V41_VERIFY_ROWS as u64;
 const _: () = assert!(cuteafd_core::V41_VERIFY_ROWS as u64 == DECODE_LANE_ROWS);
-
-/// The attention GPU of `layer` on two RTX (the encoder/decoder map: layers
-/// 0..20 on GPU0, 20..40 on GPU1).
-fn v41_attention_gpu(layer: usize) -> usize { usize::from(layer >= 20) }
 
 /// Full-head sparse attention storage (64 heads) for units of `unit` rows
 /// (`SparseAttentionStorage::<64>::storage_bytes`): query and output planes,
@@ -268,6 +265,7 @@ pub fn draft_rows(concurrency: u64, width: u8) -> u64 {
 }
 
 pub struct NativePrograms<'a> {
+    placement: EncoderPlacement,
     manifest: &'a Value,
     sms: u32,
     compressed: cuteafd_core::coordinator_programs::SparseAttentionBackend,
@@ -278,7 +276,7 @@ pub struct NativePrograms<'a> {
 impl<'a> NativePrograms<'a> {
     pub fn new(manifest: &'a Value, sms: u32) -> Result<Self> {
         ensure!(sms > 0, "V4.1 native plans require physical SM count");
-        Ok(Self { manifest, sms, compressed: cuteafd_core::coordinator_programs::SparseAttentionBackend::Bf16Aot,
+        Ok(Self { placement: EncoderPlacement::Ced, manifest, sms, compressed: cuteafd_core::coordinator_programs::SparseAttentionBackend::Bf16Aot,
             split_query: false, split_output: false })
     }
 
@@ -293,6 +291,10 @@ impl<'a> NativePrograms<'a> {
     /// The separate projection storages are charged by `projection_tp2_owners`.
     pub fn with_projection_tp2(self, split_query: bool, split_output: bool) -> Self {
         Self { split_query, split_output, ..self }
+    }
+
+    pub fn with_encoder_placement(self, placement: EncoderPlacement) -> Self {
+        Self { placement, ..self }
     }
 
     fn query_b_scratch(&self, rows: u64) -> Result<u64> {
@@ -465,6 +467,7 @@ impl<'a> NativePrograms<'a> {
         ensure!((1..=4096).contains(&unit) && unit <= reserve && reserve <= 8256 && matches!(ranks, 1 | 2)
             && (1..=4).contains(&slots) && (!window_batch || ranks == 1),
             "invalid V4.1 prefill slot geometry");
+        let map = self.placement.resolve(ranks)?;
         let (r, u) = (reserve, unit);
         let mut out = Vec::new();
         for rank in 0..ranks {
@@ -479,13 +482,13 @@ impl<'a> NativePrograms<'a> {
             add(&mut out, "lane", 2 * crate::serving_capacity::v41_workspace::hc(r as usize)?.bytes() as u64
                 + query + output + shared + sparse + r * 17105);
             // Cache producers: window storage and the source compressor storage(s).
-            let windows = if placed { (0..40).filter(|&l| v41_attention_gpu(l) == rank).count() as u64 } else { 40 };
+            let windows = if placed { (0..40).filter(|&l| map.attention(l).expect("validated layer") == rank).count() as u64 } else { 40 };
             let window = if windows == 0 { 0 } else {
                 crate::serving_capacity::v41_workspace::window(r as usize, u as usize,
                     &(0..windows as usize).collect::<Vec<_>>(), self.scratch(u, 5120, 512)? as usize)?.bytes() as u64
             };
             let sources: Vec<u64> = [2u64, 8, 14, 20].into_iter()
-                .filter(|&l| !placed || v41_attention_gpu(l as usize) == rank).collect();
+                .filter(|&l| !placed || map.attention(l as usize).expect("validated layer") == rank).collect();
             // Compression ratio two at sources 2, 8 and 14; one at 20.
             let paired = |l: u64| matches!(l, 2 | 8 | 14);
             let compressor = if sources.is_empty() { 0 } else {
@@ -497,19 +500,17 @@ impl<'a> NativePrograms<'a> {
             add(&mut out, "cache producers", window + compressor
                 + if window_batch { slots as u64 * window_batch_bytes(u)? } else { 0 });
             // Index lane (query, source selection, reindex follower on source 20's GPU).
-            let owns_index = !placed || [2usize, 8, 14, 20, 24, 28, 32, 36].iter().any(|&l| v41_attention_gpu(l) == rank);
+            let owns_index = !placed || [2usize, 8, 14, 20, 24, 28, 32, 36].iter().any(|&l| map.attention(l).expect("validated layer") == rank);
             if owns_index {
                 let index_query = COMPRESSOR_WORKSPACE + self.scratch(u, 1280, 4096)? + 4 + u * 23560;
                 let [selection, retained_follower] = index_selection_storage_bytes(r, u)?;
-                let follower = if !placed || v41_attention_gpu(20) == rank { retained_follower } else { 0 };
+                let follower = if !placed || map.attention(20)? == rank { retained_follower } else { 0 };
                 add(&mut out, "index", index_query + selection + follower);
             }
-            if !placed || rank == 0 {
-                add(&mut out, "encoder suffix", encoder_suffix_bytes(unit, concurrency));
-                add(&mut out, "embedding", u * (4 + 40960 + 16 + 10240 + 4));
-            }
+            if rank == map.attention(19)? { add(&mut out, "encoder suffix", encoder_suffix_bytes(unit, concurrency)); }
+            if rank == map.attention(0)? { add(&mut out, "embedding", u * (4 + 40960 + 16 + 10240 + 4)); }
             // Engram: reserve row planes on each gate GPU (layers 1, 14), gates' scratch at the unit.
-            let gates = [1usize, 14].iter().filter(|&&l| !placed || v41_attention_gpu(l) == rank).count() as u64;
+            let gates = [1usize, 14].iter().filter(|&&l| !placed || map.attention(l).expect("validated layer") == rank).count() as u64;
             if gates > 0 {
                 add(&mut out, "engram rows", r * crate::ENGRAM_DEVICE_ROW_BYTES as u64);
                 add(&mut out, "engram gates", gates * crate::serving_capacity::v41_workspace::engram(
@@ -556,8 +557,10 @@ impl<'a> NativePrograms<'a> {
         window_batch: bool) -> Result<Vec<Demand>> {
         ensure!((1..=4096).contains(&rows) && matches!(ranks, 1 | 2)
             && (!window_batch || ranks == 1), "invalid V4.1 target owner geometry");
+        let map = self.placement.resolve(ranks)?;
         let mut out = Vec::new();
         for rank in 0..ranks {
+            let (windows, c2, c1) = map.counts(rank);
             for lane in 0..2 {
                 let add = |out: &mut Vec<Demand>, group: &str, bytes| out.push(Demand::new(
                     rank as u8, Category::Workspace, format!("lane {lane} {group}"), bytes, Basis::Formula));
@@ -574,14 +577,13 @@ impl<'a> NativePrograms<'a> {
                 // the GPU's window layers keeps only its proposal and commit
                 // destinations until the accepted rows commit.
                 let window = crate::serving_capacity::v41_workspace::window(rows as usize, rows as usize,
-                    &(0..if ranks == 1 { 40 } else { 20 }).collect::<Vec<_>>(),
+                    &(0..windows as usize).collect::<Vec<_>>(),
                     self.scratch(rows, 5120, 512)? as usize)?.bytes() as u64;
                 let compressor = |ratio2| BLAS + rows * if ratio2 {
                     10240 + 2048 + 2048 + 8 + 1024 + 264 + 512 + 68 + 8 + 288
                 } else { 10240 + 1024 + 1024 + 264 + 512 + 68 + 8 + 288 };
                 add(&mut out, "cache producers", window
-                    + if rank == 0 { 3 * compressor(true) } else { 0 }
-                    + if rank == ranks - 1 { compressor(false) } else { 0 });
+                    + c2 * compressor(true) + c1 * compressor(false));
                 if window_batch {
                     add(&mut out, "window batch table", window_batch_bytes(rows)?);
                 }
@@ -595,11 +597,14 @@ impl<'a> NativePrograms<'a> {
                 add(&mut out, "index", index_query + selection + follower);
                 if rank == 0 {
                     add(&mut out, "embedding", rows * (4 + 40960 + 16 + 10240 + 4));
-                    // Each live unit owns one upload region, reused by L1/L14.
+                }
+                let gates = [1, 14].into_iter().filter(|&layer| map.attention(layer).unwrap() == rank).count() as u64;
+                if gates > 0 {
+                    // Each gate GPU owns one upload region.
                     // Keep it distinct from gate scratch so admission can assert
                     // k * unit_rows exactly, without charging the upload twice.
                     add(&mut out, "engram rows", rows * crate::ENGRAM_DEVICE_ROW_BYTES as u64);
-                    add(&mut out, "engram gates", 2 * crate::serving_capacity::v41_workspace::engram(
+                    add(&mut out, "engram gates", gates * crate::serving_capacity::v41_workspace::engram(
                         rows as usize, self.scratch(rows, 6144, 25600)? as usize)?.bytes() as u64);
                 }
                 if rank == ranks - 1 { add(&mut out, "target taps", index_rows * 30720); }
@@ -737,6 +742,50 @@ mod tests {
 
     fn owner(demands: &[Demand], rank: u8, group: &str) -> u64 {
         demands.iter().find(|d| d.gpu == rank && d.group == group).unwrap().bytes
+    }
+
+    #[test]
+    fn tail14_owner_deltas_match_the_memory_worksheet() -> Result<()> {
+        let manifest = manifest();
+        let ced = NativePrograms::new(&manifest, 128)?;
+        let tail = NativePrograms::new(&manifest, 128)?.with_encoder_placement(EncoderPlacement::Tail14);
+        let get = |items: &[Demand], gpu, group: &str| items.iter()
+            .filter(|d| d.gpu == gpu && d.group == group).map(|d| d.bytes).sum::<u64>();
+        for concurrency in [1, 16] {
+            let a = ced.target(64, 8256, 2752, 2, 3, concurrency, Fp8Head::All, false)?;
+            let b = tail.target(64, 8256, 2752, 2, 3, concurrency, Fp8Head::All, false)?;
+            // Scratch is already present on both GPUs; neither full lane nor
+            // full index scratch scales with the moved layer count.
+            for gpu in [0, 1] {
+                for group in ["prefill slots lane", "prefill slots index", "prefill slots target heads",
+                    "lane 0 backbone", "lane 1 backbone", "lane 0 index", "lane 1 index"] {
+                    assert_eq!(get(&a, gpu, group), get(&b, gpu, group), "{gpu} {group}");
+                }
+            }
+            let suffix = (2752u64.min(concurrency * 128) + concurrency * 128) * 40976;
+            assert_eq!(get(&a, 0, "prefill slots encoder suffix"), suffix);
+            assert_eq!(get(&b, 1, "prefill slots encoder suffix"), suffix);
+            assert_eq!(get(&b, 0, "prefill slots encoder suffix"), 0);
+            let gate = get(&a, 0, "prefill slots engram gates") / 2;
+            assert_eq!(get(&b, 0, "prefill slots engram gates"), gate);
+            assert_eq!(get(&b, 1, "prefill slots engram gates"), gate);
+            // Only unit scratch differs from the measured worksheet's native
+            // GEMM scratch. All row-plane extents are independent of it.
+            assert_eq!(get(&b, 1, "prefill slots engram rows"), 8256 * 18625);
+            let delta = |gpu, group| get(&b, gpu, group) as i64 - get(&a, gpu, group) as i64;
+            let producer = 6 * 8256 * 536 + 8256 * 364 + 2752 * 4096;
+            assert_eq!(delta(0, "prefill slots cache producers"), -(producer as i64));
+            assert_eq!(delta(1, "prefill slots cache producers"), (producer + 2752 * 8) as i64);
+            for lane in 0..2 {
+                assert_eq!(get(&b, 1, &format!("lane {lane} engram rows")), 64 * 18625);
+                let group = format!("lane {lane} engram gates");
+                assert_eq!(get(&b, 1, &group), get(&a, 0, &group) / 2);
+                let group = format!("lane {lane} cache producers");
+                assert_eq!(delta(0, &group), -delta(1, &group));
+            }
+        }
+        assert!(tail.target(64, 8256, 2752, 1, 3, 16, Fp8Head::All, false).is_err());
+        Ok(())
     }
 
     #[test]

@@ -153,6 +153,7 @@ pub struct LayoutOptions {
     pub draft_sequences: Option<u64>,
     /// V4.1 configured proposal limit; loaded neural width is five or seven.
     pub v41_draft_width: u8,
+    pub v41_encoder_placement: crate::placement::families::deepseek_v41::EncoderPlacement,
     /// DeepSeek V4/V4.1 dSpark expert halves on both coordinator GPUs.
     pub tp2_dspark_experts: bool,
     /// External DFlash attention/FFN split over the two target ranks.
@@ -324,6 +325,7 @@ impl Default for LayoutOptions {
             mimo_expert_input: Default::default(),
             draft_sequences: None,
             v41_draft_width: 5,
+            v41_encoder_placement: Default::default(),
             tp2_dspark_experts: false,
             tp2_dflash: false,
             glmf_tp2_dflash_auto: false,

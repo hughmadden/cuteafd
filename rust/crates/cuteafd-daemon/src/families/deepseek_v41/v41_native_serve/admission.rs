@@ -808,6 +808,7 @@ pub(super) fn resolve_tiered_owners(
             lifetime: Lifetime::RESIDENT, activation: Activation::always() });
     }
     let input = ProductionInput {
+        encoder_placement: Default::default(),
         coordinator_arch,
         blas,
         expert_usage: args.expert_usage_enabled()?,

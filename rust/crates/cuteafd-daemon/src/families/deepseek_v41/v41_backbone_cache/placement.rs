@@ -1,47 +1,31 @@
-//! Cache/attention placement follows compressed-source consumer groups.
-use anyhow::{ensure, Result};
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct CachePlacement { attention: [usize; 40] }
-impl CachePlacement {
-    pub fn new(attention: [usize; 40]) -> Result<Self> {
-        ensure!(attention.iter().all(|&gpu| gpu < 2), "cache GPU must be zero or one");
-        for (source,end) in [(2,8),(8,14),(14,20),(20,40)] {
-            ensure!(attention[source..end].iter().all(|&gpu| gpu == attention[source]),
-                "compressed source {source} must share its GPU with attention consumers");
-        }
-        Ok(Self { attention })
-    }
-    pub fn from_execution_plan(plan: &cuteafd_loader::placement::LayerExecutionPlan) -> Result<Self> {
-        use cuteafd_loader::placement::{FfnMode, HopStorage, LayerMode, ResidualHome};
-        ensure!(plan.modes().len() == 40, "V4.1 execution requires 40 layers");
-        ensure!(plan.spec().storage == HopStorage::DirectInput && plan.spec().row_bytes == 40976,
-            "V4.1 residual hops must land in the existing block inputs");
-        let mut attention = [0; 40];
-        for (layer, owner) in attention.iter_mut().enumerate() {
-            let LayerMode::Whole { gpu, ffn: FfnMode::Owner } = plan.mode(layer)? else {
-                anyhow::bail!("V4.1 layer {layer} requires whole attention and owner-reduced FFN")
-            };
-            ensure!(plan.homes()[layer + 1] == ResidualHome::Owned(gpu),
-                "V4.1 residual must stay on the attention owner");
-            *owner = usize::from(gpu);
-        }
-        Self::new(attention)
-    }
-    pub fn encoder_decoder() -> Self {
-        Self { attention: std::array::from_fn(|layer| usize::from(layer >= 20)) }
-    }
-    pub fn attention(&self, layer: usize) -> Result<usize> {
-        self.attention.get(layer).copied().ok_or_else(|| anyhow::anyhow!("invalid attention layer"))
-    }
-    pub fn sources(&self) -> [usize; 4] {
-        [self.attention[2],self.attention[8],self.attention[14],self.attention[20]]
-    }
-}
+//! Cache ownership uses the same validated map as admission and native weights.
+use anyhow::Result;
+pub(crate) use cuteafd_loader::placement::families::deepseek_v41::CachePlacement;
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn tail14_planner_cache_bytes_equal_runtime_storage_bytes() -> Result<()> {
+        use cuteafd_loader::placement::families::deepseek_v41::EncoderPlacement;
+        use super::super::BackboneCache;
+        let config = serde_json::from_str(include_str!(
+            "../../../../../cuteafd-loader/src/families/deepseek_v41/official-v41-config.json"))?;
+        for option in [EncoderPlacement::Ced, EncoderPlacement::Tail14] {
+            let map = option.resolve(2)?;
+            for concurrency in [1, 16] {
+                for retained in [0, 128] {
+                    let groups = 4096 + concurrency + 2 * retained;
+                    let bytes = BackboneCache::distributed_device_bytes(map, concurrency, [groups, groups, groups, 2 * groups])?;
+                    let plan = cuteafd_loader::serving_capacity::deepseek_v41_cache_bytes_with_placement(
+                        &config, 2, concurrency as u64, groups as u64, false, option)?;
+                    assert_eq!(bytes.map(|bytes| bytes as u64).as_slice(), plan);
+                }
+            }
+        }
+        Ok(())
+    }
+
     #[test]
     fn execution_plan_binds_single_and_ced_ownership() -> Result<()> {
         use cuteafd_loader::placement::families::deepseek_v41::admission::{
@@ -55,6 +39,7 @@ mod tests {
         for ranks in [1, 2] {
             let prefill = PrefillShape { rows: 128, waves: 1 };
             let placement = ProductionInput {
+        encoder_placement: Default::default(),
                 coordinator_arch: cuteafd_core::GpuArch::Sm120,
             blas: Vec::new(),
             expert_usage: false,
@@ -161,7 +146,7 @@ mod tests {
     fn placement_keeps_sources_with_consumers_and_allows_rebalancing() -> Result<()> {
         let initial = CachePlacement::encoder_decoder();
         assert_eq!(initial.sources(),[0,0,0,1]);
-        let mut rebalanced = initial.attention;
+        let mut rebalanced = initial.layers();
         rebalanced[14..20].fill(1);
         assert_eq!(CachePlacement::new(rebalanced)?.sources(),[0,0,1,1]);
         rebalanced[19] = 0;

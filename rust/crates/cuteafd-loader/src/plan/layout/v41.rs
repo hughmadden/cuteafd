@@ -34,6 +34,7 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
     report.prefill_span_rows = Some(prefill.span_rows);
     let ranks = options.rtx_bytes.len();
     ensure!((1..=2).contains(&ranks), "V4.1 requires one or two coordinator GPUs");
+    let map = options.v41_encoder_placement.resolve(ranks)?;
     cuteafd_core::concurrency::validate("deepseek_v41", shape.concurrency)?;
     let rows = u64::from(cuteafd_core::coordinator_programs::v41_live_rows(
         u32::try_from(shape.prefill_rows)?).context("invalid V4.1 prefill rows")?);
@@ -56,7 +57,7 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
         .context("missing V4.1 native FP8 allocation manifest")?)?;
     let sms = options.physical_sms.unwrap_or_else(|| ArchContext::for_device(options.coordinator_arch, options.rtx_bytes[0]).sms);
     let attention = options.coordinator_arch.v41_compressed_attention();
-    let programs = v41::owners::NativePrograms::new(&fp8, sms)?.with_compressed_attention(attention);
+    let programs = v41::owners::NativePrograms::new(&fp8, sms)?.with_compressed_attention(attention).with_encoder_placement(options.v41_encoder_placement);
     let mode = Fp8Head::configured();
     let window_batch = ranks == 1 && std::env::var("CUTEAFD_WINDOW_BATCH").map_or(true, |v| v != "0");
     // The prefill slots, one storage set over their units; two decode lanes
@@ -65,7 +66,7 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
     let span = slots as u64 * rows;
     let target = programs.target(v41::owners::DECODE_LANE_ROWS, span, rows, ranks, slots,
         shape.concurrency, mode, window_batch)?;
-    let weights = resident_weights_for_arch(checkpoint, ranks, false, options.coordinator_arch)
+    let weights = v41::resident::resident_headers_with_placement(&checkpoint.config, checkpoint.tensors.iter().map(|tensor| &tensor.meta), ranks, false, options.coordinator_arch, options.v41_encoder_placement)
         .context("unsupported V4.1 native backbone residency: check non-expert tensor formats and geometry")?;
     let mut devices = options.rtx_bytes.iter().enumerate().map(|(rank, &bytes)| DeviceLayout {
         kind: DeviceKind::Rtx, index: rank as u32, capacity_bytes: bytes, worker_budget_bytes: 0,
@@ -94,7 +95,7 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
     let gpu_embedding = devices[0].items.iter().any(|item| item.category == Category::Embedding);
     let target_layout = v41::weight_layout::TargetLayout::from_headers_for_arch(
         checkpoint.tensors.iter().map(|tensor| &tensor.meta),
-        (ranks == 2).then(|| std::array::from_fn(|layer| usize::from(layer >= 20))),
+        (ranks == 2).then(|| map.layers()),
         gpu_embedding, mode, false, false, options.coordinator_arch)?;
     for device in &mut devices { device.items.retain(|item| !v41::owners::is_arena_weight(item)); }
     let mut fixed = v41::owners::target_arena_demands(&target_layout);
@@ -238,6 +239,7 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
         options.weight_budget_bytes, options.spark_reply_formats);
     let media_cache_bytes = options.media_cache_bytes.unwrap_or(0);
     let mut prepared = ProductionInput {
+        encoder_placement: options.v41_encoder_placement,
         coordinator_arch: options.coordinator_arch,
         blas: v41::owners::blas_owners(ranks,
             if mode.target() { crate::placement::planner::serving::BlasHead::Native }
@@ -416,6 +418,7 @@ mod tests {
             let cards = vec![(96 * gib, 96 * gib); 2];
             let budgets = admission::production_budgets(&cards, 0, None, 0, &[4 * gib; 4])?;
             let input = ProductionInput {
+        encoder_placement: Default::default(),
             coordinator_arch: cuteafd_core::GpuArch::Sm120,
             blas: Vec::new(),
             expert_usage: false,
@@ -459,6 +462,7 @@ mod tests {
         let cards = vec![(96 * gib, 96 * gib); 2];
         let budgets = admission::production_budgets(&cards, 0, None, 0, &[4 * gib; 4])?;
         let input = ProductionInput {
+        encoder_placement: Default::default(),
             coordinator_arch: cuteafd_core::GpuArch::Sm120,
             blas: Vec::new(),
             expert_usage: false,

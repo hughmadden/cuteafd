@@ -5,6 +5,7 @@ use super::{
 };
 use crate::families::deepseek_v4::DeepseekV4Config;
 use serde_json::Value;
+use crate::placement::families::deepseek_v41::EncoderPlacement;
 
 /// V4's 256-source-token unit contains each C4 layer's compressed/index
 /// pages and each C128 layer's compressed page. The head split replicates
@@ -107,6 +108,13 @@ pub fn deepseek_v41_cache_geometry(
     config: &Value,
     ranks: usize,
 ) -> Result<FamilyCacheGeometry, CacheGeometryError> {
+    deepseek_v41_cache_geometry_with_placement(config, ranks, EncoderPlacement::Ced)
+}
+
+pub fn deepseek_v41_cache_geometry_with_placement(config: &Value, ranks: usize, placement: EncoderPlacement)
+    -> Result<FamilyCacheGeometry, CacheGeometryError> {
+    let map = placement.resolve(ranks).map_err(|_| CacheGeometryError::Unsupported {
+        family: "deepseek_v41", what: "tail14 requires two coordinator GPUs" })?;
     let text = config.get("text_config").unwrap_or(config);
     let list = |key: &str| -> Option<Vec<u64>> {
         text.get(key)?
@@ -161,11 +169,7 @@ pub fn deepseek_v41_cache_geometry(
         } else {
             KvPlacement::PartitionedLayers
         },
-        ranks: if ranks == 1 {
-            vec![rank(40, 3, 1)]
-        } else {
-            vec![rank(20, 3, 0), rank(20, 0, 1)]
-        },
+        ranks: (0..ranks).map(|gpu| { let (windows, c2, c1) = map.counts(gpu); rank(windows, c2, c1) }).collect(),
     })
 }
 
@@ -174,7 +178,14 @@ pub fn deepseek_v41_cache_geometry(
 /// tables so it remains independent of the selected pool.
 pub fn deepseek_v41_cache_bytes(config: &Value, ranks: usize, slots: u64, groups: u64,
     replicated: bool) -> Result<Vec<u64>, CacheGeometryError> {
-    deepseek_v41_cache_geometry(config, ranks)?;
+    deepseek_v41_cache_bytes_with_placement(config, ranks, slots, groups, replicated, EncoderPlacement::Ced)
+}
+
+pub fn deepseek_v41_cache_bytes_with_placement(config: &Value, ranks: usize, slots: u64, groups: u64,
+    replicated: bool, placement: EncoderPlacement) -> Result<Vec<u64>, CacheGeometryError> {
+    deepseek_v41_cache_geometry_with_placement(config, ranks, placement)?;
+    let map = placement.resolve(ranks).map_err(|_| CacheGeometryError::Unsupported {
+        family: "deepseek_v41", what: "invalid encoder placement" })?;
     if !(1..=cuteafd_core::V41_MAX_REQUESTS as u64).contains(&slots) || !(1..=131_072).contains(&groups)
         || replicated && ranks != 2 {
         return Err(CacheGeometryError::Unsupported { family: "deepseek_v41",
@@ -189,14 +200,16 @@ pub fn deepseek_v41_cache_bytes(config: &Value, ranks: usize, slots: u64, groups
             product("V4.1 compressor carry", &[c2, slots, 4096])?,
         ])
     };
-    if ranks == 1 { Ok(vec![rank(40, 3, 1)?]) }
-    else if replicated {
-        // Replica payloads contain KV only; index keys and compressor carry
-        // remain on the source owner. Replica tables follow the source tables.
-        let peer_c1 = groups * 2 * 256 * 288 + slots * ((2 * groups).min(4096) * 4 + 8);
-        let peer_c2 = 3 * (groups * 256 * 288 + slots * (groups.min(4096) * 4 + 8));
-        Ok(vec![rank(40, 3, 0)? + peer_c1, rank(40, 0, 1)? + peer_c2])
-    } else { Ok(vec![rank(20, 3, 0)?, rank(20, 0, 1)?]) }
+    (0..ranks).map(|gpu| {
+        let (windows, c2, c1) = map.counts(gpu);
+        let canonical = rank(if replicated { 40 } else { windows }, c2, c1)?;
+        let replicas = if replicated {
+            let (_, peer_c2, peer_c1) = map.counts(1 - gpu);
+            peer_c1 * (groups * 2 * 256 * 288 + slots * ((2 * groups).min(4096) * 4 + 8))
+                + peer_c2 * (groups * 256 * 288 + slots * (groups.min(4096) * 4 + 8))
+        } else { 0 };
+        Ok(canonical + replicas)
+    }).collect()
 }
 
 /// Resolve a shared source pool from residual per-device budgets, after all
@@ -345,6 +358,27 @@ mod tests {
             Err(CacheGeometryError::Unsupported { .. })
         ));
         assert!(deepseek_v41_cache_geometry(&config, 3).is_err());
+    }
+
+    #[test]
+    fn tail14_cache_prices_source14_on_its_consumer_device() {
+        let config: Value = serde_json::from_str(include_str!(
+            "../families/deepseek_v41/official-v41-config.json")).unwrap();
+        for slots in [1, 16] {
+            for retained in [0, 128] {
+                let groups = 4096 + slots + 2 * retained;
+                let ced = deepseek_v41_cache_bytes_with_placement(&config, 2, slots, groups, false, EncoderPlacement::Ced).unwrap();
+                let tail = deepseek_v41_cache_bytes_with_placement(&config, 2, slots, groups, false, EncoderPlacement::Tail14).unwrap();
+                let moved = groups * 256 * 356 + 6 * slots * (128 * 528 + 8) + slots * (16384 + 8 + 4096);
+                assert_eq!(ced[0] - tail[0], moved);
+                assert_eq!(tail[1] - ced[1], moved);
+                let geometry = deepseek_v41_cache_geometry_with_placement(&config, 2, EncoderPlacement::Tail14).unwrap();
+                for gpu in 0..2 {
+                    assert_eq!(tail[gpu], groups * geometry.ranks[gpu].persistent_unit_bytes
+                        + slots * geometry.ranks[gpu].active_state_per_sequence_bytes);
+                }
+            }
+        }
     }
 
     #[test]

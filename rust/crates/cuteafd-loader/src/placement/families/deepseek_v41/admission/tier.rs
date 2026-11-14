@@ -194,6 +194,7 @@ mod tests {
     fn input(config: &serde_json::Value, live: bool) -> ProductionInput<'_> {
         let gpus = 2;
         ProductionInput {
+        encoder_placement: Default::default(),
             coordinator_arch: cuteafd_core::GpuArch::Sm120,
             config, expert_usage: false, gpus, context: 4096, maximum_pool_tokens: 2 << 20,
             prefill: PrefillShape { rows: 128, waves: 2 }, concurrency: 1, retained_turns: 4,
