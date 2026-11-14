@@ -235,12 +235,24 @@ mod tests {
         let root = tempfile::tempdir()?;
         crate::plan::testing::write_v41_snapshot(root.path());
         let manifest = crate::plan::testing::write_v41_workspaces(root.path());
-        let fp8: serde_json::Value = serde_json::from_slice(&std::fs::read(manifest.parent().unwrap().join("V41_FP8_AOT.json"))?)?;
+        let mut fp8: serde_json::Value = serde_json::from_slice(&std::fs::read(manifest.parent().unwrap().join("V41_FP8_AOT.json"))?)?;
+        for variant in fp8["variants"].as_array_mut().unwrap() {
+            if variant["input_dim"] == 6144 && variant["output_dim"] == 25600 {
+                match variant["capacity"].as_u64() {
+                    Some(4096) => variant["scratch_bytes"] = 27_326_464u64.into(),
+                    Some(64) => variant["scratch_bytes"] = 587_776u64.into(),
+                    _ => {}
+                }
+            }
+        }
         let catalog = crate::read_official_v41_catalog(root.path())?;
         let prefill = PrefillShape { rows: 2752, waves: 3 };
         let run = |option, setting| -> anyhow::Result<AdmittedV41> {
             let mut fixture = input(&config, false);
             fixture.encoder_placement = option;
+            fixture.coordinator_arch = cuteafd_core::GpuArch::Sm89;
+            fixture.budgets = production_budgets(&[(CARD, CARD); 2], crate::placement::reserve::gpu("deepseek_v41"),
+                None, 0, &[128 << 30; 4])?;
             fixture.prefill = prefill;
             fixture.concurrency = 16;
             fixture.retained_turns = 128;
@@ -254,6 +266,11 @@ mod tests {
             let mut fixed = owners::target_arena_demands(&layout);
             fixed.extend(owners::NativePrograms::new(&fp8, 128)?.with_encoder_placement(option)
                 .target(64, 8256, 2752, 2, 3, 16, Fp8Head::All, false)?);
+            for gpu in 0..2 {
+                let workspace = fixed.iter().filter(|d| d.gpu == gpu && d.category == Category::Workspace).map(|d| d.bytes).sum::<u64>();
+                eprintln!("{option} GPU{gpu} fixture target weights payload={} arena={} workspaces={workspace}",
+                    layout.ranks[gpu as usize].payload_bytes(), layout.ranks[gpu as usize].bytes());
+            }
             fixture.owners = fixed.iter().map(Owner::from_demand).collect();
             fixture.weight_arenas = layout.ranks;
             let request = production_request(4096, Some(2 << 20), Onboard::Auto, prefill,

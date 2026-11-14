@@ -1,4 +1,4 @@
-//! V4.1 CED ownership stays fixed; pool and local experts use shared admission.
+//! V4.1 boot placement is fixed; pool and local experts use shared admission.
 use super::super::*;
 pub mod encoder_placement;
 pub use encoder_placement::{CachePlacement, EncoderPlacement};

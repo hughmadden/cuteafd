@@ -1,4 +1,4 @@
-//! Native V4.1 allocation owners, shared with serving admission. CED layer
+//! Native V4.1 allocation owners, shared with serving admission. Boot layer
 //! ownership is fixed; the shared planner chooses only the KV pool and the
 //! local expert prefix from these facts.
 pub use crate::placement::families::deepseek_v41::resident::*;

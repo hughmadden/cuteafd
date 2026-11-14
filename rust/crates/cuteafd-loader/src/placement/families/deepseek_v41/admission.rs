@@ -1004,7 +1004,7 @@ pub struct V41Recipe<'a> {
     pub context: u64,
     pub page_tokens: u64,
     pub maximum_pages: u64,
-    /// The executor's fixed CED ownership, unchanged by this port.
+    /// The executor's process-lifetime ownership, shared by prefill and decode.
     pub attention: Vec<LayerMode>,
     pub gpus: usize,
     pub spark_ranks: usize,

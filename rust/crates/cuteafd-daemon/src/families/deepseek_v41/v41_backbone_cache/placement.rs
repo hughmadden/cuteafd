@@ -1,4 +1,5 @@
 //! Cache ownership uses the same validated map as admission and native weights.
+#[cfg(test)]
 use anyhow::Result;
 pub(crate) use cuteafd_loader::placement::families::deepseek_v41::CachePlacement;
 

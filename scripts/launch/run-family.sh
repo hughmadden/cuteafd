@@ -704,7 +704,7 @@ coordinator="$RELEASE_COORDINATOR_CONTAINER_NAME"
 v41_encoder_placement="$(get V41_ENCODER_PLACEMENT ced)"
 case "$v41_encoder_placement" in
   ced) ;;
-  tail14) [[ "$RELEASE_RTX_GPUS" == 2 ]] || release_die "V41_ENCODER_PLACEMENT=tail14 requires two RTX GPUs" ;;
+  tail14) [[ "$RTX_GPUS" == 2 ]] || release_die "V41_ENCODER_PLACEMENT=tail14 requires two RTX GPUs" ;;
   *) release_die "V41_ENCODER_PLACEMENT must be ced or tail14" ;;
 esac
 
@@ -784,7 +784,7 @@ mkdir -p "$count_config_dir"
 count_config="$count_config_dir/plan-$(printf '%s\n' "$count_config_text" | sha256sum | cut -c1-16).config"
 printf '%s\n' "$count_config_text" >"$count_config.tmp.$$" && mv "$count_config.tmp.$$" "$count_config"
 count_args+=(--config /run/cuteafd-plan.config)
-[[ "$v41_encoder_placement" == ced ]] || count_args+=(--v41-encoder-placement "$v41_encoder_placement")
+[[ "${v41_encoder_placement:-ced}" == ced ]] || count_args+=(--v41-encoder-placement "$v41_encoder_placement")
 for phase in prefill decode; do
   format="$(get "SPARK_${phase^^}_REPLY_FORMAT" "$(get SPARK_REPLY_FORMAT)")"
   [[ -z "$format" ]] || count_args+=("--spark-${phase}-reply-format" "$format")
@@ -1172,7 +1172,7 @@ if [[ -n "${POOL_TOKENS:-}" ]]; then
 fi
 [[ "$SPECULATOR" != dspark ]] || args+=(--dspark)
 [[ -z "$draft_length" ]] || args+=(--draft-length "$draft_length")
-[[ "$v41_encoder_placement" == ced ]] || args+=(--v41-encoder-placement "$v41_encoder_placement")
+[[ "${v41_encoder_placement:-ced}" == ced ]] || args+=(--v41-encoder-placement "$v41_encoder_placement")
 [[ "$TP2_ATTENTION" != on ]] || args+=(--tp2-attention)
 [[ "$TP2_QUERY_PROJECTION" != on ]] || args+=(--tp2-query-projection)
 [[ "$TP2_OUTPUT_PROJECTION" != on ]] || args+=(--tp2-output-projection)

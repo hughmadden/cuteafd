@@ -147,7 +147,7 @@ pub fn deepseek_v41_cache_geometry_with_placement(config: &Value, ranks: usize, 
     {
         return Err(CacheGeometryError::Unsupported {
             family: "deepseek_v41",
-            what: "only the 40-layer CED cache with sources 2/8/14/20 and its 20/20 placement is implemented",
+            what: "only the 40-layer CED cache with sources 2/8/14/20 is implemented",
         });
     }
     // SourceCache: per row 64 packed index keys + FP32 scale, and FP4

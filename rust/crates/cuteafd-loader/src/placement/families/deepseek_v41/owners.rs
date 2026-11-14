@@ -363,6 +363,7 @@ impl<'a> NativePrograms<'a> {
     pub fn modules(&self, decode_rows: u64, unit: u64, ranks: usize,
         draft_rows: Option<u64>) -> Result<Vec<ProgramSet>> {
         ensure!(matches!(ranks, 1 | 2), "invalid V4.1 module owners");
+        let map = self.placement.resolve(ranks)?;
         ensure!(!(self.split_query || self.split_output) || ranks == 2, "projection TP2 requires two target GPUs");
         let mut target = vec![(5120, 1280), (32768, 8192), (5120, 512), (1280, 4096)];
         target.push((1280, if self.split_query { 16384 } else { 32768 }));
@@ -385,7 +386,9 @@ impl<'a> NativePrograms<'a> {
             };
             for rows in [decode_rows, unit] {
                 add(rows, &target)?;
-                if rank == 0 { add(rows, &[(6144, 25600)])?; }
+                if [1, 14].into_iter().any(|layer| map.attention(layer).unwrap() == rank) {
+                    add(rows, &[(6144, 25600)])?;
+                }
                 add(rows, if ranks == 1 { &[(5120, 2304), (2304, 5120)] }
                     else { &[(5120, 1152), (1152, 5120)] })?;
             }
@@ -746,7 +749,18 @@ mod tests {
 
     #[test]
     fn tail14_owner_deltas_match_the_memory_worksheet() -> Result<()> {
-        let manifest = manifest();
+        let mut manifest = manifest();
+        // Gate scratch from the native allocation worksheet/census, rather
+        // than this module's otherwise synthetic GEMM plans.
+        for variant in manifest["variants"].as_array_mut().unwrap() {
+            if variant["input_dim"] == 6144 && variant["output_dim"] == 25600 {
+                match variant["capacity"].as_u64() {
+                    Some(4096) => variant["scratch_bytes"] = 27_326_464u64.into(),
+                    Some(64) => variant["scratch_bytes"] = 587_776u64.into(),
+                    _ => {}
+                }
+            }
+        }
         let ced = NativePrograms::new(&manifest, 128)?;
         let tail = NativePrograms::new(&manifest, 128)?.with_encoder_placement(EncoderPlacement::Tail14);
         let get = |items: &[Demand], gpu, group: &str| items.iter()
@@ -767,6 +781,7 @@ mod tests {
             assert_eq!(get(&b, 1, "prefill slots encoder suffix"), suffix);
             assert_eq!(get(&b, 0, "prefill slots encoder suffix"), 0);
             let gate = get(&a, 0, "prefill slots engram gates") / 2;
+            assert!(gate.abs_diff(427_492_100) <= 4096, "native gate worksheet including allocation alignment: {gate}");
             assert_eq!(get(&b, 0, "prefill slots engram gates"), gate);
             assert_eq!(get(&b, 1, "prefill slots engram gates"), gate);
             // Only unit scratch differs from the measured worksheet's native
@@ -780,6 +795,7 @@ mod tests {
                 assert_eq!(get(&b, 1, &format!("lane {lane} engram rows")), 64 * 18625);
                 let group = format!("lane {lane} engram gates");
                 assert_eq!(get(&b, 1, &group), get(&a, 0, &group) / 2);
+                assert!(get(&b, 1, &group).abs_diff(9_894_400) <= 4096);
                 let group = format!("lane {lane} cache producers");
                 assert_eq!(delta(0, &group), -delta(1, &group));
             }
@@ -852,6 +868,12 @@ mod tests {
         let target = programs.modules(DECODE_LANE_ROWS, 256, 2, None)?;
         assert!(target[0].names.iter().any(|name| name.contains("6144_25600")));
         assert!(!target[1].names.iter().any(|name| name.contains("6144_25600")));
+        let tail = NativePrograms::new(&manifest, 188)?.with_encoder_placement(EncoderPlacement::Tail14)
+            .modules(DECODE_LANE_ROWS, 256, 2, None)?;
+        assert_eq!(target[0], tail[0]);
+        assert!(tail[1].names.iter().any(|name| name.contains("6144_25600")));
+        assert_eq!(tail[1].names.iter().filter(|name| name.contains("6144_25600")).count(),
+            target[0].names.iter().filter(|name| name.contains("6144_25600")).count());
         assert!(target.iter().all(|set| set.names.iter().any(|name| name.contains("5120_1152"))));
         assert!(target.iter().all(|set| !set.names.iter().any(|name| name.contains("_4096/"))));
         let draft = programs.modules(DECODE_LANE_ROWS, 256, 2, Some(80))?;

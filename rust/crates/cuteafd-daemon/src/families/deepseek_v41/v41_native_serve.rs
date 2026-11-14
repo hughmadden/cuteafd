@@ -88,7 +88,6 @@ fn served_profile(model_id: Option<String>, snapshot: &std::path::Path) -> Resul
 }
 
 impl crate::cli::NativeServeArgs {
-        v41_encoder_placement: Default::default(),
     fn expert_usage_enabled(&self) -> Result<bool> {
         // This executor always runs routed experts: it has no skip-routed mode.
         self.expert_usage_reader.configure(self.expert_usage, false).map_err(anyhow::Error::msg)
@@ -368,6 +367,7 @@ fn worker(
     ensure!(!args.tp2_output_projection || args.rtx_gpus==2,"--tp2-output-projection requires --rtx-gpus 2");
     ensure!(!args.tp2_query_projection || args.rtx_gpus==2,"--tp2-query-projection requires --rtx-gpus 2");
     ensure!(!args.tp2_attention || args.rtx_gpus==2,"--tp2-attention requires --rtx-gpus 2");
+    admission::validate_owner_modes(&args)?;
     if args.rtx_gpus == 2 {
         // Probe before the distributed loader reserves either device's weights.
         // SAFETY: the configured native library is trusted and remains live for the probe.

@@ -1,6 +1,5 @@
-//! Production owners for the 20/20 attention split and bottom-up TP2 experts.
+//! Production owners for the admitted encoder placement and TP2 experts.
 use super::*;
-use crate::families::deepseek_v41::v41_backbone_cache::CachePlacement;
 use crate::families::deepseek_v41::v41_backbone_execution::DistributedExecution;
 use crate::families::deepseek_v41::v41_backbone_shared::tp2::Weights as SharedWeights;
 use crate::families::deepseek_v41::v41_engram::placement::{PlacedEngram, PlacedEngramWeights};

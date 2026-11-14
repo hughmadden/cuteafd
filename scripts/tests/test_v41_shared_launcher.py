@@ -826,6 +826,11 @@ def test_v41_encoder_placement_reaches_plan_serve_and_identity(tmp_root, monkeyp
     if value == "tail14":
         assert plan[plan.index(flag) + 1] == "tail14"
         assert coordinator[coordinator.index(flag) + 1] == "tail14"
+        monkeypatch.setattr(capture_module, "example_config", original)
+        baseline = capture_module.capture(ROOT, "deepseek-v41-mxfp4-max")
+        candidate_identity = parse_run(coordinator)["env"]["CUTEAFD_RELEASE_CONFIG_SHA256"]
+        baseline_identity = parse_run(baseline["containers"][0]["argv"])["env"]["CUTEAFD_RELEASE_CONFIG_SHA256"]
+        assert candidate_identity != baseline_identity
     else:
         assert flag not in plan and flag not in coordinator
     for worker in result["containers"][1:]:

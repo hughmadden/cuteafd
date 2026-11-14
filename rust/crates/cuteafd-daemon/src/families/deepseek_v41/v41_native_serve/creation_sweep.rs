@@ -12,7 +12,6 @@
 //! replayed call by call. Every refusal is collected, and the test fails once
 //! with all of them.
 use super::admission;
-use crate::families::deepseek_v41::v41_backbone_cache::CachePlacement;
 use crate::shared::memory::device::Device;
 use crate::shared::memory::{DeviceAllocation, LoadStream};
 use anyhow::{ensure, Context, Result};
@@ -150,6 +149,9 @@ fn serve_args(snapshot: &std::path::Path, native_lib: &std::path::Path, unit: u6
             "--prefill-reserve-rows", &reserve])?;
     let mut args = crate::cli::NativeServeArgs::from_arg_matches(&matches)?;
     args.v41_encoder_placement = qualification_placement()?;
+    if args.v41_encoder_placement == cuteafd_loader::placement::families::deepseek_v41::EncoderPlacement::Tail14 {
+        args.concurrency = 16;
+    }
     Ok(args)
 }
 
@@ -166,6 +168,9 @@ fn plan_args(arch: cuteafd_core::GpuArch, directory: &std::path::Path, snapshot:
     let crate::cli::Commands::Plan(mut plan_args) = cli.command else { anyhow::bail!("expected the plan command") };
     // The launcher's global VISION=off and AUDIO=off, as main hands them to the plan.
     plan_args.v41_encoder_placement = Some(qualification_placement()?);
+    if plan_args.v41_encoder_placement == Some(cuteafd_loader::placement::families::deepseek_v41::EncoderPlacement::Tail14) {
+        plan_args.concurrency = 16;
+    }
     plan_args.vision = cuteafd_loader::plan::MediaMode::Off;
     plan_args.audio = cuteafd_loader::plan::MediaMode::Off;
     Ok(plan_args)
@@ -375,7 +380,8 @@ fn cuda_v41_two_rtx_startup_handles_create_at_planned_sizes() -> Result<()> {
     // owners: the native sizes verify_target_charges compares per owner.
     let fp8_manifest = families_manifest(&native_lib)?;
     let programs = cuteafd_loader::placement::families::deepseek_v41::owners::NativePrograms::new(&fp8_manifest, sms)?
-        .with_compressed_attention(arch.v41_compressed_attention());
+        .with_compressed_attention(arch.v41_compressed_attention())
+        .with_encoder_placement(args.v41_encoder_placement);
     let planned = |sweep: &mut Sweep, gpu: Device<'_>, rows: u32, k: u32, n: u32, owner: &str| {
         let runtime = sweep.record("FP8 plan", format!("GPU{} {owner} m{rows} {k}x{n}", gpu.id),
             gpu.run(|| fp8_plan(&lib, rows, k, n)));

@@ -1680,7 +1680,6 @@ fn plan_decode_rows(value: &str) -> Result<u64, String> {
 }
 
 impl NativeServeArgs {
-        v41_encoder_placement: Default::default(),
     pub fn adaptive_dspark(&self) -> bool {
         self.dspark && self.draft_length.draft_length.is_none()
     }

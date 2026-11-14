@@ -241,8 +241,11 @@ pub(super) fn verify_expert_charges(catalog: &cuteafd_loader::OfficialV41Catalog
 
 /// Startup admission runs before any weight payload or device owner.
 /// Loading-only owners are charged at their sequential phase, not retained in the KV ledger.
-fn validate_owner_modes(args: &crate::cli::NativeServeArgs) -> Result<()> {
+pub(super) fn validate_owner_modes(args: &crate::cli::NativeServeArgs) -> Result<()> {
     args.v41_encoder_placement.resolve(args.rtx_gpus as usize)?;
+    ensure!(args.v41_encoder_placement != families::deepseek_v41::EncoderPlacement::Tail14
+        || !(args.tp2_query_projection || args.tp2_output_projection),
+        "V4.1 tail14 requires whole query/output projections for device-ordered encoder units");
     ensure!(!args.tp2_attention,
         "unsupported V4.1 --tp2-attention: pre-weight contract is missing owner facts for replicated attention weights and per-lane workspaces");
     ensure!(!(args.tp2_query_projection || args.tp2_output_projection) || args.rtx_gpus == 2,
@@ -1197,7 +1200,6 @@ mod admission_tests {
     use clap::Parser;
 
     fn args(directory: &std::path::Path) -> crate::cli::NativeServeArgs {
-        v41_encoder_placement: Default::default(),
         if !directory.join("model.safetensors.index.json").exists() {
             cuteafd_loader::plan::testing::write_v41_snapshot(directory);
         }
@@ -1898,6 +1900,9 @@ mod admission_tests {
             assert!(validate_owner_modes(&args).unwrap_err().to_string().contains("two RTX"));
             args.rtx_gpus = 2;
             validate_owner_modes(&args).unwrap();
+            args.v41_encoder_placement = families::deepseek_v41::EncoderPlacement::Tail14;
+            assert!(validate_owner_modes(&args).unwrap_err().to_string().contains("device-ordered encoder units"));
+            args.v41_encoder_placement = Default::default();
         }
     }
 
