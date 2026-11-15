@@ -238,9 +238,12 @@ mod tests {
     fn tail14_graph_key_is_fixed_and_never_borrows_target_pins_or_captures() {
         std::thread::spawn(|| {
             set_layout(2);
-            set_encoder_placement(EncoderPlacement::Tail14).unwrap();
-            set_encoder_placement(EncoderPlacement::Tail14).unwrap();
-            assert!(set_encoder_placement(EncoderPlacement::Ced).is_err());
+            // Bind the production posture directly so an ambient diagnostic env
+            // cannot change this fixture; the public env path is covered by
+            // target_graph_mode_binds_from_environment_at_startup.
+            bind_target_graphs(EncoderPlacement::Tail14, TargetGraphs::Production).unwrap();
+            bind_target_graphs(EncoderPlacement::Tail14, TargetGraphs::Production).unwrap();
+            assert!(bind_target_graphs(EncoderPlacement::Ced, TargetGraphs::Production).is_err());
             for rows in [1, 16, 64, 128, 2752] { assert!(!captures_shape(rows)); }
             assert!(prewarm_rows(0, 64).is_empty());
             assert!(prewarm_rows(1, 64).is_empty());
@@ -362,6 +365,18 @@ mod tests {
                     }).join().unwrap();
                     assert!(error.contains("not valid Unicode"), "{error}");
                 }
+                "crosstalk" => {
+                    // Public boundary: a changed second binding must propagate its
+                    // error, not be silently accepted, and must not half-apply.
+                    std::thread::spawn(|| {
+                        set_encoder_placement(EncoderPlacement::Ced).unwrap();
+                        let error = set_encoder_placement(EncoderPlacement::Tail14)
+                            .unwrap_err().to_string();
+                        assert!(error.contains("graph placement cannot change"), "{error}");
+                        assert_eq!(PLACEMENT.with(std::cell::Cell::get), Some(EncoderPlacement::Ced));
+                        assert_eq!(target_graph_mode(), TargetGraphs::Production);
+                    }).join().unwrap();
+                }
                 other => panic!("unknown child scenario {other}"),
             }
             return;
@@ -374,7 +389,7 @@ mod tests {
         #[cfg(not(unix))]
         let nonunicode = None;
         let mut scenarios: Vec<(&str, Option<std::ffi::OsString>)> = vec![
-            ("unset", None), ("eager", Some("eager".into())),
+            ("unset", None), ("crosstalk", None), ("eager", Some("eager".into())),
             ("capture", Some("capture".into())), ("invalid", Some("auto".into())),
         ];
         if let Some(value) = nonunicode { scenarios.push(("nonunicode", Some(value))); }
