@@ -891,7 +891,7 @@ mod tests {
         assert_eq!(inputs["prefill_rows"], 2752);
         assert_eq!(inputs["prefill_waves"], 3);
         assert_eq!(inputs["lanes"], 2);
-        assert_eq!(inputs["onboard_layers"], 0);
+        assert_eq!(inputs["onboard_layers"], serde_json::json!([[], []]));
         let catalog = cuteafd_loader::read_official_v41_catalog(std::path::Path::new(&snapshot))?;
         let stored = u64::from(lib.v41_tp2_expert_info(1)?.kernel_intermediate);
         let domains = inputs["memory_dashboard_plan"]["domains"].as_array().context("admitted domains")?;
