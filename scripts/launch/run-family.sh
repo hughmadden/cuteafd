@@ -477,6 +477,16 @@ if [[ -n "${CUTEAFD_GRAPH_EAGER:-}" ]]; then
   [[ "${CUTEAFD_GRAPH_CENSUS:-}" != 1 ]] || { printf '%s\n' 'Graph eager A/B requires census timing disabled' >&2; exit 2; }
   graph_census_args+=(-e CUTEAFD_GRAPH_EAGER=layer_row)
 fi
+# Diagnostic V4.1 target-bank graph posture (placement graph qualification).
+# WIP-only and default-off; the daemon validates the value again.
+if [[ -n "${CUTEAFD_V41_TARGET_GRAPHS:-}" ]]; then
+  [[ -n "$wip_layout" ]] || { printf '%s\n' 'V4.1 target graph mode requires a WIP build' >&2; exit 2; }
+  [[ "$family" == deepseek_v41 ]] || { printf '%s\n' 'V4.1 target graph mode requires the deepseek_v41 family' >&2; exit 2; }
+  case "$CUTEAFD_V41_TARGET_GRAPHS" in
+    eager|capture) graph_census_args+=(-e "CUTEAFD_V41_TARGET_GRAPHS=$CUTEAFD_V41_TARGET_GRAPHS") ;;
+    *) printf '%s\n' 'V4.1 target graph mode must be eager or capture' >&2; exit 2 ;;
+  esac
+fi
 }
 # API keys, the live console and usage records: arguments for the serve command
 # (api_args) and the coordinator's mounts (api_mount_args), the same in every family.

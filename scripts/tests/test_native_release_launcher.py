@@ -619,6 +619,39 @@ printf '%s\0' "${RELEASE_SERVING_ARGS[@]}"
                         expected = ['before'] + (['-e', 'CUTEAFD_GRAPH_EAGER=layer_row'] if eager else []) + ['after']
                         self.assertEqual(result.stdout, ('\0'.join(expected) + '\0').encode())
 
+    def test_v41_target_graph_mode_is_wip_only_default_off_and_validated(self) -> None:
+        for launcher in ['scripts/launch/run-family.sh']:
+            source = (ROOT / launcher).read_text()
+            suffix = source.split('if [[ -n "${CUTEAFD_V41_TARGET_GRAPHS:-}" ]]; then\n', 1)[1]
+            block = ('if [[ -n "${CUTEAFD_V41_TARGET_GRAPHS:-}" ]]; then\n'
+                     + suffix.split('\nfi', 1)[0] + '\nfi\n')
+            self.assertIn('"${graph_census_args[@]}"', source)
+            for mode, family, wip, valid in [
+                (None, 'deepseek_v41', '', True), ('', 'deepseek_v41', '', True),
+                ('eager', 'deepseek_v41', '/slot', True),
+                ('capture', 'deepseek_v41', '/slot', True),
+                ('eager', 'deepseek_v41', '', False),
+                ('capture', 'deepseek_v41', '', False),
+                ('eager', 'glm5', '/slot', False),
+                ('auto', 'deepseek_v41', '/slot', False),
+                ('production', 'deepseek_v41', '/slot', False),
+            ]:
+                with self.subTest(launcher=launcher, mode=mode, family=family, wip=wip):
+                    env = dict(os.environ)
+                    env.pop('CUTEAFD_V41_TARGET_GRAPHS', None)
+                    if mode is not None:
+                        env['CUTEAFD_V41_TARGET_GRAPHS'] = mode
+                    harness = ('set -euo pipefail\nrelease_die() { exit 2; }\n'
+                               'family=$1\nwip_layout=$2\ngraph_census_args=()\n')
+                    result = subprocess.run(['bash', '-c', harness + block +
+                        'printf "%s\\0" before "${graph_census_args[@]}" after',
+                        'test', family, wip], env=env, capture_output=True)
+                    self.assertEqual(result.returncode == 0, valid, result.stderr)
+                    if valid:
+                        expected = ['before'] + (
+                            ['-e', f'CUTEAFD_V41_TARGET_GRAPHS={mode}'] if mode else []) + ['after']
+                        self.assertEqual(result.stdout, ('\0'.join(expected) + '\0').encode())
+
     def test_embedding_placement_registered_and_gpu_default(self) -> None:
         result = subprocess.run(['bash', '-c',
             'source scripts/lib/release-common.sh; release_known_key EMBEDDING; '
