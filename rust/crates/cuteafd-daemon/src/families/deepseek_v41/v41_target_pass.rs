@@ -842,10 +842,14 @@ mod tests {
         Ok(())
     }
 
+    // CPU interleaving model only: no native advance, transfer or CUDA events.
+    // Delayed completion, retained-row lifetime and cut cancellation remain native proofs.
     #[test]
     fn placed_lane_interleavings_drain_owner_reduce_and_direct_hops() -> anyhow::Result<()> {
         use crate::shared::peer_split::order::{check, host::{check_host, HostSchedule}};
         use super::CacheStage;
+        use cuteafd_loader::placement::{families::deepseek_v41::{EncoderPlacement, execution_hops}, plan_hops, HopPoint};
+        use crate::shared::peer_split::order::{Op, host::HostOp};
         let runtime = tokio::runtime::Builder::new_current_thread().build()?;
         for stage in [CacheStage::Full, CacheStage::Encoder, CacheStage::Replay] {
             // Record the real scheduler's layer order, then interleave independent
@@ -858,24 +862,39 @@ mod tests {
                 });
                 anyhow::Ok(layers)
             })?;
-            for placed in [false, true] {
+            for (placed, option) in [(false, EncoderPlacement::Ced), (true, EncoderPlacement::Ced), (true, EncoderPlacement::Tail14)] {
+                let map = option.resolve(if placed { 2 } else { 1 })?;
+                let spec = execution_hops(if placed { 2 } else { 1 });
+                let hops = plan_hops(&map.modes(), &spec)?;
+                if placed {
+                    assert_eq!(hops.len(), 1);
+                    assert_eq!((hops[0].at, hops[0].from, hops[0].to),
+                        (HopPoint::BeforeLayer(if option == EncoderPlacement::Tail14 { 14 } else { 20 }), 0, 1));
+                } else { assert!(hops.is_empty()); }
                 for leading in 0..2 {
                     for chunk in [1, 2, 7, 20, 40] {
                         let mut schedule = HostSchedule::default();
                         let mut next = [0; 2];
+                        let mut crossings = Vec::new();
                         while next.iter().any(|&at| at < layers.len()) {
                             for lane in [leading, 1 - leading] {
                                 for _ in 0..chunk {
                                     let Some(&(layer, first)) = layers.get(next[lane]) else { break };
                                     next[lane] += 1;
-                                    let owner = usize::from(placed && layer >= 20);
-                                    if placed && layer == 20 {
-                                        // Replay imports the retained encoder suffix before
-                                        // its first layer; full passes advance across L19/20.
+                                    let owner = map.attention(layer)?;
+                                    // Replay imports the retained layer19 suffix; tail14's
+                                    // suffix is already local. Full/Encoder use the planned hop.
+                                    let source = if stage == CacheStage::Replay && layer == first {
+                                        Some(map.attention(19)?).filter(|&source| source != owner)
+                                    } else { hops.iter().find(|hop| hop.at == HopPoint::BeforeLayer(layer))
+                                        .map(|hop| usize::from(hop.from)) };
+                                    if option == EncoderPlacement::Tail14 && layer == 20 { assert!(source.is_none()); }
+                                    if let Some(source) = source {
                                         assert!(layer != first || stage == CacheStage::Replay);
-                                        schedule.push_to(0, "direct-input", 0, lane, "residual and pre ready");
-                                        schedule.wait_for(1, "direct-input", 0, lane, "land block inputs");
-                                        schedule.sync(1, "direct-input copy complete");
+                                        crossings.push((layer, source, owner));
+                                        schedule.push_to(source, "direct-input", 0, lane, "residual and pre ready");
+                                        schedule.wait_for(owner, "direct-input", 0, lane, "land block inputs");
+                                        schedule.sync(owner, "direct-input copy complete");
                                     }
                                     if placed {
                                         schedule.push_to(1 - owner, "owner-reduce", layer, lane, "remote expert partial ready");
@@ -885,10 +904,22 @@ mod tests {
                                 }
                             }
                         }
+                        let expected = if !placed || (stage == CacheStage::Encoder && option == EncoderPlacement::Ced)
+                            || (stage == CacheStage::Replay && option == EncoderPlacement::Tail14) { Vec::new() }
+                            else { vec![(if stage == CacheStage::Replay { 20 } else if option == EncoderPlacement::Tail14 { 14 } else { 20 }, 0, 1); 2] };
+                        assert_eq!(crossings, expected, "stage={stage:?} placement={option} placed={placed}");
+                        if option == EncoderPlacement::Tail14 && stage == CacheStage::Full && leading == 0 && chunk == 1 {
+                            let mut missing = schedule.clone();
+                            let producer = missing.ops.iter().position(|op| matches!(op,
+                                HostOp::Queue { op: Op::Push(flag), .. } if flag.exchange == "direct-input")).unwrap();
+                            missing.ops.remove(producer);
+                            assert!(check(&missing.streams()).is_err(), "missing source13 producer must block the cut");
+                            assert!(check_host(&missing).is_err(), "host must not pass the unmatched cut wait");
+                        }
                         assert_eq!(check(&schedule.streams()), Ok(()),
-                            "stage={stage:?} placed={placed} leading={leading} chunk={chunk}");
+                            "stage={stage:?} placement={option} placed={placed} leading={leading} chunk={chunk}");
                         assert_eq!(check_host(&schedule), Ok(()),
-                            "stage={stage:?} placed={placed} leading={leading} chunk={chunk}");
+                            "stage={stage:?} placement={option} placed={placed} leading={leading} chunk={chunk}");
                     }
                 }
             }
