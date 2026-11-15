@@ -10,6 +10,13 @@ use cuteafd_transport::ExpertV2SourceKind;
 use std::cell::RefCell;
 
 impl<'w, 'a> DistributedTargetPass<'w, 'a> {
+    /// Drain this worker thread's existing test-only unit-window observations.
+    #[cfg(test)]
+    pub(crate) fn take_test_unit_windows() -> Vec<(crate::shared::memory::row_window::RowWindow,
+        Option<crate::shared::memory::row_window::RowWindow>)> {
+        UNIT_WINDOWS.with(|seen| std::mem::take(&mut *seen.borrow_mut()))
+    }
+
     /// The per-layer preparation `execute_inner` runs before the FFN, for a
     /// reserved encoder unit: the lane advance (with its block hop), Engram at
     /// layers 1 and 14, cache production and the attention, finished.

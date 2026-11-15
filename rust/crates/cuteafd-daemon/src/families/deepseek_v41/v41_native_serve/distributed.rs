@@ -733,6 +733,186 @@ mod tests {
         Ok(())
     }
 
+    // Full production startup, not the legacy 73-GB direct-pass fixture. CPU builds
+    // only type-check this test. An exact ID in a fresh process is mandatory: the
+    // FFI budget and placement are process-global. Native execution must prove
+    // admission/receipt/bind/adoption, real windows and completion; this is not a
+    // byte-exact restore, race/order, tier-count prediction or performance oracle.
+    #[test]
+    #[ignore = "requires native SM89 library/checkpoint, 2x48-GiB SM89 pair and four live Spark peers; CPU build only here"]
+    fn tail14_sm89_c16_worker_admits_and_executes_three_unit_cut() -> Result<()> {
+        use clap::{Args, FromArgMatches};
+        use cuteafd_api::openai::probe::{Probe, ProbeSpec};
+        use cuteafd_core::{memory_layout::{Category, Item}, memory_policy::MemoryPolicy};
+        use cuteafd_loader::placement::{planner::{Budget, Location}, families::deepseek_v41::expert_cost};
+        const CAP: u64 = 48 << 30;
+        const ROWS: usize = 6 * 2752 + 129;
+        const C: usize = 16;
+        let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
+        let snapshot = std::env::var("CUTEAFD_SNAPSHOT")?;
+        let native = std::env::var("CUTEAFD_NATIVE_LIB")?;
+        let peers = std::env::var("CUTEAFD_DUAL_PEERS")?;
+        let matches = crate::cli::NativeServeArgs::augment_args(clap::Command::new("fixture"))
+            .try_get_matches_from(["fixture", "--snapshot", &snapshot, "--native-lib", &native,
+                "--peers", &peers, "--dspark", "--rtx-gpus", "2", "--v41-encoder-placement", "tail14",
+                "--prefill-batch-tokens", "2752", "--prefill-waves", "3", "--prefill-reserve-rows", "8192",
+                "--concurrency", "16", "--decode-lanes", "2", "--pool-tokens", "2097152",
+                "--max-context-tokens", "1048576", "--prefix-cache-entries", "128",
+                "--gpu-expert-tier", "auto", "--rtx-expert-layers", "0"])?;
+        let mut args = crate::cli::NativeServeArgs::from_arg_matches(&matches)?;
+        ensure!(args.peers.len() == 4, "four live Spark peers serving an owned expert group are required");
+        super::super::normalize_serving(&mut args)?;
+        assert_eq!(super::super::PrefillShape::from_args(&args),
+            super::super::PrefillShape { rows: 2752, waves: 3 });
+        let shape = super::super::AdmittedPrefill::resolve(&args)?;
+        assert_eq!(shape, super::super::AdmittedPrefill { unit_cap: 2752, waves: 3 });
+        assert_eq!(shape.reserve_rows(), 8256); // Nominal CLI reserve is 8192.
+        assert_eq!(super::super::DECODE_LANE_ROWS, 64);
+        cuteafd_ffi::set_coordinator_gpu_budget(CAP)?;
+        // SAFETY: the operator supplies the matching native SM89 library; it
+        // stays loaded until this worker and all readbacks have completed.
+        let lib = unsafe { NativeLibrary::load(&native)? };
+        for id in 0..2 {
+            let device = Device { library: &lib, id };
+            assert_eq!(crate::shared::inventory::device_arch(&lib, id)?, cuteafd_core::GpuArch::Sm89);
+            let (physical, capped) = device.run(|| Ok((lib.cuda_physical_memory_info()?.1,
+                lib.cuda_memory_info()?.1)))?;
+            assert_eq!(capped as u64, (physical as u64).min(CAP));
+            eprintln!("GPU{id}: physical={physical} capped={capped} bytes");
+        }
+        let tokenizer = cuteafd_loader::LoadedTokenizer::from_snapshot(std::path::Path::new(&snapshot))?;
+        let filler = tokenizer.encode_ids("This is background context.\n")?;
+        let suffix = tokenizer.encode_ids("\nWhat is two plus two? Answer briefly.<｜Assistant｜></think>")?;
+        ensure!(!filler.is_empty(), "empty fixture filler");
+        // Same explicit-token request representation as v41_golden::score,
+        // retaining ordinary dSpark and exact prefix-cache behavior.
+        let request = |ids: Vec<u32>| {
+            let probe = Probe::new(ProbeSpec { prompt_ids: Some(ids), ..Default::default() });
+            let (events, output) = mpsc::unbounded_channel();
+            (NativeRequest { prefix_cache_source: Default::default(), finish_detail: Default::default(),
+                literal_spans: Vec::new(), prompt: String::new(), constraint: None, images: Vec::new(),
+                media: Vec::new(), audio: Vec::new(), max_tokens: 8,
+                sampling: cuteafd_core::TargetSamplingParams::greedy(), stop_token_ids: Vec::new(),
+                events, usage: None, probe: Some(probe.clone()) }, (probe, output))
+        };
+        let (send, receive) = mpsc::channel(C);
+        let mut outputs = Vec::new();
+        let mut repeat_ids = Vec::new();
+        for lane in 0..C {
+            let mut ids = tokenizer.encode_ids(&format!("<｜begin▁of▁sentence｜><｜User｜>Fixture {lane}.\n"))?;
+            ensure!(ids.len() + suffix.len() < ROWS, "fixture envelope exceeds prompt length");
+            ids.extend(filler.iter().copied().cycle().take(ROWS - ids.len() - suffix.len()));
+            ids.extend_from_slice(&suffix);
+            assert_eq!(ids.len(), ROWS);
+            if lane == 0 { repeat_ids = ids.clone(); }
+            let (input, output) = request(ids);
+            send.blocking_send(input).map_err(|_| anyhow::anyhow!("worker queue closed"))?;
+            outputs.push(output);
+        }
+        let (ready, readiness) = oneshot::channel();
+        // Only the client moves to another thread. The real outer worker and
+        // UNIT_WINDOWS observations remain on this thread under scoped policy.
+        let client = std::thread::spawn(move || -> Result<()> {
+            let startup = readiness.blocking_recv();
+            let mut errors = Vec::new();
+            match startup {
+                Ok(Ok((_, context))) => if context != 1048576 { errors.push(format!("context={context}")); },
+                other => errors.push(format!("readiness failed: {other:?}")),
+            }
+            for i in 0..=C {
+                // Drain every initial response even after any failure. Repeat
+                // only after all initial streams close, so its snapshot exists.
+                let (probe, mut output) = if i < C { outputs.remove(0) } else {
+                    if !errors.is_empty() { break; }
+                    let (input, output) = request(repeat_ids.clone());
+                    if send.blocking_send(input).is_err() {
+                        errors.push("repeat queue closed".into());
+                    }
+                    output
+                };
+                let (mut ready, mut finish, mut text) = (0, 0, String::new());
+                while let Some(chunk) = output.blocking_recv() {
+                    match chunk {
+                        Ok(InferenceChunk::Ready { prompt_usage, .. }) => {
+                            ready += 1;
+                            let hits = if i == C { ROWS } else { 0 };
+                            if prompt_usage.prompt_tokens != ROWS
+                                || prompt_usage.prompt_cache_hit_tokens != hits {
+                                errors.push(format!("request{i} prompt usage: {prompt_usage:?}"));
+                            }
+                        }
+                        Ok(InferenceChunk::Finish { .. }) => finish += 1,
+                        Ok(InferenceChunk::Text { content, .. }) => text.push_str(&content),
+                        Err(error) => errors.push(format!("request{i}: {error:?}")),
+                        _ => (),
+                    }
+                }
+                let record = probe.record();
+                if ready != 1 || finish != 1 || text.is_empty() || record.error.is_some()
+                    || record.engine.as_deref() != Some("deepseek_v41")
+                    || record.prompt_ids.len() != ROWS || record.cached_tokens != if i == C { ROWS } else { 0 } {
+                    errors.push(format!("request{i}: Ready={ready} Finish={finish} text={text:?} probe_error={:?}", record.error));
+                }
+            }
+            drop(send); // Worker drains/stops; no sender survives failure paths.
+            ensure!(errors.is_empty(), "{}", errors.join("; "));
+            Ok(())
+        });
+        DistributedTargetPass::take_test_unit_windows();
+        let stats = std::sync::Arc::new(std::sync::Mutex::new(serde_json::Value::Null));
+        let worker = MemoryPolicy { gpu_cap: Some(CAP), ..MemoryPolicy::current() }.scoped(||
+            super::super::worker(args, receive, &mut Some(ready), stats));
+        let client = client.join(); // Join before propagating the actual worker Err.
+        worker?; // Refusal is a direct failure; WorkerHandle::join cannot mask it.
+        client.map_err(|_| anyhow::anyhow!("fixture client panicked"))??;
+        let windows = DistributedTargetPass::take_test_unit_windows();
+        let mut full_slots = [0; 3];
+        let (mut rows, mut tails) = (0, 0);
+        for (window, tp2) in &windows {
+            assert_eq!(tp2.as_ref(), Some(window), "TP2 must share the pass's selected rows");
+            let range = window.range().context("unit has no explicit window")?;
+            ensure!(range.end <= 8256, "unit exceeds the resolved span");
+            rows += range.len();
+            match range.len() {
+                2752 => full_slots[range.start / 2752] += 1,
+                129 => tails += 1,
+                other => anyhow::bail!("unexpected unit rows {other}"),
+            }
+        }
+        // Each long prompt traverses two three-unit calls and a later odd tail;
+        // the exact prefix repeat must add no encoder rows. No seven-unit call.
+        assert_eq!(rows, C * ROWS);
+        assert_eq!(full_slots, [2 * C; 3]);
+        assert_eq!(tails, C);
+        let inputs = cuteafd_ffi::memory_ledger::fault::inputs();
+        assert_eq!(inputs["pool_tokens"], 2097152);
+        assert_eq!(cuteafd_bench::context::kv().context("live pool readback")?.tokens, Some(2097152));
+        assert_eq!(inputs["prefill_span_rows"], 8256);
+        assert_eq!(inputs["prefill_rows"], 2752);
+        assert_eq!(inputs["prefill_waves"], 3);
+        assert_eq!(inputs["lanes"], 2);
+        assert_eq!(inputs["onboard_layers"], 0);
+        let catalog = cuteafd_loader::read_official_v41_catalog(std::path::Path::new(&snapshot))?;
+        let stored = u64::from(lib.v41_tp2_expert_info(1)?.kernel_intermediate);
+        let domains = inputs["memory_dashboard_plan"]["domains"].as_array().context("admitted domains")?;
+        let mut paired = None;
+        for rank in 0..2 {
+            let domain = domains.iter().find(|domain| serde_json::from_value::<Budget>(domain["budget"].clone())
+                .is_ok_and(|b| b.locations.contains(&Location::coordinator(rank)))).context("coordinator domain")?;
+            let items: Vec<Item> = serde_json::from_value(domain["items"].clone())?;
+            let bytes: u64 = items.iter().filter(|item| item.category == Category::Experts
+                && item.group == "weight arena").map(|item| item.bytes).sum();
+            let per_expert = expert_cost(&catalog, 0, 2, usize::from(rank), stored)?.resident
+                / catalog.routed_experts().experts as u64;
+            ensure!(bytes > 0 && per_expert > 0 && bytes % per_expert == 0, "no exact positive tier readback");
+            let count = bytes / per_expert;
+            if let Some(previous) = paired { assert_eq!(previous, count, "paired expert count"); }
+            paired = Some(count);
+            eprintln!("GPU{rank}: selected paired experts={count}, resident arena={bytes} bytes; outcomes, not a prediction");
+        }
+        Ok(())
+    }
+
     #[test]
     #[ignore = "requires CUTEAFD_NATIVE_LIB, CUTEAFD_SNAPSHOT, CUTEAFD_DUAL_PEERS, two GPUs and live Sparks"]
     fn distributed_worker_serves_text_requests() -> Result<()> {
