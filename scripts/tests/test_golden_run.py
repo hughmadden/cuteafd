@@ -707,6 +707,62 @@ def test_spark_hosts_refused(hosts, match):
         golden.parse_hosts(hosts)
 
 
+def test_raptor_pool_is_the_unchanged_default():
+    hosts = list(golden.HOST_LOCKS)
+    assert golden.SPARK_POOLS['raptor'] is golden.HOST_LOCKS
+    assert golden.parse_hosts(','.join(hosts)) == golden.parse_hosts(','.join(hosts), 'raptor') == hosts
+    assert golden.locks_for([1, 0], hosts) == golden.locks_for([1, 0], hosts, 'raptor') == [
+        'sparks', 'gpu0', 'gpu1', 'rhea', 'moa']
+
+
+@pytest.mark.parametrize('pool,hosts,match', [
+    ('raptor', 'dodo,spark7', 'not a pool Spark'),
+    ('raptor', 'spark7,spark8,spark9,spark10', 'not a pool Spark'),
+    ('juliet', 'spark7,dodo', 'not a pool Spark'),
+    ('juliet', 'dodo', 'not a pool Spark'),
+    ('juliet', 'spark7,unknown', 'not a pool Spark'),
+    ('juliet', 'spark7,spark7', 'repeats'),
+    *[(pool, host, 'refused') for pool in ('raptor', 'juliet') for host in golden.REFUSED_HOSTS],
+    *[('juliet', host, 'not a pool Spark') for host in ('pg', 'romeo', 'juliet', 'spark1', 'spark4', 'spark5', 'spark6')],
+])
+def test_spark_pool_host_refusals_before_any_launch(spark_env, capsys, pool, hosts, match):
+    assert golden.main(spark_argv(spark_env, '--spark-pool', pool, hosts=hosts)) == 2
+    assert match in capsys.readouterr().err
+    assert not docker_calls(spark_env) and not ssh_calls(spark_env)
+    assert not any(spark_env['locks'].iterdir())
+
+
+@pytest.mark.parametrize('pool', ['raptor', 'juliet'])
+def test_explicit_spark_pool_requires_hosts(env, capsys, pool):
+    assert golden.main(BASE + ['--arm', 'a=i1:s1', '--spark-pool', pool] + GOLDEN) == 2
+    assert '--spark-pool needs --spark-hosts' in capsys.readouterr().err
+    assert not docker_calls(env) and not any(env['locks'].iterdir())
+
+
+def test_juliet_pool_uses_config_lanes_and_canonical_locks(spark_env, monkeypatch):
+    hosts = ['spark7', 'spark8', 'spark9', 'spark10']
+    lanes = ['10.0.120.228', '10.0.120.158', '10.0.120.43', '10.0.120.121']
+    spark_env['config'].write_text(''.join(
+        f'SPARK_{i}_HOST={host}\nSPARK_{i}_LANE_A={lane}\n' for i, (host, lane) in enumerate(zip(hosts, lanes))))
+    monkeypatch.setenv('STUB_RUN_OUTPUT', PASSED)
+    order = []
+    real_hold = golden.hwlock.hold
+    monkeypatch.setattr(golden.hwlock, 'hold', lambda names, *a, **k: (order.append(list(names)), real_hold(names, *a, **k))[1])
+    assert golden.parse_hosts(','.join(hosts), 'juliet') == hosts
+    assert golden.locks_for([1, 0], hosts[::-1], 'juliet') == ['sparks', 'gpu0', 'gpu1']
+    assert golden.main(spark_argv(spark_env, '--spark-pool', 'juliet', '--gpus', '1,0', hosts=','.join(hosts))) == 0
+    assert order == [['sparks', 'gpu0', 'gpu1']]
+    root = spark_env['home'] / '.cache/cuteafd/builds/gr/golden'
+    plan = json.loads((root / 'plan.json').read_text())
+    record = json.loads((root / 'a/r1/argv.json').read_text())
+    assert plan['sparks']['pool'] == 'juliet'
+    assert plan['sparks']['hosts'] == hosts and plan['sparks']['lanes'] == lanes
+    assert record['locks'] == ['sparks', 'gpu0', 'gpu1']
+    assert [host for host, command in ssh_calls(spark_env) if 'expertd-native' in command] == hosts
+    assert record['env']['CUTEAFD_GOLDEN_PEERS'] == ','.join(f'{lane}:19451' for lane in lanes)
+    assert json.loads(spark_env['state'].read_text()) == {}
+
+
 def test_expert_layers_and_lock_order():
     assert golden.parse_layers('3') == [3]
     assert golden.parse_layers('5-7,3,6') == [3, 5, 6, 7]
@@ -804,6 +860,8 @@ def test_real_experts_start_before_and_stop_before_locks_release(spark_env, monk
         assert golden.WORKER_READY in (out / f'r1/workers/{host}.log').read_text()
     record = json.loads((out / 'r1/argv.json').read_text())
     assert [w['host'] for w in record['workers']] == SPARKS and record['native_test_sha256']
+    plan = json.loads((out.parent / 'plan.json').read_text())
+    assert 'pool' not in plan['sparks']  # default raptor provenance stays unchanged
     assert set(record['spark_packages']) == {'fp8/fp8-step5/manifest.json'}
     summary = (out.parent / 'summary.md').read_text()
     assert 'Spark expert ranks: 0=dodo, 1=emu, 2=rhea, 3=moa' in summary
@@ -976,6 +1034,10 @@ def test_spark_hosts_without_lanes_in_config(spark_env, capsys):
 
 
 def test_fixture_generation_command_mode(env, monkeypatch):
+    # This test uses a temporary fixture tree; its filesystem is a stub input too.
+    findmnt = env['tmp'] / 'bin/findmnt'
+    findmnt.write_text('#!/usr/bin/env python3\nprint(\'{"filesystems": [{"fstype": "ext4", "options": "rw"}]}\')\n')
+    findmnt.chmod(0o755)
     write_slot(env['home'], 'i1')
     monkeypatch.setenv('STUB_RUN_ENV', str(env['tmp'] / 'run-env.json'))
     fixtures = env['home'] / '.cache/cuteafd/builds/gr/fixtures/chain'

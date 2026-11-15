@@ -7,7 +7,7 @@ on raptor's RTX GPUs, optionally against real expert workers on Sparks.
       [--arm-env A:KEY=VALUE] [--arm-arg A:TOKEN] [--env KEY=VALUE] [--gpus 0,1] [--repeats N] \\
       [--timeout SECONDS] [--preflight CMD] [--compare-logits A:B] \\
       [--native-test TEST_EXECUTABLE | --command] [--fixtures DIR [--fixtures-writable]] [--mount PATH] [--rdma] \\
-      [--spark-hosts H1,H2,... [--expert-layers 3,5-7] [--worker-env KEY=VALUE] [--arm-worker-env A:KEY=VALUE] [--worker-arg ARG]] \\
+      [--spark-hosts H1,H2,... [--spark-pool raptor|juliet] [--expert-layers 3,5-7] [--worker-env KEY=VALUE] [--arm-worker-env A:KEY=VALUE] [--worker-arg ARG]] \\
       -- ARGS...
 
 Each arm runs its slot's `cuteafd`, `libcuteafd_native.so`, `PROGRAMS.json` and expert
@@ -134,6 +134,8 @@ REFUSED_HOSTS = {
 }
 # Which hardware lock covers a Spark (scripts/hw/hwlock.py order; as `cuteafd bench smoke`).
 HOST_LOCKS = {'ostrich': 'sparks', 'dodo': 'sparks', 'emu': 'sparks', 'kiwi': 'sparks', 'rhea': 'rhea', 'moa': 'moa'}
+SPARK_POOLS = {'raptor': HOST_LOCKS,
+               'juliet': {f'spark{i}': 'sparks' for i in range(7, 11)}}
 WORKER_READY = 'native worker bootstrap ready'
 WORKER_LABEL = 'cuteafd.golden-run'
 DEFAULT_EXPERT_PORT = 19451  # beside serving's 19441, so a stray serving worker is detected, not reused
@@ -282,7 +284,8 @@ def worker_name(task, arm, rank):
 
 # --------------------------------------------------------------------------- Spark workers
 
-def parse_hosts(value):
+def parse_hosts(value, pool='raptor'):
+    host_locks = SPARK_POOLS[pool]
     hosts = [h.strip() for h in value.split(',') if h.strip()]
     if not hosts:
         raise ValueError('--spark-hosts names no host')
@@ -291,8 +294,8 @@ def parse_hosts(value):
     for host in hosts:
         if host in REFUSED_HOSTS:
             raise ValueError(f'--spark-hosts: {host} is refused ({REFUSED_HOSTS[host]})')
-        if host not in HOST_LOCKS:
-            raise ValueError(f'--spark-hosts: {host} is not a pool Spark ({", ".join(sorted(HOST_LOCKS))})')
+        if host not in host_locks:
+            raise ValueError(f'--spark-hosts: {host} is not a pool Spark ({", ".join(sorted(host_locks))})')
     return hosts
 
 
@@ -334,8 +337,8 @@ def build_seed(config_path):
     return cards.config(config_path).get('WIP_BUILD_SEED') or 'kakapo'
 
 
-def locks_for(gpus, hosts=()):
-    names = {f'gpu{g}' for g in gpus} | {HOST_LOCKS[h] for h in hosts}
+def locks_for(gpus, hosts=(), pool='raptor'):
+    names = {f'gpu{g}' for g in gpus} | {SPARK_POOLS[pool][h] for h in hosts}
     return hwlock.canonical(sorted(names))
 
 
@@ -1399,12 +1402,15 @@ def resolve_fixtures(args, task_root):
 
 
 def build_state(args, arms):
+    if args.spark_pool is not None and not args.spark_hosts:
+        raise ValueError('--spark-pool needs --spark-hosts')
+    pool = args.spark_pool or 'raptor'
     task_root = Path.home() / '.cache/cuteafd/builds' / args.task
     snapshot, container_path, extra = resolve_model(args.model)
     hub = hub_root()
     sparks = None
     if args.spark_hosts:
-        hosts = parse_hosts(args.spark_hosts)
+        hosts = parse_hosts(args.spark_hosts, pool)
         if args.worker_ready_timeout < 1:
             raise ValueError('--worker-ready-timeout must be positive seconds')
         if not 1 <= args.expert_port <= 65535:
@@ -1430,6 +1436,8 @@ def build_state(args, arms):
                       env=worker_env, arm_env=arm_worker_env, args=list(args.worker_arg), budget=args.worker_budget_bytes,
                       memory=args.worker_memory_bytes,
                       ready_timeout=args.worker_ready_timeout, poll_s=args.worker_poll)
+        if args.spark_pool is not None:
+            sparks['pool'] = pool
     elif args.expert_layers or args.worker_env or args.arm_worker_env or args.worker_arg or args.worker_memory_bytes is not None:
         raise ValueError('--expert-layers, --worker-env, --arm-worker-env, --worker-arg and --worker-memory-bytes need --spark-hosts')
     mode = 'native-test' if args.native_test else 'command' if args.command else 'golden'
@@ -1457,7 +1465,7 @@ def build_state(args, arms):
                  mode=mode, native_test=native_test, native_test_sha256=native_digest, fixtures=fixtures,
                  fixtures_writable=bool(args.fixtures_writable), sparks=sparks,
                  rdma=bool(args.rdma))
-    state['locks'] = locks_for(state['gpus'], sparks['hosts'] if sparks else ())
+    state['locks'] = locks_for(state['gpus'], sparks['hosts'] if sparks else (), pool)
     state['vocab'] = args.vocab or (vocab_size(snapshot) if args.compare_logits else None)
     for arm in arms.values():
         run_args(state, arm)  # every placeholder resolves, per arm
@@ -1501,6 +1509,8 @@ def main(argv=None):
     parser.add_argument('--rdma', action='store_true',
                         help='host networking and /dev/infiniband without Sparks (same-host verbs loopback)')
     parser.add_argument('--spark-hosts', metavar='H1,H2,...', help='start real expert workers, rank = position')
+    parser.add_argument('--spark-pool', choices=sorted(SPARK_POOLS),
+                        help='Spark host pool (default raptor); requires --spark-hosts')
     parser.add_argument('--expert-layers', metavar='LIST', help='expert layers the run exercises (e.g. 3 or 3,5-7); '
                         'CUTEAFD_GOLDEN_EXPERT_LAYERS and {expert_layers}')
     parser.add_argument('--expert-port', type=int, default=DEFAULT_EXPERT_PORT)
