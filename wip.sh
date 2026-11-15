@@ -6,6 +6,10 @@ source "$repo_root/scripts/lib/release-common.sh"
 source "$repo_root/scripts/lib/cdi-gpus.sh"
 source "$repo_root/scripts/build/compiler-cache.sh"
 source "$repo_root/scripts/build/build-caches.sh"
+# Keep this host policy out of child environments and native cache keys.
+wip_export_require_hit="${CUTEAFD_WIP_EXPORT_REQUIRE_HIT-0}"
+case "$wip_export_require_hit" in 0|1) ;; *) release_die "CUTEAFD_WIP_EXPORT_REQUIRE_HIT must be 0 or 1, got: $wip_export_require_hit" ;; esac
+unset CUTEAFD_WIP_EXPORT_REQUIRE_HIT
 cuteafd_build_cache_defaults
 wip_toolchain_hash="$(python3 "$repo_root/scripts/build/dev-toolchain.py")"
 audio_aot="${CUTEAFD_WIP_AUDIO_AOT:-OFF}"
@@ -1528,7 +1532,7 @@ build_expert() (
   native_store_nest "$seed_host" aarch64 "$seed_root" expert import
   native_store_sync "$seed_host" "$seed_root" aarch64 expert import
   local restore_command="${build_command/docker exec /docker exec -e CUTEAFD_WIP_NATIVE_REQUIRE_HIT=1 } native"
-  if [[ "${wip_export_locks:-off}" != on ]]; then
+  if [[ "${wip_export_locks:-off}" != on && "${wip_export_require_hit:-0}" != 1 ]]; then
     timeout --kill-after=30 7260 ssh -o BatchMode=yes "$seed_host" "$build_command native"
   elif native_store_has "$seed_host" "$seed_root" expert; then
     echo "WIP Spark export: native cache hit, no export turn"
@@ -1538,6 +1542,8 @@ build_expert() (
       "${build_command/docker exec /docker exec -e CUTEAFD_EXPORT_CACHE_REQUIRE_HIT=1 } native"; then
     echo "WIP Spark export: every export restored from the export cache, no export turn"
   else
+    [[ "${wip_export_require_hit:-0}" != 1 ]] ||
+      release_die "CUTEAFD_WIP_EXPORT_REQUIRE_HIT=1: Spark expert native/export cache miss on seed $seed_host; refusing GPU export"
     # The seed's CPU lease admits other builds; its GPU export is one at a time.
     wip_seed_export_turn
     # A build that held a turn before us may have published this very key.

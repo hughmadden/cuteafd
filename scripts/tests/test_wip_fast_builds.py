@@ -209,6 +209,116 @@ def test_native_cache_miss_with_every_export_cached_takes_no_gpu_turn(tmp_path):
     assert 'capped' not in lines and not any(line.startswith('turn ') for line in lines)
 
 
+def _wip_require_hit_policy():
+    text = (ROOT / 'wip.sh').read_text()
+    start = text.index('wip_export_require_hit=')
+    end = text.index('cuteafd_build_cache_defaults\n')
+    assert start < end < text.index('wip_toolchain_hash=')
+    return text[start:end]
+
+
+@pytest.mark.parametrize('value', ['2', 'yes', '', ' ', '1 ', '01'])
+def test_export_require_hit_refuses_invalid_values_early(value):
+    script = 'release_die() { echo "$*" >&2; exit 2; }\n' + _wip_require_hit_policy() + '\necho unexpected-setup\n'
+    result = subprocess.run(['bash', '-eu', '-c', script], capture_output=True, text=True, timeout=10,
+                            env={**os.environ, 'CUTEAFD_WIP_EXPORT_REQUIRE_HIT': value})
+    assert result.returncode == 2
+    assert 'CUTEAFD_WIP_EXPORT_REQUIRE_HIT must be 0 or 1' in result.stderr
+    assert not result.stdout
+
+
+def _wip_expert(tmp_path, hit, require_hit=None, exports_cached=False, export_locks='on'):
+    # Like the coordinator harness, run the real builder with mocked commands.
+    text = (ROOT / 'wip.sh').read_text()
+    cached_start = text.index('wip_cached_exports() {')
+    cached_helper = text[cached_start:text.index('\n}\n', cached_start) + 3]
+    helpers = text[text.index('wip_seed_export_turn() {'):text.index('# Role builders end here.')]
+    trace = tmp_path / 'trace'
+    resource = tmp_path / 'resource'
+    resource.mkdir()
+    (resource / 'export-granted').touch()
+    setup = f'''set -euo pipefail
+release_die() {{ echo "$*" >&2; exit 2; }}
+{_wip_require_hit_policy()}
+sync_seed_source() {{ :; }}
+cuteafd_compiler_cache_warn() {{ :; }}
+native_store_nest() {{ :; }}
+native_store_sync() {{ :; }}
+native_store_has() {{ return {0 if hit else 1}; }}
+wip_build_resource_acquire() {{ echo unexpected-lease >> "$TRACE"; exit 99; }}
+wip_hwlock() {{ echo unexpected-lock >> "$TRACE"; exit 99; }}
+timeout() {{ shift 2; "$@"; }}
+ssh() {{
+  printf 'ssh %s\\n' "$*" >> "$TRACE"
+  env | grep '^CUTEAFD_WIP_' >> "$TRACE" || :
+  case "$*" in *CUTEAFD_EXPORT_CACHE_REQUIRE_HIT=1*) return {0 if exports_cached else 3};; esac
+  echo fixture
+}}
+slot=test seed_host=kakapo spark_container=owned SPARK_EXPERT_DOCKER_DEV=image
+wip_spark_tp_roles= bf16_families= audio_aot=OFF wip_exlr8_env=()
+wip_export_locks={export_locks}
+wip_build_resource_dir={str(resource)!r}
+'''
+    env = {**os.environ, 'TRACE': str(trace), 'CUTEAFD_BUILD_CACHES': 'on',
+           'CUTEAFD_WIP_EXPORT_CACHE': 'on', 'CUTEAFD_KACHE_SPARK': '', 'CUTEAFD_SCCACHE_CUDA': '0'}
+    env.pop('CUTEAFD_WIP_EXPORT_REQUIRE_HIT', None)
+    if require_hit is not None:
+        env['CUTEAFD_WIP_EXPORT_REQUIRE_HIT'] = require_hit
+    result = subprocess.run(['bash', '-c', setup + cached_helper + helpers + '\nbuild_expert\n'],
+                            capture_output=True, text=True, timeout=10, env=env)
+    calls = trace.read_text()
+    assert 'CUTEAFD_WIP_EXPORT_REQUIRE_HIT' not in calls
+    assert 'unexpected-lease' not in calls and 'unexpected-lock' not in calls
+    return result, calls, resource
+
+
+@pytest.mark.parametrize('require_hit', [None, '0'])
+def test_expert_native_miss_still_takes_export_turn_by_default(tmp_path, require_hit):
+    result, calls, resource = _wip_expert(tmp_path, hit=False, require_hit=require_hit)
+    assert result.returncode == 0, result.stderr
+    assert 'WIP Spark export: waiting for the GPU export turn on kakapo' in result.stdout
+    assert (resource / 'export-request').exists() and (resource / 'export-done').exists()
+    assert any('docker exec ' in line and line.endswith('/wip/output/expert native')
+               and 'CUTEAFD_EXPORT_CACHE_REQUIRE_HIT' not in line for line in calls.splitlines())
+
+
+@pytest.mark.parametrize('export_locks', ['on', 'off'])
+def test_expert_require_hit_refuses_miss_before_export_turn(tmp_path, export_locks):
+    result, calls, resource = _wip_expert(tmp_path, hit=False, require_hit='1', export_locks=export_locks)
+    assert result.returncode == 2
+    assert 'CUTEAFD_WIP_EXPORT_REQUIRE_HIT=1' in result.stderr and 'seed kakapo' in result.stderr
+    assert 'WIP Spark export: waiting for the GPU export turn' not in result.stdout
+    assert not (resource / 'export-request').exists() and not (resource / 'export-done').exists()
+    native = [line for line in calls.splitlines() if line.endswith('/wip/output/expert native')]
+    assert len(native) == 1 and 'CUTEAFD_EXPORT_CACHE_REQUIRE_HIT=1' in native[0]
+
+
+@pytest.mark.parametrize('export_locks', ['on', 'off'])
+@pytest.mark.parametrize('hit,exports_cached', [(True, False), (False, True)])
+def test_expert_require_hit_restores_caches_without_export_turn(tmp_path, export_locks, hit, exports_cached):
+    result, calls, resource = _wip_expert(tmp_path, hit=hit, require_hit='1',
+                                        exports_cached=exports_cached, export_locks=export_locks)
+    assert result.returncode == 0, result.stderr
+    assert 'no export turn' in result.stdout
+    assert 'WIP Spark export: waiting for the GPU export turn' not in result.stdout
+    assert not (resource / 'export-request').exists() and not (resource / 'export-done').exists()
+    native = [line for line in calls.splitlines() if line.endswith('/wip/output/expert native')]
+    flag = 'CUTEAFD_WIP_NATIVE_REQUIRE_HIT=1' if hit else 'CUTEAFD_EXPORT_CACHE_REQUIRE_HIT=1'
+    assert len(native) == 1 and flag in native[0]
+
+
+def test_export_require_hit_does_not_change_native_key_environment_or_docker_commands(tmp_path):
+    baseline = tmp_path / 'baseline'
+    guarded = tmp_path / 'guarded'
+    baseline.mkdir()
+    guarded.mkdir()
+    base_result, base_calls, _ = _wip_expert(baseline, hit=True)
+    guarded_result, guarded_calls, _ = _wip_expert(guarded, hit=True, require_hit='1')
+    assert base_result.returncode == guarded_result.returncode == 0
+    # The trace includes every remote docker command and the child's WIP env.
+    assert base_calls == guarded_calls
+
+
 def test_native_store_moves_entries_between_instance_and_host_store(tmp_path):
     text = (ROOT / 'wip.sh').read_text()
     helpers = text[text.index('# Native/AOT outputs are cached by input key'):text.index('# native_store_has HOST ROOT OUTPUT')]
