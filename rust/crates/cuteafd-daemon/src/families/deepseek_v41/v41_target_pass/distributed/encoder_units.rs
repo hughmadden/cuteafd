@@ -456,6 +456,94 @@ mod placement_tests {
     use crate::shared::prefill_pipeline::{prefill_schedule, sequence_units, Step};
     use cuteafd_loader::placement::families::deepseek_v41::EncoderPlacement;
 
+    /// CPU enqueue/cut contract, paired with the loader's
+    /// `tail14_sm89_c16_admitted_cut_keeps_local_source_consumers` fixture
+    /// (48 GiB/card, C16, fixed 2M pool). This runs the shared async executor
+    /// with CPU hooks, not native kernels. Real CUDA ordering, visibility,
+    /// races, exact restores, physical tier capacity and speed remain GPU gates.
+    #[test]
+    fn tail14_cpu_three_unit_cut_orders_consumers_and_all_row_source20() -> Result<()> {
+        use cuteafd_loader::placement::{plan_hops, HopPoint, HopStorage};
+        struct CutHooks {
+            map: cuteafd_loader::placement::families::deepseek_v41::CachePlacement,
+            slots: [Option<usize>; 3],
+            finished: Vec<[bool; 20]>,
+            crossed: Vec<bool>,
+            source14: Vec<bool>,
+            source20_rows: Vec<usize>,
+            committed: Vec<usize>,
+        }
+        impl AsyncPrefillHooks for CutHooks {
+            type Ticket = (usize, usize);
+            fn route(&self, _: usize) -> FfnRoute { FfnRoute::Spark }
+            async fn begin_unit(&mut self, unit: &Unit) -> Result<()> {
+                assert!(self.slots[unit.slot].replace(unit.index).is_none());
+                Ok(())
+            }
+            async fn attention(&mut self, layer: usize, unit: &Unit) -> Result<()> {
+                assert_eq!(self.slots[unit.slot], Some(unit.index));
+                if layer > 0 { assert!(self.finished[unit.index][layer - 1]); }
+                if layer == 14 {
+                    // The completed 13 output must cross before gate14,
+                    // source14 and its local attention consumers enqueue.
+                    assert_eq!((self.map.attention(13)?, self.map.attention(14)?), (0, 1));
+                    self.crossed[unit.index] = true;
+                    if unit.index > 0 { assert!(self.source14[unit.index - 1]); }
+                    assert_eq!(self.map.sources()[2], self.map.attention(layer)?);
+                    self.source14[unit.index] = true;
+                }
+                if (14..20).contains(&layer) {
+                    assert!(self.crossed[unit.index] && self.source14[unit.index]);
+                    assert_eq!(self.map.attention(layer)?, 1);
+                }
+                Ok(())
+            }
+            async fn local_ffn(&mut self, _: usize, _: &Unit) -> Result<()> {
+                anyhow::bail!("CPU cut fixture expects routed expert waves")
+            }
+            async fn send_experts(&mut self, layer: usize, unit: &Unit) -> Result<Self::Ticket> {
+                Ok((layer, unit.index))
+            }
+            async fn land_experts(&mut self, layer: usize, unit: &Unit, ticket: Self::Ticket) -> Result<()> {
+                assert_eq!(ticket, (layer, unit.index));
+                self.finished[unit.index][layer] = true;
+                Ok(())
+            }
+            async fn end_unit(&mut self, unit: &Unit) -> Result<()> {
+                assert!(self.finished[unit.index][19]);
+                assert_eq!((self.map.attention(19)?, self.map.attention(20)?), (1, 1));
+                // Model the full encoder source publication, not the retained
+                // 128-row decoder suffix. No second residual hop at 19->20.
+                self.source20_rows[unit.index] = unit.rows.len();
+                Ok(())
+            }
+            async fn commit_unit(&mut self, unit: &Unit) -> Result<()> {
+                assert_eq!(self.source20_rows[unit.index], unit.rows.len());
+                assert_eq!(unit.index, self.committed.len());
+                self.committed.push(unit.index);
+                assert_eq!(self.slots[unit.slot].take(), Some(unit.index));
+                Ok(())
+            }
+        }
+        let map = EncoderPlacement::Tail14.resolve(2)?;
+        let spec = cuteafd_loader::placement::families::deepseek_v41::execution_hops(2);
+        let hops = plan_hops(&map.modes(), &spec)?;
+        assert_eq!(spec.storage, HopStorage::DirectInput);
+        assert_eq!(hops.len(), 1);
+        assert_eq!((hops[0].at, hops[0].from, hops[0].to), (HopPoint::BeforeLayer(14), 0, 1));
+        let units = sequence_units(6 * 2752 + 129, 2752, 3, 20)?;
+        let mut hooks = CutHooks { map, slots: [None; 3], finished: vec![[false; 20]; units.len()],
+            crossed: vec![false; units.len()], source14: vec![false; units.len()],
+            source20_rows: vec![0; units.len()], committed: Vec::new() };
+        tokio::runtime::Builder::new_current_thread().build()?.block_on(
+            run_prefill_units_async(&mut hooks, &units, 3))?;
+        assert!(hooks.crossed.iter().all(|&crossed| crossed));
+        assert!(hooks.slots.iter().all(Option::is_none));
+        assert_eq!(hooks.source20_rows, vec![2752, 2752, 2752, 2752, 2752, 2752, 129]);
+        assert_eq!(hooks.committed, (0..units.len()).collect::<Vec<_>>());
+        Ok(())
+    }
+
     /// Exercise the shared executor's causal/FIFO schedule with three physical
     /// slots, their reuse and an odd tail. This checks enqueue dependencies;
     /// GPU event completion and payload lifetime require the native fixture.

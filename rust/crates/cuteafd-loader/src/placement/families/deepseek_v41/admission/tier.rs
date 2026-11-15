@@ -228,8 +228,11 @@ mod tests {
             Operation::Serving, 20 << 30, Default::default())
     }
 
-    #[test]
-    fn tail14_c16_native_owners_reduce_paired_tier_before_loading() -> anyhow::Result<()> {
+    // Header-only, bounded admission fixture: no device allocations or CUDA.
+    // Common AOT scratch and the unchanged terminal owner are synthetic; the
+    // logical 48-GiB/card, C16, three-unit and 2M-pool contract is not reduced.
+    fn sm89_c16_tail14_admission_fixture(option: super::super::super::EncoderPlacement,
+        setting: ExpertTierSetting) -> anyhow::Result<AdmittedV41> {
         use super::super::super::{EncoderPlacement, owners, weight_layout::TargetLayout, resident::Fp8Head};
         let config = config();
         let root = tempfile::tempdir()?;
@@ -296,6 +299,14 @@ mod tests {
             Ok(fixture.prepare()?.admit_with_tier(request,
                 &TierChoice { setting, ..Default::default() })?)
         };
+        run(option, setting)
+    }
+
+    #[test]
+    fn tail14_c16_native_owners_reduce_paired_tier_before_loading() -> anyhow::Result<()> {
+        use super::super::super::EncoderPlacement;
+        let config = config();
+        let run = sm89_c16_tail14_admission_fixture;
         let ced = run(EncoderPlacement::Ced, ExpertTierSetting::Auto)?;
         let mut tail = run(EncoderPlacement::Tail14, ExpertTierSetting::Auto)?;
         let counts = [ced.placement.expert_tier.as_ref().unwrap().experts,
@@ -331,6 +342,56 @@ mod tests {
         assert_eq!(tail.solved.pool_tokens, before);
         assert_eq!(adopted.bytes, crate::serving_capacity::deepseek_v41_cache_bytes_with_placement(
             &config, 2, 16, adopted.groups, false, EncoderPlacement::Tail14)?);
+        Ok(())
+    }
+
+    /// CPU admission and cut wiring only. The companion daemon schedule test
+    /// checks enqueue order with this geometry. Neither proves CUDA ordering,
+    /// visibility/races, byte-exact restore, a production tier count or speed.
+    #[test]
+    fn tail14_sm89_c16_admitted_cut_keeps_local_source_consumers() -> anyhow::Result<()> {
+        use super::super::super::{EncoderPlacement, CachePlacement};
+        use crate::placement::{HopPoint, HopStorage, LayerExecutionPlan, hop_buffer_bytes};
+        let ced = sm89_c16_tail14_admission_fixture(EncoderPlacement::Ced, ExpertTierSetting::Auto)?;
+        let tail = sm89_c16_tail14_admission_fixture(EncoderPlacement::Tail14, ExpertTierSetting::Auto)?;
+        let spec = super::super::super::execution_hops(2);
+        let execution = LayerExecutionPlan::new(&tail.placement, spec)?;
+        let map = CachePlacement::from_execution_plan(&execution)?;
+        assert_eq!(EncoderPlacement::default(), EncoderPlacement::Ced);
+        assert_eq!(spec.storage, HopStorage::DirectInput);
+        assert_eq!(spec.row_bytes, 40960 + 16);
+        assert_eq!(execution.hops().len(), 1);
+        let hop = &execution.hops()[0];
+        assert_eq!((hop.at, hop.from, hop.to), (HopPoint::BeforeLayer(14), 0, 1));
+        assert_eq!(hop_buffer_bytes(execution.hops(), &spec, 2), Some(vec![0, 0]));
+        assert_eq!(map.attention(13)?, 0);
+        assert_eq!(map.sources(), [0, 0, 1, 1]);
+        for layer in 14..20 { assert_eq!(map.attention(layer)?, 1); }
+        assert_eq!((map.attention(19)?, map.attention(20)?), (1, 1));
+        assert_eq!([map.counts(0), map.counts(1)], [(14, 2, 0), (26, 1, 1)]);
+        // Gate14 and source14/20 retained producers share GPU1, while gate1
+        // stays on GPU0; every private decode lane is charged independently.
+        let owner = |plan: &AdmittedV41, gpu: usize, group: &str| plan.placement.items[gpu].iter()
+            .filter(|item| item.group == group).map(|item| item.bytes).sum::<u64>();
+        assert!(owner(&tail, 1, "prefill slots engram gates") > 0);
+        assert_eq!(owner(&tail, 0, "prefill slots engram gates"),
+            owner(&tail, 1, "prefill slots engram gates"));
+        assert!(owner(&tail, 1, "prefill slots cache producers") > owner(&ced, 1, "prefill slots cache producers"));
+        for lane in 0..2 {
+            assert!(owner(&tail, 1, &format!("lane {lane} engram gates")) > 0);
+            assert!(owner(&tail, 1, &format!("lane {lane} cache producers")) > 0);
+        }
+        for plan in [&ced, &tail] {
+            assert_eq!(plan.solved.decisions.prefill, PrefillShape { rows: 2752, waves: 3 });
+            assert_eq!(plan.placement.pool_tokens, 2_097_152);
+            for budget in plan.solved.budgets.iter().filter(|b| matches!(b.locations[0].device, Device::Coordinator(_))) {
+                assert_eq!(budget.physical_bytes, CARD);
+                assert!(budget.logical_bytes <= CARD);
+            }
+        }
+        let pin = ExpertTierSetting::PerLayer(ced.placement.expert_tier.as_ref().unwrap().experts / 40);
+        assert!(sm89_c16_tail14_admission_fixture(EncoderPlacement::Ced, pin).is_ok());
+        assert!(sm89_c16_tail14_admission_fixture(EncoderPlacement::Tail14, pin).is_err());
         Ok(())
     }
 

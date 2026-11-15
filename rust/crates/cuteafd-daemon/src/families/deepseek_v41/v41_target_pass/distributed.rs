@@ -1133,6 +1133,11 @@ mod tests {
         }).collect()
     }
 
+    // Legacy hardware fixture: all 20 TP2 encoder expert layers use a
+    // 73_000_000_000-byte/card load budget, two slots and 16/2048-row units.
+    // This is not an SM89-fit C16/three-unit/2M-pool qualification. Keep its
+    // native assertions; bounded CPU cut/admission coverage lives in
+    // encoder_units::placement_tests and the loader's SM89 C16 tier fixture.
     fn distributed_prefill_fixture(packed_check: bool) -> Result<()> {
         use crate::families::deepseek_v41::v41_native_serve::prefill_target::PrefillTarget;
         use crate::families::deepseek_v41::v41_experts::dspark::{DsparkChain, DsparkWeights};
