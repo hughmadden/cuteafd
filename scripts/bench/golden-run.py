@@ -1402,6 +1402,8 @@ def resolve_fixtures(args, task_root):
 
 
 def build_state(args, arms):
+    if args.worker_budget_bytes <= 0:
+        raise ValueError('--worker-budget-bytes must be positive bytes (device budget)')
     if args.spark_pool is not None and not args.spark_hosts:
         raise ValueError('--spark-pool needs --spark-hosts')
     pool = args.spark_pool or 'raptor'
@@ -1415,8 +1417,8 @@ def build_state(args, arms):
             raise ValueError('--worker-ready-timeout must be positive seconds')
         if not 1 <= args.expert_port <= 65535:
             raise ValueError('--expert-port out of range')
-        if args.worker_memory_bytes is not None and args.worker_memory_bytes <= args.worker_budget_bytes:
-            raise ValueError('--worker-memory-bytes must exceed --worker-budget-bytes')
+        if args.worker_memory_bytes is not None and args.worker_memory_bytes <= 0:
+            raise ValueError('--worker-memory-bytes must be positive bytes (host cgroup cap)')
         lanes = spark_lanes(args.config, hosts)
         worker_env = {}
         for value in args.worker_env:
@@ -1521,9 +1523,11 @@ def main(argv=None):
                         help='extra expertd-native argument (repeatable; e.g. --worker-arg=--exl3-schedule)')
     parser.add_argument('--memory-bytes', type=int, metavar='N',
                         help='host memory cap for the coordinator container (docker --memory/--memory-swap)')
-    parser.add_argument('--worker-budget-bytes', type=int, default=DEFAULT_WORKER_BUDGET)
+    parser.add_argument('--worker-budget-bytes', type=int, default=DEFAULT_WORKER_BUDGET,
+                        help='positive worker CUDA device ceiling in bytes (expertd-native --device-budget-bytes)')
     parser.add_argument('--worker-memory-bytes', type=int, metavar='N',
-                        help='container memory cap per worker (docker --memory/--memory-swap); above the device budget')
+                        help='optional independent host cgroup cap per worker in bytes; must be positive when set '
+                        '(docker --memory/--memory-swap); not CUDA-physical admission and need not exceed the device budget')
     parser.add_argument('--worker-ready-timeout', type=int, default=1500, help='seconds for worker bootstrap and coordinator model admission')
     parser.add_argument('--worker-poll', type=float, default=5.0, help=argparse.SUPPRESS)
     parser.add_argument('--config', default=str(REPO / 'cuteafd.config'),

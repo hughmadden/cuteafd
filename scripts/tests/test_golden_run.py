@@ -793,6 +793,42 @@ def test_worker_admission_rejects_nonpositive_launch_bound(spark_env, seconds, c
     assert '--worker-ready-timeout must be positive seconds' in capsys.readouterr().err
 
 
+@pytest.mark.parametrize('flag,meaning', [
+    ('--worker-budget-bytes', 'device budget'),
+    ('--worker-memory-bytes', 'host cgroup cap'),
+])
+@pytest.mark.parametrize('value', ['0', '-1'])
+def test_worker_memory_limits_refuse_nonpositive_values_before_launch(spark_env, capsys, flag, meaning, value):
+    assert golden.main(spark_argv(spark_env, flag, value)) == 2
+    assert f'{flag} must be positive bytes ({meaning})' in capsys.readouterr().err
+    assert not docker_calls(spark_env) and not ssh_calls(spark_env)
+    assert not any(spark_env['locks'].iterdir())
+
+
+@pytest.mark.parametrize('budget,memory', [
+    ('85899345920', '4294967296'),
+    ('115964116992', '4294967296'),
+    (None, None),
+])
+def test_worker_device_budget_and_host_cap_are_independent(spark_env, monkeypatch, budget, memory):
+    monkeypatch.setenv('STUB_RUN_OUTPUT', PASSED)
+    extra = [] if budget is None else ['--worker-budget-bytes', budget]
+    if memory is not None:
+        extra += ['--worker-memory-bytes', memory]
+    assert golden.main(spark_argv(spark_env, *extra)) == 0
+    workers = [shlex.split(command) for host, command in ssh_calls(spark_env) if 'expertd-native' in command]
+    assert len(workers) == 4
+    for argv in workers:
+        assert argv[argv.index('--device-budget-bytes') + 1] == (budget or '107374182400')
+    docker_workers = [call for call in docker_calls(spark_env) if call[:2] == ['run', '-d']]
+    assert len(docker_workers) == 4
+    for call in docker_workers:
+        if memory is None:
+            assert '--memory' not in call and '--memory-swap' not in call
+        else:
+            assert call[call.index('--memory') + 1] == call[call.index('--memory-swap') + 1] == memory
+
+
 def test_real_experts_start_before_and_stop_before_locks_release(spark_env, monkeypatch):
     env = spark_env
     monkeypatch.setenv('STUB_RUN_OUTPUT', PASSED)
@@ -1072,7 +1108,10 @@ def test_fixture_generation_command_mode(env, monkeypatch):
     (['--spark-hosts', 'dodo', '--arm-worker-env', 'zz:K=V'], 'names no arm'),
     (['--worker-memory-bytes', '115964116992'], 'need --spark-hosts'),
     (['--arm-arg', 'zz:--x'], 'names no arm'),
-    (['--spark-hosts', 'dodo', '--worker-memory-bytes', '1'], 'must exceed --worker-budget-bytes'),
+    (['--worker-budget-bytes', '0'], '--worker-budget-bytes must be positive'),
+    (['--worker-budget-bytes', '-1'], '--worker-budget-bytes must be positive'),
+    (['--spark-hosts', 'dodo', '--worker-memory-bytes', '0'], '--worker-memory-bytes must be positive'),
+    (['--spark-hosts', 'dodo', '--worker-memory-bytes', '-1'], '--worker-memory-bytes must be positive'),
     (['--fixtures', 'relative/dir'], 'absolute'),
 ])
 def test_fixture_and_spark_argument_refusals(env, capsys, extra, match):
