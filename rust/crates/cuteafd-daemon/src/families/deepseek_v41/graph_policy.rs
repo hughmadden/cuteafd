@@ -1,5 +1,6 @@
 //! Captured shapes per backbone layer, sharing the containing lane's buffers.
 use anyhow::{ensure, Result};
+use cuteafd_loader::placement::families::deepseek_v41::EncoderPlacement;
 
 pub(super) const MAX_DECODE_ROWS: u32 = cuteafd_core::V41_VERIFY_ROWS as u32;
 
@@ -23,12 +24,111 @@ pub(super) fn set_prefill_rows(rows: u32) -> Result<()> {
 thread_local! {
     // Startup owns a dedicated CUDA worker thread. Avoid threading a layout
     // field through every primitive owner; attach refreshes it before capture.
+    static PLACEMENT: std::cell::Cell<Option<EncoderPlacement>> = const { std::cell::Cell::new(None) };
+    static TARGET_GRAPHS: std::cell::Cell<Option<TargetGraphs>> = const { std::cell::Cell::new(None) };
     static RANKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Diagnostic-only V4.1 target-bank graph posture, parsed once when the engine
+/// binds its placement. `eager` is the exact CED target-eager control for a
+/// placement A/B; `capture` lets a tail14 trace arm collect the
+/// placement-specific inventory without borrowing CED rows or pins. Neither mode
+/// changes the admitted per-device reserve, admission, KV or tier, and `capture`
+/// is not a shipping default (`Production` is the checked-in behavior).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TargetGraphs { Production, Eager, Capture }
+
+impl TargetGraphs {
+    fn parse(value: Option<&str>) -> Result<Self> {
+        match value {
+            None => Ok(Self::Production),
+            Some("eager") => Ok(Self::Eager),
+            Some("capture") => Ok(Self::Capture),
+            Some(other) => anyhow::bail!(
+                "CUTEAFD_V41_TARGET_GRAPHS must be eager or capture (got {other:?}); unset keeps production graph behavior"),
+        }
+    }
+}
+
+fn target_graph_mode() -> TargetGraphs {
+    TARGET_GRAPHS.with(|mode| mode.get().unwrap_or(TargetGraphs::Production))
+}
+
+/// Read the one-shot diagnostic override. A present non-Unicode value is an
+/// invalid configuration, not an unset variable: the engine must refuse it at
+/// startup rather than silently keep the production posture.
+fn target_graph_environment() -> Result<Option<String>> {
+    match std::env::var("CUTEAFD_V41_TARGET_GRAPHS") {
+        Ok(value) => Ok(Some(value)),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => anyhow::bail!(
+            "CUTEAFD_V41_TARGET_GRAPHS is not valid Unicode; unset it or set eager or capture"),
+    }
+}
+
+/// Bind the placement and target-graph mode together. Both keys are validated
+/// before either is mutated, so a live engine rejects a changed placement or
+/// mode without leaving the other binding half-applied.
+fn bind_target_graphs(placement: EncoderPlacement, mode: TargetGraphs) -> Result<()> {
+    PLACEMENT.with(|key| {
+        ensure!(key.get().is_none_or(|old| old == placement), "V4.1 graph placement cannot change in a live engine");
+        Ok(())
+    })?;
+    TARGET_GRAPHS.with(|key| {
+        ensure!(key.get().is_none_or(|old| old == mode), "V4.1 target graph mode cannot change in a live engine");
+        Ok(())
+    })?;
+    PLACEMENT.with(|key| key.set(Some(placement)));
+    TARGET_GRAPHS.with(|key| key.set(Some(mode)));
+    Ok(())
+}
+
+/// Capture eligibility is placement-only in production; the diagnostic modes
+/// override it for either placement (eager: never, capture: lazily with an empty
+/// inventory). An unbound placement defaults to CED exactly as before.
+fn capture_allowed(placement: Option<EncoderPlacement>, mode: TargetGraphs) -> bool {
+    match mode {
+        TargetGraphs::Production => placement.unwrap_or_default() == EncoderPlacement::Ced,
+        TargetGraphs::Eager => false,
+        TargetGraphs::Capture => true,
+    }
+}
+
+/// The checked-in CED prewarm rows and pins are only usable by the production CED
+/// posture. `eager` and `capture` never borrow them, so a tail14 trace arm cannot
+/// inherit CED pins or spend their bytes on moved sites.
+fn inventory_qualified(placement: Option<EncoderPlacement>, mode: TargetGraphs) -> bool {
+    mode == TargetGraphs::Production && placement.unwrap_or_default() == EncoderPlacement::Ced
+}
+
+fn target_inventory_qualified() -> bool {
+    inventory_qualified(PLACEMENT.with(std::cell::Cell::get), target_graph_mode())
+}
+
+/// Bind graph eligibility before any weights/state/banks are constructed. The
+/// diagnostic target-graph mode is read and validated once here, off every hot
+/// path. Tail14 has no trace-qualified target inventory. Its target banks run
+/// eager, preserving the full existing per-device reserve for qualification;
+/// admission cannot spend graph headroom on extra experts. Unchanged expert/draft
+/// banks retain their physical layout and existing reserve. No request changes
+/// this key.
+pub(crate) fn set_encoder_placement(placement: EncoderPlacement) -> Result<()> {
+    let mode = TargetGraphs::parse(target_graph_environment()?.as_deref())?;
+    bind_target_graphs(placement, mode)
+}
+pub(crate) fn prewarm_rows(rank: usize, rows: usize) -> Vec<cuteafd_loader::serving_capacity::v41_graphs::V41PrewarmEntry> {
+    if !target_inventory_qualified() { return Vec::new(); }
+    cuteafd_loader::serving_capacity::v41_graphs::v41_prewarm_rows(ranks(), rank, rows)
+}
+pub(crate) fn joint_prewarm_rows(rows: usize) -> Vec<usize> {
+    if !target_inventory_qualified() { return Vec::new(); }
+    cuteafd_loader::serving_capacity::v41_graphs::v41_joint_prewarm_rows(ranks(), rows)
 }
 pub(crate) fn ranks() -> usize { RANKS.with(std::cell::Cell::get) }
 fn set_layout(ranks: usize) { RANKS.with(|layout| layout.set(ranks)); }
 
 pub(crate) fn pinned_shape(device: i32, rows: u32) -> bool {
+    if !target_inventory_qualified() { return false; }
     let Ok(rank) = usize::try_from(device) else { return false };
     let Some(list) = cuteafd_loader::serving_capacity::v41_graphs::v41_prewarm(ranks(), rank) else { return false };
     list.entries.iter().chain(&list.prefill_entries)
@@ -36,7 +136,8 @@ pub(crate) fn pinned_shape(device: i32, rows: u32) -> bool {
 }
 
 pub(super) fn captures_shape(rows: u32) -> bool {
-    large_shape_captured(rows, PREFILL_ROWS.get().copied())
+    capture_allowed(PLACEMENT.with(std::cell::Cell::get), target_graph_mode())
+        && large_shape_captured(rows, PREFILL_ROWS.get().copied())
 }
 
 /// Only slot zero serves non-unit prompt, replay and continuation work.
@@ -47,6 +148,7 @@ pub(crate) const PREFILL_HEAD_PREWARM_ROWS: [usize; 1] = [1];
 /// Nonwindowed prompt/replay paths reach these exact row counts. Streamed
 /// encoder units have offset bindings and deliberately remain eager (#1638).
 pub(crate) fn prefill_prewarm_rows(rank: usize, capacity: usize) -> Vec<usize> {
+    if !target_inventory_qualified() { return Vec::new(); }
     prefill_rows(rank, capacity, PREFILL_ROWS.get().copied())
 }
 
@@ -99,6 +201,15 @@ pub(crate) fn attach(library: &cuteafd_ffi::NativeLibrary, ranks: usize,
     use crate::shared::decode_graph::device::{Basis, Cycle, Preference, Site};
     tracing::warn!("V4.1 graph cache uses byte estimates: SM120 node rates are not calibrated");
     set_layout(ranks);
+    match target_graph_mode() {
+        TargetGraphs::Eager => tracing::warn!(
+            "V4.1 target graphs are forced eager by CUTEAFD_V41_TARGET_GRAPHS=eager; existing per-device graph reserves remain held"),
+        TargetGraphs::Capture => tracing::warn!(
+            "V4.1 target graphs may capture lazily without a placement inventory (CUTEAFD_V41_TARGET_GRAPHS=capture); no CED rows or pins are borrowed and existing per-device graph reserves remain held"),
+        TargetGraphs::Production if !target_inventory_qualified() => tracing::warn!(
+            "tail14 target graphs stay eager pending a placement-specific inventory; existing per-device graph reserves remain held"),
+        TargetGraphs::Production => {}
+    }
     visit(&mut |device, name, spans, bank| {
         let (base, extra) = cuteafd_loader::placement::graph_reserve::v41_default(ranks, device as usize);
         let policy = cuteafd_loader::placement::graph_reserve::current(device as usize,
@@ -124,6 +235,25 @@ mod tests {
     use crate::shared::memory::{DeviceAllocation, LoadStream};
 
     #[test]
+    fn tail14_graph_key_is_fixed_and_never_borrows_target_pins_or_captures() {
+        std::thread::spawn(|| {
+            set_layout(2);
+            // Bind the production posture directly so an ambient diagnostic env
+            // cannot change this fixture; the public env path is covered by
+            // target_graph_mode_binds_from_environment_at_startup.
+            bind_target_graphs(EncoderPlacement::Tail14, TargetGraphs::Production).unwrap();
+            bind_target_graphs(EncoderPlacement::Tail14, TargetGraphs::Production).unwrap();
+            assert!(bind_target_graphs(EncoderPlacement::Ced, TargetGraphs::Production).is_err());
+            for rows in [1, 16, 64, 128, 2752] { assert!(!captures_shape(rows)); }
+            assert!(prewarm_rows(0, 64).is_empty());
+            assert!(prewarm_rows(1, 64).is_empty());
+            assert!(joint_prewarm_rows(64).is_empty());
+            assert!(prefill_prewarm_rows(1, 2752).is_empty());
+            assert!(!pinned_shape(0, 64));
+        }).join().unwrap();
+    }
+
+    #[test]
     fn layout_state_is_local_to_the_engine_thread_and_refreshes_on_restart() {
         std::thread::spawn(|| {
             assert_eq!(ranks(), 0);
@@ -132,6 +262,165 @@ mod tests {
             std::thread::spawn(|| assert_eq!(ranks(), 0)).join().unwrap();
             set_layout(2);
             assert_eq!(ranks(), 2);
+        }).join().unwrap();
+    }
+
+    #[test]
+    fn target_graph_policy_distinguishes_production_eager_and_capture() {
+        use super::TargetGraphs::{Capture, Eager, Production};
+        for placement in [None, Some(EncoderPlacement::Ced), Some(EncoderPlacement::Tail14)] {
+            // Unset keeps the pre-existing placement-only behavior: CED (including
+            // the unbound default) captures and owns the checked-in inventory;
+            // tail14 stays eager and empty.
+            let production_qualified = placement != Some(EncoderPlacement::Tail14);
+            assert_eq!(capture_allowed(placement, Production), production_qualified);
+            assert_eq!(inventory_qualified(placement, Production), production_qualified);
+            // Exact CED-eager control: no target capture and no inventory for
+            // either placement. The per-device reserve is held by admission, not
+            // by this policy.
+            assert!(!capture_allowed(placement, Eager));
+            assert!(!inventory_qualified(placement, Eager));
+            // Diagnostic tail14 trace arm: bounded lazy capture is allowed, but
+            // the CED rows and pins are never borrowed (empty inventory).
+            assert!(capture_allowed(placement, Capture));
+            assert!(!inventory_qualified(placement, Capture));
+        }
+    }
+
+    #[test]
+    fn target_graph_mode_rejects_invalid_values() {
+        use super::TargetGraphs::{Capture, Eager, Production};
+        assert_eq!(TargetGraphs::parse(None).unwrap(), Production);
+        assert_eq!(TargetGraphs::parse(Some("eager")).unwrap(), Eager);
+        assert_eq!(TargetGraphs::parse(Some("capture")).unwrap(), Capture);
+        for invalid in ["", "eager ", "eager\n", "Eager", "auto", "production", "0", "both"] {
+            let error = TargetGraphs::parse(Some(invalid)).unwrap_err().to_string();
+            assert!(error.contains("CUTEAFD_V41_TARGET_GRAPHS"), "{error}");
+        }
+    }
+
+    #[test]
+    fn target_graph_mode_binds_from_environment_at_startup() {
+        const CHILD: &str = "CUTEAFD_V41_TARGET_GRAPHS_TEST_CHILD";
+        const TEST: &str = "families::deepseek_v41::graph_policy::tests::target_graph_mode_binds_from_environment_at_startup";
+        if let Ok(scenario) = std::env::var(CHILD) {
+            match scenario.as_str() {
+                "unset" => {
+                    std::thread::spawn(|| {
+                        set_layout(2);
+                        set_encoder_placement(EncoderPlacement::Ced).unwrap();
+                        for rows in [1, 16, 64] { assert!(captures_shape(rows)); }
+                    }).join().unwrap();
+                    std::thread::spawn(|| {
+                        set_encoder_placement(EncoderPlacement::Tail14).unwrap();
+                        for rows in [1, 16, 64] { assert!(!captures_shape(rows)); }
+                        assert!(prewarm_rows(0, 64).is_empty());
+                        assert!(prewarm_rows(1, 64).is_empty());
+                        assert!(joint_prewarm_rows(64).is_empty());
+                        assert!(prefill_prewarm_rows(1, 2752).is_empty());
+                        assert!(!pinned_shape(0, 64));
+                    }).join().unwrap();
+                }
+                "eager" => {
+                    std::thread::spawn(|| {
+                        set_layout(2);
+                        set_encoder_placement(EncoderPlacement::Ced).unwrap();
+                        for rows in [1, 16, 64] { assert!(!captures_shape(rows)); }
+                        assert!(prewarm_rows(0, 64).is_empty());
+                        assert!(joint_prewarm_rows(64).is_empty());
+                        assert!(prefill_prewarm_rows(0, 2752).is_empty());
+                        assert!(!pinned_shape(0, 64));
+                    }).join().unwrap();
+                    std::thread::spawn(|| {
+                        set_encoder_placement(EncoderPlacement::Tail14).unwrap();
+                        assert!(!captures_shape(1));
+                    }).join().unwrap();
+                }
+                "capture" => {
+                    std::thread::spawn(|| {
+                        set_layout(2);
+                        set_encoder_placement(EncoderPlacement::Tail14).unwrap();
+                        for rows in [1, 16, 64] { assert!(captures_shape(rows)); }
+                        assert!(prewarm_rows(0, 64).is_empty());
+                        assert!(prewarm_rows(1, 64).is_empty());
+                        assert!(joint_prewarm_rows(64).is_empty());
+                        assert!(prefill_prewarm_rows(1, 2752).is_empty());
+                        assert!(!pinned_shape(1, 64));
+                    }).join().unwrap();
+                    std::thread::spawn(|| {
+                        set_encoder_placement(EncoderPlacement::Ced).unwrap();
+                        assert!(captures_shape(1));
+                        assert!(!pinned_shape(0, 64));
+                    }).join().unwrap();
+                }
+                "invalid" => {
+                    let error = std::thread::spawn(|| {
+                        set_encoder_placement(EncoderPlacement::Ced).unwrap_err().to_string()
+                    }).join().unwrap();
+                    assert!(error.contains("CUTEAFD_V41_TARGET_GRAPHS"), "{error}");
+                }
+                "nonunicode" => {
+                    let error = std::thread::spawn(|| {
+                        set_encoder_placement(EncoderPlacement::Ced).unwrap_err().to_string()
+                    }).join().unwrap();
+                    assert!(error.contains("not valid Unicode"), "{error}");
+                }
+                "crosstalk" => {
+                    // Public boundary: a changed second binding must propagate its
+                    // error, not be silently accepted, and must not half-apply.
+                    std::thread::spawn(|| {
+                        set_encoder_placement(EncoderPlacement::Ced).unwrap();
+                        let error = set_encoder_placement(EncoderPlacement::Tail14)
+                            .unwrap_err().to_string();
+                        assert!(error.contains("graph placement cannot change"), "{error}");
+                        assert_eq!(PLACEMENT.with(std::cell::Cell::get), Some(EncoderPlacement::Ced));
+                        assert_eq!(target_graph_mode(), TargetGraphs::Production);
+                    }).join().unwrap();
+                }
+                other => panic!("unknown child scenario {other}"),
+            }
+            return;
+        }
+        #[cfg(unix)]
+        let nonunicode = Some({
+            use std::os::unix::ffi::OsStringExt;
+            std::ffi::OsString::from_vec(vec![0xff])
+        });
+        #[cfg(not(unix))]
+        let nonunicode = None;
+        let mut scenarios: Vec<(&str, Option<std::ffi::OsString>)> = vec![
+            ("unset", None), ("crosstalk", None), ("eager", Some("eager".into())),
+            ("capture", Some("capture".into())), ("invalid", Some("auto".into())),
+        ];
+        if let Some(value) = nonunicode { scenarios.push(("nonunicode", Some(value))); }
+        for (scenario, value) in scenarios {
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command.args(["--exact", TEST, "--nocapture"]);
+            command.env(CHILD, scenario).env_remove("CUTEAFD_V41_TARGET_GRAPHS");
+            if let Some(value) = value { command.env("CUTEAFD_V41_TARGET_GRAPHS", value); }
+            let status = command.status().unwrap();
+            assert!(status.success(), "child scenario {scenario} failed");
+        }
+    }
+
+    #[test]
+    fn target_graph_bind_rejects_changed_keys_before_mutating_either() {
+        std::thread::spawn(|| {
+            bind_target_graphs(EncoderPlacement::Ced, TargetGraphs::Eager).unwrap();
+            // Retrying the same bindings is allowed, as for the placement contract.
+            bind_target_graphs(EncoderPlacement::Ced, TargetGraphs::Eager).unwrap();
+            let error = bind_target_graphs(EncoderPlacement::Ced, TargetGraphs::Capture)
+                .unwrap_err().to_string();
+            assert!(error.contains("target graph mode cannot change"), "{error}");
+            let error = bind_target_graphs(EncoderPlacement::Tail14, TargetGraphs::Eager)
+                .unwrap_err().to_string();
+            assert!(error.contains("graph placement cannot change"), "{error}");
+            // Both keys are validated before either is mutated: a call that
+            // changes both must not apply the one that would be legal alone.
+            assert!(bind_target_graphs(EncoderPlacement::Tail14, TargetGraphs::Capture).is_err());
+            bind_target_graphs(EncoderPlacement::Ced, TargetGraphs::Eager).unwrap();
+            assert_eq!(target_graph_mode(), TargetGraphs::Eager);
+            assert_eq!(PLACEMENT.with(std::cell::Cell::get), Some(EncoderPlacement::Ced));
         }).join().unwrap();
     }
 

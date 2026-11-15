@@ -367,6 +367,7 @@ fn worker(
     ensure!(!args.tp2_output_projection || args.rtx_gpus==2,"--tp2-output-projection requires --rtx-gpus 2");
     ensure!(!args.tp2_query_projection || args.rtx_gpus==2,"--tp2-query-projection requires --rtx-gpus 2");
     ensure!(!args.tp2_attention || args.rtx_gpus==2,"--tp2-attention requires --rtx-gpus 2");
+    admission::validate_owner_modes(&args)?;
     if args.rtx_gpus == 2 {
         // Probe before the distributed loader reserves either device's weights.
         // SAFETY: the configured native library is trusted and remains live for the probe.
@@ -396,6 +397,8 @@ fn worker(
         .context("invalid V4.1 prefill batch")?;
     let rows = capacity as usize;
     // Live requests capture decode shapes and the full prefill chunk only.
+    args.v41_encoder_placement.resolve(args.rtx_gpus as usize)?;
+    super::graph_policy::set_encoder_placement(args.v41_encoder_placement)?;
     super::graph_policy::set_prefill_rows(args.prefill_batch_tokens)?;
     let mut catalog = cuteafd_loader::read_official_v41_catalog(&args.snapshot,
     )?;
@@ -557,7 +560,7 @@ fn worker(
     // Plan == runtime (WP6): the slot set and decode lanes are exactly the
     // planner's charges, nothing retained beyond them.
     admission::verify_target_charges(&lib, &args.native_lib, &[lib.cuda_get_device()?], decode_rows, reserve as u64, capacity, slots,
-        args.concurrency)?;
+        args.concurrency, args.v41_encoder_placement)?;
     admission::startup_phase(&lib, "v41/workspace:prefill-slots", device_total)?;
     let protocol_v2_timing = protocol_v2_timing();
     // Every Spark world reserves its exact physical rank plane count.

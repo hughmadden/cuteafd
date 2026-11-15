@@ -110,7 +110,7 @@ impl<'w, 'a> DistributedTargetPass<'w, 'a> {
     pub(crate) fn capture_startup(&mut self,
         bank: &crate::families::deepseek_v41::v41_backbone_cache::BackboneCache<'a>, local: &[bool; 40]) -> Result<()> {
         ensure!(self.state == State::Idle, "startup graph capture requires idle target pass");
-        let rows: Vec<_> = cuteafd_loader::serving_capacity::v41_graphs::v41_joint_prewarm_rows(crate::families::deepseek_v41::graph_policy::ranks(),
+        let rows: Vec<_> = crate::families::deepseek_v41::graph_policy::joint_prewarm_rows(
             cuteafd_core::V41_VERIFY_ROWS);
         let resources = &mut self.resources;
         bank.capture_startup_producers(&mut resources.execution.producers.windows,
@@ -153,7 +153,7 @@ impl<'w, 'a> DistributedTargetPass<'w, 'a> {
         Ok(())
     }
     /// This decode lane's device-ordered passes push every transfer between
-    /// the GPUs (`v41_peer_push`): the 19->20 hop (A1) and the chained head
+    /// the GPUs (`v41_peer_push`): the admitted encoder hop (19->20 or 13->14) and the chained head
     /// (A8, A9). Its TP2 FFN, owned by its transport, is enabled there.
     pub fn enable_peer_push(&mut self) -> Result<()> {
         let spec = cuteafd_loader::placement::families::deepseek_v41::execution_hops(2);
@@ -422,6 +422,11 @@ impl<'w, 'a> DistributedTargetPass<'w, 'a> {
         if source == destination {
             let lane = &mut self.resources.lanes[destination];
             let device = lane.device;
+            // Tail14 takes this branch at 19->20: advance rebinds query,
+            // output, router and mHC to layer 20 before its all-row source
+            // producer. Chained FFN finish already copied the slot's next
+            // inputs; rebind introduces neither a host wait nor a new arena.
+            ensure!(lane.output()?.layer + 1 == layer, "local advance skipped a layer");
             device.run(|| lane.advance())
         } else {
             let [left, right] = &mut self.resources.lanes;
@@ -431,6 +436,7 @@ impl<'w, 'a> DistributedTargetPass<'w, 'a> {
                 (right, left)
             };
             let output = source.output()?;
+            ensure!(output.layer + 1 == layer, "peer advance skipped a layer");
             unsafe {
                 destination_lane
                     .get_mut()
@@ -1127,6 +1133,11 @@ mod tests {
         }).collect()
     }
 
+    // Legacy hardware fixture: all 20 TP2 encoder expert layers use a
+    // 73_000_000_000-byte/card load budget, two slots and 16/2048-row units.
+    // This is not an SM89-fit C16/three-unit/2M-pool qualification. Keep its
+    // native assertions; bounded CPU cut/admission coverage lives in
+    // encoder_units::placement_tests and the loader's SM89 C16 tier fixture.
     fn distributed_prefill_fixture(packed_check: bool) -> Result<()> {
         use crate::families::deepseek_v41::v41_native_serve::prefill_target::PrefillTarget;
         use crate::families::deepseek_v41::v41_experts::dspark::{DsparkChain, DsparkWeights};
@@ -1150,10 +1161,16 @@ mod tests {
         ];
         // Exercise the deployment's 3/1 source split by default. Boundary 14
         // remains available to cover a source group on the second encoder GPU.
+        let option: cuteafd_loader::placement::families::deepseek_v41::EncoderPlacement =
+            std::env::var("V41_ENCODER_PLACEMENT").unwrap_or_else(|_| "ced".into()).parse().map_err(anyhow::Error::msg)?;
         let boundary = std::env::var("CUTEAFD_ATTENTION_BOUNDARY").ok()
-            .map(|value| value.parse::<usize>()).transpose()?.unwrap_or(20);
+            .map(|value| value.parse::<usize>()).transpose()?
+            .unwrap_or(if option == cuteafd_loader::placement::families::deepseek_v41::EncoderPlacement::Tail14 { 14 } else { 20 });
         ensure!([14, 20].contains(&boundary), "unsupported fixture attention boundary");
         let map = CachePlacement::new(std::array::from_fn(|l| usize::from(l >= boundary)))?;
+        crate::families::deepseek_v41::graph_policy::set_encoder_placement(
+            if boundary == 14 { cuteafd_loader::placement::families::deepseek_v41::EncoderPlacement::Tail14 }
+            else { cuteafd_loader::placement::families::deepseek_v41::EncoderPlacement::Ced })?;
         eprintln!("loading placed backbone and auxiliary weights");
         let weights = BackboneLaneWeights::load_distributed(
             &lib,

@@ -175,10 +175,11 @@ pub(super) fn scoped<T>(scope: &str, component: &str, build: impl FnOnce() -> Re
 /// planner charges (`NativePrograms::target`). A retained temporary or an
 /// unmodelled owner fails startup instead of silently shrinking the pool.
 pub(super) fn verify_target_charges(lib: &cuteafd_ffi::NativeLibrary, native_lib: &std::path::Path, gpus: &[i32],
-    decode_rows: u32, reserve: u64, unit: u32, slots: usize, concurrency: u32) -> Result<()> {
+    decode_rows: u32, reserve: u64, unit: u32, slots: usize, concurrency: u32, encoder_placement: families::deepseek_v41::EncoderPlacement) -> Result<()> {
     use cuteafd_ffi::memory_ledger::{snapshot, Space};
     let manifest = families::deepseek_v41::owners::native_manifest(native_lib, "V41_FP8_AOT.json")?;
     let programs = families::deepseek_v41::owners::NativePrograms::new(&manifest, u32::try_from(lib.sm_count()?)?)?
+        .with_encoder_placement(encoder_placement)
         .with_compressed_attention(crate::shared::inventory::device_arch(lib, gpus[0])?.v41_compressed_attention());
     let head_mode = crate::families::deepseek_v41::v41_tensors::fp8_head();
     let window_batch = gpus.len() == 1 && super::BackboneExecution::window_batch_enabled();
@@ -240,7 +241,11 @@ pub(super) fn verify_expert_charges(catalog: &cuteafd_loader::OfficialV41Catalog
 
 /// Startup admission runs before any weight payload or device owner.
 /// Loading-only owners are charged at their sequential phase, not retained in the KV ledger.
-fn validate_owner_modes(args: &crate::cli::NativeServeArgs) -> Result<()> {
+pub(super) fn validate_owner_modes(args: &crate::cli::NativeServeArgs) -> Result<()> {
+    args.v41_encoder_placement.resolve(args.rtx_gpus as usize)?;
+    ensure!(args.v41_encoder_placement != families::deepseek_v41::EncoderPlacement::Tail14
+        || !(args.tp2_query_projection || args.tp2_output_projection),
+        "V4.1 tail14 requires whole query/output projections for device-ordered encoder units");
     ensure!(!args.tp2_attention,
         "unsupported V4.1 --tp2-attention: pre-weight contract is missing owner facts for replicated attention weights and per-lane workspaces");
     ensure!(!(args.tp2_query_projection || args.tp2_output_projection) || args.rtx_gpus == 2,
@@ -272,13 +277,14 @@ pub(super) fn admit_startup(
         .context("unsupported V4.1 native backbone residency")?;
     let gpu_embedding = embedding_placement(args.embedding_placement, total) == crate::shared::memory::EmbedPlacement::Gpu;
     let target_layout = crate::families::deepseek_v41::weight_layout::target_layout_for_arch(catalog,
-        (ranks == 2).then(crate::families::deepseek_v41::v41_backbone_cache::CachePlacement::encoder_decoder),
+        (ranks == 2).then_some(args.v41_encoder_placement.resolve(ranks)?),
         gpu_embedding, crate::families::deepseek_v41::v41_tensors::fp8_head(),
         ranks == 2 && args.tp2_query_projection, ranks == 2 && args.tp2_output_projection, coordinator_arch)?;
     let weights = owners::target_arena_demands(&target_layout);
     let manifest = owners::native_manifest(&args.native_lib, "V41_FP8_AOT.json")?;
     let programs = owners::NativePrograms::new(&manifest, u32::try_from(lib.sm_count()?)?)?
         .with_compressed_attention(coordinator_arch.v41_compressed_attention())
+        .with_encoder_placement(args.v41_encoder_placement)
         .with_projection_tp2(args.tp2_query_projection, args.tp2_output_projection);
     // Every owner serve allocates: two decode lanes, the prefill slots' storage.
     let shape = super::AdmittedPrefill::resolve(args)?;
@@ -549,7 +555,7 @@ pub(crate) struct WeightCap {
 fn fixture_target(args: &crate::cli::NativeServeArgs, catalog: &cuteafd_loader::OfficialV41Catalog,
     gpus: usize, total: usize) -> Result<families::deepseek_v41::weight_layout::TargetLayout> {
     crate::families::deepseek_v41::weight_layout::target_layout_for_arch(catalog,
-        (gpus == 2).then(crate::families::deepseek_v41::v41_backbone_cache::CachePlacement::encoder_decoder),
+        (gpus == 2).then_some(args.v41_encoder_placement.resolve(gpus)?),
         embedding_placement(args.embedding_placement, total) == crate::shared::memory::EmbedPlacement::Gpu,
         crate::families::deepseek_v41::v41_tensors::fp8_head(),
         gpus == 2 && args.tp2_query_projection, gpus == 2 && args.tp2_output_projection, cuteafd_core::GpuArch::Sm89)
@@ -808,6 +814,7 @@ pub(super) fn resolve_tiered_owners(
             lifetime: Lifetime::RESIDENT, activation: Activation::always() });
     }
     let input = ProductionInput {
+        encoder_placement: args.v41_encoder_placement,
         coordinator_arch,
         blas,
         expert_usage: args.expert_usage_enabled()?,
@@ -862,12 +869,13 @@ pub(super) fn resolve_tiered_owners(
             "the GPU expert tier admitted no experts beside the pool: lower the pool or use --gpu-expert-tier off");
     }
     let groups = usize::try_from(placement.pool_tokens.div_ceil(512) + tails)?;
-    let exact = cuteafd_loader::serving_capacity::deepseek_v41_cache_bytes(
+    let exact = cuteafd_loader::serving_capacity::deepseek_v41_cache_bytes_with_placement(
         &config,
         ranks,
         args.concurrency as u64,
         groups as u64,
         args.tp2_attention,
+        args.v41_encoder_placement,
     )?;
     for (gpu, &bytes) in exact.iter().enumerate() {
         ensure!(
@@ -1023,7 +1031,7 @@ pub(super) fn adopt_measured_pool(
     admitted: &mut Admitted,
 ) -> Result<u32> {
     use cuteafd_ffi::memory_ledger::{Space, snapshot};
-    use families::deepseek_v41::admission::{MeasuredOccupancy, adopt_measured, untracked_ready_owners, whole_gpu_reserve};
+    use families::deepseek_v41::admission::{MeasuredOccupancy, untracked_ready_owners, whole_gpu_reserve};
     // Explicit reserve overrides retain the sampled base but replace the
     // optional runtime-growth owners, so do not reintroduce them here.
     if whole_gpu_reserve() { return Ok(admitted.served_context); }
@@ -1060,8 +1068,8 @@ pub(super) fn adopt_measured_pool(
     let tier_owners = admitted.solved.facts.allocations.iter()
         .filter(|owner| owner.id.starts_with("v41.tier."))
         .map(|owner| (owner.id.clone(), owner.bytes, owner.location, owner.lifetime)).collect::<Vec<_>>();
-    let adopted = adopt_measured(&admitted.config, ranks, slots, retained,
-        args.tp2_attention, admitted.maximum_pool_tokens, &mut admitted.solved, &measured)
+    let adopted = cuteafd_loader::placement::families::deepseek_v41::admission::adopt_measured_with_placement(&admitted.config, ranks, slots, retained,
+        args.tp2_attention, admitted.maximum_pool_tokens, &mut admitted.solved, &measured, args.v41_encoder_placement)
         .context("V4.1 pre-pool measurement adoption")?;
     let adopted_tier = admitted.solved.facts.allocations.iter()
         .filter(|owner| owner.id.starts_with("v41.tier."))
@@ -1070,8 +1078,8 @@ pub(super) fn adopt_measured_pool(
         .filter(|owner| owner.id.starts_with("v41.tier.")).cloned().collect::<Vec<_>>();
     ensure!(tier_owners == adopted_tier && tier_weights == adopted_weights,
         "measured KV adoption changed solved tier owners or resident-weight claims");
-    let exact = cuteafd_loader::serving_capacity::deepseek_v41_cache_bytes(
-        &admitted.config, ranks, slots, adopted.groups, args.tp2_attention)?;
+    let exact = cuteafd_loader::serving_capacity::deepseek_v41_cache_bytes_with_placement(
+        &admitted.config, ranks, slots, adopted.groups, args.tp2_attention, args.v41_encoder_placement)?;
     ensure!(exact == adopted.bytes, "adopted V4.1 cache owners differ from allocator");
     let groups = usize::try_from(adopted.groups)?;
     // The runtime geometry follows the adopted plan exactly: the same page
@@ -1892,6 +1900,9 @@ mod admission_tests {
             assert!(validate_owner_modes(&args).unwrap_err().to_string().contains("two RTX"));
             args.rtx_gpus = 2;
             validate_owner_modes(&args).unwrap();
+            args.v41_encoder_placement = families::deepseek_v41::EncoderPlacement::Tail14;
+            assert!(validate_owner_modes(&args).unwrap_err().to_string().contains("device-ordered encoder units"));
+            args.v41_encoder_placement = Default::default();
         }
     }
 

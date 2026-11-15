@@ -194,6 +194,7 @@ mod tests {
     fn input(config: &serde_json::Value, live: bool) -> ProductionInput<'_> {
         let gpus = 2;
         ProductionInput {
+        encoder_placement: Default::default(),
             coordinator_arch: cuteafd_core::GpuArch::Sm120,
             config, expert_usage: false, gpus, context: 4096, maximum_pool_tokens: 2 << 20,
             prefill: PrefillShape { rows: 128, waves: 2 }, concurrency: 1, retained_turns: 4,
@@ -225,6 +226,173 @@ mod tests {
     fn request(pool: Option<u64>, onboard: Onboard) -> Request {
         production_request(4096, pool, onboard, PrefillShape { rows: 128, waves: 2 },
             Operation::Serving, 20 << 30, Default::default())
+    }
+
+    // Header-only, bounded admission fixture: no device allocations or CUDA.
+    // Common AOT scratch and the unchanged terminal owner are synthetic; the
+    // logical 48-GiB/card, C16, three-unit and 2M-pool contract is not reduced.
+    fn sm89_c16_tail14_admission_fixture(option: super::super::super::EncoderPlacement,
+        setting: ExpertTierSetting) -> anyhow::Result<AdmittedV41> {
+        use super::super::super::{EncoderPlacement, owners, weight_layout::TargetLayout, resident::Fp8Head};
+        let config = config();
+        let root = tempfile::tempdir()?;
+        crate::plan::testing::write_v41_snapshot(root.path());
+        let manifest = crate::plan::testing::write_v41_workspaces(root.path());
+        let mut fp8: serde_json::Value = serde_json::from_slice(&std::fs::read(manifest.parent().unwrap().join("V41_FP8_AOT.json"))?)?;
+        for variant in fp8["variants"].as_array_mut().unwrap() {
+            if variant["input_dim"] == 6144 && variant["output_dim"] == 25600 {
+                match variant["capacity"].as_u64() {
+                    Some(4096) => variant["scratch_bytes"] = (27_326_464u64 - 587_776).into(),
+                    Some(64) => variant["scratch_bytes"] = (587_776u64 - 512).into(),
+                    _ => {}
+                }
+            }
+        }
+        let catalog = crate::read_official_v41_catalog(root.path())?;
+        let prefill = PrefillShape { rows: 2752, waves: 3 };
+        let fixed_for = |option: EncoderPlacement| -> anyhow::Result<_> {
+            let layout = TargetLayout::new_for_arch(&catalog, Some(option.resolve(2)?.layers()), true,
+                Fp8Head::All, false, false, cuteafd_core::GpuArch::Sm89)?;
+            let mut fixed = owners::target_arena_demands(&layout);
+            fixed.extend(owners::NativePrograms::new(&fp8, 128)?.with_encoder_placement(option)
+                .target(64, 8256, 2752, 2, 3, 16, Fp8Head::All, false)?);
+            Ok((layout, fixed))
+        };
+        // The real serving baseline includes terminal/draft/transport owners
+        // absent from this header-only target fixture. Hold an unchanged
+        // terminal owner in both arms so GPU1 is the tight baseline device,
+        // as in the design's C16 worksheet. This is a controlled admission
+        // fixture, not a prediction of the full deployment's absolute tier.
+        let (_, baseline) = fixed_for(EncoderPlacement::Ced)?;
+        let cache = crate::serving_capacity::deepseek_v41_cache_bytes_with_placement(
+            &config, 2, 16, 4368, false, EncoderPlacement::Ced)?;
+        let totals: [u64; 2] = std::array::from_fn(|gpu| cache[gpu] + baseline.iter()
+            .filter(|owner| owner.gpu as usize == gpu).map(|owner| owner.bytes).sum::<u64>());
+        let terminal = totals[0].saturating_sub(totals[1]) + 32 * MIB;
+        eprintln!("fixture unchanged terminal owner on GPU1={terminal}");
+        let run = |option, setting| -> anyhow::Result<AdmittedV41> {
+            let mut fixture = input(&config, false);
+            fixture.encoder_placement = option;
+            fixture.coordinator_arch = cuteafd_core::GpuArch::Sm89;
+            fixture.budgets = production_budgets(&[(CARD, CARD); 2], crate::placement::reserve::gpu("deepseek_v41"),
+                None, 0, &[128 << 30; 4])?;
+            fixture.prefill = prefill;
+            fixture.concurrency = 16;
+            fixture.retained_turns = 128;
+            fixture.resident_weight_limit = u64::MAX;
+            for expert in &mut fixture.experts {
+                expert.whole.resident = 384 * 9_131_264 * 2;
+                for half in &mut expert.half { half.resident = 384 * 9_131_264; }
+            }
+            let (layout, mut fixed) = fixed_for(option)?;
+            fixed.push(crate::placement::Demand::new(1, Category::Workspace,
+                "fixture unchanged terminal owners", terminal, Basis::Formula));
+            for gpu in 0..2 {
+                let workspace = fixed.iter().filter(|d| d.gpu == gpu && d.category == Category::Workspace).map(|d| d.bytes).sum::<u64>();
+                eprintln!("{option} GPU{gpu} fixture target weights payload={} arena={} workspaces={workspace}",
+                    layout.ranks[gpu as usize].payload_bytes(), layout.ranks[gpu as usize].bytes());
+            }
+            fixture.owners = fixed.iter().map(Owner::from_demand).collect();
+            fixture.weight_arenas = layout.ranks;
+            let request = production_request(4096, Some(2 << 20), Onboard::Auto, prefill,
+                Operation::Serving, u64::MAX, Default::default());
+            Ok(fixture.prepare()?.admit_with_tier(request,
+                &TierChoice { setting, ..Default::default() })?)
+        };
+        run(option, setting)
+    }
+
+    #[test]
+    fn tail14_c16_native_owners_reduce_paired_tier_before_loading() -> anyhow::Result<()> {
+        use super::super::super::EncoderPlacement;
+        let config = config();
+        let run = sm89_c16_tail14_admission_fixture;
+        let ced = run(EncoderPlacement::Ced, ExpertTierSetting::Auto)?;
+        let mut tail = run(EncoderPlacement::Tail14, ExpertTierSetting::Auto)?;
+        let counts = [ced.placement.expert_tier.as_ref().unwrap().experts,
+            tail.placement.expert_tier.as_ref().unwrap().experts];
+        let loss = counts[0].checked_sub(counts[1]).expect("GPU1-bound fixture must lose paired residency");
+        eprintln!("tail14 C16 fixture paired experts: ced={} tail14={} loss={loss}", counts[0], counts[1]);
+        assert!((220..=260).contains(&loss));
+        assert_eq!(ced.placement.pool_tokens, 2 << 20);
+        assert_eq!(tail.placement.pool_tokens, 2 << 20);
+        assert_eq!(tail.solved.decisions.attention, EncoderPlacement::Tail14.resolve(2)?.modes());
+        // A pin that fits CED cannot force tail14 to spend its pool or reserves.
+        assert!(run(EncoderPlacement::Ced, ExpertTierSetting::PerLayer(counts[0] / 40)).is_ok());
+        assert!(run(EncoderPlacement::Tail14, ExpertTierSetting::PerLayer(counts[0] / 40)).is_err());
+        for gpu in 0..2 {
+            for option in [EncoderPlacement::Ced, EncoderPlacement::Tail14] {
+                let plan = if option == EncoderPlacement::Ced { &ced } else { &tail };
+                let groups = 4096 + 16 + 256;
+                let exact = crate::serving_capacity::deepseek_v41_cache_bytes_with_placement(
+                    &config, 2, 16, groups, false, option)?;
+                let charged = plan.placement.items[gpu].iter().filter(|item| item.category == Category::Kv)
+                    .map(|item| item.bytes).sum::<u64>();
+                assert_eq!(charged, exact[gpu]);
+                eprintln!("{option} GPU{gpu} fixture KV={charged}");
+            }
+        }
+        let before = tail.solved.pool_tokens;
+        let measured = [MeasuredOccupancy { gpu: 0, backing: 0, unattributed: 0 },
+            MeasuredOccupancy { gpu: 1, backing: 0, unattributed: 0 }];
+        assert!(adopt_measured_with_placement(&config, 2, 16, 128, false, 2 << 20,
+            &mut tail.solved, &measured, EncoderPlacement::Ced).is_err());
+        let adopted = adopt_measured_with_placement(&config, 2, 16, 128, false, 2 << 20,
+            &mut tail.solved, &measured, EncoderPlacement::Tail14)?;
+        assert_eq!(tail.solved.pool_tokens, before);
+        assert_eq!(adopted.bytes, crate::serving_capacity::deepseek_v41_cache_bytes_with_placement(
+            &config, 2, 16, adopted.groups, false, EncoderPlacement::Tail14)?);
+        Ok(())
+    }
+
+    /// CPU admission and cut wiring only. The companion daemon schedule test
+    /// checks enqueue order with this geometry. Neither proves CUDA ordering,
+    /// visibility/races, byte-exact restore, a production tier count or speed.
+    #[test]
+    fn tail14_sm89_c16_admitted_cut_keeps_local_source_consumers() -> anyhow::Result<()> {
+        use super::super::super::{EncoderPlacement, CachePlacement};
+        use crate::placement::{HopPoint, HopStorage, LayerExecutionPlan, hop_buffer_bytes};
+        let ced = sm89_c16_tail14_admission_fixture(EncoderPlacement::Ced, ExpertTierSetting::Auto)?;
+        let tail = sm89_c16_tail14_admission_fixture(EncoderPlacement::Tail14, ExpertTierSetting::Auto)?;
+        let spec = super::super::super::execution_hops(2);
+        let execution = LayerExecutionPlan::new(&tail.placement, spec)?;
+        let map = CachePlacement::from_execution_plan(&execution)?;
+        assert_eq!(EncoderPlacement::default(), EncoderPlacement::Ced);
+        assert_eq!(spec.storage, HopStorage::DirectInput);
+        assert_eq!(spec.row_bytes, 40960 + 16);
+        assert_eq!(execution.hops().len(), 1);
+        let hop = &execution.hops()[0];
+        assert_eq!((hop.at, hop.from, hop.to), (HopPoint::BeforeLayer(14), 0, 1));
+        assert_eq!(hop_buffer_bytes(execution.hops(), &spec, 2), Some(vec![0, 0]));
+        assert_eq!(map.attention(13)?, 0);
+        assert_eq!(map.sources(), [0, 0, 1, 1]);
+        for layer in 14..20 { assert_eq!(map.attention(layer)?, 1); }
+        assert_eq!((map.attention(19)?, map.attention(20)?), (1, 1));
+        assert_eq!([map.counts(0), map.counts(1)], [(14, 2, 0), (26, 1, 1)]);
+        // Gate14 and source14/20 retained producers share GPU1, while gate1
+        // stays on GPU0; every private decode lane is charged independently.
+        let owner = |plan: &AdmittedV41, gpu: usize, group: &str| plan.placement.items[gpu].iter()
+            .filter(|item| item.group == group).map(|item| item.bytes).sum::<u64>();
+        assert!(owner(&tail, 1, "prefill slots engram gates") > 0);
+        assert_eq!(owner(&tail, 0, "prefill slots engram gates"),
+            owner(&tail, 1, "prefill slots engram gates"));
+        assert!(owner(&tail, 1, "prefill slots cache producers") > owner(&ced, 1, "prefill slots cache producers"));
+        for lane in 0..2 {
+            assert!(owner(&tail, 1, &format!("lane {lane} engram gates")) > 0);
+            assert!(owner(&tail, 1, &format!("lane {lane} cache producers")) > 0);
+        }
+        for plan in [&ced, &tail] {
+            assert_eq!(plan.solved.decisions.prefill, PrefillShape { rows: 2752, waves: 3 });
+            assert_eq!(plan.placement.pool_tokens, 2_097_152);
+            for budget in plan.solved.budgets.iter().filter(|b| matches!(b.locations[0].device, Device::Coordinator(_))) {
+                assert_eq!(budget.physical_bytes, CARD);
+                assert!(budget.logical_bytes <= CARD);
+            }
+        }
+        let pin = ExpertTierSetting::PerLayer(ced.placement.expert_tier.as_ref().unwrap().experts / 40);
+        assert!(sm89_c16_tail14_admission_fixture(EncoderPlacement::Ced, pin).is_ok());
+        assert!(sm89_c16_tail14_admission_fixture(EncoderPlacement::Tail14, pin).is_err());
+        Ok(())
     }
 
     #[test]

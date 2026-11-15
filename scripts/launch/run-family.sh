@@ -477,6 +477,16 @@ if [[ -n "${CUTEAFD_GRAPH_EAGER:-}" ]]; then
   [[ "${CUTEAFD_GRAPH_CENSUS:-}" != 1 ]] || { printf '%s\n' 'Graph eager A/B requires census timing disabled' >&2; exit 2; }
   graph_census_args+=(-e CUTEAFD_GRAPH_EAGER=layer_row)
 fi
+# Diagnostic V4.1 target-bank graph posture (placement graph qualification).
+# WIP-only and default-off; the daemon validates the value again.
+if [[ -n "${CUTEAFD_V41_TARGET_GRAPHS:-}" ]]; then
+  [[ -n "$wip_layout" ]] || { printf '%s\n' 'V4.1 target graph mode requires a WIP build' >&2; exit 2; }
+  [[ "$family" == deepseek_v41 ]] || { printf '%s\n' 'V4.1 target graph mode requires the deepseek_v41 family' >&2; exit 2; }
+  case "$CUTEAFD_V41_TARGET_GRAPHS" in
+    eager|capture) graph_census_args+=(-e "CUTEAFD_V41_TARGET_GRAPHS=$CUTEAFD_V41_TARGET_GRAPHS") ;;
+    *) printf '%s\n' 'V4.1 target graph mode must be eager or capture' >&2; exit 2 ;;
+  esac
+fi
 }
 # API keys, the live console and usage records: arguments for the serve command
 # (api_args) and the coordinator's mounts (api_mount_args), the same in every family.
@@ -701,6 +711,13 @@ namespace_mount_args=("${RELEASE_HUB_MOUNTS[@]}")
   release_die "unsupported: EXL3 for DeepSeek V4/V4.1 Flash"
 coordinator="$RELEASE_COORDINATOR_CONTAINER_NAME"
 [[ "$TP2_DSPARK_EXPERTS" != on || "$SPECULATOR" == dspark ]] || release_die "TP2_DSPARK_EXPERTS requires dSpark"
+v41_encoder_placement="$(get V41_ENCODER_PLACEMENT ced)"
+case "$v41_encoder_placement" in
+  ced) ;;
+  tail14) [[ "$RTX_GPUS" == 2 ]] || release_die "V41_ENCODER_PLACEMENT=tail14 requires two RTX GPUs" ;;
+  *) release_die "V41_ENCODER_PLACEMENT must be ced or tail14" ;;
+esac
+
 
 RELEASE_RECLAIM_ARGS=()
 ((restart == 0)) || release_coordinator_reclaim_args "$coordinator"
@@ -777,6 +794,7 @@ mkdir -p "$count_config_dir"
 count_config="$count_config_dir/plan-$(printf '%s\n' "$count_config_text" | sha256sum | cut -c1-16).config"
 printf '%s\n' "$count_config_text" >"$count_config.tmp.$$" && mv "$count_config.tmp.$$" "$count_config"
 count_args+=(--config /run/cuteafd-plan.config)
+[[ "${v41_encoder_placement:-ced}" == ced ]] || count_args+=(--v41-encoder-placement "$v41_encoder_placement")
 for phase in prefill decode; do
   format="$(get "SPARK_${phase^^}_REPLY_FORMAT" "$(get SPARK_REPLY_FORMAT)")"
   [[ -z "$format" ]] || count_args+=("--spark-${phase}-reply-format" "$format")
@@ -996,7 +1014,7 @@ assert hashlib.sha256((root / "lib/libcuteafd_native.so").read_bytes()).hexdiges
 fi
 
 peers="$(jq -er '.peers | join(",")' <<<"$count_plan")"
-fingerprint="$(printf '%s\n' "$engine_commit" "$RELEASE_MODEL_ID" "$RELEASE_MODEL_REVISION" "$ADDR" "$RELEASE_RTX_GPUS" "$gpu_uuid_csv" "$gpu_pci_csv" "$CONCURRENCY" "${HTTP_QUEUE_DEPTH:-$CONCURRENCY}" "$HTTP_QUEUE_WAIT_MS" "$HOST_CACHE_BYTES" "$RTX_EXPERT_LAYERS" "${KV_POOL_SIZE}${POOL_TOKENS:+:planner=$POOL_TOKENS}" "$EMBEDDING" "$VISION" "$AUDIO" "memory=${memory_policy_args[*]}" "$PREFIX_CACHE_ENTRIES" "$MAX_CONTEXT_TOKENS" "$MAX_OUTPUT_TOKENS" "$PREFILL_BATCH_TOKENS" "prefill-waves=${V41_PREFILL_WAVES:-}" "prefill-reserve=${V41_PREFILL_RESERVE_ROWS:-}" "$SPECULATOR" "${DRAFT_SURVIVAL_LENGTHS:-off}"${DRAFT_POLICY:+ "draft-policy=$DRAFT_POLICY"}${DRAFT_ROW_COST:+ "draft-row-cost=$DRAFT_ROW_COST"} "${draft_length:-auto}" "$TP2_ATTENTION" "$TP2_QUERY_PROJECTION" "$TP2_OUTPUT_PROJECTION" "$TP2_DSPARK_EXPERTS" "${CUTEAFD_PROTOCOL_V2_VERBS_HOST_DEVICE_MAP:-}" "${CUTEAFD_PROTOCOL_V2_VERBS_HOST_EXECUTION_LANES:-}" "${v41_worker_budget:-}" "$SPARK_COUNT" "$(release_hosts_csv)" "$peers" "spark-tp=${spark_tp}" "gpu-expert-tier=$v41_gpu_expert_tier:${v41_tier_profile:+$(sha256sum <"$v41_tier_profile" | awk '{print $1}')}" "v41-spark-tp-roles=${spark_tp_roles_required}" | sha256sum | awk '{print $1}')"
+fingerprint="$(printf '%s\n' "$engine_commit" "$RELEASE_MODEL_ID" "$RELEASE_MODEL_REVISION" "$ADDR" "$RELEASE_RTX_GPUS" "$gpu_uuid_csv" "$gpu_pci_csv" "$CONCURRENCY" "${HTTP_QUEUE_DEPTH:-$CONCURRENCY}" "$HTTP_QUEUE_WAIT_MS" "$HOST_CACHE_BYTES" "$RTX_EXPERT_LAYERS" "${KV_POOL_SIZE}${POOL_TOKENS:+:planner=$POOL_TOKENS}" "$EMBEDDING" "$VISION" "$AUDIO" "memory=${memory_policy_args[*]}" "$PREFIX_CACHE_ENTRIES" "$MAX_CONTEXT_TOKENS" "$MAX_OUTPUT_TOKENS" "$PREFILL_BATCH_TOKENS" "prefill-waves=${V41_PREFILL_WAVES:-}" "prefill-reserve=${V41_PREFILL_RESERVE_ROWS:-}" "$SPECULATOR" "${DRAFT_SURVIVAL_LENGTHS:-off}"${DRAFT_POLICY:+ "draft-policy=$DRAFT_POLICY"}${DRAFT_ROW_COST:+ "draft-row-cost=$DRAFT_ROW_COST"} "${draft_length:-auto}" "$TP2_ATTENTION" "$TP2_QUERY_PROJECTION" "$TP2_OUTPUT_PROJECTION" "$TP2_DSPARK_EXPERTS" "v41-encoder-placement=$v41_encoder_placement" "${CUTEAFD_PROTOCOL_V2_VERBS_HOST_DEVICE_MAP:-}" "${CUTEAFD_PROTOCOL_V2_VERBS_HOST_EXECUTION_LANES:-}" "${v41_worker_budget:-}" "$SPARK_COUNT" "$(release_hosts_csv)" "$peers" "spark-tp=${spark_tp}" "gpu-expert-tier=$v41_gpu_expert_tier:${v41_tier_profile:+$(sha256sum <"$v41_tier_profile" | awk '{print $1}')}" "v41-spark-tp-roles=${spark_tp_roles_required}" | sha256sum | awk '{print $1}')"
 spark_prefix="$RELEASE_SPARK_CONTAINER_PREFIX"
 # Launch features shared with every family, validated before a dry run returns
 # and before any service is stopped.
@@ -1014,6 +1032,7 @@ if ((dry_run)); then
   echo "  RTX layout: $RELEASE_RTX_GPUS GPU(s), host indices $gpu_index_csv"
   echo "  physical GPUs: $gpu_uuid_csv"
   echo "  TP2 attention/query/output/draft experts: $TP2_ATTENTION/$TP2_QUERY_PROJECTION/$TP2_OUTPUT_PROJECTION/$TP2_DSPARK_EXPERTS"
+  echo "  V4.1 encoder placement: $v41_encoder_placement (ced: 0-19/20-39; tail14: 0-13/14-39)"
   echo "  Spark ranks: $SPARK_COUNT; hosts: $(release_hosts_csv)"
   echo "  Spark peers: $peers"
   echo "  Spark owners: coordinator-authoritative typed admission"
@@ -1163,6 +1182,7 @@ if [[ -n "${POOL_TOKENS:-}" ]]; then
 fi
 [[ "$SPECULATOR" != dspark ]] || args+=(--dspark)
 [[ -z "$draft_length" ]] || args+=(--draft-length "$draft_length")
+[[ "${v41_encoder_placement:-ced}" == ced ]] || args+=(--v41-encoder-placement "$v41_encoder_placement")
 [[ "$TP2_ATTENTION" != on ]] || args+=(--tp2-attention)
 [[ "$TP2_QUERY_PROJECTION" != on ]] || args+=(--tp2-query-projection)
 [[ "$TP2_OUTPUT_PROJECTION" != on ]] || args+=(--tp2-output-projection)

@@ -804,3 +804,51 @@ def test_v41_prefix_point_boundaries_default_and_override(tmp_root, monkeypatch,
     assert not any("prefix-point" in arg for plan in result["plans"] for arg in plan)
     for worker in result["containers"][1:]:
         assert not any("prefix-point" in arg or "PREFIX_POINT" in arg for arg in worker["argv"])
+
+
+@pytest.mark.parametrize("value", [None, "ced", "tail14"])
+def test_v41_encoder_placement_reaches_plan_serve_and_identity(tmp_root, monkeypatch, value):
+    import v41_launch_capture as capture_module
+
+    original = capture_module.example_config
+
+    def with_key(name, directory):
+        config = original(name, directory)
+        if value is not None:
+            return capture_module.append_config(config, f"V41_ENCODER_PLACEMENT={value}\n")
+        return config
+
+    monkeypatch.setattr(capture_module, "example_config", with_key)
+    result = capture_module.capture(ROOT, "deepseek-v41-mxfp4-max")
+    plan = result["plans"][0]
+    coordinator = result["containers"][0]["argv"]
+    flag = "--v41-encoder-placement"
+    if value == "tail14":
+        assert plan[plan.index(flag) + 1] == "tail14"
+        assert coordinator[coordinator.index(flag) + 1] == "tail14"
+        monkeypatch.setattr(capture_module, "example_config", original)
+        baseline = capture_module.capture(ROOT, "deepseek-v41-mxfp4-max")
+        candidate_identity = parse_run(coordinator)["env"]["CUTEAFD_RELEASE_CONFIG_SHA256"]
+        baseline_identity = parse_run(baseline["containers"][0]["argv"])["env"]["CUTEAFD_RELEASE_CONFIG_SHA256"]
+        assert candidate_identity != baseline_identity
+    else:
+        assert flag not in plan and flag not in coordinator
+    for worker in result["containers"][1:]:
+        assert flag not in worker["argv"]
+
+
+@pytest.mark.parametrize("case,value,error", [
+    ("deepseek-v41-mxfp4-max", "cut10", "must be ced or tail14"),
+    ("deepseek-v41-mxfp4-min", "tail14", "requires two RTX GPUs"),
+])
+def test_v41_encoder_placement_refuses_invalid_boot_layout(tmp_root, monkeypatch, case, value, error):
+    import v41_launch_capture as capture_module
+
+    original = capture_module.example_config
+
+    def with_key(name, directory):
+        return capture_module.append_config(original(name, directory), f"V41_ENCODER_PLACEMENT={value}\n")
+
+    monkeypatch.setattr(capture_module, "example_config", with_key)
+    with pytest.raises(RuntimeError, match=error):
+        capture_module.capture(ROOT, case)

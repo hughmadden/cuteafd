@@ -70,6 +70,8 @@ pub struct DeploymentSpec<'a> {
     pub family: &'a str,
     pub snapshot: &'a str,
     pub rtx_gpus: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub v41_encoder_placement: Option<crate::placement::families::deepseek_v41::EncoderPlacement>,
     pub spark_ranks: usize,
     pub spark_expert_world: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -178,7 +180,14 @@ impl<'a> DeploymentSpec<'a> {
         let spark_tp_role = (family == "deepseek_v41" && !exl3 && ranks != 0 && ranks != 4)
             .then(|| format!("tp{ranks}"));
         Ok(Self { version: 1, family, snapshot: &report.snapshot,
-            rtx_gpus: options.rtx_gpus, spark_ranks: physical, spark_expert_world: ranks,
+            rtx_gpus: options.rtx_gpus,
+            v41_encoder_placement: (family == "deepseek_v41").then(|| {
+                use crate::placement::{families::deepseek_v41::EncoderPlacement, LayerMode};
+                if report.solver_placement.as_ref().and_then(|p| p.layers.get(14))
+                    .is_some_and(|layer| matches!(layer.mode, LayerMode::Whole { gpu: 1, .. })) {
+                    EncoderPlacement::Tail14
+                } else { EncoderPlacement::Ced }
+            }), spark_ranks: physical, spark_expert_world: ranks,
             replay_records: report.replay_records, spark_roles,
             prefill_unit_rows: report.prefill_unit_rows.unwrap_or(0),
             prefill_waves: report.prefill_waves.unwrap_or(0),

@@ -12,7 +12,6 @@
 //! replayed call by call. Every refusal is collected, and the test fails once
 //! with all of them.
 use super::admission;
-use crate::families::deepseek_v41::v41_backbone_cache::CachePlacement;
 use crate::shared::memory::device::Device;
 use crate::shared::memory::{DeviceAllocation, LoadStream};
 use anyhow::{ensure, Context, Result};
@@ -129,6 +128,12 @@ fn synthetic_experts<'a>(device: Device<'a>, layer: crate::families::deepseek_v4
         std::rc::Rc::new(arena), 0, layer, &planes, budget))
 }
 
+/// Only the ignored hardware sweep reads this test selector. Production
+/// consumes the typed CLI/admission contract, never an inference-only env key.
+fn qualification_placement() -> Result<cuteafd_loader::placement::families::deepseek_v41::EncoderPlacement> {
+    std::env::var("V41_ENCODER_PLACEMENT").unwrap_or_else(|_| "ced".into()).parse().map_err(anyhow::Error::msg)
+}
+
 /// Serve's arguments as the launcher derives them from the deployment plan.
 fn serve_args(snapshot: &std::path::Path, native_lib: &std::path::Path, unit: u64, waves: u64, reserve: u64)
     -> Result<crate::cli::NativeServeArgs> {
@@ -142,7 +147,12 @@ fn serve_args(snapshot: &std::path::Path, native_lib: &std::path::Path, unit: u6
             "--prefix-cache-entries", "20", "--max-context-tokens", "1048576", "--max-output-tokens", "262144",
             "--pool-tokens", "0", "--prefill-batch-tokens", &unit, "--prefill-waves", &waves,
             "--prefill-reserve-rows", &reserve])?;
-    Ok(crate::cli::NativeServeArgs::from_arg_matches(&matches)?)
+    let mut args = crate::cli::NativeServeArgs::from_arg_matches(&matches)?;
+    args.v41_encoder_placement = qualification_placement()?;
+    if args.v41_encoder_placement == cuteafd_loader::placement::families::deepseek_v41::EncoderPlacement::Tail14 {
+        args.concurrency = 16;
+    }
+    Ok(args)
 }
 
 /// Parse the exact sweep plan argv without opening a checkpoint or a library.
@@ -157,6 +167,10 @@ fn plan_args(arch: cuteafd_core::GpuArch, directory: &std::path::Path, snapshot:
         "--embedding-placement", "host"])?;
     let crate::cli::Commands::Plan(mut plan_args) = cli.command else { anyhow::bail!("expected the plan command") };
     // The launcher's global VISION=off and AUDIO=off, as main hands them to the plan.
+    plan_args.v41_encoder_placement = Some(qualification_placement()?);
+    if plan_args.v41_encoder_placement == Some(cuteafd_loader::placement::families::deepseek_v41::EncoderPlacement::Tail14) {
+        plan_args.concurrency = 16;
+    }
     plan_args.vision = cuteafd_loader::plan::MediaMode::Off;
     plan_args.audio = cuteafd_loader::plan::MediaMode::Off;
     Ok(plan_args)
@@ -218,6 +232,7 @@ fn cuda_v41_two_rtx_startup_handles_create_at_planned_sizes() -> Result<()> {
     cuteafd_loader::plan::testing::write_v41_snapshot(fixture.path());
     let catalog = cuteafd_loader::read_official_v41_catalog(fixture.path())?;
     let (report, args) = deployment(arch, &directory, fixture.path(), &native_lib)?;
+    super::super::graph_policy::set_encoder_placement(args.v41_encoder_placement)?;
     let onboard = report.solver_placement.as_ref().context("plan placement")?.onboard_layers;
 
     // Serve's shapes, through its own resolution of those arguments.
@@ -229,7 +244,7 @@ fn cuda_v41_two_rtx_startup_handles_create_at_planned_sizes() -> Result<()> {
     let decode = super::DECODE_LANE_ROWS;
     let width = if args.draft_length.draft_length.unwrap_or(5) > 5 { 7 } else { 5 };
     let requests = args.concurrency;
-    let map = CachePlacement::encoder_decoder();
+    let map = args.v41_encoder_placement.resolve(2)?;
     let spark_world = crate::shared::spark_topology::world(args.peers.len())?;
     let ranks = spark_world.topology().world_size();
     let snapshot_slots = cuteafd_core::prefix::mark_slots_with_host(0, u64::from(args.resolved_prefix_entries()), 1,
@@ -366,7 +381,8 @@ fn cuda_v41_two_rtx_startup_handles_create_at_planned_sizes() -> Result<()> {
     // owners: the native sizes verify_target_charges compares per owner.
     let fp8_manifest = families_manifest(&native_lib)?;
     let programs = cuteafd_loader::placement::families::deepseek_v41::owners::NativePrograms::new(&fp8_manifest, sms)?
-        .with_compressed_attention(arch.v41_compressed_attention());
+        .with_compressed_attention(arch.v41_compressed_attention())
+        .with_encoder_placement(args.v41_encoder_placement);
     let planned = |sweep: &mut Sweep, gpu: Device<'_>, rows: u32, k: u32, n: u32, owner: &str| {
         let runtime = sweep.record("FP8 plan", format!("GPU{} {owner} m{rows} {k}x{n}", gpu.id),
             gpu.run(|| fp8_plan(&lib, rows, k, n)));

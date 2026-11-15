@@ -133,6 +133,7 @@ mod tests {
             gpu: u8, draft: bool| -> Result<(u64, u64)> {
             let demand = owners::arena_demand(gpu, layout);
             let prepared = admission::ProductionInput {
+        encoder_placement: Default::default(),
                 coordinator_arch: cuteafd_core::GpuArch::Sm120,
                 blas: Vec::new(),
                 expert_usage: false, config: &config, gpus: ranks, context: 512, maximum_pool_tokens: 512,

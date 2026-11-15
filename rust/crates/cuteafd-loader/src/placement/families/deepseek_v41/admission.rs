@@ -410,7 +410,12 @@ pub fn cache_owners(
     replicated: bool,
     maximum: u64,
 ) -> Result<Vec<Vec<Component>>, Refusal> {
-    let geometry = crate::serving_capacity::deepseek_v41_cache_geometry(config, ranks)
+    cache_owners_with_placement(config, ranks, slots, tails, replicated, maximum, super::EncoderPlacement::Ced)
+}
+pub fn cache_owners_with_placement(config: &serde_json::Value, ranks: usize, slots: u64, tails: u64,
+    replicated: bool, maximum: u64, placement: super::EncoderPlacement) -> Result<Vec<Vec<Component>>, Refusal> {
+    let map = placement.resolve(ranks).map_err(|error| invalid(&error.to_string()))?;
+    let geometry = crate::serving_capacity::deepseek_v41_cache_geometry_with_placement(config, ranks, placement)
         .map_err(|error| invalid(&error.to_string()))?;
     if tails > 4096 || (replicated && ranks != 2) {
         return Err(invalid("invalid V4.1 cache admission shape"));
@@ -421,18 +426,17 @@ pub fn cache_owners(
         .map(|rank| rank.persistent_unit_bytes)
         .collect::<Vec<_>>();
     if replicated {
-        units[0] += 2 * 256 * 288;
-        units[1] += 3 * 256 * 288;
+        for gpu in 0..ranks { let (_, c2, c1) = map.counts(1 - gpu); units[gpu] += (c2 + 2 * c1) * 256 * 288; }
     }
     // At one group each source table is still linear; subtracting its entries
     // from the allocator total isolates fixed windows and compressor carry.
-    let first = crate::serving_capacity::deepseek_v41_cache_bytes(config, ranks, slots, 1, replicated)
+    let first = crate::serving_capacity::deepseek_v41_cache_bytes_with_placement(config, ranks, slots, 1, replicated, placement)
         .map_err(|error| invalid(&error.to_string()))?;
     let mut out = vec![Vec::new(); ranks];
-    let sources = if ranks == 1 { vec![(3u64, 1u64)] } else { vec![(3, 0), (0, 1)] };
+    let sources = (0..ranks).map(|gpu| { let (_, c2, c1) = map.counts(gpu); (c2, c1) }).collect::<Vec<_>>();
     for (gpu, &(c2, c1)) in sources.iter().enumerate() {
         let replica = if replicated {
-            if gpu == 0 { (0, 1) } else { (3, 0) }
+            let (_, c2, c1) = map.counts(1 - gpu); (c2, c1)
         } else {
             (0, 0)
         };
@@ -565,6 +569,14 @@ pub fn adopt_measured(
     plan: &mut ResolvedPlan,
     measured: &[MeasuredOccupancy],
 ) -> Result<AdoptedPool, Refusal> {
+    adopt_measured_with_placement(config, gpus, slots, retained_turns, replicated, maximum_pool_tokens, plan, measured, super::EncoderPlacement::Ced)
+}
+pub fn adopt_measured_with_placement(config: &serde_json::Value, gpus: usize, slots: u64, retained_turns: u64,
+    replicated: bool, maximum_pool_tokens: u64, plan: &mut ResolvedPlan, measured: &[MeasuredOccupancy],
+    placement: super::EncoderPlacement) -> Result<AdoptedPool, Refusal> {
+    if placement.resolve(gpus).map_err(|error| invalid(&error.to_string()))?.modes() != plan.decisions.attention {
+        return Err(invalid("measured adoption encoder placement differs from admitted execution"));
+    }
     let tails = slots
         .checked_add(retained_turns.checked_mul(2).ok_or(Refusal::Overflow("V4.1 retained turns"))?)
         .ok_or(Refusal::Overflow("V4.1 private tails"))?;
@@ -588,7 +600,7 @@ pub fn adopt_measured(
                 Category::Runtime, group));
         }
     }
-    let owners = cache_owners(config, gpus, slots, tails, replicated, maximum)?;
+    let owners = cache_owners_with_placement(config, gpus, slots, tails, replicated, maximum, placement)?;
     refit_pool(plan, &owners, tails)
 }
 
@@ -986,12 +998,13 @@ pub fn production_request(
 /// Physical subrecipes prepared from headers and program tables. This builder
 /// selects neither the pool nor an expert prefix; the shared planner does.
 pub struct V41Recipe<'a> {
+    pub encoder_placement: super::EncoderPlacement,
     pub expert_usage: Option<cuteafd_core::expert_usage::Geometry>,
     pub config: &'a serde_json::Value,
     pub context: u64,
     pub page_tokens: u64,
     pub maximum_pages: u64,
-    /// The executor's fixed CED ownership, unchanged by this port.
+    /// The executor's process-lifetime ownership, shared by prefill and decode.
     pub attention: Vec<LayerMode>,
     pub gpus: usize,
     pub spark_ranks: usize,
@@ -1168,6 +1181,7 @@ impl V41Recipe<'_> {
 }
 
 pub struct ProductionInput<'a> {
+    pub encoder_placement: super::EncoderPlacement,
     /// Sampled coordinator architecture; callers select context, program and
     /// packed-scale facts with it before prepare. Graph/BLAS calibration stays
     /// the shared upstream inventory until an architecture is measured.
@@ -1311,12 +1325,8 @@ impl<'a> ProductionInput<'a> {
                 context: self.context,
             });
         }
-        let attention = (0..routed)
-            .map(|layer| LayerMode::Whole {
-                gpu: u8::from(self.gpus == 2 && layer >= 20),
-                ffn: FfnMode::Owner,
-            })
-            .collect::<Vec<_>>();
+        let attention = self.encoder_placement.resolve(self.gpus)
+            .map_err(|error| invalid(&error.to_string()))?.modes();
         let counts = match &self.onboard_counts {
             Some(counts) => counts.clone(),
             None if self.spark_ranks == 0 => vec![routed],
@@ -1334,6 +1344,7 @@ impl<'a> ProductionInput<'a> {
         }
         let expert_usage = self.expert_usage.then(|| expert_usage_geometry(self.config)).transpose()?;
         let mut recipe = V41Recipe {
+            encoder_placement: self.encoder_placement,
             expert_usage,
             config: self.config,
             context: self.context,
@@ -1598,6 +1609,9 @@ impl Domains<'_> {
 
 impl Recipe for V41Recipe<'_> {
     fn prepare(&self, request: &Request) -> Result<Contract, Refusal> {
+        if self.encoder_placement.resolve(self.gpus).map_err(|error| invalid(&error.to_string()))?.modes() != self.attention {
+            return Err(invalid("native owner placement differs from execution modes"));
+        }
         if !(1..=2).contains(&self.gpus)
             || self.context == 0
             || request.context.maximum != self.context
@@ -1852,13 +1866,14 @@ impl Recipe for V41Recipe<'_> {
                 else { components };
             contract.components.extend(components);
         }
-        for components in cache_owners(
+        for components in cache_owners_with_placement(
             self.config,
             self.gpus,
             self.concurrency,
             self.tails,
             self.replicated,
             self.maximum_pages,
+            self.encoder_placement,
         )? {
             contract.components.extend(components);
         }

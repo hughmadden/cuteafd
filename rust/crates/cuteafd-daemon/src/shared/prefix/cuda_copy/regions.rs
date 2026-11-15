@@ -88,6 +88,41 @@ mod tests {
     }
 
     #[test]
+    fn deepseek_v41_tail14_host_segments_keep_canonical_order_and_real_devices() -> Result<()> {
+        use cuteafd_loader::placement::families::deepseek_v41::EncoderPlacement;
+        let map = EncoderPlacement::Tail14.resolve(2)?;
+        // Four canonical source records, four physical planes in each. The
+        // registered source-14 pointers really belong to device 1. Address
+        // sorting may never be used as source or device ownership.
+        let mut buffers = Vec::new();
+        for (source, gpu) in map.sources().into_iter().enumerate() {
+            for (plane, bytes) in [64 * 256, 4 * 256, 256 * 256, 32 * 256].into_iter().enumerate() {
+                buffers.push(buffer(0x100000 + ((3 - source) * 4 + plane) as u64 * 0x20000, bytes, gpu as i32));
+            }
+        }
+        let regions = Regions::new(&buffers)?;
+        let mut offset = 0;
+        let mut routed = Vec::new();
+        for segment in &buffers {
+            regions.route(HostRange { chunk: 0, offset, bytes: segment.bytes },
+                DeviceRange { addr: segment.ptr as u64, bytes: segment.bytes }, &mut routed)?;
+            offset += segment.bytes;
+        }
+        assert_eq!(routed.len(), buffers.len());
+        let mut offset = 0;
+        for ((rank, host, device), segment) in routed.iter().zip(&buffers) {
+            assert_eq!(regions.devices[*rank], segment.device_id);
+            assert_eq!(device.device_id, map.sources()[offset / (256 * 356)] as i32);
+            assert_eq!(device.ptr, segment.ptr);
+            assert_eq!(host.offset, offset);
+            offset += segment.bytes;
+        }
+        assert_eq!(offset, 4 * 256 * 356);
+        assert!(routed[8..].iter().all(|(_, _, device)| device.device_id == 1));
+        Ok(())
+    }
+
+    #[test]
     fn gaps_overflow_and_overlapping_registrations_are_rejected() -> Result<()> {
         assert!(Regions::new(&[buffer(1024, 1024, 0), buffer(1536, 1024, 1)]).is_err());
         let regions = Regions::new(&[buffer(1024, 512, 0), buffer(2048, 512, 1)])?;

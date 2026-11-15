@@ -10,6 +10,13 @@ use cuteafd_transport::ExpertV2SourceKind;
 use std::cell::RefCell;
 
 impl<'w, 'a> DistributedTargetPass<'w, 'a> {
+    /// Drain this worker thread's existing test-only unit-window observations.
+    #[cfg(test)]
+    pub(crate) fn take_test_unit_windows() -> Vec<(crate::shared::memory::row_window::RowWindow,
+        Option<crate::shared::memory::row_window::RowWindow>)> {
+        UNIT_WINDOWS.with(|seen| std::mem::take(&mut *seen.borrow_mut()))
+    }
+
     /// The per-layer preparation `execute_inner` runs before the FFN, for a
     /// reserved encoder unit: the lane advance (with its block hop), Engram at
     /// layers 1 and 14, cache production and the attention, finished.
@@ -446,6 +453,146 @@ impl<'w, 'a> DistributedTargetPass<'w, 'a> {
         // Non-unit work (replay, continuation, scoring) runs at rows from 0.
         // Here a refusal is loud; error and cancel exits reset in `Drop`.
         for slot in &mut hooks.slots { slot.select_window(crate::shared::memory::row_window::RowWindow::NONE)?; }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod placement_tests {
+    use super::*;
+    use crate::shared::prefill_pipeline::{prefill_schedule, sequence_units, Step};
+    use cuteafd_loader::placement::families::deepseek_v41::EncoderPlacement;
+
+    /// CPU enqueue/cut contract, paired with the loader's
+    /// `tail14_sm89_c16_admitted_cut_keeps_local_source_consumers` fixture
+    /// (48 GiB/card, C16, fixed 2M pool). This runs the shared async executor
+    /// with CPU hooks, not native kernels. Real CUDA ordering, visibility,
+    /// races, exact restores, physical tier capacity and speed remain GPU gates.
+    #[test]
+    fn tail14_cpu_three_unit_cut_orders_consumers_and_all_row_source20() -> Result<()> {
+        use cuteafd_loader::placement::{plan_hops, HopPoint, HopStorage};
+        struct CutHooks {
+            map: cuteafd_loader::placement::families::deepseek_v41::CachePlacement,
+            slots: [Option<usize>; 3],
+            finished: Vec<[bool; 20]>,
+            crossed: Vec<bool>,
+            source14: Vec<bool>,
+            source20_rows: Vec<usize>,
+            committed: Vec<usize>,
+        }
+        impl AsyncPrefillHooks for CutHooks {
+            type Ticket = (usize, usize);
+            fn route(&self, _: usize) -> FfnRoute { FfnRoute::Spark }
+            async fn begin_unit(&mut self, unit: &Unit) -> Result<()> {
+                assert!(self.slots[unit.slot].replace(unit.index).is_none());
+                Ok(())
+            }
+            async fn attention(&mut self, layer: usize, unit: &Unit) -> Result<()> {
+                assert_eq!(self.slots[unit.slot], Some(unit.index));
+                if layer > 0 { assert!(self.finished[unit.index][layer - 1]); }
+                if layer == 14 {
+                    // The completed 13 output must cross before gate14,
+                    // source14 and its local attention consumers enqueue.
+                    assert_eq!((self.map.attention(13)?, self.map.attention(14)?), (0, 1));
+                    self.crossed[unit.index] = true;
+                    if unit.index > 0 { assert!(self.source14[unit.index - 1]); }
+                    assert_eq!(self.map.sources()[2], self.map.attention(layer)?);
+                    self.source14[unit.index] = true;
+                }
+                if (14..20).contains(&layer) {
+                    assert!(self.crossed[unit.index] && self.source14[unit.index]);
+                    assert_eq!(self.map.attention(layer)?, 1);
+                }
+                Ok(())
+            }
+            async fn local_ffn(&mut self, _: usize, _: &Unit) -> Result<()> {
+                anyhow::bail!("CPU cut fixture expects routed expert waves")
+            }
+            async fn send_experts(&mut self, layer: usize, unit: &Unit) -> Result<Self::Ticket> {
+                Ok((layer, unit.index))
+            }
+            async fn land_experts(&mut self, layer: usize, unit: &Unit, ticket: Self::Ticket) -> Result<()> {
+                assert_eq!(ticket, (layer, unit.index));
+                self.finished[unit.index][layer] = true;
+                Ok(())
+            }
+            async fn end_unit(&mut self, unit: &Unit) -> Result<()> {
+                assert!(self.finished[unit.index][19]);
+                assert_eq!((self.map.attention(19)?, self.map.attention(20)?), (1, 1));
+                // Model the full encoder source publication, not the retained
+                // 128-row decoder suffix. No second residual hop at 19->20.
+                self.source20_rows[unit.index] = unit.rows.len();
+                Ok(())
+            }
+            async fn commit_unit(&mut self, unit: &Unit) -> Result<()> {
+                assert_eq!(self.source20_rows[unit.index], unit.rows.len());
+                assert_eq!(unit.index, self.committed.len());
+                self.committed.push(unit.index);
+                assert_eq!(self.slots[unit.slot].take(), Some(unit.index));
+                Ok(())
+            }
+        }
+        let map = EncoderPlacement::Tail14.resolve(2)?;
+        let spec = cuteafd_loader::placement::families::deepseek_v41::execution_hops(2);
+        let hops = plan_hops(&map.modes(), &spec)?;
+        assert_eq!(spec.storage, HopStorage::DirectInput);
+        assert_eq!(hops.len(), 1);
+        assert_eq!((hops[0].at, hops[0].from, hops[0].to), (HopPoint::BeforeLayer(14), 0, 1));
+        let units = sequence_units(6 * 2752 + 129, 2752, 3, 20)?;
+        let mut hooks = CutHooks { map, slots: [None; 3], finished: vec![[false; 20]; units.len()],
+            crossed: vec![false; units.len()], source14: vec![false; units.len()],
+            source20_rows: vec![0; units.len()], committed: Vec::new() };
+        tokio::runtime::Builder::new_current_thread().build()?.block_on(
+            run_prefill_units_async(&mut hooks, &units, 3))?;
+        assert!(hooks.crossed.iter().all(|&crossed| crossed));
+        assert!(hooks.slots.iter().all(Option::is_none));
+        assert_eq!(hooks.source20_rows, vec![2752, 2752, 2752, 2752, 2752, 2752, 129]);
+        assert_eq!(hooks.committed, (0..units.len()).collect::<Vec<_>>());
+        Ok(())
+    }
+
+    /// Exercise the shared executor's causal/FIFO schedule with three physical
+    /// slots, their reuse and an odd tail. This checks enqueue dependencies;
+    /// GPU event completion and payload lifetime require the native fixture.
+    #[test]
+    fn tail14_three_unit_schedule_retains_one_crossing_and_source20_frontier() -> Result<()> {
+        let map = EncoderPlacement::Tail14.resolve(2)?;
+        let units = sequence_units(6 * 2752 + 129, 2752, 3, 20)?;
+        let schedule = prefill_schedule(&[FfnRoute::Spark; 20], &units, 3)?;
+        let mut publication = vec![[false; 20]; units.len()];
+        let mut finished = vec![[false; 20]; units.len()];
+        let mut fifo = std::collections::VecDeque::new();
+        let mut hops = Vec::new();
+        let mut ended = Vec::new();
+        for step in schedule {
+            match step {
+                Step::Attention { layer, unit } => {
+                    if unit > 0 { assert!(publication[unit - 1][layer]); }
+                    if layer > 0 { assert!(finished[unit][layer - 1]); }
+                    if layer > 0 && map.attention(layer - 1)? != map.attention(layer)? {
+                        assert_eq!(layer, 14);
+                        hops.push((unit, units[unit].slot, units[unit].rows.len() * 40976));
+                    }
+                    publication[unit][layer] = true;
+                }
+                Step::Send { layer, unit } => fifo.push_back((layer, unit)),
+                Step::Land { layer, unit } => {
+                    assert_eq!(fifo.pop_front(), Some((layer, unit)));
+                    finished[unit][layer] = true;
+                }
+                Step::End { unit } => {
+                    assert!(finished[unit][19]);
+                    assert_eq!(map.attention(19)?, map.attention(20)?);
+                    ended.push(unit); // source20 must be produced before commit
+                }
+                Step::Commit { unit } => assert_eq!(ended.last(), Some(&unit)),
+                _ => {}
+            }
+        }
+        assert_eq!(hops.len(), units.len());
+        assert_eq!(hops.last().unwrap().2, 129 * 40976);
+        assert!(fifo.is_empty());
+        assert_eq!(ended, (0..units.len()).collect::<Vec<_>>());
         Ok(())
     }
 }
