@@ -723,7 +723,7 @@ def test_raptor_pool_is_the_unchanged_default():
     ('juliet', 'spark7,unknown', 'not a pool Spark'),
     ('juliet', 'spark7,spark7', 'repeats'),
     *[(pool, host, 'refused') for pool in ('raptor', 'juliet') for host in golden.REFUSED_HOSTS],
-    *[('juliet', host, 'not a pool Spark') for host in ('pg', 'romeo', 'juliet', 'spark1', 'spark4', 'spark5', 'spark6')],
+    *[('juliet', host, 'not a pool Spark') for host in ('pg', 'romeo', 'juliet', 'spark1', 'spark4')],
 ])
 def test_spark_pool_host_refusals_before_any_launch(spark_env, capsys, pool, hosts, match):
     assert golden.main(spark_argv(spark_env, '--spark-pool', pool, hosts=hosts)) == 2
@@ -732,11 +732,41 @@ def test_spark_pool_host_refusals_before_any_launch(spark_env, capsys, pool, hos
     assert not any(spark_env['locks'].iterdir())
 
 
-@pytest.mark.parametrize('pool', ['raptor', 'juliet'])
-def test_explicit_spark_pool_requires_hosts(env, capsys, pool):
-    assert golden.main(BASE + ['--arm', 'a=i1:s1', '--spark-pool', pool] + GOLDEN) == 2
+def test_raptor_pool_still_requires_explicit_hosts(env, capsys):
+    assert golden.main(BASE + ['--arm', 'a=i1:s1', '--spark-pool', 'raptor'] + GOLDEN) == 2
     assert '--spark-pool needs --spark-hosts' in capsys.readouterr().err
     assert not docker_calls(env) and not any(env['locks'].iterdir())
+
+
+def test_juliet_default_hosts_are_5_through_8_and_9_10_are_explicit_only():
+    from types import SimpleNamespace
+    default = SimpleNamespace(spark_hosts=None, spark_pool='juliet')
+    assert golden.spark_hosts_from_args(default) == 'spark5,spark6,spark7,spark8'
+    explicit = SimpleNamespace(spark_hosts='spark9,spark10', spark_pool='juliet')
+    assert golden.spark_hosts_from_args(explicit) == 'spark9,spark10'
+    assert golden.parse_hosts('spark5,spark6,spark7,spark8', 'juliet') == ['spark5', 'spark6', 'spark7', 'spark8']
+    assert golden.parse_hosts('spark9,spark10', 'juliet') == ['spark9', 'spark10']
+
+
+def test_juliet_pool_defaults_to_project_hosts_5_8(spark_env, monkeypatch):
+    hosts = ['spark5', 'spark6', 'spark7', 'spark8']
+    lanes = ['10.0.120.228', '10.0.120.158', '10.0.120.43', '10.0.120.121']
+    spark_env['config'].write_text(''.join(
+        f'SPARK_{i}_HOST={host}\nSPARK_{i}_LANE_A={lane}\n' for i, (host, lane) in enumerate(zip(hosts, lanes))))
+    monkeypatch.setenv('STUB_RUN_OUTPUT', PASSED)
+    test = spark_env['tmp'] / 'chain-test'
+    test.write_text('#!/bin/sh\n'); test.chmod(0o755)
+    argv = SPARK_BASE + ['--model', 'org/model', '--arm', 'a=i1:s1', '--gpus', '1',
+                         '--config', str(spark_env['config']), '--spark-pool', 'juliet',
+                         '--expert-layers', '3', '--worker-poll', '0.05',
+                         '--native-test', str(test), '--',
+                         'families::step5::chain::tests::native_step5_layer_chain', '--exact', '--ignored']
+    assert golden.main(argv) == 0
+    root = spark_env['home'] / '.cache/cuteafd/builds/gr/golden'
+    plan = json.loads((root / 'plan.json').read_text())
+    assert plan['sparks']['hosts'] == hosts
+    assert [host for host, command in ssh_calls(spark_env) if 'expertd-native' in command] == hosts
+    assert all('spark9' not in host and 'spark10' not in host for host in plan['sparks']['hosts'])
 
 
 def test_juliet_pool_uses_config_lanes_and_canonical_locks(spark_env, monkeypatch):
