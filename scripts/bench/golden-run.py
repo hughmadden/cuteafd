@@ -8,6 +8,7 @@ on raptor's RTX GPUs, optionally against real expert workers on Sparks.
       [--timeout SECONDS] [--preflight CMD] [--compare-logits A:B] \\
       [--native-test TEST_EXECUTABLE | --command] [--fixtures DIR [--fixtures-writable]] [--mount PATH] [--rdma] \\
       [--spark-hosts H1,H2,... [--spark-pool raptor|juliet] [--expert-layers 3,5-7] [--worker-env KEY=VALUE] [--arm-worker-env A:KEY=VALUE] [--worker-arg ARG]] \\
+      (juliet pool default hosts: spark5,spark6,spark7,spark8; spark9/10 only when named) \\
       -- ARGS...
 
 Each arm runs its slot's `cuteafd`, `libcuteafd_native.so`, `PROGRAMS.json` and expert
@@ -134,8 +135,12 @@ REFUSED_HOSTS = {
 }
 # Which hardware lock covers a Spark (scripts/hw/hwlock.py order; as `cuteafd bench smoke`).
 HOST_LOCKS = {'ostrich': 'sparks', 'dodo': 'sparks', 'emu': 'sparks', 'kiwi': 'sparks', 'rhea': 'rhea', 'moa': 'moa'}
+# Juliet's project default is sparks 5-8.  Sparks 9-10 stay out of the automatic
+# default and are admitted only when a project explicitly names them.
+JULIET_DEFAULT_HOSTS = ('spark5', 'spark6', 'spark7', 'spark8')
+JULIET_OPTIONAL_HOSTS = ('spark9', 'spark10')
 SPARK_POOLS = {'raptor': HOST_LOCKS,
-               'juliet': {f'spark{i}': 'sparks' for i in range(7, 11)}}
+               'juliet': {host: 'sparks' for host in JULIET_DEFAULT_HOSTS + JULIET_OPTIONAL_HOSTS}}
 WORKER_READY = 'native worker bootstrap ready'
 WORKER_LABEL = 'cuteafd.golden-run'
 DEFAULT_EXPERT_PORT = 19451  # beside serving's 19441, so a stray serving worker is detected, not reused
@@ -283,6 +288,15 @@ def worker_name(task, arm, rank):
 
 
 # --------------------------------------------------------------------------- Spark workers
+
+def spark_hosts_from_args(args):
+    """Explicit --spark-hosts wins; Juliet alone has the project default 5-8."""
+    if args.spark_hosts:
+        return args.spark_hosts
+    if args.spark_pool == 'juliet':
+        return ','.join(JULIET_DEFAULT_HOSTS)
+    return None
+
 
 def parse_hosts(value, pool='raptor'):
     host_locks = SPARK_POOLS[pool]
@@ -1388,7 +1402,7 @@ def resolve_fixtures(args, task_root):
         raise ValueError('--fixtures takes an absolute directory')
     path = path.resolve()
     if args.fixtures_writable:
-        if args.spark_hosts:
+        if spark_hosts_from_args(args):
             raise ValueError('fixture generation runs GPU-only: drop --spark-hosts (the Sparks would idle)')
         if not path.is_relative_to(task_root) or path.is_relative_to(task_root / 'golden') or path == task_root:
             raise ValueError(f'--fixtures-writable directory must be under {task_root}/ and outside golden/')
@@ -1404,15 +1418,16 @@ def resolve_fixtures(args, task_root):
 def build_state(args, arms):
     if args.worker_budget_bytes <= 0:
         raise ValueError('--worker-budget-bytes must be positive bytes (device budget)')
-    if args.spark_pool is not None and not args.spark_hosts:
+    spark_hosts = spark_hosts_from_args(args)
+    if args.spark_pool is not None and not spark_hosts:
         raise ValueError('--spark-pool needs --spark-hosts')
     pool = args.spark_pool or 'raptor'
     task_root = Path.home() / '.cache/cuteafd/builds' / args.task
     snapshot, container_path, extra = resolve_model(args.model)
     hub = hub_root()
     sparks = None
-    if args.spark_hosts:
-        hosts = parse_hosts(args.spark_hosts, pool)
+    if spark_hosts:
+        hosts = parse_hosts(spark_hosts, pool)
         if args.worker_ready_timeout < 1:
             raise ValueError('--worker-ready-timeout must be positive seconds')
         if not 1 <= args.expert_port <= 65535:
