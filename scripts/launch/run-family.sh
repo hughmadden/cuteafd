@@ -840,7 +840,7 @@ release_coordinator_arch_args "$gpu_uuid_csv" v41_arch_args
 v41_weight_budget_gib="$(release_gib "$profile_cap")"
 count_plan="$(docker run --rm --network none "${count_mounts[@]}" "$COORDINATOR_DOCKER_INFERENCE" \
   "${count_command[@]}" plan "$(readlink -f "$hf_home/$snapshot_rel")" --vision "$VISION" --audio off \
-  --deployment "${readiness_args[@]}" "${count_args[@]}" ${v41_arch_args[@]+"${v41_arch_args[@]}"} --rtx "$RELEASE_RTX_GPUS" \
+  --layout --deployment "${readiness_args[@]}" "${count_args[@]}" ${v41_arch_args[@]+"${v41_arch_args[@]}"} --rtx "$RELEASE_RTX_GPUS" \
   "${plan_memory_args[@]}" --gpu-memory-cap "$profile_cap" --coordinator-weight-budget-gib "$v41_weight_budget_gib" \
   --pool-tokens "$count_pool" --prefill-rows "$count_prefill" --max-context-tokens "$MAX_CONTEXT_TOKENS" \
   --concurrency "$CONCURRENCY" --prefix-cache-entries "$PREFIX_CACHE_ENTRIES" --host-cache-bytes "$HOST_CACHE_BYTES")"

@@ -170,6 +170,7 @@ def test_shared_launcher_matches_the_private_v41_path(case: str, tmp_root) -> No
                                              str(int(float(expected[cap_index + 1]) * 2**30))]
         expected[expected.index("--max-context-tokens") + 1] = "auto"
         expected.insert(expected.index("--require-ready"), "--deployment")
+        expected.insert(expected.index("--deployment"), "--layout")
         if case in KIT_CARDS:
             expected.remove("--require-ready")
         coordinator = parse_run(golden["containers"][0]["argv"])
@@ -821,6 +822,8 @@ def test_v41_encoder_placement_reaches_plan_serve_and_identity(tmp_root, monkeyp
     monkeypatch.setattr(capture_module, "example_config", with_key)
     result = capture_module.capture(ROOT, "deepseek-v41-mxfp4-max")
     plan = result["plans"][0]
+    assert plan.count("--layout") == 1
+    assert plan[plan.index("--layout") + 1] == "--deployment"
     coordinator = result["containers"][0]["argv"]
     flag = "--v41-encoder-placement"
     if value == "tail14":
