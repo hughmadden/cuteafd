@@ -150,12 +150,17 @@ impl PreparedV41<'_> {
         // are additional backing/runtime bytes, outside the sampled base,
         // named arena tails, KV and the unchanged graph reserve. Price them
         // before optional residency: an exact pool cannot pay them at adoption.
+        // A5 (def511, tail14/C16) measured 319,960,814 / 387,393,726 B:
+        // Only GPU1 exceeded its forecast, by 20,389,108 B; add 32 MiB
+        // there, leaving 13,165,324 B above A5 for 2 MiB driver-backing
+        // units and run variance without spending release padding. GPU0 stays
+        // at 347,517,986 B: its prior high-water already exceeds A5.
         // Measurement replaces this forecast; it never subtracts it as an
         // already-created owner. Other architectures keep their own inventory.
         if self.coordinator_arch == cuteafd_core::GpuArch::Sm89 && self.recipe.gpus == 2
             && !whole_gpu_reserve()
         {
-            for (rank, bytes) in [347_517_986, 367_004_618].into_iter().enumerate() {
+            for (rank, bytes) in [347_517_986, 400_559_050].into_iter().enumerate() {
                 self.recipe.opaques.push(Opaque {
                     location: Location::coordinator(rank as u8), bytes,
                     basis: Basis::Calibrated,
@@ -583,6 +588,202 @@ mod tests {
             budget.logical_bytes = (8 << 30) + MIB;
         }
         assert!(tight.admit_with_tier(request(None, Onboard::Auto), &choice).is_err());
+    }
+
+    #[test]
+    fn a5_tail14_exact_pool_survives_measured_prepool_adoption() -> anyhow::Result<()> {
+        use super::super::super::{CachePlacement, EncoderPlacement};
+        use crate::placement::{ExpertHome, LayerExecutionPlan};
+        use cuteafd_core::{GpuArch, memory_policy::MemoryPolicy};
+        MemoryPolicy::default().scoped(|| {
+            let config = config();
+            let directory = tempfile::tempdir()?;
+            let choice = a5_profile_choice(directory.path())?;
+            let (prepared, request) = a5_prepool_fixture(&config, GpuArch::Sm89, EncoderPlacement::Tail14, &choice)?;
+            assert_eq!(prepared.recipe.concurrency, 16);
+            assert_eq!(prepared.recipe.tails, 16 + 2 * 20);
+            let mut admitted = prepared.admit_with_tier(request, &choice)?;
+            let tier = admitted.placement.expert_tier.clone().unwrap();
+            eprintln!("A5 SM89 Tail14 AUTO experts={}", tier.experts);
+            let weights = serde_json::to_value(&admitted.solved.facts.resident_weights)?;
+            assert_eq!(admitted.solved.request.context.maximum, 1_048_576);
+            assert_eq!(admitted.solved.request.pool, Pin::Exact(2_097_152));
+            assert_eq!(admitted.solved.decisions.prefill, PrefillShape { rows: 2752, waves: 3 });
+            assert_eq!(admitted.solved.decisions.attention, EncoderPlacement::Tail14.resolve(2)?.modes());
+            let execution = LayerExecutionPlan::new(&admitted.placement, super::super::super::execution_hops(2))?;
+            let map = CachePlacement::from_execution_plan(&execution)?;
+            assert_eq!(map, EncoderPlacement::Tail14.resolve(2)?);
+            assert_eq!((map.attention(13)?, map.attention(14)?), (0, 1));
+            assert_eq!(execution.attention_owners(13)?, vec![0]);
+            assert_eq!(execution.attention_owners(14)?, vec![1]);
+            assert!(admitted.placement.layers.iter().all(|layer| layer.experts == ExpertHome::Spark));
+            assert_eq!(admitted.spark.spark_layers, (0..40).collect::<Vec<_>>());
+            assert_eq!(tier.source, crate::placement::ExpertTierSource::Profile);
+            assert_eq!(admitted.placement.pool_tokens, 2_097_152);
+            assert_eq!(admitted.solved.pool_tokens, 2_097_152);
+            let adopted = adopt_measured_with_placement(&config, 2, 16, 20, false, 2_097_152,
+                &mut admitted.solved, &[
+                    MeasuredOccupancy { gpu: 0, backing: 96_620_164, unattributed: 223_340_650 },
+                    MeasuredOccupancy { gpu: 1, backing: 225_540_192, unattributed: 161_853_534 },
+                ], EncoderPlacement::Tail14)
+                .expect("A5 measured owners must fit without shrinking the exact 2M pool");
+            assert_eq!(adopted.pages * 512, 2_097_152);
+            assert_eq!(adopted.groups, 4096 + 16 + 2 * 20);
+            assert_eq!(admitted.solved.pool_tokens, 2_097_152);
+            assert_eq!(admitted.placement.expert_tier.as_ref().unwrap(), &tier);
+            assert_eq!(serde_json::to_value(&admitted.solved.facts.resident_weights)?, weights);
+            assert!(admitted.solved.facts.allowances.iter().all(|owner| !owner.source.starts_with(PRE_POOL_FORECAST)));
+            for (gpu, bytes) in [319_960_814, 387_393_726].into_iter().enumerate() {
+                assert_eq!(admitted.solved.facts.allocations.iter()
+                    .filter(|owner| owner.id.starts_with(&format!("v41.measured.{gpu}.")))
+                    .map(|owner| owner.bytes).sum::<u64>(), bytes);
+            }
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn a5_prepool_legacy_veto_ced_and_sm120_controls() -> anyhow::Result<()> {
+        use super::super::super::{CachePlacement, EncoderPlacement};
+        use crate::placement::{ExpertHome, LayerExecutionPlan};
+        use cuteafd_core::{GpuArch, memory_policy::MemoryPolicy};
+        MemoryPolicy::default().scoped(|| {
+            let config = config();
+            let directory = tempfile::tempdir()?;
+            let choice = a5_profile_choice(directory.path())?;
+            let synthetic_legacy_veto = || -> anyhow::Result<AdmittedV41> {
+                // Synthetic frozen-d4e4 veto control only: SM120 skips the
+                // automatic SM89 forecast so we can install the old values.
+                // This is not a matched architecture before/after comparison.
+                let (mut prepared, request) = a5_prepool_fixture(&config, GpuArch::Sm120, EncoderPlacement::Tail14, &choice)?;
+                for (rank, bytes) in [347_517_986, 367_004_618].into_iter().enumerate() {
+                    prepared.recipe.opaques.push(Opaque { location: Location::coordinator(rank as u8), bytes,
+                        basis: Basis::Calibrated, lifetime: Lifetime { first: Phase::Ready, last: Phase::Growth },
+                        source: format!("{PRE_POOL_FORECAST} synthetic A5 frozen d4e4 GPU{rank}") });
+                }
+                Ok(prepared.admit_with_tier(request, &choice)?)
+            };
+            let measured = [
+                MeasuredOccupancy { gpu: 0, backing: 96_620_164, unattributed: 223_340_650 },
+                MeasuredOccupancy { gpu: 1, backing: 225_540_192, unattributed: 161_853_534 },
+            ];
+            let mut old = synthetic_legacy_veto()?;
+            eprintln!("synthetic frozen-d4e4 Tail14 AUTO experts={}", old.placement.expert_tier.as_ref().unwrap().experts);
+            let ready = old.solved.phases.iter().find(|p| p.budget == "rtx1" && p.phase == Phase::Ready).unwrap();
+            assert_eq!(ready.available - ready.owned - ready.opaque, 2_945_764);
+            assert!(matches!(adopt_measured_with_placement(&config, 2, 16, 20, false, 2_097_152,
+                &mut old.solved, &measured, EncoderPlacement::Tail14),
+                Err(Refusal::Capacity { required: 50_863_155_728, available: 50_845_712_384, .. })));
+
+            let (prepared, request) = a5_prepool_fixture(&config, GpuArch::Sm120, EncoderPlacement::Tail14, &choice)?;
+            let other_arch = prepared.admit_with_tier(request, &choice)?;
+            assert!(other_arch.solved.facts.allowances.iter().all(|owner| !owner.source.starts_with(PRE_POOL_FORECAST)));
+            eprintln!("A5 SM120 Tail14 AUTO experts={}", other_arch.placement.expert_tier.as_ref().unwrap().experts);
+            assert_eq!(other_arch.placement.pool_tokens, 2_097_152);
+
+            let (prepared, request) = a5_prepool_fixture(&config, GpuArch::Sm89, EncoderPlacement::Ced, &choice)?;
+            assert_eq!(prepared.recipe.concurrency, 16);
+            assert_eq!(prepared.recipe.tails, 16 + 2 * 20);
+            let mut ced = prepared.admit_with_tier(request, &choice)?;
+            let tier = ced.placement.expert_tier.clone().unwrap();
+            eprintln!("A5 SM89 CED AUTO experts={}", tier.experts);
+            let weights = serde_json::to_value(&ced.solved.facts.resident_weights)?;
+            assert_eq!(ced.solved.request.context.maximum, 1_048_576);
+            assert_eq!(ced.solved.request.pool, Pin::Exact(2_097_152));
+            assert_eq!(ced.solved.decisions.prefill, PrefillShape { rows: 2752, waves: 3 });
+            assert_eq!(ced.solved.decisions.attention, EncoderPlacement::Ced.resolve(2)?.modes());
+            let execution = LayerExecutionPlan::new(&ced.placement, super::super::super::execution_hops(2))?;
+            let map = CachePlacement::from_execution_plan(&execution)?;
+            assert_eq!(map, EncoderPlacement::Ced.resolve(2)?);
+            assert_eq!((map.attention(19)?, map.attention(20)?), (0, 1));
+            assert_eq!(execution.attention_owners(14)?, vec![0]);
+            assert_eq!(execution.attention_owners(19)?, vec![0]);
+            assert_eq!(execution.attention_owners(20)?, vec![1]);
+            assert!(ced.placement.layers.iter().all(|layer| layer.experts == ExpertHome::Spark));
+            assert_eq!(ced.spark.spark_layers, (0..40).collect::<Vec<_>>());
+            assert_eq!(tier.source, crate::placement::ExpertTierSource::Profile);
+            assert_eq!(ced.placement.pool_tokens, 2_097_152);
+            assert_eq!(ced.solved.pool_tokens, 2_097_152);
+            // Stress CED with A5's tail14 measurement, not a CED census.
+            let adopted = adopt_measured_with_placement(&config, 2, 16, 20, false, 2_097_152,
+                &mut ced.solved, &measured, EncoderPlacement::Ced)?;
+            assert_eq!(adopted.pages * 512, 2_097_152);
+            assert_eq!(adopted.groups, 4096 + 16 + 2 * 20);
+            assert_eq!(ced.solved.pool_tokens, 2_097_152);
+            assert_eq!(ced.placement.expert_tier.as_ref().unwrap(), &tier);
+            assert_eq!(serde_json::to_value(&ced.solved.facts.resident_weights)?, weights);
+            assert!(ced.solved.facts.allowances.iter().all(|owner| !owner.source.starts_with(PRE_POOL_FORECAST)));
+            for (gpu, bytes) in [319_960_814, 387_393_726].into_iter().enumerate() {
+                assert_eq!(ced.solved.facts.allocations.iter()
+                    .filter(|owner| owner.id.starts_with(&format!("v41.measured.{gpu}.")))
+                    .map(|owner| owner.bytes).sum::<u64>(), bytes);
+            }
+            Ok(())
+        })
+    }
+
+    fn a5_profile_choice(directory: &std::path::Path) -> anyhow::Result<TierChoice> {
+        let profile = directory.join("routes.json");
+        std::fs::write(&profile, serde_json::to_vec(&serde_json::json!({
+            "layers": vec![vec![1u64; 384]; 40],
+        }))?)?;
+        Ok(TierChoice { setting: ExpertTierSetting::Auto, profile: Some(profile), ..Default::default() })
+    }
+
+    // Strict A5 geometry with synthetic fixed owners (including the unchanged
+    // decode2/boundaries1 inventory), not a native inventory
+    // or a claim to replay the deployment's route profile. Freeze GPU1's
+    // synthetic veto boundary independently of the production forecast: tier 3100
+    // (28,306,918,400 B/rank), 2,945,764 B pre-adoption slack, then a
+    // 20,389,108 B forecast shortfall -> 17,443,344 B measured veto.
+    fn a5_prepool_fixture<'a>(config: &'a serde_json::Value, arch: cuteafd_core::GpuArch,
+        placement: super::super::super::EncoderPlacement, choice: &TierChoice)
+        -> anyhow::Result<(PreparedV41<'a>, Request)> {
+        use super::super::super::EncoderPlacement;
+        let prefill = PrefillShape { rows: 2752, waves: 3 };
+        let mut fixture = input(config, false);
+        fixture.coordinator_arch = arch;
+        fixture.encoder_placement = EncoderPlacement::Tail14;
+        fixture.context = 1_048_576;
+        fixture.maximum_pool_tokens = 2_097_152;
+        fixture.prefill = prefill;
+        fixture.concurrency = 16;
+        fixture.retained_turns = 20;
+        fixture.resident_weight_limit = u64::MAX;
+        for expert in &mut fixture.experts {
+            expert.whole.resident = 384 * 9_131_264 * 2;
+            for half in &mut expert.half { half.resident = 384 * 9_131_264; }
+        }
+        fixture.budgets = production_budgets(&[(CARD, CARD); 2], 100 * MIB, None, 0, &[128 << 30; 4])?;
+        // Model the sampled base separately from the unchanged 100 MiB pad.
+        for budget in fixture.budgets.iter_mut().filter(|b| b.id.starts_with("rtx")) {
+            budget.baseline = Baseline::Forecast { occupied: CARD - 100 * MIB - 50_845_712_384,
+                assumed: false, source: "A5 boundary fixture sampled base".into() };
+            assert_eq!(budget.available()?, 50_845_712_384);
+        }
+        let mut prepared = fixture.prepare()?;
+        prepared.minimum = 0;
+        prepared.recipe.counts = vec![0];
+        let request = production_request(1_048_576u64, Some(2_097_152), Onboard::Auto, prefill,
+            Operation::Serving, u64::MAX, Default::default());
+        let inputs = choice.inputs(40, 384, 6)?.unwrap();
+        let costs = TierCosts::new(&prepared, choice.request(&inputs, &prepared.recipe.layers, 384, 0)?)?;
+        let contract = prepared.recipe.prepare(&request)?;
+        // No production forecast is installed for this reference solve.
+        let (reference, _) = solve_residency(request.clone(), prepared.budgets.clone(),
+            ResidencyRange { minimum: 3100, maximum: 3100, exact: Some(3100) }, |_, count| {
+                let mut candidate = contract.clone();
+                candidate.components.extend(costs.owners(count, candidate.maximum_pages)?);
+                Ok(candidate)
+            })?;
+        let ready = reference.phases.iter().find(|p| p.budget == "rtx1" && p.phase == Phase::Ready).unwrap();
+        let fixed = 50_845_712_384 - 367_004_618 - 2_945_764 - ready.owned - ready.opaque;
+        prepared.recipe.owners.push(Case { when: Vec::new(), value: owner_components("a5.fixed",
+            &[Owner::charged(1, Category::Workspace, "A5 fixture fixed pre-pool owners", fixed)],
+            prepared.recipe.maximum_pages)? });
+        prepared.recipe.encoder_placement = placement;
+        prepared.recipe.attention = placement.resolve(2)?.modes();
+        Ok((prepared, request))
     }
 
     #[test]
