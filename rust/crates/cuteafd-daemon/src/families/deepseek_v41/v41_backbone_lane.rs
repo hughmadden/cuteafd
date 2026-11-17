@@ -792,6 +792,9 @@ pub(crate) struct BackboneLane<'w, 'a> {
 }
 
 impl<'w, 'a> BackboneLane<'w, 'a> {
+    #[cfg(test)]
+    pub(crate) fn test_backed_row_capacity(&self) -> usize { self.capacity }
+
     pub(crate) fn visit_graph_banks(&mut self, f: &mut dyn FnMut(i32, &'static str, bool, &mut dyn crate::shared::decode_graph::CacheAttached) -> Result<()>) -> Result<()> {
         if let Some(graphs) = &mut self.tp2_ffn_graphs {
             f(graphs.device.id, "tp2_ffn", true, &mut graphs.bank)?;
@@ -1123,7 +1126,7 @@ impl<'w, 'a> BackboneLane<'w, 'a> {
         let library = self.weights.library;
         let read = |output: &AttentionQueryOutput<'_>| -> Result<Vec<Vec<u8>>> {
             [output.hidden, output.raw_rank, output.normalized_rank,
-                output.projected, output.rotated, output.positions, output.frequencies]
+                output.projected()?, output.rotated, output.positions, output.frequencies]
                 .into_iter().map(|buffer| {
                     let mut bytes = vec![0; buffer.bytes];
                     library.copy_d2h(&mut bytes, buffer)?;

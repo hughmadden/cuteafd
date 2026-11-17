@@ -67,6 +67,7 @@ mod tests {
     #[test]
     #[ignore = "requires CUTEAFD_NATIVE_LIB, CUTEAFD_SNAPSHOT and two CUDA GPUs"]
     fn imported_block_state_matches_direct_query_and_cancellation_reuses_storage() -> Result<()> {
+        let _query_trace = crate::families::deepseek_v41::v41_attention_query::QueryTraceScope::enter();
         use std::{
             future::Future,
             sync::atomic::{AtomicBool, Ordering},
@@ -309,7 +310,7 @@ mod tests {
                         output.hidden,
                         output.raw_rank,
                         output.normalized_rank,
-                        output.projected,
+                        output.projected()?,
                         output.rotated,
                     ]
                     .into_iter()
@@ -339,7 +340,7 @@ mod tests {
                     placed_query.hidden,
                     placed_query.raw_rank,
                     placed_query.normalized_rank,
-                    placed_query.projected,
+                    placed_query.projected()?,
                     placed_query.rotated,
                 ]
                 .into_iter()

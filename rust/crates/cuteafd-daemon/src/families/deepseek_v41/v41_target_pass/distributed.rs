@@ -15,7 +15,7 @@ fn trace_query_component(query: &crate::families::deepseek_v41::v41_attention_qu
         "hidden" => (query.hidden, 10240),
         "raw_rank" => (query.raw_rank, 2560),
         "normalized_rank" => (query.normalized_rank, 2560),
-        "projected" | "qb_pair" => (query.projected, 65536),
+        "projected" | "qb_pair" => (query.projected()?, 65536),
         "rotated" => (query.rotated, 65536),
         _ => anyhow::bail!("unknown query trace component"),
     })
@@ -23,6 +23,11 @@ fn trace_query_component(query: &crate::families::deepseek_v41::v41_attention_qu
 
 
 pub(crate) type DistributedTargetPass<'w, 'a> = Pass<'a, PlacedResources<'w, 'a>>;
+
+#[cfg(test)]
+thread_local! {
+    static DECODE_GEOMETRY: std::cell::Cell<Option<[[usize; 2]; 2]>> = const { std::cell::Cell::new(None) };
+}
 
 pub(crate) struct PlacedResources<'w, 'a> {
     map: CachePlacement,
@@ -74,6 +79,18 @@ impl Drop for ReservedPassGuard<'_, '_, '_, '_, '_> {
     }
 }
 impl<'w, 'a> DistributedTargetPass<'w, 'a> {
+    /// Observe the two constructed decode owners, in pass then TP2-rank order.
+    #[cfg(test)]
+    pub(crate) fn record_test_decode_geometry(&self, second: &Self) {
+        let rows = |pass: &Self| std::array::from_fn(|rank|
+            pass.resources.lanes[rank].test_backed_row_capacity());
+        DECODE_GEOMETRY.with(|seen| seen.set(Some([rows(self), rows(second)])));
+    }
+    #[cfg(test)]
+    pub(crate) fn take_test_decode_geometry() -> Option<[[usize; 2]; 2]> {
+        DECODE_GEOMETRY.with(|seen| seen.take())
+    }
+
     pub(crate) fn visit_graph_banks(&mut self, f: &mut dyn FnMut(i32, &'static str, bool, &mut dyn crate::shared::decode_graph::CacheAttached) -> Result<()>) -> Result<()> {
         for lane in &mut self.resources.lanes { lane.get_mut().visit_graph_banks(f)?; }
         for index in self.resources.indices.iter_mut().flatten() { index.get_mut().visit_graph_banks(f)?; }
@@ -1139,6 +1156,9 @@ mod tests {
     // native assertions; bounded CPU cut/admission coverage lives in
     // encoder_units::placement_tests and the loader's SM89 C16 tier fixture.
     fn distributed_prefill_fixture(packed_check: bool) -> Result<()> {
+        // This numerical fixture also supports projected/qb_pair readback.
+        // Trace layout is selected explicitly here, independently of trace env.
+        let _query_trace = crate::families::deepseek_v41::v41_attention_query::QueryTraceScope::enter();
         use crate::families::deepseek_v41::v41_native_serve::prefill_target::PrefillTarget;
         use crate::families::deepseek_v41::v41_experts::dspark::{DsparkChain, DsparkWeights};
         let lib = unsafe { NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?)? };
