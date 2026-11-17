@@ -752,16 +752,22 @@ mod tests {
         let snapshot = std::env::var("CUTEAFD_SNAPSHOT")?;
         let native = std::env::var("CUTEAFD_NATIVE_LIB")?;
         let peers = std::env::var("CUTEAFD_DUAL_PEERS")?;
+        // Disable intermediate prefix points only to isolate full-prompt encoder
+        // geometry for this window-inventory fixture. Prompt-end/turn-end prefix
+        // caching remains active; this does not qualify the default intermediate-
+        // boundary or byte-cache behavior.
         let matches = crate::cli::NativeServeArgs::augment_args(clap::Command::new("fixture"))
             .try_get_matches_from(["fixture", "--snapshot", &snapshot, "--native-lib", &native,
                 "--peers", &peers, "--dspark", "--rtx-gpus", "2", "--v41-encoder-placement", "tail14",
                 "--prefill-batch-tokens", "2752", "--prefill-waves", "3", "--prefill-reserve-rows", "8192",
                 "--concurrency", "16", "--decode-lanes", "2", "--pool-tokens", "2097152",
                 "--max-context-tokens", "1048576", "--prefix-cache-entries", "128",
+                "--prefix-point-boundaries", "0",
                 "--gpu-expert-tier", "auto", "--rtx-expert-layers", "0"])?;
         let mut args = crate::cli::NativeServeArgs::from_arg_matches(&matches)?;
         ensure!(args.peers.len() == 4, "four live Spark peers serving an owned expert group are required");
         super::super::normalize_serving(&mut args)?;
+        assert_eq!(args.prefix.prefix_point_boundaries, 0);
         assert_eq!(super::super::PrefillShape::from_args(&args),
             super::super::PrefillShape { rows: 2752, waves: 3 });
         let shape = super::super::AdmittedPrefill::resolve(&args)?;
