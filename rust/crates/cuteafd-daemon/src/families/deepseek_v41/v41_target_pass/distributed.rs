@@ -24,6 +24,11 @@ fn trace_query_component(query: &crate::families::deepseek_v41::v41_attention_qu
 
 pub(crate) type DistributedTargetPass<'w, 'a> = Pass<'a, PlacedResources<'w, 'a>>;
 
+#[cfg(test)]
+thread_local! {
+    static DECODE_GEOMETRY: std::cell::Cell<Option<[[usize; 2]; 2]>> = const { std::cell::Cell::new(None) };
+}
+
 pub(crate) struct PlacedResources<'w, 'a> {
     map: CachePlacement,
     embedding: DeviceOwner<'a, TargetEmbeddingWave<'w, 'a>>,
@@ -74,6 +79,18 @@ impl Drop for ReservedPassGuard<'_, '_, '_, '_, '_> {
     }
 }
 impl<'w, 'a> DistributedTargetPass<'w, 'a> {
+    /// Observe the two constructed decode owners, in pass then TP2-rank order.
+    #[cfg(test)]
+    pub(crate) fn record_test_decode_geometry(&self, second: &Self) {
+        let rows = |pass: &Self| std::array::from_fn(|rank|
+            pass.resources.lanes[rank].test_backed_row_capacity());
+        DECODE_GEOMETRY.with(|seen| seen.set(Some([rows(self), rows(second)])));
+    }
+    #[cfg(test)]
+    pub(crate) fn take_test_decode_geometry() -> Option<[[usize; 2]; 2]> {
+        DECODE_GEOMETRY.with(|seen| seen.take())
+    }
+
     pub(crate) fn visit_graph_banks(&mut self, f: &mut dyn FnMut(i32, &'static str, bool, &mut dyn crate::shared::decode_graph::CacheAttached) -> Result<()>) -> Result<()> {
         for lane in &mut self.resources.lanes { lane.get_mut().visit_graph_banks(f)?; }
         for index in self.resources.indices.iter_mut().flatten() { index.get_mut().visit_graph_banks(f)?; }

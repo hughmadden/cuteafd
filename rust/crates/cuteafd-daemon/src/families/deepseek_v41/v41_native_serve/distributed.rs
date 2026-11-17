@@ -273,6 +273,8 @@ pub(super) fn worker(mut args: crate::cli::NativeServeArgs, mut receive: mpsc::R
     if args.tp2_attention { pass.enable_dual_attention()?; }
     let mut second = make_pass(decode_rows).context("constructing second distributed decode lane")?;
     if args.tp2_attention { second.enable_dual_attention()?; }
+    #[cfg(test)]
+    pass.record_test_decode_geometry(&second);
     // Decode lanes only: prefill slots keep their copy-engine transfers.
     let peer_push = crate::families::deepseek_v41::v41_peer_push::mode()?
         == crate::families::deepseek_v41::v41_peer_push::Mode::Push;
@@ -866,33 +868,142 @@ mod tests {
             Ok(())
         });
         DistributedTargetPass::take_test_unit_windows();
+        DistributedTargetPass::take_test_decode_geometry();
+        let normalized_args = serde_json::json!({
+            "decode_lanes": args.decode_lanes, "prefill_batch_tokens": args.prefill_batch_tokens,
+            "prefill_waves": args.prefill_waves, "prefill_reserve_rows": args.prefill_reserve_rows,
+        });
         let stats = std::sync::Arc::new(std::sync::Mutex::new(serde_json::Value::Null));
         let worker = MemoryPolicy { gpu_cap: Some(CAP), ..MemoryPolicy::current() }.scoped(||
             super::super::worker(args, receive, &mut Some(ready), stats));
         let client = client.join(); // Join before propagating the actual worker Err.
-        worker?; // Refusal is a direct failure; WorkerHandle::join cannot mask it.
-        client.map_err(|_| anyhow::anyhow!("fixture client panicked"))??;
+        let geometry = DistributedTargetPass::take_test_decode_geometry();
         let windows = DistributedTargetPass::take_test_unit_windows();
+        let inputs = cuteafd_ffi::memory_ledger::fault::inputs();
+        // Capture each fallible readback independently before any remaining gate.
+        // Errors are scalar diagnostics; none may suppress the other ranks/owners.
+        fn raw<T: serde::Serialize>(value: &std::result::Result<T, String>) -> serde_json::Value {
+            match value {
+                Ok(value) => serde_json::json!(value),
+                Err(error) => serde_json::json!(error),
+            }
+        }
+        let catalog = cuteafd_loader::read_official_v41_catalog(std::path::Path::new(&snapshot))
+            .map_err(|error| format!("catalog: {error:#}"));
+        let stored = lib.v41_tp2_expert_info(1).map(|info| u64::from(info.kernel_intermediate))
+            .map_err(|error| format!("expert info: {error:#}"));
+        let domains = inputs["memory_dashboard_plan"]["domains"].as_array()
+            .ok_or_else(|| "admitted domains missing or not an array".to_string());
+        let decoded_domains = domains.map(|domains| domains.iter().map(|domain| (
+            serde_json::from_value::<Budget>(domain["budget"].clone()).map_err(|error| format!("budget: {error}")),
+            serde_json::from_value::<Vec<Item>>(domain["items"].clone()).map_err(|error| format!("items: {error}")),
+        )).collect::<Vec<_>>());
+        let arena_domains = decoded_domains.as_ref().map(|domains| domains.iter().enumerate()
+            .map(|(index, (budget, items))| serde_json::json!({
+                "domain": index,
+                "locations": raw(&budget.as_ref().map(|budget| &budget.locations).map_err(|error| error.clone())),
+                "arenas": raw(&items.as_ref().map(|items| items.iter()
+                    .filter(|item| item.group.contains("arena"))
+                    .map(|item| (item.category, item.group.as_str(), item.bytes)).collect::<Vec<_>>())
+                    .map_err(|error| error.clone())),
+            })).collect::<Vec<_>>()).map_err(|error| error.clone());
+        let mut tier_readbacks = Vec::new();
+        let mut tier_diagnostics = Vec::new();
+        let mut counts = Vec::new();
+        for rank in 0..2u8 {
+            let extent = (|| -> std::result::Result<u64, String> {
+                let domains = decoded_domains.as_ref().map_err(|error| error.clone())?;
+                // Decode every domain above, including ones after a malformed budget.
+                let (_, items) = domains.iter().find(|(budget, _)| budget.as_ref()
+                    .is_ok_and(|budget| budget.locations.contains(&Location::coordinator(rank))))
+                    .ok_or_else(|| format!("coordinator {rank} domain missing"))?;
+                items.as_ref().map_err(|error| error.clone())?.iter()
+                    .filter(|item| item.category == Category::Experts && item.group == "weight arena")
+                    .try_fold(0u64, |sum, item| sum.checked_add(item.bytes)
+                        .ok_or_else(|| "expert arena extent overflow".to_string()))
+            })();
+            let resident = (|| -> std::result::Result<u64, String> {
+                let catalog = catalog.as_ref().map_err(|error| error.clone())?;
+                let stored = *stored.as_ref().map_err(|error| error.clone())?;
+                expert_cost(catalog, 0, 2, usize::from(rank), stored).map(|cost| cost.resident)
+                    .map_err(|error| format!("expert_cost: {error:#}"))
+            })();
+            let divisor = catalog.as_ref().map(|catalog| catalog.routed_experts().experts as u64)
+                .map_err(|error| error.clone());
+            let divide = |numerator: &std::result::Result<u64, String>,
+                denominator: &std::result::Result<u64, String>, remainder: bool| -> std::result::Result<u64, String> {
+                let numerator = *numerator.as_ref().map_err(|error| error.clone())?;
+                let denominator = *denominator.as_ref().map_err(|error| error.clone())?;
+                (if remainder { numerator.checked_rem(denominator) } else { numerator.checked_div(denominator) })
+                    .ok_or_else(|| "zero divisor".to_string())
+            };
+            let per_expert = divide(&resident, &divisor, false);
+            let count = divide(&extent, &per_expert, false);
+            // Arena extents can include inter-view padding. This tier uses one
+            // resident-weights view; expose both divisions and retain exact gates.
+            tier_diagnostics.push(serde_json::json!({
+                "rank": rank, "resident": raw(&resident), "divisor": raw(&divisor),
+                "remainder": raw(&divide(&resident, &divisor, true)), "per_expert": raw(&per_expert),
+                "arena_extent": raw(&extent), "arena_remainder": raw(&divide(&extent, &per_expert, true)),
+                "derived_count": raw(&count),
+            }));
+            counts.push(count);
+            tier_readbacks.push((extent, per_expert));
+        }
+        let onboard = &inputs["onboard_layers"];
+        let onboard_ranks = onboard.as_array().ok_or_else(|| "onboard_layers is not an array".to_string());
+        let onboard_lengths = onboard_ranks.as_ref().map(|ranks| ranks.iter().enumerate()
+            .map(|(rank, layers)| raw(&layers.as_array().map(Vec::len)
+                .ok_or_else(|| format!("onboard rank {rank} is not an array"))))
+            .collect::<Vec<_>>()).map_err(|error| error.clone());
+        let kv = cuteafd_bench::context::kv().ok_or_else(|| "live pool readback missing".to_string());
+        eprintln!("F2 raw diagnostics: {}", serde_json::json!({
+            "native_decode": { "passes": geometry.as_ref().map(|passes| passes.len()),
+                "backed_rows_by_pass_and_tp2_rank": geometry },
+            "planner_lanes": inputs["lanes"], "normalized_args": normalized_args,
+            "onboard_layers": onboard,
+            "onboard_outer_len": raw(&onboard_ranks.map(Vec::len)),
+            "onboard_per_rank_lengths": raw(&onboard_lengths),
+            "prefill": { "span": inputs["prefill_span_rows"], "rows": inputs["prefill_rows"],
+                "waves": inputs["prefill_waves"] },
+            "arena_domains": raw(&arena_domains), "expert_info_stored": raw(&stored),
+            "expert_cost": tier_diagnostics, "final_rank_counts": counts.iter().map(raw).collect::<Vec<_>>(),
+            "paired_counts": counts.first().zip(counts.get(1)).map(|(first, second)|
+                first.as_ref().ok().zip(second.as_ref().ok()).map(|(first, second)| first == second)),
+            "pool_tokens": inputs["pool_tokens"],
+            "live_kv": raw(&kv.as_ref().map(|kv| (kv.pages, kv.tokens)).map_err(|error| error.clone())),
+            "worker_error": worker.as_ref().err().map(|error| format!("{error:#}")),
+        }));
         let mut full_slots = [0; 3];
         let (mut rows, mut tails) = (0, 0);
+        let (mut missing_windows, mut invalid_full_slots) = (0, 0);
+        for (window, _) in &windows {
+            if let Some(range) = window.range() {
+                rows += range.len();
+                if range.len() == 2752 {
+                    if let Some(slot) = full_slots.get_mut(range.start / 2752) { *slot += 1; }
+                    else { invalid_full_slots += 1; }
+                } else if range.len() == 129 { tails += 1; }
+            } else { missing_windows += 1; }
+        }
+        eprintln!("windows: count={} rows={rows} full_slots={full_slots:?} tails={tails} missing={missing_windows} invalid_full_slots={invalid_full_slots}", windows.len());
+        worker?; // Refusal is a direct failure; WorkerHandle::join cannot mask it.
+        client.map_err(|_| anyhow::anyhow!("fixture client panicked"))??;
         for (window, tp2) in &windows {
             assert_eq!(tp2.as_ref(), Some(window), "TP2 must share the pass's selected rows");
             let range = window.range().context("unit has no explicit window")?;
             ensure!(range.end <= 8256, "unit exceeds the resolved span");
-            rows += range.len();
             match range.len() {
-                2752 => full_slots[range.start / 2752] += 1,
-                129 => tails += 1,
+                2752 | 129 => (),
                 other => anyhow::bail!("unexpected unit rows {other}"),
             }
         }
         // Each long prompt traverses two three-unit calls and a later odd tail;
         // the exact prefix repeat must add no encoder rows. No seven-unit call.
-        eprintln!("windows: count={} rows={rows} full_slots={full_slots:?} tails={tails}", windows.len());
+        assert_eq!(invalid_full_slots, 0, "full unit outside the three slots");
         assert_eq!(rows, C * ROWS);
         assert_eq!(full_slots, [2 * C; 3]);
         assert_eq!(tails, C);
-        let inputs = cuteafd_ffi::memory_ledger::fault::inputs();
         assert_eq!(inputs["pool_tokens"], 2097152);
         // The exact post-refit logical budget excludes private COW tails;
         // live KvCapacity includes every physical allocatable group, tails included.
@@ -902,31 +1013,19 @@ mod tests {
         let logical_pages = logical_tokens / unit_tokens;
         let physical_pages = logical_pages + tail_groups;
         let physical_tokens = physical_pages * unit_tokens;
-        let kv = cuteafd_bench::context::kv().context("live pool readback")?;
+        let kv = kv.map_err(anyhow::Error::msg)?;
         eprintln!("KV: logical_pages={logical_pages} logical_tokens={logical_tokens} physical_pages={physical_pages} physical_tokens={physical_tokens} tail_groups={tail_groups} live_pages={:?} live_tokens={:?}", kv.pages, kv.tokens);
         assert_eq!(kv.pages, Some(physical_pages));
         assert_eq!(kv.tokens, Some(physical_tokens));
-        eprintln!("prefill: span={} rows={} waves={} lanes={} onboard={:?}",
-            inputs["prefill_span_rows"], inputs["prefill_rows"], inputs["prefill_waves"], inputs["lanes"],
-            inputs["onboard_layers"].as_array().map(|ranks| ranks.iter().filter_map(|layers| layers.as_array()).flatten().count()));
         assert_eq!(inputs["prefill_span_rows"], 8256);
         assert_eq!(inputs["prefill_rows"], 2752);
         assert_eq!(inputs["prefill_waves"], 3);
-        assert_eq!(inputs["lanes"], 2);
+        assert_eq!(geometry, Some([[64, 64], [64, 64]]), "actual native decode passes and TP2 backed rows");
         assert_eq!(inputs["onboard_layers"], serde_json::json!([[], []]));
-        let catalog = cuteafd_loader::read_official_v41_catalog(std::path::Path::new(&snapshot))?;
-        let stored = u64::from(lib.v41_tp2_expert_info(1)?.kernel_intermediate);
-        let domains = inputs["memory_dashboard_plan"]["domains"].as_array().context("admitted domains")?;
         let mut paired = None;
-        for rank in 0..2 {
-            let domain = domains.iter().find(|domain| serde_json::from_value::<Budget>(domain["budget"].clone())
-                .is_ok_and(|b| b.locations.contains(&Location::coordinator(rank)))).context("coordinator domain")?;
-            let items: Vec<Item> = serde_json::from_value(domain["items"].clone())?;
-            let bytes: u64 = items.iter().filter(|item| item.category == Category::Experts
-                && item.group == "weight arena").map(|item| item.bytes).sum();
-            let per_expert = expert_cost(&catalog, 0, 2, usize::from(rank), stored)?.resident
-                / catalog.routed_experts().experts as u64;
-            eprintln!("tier inputs: rank={rank} arena={bytes} per_expert={per_expert}");
+        for (rank, (bytes, per_expert)) in tier_readbacks.into_iter().enumerate() {
+            let bytes = bytes.map_err(anyhow::Error::msg)?;
+            let per_expert = per_expert.map_err(anyhow::Error::msg)?;
             ensure!(bytes > 0 && per_expert > 0 && bytes % per_expert == 0, "no exact positive tier readback");
             let count = bytes / per_expert;
             eprintln!("tier: rank={rank} arena={bytes} per_expert={per_expert} count={count}; outcomes, not a prediction");
