@@ -767,6 +767,7 @@ mod tests {
         let mut args = crate::cli::NativeServeArgs::from_arg_matches(&matches)?;
         ensure!(args.peers.len() == 4, "four live Spark peers serving an owned expert group are required");
         super::super::normalize_serving(&mut args)?;
+        let tail_groups = u64::from(args.concurrency) + 2 * u64::from(args.resolved_prefix_entries());
         assert_eq!(args.prefix.prefix_point_boundaries, 0);
         assert_eq!(super::super::PrefillShape::from_args(&args),
             super::super::PrefillShape { rows: 2752, waves: 3 });
@@ -887,12 +888,27 @@ mod tests {
         }
         // Each long prompt traverses two three-unit calls and a later odd tail;
         // the exact prefix repeat must add no encoder rows. No seven-unit call.
+        eprintln!("windows: count={} rows={rows} full_slots={full_slots:?} tails={tails}", windows.len());
         assert_eq!(rows, C * ROWS);
         assert_eq!(full_slots, [2 * C; 3]);
         assert_eq!(tails, C);
         let inputs = cuteafd_ffi::memory_ledger::fault::inputs();
         assert_eq!(inputs["pool_tokens"], 2097152);
-        assert_eq!(cuteafd_bench::context::kv().context("live pool readback")?.tokens, Some(2097152));
+        // The exact post-refit logical budget excludes private COW tails;
+        // live KvCapacity includes every physical allocatable group, tails included.
+        let logical_tokens = inputs["pool_tokens"].as_u64().context("nonnegative logical pool tokens")?;
+        let unit_tokens = crate::families::deepseek_v41::v41_backbone_cache::UNIT_TOKENS as u64;
+        assert_eq!(logical_tokens % unit_tokens, 0, "logical pool must contain whole units");
+        let logical_pages = logical_tokens / unit_tokens;
+        let physical_pages = logical_pages + tail_groups;
+        let physical_tokens = physical_pages * unit_tokens;
+        let kv = cuteafd_bench::context::kv().context("live pool readback")?;
+        eprintln!("KV: logical_pages={logical_pages} logical_tokens={logical_tokens} physical_pages={physical_pages} physical_tokens={physical_tokens} tail_groups={tail_groups} live_pages={:?} live_tokens={:?}", kv.pages, kv.tokens);
+        assert_eq!(kv.pages, Some(physical_pages));
+        assert_eq!(kv.tokens, Some(physical_tokens));
+        eprintln!("prefill: span={} rows={} waves={} lanes={} onboard={:?}",
+            inputs["prefill_span_rows"], inputs["prefill_rows"], inputs["prefill_waves"], inputs["lanes"],
+            inputs["onboard_layers"].as_array().map(|ranks| ranks.iter().filter_map(|layers| layers.as_array()).flatten().count()));
         assert_eq!(inputs["prefill_span_rows"], 8256);
         assert_eq!(inputs["prefill_rows"], 2752);
         assert_eq!(inputs["prefill_waves"], 3);
@@ -910,11 +926,12 @@ mod tests {
                 && item.group == "weight arena").map(|item| item.bytes).sum();
             let per_expert = expert_cost(&catalog, 0, 2, usize::from(rank), stored)?.resident
                 / catalog.routed_experts().experts as u64;
+            eprintln!("tier inputs: rank={rank} arena={bytes} per_expert={per_expert}");
             ensure!(bytes > 0 && per_expert > 0 && bytes % per_expert == 0, "no exact positive tier readback");
             let count = bytes / per_expert;
+            eprintln!("tier: rank={rank} arena={bytes} per_expert={per_expert} count={count}; outcomes, not a prediction");
             if let Some(previous) = paired { assert_eq!(previous, count, "paired expert count"); }
             paired = Some(count);
-            eprintln!("GPU{rank}: selected paired experts={count}, resident arena={bytes} bytes; outcomes, not a prediction");
         }
         Ok(())
     }
