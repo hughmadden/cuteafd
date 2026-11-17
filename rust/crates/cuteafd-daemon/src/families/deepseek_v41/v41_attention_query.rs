@@ -15,6 +15,66 @@ thread_local! {
 }
 const MATRICES: [(u32, u32); 2] = [(5120, 1280), (1280, 32768)];
 const ROW_BYTES: [usize; 7] = [10240, 2560, 2560, 65536, 65536, 8, 256];
+
+/// Captured once by storage; execution never consults the ambient trace scope.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum QueryLayout {
+    Production,
+    #[cfg(test)]
+    RetainedProjection,
+}
+impl QueryLayout {
+    fn selected() -> Self {
+        #[cfg(test)]
+        if QUERY_TRACE_DEPTH.with(|depth| depth.get() > 0) {
+            return Self::RetainedProjection;
+        }
+        Self::Production
+    }
+    fn retains_projection(self) -> bool {
+        match self {
+            Self::Production => false,
+            #[cfg(test)]
+            Self::RetainedProjection => true,
+        }
+    }
+    fn allocates(self, plane: usize) -> bool {
+        plane != 4 || self.retains_projection()
+    }
+    fn buffer_bytes(self, rows: u32) -> usize {
+        4 + rows as usize * ROW_BYTES.iter().enumerate()
+            .filter(|(i, _)| self.allocates(*i)).map(|(_, bytes)| bytes).sum::<usize>()
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static QUERY_TRACE_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Opt numerical fixtures into retaining pre-RoPE queries at construction.
+/// Nestable and panic-safe; keep sizing and construction inside the scope.
+/// The guard stays on this thread, and existing storage keeps its layout after
+/// the guard drops. Async fixtures must construct on this same thread.
+#[cfg(test)]
+#[must_use]
+pub(crate) struct QueryTraceScope {
+    _thread: PhantomData<std::rc::Rc<()>>,
+}
+#[cfg(test)]
+impl QueryTraceScope {
+    pub(crate) fn enter() -> Self {
+        QUERY_TRACE_DEPTH.with(|depth| depth.set(depth.get().checked_add(1).expect("query trace scope depth overflow")));
+        Self { _thread: PhantomData }
+    }
+}
+#[cfg(test)]
+impl Drop for QueryTraceScope {
+    fn drop(&mut self) {
+        QUERY_TRACE_DEPTH.with(|depth| depth.set(depth.get() - 1));
+    }
+}
+
 fn part(mut b: CuteafdDeviceBuffer, offset: usize, bytes: usize) -> CuteafdDeviceBuffer {
     debug_assert!(offset + bytes <= b.bytes);
     b.ptr = unsafe { b.ptr.cast::<u8>().add(offset).cast() };
@@ -135,6 +195,7 @@ impl<'a> AttentionQueryWeights<'a> {
     /// RTX), where a joined chain head may sit.
     pub fn storage(&self, unit: u32, readers: &[i32]) -> Result<std::rc::Rc<AttentionQueryStorage<'a>>> {
         ensure!((1..=4096).contains(&unit), "invalid attention query unit {unit}");
+        let layout = QueryLayout::selected();
         let stream = LoadStream {
             library: self.library,
             raw: self.library.cuda_stream_create()?,
@@ -148,6 +209,8 @@ impl<'a> AttentionQueryWeights<'a> {
             .map(|k| DeviceAllocation::new(self.library, k.info().scratch_bytes as usize, Tag::workspace("v41/attention-query")))
             .collect::<Result<Vec<_>>>()?;
         let storage = AttentionQueryStorage {
+            #[cfg(test)]
+            layout,
             stream,
             kernels,
             scratch,
@@ -155,7 +218,7 @@ impl<'a> AttentionQueryWeights<'a> {
             buffers: ROW_BYTES
                 .into_iter().enumerate()
                 .map(|(i, n)| {
-                    if i == 4 && !cfg!(test) { Ok(None) }
+                    if !layout.allocates(i) { Ok(None) }
                     else { DeviceAllocation::new(self.library, n * unit as usize, Tag::workspace("v41/attention-query")).map(Some) }
                 })
                 .collect::<Result<Vec<_>>>()?,
@@ -207,7 +270,7 @@ pub(crate) struct AttentionQueryOutput<'a> {
     pub raw_rank: CuteafdDeviceBuffer,
     pub normalized_rank: CuteafdDeviceBuffer,
     #[cfg(test)]
-    pub projected: CuteafdDeviceBuffer,
+    projected: Option<CuteafdDeviceBuffer>,
     #[cfg(test)]
     pub qb_scratch: Option<CuteafdDeviceBuffer>,
     pub rotated: CuteafdDeviceBuffer,
@@ -216,6 +279,10 @@ pub(crate) struct AttentionQueryOutput<'a> {
     _owner: PhantomData<&'a ()>,
 }
 impl AttentionQueryOutput<'_> {
+    #[cfg(test)]
+    pub(crate) fn projected(&self) -> Result<CuteafdDeviceBuffer> {
+        self.projected.context("query projection was not retained; construct query storage inside QueryTraceScope::enter()")
+    }
     pub fn binding(&self) -> Result<QueryBinding> {
         self.binding.context("query has no token binding")
     }
@@ -234,6 +301,8 @@ impl AttentionQueryOutput<'_> {
 /// `acquire` before every write. The GEMM plans' scratch and alpha are plain
 /// scratch, ordered by this stream. Prefill slots share one per GPU.
 pub(crate) struct AttentionQueryStorage<'a> {
+    #[cfg(test)]
+    layout: QueryLayout,
     stream: LoadStream<'a>,
     kernels: Vec<V41Fp8Plan<'a>>,
     scratch: Vec<DeviceAllocation<'a>>,
@@ -297,8 +366,7 @@ impl AttentionQueryWave<'_, '_> {
         Self::device_bytes_with_split(library,capacity,false)
     }
     pub fn device_bytes_with_split(library:&NativeLibrary,capacity:u32,split_query_b:bool)->Result<usize> {
-        let mut bytes = 4 + capacity as usize * ROW_BYTES.iter().enumerate()
-            .filter(|(i, _)| *i != 4 || cfg!(test)).map(|(_, bytes)| bytes).sum::<usize>();
+        let mut bytes = QueryLayout::selected().buffer_bytes(capacity);
         for (k, n) in MATRICES.into_iter().take(if split_query_b {1} else {2}) {
             bytes += library.v41_fp8_matrix_plan_info(capacity, k, n)?.scratch_bytes as usize;
         }
@@ -397,8 +465,10 @@ impl AttentionQueryWave<'_, '_> {
             // Serving rotates the completed projection in place, saving one
             // 64-head BF16 buffer per lane without changing the kernel math.
             #[cfg(test)]
-            self.storage.stream.library.copy_d2d_async(self.b(4), self.b(3),
-                rows as usize * ROW_BYTES[3], self.storage.stream.raw)?;
+            if self.storage.layout.retains_projection() {
+                self.storage.stream.library.copy_d2d_async(self.b(4), self.b(3),
+                    rows as usize * ROW_BYTES[3], self.storage.stream.raw)?;
+            }
             self.norm.rope(
                 self.b(3),
                 self.b(6),
@@ -672,7 +742,9 @@ impl AttentionQueryWave<'_, '_> {
             projection.execute_after(self.weights.layer,rows,self.b(2),Some(self.storage.stream.raw),|projected,stream| {
                 self.storage.stream.library.copy_d2d_async(self.b(3),projected,rows as usize*ROW_BYTES[3],stream)?;
                 #[cfg(test)]
-                self.storage.stream.library.copy_d2d_async(self.b(4),projected,rows as usize*ROW_BYTES[3],stream)?;
+                if self.storage.layout.retains_projection() {
+                    self.storage.stream.library.copy_d2d_async(self.b(4),projected,rows as usize*ROW_BYTES[3],stream)?;
+                }
                 self.norm.rope(self.b(3),self.b(6),self.b(3),rows,64,false,stream)
             }).await?;
         }
@@ -696,7 +768,7 @@ impl AttentionQueryWave<'_, '_> {
             raw_rank: b(1),
             normalized_rank: b(2),
             #[cfg(test)]
-            projected: b(4),
+            projected: self.storage.layout.retains_projection().then(|| b(4)),
             #[cfg(test)]
             qb_scratch: self.storage.scratch.get(1).map(|scratch|scratch.buffer),
             rotated: b(3),
@@ -732,6 +804,87 @@ impl Drop for AttentionQueryWave<'_, '_> {
 }
 
 #[cfg(test)]
+mod layout_tests {
+    use super::*;
+
+    #[test]
+    fn default_layout_has_only_production_planes_at_decode_and_prefill_sizes() {
+        let layout = QueryLayout::selected();
+        assert_eq!(layout, QueryLayout::Production);
+        for rows in [1, 64, 2752] {
+            assert_eq!(layout.buffer_bytes(rows), 4 + rows as usize * 81_160);
+            for plane in 0..ROW_BYTES.len() {
+                assert_eq!(layout.allocates(plane), plane != 4);
+            }
+        }
+    }
+
+    #[test]
+    fn retained_layout_adds_exactly_one_projection_plane_per_row() {
+        let _trace = QueryTraceScope::enter();
+        let retained = QueryLayout::selected();
+        assert_eq!(retained, QueryLayout::RetainedProjection);
+        for (rows, two_lane_extra) in [(64, 8_388_608), (2752, 360_710_144)] {
+            let extra = retained.buffer_bytes(rows) - QueryLayout::Production.buffer_bytes(rows);
+            assert_eq!(extra, rows as usize * 65_536);
+            assert_eq!(2 * extra, two_lane_extra);
+            for plane in 0..ROW_BYTES.len() {
+                assert!(retained.allocates(plane));
+            }
+        }
+    }
+
+    #[test]
+    fn captured_layout_survives_scope_changes() {
+        let production = QueryLayout::selected();
+        let retained = {
+            let _trace = QueryTraceScope::enter();
+            assert!(!production.retains_projection());
+            QueryLayout::selected()
+        };
+        assert_eq!(QueryLayout::selected(), QueryLayout::Production);
+        assert!(retained.retains_projection());
+        assert!(!production.retains_projection());
+    }
+
+    #[test]
+    fn trace_scope_nests_and_resets_on_panic() {
+        assert_eq!(QueryLayout::selected(), QueryLayout::Production);
+        {
+            let _outer = QueryTraceScope::enter();
+            let failed = std::panic::catch_unwind(|| {
+                let _inner = QueryTraceScope::enter();
+                assert_eq!(QueryLayout::selected(), QueryLayout::RetainedProjection);
+                panic!("injected nested trace failure");
+            });
+            assert!(failed.is_err());
+            assert_eq!(QueryLayout::selected(), QueryLayout::RetainedProjection);
+        }
+        assert_eq!(QueryLayout::selected(), QueryLayout::Production);
+        let failed = std::panic::catch_unwind(|| {
+            let _trace = QueryTraceScope::enter();
+            panic!("injected trace failure");
+        });
+        assert!(failed.is_err());
+        assert_eq!(QueryLayout::selected(), QueryLayout::Production);
+    }
+
+    #[test]
+    fn trace_scope_is_thread_local() {
+        let _trace = QueryTraceScope::enter();
+        std::thread::spawn(|| {
+            assert_eq!(QueryLayout::selected(), QueryLayout::Production);
+            {
+                let _trace = QueryTraceScope::enter();
+                assert_eq!(QueryLayout::selected(), QueryLayout::RetainedProjection);
+            }
+            assert_eq!(QueryLayout::selected(), QueryLayout::Production);
+        }).join().expect("query trace thread panicked");
+        assert_eq!(QueryLayout::selected(), QueryLayout::RetainedProjection);
+    }
+}
+
+#[cfg(test)]
 mod tp2_tests {
     use super::*;
     use crate::shared::memory::device::{Allocation,Device};
@@ -744,12 +897,13 @@ mod tp2_tests {
         let devices=[Device { library:&library,id:0 },Device { library:&library,id:1 }];
         let runtime=tokio::runtime::Builder::new_current_thread().build()?;
         let read=|device:Device,output:AttentionQueryOutput<'_>|->Result<Vec<Vec<u8>>> {
-            [output.hidden,output.raw_rank,output.normalized_rank,output.projected,
+            [output.hidden,output.raw_rank,output.normalized_rank,output.projected()?,
                 output.rotated,output.positions,output.frequencies].into_iter().map(|view| {
                     let mut bytes=vec![0;view.bytes];device.run(||library.copy_d2h(&mut bytes,view))?;Ok(bytes)
                 }).collect()
         };
         for (owner,layer) in [(0,2),(1,20)] {
+            let trace_scope = QueryTraceScope::enter();
             let device=devices[owner];let capacity=16;
             let weights=device.own(||AttentionQueryWeights::load(&library,&catalog,layer,
                 AttentionQueryWeights::device_bytes(&library,&catalog,layer)?,1<<20))?;
@@ -759,6 +913,7 @@ mod tp2_tests {
             assert!(split_weights.tensors.get(&split_weights.names[2]).is_err());
             assert_eq!(split_weights.scales.len(),1);
             let mut query=device.own(||split_weights.wave(capacity,usize::MAX))?;
+            drop(trace_scope);
             assert_eq!(query.storage.scratch.len(),1);
             assert!(query.rebind(&weights).is_err());
             let halves=[vec![Weights::load(devices[0],&catalog,layer,Kind::QueryB,0,

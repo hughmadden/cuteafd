@@ -1123,7 +1123,7 @@ impl<'w, 'a> BackboneLane<'w, 'a> {
         let library = self.weights.library;
         let read = |output: &AttentionQueryOutput<'_>| -> Result<Vec<Vec<u8>>> {
             [output.hidden, output.raw_rank, output.normalized_rank,
-                output.projected, output.rotated, output.positions, output.frequencies]
+                output.projected()?, output.rotated, output.positions, output.frequencies]
                 .into_iter().map(|buffer| {
                     let mut bytes = vec![0; buffer.bytes];
                     library.copy_d2h(&mut bytes, buffer)?;

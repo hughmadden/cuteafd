@@ -111,6 +111,7 @@ fn queued_engram_fixture(runtime: &tokio::runtime::Runtime, requests: &Requests<
 
 #[test]
 fn real_layer_zero_executes_embedding_attention_tp4_and_mhc() -> Result<()> {
+    let _query_trace = crate::families::deepseek_v41::v41_attention_query::QueryTraceScope::enter();
     let Some(path) = std::env::var_os("CUTEAFD_LAYER0_LIBRARY") else {
         eprintln!("skip distributed layer test: CUTEAFD_LAYER0_LIBRARY unset");
         return Ok(());

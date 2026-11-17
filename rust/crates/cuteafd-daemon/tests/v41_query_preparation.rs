@@ -54,6 +54,7 @@ fn read(lib: &NativeLibrary, b: CuteafdDeviceBuffer) -> Result<Vec<u8>> {
 #[test]
 #[ignore = "requires the official V4.1 snapshot and a CUDA native library"]
 fn query_preparation_preserves_values_and_drains_producer_errors() -> Result<()> {
+    let trace_scope = v41_attention_query::QueryTraceScope::enter();
     let lib = unsafe { NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?)? };
     let cat = read_official_v41_catalog(std::path::Path::new(&std::env::var("CUTEAFD_V41_SNAPSHOT")?),
     )?;
@@ -80,6 +81,8 @@ fn query_preparation_preserves_values_and_drains_producer_errors() -> Result<()>
     let mut hc = v41_hc::HcSublayer::new(&lib, &layers[0].2, layers[0].3.clone(), 256, usize::MAX)?;
     let mut q = layers[0].1.wave(256, usize::MAX)?;
     let mut alternate = layers[0].1.wave(256, usize::MAX)?;
+    // Both waves must keep the retained layout after the construction scope.
+    drop(trace_scope);
     for index in [0, 1, 2, 0] {
         let (layer, qw, hw, names) = &layers[index];
         // Every query call drained; discard the unfinished fixture sublayer
@@ -115,13 +118,25 @@ fn query_preparation_preserves_values_and_drains_producer_errors() -> Result<()>
                     o.hidden,
                     o.raw_rank,
                     o.normalized_rank,
-                    o.projected,
+                    o.projected()?,
                     o.rotated,
                     o.frequencies,
                 ]
                 .into_iter()
                 .map(|b| read(&lib, b))
                 .collect::<Result<Vec<_>>>()?;
+                if cases == 0 {
+                    let mut untraced = layers[0].1.wave(256, usize::MAX)?;
+                    // A later scope cannot add a projection to existing storage.
+                    let _trace = v41_attention_query::QueryTraceScope::enter();
+                    lib.copy_d2d(untraced.input(), normalized, normalized.bytes)?;
+                    // SAFETY: this wave's weights, initialized input and token
+                    // storage remain live through synchronous execution.
+                    let output = unsafe { untraced.execute_tokens(&tokens)? };
+                    let error = output.projected().expect_err("default query retained a projection");
+                    ensure!(error.to_string().contains("QueryTraceScope::enter()"));
+                    ensure!(read(&lib, output.rotated)? == baseline[4], "default query differs");
+                }
                 lib.copy_h2d(q.input(), &vec![0; q.input().bytes])?;
                 let o = unsafe {
                     runtime.block_on(q.execute_tokens_prepared_cooperative(&tokens, |stream, input| {
@@ -133,7 +148,7 @@ fn query_preparation_preserves_values_and_drains_producer_errors() -> Result<()>
                     o.hidden,
                     o.raw_rank,
                     o.normalized_rank,
-                    o.projected,
+                    o.projected()?,
                     o.rotated,
                     o.frequencies,
                 ]

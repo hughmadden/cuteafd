@@ -15,7 +15,7 @@ fn trace_query_component(query: &crate::families::deepseek_v41::v41_attention_qu
         "hidden" => (query.hidden, 10240),
         "raw_rank" => (query.raw_rank, 2560),
         "normalized_rank" => (query.normalized_rank, 2560),
-        "projected" | "qb_pair" => (query.projected, 65536),
+        "projected" | "qb_pair" => (query.projected()?, 65536),
         "rotated" => (query.rotated, 65536),
         _ => anyhow::bail!("unknown query trace component"),
     })
@@ -1139,6 +1139,9 @@ mod tests {
     // native assertions; bounded CPU cut/admission coverage lives in
     // encoder_units::placement_tests and the loader's SM89 C16 tier fixture.
     fn distributed_prefill_fixture(packed_check: bool) -> Result<()> {
+        // This numerical fixture also supports projected/qb_pair readback.
+        // Trace layout is selected explicitly here, independently of trace env.
+        let _query_trace = crate::families::deepseek_v41::v41_attention_query::QueryTraceScope::enter();
         use crate::families::deepseek_v41::v41_native_serve::prefill_target::PrefillTarget;
         use crate::families::deepseek_v41::v41_experts::dspark::{DsparkChain, DsparkWeights};
         let lib = unsafe { NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?)? };
